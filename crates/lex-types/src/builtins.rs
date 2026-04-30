@@ -116,6 +116,45 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             ));
             Some(Ty::Record(fields))
         }
+        "bytes" => {
+            let mut fields = IndexMap::new();
+            fields.insert("len".into(), Ty::function(
+                vec![Ty::bytes()], EffectSet::empty(), Ty::int(),
+            ));
+            fields.insert("is_empty".into(), Ty::function(
+                vec![Ty::bytes()], EffectSet::empty(), Ty::bool(),
+            ));
+            fields.insert("eq".into(), Ty::function(
+                vec![Ty::bytes(), Ty::bytes()], EffectSet::empty(), Ty::bool(),
+            ));
+            fields.insert("from_str".into(), Ty::function(
+                vec![Ty::str()], EffectSet::empty(), Ty::bytes(),
+            ));
+            fields.insert("to_str".into(), Ty::function(
+                vec![Ty::bytes()], EffectSet::empty(),
+                Ty::Con("Result".into(), vec![Ty::str(), Ty::str()]),
+            ));
+            fields.insert("slice".into(), Ty::function(
+                vec![Ty::bytes(), Ty::int(), Ty::int()],
+                EffectSet::empty(), Ty::bytes(),
+            ));
+            Some(Ty::Record(fields))
+        }
+        "net" => {
+            let mut fields = IndexMap::new();
+            // get :: Str -> [net] Result[Str, Str]
+            fields.insert("get".into(), Ty::function(
+                vec![Ty::str()],
+                EffectSet::singleton("net"),
+                Ty::Con("Result".into(), vec![Ty::str(), Ty::str()]),
+            ));
+            fields.insert("post".into(), Ty::function(
+                vec![Ty::str(), Ty::str()],
+                EffectSet::singleton("net"),
+                Ty::Con("Result".into(), vec![Ty::str(), Ty::str()]),
+            ));
+            Some(Ty::Record(fields))
+        }
         "json" => {
             let mut fields = IndexMap::new();
             // stringify :: T -> Str  (polymorphic on input)
@@ -228,6 +267,8 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "option" => "option",
         "json" => "json",
         "flow" => "flow",
+        "bytes" => "bytes",
+        "net" => "net",
         _ => return None,
     })
 }

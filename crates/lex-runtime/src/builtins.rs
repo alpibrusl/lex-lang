@@ -143,7 +143,50 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             }
         }
 
+        // -- bytes --
+        ("bytes", "len") => {
+            let b = expect_bytes(args.first())?;
+            Ok(Value::Int(b.len() as i64))
+        }
+        ("bytes", "eq") => {
+            let a = expect_bytes(args.first())?;
+            let b = expect_bytes(args.get(1))?;
+            Ok(Value::Bool(a == b))
+        }
+        ("bytes", "from_str") => {
+            let s = expect_str(args.first())?;
+            Ok(Value::Bytes(s.into_bytes()))
+        }
+        ("bytes", "to_str") => {
+            let b = expect_bytes(args.first())?;
+            match String::from_utf8(b.to_vec()) {
+                Ok(s) => Ok(ok_v(Value::Str(s))),
+                Err(e) => Ok(err_v(Value::Str(format!("{e}")))),
+            }
+        }
+        ("bytes", "slice") => {
+            let b = expect_bytes(args.first())?;
+            let lo = expect_int(args.get(1))? as usize;
+            let hi = expect_int(args.get(2))? as usize;
+            if lo > hi || hi > b.len() {
+                return Err(format!("bytes.slice: out of range [{lo}..{hi}] of {}", b.len()));
+            }
+            Ok(Value::Bytes(b[lo..hi].to_vec()))
+        }
+        ("bytes", "is_empty") => {
+            let b = expect_bytes(args.first())?;
+            Ok(Value::Bool(b.is_empty()))
+        }
+
         _ => Err(format!("unknown pure builtin: {kind}.{op}")),
+    }
+}
+
+fn expect_bytes(v: Option<&Value>) -> Result<&Vec<u8>, String> {
+    match v {
+        Some(Value::Bytes(b)) => Ok(b),
+        Some(other) => Err(format!("expected Bytes, got {other:?}")),
+        None => Err("missing argument".into()),
     }
 }
 
