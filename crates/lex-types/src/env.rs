@@ -62,6 +62,21 @@ impl TypeEnv {
         e.types.insert("Map".into(), TypeDef { params: vec!["K".into(), "V".into()], kind: TypeDefKind::Opaque });
         e.types.insert("Set".into(), TypeDef { params: vec!["T".into()], kind: TypeDefKind::Opaque });
 
+        // Matrix = { rows :: Int, cols :: Int, data :: List[Float] }.
+        // Used by std.math; runtime values are the F64Array fast lane,
+        // not a real record. The alias makes math.* signatures readable
+        // (`:: Matrix` instead of an inline record) and lets call sites
+        // unify nominally. Field access via `m.rows` would type-check
+        // but fail at runtime — use `math.rows / math.cols / math.get`.
+        let mut mat_fields = IndexMap::new();
+        mat_fields.insert("rows".into(), Ty::int());
+        mat_fields.insert("cols".into(), Ty::int());
+        mat_fields.insert("data".into(), Ty::List(Box::new(Ty::float())));
+        e.types.insert("Matrix".into(), TypeDef {
+            params: vec![],
+            kind: TypeDefKind::Alias(Ty::Record(mat_fields)),
+        });
+
         e
     }
 
