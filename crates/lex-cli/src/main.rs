@@ -44,6 +44,7 @@ fn run(args: &[String]) -> Result<()> {
         "serve" => cmd_serve(&args[1..]),
         "conformance" => cmd_conformance(&args[1..]),
         "spec" => cmd_spec(&args[1..]),
+        "agent-tool" => cmd_agent_tool(&args[1..]),
         "help" | "--help" | "-h" => { print_usage(); Ok(()) }
         other => bail!("unknown command `{other}`. try `lex help`"),
     }
@@ -68,6 +69,10 @@ fn print_usage() {
     println!("  conformance <dir>                  run all JSON test descriptors in <dir>");
     println!("  spec check <spec> --source <file>  check a Spec against a Lex source");
     println!("  spec smt <spec>                    emit SMT-LIB for external Z3");
+    println!("  agent-tool [--allow-effects ks] (--request 'q' | --body-file F | --body 'B')");
+    println!("                                     have an LLM emit a Lex tool body, run it");
+    println!("                                     under the declared effects (rejected at");
+    println!("                                     type-check if it tries anything else)");
     println!();
     println!("policy flags (run, replay):");
     println!("  --allow-effects k1,k2,...   permit these effect kinds");
@@ -566,4 +571,268 @@ fn cmd_spec(args: &[String]) -> Result<()> {
         }
         other => bail!("unknown `lex spec` subcommand: {other}"),
     }
+}
+
+// ---- agent-tool ----------------------------------------------------
+//
+// Pitch: hand an LLM a request, ask it to emit a Lex tool body, run
+// the body under a declared effect set. The type checker rejects any
+// body that touches effects outside that set — *before* a single byte
+// runs. Lex's effect system + capability gate as a sandbox for
+// agent-generated code.
+//
+//   lex agent-tool --allow-effects net --request "weather in Paris"
+//   lex agent-tool --allow-effects net --body 'match net.get("https://wttr.in/Paris?format=3") { Ok(s) => s, Err(e) => e }'
+
+struct AgentToolOpts {
+    allowed_effects: Vec<String>,
+    user_input: String,
+    body_source: BodySource,
+    api_key: Option<String>,
+    model: String,
+    show_source: bool,
+}
+
+enum BodySource {
+    Request(String),
+    Literal(String),
+    File(PathBuf),
+}
+
+fn cmd_agent_tool(args: &[String]) -> Result<()> {
+    let opts = parse_agent_tool_args(args)?;
+
+    // 1) Get the tool body — from Claude or supplied verbatim.
+    let body = match &opts.body_source {
+        BodySource::Literal(b) => b.clone(),
+        BodySource::File(p) => fs::read_to_string(p)
+            .with_context(|| format!("read body from {}", p.display()))?,
+        BodySource::Request(req) => {
+            let api_key = opts.api_key.clone()
+                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                .ok_or_else(|| anyhow!(
+                    "--request needs ANTHROPIC_API_KEY (or pass --api-key); \
+                     for offline use try --body or --body-file"))?;
+            call_claude_for_body(req, &opts.allowed_effects, &api_key, &opts.model)?
+        }
+    };
+    let body = strip_code_fences(&body);
+
+    if opts.show_source {
+        eprintln!("→ tool body:");
+        for l in body.lines() { eprintln!("    {l}"); }
+    }
+
+    // 2) Splice into the template.
+    let src = build_tool_program(&body, &opts.allowed_effects);
+    if opts.show_source {
+        eprintln!("→ assembled program:");
+        for l in src.lines() { eprintln!("    {l}"); }
+    }
+
+    // 3) Parse + type-check. This is where a malicious body gets caught:
+    // any effect not in `[allowed_effects]` shows up as an undeclared
+    // effect on `fn tool` and the checker rejects it.
+    let prog = parse_source(&src).context("parse agent-generated source")?;
+    let stages = canonicalize_program(&prog);
+    if let Err(errs) = lex_types::check_program(&stages) {
+        eprintln!("→ TYPE-CHECK REJECTED — tool not run.");
+        for e in &errs {
+            eprintln!("  {e}");
+            if let lex_types::TypeError::EffectNotDeclared { effect, .. } = e {
+                eprintln!("    (the body uses effect `{effect}` but the host only allows {:?})",
+                    opts.allowed_effects);
+            }
+        }
+        std::process::exit(2);
+    }
+
+    // 4) Compile + policy gate.
+    let bc = compile_program(&stages);
+    let mut policy = Policy::pure();
+    policy.allow_effects = opts.allowed_effects.iter().cloned().collect();
+    if let Err(violations) = check_policy(&bc, &policy) {
+        eprintln!("→ POLICY REJECTED — tool not run.");
+        for v in &violations {
+            eprintln!("  {}", serde_json::to_string(v).unwrap_or_default());
+        }
+        std::process::exit(3);
+    }
+
+    // 5) Run.
+    let bc = std::sync::Arc::new(bc);
+    let handler = DefaultHandler::new(policy).with_program(std::sync::Arc::clone(&bc));
+    let mut vm = Vm::with_handler(&bc, Box::new(handler));
+    let result = vm.call("tool", vec![Value::Str(opts.user_input.clone())])
+        .map_err(|e| anyhow!("runtime: {e}"))?;
+
+    match result {
+        Value::Str(s) => println!("{s}"),
+        other => println!("{}", value_to_json_string(&other)),
+    }
+    Ok(())
+}
+
+fn parse_agent_tool_args(args: &[String]) -> Result<AgentToolOpts> {
+    let mut allowed_effects: Vec<String> = Vec::new();
+    let mut user_input: Option<String> = None;
+    let mut body: Option<BodySource> = None;
+    let mut api_key: Option<String> = None;
+    let mut model = "claude-sonnet-4-6".to_string();
+    let mut show_source = true;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--allow-effects" => {
+                let v = args.get(i + 1).ok_or_else(|| anyhow!("--allow-effects needs a value"))?;
+                allowed_effects = v.split(',').filter(|s| !s.is_empty()).map(String::from).collect();
+                i += 2;
+            }
+            "--input" => {
+                user_input = Some(args.get(i + 1).ok_or_else(|| anyhow!("--input needs a value"))?.clone());
+                i += 2;
+            }
+            "--request" => {
+                let v = args.get(i + 1).ok_or_else(|| anyhow!("--request needs a value"))?.clone();
+                if user_input.is_none() { user_input = Some(v.clone()); }
+                body = Some(BodySource::Request(v));
+                i += 2;
+            }
+            "--body" => {
+                body = Some(BodySource::Literal(args.get(i + 1).ok_or_else(|| anyhow!("--body needs a value"))?.clone()));
+                i += 2;
+            }
+            "--body-file" => {
+                body = Some(BodySource::File(PathBuf::from(args.get(i + 1)
+                    .ok_or_else(|| anyhow!("--body-file needs a path"))?)));
+                i += 2;
+            }
+            "--api-key" => {
+                api_key = Some(args.get(i + 1).ok_or_else(|| anyhow!("--api-key needs a value"))?.clone());
+                i += 2;
+            }
+            "--model" => {
+                model = args.get(i + 1).ok_or_else(|| anyhow!("--model needs a value"))?.clone();
+                i += 2;
+            }
+            "--quiet" => { show_source = false; i += 1; }
+            other => bail!("unknown agent-tool flag: {other}"),
+        }
+    }
+    Ok(AgentToolOpts {
+        allowed_effects,
+        user_input: user_input.unwrap_or_default(),
+        body_source: body.ok_or_else(||
+            anyhow!("must pass --request '<query>', --body '<src>', or --body-file <path>"))?,
+        api_key,
+        model,
+        show_source,
+    })
+}
+
+fn build_tool_program(body: &str, allowed_effects: &[String]) -> String {
+    // Auto-import every std module so the agent can syntactically
+    // reach any effect — the *signature* gates what's allowed. This
+    // makes the demo land: a body using `io.read` resolves cleanly
+    // to the io builtin, then the type checker rejects it with
+    // "effect `io` not declared on `fn tool`" instead of a confusing
+    // unknown-identifier error.
+    let imports = [
+        "import \"std.io\"    as io",
+        "import \"std.net\"   as net",
+        "import \"std.str\"   as str",
+        "import \"std.int\"   as int",
+        "import \"std.float\" as float",
+        "import \"std.list\"  as list",
+        "import \"std.json\"  as json",
+        "import \"std.bytes\" as bytes",
+    ].join("\n");
+    let effects = if allowed_effects.is_empty() {
+        String::new()
+    } else {
+        format!("[{}] ", allowed_effects.join(", "))
+    };
+    // The tool's signature is fixed: input -> Str. The agent provides
+    // only the body. Effects are declared from the host's allow-list
+    // so any extra effect inside the body is an undeclared use.
+    format!("{imports}\n\nfn tool(input :: Str) -> {effects}Str {{\n{body}\n}}\n")
+}
+
+fn strip_code_fences(s: &str) -> String {
+    let t = s.trim();
+    let t = t.strip_prefix("```lex").or_else(|| t.strip_prefix("```")).unwrap_or(t);
+    let t = t.strip_suffix("```").unwrap_or(t).trim();
+    // If the model wrapped the body in `fn tool(...) { ... }`, peel it down
+    // to just the inner block so the template re-wraps it cleanly.
+    if let Some((_, rest)) = t.split_once("fn tool(") {
+        if let Some(open) = rest.find('{') {
+            let after_brace = &rest[open + 1..];
+            if let Some(close) = after_brace.rfind('}') {
+                return after_brace[..close].trim().to_string();
+            }
+        }
+    }
+    t.to_string()
+}
+
+fn call_claude_for_body(
+    user_request: &str,
+    allowed_effects: &[String],
+    api_key: &str,
+    model: &str,
+) -> Result<String> {
+    let effects_str = if allowed_effects.is_empty() {
+        "(none)".to_string()
+    } else {
+        format!("[{}]", allowed_effects.join(", "))
+    };
+    let system = format!(r#"You are a code generator for the Lex programming language.
+
+Output ONLY the body of:
+
+    fn tool(input :: Str) -> {effects_str} Str {{ <YOUR BODY> }}
+
+Imports already in scope: net, str, int, float, list, json.
+Useful builtins:
+  net.get(url :: Str) -> [net] Result[Str, Str]
+  net.post(url, body) -> [net] Result[Str, Str]
+  str.concat(a, b) -> Str          # use repeatedly to build a string
+  str.split(s, sep) -> List[Str]
+  str.contains(s, needle) -> Bool
+  int.to_str(n :: Int) -> Str
+  json.stringify(v) -> Str
+  json.parse(s) -> Result[T, Str]
+
+Hard constraints:
+1. Only use effects from the set {effects_str}. ANY other effect (io.read,
+   io.write, fs_read, fs_write, ...) will be rejected by the type
+   checker before execution.
+2. Output a single block-bodied expression (no `fn` declaration, no
+   imports, no markdown fences). Begin directly with code.
+3. Match Result with Ok/Err arms; never use a `.unwrap`.
+4. Lex has no string interpolation — chain `str.concat(a, b)` calls.
+"#);
+    let body = serde_json::json!({
+        "model": model,
+        "max_tokens": 1024,
+        "system": system,
+        "messages": [{ "role": "user", "content": user_request }],
+    });
+    let resp: serde_json::Value = ureq::post("https://api.anthropic.com/v1/messages")
+        .set("x-api-key", api_key)
+        .set("anthropic-version", "2023-06-01")
+        .set("content-type", "application/json")
+        .send_json(body)
+        .map_err(|e| anyhow!("claude api: {e}"))?
+        .into_json()
+        .context("decode claude response")?;
+    let text = resp.get("content")
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.iter().find_map(|item| {
+            if item.get("type")?.as_str()? == "text" {
+                item.get("text")?.as_str().map(String::from)
+            } else { None }
+        }))
+        .ok_or_else(|| anyhow!("claude response missing text content; got: {resp}"))?;
+    Ok(text)
 }
