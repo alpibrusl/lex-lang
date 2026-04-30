@@ -39,7 +39,9 @@ fn run(args: &[String]) -> Result<()> {
         "publish" => cmd_publish(&args[1..]),
         "store" => cmd_store(&args[1..]),
         "trace" => cmd_trace(&args[1..]),
+        "replay" => cmd_replay(&args[1..]),
         "diff" => cmd_diff(&args[1..]),
+        "serve" => cmd_serve(&args[1..]),
         "help" | "--help" | "-h" => { print_usage(); Ok(()) }
         other => bail!("unknown command `{other}`. try `lex help`"),
     }
@@ -56,8 +58,13 @@ fn print_usage() {
     println!("                                     publish each stage to the store as Draft");
     println!("  store list [--store DIR]           list SigIds in the store");
     println!("  store get [--store DIR] <stage>    print metadata + canonical AST for a StageId");
+    println!("  trace <run_id>                     print a saved trace tree as JSON");
+    println!("  replay <run_id> <file> <fn> [args] [--override NODE=JSON]...");
+    println!("                                     re-execute with effect overrides keyed by NodeId");
+    println!("  diff <run_a> <run_b>               first NodeId where two traces diverge");
+    println!("  serve [--port N] [--store DIR]     start the agent API HTTP server");
     println!();
-    println!("policy flags (run):");
+    println!("policy flags (run, replay):");
     println!("  --allow-effects k1,k2,...   permit these effect kinds");
     println!("  --allow-fs-read PATH        (repeatable) permit fs_read under PATH");
     println!("  --allow-fs-write PATH       (repeatable) permit fs_write under PATH");
@@ -386,4 +393,103 @@ fn cmd_store(args: &[String]) -> Result<()> {
         }
         other => bail!("unknown `lex store` subcommand: {other}"),
     }
+}
+
+fn cmd_replay(args: &[String]) -> Result<()> {
+    // usage: lex replay <run_id> <file> <fn> [args] [--override NODE=JSON]
+    // Re-runs the function with overrides keyed by NodeId. Saves a fresh
+    // trace and prints its run_id. The original run_id is referenced for
+    // the user's bookkeeping; we don't currently load it (the function is
+    // re-executed from source).
+    let mut overrides: indexmap::IndexMap<String, serde_json::Value> = indexmap::IndexMap::new();
+    let mut policy = Policy::pure();
+    let mut positional: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--override" => {
+                let val = args.get(i + 1).ok_or_else(|| anyhow!("--override needs NODE=JSON"))?;
+                let (node, json) = val.split_once('=').ok_or_else(|| anyhow!("--override expects NODE=JSON"))?;
+                let v: serde_json::Value = serde_json::from_str(json)
+                    .with_context(|| format!("--override value must be JSON: {json}"))?;
+                overrides.insert(node.to_string(), v);
+                i += 2;
+            }
+            "--allow-effects" => {
+                let val = args.get(i + 1).ok_or_else(|| anyhow!("--allow-effects needs a value"))?;
+                policy.allow_effects = val.split(',').filter(|s| !s.is_empty())
+                    .map(|s| s.to_string()).collect::<BTreeSet<_>>();
+                i += 2;
+            }
+            _ => { positional.push(args[i].clone()); i += 1; }
+        }
+    }
+    let _orig_run_id = positional.first().ok_or_else(|| anyhow!("usage: lex replay <run_id> <file> <fn> [args]"))?;
+    let path = positional.get(1).ok_or_else(|| anyhow!("missing <file>"))?;
+    let func = positional.get(2).ok_or_else(|| anyhow!("missing <fn>"))?;
+
+    let src = read_source(path)?;
+    let prog = parse_source(&src)?;
+    let stages = canonicalize_program(&prog);
+    if let Err(errs) = lex_types::check_program(&stages) {
+        for e in &errs { eprintln!("{}", serde_json::to_string(e)?); }
+        std::process::exit(2);
+    }
+    let bc = compile_program(&stages);
+    if let Err(violations) = check_policy(&bc, &policy) {
+        for v in &violations { eprintln!("{}", serde_json::to_string(v)?); }
+        std::process::exit(3);
+    }
+
+    let recorder = lex_trace::Recorder::new().with_overrides(overrides);
+    let handle = recorder.handle();
+    let handler = DefaultHandler::new(policy);
+    let mut vm = Vm::with_handler(&bc, Box::new(handler));
+    vm.set_tracer(Box::new(recorder));
+
+    let vargs: Vec<Value> = positional[3..].iter().map(|a| {
+        let v: serde_json::Value = serde_json::from_str(a)
+            .with_context(|| format!("arg `{a}` must be JSON"))?;
+        Ok(json_to_value(&v))
+    }).collect::<Result<Vec<_>>>()?;
+
+    let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let result = vm.call(func, vargs);
+    let ended = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+
+    let store = lex_store::Store::open(default_store_root())?;
+    let (root_out, root_err) = match &result {
+        Ok(v) => (Some(value_to_json(v)), None),
+        Err(e) => (None, Some(format!("{e}"))),
+    };
+    let tree = handle.finalize(func.clone(), serde_json::Value::Null, root_out, root_err, started, ended);
+    let new_run_id = store.save_trace(&tree)?;
+    eprintln!("trace saved: {new_run_id}");
+    let r = result.map_err(|e| anyhow!("runtime: {e}"))?;
+    println!("{}", value_to_json_string(&r));
+    Ok(())
+}
+
+fn cmd_serve(args: &[String]) -> Result<()> {
+    let mut port: u16 = 4040;
+    let mut store_root = default_store_root();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--port" => {
+                let v = args.get(i + 1).ok_or_else(|| anyhow!("--port needs value"))?;
+                port = v.parse().context("--port must be u16")?;
+                i += 2;
+            }
+            "--store" => {
+                let v = args.get(i + 1).ok_or_else(|| anyhow!("--store needs path"))?;
+                store_root = std::path::PathBuf::from(v);
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+    eprintln!("lex agent API listening on http://127.0.0.1:{port}");
+    eprintln!("store: {}", store_root.display());
+    lex_api::serve(port, store_root)
 }
