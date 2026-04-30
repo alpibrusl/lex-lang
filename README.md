@@ -311,4 +311,4 @@ cargo test --release -p core-compiler -- --ignored   # release-only matmul perf 
 
 ## License
 
-Apache-2.0.
+[EUPL-1.2](LICENSE) — the European Union Public Licence v. 1.2.
