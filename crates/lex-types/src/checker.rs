@@ -121,6 +121,20 @@ impl Checker {
         }
     }
 
+    /// If `ty` is a `Ty::Con(name, _)` whose definition is a record
+    /// alias (`type Foo = { ... }`), return the inner record type.
+    /// Otherwise return `ty` unchanged.
+    fn unfold_record_alias(&self, ty: Ty) -> Ty {
+        if let Ty::Con(ref n, _) = ty {
+            if let Some(td) = self.type_env.types.get(n) {
+                if let TypeDefKind::Alias(inner @ Ty::Record(_)) = &td.kind {
+                    return inner.clone();
+                }
+            }
+        }
+        ty
+    }
+
     fn check_fn(&mut self, fd: &a::FnDecl) -> Result<Scheme, Vec<TypeError>> {
         // Instantiate fn's signature with fresh vars for its type params.
         let scheme = function_scheme(fd);
@@ -138,7 +152,11 @@ impl Checker {
         let body_ty = self.check_expr(&fd.body, "n_0", &mut locals, &mut inferred_effects)
             .map_err(|e| vec![e])?;
 
-        if let Err(e) = self.u.unify(&body_ty, &ret_ty) {
+        // Unfold record-aliased return types so users can declare
+        //   `type Response = { ... }`
+        // and return a record literal directly.
+        let ret_ty_unfolded = self.unfold_record_alias(ret_ty.clone());
+        if let Err(e) = self.u.unify(&body_ty, &ret_ty_unfolded) {
             return Err(vec![mismatch_err("n_0", e, &self.u, vec![format!("in function `{}`", fd.name)])]);
         }
 
@@ -248,6 +266,17 @@ impl Checker {
             a::CExpr::FieldAccess { value, field } => {
                 let vt = self.check_expr(value, node_id, locals, effs)?;
                 let resolved = self.u.resolve(&vt);
+                // Unfold a Record-aliased Con (e.g. `type Request = { ... }`).
+                let resolved = match resolved {
+                    Ty::Con(ref n, _) => match self.type_env.types.get(n) {
+                        Some(td) => match &td.kind {
+                            TypeDefKind::Alias(inner @ Ty::Record(_)) => inner.clone(),
+                            _ => resolved,
+                        },
+                        None => resolved,
+                    },
+                    other => other,
+                };
                 match resolved {
                     Ty::Record(fields) => fields.get(field).cloned()
                         .ok_or_else(|| TypeError::UnknownField {

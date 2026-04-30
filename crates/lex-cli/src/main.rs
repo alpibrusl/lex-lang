@@ -140,7 +140,8 @@ fn cmd_run(args: &[String]) -> Result<()> {
         std::process::exit(3);
     }
 
-    let handler = DefaultHandler::new(policy);
+    let bc = std::sync::Arc::new(bc);
+    let handler = DefaultHandler::new(policy).with_program(std::sync::Arc::clone(&bc));
     let mut vm = Vm::with_handler(&bc, Box::new(handler));
     let recorder = lex_trace::Recorder::new();
     let trace_handle = recorder.handle();
@@ -457,7 +458,8 @@ fn cmd_replay(args: &[String]) -> Result<()> {
 
     let recorder = lex_trace::Recorder::new().with_overrides(overrides);
     let handle = recorder.handle();
-    let handler = DefaultHandler::new(policy);
+    let bc = std::sync::Arc::new(bc);
+    let handler = DefaultHandler::new(policy).with_program(std::sync::Arc::clone(&bc));
     let mut vm = Vm::with_handler(&bc, Box::new(handler));
     vm.set_tracer(Box::new(recorder));
 
