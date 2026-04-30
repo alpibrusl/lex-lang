@@ -19,6 +19,13 @@ pub struct Policy {
     pub allow_effects: BTreeSet<String>,
     pub allow_fs_read: Vec<PathBuf>,
     pub allow_fs_write: Vec<PathBuf>,
+    /// Per-host scope on the [net] effect. Empty = any host (when
+    /// [net] is in `allow_effects`); non-empty = only requests to
+    /// these hosts succeed. Hosts compare against the URL's host
+    /// substring (port-agnostic). Lets a tool be granted [net] but
+    /// scoped to e.g. `api.openai.com` only — without this, [net]
+    /// is a blank check to exfiltrate anywhere.
+    pub allow_net_host: Vec<String>,
     pub budget: Option<u64>,
 }
 
@@ -30,7 +37,13 @@ impl Policy {
         for k in ["io", "net", "time", "rand", "llm", "proc", "panic", "fs_read", "fs_write", "budget"] {
             s.insert(k.to_string());
         }
-        Self { allow_effects: s, allow_fs_read: Vec::new(), allow_fs_write: Vec::new(), budget: None }
+        Self {
+            allow_effects: s,
+            allow_fs_read: Vec::new(),
+            allow_fs_write: Vec::new(),
+            allow_net_host: Vec::new(),
+            budget: None,
+        }
     }
 }
 

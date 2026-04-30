@@ -93,6 +93,34 @@ impl DefaultHandler {
             None => PathBuf::from(p),
         }
     }
+
+    /// Enforce `--allow-net-host` against an outgoing URL. Empty
+    /// allowlist = any host. Non-empty = the URL's host must match
+    /// (substring; port-agnostic) at least one entry.
+    fn ensure_host_allowed(&self, url: &str) -> Result<(), String> {
+        if self.policy.allow_net_host.is_empty() { return Ok(()); }
+        let host = extract_host(url).unwrap_or("");
+        if self.policy.allow_net_host.iter().any(|h| host == h) {
+            Ok(())
+        } else {
+            Err(format!(
+                "net call to host `{host}` not in --allow-net-host {:?}",
+                self.policy.allow_net_host,
+            ))
+        }
+    }
+}
+
+fn extract_host(url: &str) -> Option<&str> {
+    let rest = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://"))?;
+    let host_port = match rest.find('/') {
+        Some(i) => &rest[..i],
+        None => rest,
+    };
+    Some(match host_port.rsplit_once(':') {
+        Some((h, _)) => h,
+        None => host_port,
+    })
 }
 
 impl EffectHandler for DefaultHandler {
@@ -113,6 +141,17 @@ impl EffectHandler for DefaultHandler {
             ("io", "read") => {
                 let path = expect_str(args.first())?.to_string();
                 let resolved = self.resolve_read_path(&path);
+                // Honor read-allowlist if any. Symmetric with io.write.
+                // The path argument is checked as-given (resolved-against-
+                // read_root for tests); a tool granted [io] cannot escape
+                // the configured prefix even though the effect itself is
+                // permitted. This is the per-path scope the bench's case
+                // #6 ("[io] granted, body reads /etc/passwd") needed.
+                if !self.policy.allow_fs_read.is_empty()
+                    && !self.policy.allow_fs_read.iter().any(|a| resolved.starts_with(a))
+                {
+                    return Err(format!("read of `{path}` outside --allow-fs-read"));
+                }
                 match std::fs::read_to_string(&resolved) {
                     Ok(s) => Ok(ok(Value::Str(s))),
                     Err(e) => Ok(err(Value::Str(format!("{e}")))),
@@ -151,11 +190,13 @@ impl EffectHandler for DefaultHandler {
             }
             ("net", "get") => {
                 let url = expect_str(args.first())?.to_string();
+                self.ensure_host_allowed(&url)?;
                 Ok(http_request("GET", &url, None))
             }
             ("net", "post") => {
                 let url = expect_str(args.first())?.to_string();
                 let body = expect_str(args.get(1))?.to_string();
+                self.ensure_host_allowed(&url)?;
                 Ok(http_request("POST", &url, Some(&body)))
             }
             ("net", "serve") => {
