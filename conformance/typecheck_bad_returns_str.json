@@ -1,0 +1,6 @@
+{
+  "name": "typecheck_bad_returns_str",
+  "language": "lex",
+  "source": "fn bad(x :: Int) -> Str { x }\n",
+  "expected_status": {"error_kind": "type_mismatch"}
+}

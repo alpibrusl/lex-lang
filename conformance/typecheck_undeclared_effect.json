@@ -1,0 +1,6 @@
+{
+  "name": "typecheck_undeclared_effect",
+  "language": "lex",
+  "source": "import \"std.io\" as io\nfn bad() -> Str {\n  match io.read(\"/etc/x\") {\n    Ok(s) => s,\n    Err(e) => e,\n  }\n}\n",
+  "expected_status": {"error_kind": "effect_not_declared"}
+}

@@ -1,0 +1,9 @@
+{
+  "name": "c_echo_io_allowed",
+  "language": "lex",
+  "source_file": "../examples/c_echo.lex",
+  "fn": "echo",
+  "input": ["hello"],
+  "policy": {"allow_effects": ["io"]},
+  "expected_output": null
+}

@@ -42,6 +42,7 @@ fn run(args: &[String]) -> Result<()> {
         "replay" => cmd_replay(&args[1..]),
         "diff" => cmd_diff(&args[1..]),
         "serve" => cmd_serve(&args[1..]),
+        "conformance" => cmd_conformance(&args[1..]),
         "help" | "--help" | "-h" => { print_usage(); Ok(()) }
         other => bail!("unknown command `{other}`. try `lex help`"),
     }
@@ -63,6 +64,7 @@ fn print_usage() {
     println!("                                     re-execute with effect overrides keyed by NodeId");
     println!("  diff <run_a> <run_b>               first NodeId where two traces diverge");
     println!("  serve [--port N] [--store DIR]     start the agent API HTTP server");
+    println!("  conformance <dir>                  run all JSON test descriptors in <dir>");
     println!();
     println!("policy flags (run, replay):");
     println!("  --allow-effects k1,k2,...   permit these effect kinds");
@@ -493,4 +495,14 @@ fn cmd_serve(args: &[String]) -> Result<()> {
     eprintln!("lex agent API listening on http://127.0.0.1:{port}");
     eprintln!("store: {}", store_root.display());
     lex_api::serve(port, store_root)
+}
+
+fn cmd_conformance(args: &[String]) -> Result<()> {
+    let dir = args.first().ok_or_else(|| anyhow!("usage: lex conformance <dir>"))?;
+    let report = conformance::run_directory(dir).context("reading conformance directory")?;
+    for name in &report.passed { println!("PASS  {name}"); }
+    for (name, why) in &report.failed { println!("FAIL  {name}: {why}"); }
+    println!();
+    println!("{}/{} passed", report.passed.len(), report.total());
+    if report.ok() { Ok(()) } else { std::process::exit(4); }
 }

@@ -1,0 +1,8 @@
+{
+  "name": "b_double_input_ok",
+  "language": "lex",
+  "source_file": "../examples/b_parse_int.lex",
+  "fn": "double_input",
+  "input": ["21"],
+  "expected_output": {"$variant": "Ok", "args": [42]}
+}
