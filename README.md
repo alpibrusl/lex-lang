@@ -209,6 +209,37 @@ let cs = CoreStage {
 
 A native `matmul` (via `matrixmultiply::dgemm`) is registered in Core's `NativeRegistry` and callable from Lex.
 
+## Sandboxing agent-generated code
+
+Lex's effect system + capability gate compose into a sandbox for code an LLM emits at runtime. `lex agent-tool` asks Claude for a tool body, splices it into a fixed signature, and runs it under a declared effect set — the type checker rejects any body that reaches outside that set, **before a single byte runs**.
+
+```bash
+# Benign request — fits in `[net]`, runs.
+lex agent-tool --allow-effects net \
+  --request 'fetch http://example.com and return its length'
+# → ok len=1256
+
+# Malicious body — uses io even though only net was granted. The
+# type checker rejects before execution.
+lex agent-tool --allow-effects net --input "x" \
+  --body 'match io.read("/etc/passwd") { Ok(s) => s, Err(e) => e }'
+# → TYPE-CHECK REJECTED — tool not run.
+#     effect `io` not declared at n_0
+#       (the body uses effect `io` but the host only allows ["net"])
+#   exit 2
+```
+
+The flow is:
+
+1. **Build** a fixed program: `fn tool(input :: Str) -> [<allowed>] Str { <BODY> }` with every std module pre-imported, so the agent can syntactically reach any effect — the *signature* is what gates use.
+2. **Type-check.** Any effect appearing in the body but not declared on `tool` produces `EffectNotDeclared`.
+3. **Policy-check.** A second gate at the runtime policy layer.
+4. **Run.** Pass the user's input; print whatever the tool returns.
+
+`--body '<src>'` and `--body-file <path>` skip the API call (handy for testing or when the body is already on hand). `--request '<query>'` calls the Anthropic API; needs `ANTHROPIC_API_KEY` (or pass `--api-key`). The default model is `claude-sonnet-4-6`; override with `--model`.
+
+This pattern works for plugin marketplaces (per-plugin effect manifests), multi-tenant code runners (per-tenant effect quotas), and any flow where untrusted code lands on your machine and you'd rather not trust it.
+
 ## Toolchain reference
 
 | Command | Purpose |
@@ -227,6 +258,7 @@ A native `matmul` (via `matrixmultiply::dgemm`) is registered in Core's `NativeR
 | `lex spec check <spec> --source <file> [--trials N]` | Property-check a Spec |
 | `lex spec smt <spec>` | Emit SMT-LIB 2 for external Z3 |
 | `lex serve [--port N] [--store DIR]` | Run the agent HTTP/JSON API |
+| `lex agent-tool --allow-effects ks (--request 'q' \| --body 'src' \| --body-file F)` | Run an LLM-emitted tool body under declared effects |
 
 ### Policy flags (run / replay)
 
