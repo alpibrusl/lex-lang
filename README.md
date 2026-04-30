@@ -234,7 +234,7 @@ The flow is:
 1. **Build** a fixed program: `fn tool(input :: Str) -> [<allowed>] Str { <BODY> }` with every std module pre-imported, so the agent can syntactically reach any effect — the *signature* is what gates use.
 2. **Type-check.** Any effect appearing in the body but not declared on `tool` produces `EffectNotDeclared`.
 3. **Policy-check.** A second gate at the runtime policy layer.
-4. **Run.** Pass the user's input; print whatever the tool returns.
+4. **Run** with a step-limit cap (`--max-steps`, default 1M). Closes the runaway-compute hole — an LLM-emitted `list.fold(list.range(0, 1e9), …)` aborts at the cap with exit code 4, before the host hangs.
 
 `--body '<src>'` and `--body-file <path>` skip the API call (handy for testing or when the body is already on hand). `--request '<query>'` calls the Anthropic API; needs `ANTHROPIC_API_KEY` (or pass `--api-key`). The default model is `claude-sonnet-4-6`; override with `--model`.
 
