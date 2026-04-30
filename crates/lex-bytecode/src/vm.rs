@@ -1,4 +1,4 @@
-//! M4: bytecode VM. Stack machine, pure subset (no effects).
+//! M5: bytecode VM. Stack machine with effect dispatch through a host handler.
 
 use crate::op::*;
 use crate::program::*;
@@ -15,10 +15,27 @@ pub enum VmError {
     StackUnderflow,
     #[error("unknown function id: {0}")]
     UnknownFunction(u32),
+    #[error("effect handler error: {0}")]
+    Effect(String),
+}
+
+/// Host-side effect dispatch. Implementors decide what `kind`/`op` mean
+/// and how arguments map to side effects.
+pub trait EffectHandler {
+    fn dispatch(&mut self, kind: &str, op: &str, args: Vec<Value>) -> Result<Value, String>;
+}
+
+/// A handler that fails any effect call. Useful as a default for pure-only runs.
+pub struct DenyAllEffects;
+impl EffectHandler for DenyAllEffects {
+    fn dispatch(&mut self, kind: &str, op: &str, _args: Vec<Value>) -> Result<Value, String> {
+        Err(format!("effects not permitted (attempted {kind}.{op})"))
+    }
 }
 
 pub struct Vm<'a> {
     program: &'a Program,
+    handler: Box<dyn EffectHandler + 'a>,
     /// Per-call frames. Each frame has its own locals array and pc.
     frames: Vec<Frame>,
     stack: Vec<Value>,
@@ -37,7 +54,18 @@ struct Frame {
 
 impl<'a> Vm<'a> {
     pub fn new(program: &'a Program) -> Self {
-        Self { program, frames: Vec::new(), stack: Vec::new(), step_limit: 10_000_000, steps: 0 }
+        Self::with_handler(program, Box::new(DenyAllEffects))
+    }
+
+    pub fn with_handler(program: &'a Program, handler: Box<dyn EffectHandler + 'a>) -> Self {
+        Self {
+            program,
+            handler,
+            frames: Vec::new(),
+            stack: Vec::new(),
+            step_limit: 10_000_000,
+            steps: 0,
+        }
     }
 
     pub fn call(&mut self, name: &str, args: Vec<Value>) -> Result<Value, VmError> {
@@ -242,6 +270,21 @@ impl<'a> Vm<'a> {
                     frame.locals = vec![Value::Unit; f.locals_count.max(f.arity) as usize];
                     for (i, v) in args.into_iter().enumerate() { frame.locals[i] = v; }
                     // Stack base stays the same.
+                }
+                Op::EffectCall { kind_idx, op_idx, arity } => {
+                    let mut args: Vec<Value> = (0..arity).map(|_| Value::Unit).collect();
+                    for i in (0..arity as usize).rev() { args[i] = self.pop()?; }
+                    let kind = match &self.program.constants[kind_idx as usize] {
+                        Const::Str(s) => s.clone(),
+                        _ => return Err(VmError::TypeMismatch("expected Str const for effect kind".into())),
+                    };
+                    let op_name = match &self.program.constants[op_idx as usize] {
+                        Const::Str(s) => s.clone(),
+                        _ => return Err(VmError::TypeMismatch("expected Str const for effect op".into())),
+                    };
+                    let r = self.handler.dispatch(&kind, &op_name, args)
+                        .map_err(VmError::Effect)?;
+                    self.stack.push(r);
                 }
                 Op::Return => {
                     let v = self.pop()?;

@@ -1,6 +1,4 @@
 //! Bytecode instruction set per spec §8.2.
-//!
-//! Pure subset (M4). Effect opcodes come in M5.
 
 use serde::{Deserialize, Serialize};
 
@@ -54,6 +52,9 @@ pub enum Op {
     JumpIfNot(i32),
     Call { fn_id: u32, arity: u16 },
     TailCall { fn_id: u32, arity: u16 },
+    /// EFFECT_CALL `<effect_kind_const_idx>` `<op_name_const_idx>` `<arity>`.
+    /// Pops `arity` args, dispatches to a host effect handler, pushes result.
+    EffectCall { kind_idx: u32, op_idx: u32, arity: u16 },
     Return,
     Panic(u32),     // pushes constant message and aborts
 

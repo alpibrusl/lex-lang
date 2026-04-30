@@ -70,8 +70,18 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
         constants: Vec::new(),
         functions: Vec::new(),
         function_names: IndexMap::new(),
+        module_aliases: IndexMap::new(),
         entry: None,
     };
+
+    // Collect imports as alias → module-name. The module name is the part
+    // after `std.` (so `import "std.io" as io` ⇒ alias `io` → module `io`).
+    for s in stages {
+        if let a::Stage::Import(i) = s {
+            let module = i.reference.strip_prefix("std.").unwrap_or(&i.reference).to_string();
+            p.module_aliases.insert(i.alias.clone(), module);
+        }
+    }
 
     for s in stages {
         if let a::Stage::FnDecl(fd) = s {
@@ -82,12 +92,21 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
                 arity: fd.params.len() as u16,
                 locals_count: 0,
                 code: Vec::new(),
+                effects: fd.effects.iter().map(|e| DeclaredEffect {
+                    kind: e.name.clone(),
+                    arg: e.arg.as_ref().map(|a| match a {
+                        a::EffectArg::Str { value } => EffectArg::Str(value.clone()),
+                        a::EffectArg::Int { value } => EffectArg::Int(*value),
+                        a::EffectArg::Ident { value } => EffectArg::Ident(value.clone()),
+                    }),
+                }).collect(),
             });
         }
     }
 
     let mut pool = ConstPool::default();
     let function_names = p.function_names.clone();
+    let module_aliases = p.module_aliases.clone();
 
     for s in stages {
         if let a::Stage::FnDecl(fd) = s {
@@ -98,6 +117,7 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
                 peak_local: 0,
                 pool: &mut pool,
                 function_names: &function_names,
+                module_aliases: &module_aliases,
             };
             for param in &fd.params {
                 let i = fc.next_local;
@@ -124,6 +144,7 @@ struct FnCompiler<'a> {
     peak_local: u16,
     pool: &'a mut ConstPool,
     function_names: &'a IndexMap<String, u32>,
+    module_aliases: &'a IndexMap<String, String>,
 }
 
 impl<'a> FnCompiler<'a> {
@@ -222,6 +243,24 @@ impl<'a> FnCompiler<'a> {
     }
 
     fn compile_call(&mut self, callee: &a::CExpr, args: &[a::CExpr], tail: bool) {
+        // Module function call: `alias.op(args)` where `alias` is an imported
+        // module ⇒ EffectCall(kind=module_name, op=field_name).
+        if let a::CExpr::FieldAccess { value, field } = callee {
+            if let a::CExpr::Var { name } = value.as_ref() {
+                if let Some(module) = self.module_aliases.get(name) {
+                    for a in args { self.compile_expr(a, false); }
+                    let kind_idx = self.pool.str(module);
+                    let op_idx = self.pool.str(field);
+                    self.emit(Op::EffectCall {
+                        kind_idx,
+                        op_idx,
+                        arity: args.len() as u16,
+                    });
+                    let _ = tail; // EffectCall doesn't tail-optimize.
+                    return;
+                }
+            }
+        }
         match callee {
             a::CExpr::Var { name } if self.function_names.contains_key(name) => {
                 for a in args { self.compile_expr(a, false); }
@@ -232,7 +271,7 @@ impl<'a> FnCompiler<'a> {
                     self.emit(Op::Call { fn_id, arity: args.len() as u16 });
                 }
             }
-            other => panic!("unsupported callee in M4: {other:?}"),
+            other => panic!("unsupported callee: {other:?}"),
         }
     }
 
