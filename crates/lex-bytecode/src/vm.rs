@@ -33,9 +33,43 @@ impl EffectHandler for DenyAllEffects {
     }
 }
 
+/// Trace receiver. Implementors record the call/effect tree and may
+/// substitute effect responses (for replay).
+pub trait Tracer {
+    fn enter_call(&mut self, node_id: &str, name: &str, args: &[Value]);
+    fn enter_effect(&mut self, node_id: &str, kind: &str, op: &str, args: &[Value]);
+    fn exit_ok(&mut self, value: &Value);
+    fn exit_err(&mut self, message: &str);
+    /// Tail-call optimization: pop the current frame's open call without
+    /// re-entering the parent (the new call takes its place).
+    fn exit_call_tail(&mut self);
+    /// During replay, return Some(v) to substitute an effect's output.
+    fn override_effect(&mut self, _node_id: &str) -> Option<Value> { None }
+}
+
+/// No-op tracer for normal execution.
+pub struct NullTracer;
+impl Tracer for NullTracer {
+    fn enter_call(&mut self, _: &str, _: &str, _: &[Value]) {}
+    fn enter_effect(&mut self, _: &str, _: &str, _: &str, _: &[Value]) {}
+    fn exit_ok(&mut self, _: &Value) {}
+    fn exit_err(&mut self, _: &str) {}
+    fn exit_call_tail(&mut self) {}
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum FrameKind {
+    /// Top-level entry frame; doesn't correspond to a Call opcode.
+    Entry,
+    /// Frame opened by Call/TailCall. The `String` is the originating
+    /// `NodeId`; useful for diagnostics even if currently unread.
+    Call(#[allow(dead_code)] String),
+}
+
 pub struct Vm<'a> {
     program: &'a Program,
     handler: Box<dyn EffectHandler + 'a>,
+    pub(crate) tracer: Box<dyn Tracer + 'a>,
     /// Per-call frames. Each frame has its own locals array and pc.
     frames: Vec<Frame>,
     stack: Vec<Value>,
@@ -50,6 +84,14 @@ struct Frame {
     locals: Vec<Value>,
     /// Stack base when this frame started (for cleanup on return).
     stack_base: usize,
+    trace_kind: FrameKind,
+}
+
+fn const_str(constants: &[Const], idx: u32) -> String {
+    match constants.get(idx as usize) {
+        Some(Const::NodeId(s)) | Some(Const::Str(s)) => s.clone(),
+        _ => String::new(),
+    }
 }
 
 impl<'a> Vm<'a> {
@@ -61,11 +103,16 @@ impl<'a> Vm<'a> {
         Self {
             program,
             handler,
+            tracer: Box::new(NullTracer),
             frames: Vec::new(),
             stack: Vec::new(),
             step_limit: 10_000_000,
             steps: 0,
         }
+    }
+
+    pub fn set_tracer(&mut self, tracer: Box<dyn Tracer + 'a>) {
+        self.tracer = tracer;
     }
 
     pub fn call(&mut self, name: &str, args: Vec<Value>) -> Result<Value, VmError> {
@@ -80,7 +127,10 @@ impl<'a> Vm<'a> {
         }
         let mut locals = vec![Value::Unit; f.locals_count.max(f.arity) as usize];
         for (i, v) in args.into_iter().enumerate() { locals[i] = v; }
-        self.frames.push(Frame { fn_id, pc: 0, locals, stack_base: self.stack.len() });
+        self.frames.push(Frame {
+            fn_id, pc: 0, locals, stack_base: self.stack.len(),
+            trace_kind: FrameKind::Entry,
+        });
         self.run()
     }
 
@@ -251,27 +301,39 @@ impl<'a> Vm<'a> {
                         self.frames[frame_idx].pc = new_pc;
                     }
                 }
-                Op::Call { fn_id, arity } => {
+                Op::Call { fn_id, arity, node_id_idx } => {
                     let mut args: Vec<Value> = (0..arity).map(|_| Value::Unit).collect();
                     for i in (0..arity as usize).rev() { args[i] = self.pop()?; }
+                    let node_id = const_str(&self.program.constants, node_id_idx);
+                    let callee_name = self.program.functions[fn_id as usize].name.clone();
+                    self.tracer.enter_call(&node_id, &callee_name, &args);
                     let f = &self.program.functions[fn_id as usize];
                     let mut locals = vec![Value::Unit; f.locals_count.max(f.arity) as usize];
                     for (i, v) in args.into_iter().enumerate() { locals[i] = v; }
-                    self.frames.push(Frame { fn_id, pc: 0, locals, stack_base: self.stack.len() });
+                    self.frames.push(Frame {
+                        fn_id, pc: 0, locals, stack_base: self.stack.len(),
+                        trace_kind: FrameKind::Call(node_id),
+                    });
                 }
-                Op::TailCall { fn_id, arity } => {
+                Op::TailCall { fn_id, arity, node_id_idx } => {
                     let mut args: Vec<Value> = (0..arity).map(|_| Value::Unit).collect();
                     for i in (0..arity as usize).rev() { args[i] = self.pop()?; }
-                    // Reuse current frame.
+                    let node_id = const_str(&self.program.constants, node_id_idx);
+                    let callee_name = self.program.functions[fn_id as usize].name.clone();
+                    // A tail call closes the current call's trace frame and
+                    // opens a new one in its place — preserves the caller's
+                    // tree depth in the trace.
+                    self.tracer.exit_call_tail();
+                    self.tracer.enter_call(&node_id, &callee_name, &args);
                     let f = &self.program.functions[fn_id as usize];
                     let frame = self.frames.last_mut().unwrap();
                     frame.fn_id = fn_id;
                     frame.pc = 0;
                     frame.locals = vec![Value::Unit; f.locals_count.max(f.arity) as usize];
                     for (i, v) in args.into_iter().enumerate() { frame.locals[i] = v; }
-                    // Stack base stays the same.
+                    frame.trace_kind = FrameKind::Call(node_id);
                 }
-                Op::EffectCall { kind_idx, op_idx, arity } => {
+                Op::EffectCall { kind_idx, op_idx, arity, node_id_idx } => {
                     let mut args: Vec<Value> = (0..arity).map(|_| Value::Unit).collect();
                     for i in (0..arity as usize).rev() { args[i] = self.pop()?; }
                     let kind = match &self.program.constants[kind_idx as usize] {
@@ -282,15 +344,31 @@ impl<'a> Vm<'a> {
                         Const::Str(s) => s.clone(),
                         _ => return Err(VmError::TypeMismatch("expected Str const for effect op".into())),
                     };
-                    let r = self.handler.dispatch(&kind, &op_name, args)
-                        .map_err(VmError::Effect)?;
-                    self.stack.push(r);
+                    let node_id = const_str(&self.program.constants, node_id_idx);
+                    self.tracer.enter_effect(&node_id, &kind, &op_name, &args);
+                    let result = match self.tracer.override_effect(&node_id) {
+                        Some(v) => Ok(v),
+                        None => self.handler.dispatch(&kind, &op_name, args.clone()),
+                    };
+                    match result {
+                        Ok(v) => {
+                            self.tracer.exit_ok(&v);
+                            self.stack.push(v);
+                        }
+                        Err(e) => {
+                            self.tracer.exit_err(&e);
+                            return Err(VmError::Effect(e));
+                        }
+                    }
                 }
                 Op::Return => {
                     let v = self.pop()?;
                     let frame = self.frames.pop().unwrap();
                     // Trim any extra stuff that the function pushed but didn't pop.
                     self.stack.truncate(frame.stack_base);
+                    if matches!(frame.trace_kind, FrameKind::Call(_)) {
+                        self.tracer.exit_ok(&v);
+                    }
                     if self.frames.is_empty() {
                         return Ok(v);
                     }
@@ -440,6 +518,6 @@ fn const_to_value(c: &Const) -> Value {
         Const::Str(s) => Value::Str(s.clone()),
         Const::Bytes(b) => Value::Bytes(b.clone()),
         Const::Unit => Value::Unit,
-        Const::FieldName(s) | Const::VariantName(s) => Value::Str(s.clone()),
+        Const::FieldName(s) | Const::VariantName(s) | Const::NodeId(s) => Value::Str(s.clone()),
     }
 }

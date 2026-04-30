@@ -296,6 +296,37 @@ impl Store {
         Ok(out)
     }
 
+    // ---- traces (§4.2 / M7) ----
+
+    fn trace_path(&self, run_id: &str) -> PathBuf {
+        self.root.join("traces").join(run_id).join("trace.json")
+    }
+
+    pub fn save_trace(&self, tree: &lex_trace::TraceTree) -> Result<String, StoreError> {
+        let path = self.trace_path(&tree.run_id);
+        write_canonical_json(&path, tree)?;
+        Ok(tree.run_id.clone())
+    }
+
+    pub fn load_trace(&self, run_id: &str) -> Result<lex_trace::TraceTree, StoreError> {
+        let bytes = fs::read(self.trace_path(run_id))?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    pub fn list_traces(&self) -> Result<Vec<String>, StoreError> {
+        let dir = self.root.join("traces");
+        if !dir.exists() { return Ok(Vec::new()); }
+        let mut out = Vec::new();
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                out.push(entry.file_name().to_string_lossy().to_string());
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
     // ---- internals ----
 
     fn lookup_lifecycle(&self, stage_id: &str) -> Result<(String, Lifecycle), StoreError> {

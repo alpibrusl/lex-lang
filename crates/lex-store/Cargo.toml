@@ -11,6 +11,7 @@ sha2.workspace = true
 thiserror.workspace = true
 indexmap.workspace = true
 lex-ast = { path = "../lex-ast" }
+lex-trace = { path = "../lex-trace" }
 
 [dev-dependencies]
 lex-syntax = { path = "../lex-syntax" }

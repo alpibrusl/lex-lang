@@ -15,6 +15,8 @@ pub enum Const {
     FieldName(String),
     /// A variant tag, used by MAKE_VARIANT/TEST_VARIANT/GET_VARIANT.
     VariantName(String),
+    /// An AST NodeId, attached to Call / EffectCall for trace keying (§10.1).
+    NodeId(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -50,11 +52,12 @@ pub enum Op {
     Jump(i32),
     JumpIf(i32),     // pops Bool
     JumpIfNot(i32),
-    Call { fn_id: u32, arity: u16 },
-    TailCall { fn_id: u32, arity: u16 },
+    Call { fn_id: u32, arity: u16, node_id_idx: u32 },
+    TailCall { fn_id: u32, arity: u16, node_id_idx: u32 },
     /// EFFECT_CALL `<effect_kind_const_idx>` `<op_name_const_idx>` `<arity>`.
     /// Pops `arity` args, dispatches to a host effect handler, pushes result.
-    EffectCall { kind_idx: u32, op_idx: u32, arity: u16 },
+    /// `node_id_idx` points to a `Const::NodeId` for trace keying.
+    EffectCall { kind_idx: u32, op_idx: u32, arity: u16, node_id_idx: u32 },
     Return,
     Panic(u32),     // pushes constant message and aborts
 
