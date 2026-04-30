@@ -79,6 +79,7 @@ fn print_usage() {
     println!("  --allow-fs-read PATH        (repeatable) permit fs_read under PATH");
     println!("  --allow-fs-write PATH       (repeatable) permit fs_write under PATH");
     println!("  --budget N                  cap aggregate declared budget");
+    println!("  --max-steps N               cap VM opcode dispatches at N (DoS guard)");
 }
 
 fn read_source(path: &str) -> Result<String> {
@@ -122,7 +123,7 @@ fn cmd_check(args: &[String]) -> Result<()> {
 }
 
 fn cmd_run(args: &[String]) -> Result<()> {
-    let (policy, positional, trace) = parse_run_flags(args)?;
+    let (policy, positional, trace, max_steps) = parse_run_flags(args)?;
     let path = positional.first().ok_or_else(|| anyhow!("usage: lex run [policy] <file> <fn> [args]"))?;
     let func = positional.get(1).ok_or_else(|| anyhow!("missing function name"))?;
     let src = read_source(path)?;
@@ -148,6 +149,7 @@ fn cmd_run(args: &[String]) -> Result<()> {
     let bc = std::sync::Arc::new(bc);
     let handler = DefaultHandler::new(policy).with_program(std::sync::Arc::clone(&bc));
     let mut vm = Vm::with_handler(&bc, Box::new(handler));
+    if let Some(n) = max_steps { vm.set_step_limit(n); }
     let recorder = lex_trace::Recorder::new();
     let trace_handle = recorder.handle();
     if trace { vm.set_tracer(Box::new(recorder)); }
@@ -181,10 +183,11 @@ fn cmd_run(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn parse_run_flags(args: &[String]) -> Result<(Policy, Vec<String>, bool)> {
+fn parse_run_flags(args: &[String]) -> Result<(Policy, Vec<String>, bool, Option<u64>)> {
     let mut policy = Policy::pure();
     let mut positional = Vec::new();
     let mut trace = false;
+    let mut max_steps: Option<u64> = None;
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -210,11 +213,16 @@ fn parse_run_flags(args: &[String]) -> Result<(Policy, Vec<String>, bool)> {
                 policy.budget = Some(val.parse().context("--budget must be an integer")?);
                 i += 2;
             }
+            "--max-steps" => {
+                let val = args.get(i + 1).ok_or_else(|| anyhow!("--max-steps needs a value"))?;
+                max_steps = Some(val.parse().context("--max-steps must be an integer")?);
+                i += 2;
+            }
             "--trace" => { trace = true; i += 1; }
             _ => { positional.push(a.clone()); i += 1; }
         }
     }
-    Ok((policy, positional, trace))
+    Ok((policy, positional, trace, max_steps))
 }
 
 fn cmd_trace(args: &[String]) -> Result<()> {
@@ -591,6 +599,12 @@ struct AgentToolOpts {
     api_key: Option<String>,
     model: String,
     show_source: bool,
+    /// Cap on opcode dispatches before the VM aborts with
+    /// `step limit exceeded`. Defends against agent-emitted DoS
+    /// (`list.fold(list.range(0, 1e9), …)`). Default 1_000_000 —
+    /// generous enough for analytics + linreg, tight enough that
+    /// runaway loops surface in <1s.
+    max_steps: u64,
 }
 
 enum BodySource {
@@ -659,12 +673,24 @@ fn cmd_agent_tool(args: &[String]) -> Result<()> {
         std::process::exit(3);
     }
 
-    // 5) Run.
+    // 5) Run with a step-limit cap. This is the runtime DoS guard:
+    // type-check rejects effects, max_steps rejects runaway compute.
     let bc = std::sync::Arc::new(bc);
     let handler = DefaultHandler::new(policy).with_program(std::sync::Arc::clone(&bc));
     let mut vm = Vm::with_handler(&bc, Box::new(handler));
-    let result = vm.call("tool", vec![Value::Str(opts.user_input.clone())])
-        .map_err(|e| anyhow!("runtime: {e}"))?;
+    vm.set_step_limit(opts.max_steps);
+    let result = match vm.call("tool", vec![Value::Str(opts.user_input.clone())]) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!("{e}");
+            if msg.contains("step limit") {
+                eprintln!("→ STEP-LIMIT EXCEEDED — tool aborted at {} steps.", opts.max_steps);
+                eprintln!("  (raise with --max-steps; default {})", default_max_steps());
+                std::process::exit(4);
+            }
+            return Err(anyhow!("runtime: {e}"));
+        }
+    };
 
     match result {
         Value::Str(s) => println!("{s}"),
@@ -673,6 +699,8 @@ fn cmd_agent_tool(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+const fn default_max_steps() -> u64 { 1_000_000 }
+
 fn parse_agent_tool_args(args: &[String]) -> Result<AgentToolOpts> {
     let mut allowed_effects: Vec<String> = Vec::new();
     let mut user_input: Option<String> = None;
@@ -680,6 +708,7 @@ fn parse_agent_tool_args(args: &[String]) -> Result<AgentToolOpts> {
     let mut api_key: Option<String> = None;
     let mut model = "claude-sonnet-4-6".to_string();
     let mut show_source = true;
+    let mut max_steps: u64 = default_max_steps();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -715,6 +744,11 @@ fn parse_agent_tool_args(args: &[String]) -> Result<AgentToolOpts> {
                 model = args.get(i + 1).ok_or_else(|| anyhow!("--model needs a value"))?.clone();
                 i += 2;
             }
+            "--max-steps" => {
+                max_steps = args.get(i + 1).ok_or_else(|| anyhow!("--max-steps needs a value"))?
+                    .parse().context("--max-steps must be an integer")?;
+                i += 2;
+            }
             "--quiet" => { show_source = false; i += 1; }
             other => bail!("unknown agent-tool flag: {other}"),
         }
@@ -727,6 +761,7 @@ fn parse_agent_tool_args(args: &[String]) -> Result<AgentToolOpts> {
         api_key,
         model,
         show_source,
+        max_steps,
     })
 }
 

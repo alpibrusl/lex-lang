@@ -115,6 +115,15 @@ impl<'a> Vm<'a> {
         self.tracer = tracer;
     }
 
+    /// Cap the number of opcode dispatches before the VM aborts with
+    /// `step limit exceeded`. Useful as a runtime DoS guard against
+    /// untrusted code (e.g. the `agent-tool` sandbox, where an LLM
+    /// could emit `list.fold(list.range(0, 1_000_000_000), …)` to hang
+    /// the host). Default is 10_000_000.
+    pub fn set_step_limit(&mut self, limit: u64) {
+        self.step_limit = limit;
+    }
+
     pub fn call(&mut self, name: &str, args: Vec<Value>) -> Result<Value, VmError> {
         let fn_id = self.program.lookup(name).ok_or_else(|| VmError::Panic(format!("no function `{name}`")))?;
         self.invoke(fn_id, args)
@@ -137,7 +146,10 @@ impl<'a> Vm<'a> {
     fn run(&mut self) -> Result<Value, VmError> {
         loop {
             if self.steps > self.step_limit {
-                return Err(VmError::Panic("step limit exceeded".into()));
+                return Err(VmError::Panic(format!(
+                    "step limit exceeded ({} > {})",
+                    self.steps, self.step_limit,
+                )));
             }
             self.steps += 1;
             let frame_idx = self.frames.len() - 1;

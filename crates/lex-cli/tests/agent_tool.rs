@@ -100,3 +100,39 @@ fn fs_write_effect_rejected_when_only_net_allowed() {
     // checker rejects the io effect — both are non-zero exits.
     assert_ne!(code, 0, "expected rejection; stderr:\n{stderr}");
 }
+
+#[test]
+fn step_limit_aborts_runaway_compute() {
+    // 10_000-element fold ≈ 120k ops; capped at 5_000 steps the VM
+    // aborts well before it finishes. Without this guard, an LLM-emitted
+    // `list.fold(list.range(0, BIG), ...)` would hang the host.
+    let (code, _stdout, stderr) = run(&[
+        "agent-tool",
+        "--allow-effects", "",
+        "--quiet",
+        "--max-steps", "5000",
+        "--input", "x",
+        "--body",
+        "int.to_str(list.fold(list.range(0, 10000), 0, \
+         fn (a :: Int, b :: Int) -> Int { a + b }))",
+    ]);
+    assert_eq!(code, 4, "expected step-limit exit (4); stderr:\n{stderr}");
+    assert!(stderr.contains("STEP-LIMIT"), "stderr:\n{stderr}");
+}
+
+#[test]
+fn benign_compute_runs_within_default_step_limit() {
+    // Default --max-steps is generous (1M); a 100-element fold finishes.
+    let (code, stdout, stderr) = run(&[
+        "agent-tool",
+        "--allow-effects", "",
+        "--quiet",
+        "--input", "x",
+        "--body",
+        "int.to_str(list.fold(list.range(0, 100), 0, \
+         fn (a :: Int, b :: Int) -> Int { a + b }))",
+    ]);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    // sum 0..100 = 4950
+    assert_eq!(stdout.trim(), "4950");
+}
