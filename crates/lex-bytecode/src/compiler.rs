@@ -571,9 +571,197 @@ impl<'a> FnCompiler<'a> {
             ("result", "map_err") => self.emit_variant_map(args, "Err", true),
             ("option", "map") => self.emit_variant_map(args, "Some", true),
             ("option", "and_then") => self.emit_variant_map(args, "Some", false),
+            ("list", "map") => self.emit_list_map(args),
+            ("list", "filter") => self.emit_list_filter(args),
+            ("list", "fold") => self.emit_list_fold(args),
             _ => return false,
         }
         true
+    }
+
+    /// `list.map(xs, f)` — inline loop applying `f` to each element.
+    /// Stack contract: pushes the resulting List.
+    fn emit_list_map(&mut self, args: &[a::CExpr]) {
+        // Compile xs and f, store both as locals.
+        self.compile_expr(&args[0], false);
+        let xs = self.alloc_local("__lm_xs");
+        self.emit(Op::StoreLocal(xs));
+        self.compile_expr(&args[1], false);
+        let f = self.alloc_local("__lm_f");
+        self.emit(Op::StoreLocal(f));
+
+        // out := []
+        self.emit(Op::MakeList(0));
+        let out = self.alloc_local("__lm_out");
+        self.emit(Op::StoreLocal(out));
+
+        // i := 0
+        let zero = self.pool.int(0);
+        self.emit(Op::PushConst(zero));
+        let i = self.alloc_local("__lm_i");
+        self.emit(Op::StoreLocal(i));
+
+        // loop_top: while i < len(xs) { ... }
+        let loop_top = self.code.len();
+        self.emit(Op::LoadLocal(i));
+        self.emit(Op::LoadLocal(xs));
+        self.emit(Op::GetListLen);
+        self.emit(Op::NumLt);
+        let j_exit = self.code.len();
+        self.emit(Op::JumpIfNot(0));
+
+        // body: out := out ++ [f(xs[i])]
+        let nid = self.pool.node_id("n_list_map");
+        self.emit(Op::LoadLocal(out));
+        self.emit(Op::LoadLocal(f));
+        self.emit(Op::LoadLocal(xs));
+        self.emit(Op::LoadLocal(i));
+        self.emit(Op::GetListElemDyn);
+        self.emit(Op::CallClosure { arity: 1, node_id_idx: nid });
+        self.emit(Op::ListAppend);
+        self.emit(Op::StoreLocal(out));
+
+        // i := i + 1
+        self.emit(Op::LoadLocal(i));
+        let one = self.pool.int(1);
+        self.emit(Op::PushConst(one));
+        self.emit(Op::NumAdd);
+        self.emit(Op::StoreLocal(i));
+
+        // jump back
+        let jump_back = self.code.len();
+        let back = (loop_top as i32) - (jump_back as i32 + 1);
+        self.emit(Op::Jump(back));
+
+        // exit: patch j_exit, push out
+        let exit_target = self.code.len() as i32;
+        if let Op::JumpIfNot(off) = &mut self.code[j_exit] {
+            *off = exit_target - (j_exit as i32 + 1);
+        }
+        self.emit(Op::LoadLocal(out));
+    }
+
+    /// `list.filter(xs, pred)` — keep elements where pred returns true.
+    fn emit_list_filter(&mut self, args: &[a::CExpr]) {
+        self.compile_expr(&args[0], false);
+        let xs = self.alloc_local("__lf_xs");
+        self.emit(Op::StoreLocal(xs));
+        self.compile_expr(&args[1], false);
+        let f = self.alloc_local("__lf_f");
+        self.emit(Op::StoreLocal(f));
+
+        self.emit(Op::MakeList(0));
+        let out = self.alloc_local("__lf_out");
+        self.emit(Op::StoreLocal(out));
+
+        let zero = self.pool.int(0);
+        self.emit(Op::PushConst(zero));
+        let i = self.alloc_local("__lf_i");
+        self.emit(Op::StoreLocal(i));
+
+        let loop_top = self.code.len();
+        self.emit(Op::LoadLocal(i));
+        self.emit(Op::LoadLocal(xs));
+        self.emit(Op::GetListLen);
+        self.emit(Op::NumLt);
+        let j_exit = self.code.len();
+        self.emit(Op::JumpIfNot(0));
+
+        // x := xs[i]
+        self.emit(Op::LoadLocal(xs));
+        self.emit(Op::LoadLocal(i));
+        self.emit(Op::GetListElemDyn);
+        let x = self.alloc_local("__lf_x");
+        self.emit(Op::StoreLocal(x));
+
+        // if pred(x) { out := out ++ [x] }
+        let nid = self.pool.node_id("n_list_filter");
+        self.emit(Op::LoadLocal(f));
+        self.emit(Op::LoadLocal(x));
+        self.emit(Op::CallClosure { arity: 1, node_id_idx: nid });
+        let j_skip = self.code.len();
+        self.emit(Op::JumpIfNot(0));
+
+        self.emit(Op::LoadLocal(out));
+        self.emit(Op::LoadLocal(x));
+        self.emit(Op::ListAppend);
+        self.emit(Op::StoreLocal(out));
+
+        let skip_target = self.code.len() as i32;
+        if let Op::JumpIfNot(off) = &mut self.code[j_skip] {
+            *off = skip_target - (j_skip as i32 + 1);
+        }
+
+        // i := i + 1
+        self.emit(Op::LoadLocal(i));
+        let one = self.pool.int(1);
+        self.emit(Op::PushConst(one));
+        self.emit(Op::NumAdd);
+        self.emit(Op::StoreLocal(i));
+
+        let jump_back = self.code.len();
+        let back = (loop_top as i32) - (jump_back as i32 + 1);
+        self.emit(Op::Jump(back));
+
+        let exit_target = self.code.len() as i32;
+        if let Op::JumpIfNot(off) = &mut self.code[j_exit] {
+            *off = exit_target - (j_exit as i32 + 1);
+        }
+        self.emit(Op::LoadLocal(out));
+    }
+
+    /// `list.fold(xs, init, f)` — left fold with two-arg combiner.
+    fn emit_list_fold(&mut self, args: &[a::CExpr]) {
+        // args: xs, init, f
+        self.compile_expr(&args[0], false);
+        let xs = self.alloc_local("__lo_xs");
+        self.emit(Op::StoreLocal(xs));
+        self.compile_expr(&args[1], false);
+        let acc = self.alloc_local("__lo_acc");
+        self.emit(Op::StoreLocal(acc));
+        self.compile_expr(&args[2], false);
+        let f = self.alloc_local("__lo_f");
+        self.emit(Op::StoreLocal(f));
+
+        let zero = self.pool.int(0);
+        self.emit(Op::PushConst(zero));
+        let i = self.alloc_local("__lo_i");
+        self.emit(Op::StoreLocal(i));
+
+        let loop_top = self.code.len();
+        self.emit(Op::LoadLocal(i));
+        self.emit(Op::LoadLocal(xs));
+        self.emit(Op::GetListLen);
+        self.emit(Op::NumLt);
+        let j_exit = self.code.len();
+        self.emit(Op::JumpIfNot(0));
+
+        // acc := f(acc, xs[i])
+        let nid = self.pool.node_id("n_list_fold");
+        self.emit(Op::LoadLocal(f));
+        self.emit(Op::LoadLocal(acc));
+        self.emit(Op::LoadLocal(xs));
+        self.emit(Op::LoadLocal(i));
+        self.emit(Op::GetListElemDyn);
+        self.emit(Op::CallClosure { arity: 2, node_id_idx: nid });
+        self.emit(Op::StoreLocal(acc));
+
+        // i := i + 1
+        self.emit(Op::LoadLocal(i));
+        let one = self.pool.int(1);
+        self.emit(Op::PushConst(one));
+        self.emit(Op::NumAdd);
+        self.emit(Op::StoreLocal(i));
+
+        let jump_back = self.code.len();
+        let back = (loop_top as i32) - (jump_back as i32 + 1);
+        self.emit(Op::Jump(back));
+
+        let exit_target = self.code.len() as i32;
+        if let Op::JumpIfNot(off) = &mut self.code[j_exit] {
+            *off = exit_target - (j_exit as i32 + 1);
+        }
+        self.emit(Op::LoadLocal(acc));
     }
 
     /// Inline pattern: `<module>.map(v, f)` and friends.
