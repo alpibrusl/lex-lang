@@ -19,7 +19,11 @@
 pub mod shape;
 pub mod check;
 pub mod error;
+pub mod mutation;
+pub mod native;
 
 pub use check::{check_core_stage, CoreStage};
 pub use error::CoreError;
+pub use mutation::{check_no_mut_return, CoreExpr};
+pub use native::{make_matrix, NativeFn, NativeRegistry};
 pub use shape::{ShapeExpr, ShapeSolver, Tensor};
