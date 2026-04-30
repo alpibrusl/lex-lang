@@ -43,6 +43,7 @@ fn run(args: &[String]) -> Result<()> {
         "diff" => cmd_diff(&args[1..]),
         "serve" => cmd_serve(&args[1..]),
         "conformance" => cmd_conformance(&args[1..]),
+        "spec" => cmd_spec(&args[1..]),
         "help" | "--help" | "-h" => { print_usage(); Ok(()) }
         other => bail!("unknown command `{other}`. try `lex help`"),
     }
@@ -65,6 +66,8 @@ fn print_usage() {
     println!("  diff <run_a> <run_b>               first NodeId where two traces diverge");
     println!("  serve [--port N] [--store DIR]     start the agent API HTTP server");
     println!("  conformance <dir>                  run all JSON test descriptors in <dir>");
+    println!("  spec check <spec> --source <file>  check a Spec against a Lex source");
+    println!("  spec smt <spec>                    emit SMT-LIB for external Z3");
     println!();
     println!("policy flags (run, replay):");
     println!("  --allow-effects k1,k2,...   permit these effect kinds");
@@ -505,4 +508,52 @@ fn cmd_conformance(args: &[String]) -> Result<()> {
     println!();
     println!("{}/{} passed", report.passed.len(), report.total());
     if report.ok() { Ok(()) } else { std::process::exit(4); }
+}
+
+fn cmd_spec(args: &[String]) -> Result<()> {
+    let sub = args.first().ok_or_else(|| anyhow!("usage: lex spec {{check|smt}} ..."))?;
+    let rest = &args[1..];
+    match sub.as_str() {
+        "check" => {
+            let mut spec_path: Option<&String> = None;
+            let mut src_path: Option<&String> = None;
+            let mut trials: u32 = 1000;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--source" => { src_path = rest.get(i + 1); i += 2; }
+                    "--trials" => {
+                        trials = rest.get(i + 1).and_then(|s| s.parse().ok())
+                            .ok_or_else(|| anyhow!("--trials needs a u32"))?;
+                        i += 2;
+                    }
+                    _ if spec_path.is_none() => { spec_path = Some(&rest[i]); i += 1; }
+                    other => bail!("unexpected arg `{other}`"),
+                }
+            }
+            let spec_path = spec_path.ok_or_else(|| anyhow!("usage: lex spec check <spec> --source <file>"))?;
+            let src_path = src_path.ok_or_else(|| anyhow!("--source <file> required"))?;
+            let spec_src = read_source(spec_path)?;
+            let lex_src = read_source(src_path)?;
+            let spec = spec_checker::parse_spec(&spec_src)
+                .map_err(|e| anyhow!("spec parse: {e}"))?;
+            let r = spec_checker::check_spec(&spec, &lex_src, trials);
+            println!("{}", serde_json::to_string_pretty(&r)?);
+            // Exit code: 0 proved, 5 counterexample, 6 inconclusive.
+            match r.status {
+                spec_checker::ProofStatus::Proved => Ok(()),
+                spec_checker::ProofStatus::Counterexample => std::process::exit(5),
+                spec_checker::ProofStatus::Inconclusive => std::process::exit(6),
+            }
+        }
+        "smt" => {
+            let path = rest.first().ok_or_else(|| anyhow!("usage: lex spec smt <spec>"))?;
+            let spec_src = read_source(path)?;
+            let spec = spec_checker::parse_spec(&spec_src)
+                .map_err(|e| anyhow!("spec parse: {e}"))?;
+            print!("{}", spec_checker::to_smtlib(&spec));
+            Ok(())
+        }
+        other => bail!("unknown `lex spec` subcommand: {other}"),
+    }
 }
