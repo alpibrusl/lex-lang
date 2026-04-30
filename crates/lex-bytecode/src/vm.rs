@@ -283,6 +283,33 @@ impl<'a> Vm<'a> {
                         other => return Err(VmError::TypeMismatch(format!("GetListElem on non-list: {other:?}"))),
                     }
                 }
+                Op::GetListElemDyn => {
+                    // Stack: [list, idx]
+                    let idx = match self.pop()? {
+                        Value::Int(n) => n as usize,
+                        other => return Err(VmError::TypeMismatch(format!("GetListElemDyn idx: {other:?}"))),
+                    };
+                    let v = self.pop()?;
+                    match v {
+                        Value::List(items) => {
+                            let v = items.into_iter().nth(idx)
+                                .ok_or_else(|| VmError::TypeMismatch("list index oob".into()))?;
+                            self.stack.push(v);
+                        }
+                        other => return Err(VmError::TypeMismatch(format!("GetListElemDyn on non-list: {other:?}"))),
+                    }
+                }
+                Op::ListAppend => {
+                    let value = self.pop()?;
+                    let list = self.pop()?;
+                    match list {
+                        Value::List(mut items) => {
+                            items.push(value);
+                            self.stack.push(Value::List(items));
+                        }
+                        other => return Err(VmError::TypeMismatch(format!("ListAppend on non-list: {other:?}"))),
+                    }
+                }
                 Op::Jump(off) => {
                     let new_pc = (self.frames[frame_idx].pc as i32 + off) as usize;
                     self.frames[frame_idx].pc = new_pc;

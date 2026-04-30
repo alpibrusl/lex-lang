@@ -47,6 +47,12 @@ pub enum Op {
     GetVariantArg(u16),    // pop variant, push its i'th arg
     GetListLen,
     GetListElem(u32),
+    /// Pop [list, value]; push list with `value` appended.
+    ListAppend,
+    /// Pop list; push it indexed by the integer on top.
+    /// Stack: [list, idx] → [list[idx]]. (Like GetListElem(u32) but
+    /// the index is dynamic.)
+    GetListElemDyn,
 
     // control flow
     Jump(i32),
