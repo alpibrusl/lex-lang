@@ -59,6 +59,46 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             }
             Ok(Value::Str(out))
         }
+        ("str", "starts_with") => {
+            let s = expect_str(args.first())?;
+            let prefix = expect_str(args.get(1))?;
+            Ok(Value::Bool(s.starts_with(prefix.as_str())))
+        }
+        ("str", "ends_with") => {
+            let s = expect_str(args.first())?;
+            let suffix = expect_str(args.get(1))?;
+            Ok(Value::Bool(s.ends_with(suffix.as_str())))
+        }
+        ("str", "contains") => {
+            let s = expect_str(args.first())?;
+            let needle = expect_str(args.get(1))?;
+            Ok(Value::Bool(s.contains(needle.as_str())))
+        }
+        ("str", "replace") => {
+            let s = expect_str(args.first())?;
+            let from = expect_str(args.get(1))?;
+            let to = expect_str(args.get(2))?;
+            Ok(Value::Str(s.replace(from.as_str(), to.as_str())))
+        }
+        ("str", "trim") => Ok(Value::Str(expect_str(args.first())?.trim().to_string())),
+        ("str", "to_upper") => Ok(Value::Str(expect_str(args.first())?.to_uppercase())),
+        ("str", "to_lower") => Ok(Value::Str(expect_str(args.first())?.to_lowercase())),
+        ("str", "strip_prefix") => {
+            let s = expect_str(args.first())?;
+            let prefix = expect_str(args.get(1))?;
+            Ok(match s.strip_prefix(prefix.as_str()) {
+                Some(rest) => some(Value::Str(rest.to_string())),
+                None => none(),
+            })
+        }
+        ("str", "strip_suffix") => {
+            let s = expect_str(args.first())?;
+            let suffix = expect_str(args.get(1))?;
+            Ok(match s.strip_suffix(suffix.as_str()) {
+                Some(rest) => some(Value::Str(rest.to_string())),
+                None => none(),
+            })
+        }
 
         // -- int / float --
         ("int", "to_str") => Ok(Value::Str(expect_int(args.first())?.to_string())),

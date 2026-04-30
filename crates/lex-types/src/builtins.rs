@@ -50,6 +50,32 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::empty(),
                 Ty::str(),
             ));
+            // -- predicates --
+            for name in &["starts_with", "ends_with", "contains"] {
+                fields.insert((*name).into(), Ty::function(
+                    vec![Ty::str(), Ty::str()],
+                    EffectSet::empty(),
+                    Ty::bool(),
+                ));
+            }
+            // -- transformers --
+            fields.insert("replace".into(), Ty::function(
+                vec![Ty::str(), Ty::str(), Ty::str()],
+                EffectSet::empty(),
+                Ty::str(),
+            ));
+            for name in &["trim", "to_upper", "to_lower"] {
+                fields.insert((*name).into(), Ty::function(
+                    vec![Ty::str()], EffectSet::empty(), Ty::str(),
+                ));
+            }
+            for name in &["strip_prefix", "strip_suffix"] {
+                fields.insert((*name).into(), Ty::function(
+                    vec![Ty::str(), Ty::str()],
+                    EffectSet::empty(),
+                    Ty::Con("Option".into(), vec![Ty::str()]),
+                ));
+            }
             Some(Ty::Record(fields))
         }
         "int" => {

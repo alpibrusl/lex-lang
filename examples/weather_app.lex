@@ -14,8 +14,6 @@
 import "std.net" as net
 import "std.str" as str
 import "std.int" as int
-import "std.list" as list
-import "std.option" as option
 
 type Request  = { body :: Str, method :: Str, path :: Str, query :: Str }
 type Response = { body :: Str, status :: Int }
@@ -48,27 +46,11 @@ fn forecast(city :: Str) -> Str {
   str.concat(head, "\",\"days\":[\"day1\",\"day2\",\"day3\"]}")
 }
 
-# Returns Some(rest) iff `path` starts with `prefix`. Lex stdlib doesn't
-# ship str.starts_with yet, so we use str.split + a pair of list ops.
-fn strip_prefix(path :: Str, prefix :: Str) -> Option[Str] {
-  let parts := str.split(path, prefix)
-  match list.head(parts) {
-    Some(first) => match str.is_empty(first) {
-      true  => match list.head(list.tail(parts)) {
-        Some(rest) => Some(rest),
-        None       => None,
-      },
-      false => None,
-    },
-    None => None,
-  }
-}
-
 fn handle(req :: Request) -> Response {
   match req.method {
-    "GET" => match strip_prefix(req.path, "/weather/") {
+    "GET" => match str.strip_prefix(req.path, "/weather/") {
       Some(city) => { status: 200, body: current_weather(city) },
-      None       => match strip_prefix(req.path, "/forecast/") {
+      None       => match str.strip_prefix(req.path, "/forecast/") {
         Some(city) => { status: 200, body: forecast(city) },
         None       => match req.path {
           "/health" => { status: 200, body: "{\"ok\":true}" },
