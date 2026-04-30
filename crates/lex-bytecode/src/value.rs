@@ -18,6 +18,12 @@ pub enum Value {
     /// function's first `captures.len()` params bind to `captures`; the
     /// remaining params are supplied at call time.
     Closure { fn_id: u32, captures: Vec<Value> },
+    /// Dense row-major `f64` matrix. A "fast lane" representation that
+    /// avoids the per-element `Value::Float` boxing of `Value::List`.
+    /// Used by Core's native tensor ops (matmul, dot, …) so end-to-end
+    /// matmul perf hits the §13.7 #1 100ms target without paying for
+    /// 2M Value boxings at the call boundary.
+    F64Array { rows: u32, cols: u32, data: Vec<f64> },
 }
 
 impl Value {

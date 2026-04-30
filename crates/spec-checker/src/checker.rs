@@ -281,5 +281,13 @@ fn value_to_json(v: &Value) -> serde_json::Value {
             J::Object(m)
         }
         Value::Closure { fn_id, .. } => J::String(format!("<closure fn_{fn_id}>")),
+        Value::F64Array { rows, cols, data } => {
+            let mut m = serde_json::Map::new();
+            m.insert("$f64_array".into(), J::Bool(true));
+            m.insert("rows".into(), J::from(*rows));
+            m.insert("cols".into(), J::from(*cols));
+            m.insert("data".into(), J::Array(data.iter().map(|f| J::from(*f)).collect()));
+            J::Object(m)
+        }
     }
 }
