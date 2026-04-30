@@ -130,9 +130,81 @@ impl EffectHandler for DefaultHandler {
                 // enforced statically in `policy::check_program`.
                 Ok(Value::Unit)
             }
+            ("net", "get") => {
+                let url = expect_str(args.first())?.to_string();
+                Ok(http_request("GET", &url, None))
+            }
+            ("net", "post") => {
+                let url = expect_str(args.first())?.to_string();
+                let body = expect_str(args.get(1))?.to_string();
+                Ok(http_request("POST", &url, Some(&body)))
+            }
             other => Err(format!("unsupported effect {}.{}", other.0, other.1)),
         }
     }
+}
+
+/// Minimal hand-rolled HTTP/1.0 client. Supports `http://host:port/path`
+/// only (no TLS, no redirects). Returns `Result[Str, Str]` as a Lex
+/// `Value::Variant`.
+fn http_request(method: &str, url: &str, body: Option<&str>) -> Value {
+    let parsed = match parse_http_url(url) {
+        Ok(u) => u,
+        Err(e) => return err_value(format!("bad url: {e}")),
+    };
+    let body_bytes = body.unwrap_or("").as_bytes();
+    let req = format!(
+        "{method} {path} HTTP/1.0\r\nHost: {host}\r\nContent-Length: {clen}\r\nConnection: close\r\n\r\n",
+        path = parsed.path,
+        host = parsed.host,
+        clen = body_bytes.len(),
+    );
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+    let mut stream = match TcpStream::connect((parsed.host.as_str(), parsed.port)) {
+        Ok(s) => s,
+        Err(e) => return err_value(format!("connect: {e}")),
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+    if let Err(e) = stream.write_all(req.as_bytes()) {
+        return err_value(format!("write: {e}"));
+    }
+    if !body_bytes.is_empty() {
+        if let Err(e) = stream.write_all(body_bytes) {
+            return err_value(format!("write body: {e}"));
+        }
+    }
+    let mut buf = String::new();
+    if let Err(e) = stream.read_to_string(&mut buf) {
+        return err_value(format!("read: {e}"));
+    }
+    // Split headers from body.
+    let body_text = match buf.split_once("\r\n\r\n") {
+        Some((_head, b)) => b.to_string(),
+        None => buf,
+    };
+    Value::Variant { name: "Ok".into(), args: vec![Value::Str(body_text)] }
+}
+
+struct ParsedUrl { host: String, port: u16, path: String }
+
+fn parse_http_url(url: &str) -> Result<ParsedUrl, String> {
+    let rest = url.strip_prefix("http://").ok_or_else(|| "must start with http://".to_string())?;
+    let (host_port, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse::<u16>().map_err(|e| format!("port: {e}"))?),
+        None => (host_port.to_string(), 80),
+    };
+    Ok(ParsedUrl { host, port, path: path.to_string() })
+}
+
+fn err_value(msg: String) -> Value {
+    Value::Variant { name: "Err".into(), args: vec![Value::Str(msg)] }
 }
 
 fn expect_str(v: Option<&Value>) -> Result<&str, String> {
