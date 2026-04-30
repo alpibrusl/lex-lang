@@ -4,10 +4,11 @@
 //! declared `[fs_read("/data")]` that's allowed at startup still has to
 //! pass the path check at the point of dispatch).
 
-use lex_bytecode::vm::EffectHandler;
-use lex_bytecode::Value;
+use lex_bytecode::vm::{EffectHandler, Vm};
+use lex_bytecode::{Program, Value};
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::builtins::try_pure_builtin;
@@ -40,6 +41,10 @@ pub struct DefaultHandler {
     pub read_root: Option<PathBuf>,
     /// Captured budget consumption (post-static-check, observability only).
     pub budget_used: RefCell<u64>,
+    /// Shared reference to the program, needed by `net.serve` so the
+    /// handler can spin up fresh VMs to dispatch incoming requests.
+    /// `None` if the handler was constructed without a program.
+    pub program: Option<Arc<Program>>,
 }
 
 impl DefaultHandler {
@@ -49,7 +54,12 @@ impl DefaultHandler {
             sink: Box::new(StdoutSink),
             read_root: None,
             budget_used: RefCell::new(0),
+            program: None,
         }
+    }
+
+    pub fn with_program(mut self, program: Arc<Program>) -> Self {
+        self.program = Some(program); self
     }
 
     pub fn with_sink(mut self, sink: Box<dyn IoSink>) -> Self {
@@ -139,9 +149,85 @@ impl EffectHandler for DefaultHandler {
                 let body = expect_str(args.get(1))?.to_string();
                 Ok(http_request("POST", &url, Some(&body)))
             }
+            ("net", "serve") => {
+                let port = match args.first() {
+                    Some(Value::Int(n)) if (0..=65535).contains(n) => *n as u16,
+                    _ => return Err("net.serve(port, handler): port must be Int 0..=65535".into()),
+                };
+                let handler_name = expect_str(args.get(1))?.to_string();
+                let program = self.program.clone()
+                    .ok_or_else(|| "net.serve requires a Program reference; use DefaultHandler::with_program".to_string())?;
+                let policy = self.policy.clone();
+                serve_http(port, handler_name, program, policy)
+            }
             other => Err(format!("unsupported effect {}.{}", other.0, other.1)),
         }
     }
+}
+
+/// Blocks the calling thread, accepts incoming HTTP requests on
+/// `127.0.0.1:port`, and dispatches each through the named Lex
+/// stage. Each request gets a fresh `Vm`; the program and policy
+/// are shared.
+///
+/// Handler signature in Lex (by convention):
+///   fn <name>(req :: Record { method :: Str, path :: Str, body :: Str })
+///        -> Record { status :: Int, body :: Str }
+fn serve_http(port: u16, handler_name: String, program: Arc<Program>, policy: Policy) -> Result<Value, String> {
+    let server = tiny_http::Server::http(("127.0.0.1", port))
+        .map_err(|e| format!("net.serve bind {port}: {e}"))?;
+    eprintln!("net.serve: listening on http://127.0.0.1:{port}");
+    for mut req in server.incoming_requests() {
+        let lex_req = build_request_value(&mut req);
+        let handler = DefaultHandler::new(policy.clone()).with_program(Arc::clone(&program));
+        let mut vm = Vm::with_handler(&program, Box::new(handler));
+        match vm.call(&handler_name, vec![lex_req]) {
+            Ok(resp) => {
+                let (status, body) = unpack_response(&resp);
+                let response = tiny_http::Response::from_string(body)
+                    .with_status_code(status);
+                let _ = req.respond(response);
+            }
+            Err(e) => {
+                let response = tiny_http::Response::from_string(format!("internal error: {e}"))
+                    .with_status_code(500);
+                let _ = req.respond(response);
+            }
+        }
+    }
+    Ok(Value::Unit)
+}
+
+fn build_request_value(req: &mut tiny_http::Request) -> Value {
+    let method = format!("{:?}", req.method()).to_uppercase();
+    let url = req.url().to_string();
+    let (path, query) = match url.split_once('?') {
+        Some((p, q)) => (p.to_string(), q.to_string()),
+        None => (url, String::new()),
+    };
+    let mut body = String::new();
+    let _ = req.as_reader().read_to_string(&mut body);
+    let mut rec = indexmap::IndexMap::new();
+    rec.insert("method".into(), Value::Str(method));
+    rec.insert("path".into(), Value::Str(path));
+    rec.insert("query".into(), Value::Str(query));
+    rec.insert("body".into(), Value::Str(body));
+    Value::Record(rec)
+}
+
+fn unpack_response(v: &Value) -> (u16, String) {
+    if let Value::Record(rec) = v {
+        let status = rec.get("status").and_then(|s| match s {
+            Value::Int(n) => Some(*n as u16),
+            _ => None,
+        }).unwrap_or(200);
+        let body = rec.get("body").and_then(|b| match b {
+            Value::Str(s) => Some(s.clone()),
+            _ => None,
+        }).unwrap_or_default();
+        return (status, body);
+    }
+    (500, format!("handler returned non-record: {v:?}"))
 }
 
 /// Minimal hand-rolled HTTP/1.0 client. Supports `http://host:port/path`

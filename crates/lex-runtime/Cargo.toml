@@ -9,6 +9,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 indexmap.workspace = true
+tiny_http = "0.12"
 lex-bytecode = { path = "../lex-bytecode" }
 
 [dev-dependencies]

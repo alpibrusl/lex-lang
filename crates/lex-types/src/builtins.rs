@@ -40,6 +40,16 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 Ty::Con("Option".into(), vec![Ty::int()])));
             fields.insert("concat".into(), Ty::function(vec![Ty::str(), Ty::str()], EffectSet::empty(), Ty::str()));
             fields.insert("len".into(), Ty::function(vec![Ty::str()], EffectSet::empty(), Ty::int()));
+            fields.insert("split".into(), Ty::function(
+                vec![Ty::str(), Ty::str()],
+                EffectSet::empty(),
+                Ty::List(Box::new(Ty::str())),
+            ));
+            fields.insert("join".into(), Ty::function(
+                vec![Ty::List(Box::new(Ty::str())), Ty::str()],
+                EffectSet::empty(),
+                Ty::str(),
+            ));
             Some(Ty::Record(fields))
         }
         "int" => {
@@ -152,6 +162,14 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 vec![Ty::str(), Ty::str()],
                 EffectSet::singleton("net"),
                 Ty::Con("Result".into(), vec![Ty::str(), Ty::str()]),
+            ));
+            // serve :: (Int, Str) -> [net] Unit  (blocks; never returns
+            // under normal use). Handler's signature isn't carried in
+            // the type system here — looked up by name at runtime.
+            fields.insert("serve".into(), Ty::function(
+                vec![Ty::int(), Ty::str()],
+                EffectSet::singleton("net"),
+                Ty::Unit,
             ));
             Some(Ty::Record(fields))
         }
