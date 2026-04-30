@@ -171,6 +171,14 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::singleton("net"),
                 Ty::Unit,
             ));
+            // serve_tls :: (Int, Str, Str, Str) -> [net] Unit
+            //              port  cert  key   handler
+            // cert and key are filesystem paths to PEM-encoded files.
+            fields.insert("serve_tls".into(), Ty::function(
+                vec![Ty::int(), Ty::str(), Ty::str(), Ty::str()],
+                EffectSet::singleton("net"),
+                Ty::Unit,
+            ));
             Some(Ty::Record(fields))
         }
         "json" => {
