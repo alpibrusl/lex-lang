@@ -240,6 +240,17 @@ The flow is:
 
 This pattern works for plugin marketplaces (per-plugin effect manifests), multi-tenant code runners (per-tenant effect quotas), and any flow where untrusted code lands on your machine and you'd rather not trust it.
 
+### Adversarial benchmark
+
+`bench/REPORT.md` runs 6 attacks and 2 benign cases through both `lex agent-tool` and a naive Python `exec()`-with-blocklist sandbox (`bench/python_naive_sandbox.py`). Regenerate with `cargo test -p lex-cli --test agent_sandbox_bench`.
+
+| | Adversarial blocked | Benign allowed |
+|---|---|---|
+| **Lex (effect types)** | **5 / 5** | 2 / 2 |
+| **Python (naive exec sandbox)** | 1 / 5 | 2 / 2 |
+
+Lex catches all 5 targeted attacks at type-check time (file read/write, shell exec, blocklist bypass, object-graph escape) without running them. The naive Python sandbox catches one and is bypassed by all four others — including the classic `().__class__.__base__.__subclasses__()` walk to `Popen`. The 6th attack is *out of scope*: when Lex grants `[io]` and the attack uses `io.read`, the sandbox lets it through. Lex's capability granularity is per-effect; for finer-grained scopes use `--allow-fs-read PATH`. The point of including the case is to show what the sandbox **doesn't** claim.
+
 ## Toolchain reference
 
 | Command | Purpose |
