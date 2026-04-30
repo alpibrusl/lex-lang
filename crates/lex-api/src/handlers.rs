@@ -80,6 +80,7 @@ fn route(
         (Method::Post, "/v1/parse") => parse_handler(body),
         (Method::Post, "/v1/check") => check_handler(body),
         (Method::Post, "/v1/publish") => publish_handler(state, body),
+        (Method::Post, "/v1/patch") => patch_handler(state, body),
         (Method::Get, p) if p.starts_with("/v1/stage/") => {
             let id = &p["/v1/stage/".len()..];
             stage_handler(state, id)
@@ -163,6 +164,60 @@ fn publish_handler(state: &State, body: &str) -> Response<std::io::Cursor<Vec<u8
         }
     }
     json_response(200, &serde_json::Value::Array(out))
+}
+
+#[derive(Deserialize)]
+struct PatchReq {
+    stage_id: String,
+    patch: lex_ast::Patch,
+    #[serde(default)] activate: bool,
+}
+
+/// POST /v1/patch — apply a structured edit to a stored stage's
+/// canonical AST, type-check the result, and publish a new stage.
+fn patch_handler(state: &State, body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    let req: PatchReq = match serde_json::from_str(body) {
+        Ok(r) => r, Err(e) => return error_response(400, format!("bad request: {e}")),
+    };
+    let store = state.store.lock().unwrap();
+
+    // 1. Load.
+    let original = match store.get_ast(&req.stage_id) {
+        Ok(s) => s, Err(e) => return error_response(404, format!("stage: {e}")),
+    };
+
+    // 2. Apply.
+    let patched = match lex_ast::apply_patch(&original, &req.patch) {
+        Ok(s) => s,
+        Err(e) => return error_with_detail(422, "patch failed",
+            serde_json::to_value(&e).unwrap_or_default()),
+    };
+
+    // 3. Type-check the new stage in isolation.
+    let stages = vec![patched.clone()];
+    if let Err(errs) = lex_types::check_program(&stages) {
+        return error_with_detail(422, "type errors after patch",
+            serde_json::to_value(&errs).unwrap_or_default());
+    }
+
+    // 4. Publish.
+    let new_id = match store.publish(&patched) {
+        Ok(id) => id, Err(e) => return error_response(500, format!("publish: {e}")),
+    };
+    if req.activate {
+        if let Err(e) = store.activate(&new_id) {
+            return error_response(500, format!("activate: {e}"));
+        }
+    }
+    let sig = lex_ast::sig_id(&patched).unwrap_or_default();
+    let status = format!("{:?}",
+        store.get_status(&new_id).unwrap_or(lex_store::StageStatus::Draft)).to_lowercase();
+    json_response(200, &serde_json::json!({
+        "old_stage_id": req.stage_id,
+        "new_stage_id": new_id,
+        "sig_id": sig,
+        "status": status,
+    }))
 }
 
 fn stage_handler(state: &State, id: &str) -> Response<std::io::Cursor<Vec<u8>>> {

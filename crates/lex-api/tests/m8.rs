@@ -226,3 +226,92 @@ fn replay_with_overrides() {
     let v: serde_json::Value = serde_json::from_str(&b).unwrap();
     assert_eq!(v["output"], json!({"$variant": "Ok", "args": ["INJECTED"]}));
 }
+
+#[test]
+fn patch_replaces_a_subexpression_and_publishes_new_stage() {
+    // Publish a stage, patch a sub-expression, run the patched stage.
+    let (srv, _tmp) = start_server();
+    let src = "fn add_one(x :: Int) -> Int { x + 1 }\n";
+
+    // 1. Publish the original.
+    let pub_body = json!({"source": src, "activate": true}).to_string();
+    let (s, b) = http(&srv.addr, "POST", "/v1/publish", &pub_body);
+    assert_eq!(s, 200, "publish: {b}");
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    let stage_id = v[0]["stage_id"].as_str().unwrap().to_string();
+
+    // 2. Patch the literal `1` with `100`. Body sits at n_0.2 (1 param);
+    //    BinOp.rhs is at n_0.2.1.
+    let patch_body = json!({
+        "stage_id": stage_id,
+        "patch": {
+            "op": "replace",
+            "target": "n_0.2.1",
+            "with": { "node": "Literal", "value": { "kind": "Int", "value": 100 } }
+        },
+        "activate": true,
+    }).to_string();
+    let (s, b) = http(&srv.addr, "POST", "/v1/patch", &patch_body);
+    assert_eq!(s, 200, "patch: {b}");
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    let new_id = v["new_stage_id"].as_str().unwrap().to_string();
+    assert_ne!(new_id, stage_id, "new StageId must differ from original");
+    assert_eq!(v["status"], "active");
+
+    // 3. Run the patched function: add_one(5) should now be 105.
+    let run_body = json!({"source": "fn add_one(x :: Int) -> Int { x + 100 }\n",
+                         "fn": "add_one", "args": [5]}).to_string();
+    let (s, b) = http(&srv.addr, "POST", "/v1/run", &run_body);
+    assert_eq!(s, 200);
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(v["output"], json!(105));
+}
+
+#[test]
+fn patch_with_type_error_after_apply_returns_422() {
+    // Replacing an Int with a Str should fail typecheck and surface 422
+    // with the structured TypeError list.
+    let (srv, _tmp) = start_server();
+    let src = "fn add_one(x :: Int) -> Int { x + 1 }\n";
+
+    let (s, b) = http(&srv.addr, "POST", "/v1/publish",
+        &json!({"source": src, "activate": true}).to_string());
+    assert_eq!(s, 200);
+    let stage_id = serde_json::from_str::<serde_json::Value>(&b).unwrap()
+        [0]["stage_id"].as_str().unwrap().to_string();
+
+    // Replace `1` (Int) with `"oops"` (Str).
+    let patch_body = json!({
+        "stage_id": stage_id,
+        "patch": {
+            "op": "replace",
+            "target": "n_0.2.1",
+            "with": { "node": "Literal", "value": { "kind": "Str", "value": "oops" } }
+        },
+    }).to_string();
+    let (s, b) = http(&srv.addr, "POST", "/v1/patch", &patch_body);
+    assert_eq!(s, 422, "expected 422 on type-incompatible patch, got {s}: {b}");
+    assert!(b.contains("type_mismatch"), "body should carry structured TypeError: {b}");
+}
+
+#[test]
+fn patch_with_unknown_node_returns_422() {
+    let (srv, _tmp) = start_server();
+    let (s, b) = http(&srv.addr, "POST", "/v1/publish",
+        &json!({"source": "fn one() -> Int { 1 }\n", "activate": true}).to_string());
+    assert_eq!(s, 200);
+    let stage_id = serde_json::from_str::<serde_json::Value>(&b).unwrap()
+        [0]["stage_id"].as_str().unwrap().to_string();
+
+    let patch_body = json!({
+        "stage_id": stage_id,
+        "patch": {
+            "op": "replace",
+            "target": "n_0.99.99",
+            "with": { "node": "Literal", "value": { "kind": "Int", "value": 0 } }
+        },
+    }).to_string();
+    let (s, b) = http(&srv.addr, "POST", "/v1/patch", &patch_body);
+    assert_eq!(s, 422);
+    assert!(b.contains("unknown_node"), "expected unknown_node in body: {b}");
+}
