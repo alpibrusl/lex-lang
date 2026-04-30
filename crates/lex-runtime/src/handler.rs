@@ -10,6 +10,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::builtins::try_pure_builtin;
 use crate::policy::Policy;
 
 /// Output sink used by `io.print`. Tests inject a buffer; production prints
@@ -77,6 +78,12 @@ impl DefaultHandler {
 
 impl EffectHandler for DefaultHandler {
     fn dispatch(&mut self, kind: &str, op: &str, args: Vec<Value>) -> Result<Value, String> {
+        // Pure stdlib builtins (str, list, json, ...) bypass the policy
+        // gate — they have no observable side effects and aren't tracked
+        // by the type system as effects.
+        if let Some(r) = try_pure_builtin(kind, op, &args) {
+            return r;
+        }
         self.ensure_kind_allowed(kind)?;
         match (kind, op) {
             ("io", "print") => {

@@ -54,6 +54,11 @@ pub enum Op {
     JumpIfNot(i32),
     Call { fn_id: u32, arity: u16, node_id_idx: u32 },
     TailCall { fn_id: u32, arity: u16, node_id_idx: u32 },
+    /// Build a Value::Closure: pop `capture_count` values (in order) and
+    /// pair them with `fn_id`.
+    MakeClosure { fn_id: u32, capture_count: u16 },
+    /// Call a closure: pop `arity` args + 1 closure (top of stack), invoke.
+    CallClosure { arity: u16, node_id_idx: u32 },
     /// EFFECT_CALL `<effect_kind_const_idx>` `<op_name_const_idx>` `<arity>`.
     /// Pops `arity` args, dispatches to a host effect handler, pushes result.
     /// `node_id_idx` points to a `Const::NodeId` for trace keying.

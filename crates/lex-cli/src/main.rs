@@ -297,6 +297,7 @@ fn value_to_json(v: &Value) -> serde_json::Value {
             m.insert("args".into(), J::Array(args.iter().map(value_to_json).collect()));
             J::Object(m)
         }
+        Value::Closure { fn_id, .. } => J::String(format!("<closure fn_{fn_id}>")),
     }
 }
 
