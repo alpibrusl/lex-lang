@@ -16,7 +16,7 @@ pub fn try_pure_builtin(kind: &str, op: &str, args: &[Value]) -> Option<Result<V
 /// walk to skip pure builtins that programs reference via imports.
 pub fn is_pure_module(kind: &str) -> bool {
     matches!(kind, "str" | "int" | "float" | "bool" | "list" | "map" | "set"
-        | "option" | "result" | "tuple" | "json" | "bytes")
+        | "option" | "result" | "tuple" | "json" | "bytes" | "flow")
 }
 
 fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {

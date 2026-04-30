@@ -574,6 +574,9 @@ impl<'a> FnCompiler<'a> {
             ("list", "map") => self.emit_list_map(args),
             ("list", "filter") => self.emit_list_filter(args),
             ("list", "fold") => self.emit_list_fold(args),
+            ("flow", "sequential") => self.emit_flow_sequential(args),
+            ("flow", "branch") => self.emit_flow_branch(args),
+            ("flow", "retry") => self.emit_flow_retry(args),
             _ => return false,
         }
         true
@@ -823,6 +826,147 @@ impl<'a> FnCompiler<'a> {
         if let Op::Jump(off) = &mut self.code[j_end] {
             *off = end_target - (j_end as i32 + 1);
         }
+    }
+
+    // ---- std.flow trampolines ----------------------------------------
+    //
+    // Each flow.<op>(c1, c2, ...) call site:
+    //   1. compiles its closure args and leaves them on the stack
+    //   2. registers a fresh "trampoline" Function whose body invokes
+    //      those captured closures appropriately
+    //   3. emits MakeClosure { fn_id: trampoline, capture_count: N }
+    //
+    // The trampoline's parameter layout is [capture_0, ..., capture_{N-1},
+    // arg_0, ...]: captures first, the closure's own args after.
+
+    /// Allocate a fresh fn_id for a trampoline and install its bytecode.
+    fn install_trampoline(&mut self, name: &str, arity: u16, locals_count: u16, code: Vec<Op>) -> u32 {
+        let fn_id = self.next_fn_id.len() as u32;
+        self.next_fn_id.push(Function {
+            name: name.into(),
+            arity,
+            locals_count,
+            code,
+            effects: Vec::new(),
+        });
+        fn_id
+    }
+
+    /// `flow.sequential(f, g)` returns a closure `(x) -> g(f(x))`.
+    fn emit_flow_sequential(&mut self, args: &[a::CExpr]) {
+        // Push f, g; build the trampoline closure with 2 captures.
+        self.compile_expr(&args[0], false);
+        self.compile_expr(&args[1], false);
+        let nid = self.pool.node_id("n_flow_sequential");
+        let code = vec![
+            // Locals: [f=0, g=1, x=2]
+            Op::LoadLocal(0),                                  // push f
+            Op::LoadLocal(2),                                  // push x
+            Op::CallClosure { arity: 1, node_id_idx: nid },    // r = f(x)
+            // stack: [r]
+            Op::StoreLocal(3),                                 // tmp = r
+            Op::LoadLocal(1),                                  // push g
+            Op::LoadLocal(3),                                  // push tmp
+            Op::CallClosure { arity: 1, node_id_idx: nid },    // r = g(tmp)
+            Op::Return,
+        ];
+        let fn_id = self.install_trampoline("__flow_sequential", 3, 4, code);
+        self.emit(Op::MakeClosure { fn_id, capture_count: 2 });
+    }
+
+    /// `flow.branch(cond, t, f)` returns a closure `(x) -> if cond(x) then t(x) else f(x)`.
+    fn emit_flow_branch(&mut self, args: &[a::CExpr]) {
+        self.compile_expr(&args[0], false);
+        self.compile_expr(&args[1], false);
+        self.compile_expr(&args[2], false);
+        let nid = self.pool.node_id("n_flow_branch");
+        let mut code = vec![
+            // Locals: [cond=0, t=1, f=2, x=3]
+            Op::LoadLocal(0),                               // push cond
+            Op::LoadLocal(3),                               // push x
+            Op::CallClosure { arity: 1, node_id_idx: nid }, // bool
+        ];
+        let j_false = code.len();
+        code.push(Op::JumpIfNot(0));                        // patched
+        // true arm: t(x)
+        code.push(Op::LoadLocal(1));
+        code.push(Op::LoadLocal(3));
+        code.push(Op::CallClosure { arity: 1, node_id_idx: nid });
+        code.push(Op::Return);
+        // false arm
+        let false_target = code.len() as i32;
+        if let Op::JumpIfNot(off) = &mut code[j_false] {
+            *off = false_target - (j_false as i32 + 1);
+        }
+        code.push(Op::LoadLocal(2));
+        code.push(Op::LoadLocal(3));
+        code.push(Op::CallClosure { arity: 1, node_id_idx: nid });
+        code.push(Op::Return);
+
+        let fn_id = self.install_trampoline("__flow_branch", 4, 4, code);
+        self.emit(Op::MakeClosure { fn_id, capture_count: 3 });
+    }
+
+    /// `flow.retry(f, max_attempts)` returns a closure `(x) -> Result[U, E]`
+    /// that calls `f(x)` up to `max_attempts` times, returning the first
+    /// `Ok` or the final `Err`.
+    fn emit_flow_retry(&mut self, args: &[a::CExpr]) {
+        self.compile_expr(&args[0], false);
+        self.compile_expr(&args[1], false);
+        let call_nid = self.pool.node_id("n_flow_retry");
+        let ok_idx = self.pool.variant("Ok");
+        let zero_const = self.pool.int(0);
+        let one_const = self.pool.int(1);
+        // Locals: [f=0, max=1, x=2, i=3, last=4]
+        let mut code = vec![
+            // i := 0
+            Op::PushConst(zero_const),
+            Op::StoreLocal(3),
+        ];
+        // loop_top: while i < max
+        let loop_top = code.len() as i32;
+        code.push(Op::LoadLocal(3));
+        code.push(Op::LoadLocal(1));
+        code.push(Op::NumLt);
+        let j_done = code.len();
+        code.push(Op::JumpIfNot(0));                       // patched
+
+        // body: r := f(x); last := r
+        code.push(Op::LoadLocal(0));
+        code.push(Op::LoadLocal(2));
+        code.push(Op::CallClosure { arity: 1, node_id_idx: call_nid });
+        code.push(Op::StoreLocal(4));
+
+        // Test variant Ok on last; if so, return last.
+        code.push(Op::LoadLocal(4));
+        code.push(Op::TestVariant(ok_idx));
+        let j_was_err = code.len();
+        code.push(Op::JumpIfNot(0));                       // patched: skip return
+        code.push(Op::LoadLocal(4));
+        code.push(Op::Return);
+
+        // was_err: i := i + 1; jump loop_top
+        let was_err_target = code.len() as i32;
+        if let Op::JumpIfNot(off) = &mut code[j_was_err] {
+            *off = was_err_target - (j_was_err as i32 + 1);
+        }
+        code.push(Op::LoadLocal(3));
+        code.push(Op::PushConst(one_const));
+        code.push(Op::NumAdd);
+        code.push(Op::StoreLocal(3));
+        let pc_after_jump = code.len() as i32 + 1;
+        code.push(Op::Jump(loop_top - pc_after_jump));
+
+        // done: return last (the final Err, or Unit if max=0).
+        let done_target = code.len() as i32;
+        if let Op::JumpIfNot(off) = &mut code[j_done] {
+            *off = done_target - (j_done as i32 + 1);
+        }
+        code.push(Op::LoadLocal(4));
+        code.push(Op::Return);
+
+        let fn_id = self.install_trampoline("__flow_retry", 3, 5, code);
+        self.emit(Op::MakeClosure { fn_id, capture_count: 2 });
     }
 }
 

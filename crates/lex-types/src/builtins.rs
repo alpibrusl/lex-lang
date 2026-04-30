@@ -176,6 +176,41 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             ));
             Some(Ty::Record(fields))
         }
+        "flow" => {
+            // Orchestration primitives (spec §11.2). Each takes one or
+            // more closures and returns a closure with a derived shape.
+            let mut fields = IndexMap::new();
+            // sequential[T, U, V](f: (T) -> U, g: (U) -> V) -> (T) -> V
+            fields.insert("sequential".into(), Ty::function(
+                vec![
+                    Ty::function(vec![Ty::Var(0)], EffectSet::empty(), Ty::Var(1)),
+                    Ty::function(vec![Ty::Var(1)], EffectSet::empty(), Ty::Var(2)),
+                ],
+                EffectSet::empty(),
+                Ty::function(vec![Ty::Var(0)], EffectSet::empty(), Ty::Var(2)),
+            ));
+            // branch[T, U](cond: (T) -> Bool, t: (T) -> U, f: (T) -> U) -> (T) -> U
+            fields.insert("branch".into(), Ty::function(
+                vec![
+                    Ty::function(vec![Ty::Var(0)], EffectSet::empty(), Ty::bool()),
+                    Ty::function(vec![Ty::Var(0)], EffectSet::empty(), Ty::Var(1)),
+                    Ty::function(vec![Ty::Var(0)], EffectSet::empty(), Ty::Var(1)),
+                ],
+                EffectSet::empty(),
+                Ty::function(vec![Ty::Var(0)], EffectSet::empty(), Ty::Var(1)),
+            ));
+            // retry[T, U, E](f: (T) -> Result[U, E], n: Int) -> (T) -> Result[U, E]
+            let result_ty = Ty::Con("Result".into(), vec![Ty::Var(1), Ty::Var(2)]);
+            fields.insert("retry".into(), Ty::function(
+                vec![
+                    Ty::function(vec![Ty::Var(0)], EffectSet::empty(), result_ty.clone()),
+                    Ty::int(),
+                ],
+                EffectSet::empty(),
+                Ty::function(vec![Ty::Var(0)], EffectSet::empty(), result_ty),
+            ));
+            Some(Ty::Record(fields))
+        }
         _ => None,
     }
 }
@@ -192,6 +227,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "result" => "result",
         "option" => "option",
         "json" => "json",
+        "flow" => "flow",
         _ => return None,
     })
 }
