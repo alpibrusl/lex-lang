@@ -89,6 +89,44 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::empty(),
                 Ty::int(),
             ));
+            fields.insert("is_empty".into(), Ty::function(
+                vec![Ty::List(Box::new(Ty::Var(0)))],
+                EffectSet::empty(),
+                Ty::bool(),
+            ));
+            fields.insert("range".into(), Ty::function(
+                vec![Ty::int(), Ty::int()],
+                EffectSet::empty(),
+                Ty::List(Box::new(Ty::int())),
+            ));
+            fields.insert("head".into(), Ty::function(
+                vec![Ty::List(Box::new(Ty::Var(0)))],
+                EffectSet::empty(),
+                Ty::Con("Option".into(), vec![Ty::Var(0)]),
+            ));
+            fields.insert("tail".into(), Ty::function(
+                vec![Ty::List(Box::new(Ty::Var(0)))],
+                EffectSet::empty(),
+                Ty::List(Box::new(Ty::Var(0))),
+            ));
+            fields.insert("concat".into(), Ty::function(
+                vec![Ty::List(Box::new(Ty::Var(0))), Ty::List(Box::new(Ty::Var(0)))],
+                EffectSet::empty(),
+                Ty::List(Box::new(Ty::Var(0))),
+            ));
+            Some(Ty::Record(fields))
+        }
+        "json" => {
+            let mut fields = IndexMap::new();
+            // stringify :: T -> Str  (polymorphic on input)
+            fields.insert("stringify".into(), Ty::function(
+                vec![Ty::Var(0)], EffectSet::empty(), Ty::str(),
+            ));
+            // parse :: Str -> Result[T, Str]
+            fields.insert("parse".into(), Ty::function(
+                vec![Ty::str()], EffectSet::empty(),
+                Ty::Con("Result".into(), vec![Ty::Var(0), Ty::str()]),
+            ));
             Some(Ty::Record(fields))
         }
         "result" => {
@@ -153,6 +191,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "list" => "list",
         "result" => "result",
         "option" => "option",
+        "json" => "json",
         _ => return None,
     })
 }

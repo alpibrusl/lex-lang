@@ -14,6 +14,10 @@ pub enum Value {
     Tuple(Vec<Value>),
     Record(IndexMap<String, Value>),
     Variant { name: String, args: Vec<Value> },
+    /// First-class function value (a lambda + its captured locals). The
+    /// function's first `captures.len()` params bind to `captures`; the
+    /// remaining params are supplied at call time.
+    Closure { fn_id: u32, captures: Vec<Value> },
 }
 
 impl Value {

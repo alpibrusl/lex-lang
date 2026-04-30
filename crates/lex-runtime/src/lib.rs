@@ -13,8 +13,10 @@
 //!   only. We ship the policy/dispatch layer, which is the user-visible
 //!   half of §7.4 and what the §7.6 acceptance tests exercise.
 
+pub mod builtins;
 pub mod policy;
 pub mod handler;
 
+pub use builtins::{is_pure_module, try_pure_builtin};
 pub use handler::{CapturedSink, DefaultHandler, IoSink, StdoutSink};
 pub use policy::{check_program, Policy, PolicyReport, PolicyViolation};

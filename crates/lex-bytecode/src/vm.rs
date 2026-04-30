@@ -301,6 +301,33 @@ impl<'a> Vm<'a> {
                         self.frames[frame_idx].pc = new_pc;
                     }
                 }
+                Op::MakeClosure { fn_id, capture_count } => {
+                    let n = capture_count as usize;
+                    let mut captures: Vec<Value> = (0..n).map(|_| Value::Unit).collect();
+                    for i in (0..n).rev() { captures[i] = self.pop()?; }
+                    self.stack.push(Value::Closure { fn_id, captures });
+                }
+                Op::CallClosure { arity, node_id_idx } => {
+                    let mut args: Vec<Value> = (0..arity).map(|_| Value::Unit).collect();
+                    for i in (0..arity as usize).rev() { args[i] = self.pop()?; }
+                    let closure = self.pop()?;
+                    let (fn_id, captures) = match closure {
+                        Value::Closure { fn_id, captures } => (fn_id, captures),
+                        other => return Err(VmError::TypeMismatch(format!("CallClosure on non-closure: {other:?}"))),
+                    };
+                    let node_id = const_str(&self.program.constants, node_id_idx);
+                    let callee_name = self.program.functions[fn_id as usize].name.clone();
+                    let mut combined = captures;
+                    combined.extend(args);
+                    self.tracer.enter_call(&node_id, &callee_name, &combined);
+                    let f = &self.program.functions[fn_id as usize];
+                    let mut locals = vec![Value::Unit; f.locals_count.max(f.arity) as usize];
+                    for (i, v) in combined.into_iter().enumerate() { locals[i] = v; }
+                    self.frames.push(Frame {
+                        fn_id, pc: 0, locals, stack_base: self.stack.len(),
+                        trace_kind: FrameKind::Call(node_id),
+                    });
+                }
                 Op::Call { fn_id, arity, node_id_idx } => {
                     let mut args: Vec<Value> = (0..arity).map(|_| Value::Unit).collect();
                     for i in (0..arity as usize).rev() { args[i] = self.pop()?; }

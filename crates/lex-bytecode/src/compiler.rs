@@ -115,6 +115,7 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
     let mut pool = ConstPool::default();
     let function_names = p.function_names.clone();
     let module_aliases = p.module_aliases.clone();
+    let mut pending_lambdas: Vec<PendingLambda> = Vec::new();
 
     for s in stages {
         if let a::Stage::FnDecl(_) = s {
@@ -131,6 +132,8 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
                 function_names: &function_names,
                 module_aliases: &module_aliases,
                 id_map: &id_map,
+                pending_lambdas: &mut pending_lambdas,
+                next_fn_id: &mut p.functions,
             };
             for param in &fd.params {
                 let i = fc.next_local;
@@ -140,13 +143,63 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
             }
             fc.compile_expr(&fd.body, true);
             fc.code.push(Op::Return);
+            let code = std::mem::take(&mut fc.code);
+            let peak = fc.peak_local;
+            drop(fc);
             let idx = function_names[&fd.name];
-            p.functions[idx as usize].code = fc.code;
-            p.functions[idx as usize].locals_count = fc.peak_local;
+            p.functions[idx as usize].code = code;
+            p.functions[idx as usize].locals_count = peak;
         }
     }
+
+    // Compile pending lambdas in FIFO order. Each lambda may emit further
+    // lambdas; loop until the queue drains.
+    while let Some(pl) = pending_lambdas.pop() {
+        let id_map = std::collections::HashMap::new();
+        let mut fc = FnCompiler {
+            code: Vec::new(),
+            locals: IndexMap::new(),
+            next_local: 0,
+            peak_local: 0,
+            pool: &mut pool,
+            function_names: &function_names,
+            module_aliases: &module_aliases,
+            id_map: &id_map,
+            pending_lambdas: &mut pending_lambdas,
+            next_fn_id: &mut p.functions,
+        };
+        for name in &pl.capture_names {
+            let i = fc.next_local;
+            fc.locals.insert(name.clone(), i);
+            fc.next_local += 1;
+            fc.peak_local = fc.next_local;
+        }
+        for p in &pl.params {
+            let i = fc.next_local;
+            fc.locals.insert(p.name.clone(), i);
+            fc.next_local += 1;
+            fc.peak_local = fc.next_local;
+        }
+        fc.compile_expr(&pl.body, true);
+        fc.code.push(Op::Return);
+        let code = std::mem::take(&mut fc.code);
+        let peak = fc.peak_local;
+        drop(fc);
+        p.functions[pl.fn_id as usize].code = code;
+        p.functions[pl.fn_id as usize].locals_count = peak;
+    }
+
     p.constants = pool.pool;
     p
+}
+
+#[derive(Debug, Clone)]
+struct PendingLambda {
+    fn_id: u32,
+    /// Names of captured outer-scope locals, in order.
+    capture_names: Vec<String>,
+    params: Vec<a::Param>,
+    body: a::CExpr,
 }
 
 struct FnCompiler<'a> {
@@ -160,6 +213,12 @@ struct FnCompiler<'a> {
     module_aliases: &'a IndexMap<String, String>,
     /// CExpr address → NodeId, populated per stage via `lex_ast::expr_ids`.
     id_map: &'a std::collections::HashMap<*const a::CExpr, lex_ast::NodeId>,
+    /// Queue of lambdas discovered during compilation; each gets a fresh
+    /// fn_id and is compiled in a later pass.
+    pending_lambdas: &'a mut Vec<PendingLambda>,
+    /// Mutable view of the function table — used to allocate fn_ids for
+    /// freshly-discovered lambdas.
+    next_fn_id: &'a mut Vec<Function>,
 }
 
 impl<'a> FnCompiler<'a> {
@@ -229,7 +288,7 @@ impl<'a> FnCompiler<'a> {
                     other => panic!("unknown unary: {other}"),
                 }
             }
-            a::CExpr::Lambda { .. } => panic!("lambda not supported in M4"),
+            a::CExpr::Lambda { params, body, .. } => self.compile_lambda(params, body),
             a::CExpr::Return { value } => {
                 self.compile_expr(value, true);
                 self.emit(Op::Return);
@@ -266,10 +325,16 @@ impl<'a> FnCompiler<'a> {
         let node_id_idx = self.pool.node_id(&node_id);
 
         // Module function call: `alias.op(args)` where `alias` is an imported
-        // module ⇒ EffectCall(kind=module_name, op=field_name).
+        // module ⇒ EffectCall, except for higher-order pure ops where we
+        // emit inline bytecode using CallClosure (the closure-arg can't be
+        // serialized through the effect handler).
         if let a::CExpr::FieldAccess { value, field } = callee {
             if let a::CExpr::Var { name } = value.as_ref() {
                 if let Some(module) = self.module_aliases.get(name) {
+                    if self.try_emit_higher_order(module, field, args, node_id_idx) {
+                        let _ = tail;
+                        return;
+                    }
                     for a in args { self.compile_expr(a, false); }
                     let kind_idx = self.pool.str(module);
                     let op_idx = self.pool.str(field);
@@ -279,7 +344,7 @@ impl<'a> FnCompiler<'a> {
                         arity: args.len() as u16,
                         node_id_idx,
                     });
-                    let _ = tail; // EffectCall doesn't tail-optimize.
+                    let _ = tail;
                     return;
                 }
             }
@@ -294,7 +359,20 @@ impl<'a> FnCompiler<'a> {
                     self.emit(Op::Call { fn_id, arity: args.len() as u16, node_id_idx });
                 }
             }
-            other => panic!("unsupported callee: {other:?}"),
+            a::CExpr::Var { name } if self.locals.contains_key(name) => {
+                // First-class function value bound to a local. Push the
+                // closure, then args, then CallClosure.
+                let slot = self.locals[name];
+                self.emit(Op::LoadLocal(slot));
+                for a in args { self.compile_expr(a, false); }
+                self.emit(Op::CallClosure { arity: args.len() as u16, node_id_idx });
+            }
+            // Lambda directly applied — push closure + args + CallClosure.
+            other => {
+                self.compile_expr(other, false);
+                for a in args { self.compile_expr(a, false); }
+                self.emit(Op::CallClosure { arity: args.len() as u16, node_id_idx });
+            }
         }
     }
 
@@ -434,5 +512,204 @@ impl<'a> FnCompiler<'a> {
             }
         }
         fails
+    }
+
+    /// Compile a Lambda: collect free variables that resolve to outer-scope
+    /// locals, register a synthetic function, emit MakeClosure with the
+    /// captured values pushed in order.
+    fn compile_lambda(&mut self, params: &[a::Param], body: &a::CExpr) {
+        // Free vars = vars referenced in body that aren't bound locally.
+        let mut bound: std::collections::HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
+        let mut frees: Vec<String> = Vec::new();
+        free_vars(body, &mut bound, &mut frees);
+
+        // Filter to those that are in the enclosing locals (captures) —
+        // skip globals (function names) which are referenced directly.
+        let captures: Vec<String> = frees.into_iter()
+            .filter(|n| self.locals.contains_key(n) && !self.function_names.contains_key(n))
+            .collect();
+
+        // Allocate a fresh fn_id by appending a placeholder Function.
+        let fn_id = self.next_fn_id.len() as u32;
+        self.next_fn_id.push(Function {
+            name: format!("__lambda_{fn_id}"),
+            arity: (captures.len() + params.len()) as u16,
+            locals_count: 0,
+            code: Vec::new(),
+            effects: Vec::new(),
+        });
+
+        // Emit code at the lambda site: load each captured local, then MakeClosure.
+        for c in &captures {
+            let slot = *self.locals.get(c).expect("free var must be in scope");
+            self.emit(Op::LoadLocal(slot));
+        }
+        self.emit(Op::MakeClosure { fn_id, capture_count: captures.len() as u16 });
+
+        // Queue the body for later compilation.
+        self.pending_lambdas.push(PendingLambda {
+            fn_id,
+            capture_names: captures,
+            params: params.to_vec(),
+            body: body.clone(),
+        });
+    }
+
+    /// Higher-order stdlib ops on Result/Option whose function arg is a
+    /// closure. Emit inline: pattern-match on the variant, invoke the
+    /// closure when applicable, return wrapped result.
+    fn try_emit_higher_order(
+        &mut self,
+        module: &str,
+        op: &str,
+        args: &[a::CExpr],
+        _node_id_idx: u32,
+    ) -> bool {
+        match (module, op) {
+            ("result", "map") => self.emit_variant_map(args, "Ok", true),
+            ("result", "and_then") => self.emit_variant_map(args, "Ok", false),
+            ("result", "map_err") => self.emit_variant_map(args, "Err", true),
+            ("option", "map") => self.emit_variant_map(args, "Some", true),
+            ("option", "and_then") => self.emit_variant_map(args, "Some", false),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Inline pattern: `<module>.map(v, f)` and friends.
+    /// `wrap_with`: variant tag whose payload triggers the call (Ok / Some / Err).
+    /// `wrap_result`: if true, wrap the closure's result back in `wrap_with`
+    /// (map shape); if false, expect the closure to return a wrapped value
+    /// itself (and_then shape).
+    fn emit_variant_map(
+        &mut self,
+        args: &[a::CExpr],
+        wrap_with: &str,
+        wrap_result: bool,
+    ) {
+        // args[0] = the wrapped value (Result/Option), args[1] = closure
+        let wrap_idx = self.pool.variant(wrap_with);
+
+        // Compile and store the value into a local, evaluate closure on top of stack.
+        self.compile_expr(&args[0], false);
+        let val_slot = self.alloc_local("__hov");
+        self.emit(Op::StoreLocal(val_slot));
+
+        self.compile_expr(&args[1], false);
+        let f_slot = self.alloc_local("__hof");
+        self.emit(Op::StoreLocal(f_slot));
+
+        // Stack discipline:
+        //   load val ⇒ [v]
+        //   dup     ⇒ [v, v]
+        //   test    ⇒ [v, Bool]
+        //   jumpifnot ⇒ [v]
+        // Both branches end with [v] before the branch body.
+        self.emit(Op::LoadLocal(val_slot));
+        self.emit(Op::Dup);
+        self.emit(Op::TestVariant(wrap_idx));
+        let j_skip = self.code.len();
+        self.emit(Op::JumpIfNot(0));
+
+        // Matched arm: extract payload, call closure on it.
+        self.emit(Op::GetVariantArg(0));
+        let arg_slot = self.alloc_local("__hov_arg");
+        self.emit(Op::StoreLocal(arg_slot));
+        self.emit(Op::LoadLocal(f_slot));
+        self.emit(Op::LoadLocal(arg_slot));
+        let nid = self.pool.node_id("n_hov");
+        self.emit(Op::CallClosure { arity: 1, node_id_idx: nid });
+        if wrap_result {
+            self.emit(Op::MakeVariant { name_idx: wrap_idx, arity: 1 });
+        }
+        let j_end = self.code.len();
+        self.emit(Op::Jump(0));
+
+        // Skip arm: stack already has [v] from the failed Dup; nothing to do.
+        let skip_target = self.code.len() as i32;
+        if let Op::JumpIfNot(off) = &mut self.code[j_skip] {
+            *off = skip_target - (j_skip as i32 + 1);
+        }
+
+        let end_target = self.code.len() as i32;
+        if let Op::Jump(off) = &mut self.code[j_end] {
+            *off = end_target - (j_end as i32 + 1);
+        }
+    }
+}
+
+/// Collect free variables referenced in `e` that are not in `bound`.
+/// Mutates `bound` to track let/lambda introductions during the walk;
+/// the caller's set is preserved on return because Rust's borrow rules
+/// force us to clone for sub-scopes that rebind a name.
+fn free_vars(e: &a::CExpr, bound: &mut std::collections::HashSet<String>, out: &mut Vec<String>) {
+    match e {
+        a::CExpr::Literal { .. } => {}
+        a::CExpr::Var { name } => {
+            if !bound.contains(name) && !out.contains(name) {
+                out.push(name.clone());
+            }
+        }
+        a::CExpr::Call { callee, args } => {
+            free_vars(callee, bound, out);
+            for a in args { free_vars(a, bound, out); }
+        }
+        a::CExpr::Let { name, value, body, .. } => {
+            free_vars(value, bound, out);
+            let was_bound = bound.contains(name);
+            bound.insert(name.clone());
+            free_vars(body, bound, out);
+            if !was_bound { bound.remove(name); }
+        }
+        a::CExpr::Match { scrutinee, arms } => {
+            free_vars(scrutinee, bound, out);
+            for arm in arms {
+                let mut local_bound = bound.clone();
+                pattern_binders(&arm.pattern, &mut local_bound);
+                free_vars(&arm.body, &mut local_bound, out);
+            }
+        }
+        a::CExpr::Block { statements, result } => {
+            let mut local_bound = bound.clone();
+            for s in statements { free_vars(s, &mut local_bound, out); }
+            free_vars(result, &mut local_bound, out);
+        }
+        a::CExpr::Constructor { args, .. } => {
+            for a in args { free_vars(a, bound, out); }
+        }
+        a::CExpr::RecordLit { fields } => {
+            for f in fields { free_vars(&f.value, bound, out); }
+        }
+        a::CExpr::TupleLit { items } | a::CExpr::ListLit { items } => {
+            for it in items { free_vars(it, bound, out); }
+        }
+        a::CExpr::FieldAccess { value, .. } => free_vars(value, bound, out),
+        a::CExpr::Lambda { params, body, .. } => {
+            let mut inner = bound.clone();
+            for p in params { inner.insert(p.name.clone()); }
+            free_vars(body, &mut inner, out);
+        }
+        a::CExpr::BinOp { lhs, rhs, .. } => {
+            free_vars(lhs, bound, out);
+            free_vars(rhs, bound, out);
+        }
+        a::CExpr::UnaryOp { expr, .. } => free_vars(expr, bound, out),
+        a::CExpr::Return { value } => free_vars(value, bound, out),
+    }
+}
+
+fn pattern_binders(p: &a::Pattern, bound: &mut std::collections::HashSet<String>) {
+    match p {
+        a::Pattern::PWild | a::Pattern::PLiteral { .. } => {}
+        a::Pattern::PVar { name } => { bound.insert(name.clone()); }
+        a::Pattern::PConstructor { args, .. } => {
+            for a in args { pattern_binders(a, bound); }
+        }
+        a::Pattern::PRecord { fields } => {
+            for f in fields { pattern_binders(&f.pattern, bound); }
+        }
+        a::Pattern::PTuple { items } => {
+            for it in items { pattern_binders(it, bound); }
+        }
     }
 }
