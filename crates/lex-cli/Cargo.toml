@@ -18,3 +18,4 @@ lex-ast = { path = "../lex-ast" }
 lex-types = { path = "../lex-types" }
 lex-bytecode = { path = "../lex-bytecode" }
 lex-runtime = { path = "../lex-runtime" }
+lex-store = { path = "../lex-store" }
