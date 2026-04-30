@@ -39,7 +39,10 @@ fn example_d_shape() {
     };
     let r = vm.call("area", vec![circle]).unwrap();
     let v = match r { Value::Float(f) => f, other => panic!("expected float, got {other:?}") };
-    assert!((v - 3.14159).abs() < 1e-6, "got {v}");
+    // Source uses 3.14159 directly (the spec's example, not std::f64::consts::PI).
+    #[allow(clippy::approx_constant)]
+    let expected_area = 3.14159_f64;
+    assert!((v - expected_area).abs() < 1e-6, "got {v}");
 
     let rect = Value::Variant {
         name: "Rect".into(),

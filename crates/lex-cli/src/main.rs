@@ -7,7 +7,7 @@
 //!   lex hash <file>                    # canonical AST hash for each stage
 
 use anyhow::{anyhow, bail, Context, Result};
-use lex_ast::{canonicalize_program, print_stages, stage_canonical_hash_hex, stage_id, Stage};
+use lex_ast::{canonicalize_program, stage_canonical_hash_hex, stage_id, Stage};
 use lex_bytecode::{compile_program, Value, Vm};
 use lex_syntax::parse_source;
 use std::fs;
@@ -180,6 +180,3 @@ fn value_to_json(v: &Value) -> serde_json::Value {
         }
     }
 }
-
-#[allow(dead_code)]
-fn unused_print_stages(s: &[Stage]) -> String { print_stages(s) }
