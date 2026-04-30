@@ -4,6 +4,8 @@ A small family of programming languages designed for LLMs as primary writers, re
 
 Implementation of `langspecv2.md`. The design rules and milestone definitions all come from that document; this README focuses on what currently runs.
 
+> **Looking for the pitch?** The [project landing page](docs/index.html) is a single static HTML — open it locally, or visit it via GitHub Pages once enabled (Settings → Pages → Source: `main` / `/docs`). It frames Lex as a sandbox for agent-written code: type-check rejects malicious LLM-generated bodies before they run.
+
 ## Design rules at a glance
 
 1. **One canonical AST per meaning.** Two programs that mean the same thing have the same canonical AST and the same hash.
