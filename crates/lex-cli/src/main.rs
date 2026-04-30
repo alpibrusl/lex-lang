@@ -6,11 +6,15 @@
 //!   lex run [--allow-effects k1,k2] [--allow-fs-read p] [--allow-fs-write p]
 //!           [--budget N] <file> <fn> [<arg>...]
 //!   lex hash <file>
+//!   lex publish [--store DIR] [--activate] <file>
+//!   lex store list [--store DIR]
+//!   lex store get [--store DIR] <stage_id>
 
 use anyhow::{anyhow, bail, Context, Result};
-use lex_ast::{canonicalize_program, stage_canonical_hash_hex, stage_id, Stage};
+use lex_ast::{canonicalize_program, sig_id, stage_canonical_hash_hex, stage_id, Stage};
 use lex_bytecode::{compile_program, vm::Vm, Value};
 use lex_runtime::{check_program as check_policy, DefaultHandler, Policy};
+use lex_store::Store;
 use lex_syntax::parse_source;
 use std::collections::BTreeSet;
 use std::fs;
@@ -32,6 +36,8 @@ fn run(args: &[String]) -> Result<()> {
         "check" => cmd_check(&args[1..]),
         "run" => cmd_run(&args[1..]),
         "hash" => cmd_hash(&args[1..]),
+        "publish" => cmd_publish(&args[1..]),
+        "store" => cmd_store(&args[1..]),
         "help" | "--help" | "-h" => { print_usage(); Ok(()) }
         other => bail!("unknown command `{other}`. try `lex help`"),
     }
@@ -44,6 +50,10 @@ fn print_usage() {
     println!("  check <file>                       type-check; exit 0 or print errors");
     println!("  run [policy] <file> <fn> [args]    execute fn (args parsed as JSON)");
     println!("  hash <file>                        print stage canonical hashes");
+    println!("  publish [--store DIR] [--activate] <file>");
+    println!("                                     publish each stage to the store as Draft");
+    println!("  store list [--store DIR]           list SigIds in the store");
+    println!("  store get [--store DIR] <stage>    print metadata + canonical AST for a StageId");
     println!();
     println!("policy flags (run):");
     println!("  --allow-effects k1,k2,...   permit these effect kinds");
@@ -235,5 +245,100 @@ fn value_to_json(v: &Value) -> serde_json::Value {
             m.insert("args".into(), J::Array(args.iter().map(value_to_json).collect()));
             J::Object(m)
         }
+    }
+}
+
+// ---- M6: store subcommands ----
+
+fn default_store_root() -> PathBuf {
+    if let Ok(s) = std::env::var("LEX_STORE") { return PathBuf::from(s); }
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home).join(".lex").join("store");
+    }
+    PathBuf::from(".lex-store")
+}
+
+fn parse_store_flag(args: &[String]) -> (PathBuf, Vec<String>, bool) {
+    // Returns (store_root, remaining_args, activate).
+    let mut root = default_store_root();
+    let mut activate = false;
+    let mut rest = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--store" => {
+                if let Some(v) = args.get(i + 1) { root = PathBuf::from(v); i += 2; } else { i += 1; }
+            }
+            "--activate" => { activate = true; i += 1; }
+            _ => { rest.push(args[i].clone()); i += 1; }
+        }
+    }
+    (root, rest, activate)
+}
+
+fn cmd_publish(args: &[String]) -> Result<()> {
+    let (root, rest, activate) = parse_store_flag(args);
+    let path = rest.first().ok_or_else(|| anyhow!("usage: lex publish [--store DIR] [--activate] <file>"))?;
+    let src = read_source(path)?;
+    let prog = parse_source(&src)?;
+    let stages = canonicalize_program(&prog);
+    if let Err(errs) = lex_types::check_program(&stages) {
+        for e in &errs {
+            eprintln!("{}", serde_json::to_string(e)?);
+        }
+        std::process::exit(2);
+    }
+    let store = Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
+    let mut out = Vec::new();
+    for s in &stages {
+        // Imports aren't stages.
+        if matches!(s, Stage::Import(_)) { continue; }
+        let id = store.publish(s).with_context(|| "publishing stage")?;
+        if activate {
+            store.activate(&id).with_context(|| format!("activating {id}"))?;
+        }
+        let name = match s { Stage::FnDecl(fd) => &fd.name, Stage::TypeDecl(td) => &td.name, _ => "?" };
+        let sig = sig_id(s).unwrap_or_else(|| "-".into());
+        let entry = serde_json::json!({
+            "name": name,
+            "sig_id": sig,
+            "stage_id": id,
+            "status": format!("{:?}", store.get_status(&id)?).to_lowercase(),
+        });
+        out.push(entry);
+    }
+    println!("{}", serde_json::to_string_pretty(&out)?);
+    Ok(())
+}
+
+fn cmd_store(args: &[String]) -> Result<()> {
+    let sub = args.first().ok_or_else(|| anyhow!("usage: lex store {{list|get}} ..."))?;
+    let rest = &args[1..];
+    match sub.as_str() {
+        "list" => {
+            let (root, _rest, _) = parse_store_flag(rest);
+            let store = Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
+            let sigs = store.list_sigs()?;
+            for s in sigs {
+                let active = store.resolve_sig(&s)?.unwrap_or_default();
+                println!("{s}\tactive={active}");
+            }
+            Ok(())
+        }
+        "get" => {
+            let (root, rest, _) = parse_store_flag(rest);
+            let store = Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
+            let id = rest.first().ok_or_else(|| anyhow!("usage: lex store get <stage_id>"))?;
+            let meta = store.get_metadata(id)?;
+            let ast = store.get_ast(id)?;
+            let v = serde_json::json!({
+                "metadata": serde_json::to_value(&meta)?,
+                "status": format!("{:?}", store.get_status(id)?).to_lowercase(),
+                "ast": serde_json::to_value(&ast)?,
+            });
+            println!("{}", serde_json::to_string_pretty(&v)?);
+            Ok(())
+        }
+        other => bail!("unknown `lex store` subcommand: {other}"),
     }
 }

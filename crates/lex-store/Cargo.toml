@@ -9,3 +9,9 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+indexmap.workspace = true
+lex-ast = { path = "../lex-ast" }
+
+[dev-dependencies]
+lex-syntax = { path = "../lex-syntax" }
+tempfile = "3"
