@@ -158,7 +158,24 @@ impl EffectHandler for DefaultHandler {
                 let program = self.program.clone()
                     .ok_or_else(|| "net.serve requires a Program reference; use DefaultHandler::with_program".to_string())?;
                 let policy = self.policy.clone();
-                serve_http(port, handler_name, program, policy)
+                serve_http(port, handler_name, program, policy, None)
+            }
+            ("net", "serve_tls") => {
+                let port = match args.first() {
+                    Some(Value::Int(n)) if (0..=65535).contains(n) => *n as u16,
+                    _ => return Err("net.serve_tls(port, cert, key, handler): port must be Int 0..=65535".into()),
+                };
+                let cert_path = expect_str(args.get(1))?.to_string();
+                let key_path = expect_str(args.get(2))?.to_string();
+                let handler_name = expect_str(args.get(3))?.to_string();
+                let program = self.program.clone()
+                    .ok_or_else(|| "net.serve_tls requires a Program reference".to_string())?;
+                let policy = self.policy.clone();
+                let cert = std::fs::read(&cert_path)
+                    .map_err(|e| format!("net.serve_tls: read cert {cert_path}: {e}"))?;
+                let key = std::fs::read(&key_path)
+                    .map_err(|e| format!("net.serve_tls: read key {key_path}: {e}"))?;
+                serve_http(port, handler_name, program, policy, Some(TlsConfig { cert, key }))
             }
             other => Err(format!("unsupported effect {}.{}", other.0, other.1)),
         }
@@ -173,10 +190,38 @@ impl EffectHandler for DefaultHandler {
 /// Handler signature in Lex (by convention):
 ///   fn <name>(req :: Record { method :: Str, path :: Str, body :: Str })
 ///        -> Record { status :: Int, body :: Str }
-fn serve_http(port: u16, handler_name: String, program: Arc<Program>, policy: Policy) -> Result<Value, String> {
-    let server = tiny_http::Server::http(("127.0.0.1", port))
-        .map_err(|e| format!("net.serve bind {port}: {e}"))?;
-    eprintln!("net.serve: listening on http://127.0.0.1:{port}");
+/// PEM-encoded certificate + private key, both as raw bytes.
+pub struct TlsConfig {
+    pub cert: Vec<u8>,
+    pub key: Vec<u8>,
+}
+
+fn serve_http(
+    port: u16,
+    handler_name: String,
+    program: Arc<Program>,
+    policy: Policy,
+    tls: Option<TlsConfig>,
+) -> Result<Value, String> {
+    let (server, scheme) = match tls {
+        None => (
+            tiny_http::Server::http(("127.0.0.1", port))
+                .map_err(|e| format!("net.serve bind {port}: {e}"))?,
+            "http",
+        ),
+        Some(cfg) => {
+            let ssl = tiny_http::SslConfig {
+                certificate: cfg.cert,
+                private_key: cfg.key,
+            };
+            (
+                tiny_http::Server::https(("127.0.0.1", port), ssl)
+                    .map_err(|e| format!("net.serve_tls bind {port}: {e}"))?,
+                "https",
+            )
+        }
+    };
+    eprintln!("net.serve: listening on {scheme}://127.0.0.1:{port}");
     // Thread-per-request: the main loop accepts; each request runs on
     // its own worker thread with its own fresh Vm. The Program is
     // shared via Arc; Policy and handler_name are cloned per request.
