@@ -38,6 +38,8 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             fields.insert("is_empty".into(), Ty::function(vec![Ty::str()], EffectSet::empty(), Ty::bool()));
             fields.insert("to_int".into(), Ty::function(vec![Ty::str()], EffectSet::empty(),
                 Ty::Con("Option".into(), vec![Ty::int()])));
+            fields.insert("to_float".into(), Ty::function(vec![Ty::str()], EffectSet::empty(),
+                Ty::Con("Option".into(), vec![Ty::float()])));
             fields.insert("concat".into(), Ty::function(vec![Ty::str(), Ty::str()], EffectSet::empty(), Ty::str()));
             fields.insert("len".into(), Ty::function(vec![Ty::str()], EffectSet::empty(), Ty::int()));
             fields.insert("split".into(), Ty::function(
@@ -82,6 +84,65 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             let mut fields = IndexMap::new();
             fields.insert("to_str".into(), Ty::function(vec![Ty::int()], EffectSet::empty(), Ty::str()));
             fields.insert("to_float".into(), Ty::function(vec![Ty::int()], EffectSet::empty(), Ty::float()));
+            Some(Ty::Record(fields))
+        }
+        "math" => {
+            let mut fields = IndexMap::new();
+            // Matrix is registered as a built-in type alias in
+            // TypeEnv::new_with_builtins; refer to it nominally so call
+            // sites unify against the user's `:: Matrix` annotations.
+            let mat = || Ty::Con("Matrix".into(), Vec::new());
+            // Scalar floats.
+            for name in &["exp", "log", "sqrt", "abs"] {
+                fields.insert((*name).into(), Ty::function(
+                    vec![Ty::float()], EffectSet::empty(), Ty::float(),
+                ));
+            }
+            // Constructors.
+            fields.insert("zeros".into(), Ty::function(
+                vec![Ty::int(), Ty::int()], EffectSet::empty(), mat(),
+            ));
+            fields.insert("ones".into(), Ty::function(
+                vec![Ty::int(), Ty::int()], EffectSet::empty(), mat(),
+            ));
+            fields.insert("from_lists".into(), Ty::function(
+                vec![Ty::List(Box::new(Ty::List(Box::new(Ty::float()))))],
+                EffectSet::empty(),
+                mat(),
+            ));
+            fields.insert("from_flat".into(), Ty::function(
+                vec![Ty::int(), Ty::int(), Ty::List(Box::new(Ty::float()))],
+                EffectSet::empty(),
+                mat(),
+            ));
+            // Accessors.
+            fields.insert("rows".into(), Ty::function(vec![mat()], EffectSet::empty(), Ty::int()));
+            fields.insert("cols".into(), Ty::function(vec![mat()], EffectSet::empty(), Ty::int()));
+            fields.insert("get".into(), Ty::function(
+                vec![mat(), Ty::int(), Ty::int()], EffectSet::empty(), Ty::float(),
+            ));
+            fields.insert("to_flat".into(), Ty::function(
+                vec![mat()], EffectSet::empty(),
+                Ty::List(Box::new(Ty::float())),
+            ));
+            // Linalg ops.
+            fields.insert("transpose".into(), Ty::function(
+                vec![mat()], EffectSet::empty(), mat(),
+            ));
+            fields.insert("matmul".into(), Ty::function(
+                vec![mat(), mat()], EffectSet::empty(), mat(),
+            ));
+            fields.insert("scale".into(), Ty::function(
+                vec![Ty::float(), mat()], EffectSet::empty(), mat(),
+            ));
+            for name in &["add", "sub"] {
+                fields.insert((*name).into(), Ty::function(
+                    vec![mat(), mat()], EffectSet::empty(), mat(),
+                ));
+            }
+            fields.insert("sigmoid".into(), Ty::function(
+                vec![mat()], EffectSet::empty(), mat(),
+            ));
             Some(Ty::Record(fields))
         }
         "float" => {
@@ -344,6 +405,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "bytes" => "bytes",
         "net" => "net",
         "chat" => "chat",
+        "math" => "math",
         _ => return None,
     })
 }

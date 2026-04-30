@@ -16,7 +16,7 @@ pub fn try_pure_builtin(kind: &str, op: &str, args: &[Value]) -> Option<Result<V
 /// walk to skip pure builtins that programs reference via imports.
 pub fn is_pure_module(kind: &str) -> bool {
     matches!(kind, "str" | "int" | "float" | "bool" | "list" | "map" | "set"
-        | "option" | "result" | "tuple" | "json" | "bytes" | "flow")
+        | "option" | "result" | "tuple" | "json" | "bytes" | "flow" | "math")
 }
 
 fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
@@ -105,6 +105,13 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         ("int", "to_float") => Ok(Value::Float(expect_int(args.first())? as f64)),
         ("float", "to_int") => Ok(Value::Int(expect_float(args.first())? as i64)),
         ("float", "to_str") => Ok(Value::Str(expect_float(args.first())?.to_string())),
+        ("str", "to_float") => {
+            let s = expect_str(args.first())?;
+            match s.parse::<f64>() {
+                Ok(f) => Ok(some(Value::Float(f))),
+                Err(_) => Ok(none()),
+            }
+        }
 
         // -- list --
         ("list", "len") => Ok(Value::Int(expect_list(args.first())?.len() as i64)),
@@ -218,8 +225,203 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             Ok(Value::Bool(b.is_empty()))
         }
 
+        // -- math --
+        // Matrices are stored as the F64Array fast-lane variant (a flat
+        // row-major Vec<f64> with shape). Lex code treats them as the
+        // type alias `Matrix = { rows :: Int, cols :: Int, data ::
+        // List[Float] }`; field access is unsupported, so all
+        // introspection happens through these helpers.
+        ("math", "exp")  => Ok(Value::Float(expect_float(args.first())?.exp())),
+        ("math", "log")  => Ok(Value::Float(expect_float(args.first())?.ln())),
+        ("math", "sqrt") => Ok(Value::Float(expect_float(args.first())?.sqrt())),
+        ("math", "abs")  => Ok(Value::Float(expect_float(args.first())?.abs())),
+        ("math", "zeros") => {
+            let r = expect_int(args.first())?;
+            let c = expect_int(args.get(1))?;
+            if r < 0 || c < 0 {
+                return Err(format!("math.zeros: negative dim {r}x{c}"));
+            }
+            let r = r as usize; let c = c as usize;
+            Ok(Value::F64Array { rows: r as u32, cols: c as u32, data: vec![0.0; r * c] })
+        }
+        ("math", "ones") => {
+            let r = expect_int(args.first())?;
+            let c = expect_int(args.get(1))?;
+            if r < 0 || c < 0 {
+                return Err(format!("math.ones: negative dim {r}x{c}"));
+            }
+            let r = r as usize; let c = c as usize;
+            Ok(Value::F64Array { rows: r as u32, cols: c as u32, data: vec![1.0; r * c] })
+        }
+        ("math", "from_lists") => {
+            let rows = expect_list(args.first())?;
+            let r = rows.len();
+            if r == 0 {
+                return Ok(Value::F64Array { rows: 0, cols: 0, data: Vec::new() });
+            }
+            let first_row = match &rows[0] {
+                Value::List(xs) => xs,
+                other => return Err(format!("math.from_lists: row 0 not List, got {other:?}")),
+            };
+            let c = first_row.len();
+            let mut data = Vec::with_capacity(r * c);
+            for (i, row) in rows.iter().enumerate() {
+                let row = match row {
+                    Value::List(xs) => xs,
+                    other => return Err(format!("math.from_lists: row {i} not List, got {other:?}")),
+                };
+                if row.len() != c {
+                    return Err(format!("math.from_lists: row {i} has {} cols, expected {c}", row.len()));
+                }
+                for (j, v) in row.iter().enumerate() {
+                    let f = match v {
+                        Value::Float(f) => *f,
+                        Value::Int(n) => *n as f64,
+                        other => return Err(format!("math.from_lists: ({i},{j}) not numeric, got {other:?}")),
+                    };
+                    data.push(f);
+                }
+            }
+            Ok(Value::F64Array { rows: r as u32, cols: c as u32, data })
+        }
+        ("math", "from_flat") => {
+            let r = expect_int(args.first())?;
+            let c = expect_int(args.get(1))?;
+            let xs = expect_list(args.get(2))?;
+            if r < 0 || c < 0 {
+                return Err(format!("math.from_flat: negative dim {r}x{c}"));
+            }
+            let r = r as usize; let c = c as usize;
+            if xs.len() != r * c {
+                return Err(format!("math.from_flat: list len {} != {}*{}", xs.len(), r, c));
+            }
+            let mut data = Vec::with_capacity(r * c);
+            for v in xs {
+                data.push(match v {
+                    Value::Float(f) => *f,
+                    Value::Int(n)   => *n as f64,
+                    other => return Err(format!("math.from_flat: non-numeric element {other:?}")),
+                });
+            }
+            Ok(Value::F64Array { rows: r as u32, cols: c as u32, data })
+        }
+        ("math", "rows") => {
+            let (r, _, _) = unpack_matrix(first_arg(args)?)?;
+            Ok(Value::Int(r as i64))
+        }
+        ("math", "cols") => {
+            let (_, c, _) = unpack_matrix(first_arg(args)?)?;
+            Ok(Value::Int(c as i64))
+        }
+        ("math", "get") => {
+            let (r, c, data) = unpack_matrix(first_arg(args)?)?;
+            let i = expect_int(args.get(1))? as usize;
+            let j = expect_int(args.get(2))? as usize;
+            if i >= r || j >= c {
+                return Err(format!("math.get: ({i},{j}) out of {r}x{c}"));
+            }
+            Ok(Value::Float(data[i * c + j]))
+        }
+        ("math", "to_flat") => {
+            let (_, _, data) = unpack_matrix(first_arg(args)?)?;
+            Ok(Value::List(data.into_iter().map(Value::Float).collect()))
+        }
+        ("math", "transpose") => {
+            let (r, c, data) = unpack_matrix(first_arg(args)?)?;
+            let mut out = vec![0.0; r * c];
+            for i in 0..r {
+                for j in 0..c {
+                    out[j * r + i] = data[i * c + j];
+                }
+            }
+            Ok(Value::F64Array { rows: c as u32, cols: r as u32, data: out })
+        }
+        ("math", "matmul") => {
+            let (m, k1, a) = unpack_matrix(first_arg(args)?)?;
+            let (k2, n, b) = unpack_matrix(args.get(1).ok_or("math.matmul: missing arg 1")?)?;
+            if k1 != k2 {
+                return Err(format!("math.matmul: dim mismatch {m}x{k1} · {k2}x{n}"));
+            }
+            // Plain triple loop. For the small matrices used in the ML
+            // demo (n<200, k<10) this is well under a millisecond and
+            // avoids pulling in matrixmultiply for the runtime crate.
+            let mut c = vec![0.0; m * n];
+            for i in 0..m {
+                for kk in 0..k1 {
+                    let aik = a[i * k1 + kk];
+                    for j in 0..n {
+                        c[i * n + j] += aik * b[kk * n + j];
+                    }
+                }
+            }
+            Ok(Value::F64Array { rows: m as u32, cols: n as u32, data: c })
+        }
+        ("math", "scale") => {
+            let s = expect_float(args.first())?;
+            let (r, c, mut data) = unpack_matrix(args.get(1).ok_or("math.scale: missing arg 1")?)?;
+            for x in &mut data { *x *= s; }
+            Ok(Value::F64Array { rows: r as u32, cols: c as u32, data })
+        }
+        ("math", "add") | ("math", "sub") => {
+            let (ar, ac, a) = unpack_matrix(first_arg(args)?)?;
+            let (br, bc, b) = unpack_matrix(args.get(1).ok_or("math.add/sub: missing arg 1")?)?;
+            if ar != br || ac != bc {
+                return Err(format!("math.{op}: shape mismatch {ar}x{ac} vs {br}x{bc}"));
+            }
+            let neg = op == "sub";
+            let mut out = a;
+            for (i, x) in out.iter_mut().enumerate() {
+                if neg { *x -= b[i] } else { *x += b[i] }
+            }
+            Ok(Value::F64Array { rows: ar as u32, cols: ac as u32, data: out })
+        }
+        ("math", "sigmoid") => {
+            let (r, c, mut data) = unpack_matrix(first_arg(args)?)?;
+            for x in &mut data { *x = 1.0 / (1.0 + (-*x).exp()); }
+            Ok(Value::F64Array { rows: r as u32, cols: c as u32, data })
+        }
+
         _ => Err(format!("unknown pure builtin: {kind}.{op}")),
     }
+}
+
+/// Unpack any matrix-shaped Value into (rows, cols, flat row-major data).
+/// Accepts the F64Array fast lane and the legacy `Record { rows, cols,
+/// data: List[Float] }` shape for compatibility with hand-built matrices.
+fn unpack_matrix(v: &Value) -> Result<(usize, usize, Vec<f64>), String> {
+    if let Value::F64Array { rows, cols, data } = v {
+        return Ok((*rows as usize, *cols as usize, data.clone()));
+    }
+    let rec = match v {
+        Value::Record(r) => r,
+        other => return Err(format!("expected matrix, got {other:?}")),
+    };
+    let rows = match rec.get("rows") {
+        Some(Value::Int(n)) => *n as usize,
+        _ => return Err("matrix: missing/invalid `rows`".into()),
+    };
+    let cols = match rec.get("cols") {
+        Some(Value::Int(n)) => *n as usize,
+        _ => return Err("matrix: missing/invalid `cols`".into()),
+    };
+    let data = match rec.get("data") {
+        Some(Value::List(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for it in items {
+                out.push(match it {
+                    Value::Float(f) => *f,
+                    Value::Int(n) => *n as f64,
+                    other => return Err(format!("matrix data: not numeric, got {other:?}")),
+                });
+            }
+            out
+        }
+        _ => return Err("matrix: missing/invalid `data`".into()),
+    };
+    if data.len() != rows * cols {
+        return Err(format!("matrix: data len {} != {rows}*{cols}", data.len()));
+    }
+    Ok((rows, cols, data))
 }
 
 fn expect_bytes(v: Option<&Value>) -> Result<&Vec<u8>, String> {

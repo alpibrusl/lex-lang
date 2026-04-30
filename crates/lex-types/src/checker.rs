@@ -154,10 +154,17 @@ impl Checker {
 
         // Unfold record-aliased return types so users can declare
         //   `type Response = { ... }`
-        // and return a record literal directly.
-        let ret_ty_unfolded = self.unfold_record_alias(ret_ty.clone());
-        if let Err(e) = self.u.unify(&body_ty, &ret_ty_unfolded) {
-            return Err(vec![mismatch_err("n_0", e, &self.u, vec![format!("in function `{}`", fd.name)])]);
+        // and return a record literal directly. If the body itself
+        // produces an aliased Con (e.g. a value of type `Matrix`
+        // returned to a `-> Matrix` signature), the two sides should
+        // match nominally — try the un-unfolded pair first, fall
+        // back to unfolded.
+        if self.u.unify(&body_ty, &ret_ty).is_err() {
+            let ret_ty_unfolded = self.unfold_record_alias(ret_ty.clone());
+            let body_ty_unfolded = self.unfold_record_alias(self.u.resolve(&body_ty));
+            if let Err(e) = self.u.unify(&body_ty_unfolded, &ret_ty_unfolded) {
+                return Err(vec![mismatch_err("n_0", e, &self.u, vec![format!("in function `{}`", fd.name)])]);
+            }
         }
 
         if !inferred_effects.is_subset(&declared_effects) {
