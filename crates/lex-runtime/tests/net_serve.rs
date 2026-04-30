@@ -120,3 +120,79 @@ fn weather_app_responds_to_routes() {
     assert_eq!(status, 405);
     assert!(body.contains("method not allowed"));
 }
+
+#[test]
+fn net_serve_handles_concurrent_requests() {
+    // Each handler simulates work via a small list-fold; many threads
+    // hammer the server in parallel. All must succeed with the right
+    // body. This validates that worker threads don't share mutable
+    // state that could race.
+    let src = r#"
+import "std.net" as net
+import "std.str" as str
+import "std.int" as int
+import "std.list" as list
+
+fn handle(req :: { body :: Str, method :: Str, path :: Str, query :: Str }) -> { body :: Str, status :: Int } {
+  # Sum 0..50; deterministic but non-trivial work to encourage scheduling.
+  let total := list.fold(list.range(0, 50), 0, fn (acc :: Int, x :: Int) -> Int { acc + x })
+  { status: 200, body: str.concat(req.path, str.concat(":", int.to_str(total))) }
+}
+
+fn main() -> [net] Nil { net.serve(18094, "handle") }
+"#;
+    spawn_lex_server(src, "main");
+
+    // Fire 32 requests across 8 client threads.
+    let mut handles = Vec::new();
+    for t in 0..8 {
+        let h = thread::spawn(move || {
+            for i in 0..4 {
+                let path = format!("/req-{t}-{i}");
+                let (status, body) = http(18094, "GET", &path, "");
+                assert_eq!(status, 200, "req {t}-{i}: status {status}");
+                assert!(body.starts_with(&path), "req {t}-{i}: body {body}");
+                // sum 0..50 = 1225.
+                assert!(body.ends_with(":1225"), "req {t}-{i}: body {body}");
+            }
+        });
+        handles.push(h);
+    }
+    for h in handles { h.join().expect("worker thread panicked"); }
+}
+
+#[test]
+fn net_serve_concurrent_requests_finish_in_bounded_time() {
+    // 8 concurrent requests with light per-request work. Sanity check:
+    // the server doesn't deadlock, doesn't drop requests, and responds
+    // within a reasonable wall-clock bound. Strict speedup measurements
+    // are environment-sensitive (single-CPU CI vs. multi-core) so we
+    // only assert correctness + bounded duration here.
+    let src = r#"
+import "std.net" as net
+import "std.list" as list
+import "std.str" as str
+import "std.int" as int
+
+fn handle(req :: { body :: Str, method :: Str, path :: Str, query :: Str }) -> { body :: Str, status :: Int } {
+  let n := list.fold(list.range(0, 200), 0, fn (acc :: Int, x :: Int) -> Int { acc + x })
+  { status: 200, body: int.to_str(n) }
+}
+
+fn main() -> [net] Nil { net.serve(18095, "handle") }
+"#;
+    spawn_lex_server(src, "main");
+
+    let start = std::time::Instant::now();
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        handles.push(thread::spawn(move || {
+            let (status, body) = http(18095, "GET", "/work", "");
+            assert_eq!(status, 200);
+            assert_eq!(body, "19900");  // sum 0..200 = 19900
+        }));
+    }
+    for h in handles { h.join().unwrap(); }
+    let elapsed = start.elapsed();
+    assert!(elapsed.as_secs() < 10, "8 concurrent requests took {}s — handler stuck?", elapsed.as_secs());
+}
