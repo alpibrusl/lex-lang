@@ -123,6 +123,10 @@ fn build_matrix(rows: usize, cols: usize, fill: impl Fn(usize, usize) -> f64) ->
 }
 
 fn unwrap_matrix(v: &Value) -> (usize, usize, Vec<f64>) {
+    // Native matmul now returns the fast `Value::F64Array` lane.
+    if let Value::F64Array { rows, cols, data } = v {
+        return (*rows as usize, *cols as usize, data.clone());
+    }
     let rec = match v { Value::Record(r) => r, _ => panic!("not a matrix") };
     let rows = match rec["rows"] { Value::Int(n) => n as usize, _ => panic!() };
     let cols = match rec["cols"] { Value::Int(n) => n as usize, _ => panic!() };
@@ -198,10 +202,12 @@ fn native_matmul_perf_1024_release_only() {
 
     let (rows, cols, _) = unwrap_matrix(&r);
     assert_eq!((rows, cols), (n, n));
+    // §13.7 #1: <100ms target. Now that the matmul path uses the
+    // `Value::F64Array` fast lane (no per-element boxing), end-to-end
+    // matches the kernel time. We allow a 150ms cap for CI variance.
     assert!(
-        elapsed.as_millis() < 500,
-        "1024×1024 matmul end-to-end took {}ms (kernel target <100ms; \
-         observed time is dominated by Value::Float (un)boxing of 2M elements)",
+        elapsed.as_millis() < 150,
+        "1024×1024 matmul end-to-end took {}ms (spec target <100ms; cap 150ms for CI variance)",
         elapsed.as_millis(),
     );
 }

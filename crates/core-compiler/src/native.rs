@@ -42,12 +42,22 @@ impl NativeRegistry {
     }
 }
 
-/// Matrix value layout: `Record { rows, cols, data: List[Float] }`,
-/// row-major. We unwrap to a flat `Vec<f64>` for the hot loop.
+/// Matrix value: prefers the `Value::F64Array` fast lane (no boxing
+/// overhead). Also accepts the legacy `Record { rows, cols, data:
+/// List[Float] }` shape so existing Lex source that builds matrices
+/// from records still works.
 fn unpack_matrix(v: &Value) -> Result<(usize, usize, Vec<f64>), String> {
+    if let Value::F64Array { rows, cols, data } = v {
+        let r = *rows as usize;
+        let c = *cols as usize;
+        if data.len() != r * c {
+            return Err(format!("F64Array data has {} elements but rows*cols = {}", data.len(), r * c));
+        }
+        return Ok((r, c, data.clone()));
+    }
     let rec = match v {
         Value::Record(r) => r,
-        other => return Err(format!("expected Record matrix, got {other:?}")),
+        other => return Err(format!("expected matrix (F64Array or Record), got {other:?}")),
     };
     let rows = rec.get("rows").ok_or("missing field rows")?;
     let cols = rec.get("cols").ok_or("missing field cols")?;
@@ -74,7 +84,21 @@ fn unpack_matrix(v: &Value) -> Result<(usize, usize, Vec<f64>), String> {
     Ok((r, c, buf))
 }
 
+/// Pack a result matrix as the fast `F64Array` representation. Native
+/// op consumers see this and unwrap directly without per-element
+/// boxing on subsequent calls.
 fn pack_matrix(rows: usize, cols: usize, data: Vec<f64>) -> Value {
+    Value::F64Array {
+        rows: rows as u32,
+        cols: cols as u32,
+        data,
+    }
+}
+
+/// Legacy packer: builds a `Record { rows, cols, data: List[Float] }`.
+/// Retained for tests / callers that need the wire-friendly shape.
+#[allow(dead_code)]
+pub fn pack_matrix_record(rows: usize, cols: usize, data: Vec<f64>) -> Value {
     let mut rec = IndexMap::new();
     rec.insert("rows".into(), Value::Int(rows as i64));
     rec.insert("cols".into(), Value::Int(cols as i64));
