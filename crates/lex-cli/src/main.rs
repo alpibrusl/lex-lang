@@ -1,17 +1,21 @@
-//! Lex CLI per spec §12.1. M4-level subset: parse, check, run.
+//! Lex CLI per spec §12.1.
 //!
 //! Usage:
 //!   lex parse <file>
 //!   lex check <file>
-//!   lex run <file> <fn> [<arg>...]    # args parsed as JSON
-//!   lex hash <file>                    # canonical AST hash for each stage
+//!   lex run [--allow-effects k1,k2] [--allow-fs-read p] [--allow-fs-write p]
+//!           [--budget N] <file> <fn> [<arg>...]
+//!   lex hash <file>
 
 use anyhow::{anyhow, bail, Context, Result};
 use lex_ast::{canonicalize_program, stage_canonical_hash_hex, stage_id, Stage};
-use lex_bytecode::{compile_program, Value, Vm};
+use lex_bytecode::{compile_program, vm::Vm, Value};
+use lex_runtime::{check_program as check_policy, DefaultHandler, Policy};
 use lex_syntax::parse_source;
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
+use std::path::PathBuf;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -34,12 +38,18 @@ fn run(args: &[String]) -> Result<()> {
 }
 
 fn print_usage() {
-    println!("lex — Lex toolchain (M0–M4 subset)\n");
+    println!("lex — Lex toolchain\n");
     println!("commands:");
-    println!("  parse <file>              print canonical AST as JSON");
-    println!("  check <file>              type-check; exit 0 or print errors");
-    println!("  run <file> <fn> [args]    execute fn (args parsed as JSON)");
-    println!("  hash <file>               print stage canonical hashes");
+    println!("  parse <file>                       print canonical AST as JSON");
+    println!("  check <file>                       type-check; exit 0 or print errors");
+    println!("  run [policy] <file> <fn> [args]    execute fn (args parsed as JSON)");
+    println!("  hash <file>                        print stage canonical hashes");
+    println!();
+    println!("policy flags (run):");
+    println!("  --allow-effects k1,k2,...   permit these effect kinds");
+    println!("  --allow-fs-read PATH        (repeatable) permit fs_read under PATH");
+    println!("  --allow-fs-write PATH       (repeatable) permit fs_write under PATH");
+    println!("  --budget N                  cap aggregate declared budget");
 }
 
 fn read_source(path: &str) -> Result<String> {
@@ -83,8 +93,9 @@ fn cmd_check(args: &[String]) -> Result<()> {
 }
 
 fn cmd_run(args: &[String]) -> Result<()> {
-    let path = args.first().ok_or_else(|| anyhow!("usage: lex run <file> <fn> [args]"))?;
-    let func = args.get(1).ok_or_else(|| anyhow!("missing function name"))?;
+    let (policy, positional) = parse_run_flags(args)?;
+    let path = positional.first().ok_or_else(|| anyhow!("usage: lex run [policy] <file> <fn> [args]"))?;
+    let func = positional.get(1).ok_or_else(|| anyhow!("missing function name"))?;
     let src = read_source(path)?;
     let prog = parse_source(&src)?;
     let stages = canonicalize_program(&prog);
@@ -96,8 +107,20 @@ fn cmd_run(args: &[String]) -> Result<()> {
         std::process::exit(2);
     }
     let bc = compile_program(&stages);
-    let mut vm = Vm::new(&bc);
-    let vargs: Vec<Value> = args[2..]
+
+    // M5: capability/policy gate. Refuse to run programs whose declared
+    // effects exceed the policy.
+    if let Err(violations) = check_policy(&bc, &policy) {
+        for v in &violations {
+            let json = serde_json::to_string(v)?;
+            eprintln!("{json}");
+        }
+        std::process::exit(3);
+    }
+
+    let handler = DefaultHandler::new(policy);
+    let mut vm = Vm::with_handler(&bc, Box::new(handler));
+    let vargs: Vec<Value> = positional[2..]
         .iter()
         .map(|a| {
             let v: serde_json::Value = serde_json::from_str(a)
@@ -108,6 +131,40 @@ fn cmd_run(args: &[String]) -> Result<()> {
     let r = vm.call(func, vargs).map_err(|e| anyhow!("runtime: {e}"))?;
     println!("{}", value_to_json_string(&r));
     Ok(())
+}
+
+fn parse_run_flags(args: &[String]) -> Result<(Policy, Vec<String>)> {
+    let mut policy = Policy::pure();
+    let mut positional = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        match a.as_str() {
+            "--allow-effects" => {
+                let val = args.get(i + 1).ok_or_else(|| anyhow!("--allow-effects needs a value"))?;
+                policy.allow_effects = val.split(',').filter(|s| !s.is_empty())
+                    .map(|s| s.to_string()).collect::<BTreeSet<_>>();
+                i += 2;
+            }
+            "--allow-fs-read" => {
+                let val = args.get(i + 1).ok_or_else(|| anyhow!("--allow-fs-read needs a value"))?;
+                policy.allow_fs_read.push(PathBuf::from(val));
+                i += 2;
+            }
+            "--allow-fs-write" => {
+                let val = args.get(i + 1).ok_or_else(|| anyhow!("--allow-fs-write needs a value"))?;
+                policy.allow_fs_write.push(PathBuf::from(val));
+                i += 2;
+            }
+            "--budget" => {
+                let val = args.get(i + 1).ok_or_else(|| anyhow!("--budget needs a value"))?;
+                policy.budget = Some(val.parse().context("--budget must be an integer")?);
+                i += 2;
+            }
+            _ => { positional.push(a.clone()); i += 1; }
+        }
+    }
+    Ok((policy, positional))
 }
 
 fn cmd_hash(args: &[String]) -> Result<()> {
