@@ -242,21 +242,23 @@ This pattern works for plugin marketplaces (per-plugin effect manifests), multi-
 
 ### Adversarial benchmark
 
-`bench/REPORT.md` runs 6 attacks and 2 benign cases through three sandboxes side-by-side. Regenerate with `cargo test -p lex-cli --test agent_sandbox_bench`.
+`bench/REPORT.md` runs 7 attacks and 2 benign cases through three sandboxes side-by-side. "Actively blocked" means the sandbox pre-emptively rejected (type-check, AST rewrite, or policy gate) — it excludes cases that fail at runtime via NameError. Regenerate with `cargo test -p lex-cli --test agent_sandbox_bench`.
 
-|  | Adversarial blocked | Benign allowed | Mechanism |
+|  | Actively blocked | Benign allowed | Mechanism |
 |---|---|---|---|
-| **Lex** | **5 / 5** | 2 / 2 | static effect typing — pre-execution |
-| Python (naive `exec`) | 1 / 5 | 2 / 2 | `__builtins__` allowlist + string blocklist |
-| Python (RestrictedPython) | 5 / 5 | 2 / 2 | AST rewrite + `safe_builtins` + `safer_getattr` |
+| **Lex** | **7 / 7** | 2 / 2 | static effect typing — pre-execution |
+| Python (naive `exec`) | 0 / 7 | 2 / 2 | `__builtins__` allowlist + string blocklist |
+| Python (RestrictedPython) | 3 / 7 | 2 / 2 | AST rewrite + `safe_builtins` + `safer_getattr` |
 
-RestrictedPython is the most-reached-for credible Python sandbox, and on these capability-style attacks it matches Lex 5/5. The interesting comparison is the *kind* of guarantee:
+The headline is now uniformly active rejection: Lex catches every attack at type-check or policy gate. RestrictedPython actively catches the AST-traversal patterns; the rest rely on `safe_builtins` making the dangerous symbol unreachable at runtime (still safe — just passive).
 
-- RestrictedPython is opt-in **restriction** of an unrestricted base. The host has to keep `safe_builtins` audited as Python evolves; a new built-in landing in stdlib means updating the allowlist.
-- Lex is opt-in **granting** from a sandboxed default. Effects are part of the language's type system; the policy lives in the function signature.
-- Lex rejects at **type-check** (zero user code runs); RestrictedPython rejects at compile + runtime. For agent-generated code this matters when the attacker controls *both* the source and the trigger.
+Cases 6 and 7 demonstrate **per-path** and **per-host** scopes — `--allow-fs-read /tmp/safe` and `--allow-net-host api.openai.com`. A tool granted `[io]` can be locked to a specific directory; a tool granted `[net]` can be pinned to a specific host. RestrictedPython has no per-path or per-host scope: once `open` or `urllib` is in globals, it's available for any target.
 
-The 6th attack is intentionally **out of scope**: when Lex grants `[io]`, the attack uses `io.read` legitimately. Lex's capability granularity is per-effect; for finer-grained scopes use `--allow-fs-read PATH`. Listed to show what the sandbox does **not** claim.
+The structural pitch:
+
+- RestrictedPython is opt-in **restriction** of an unrestricted base. The host must keep `safe_builtins` audited as Python evolves.
+- Lex is opt-in **granting** from a sandboxed default. Effects are part of the language's type system.
+- Lex rejects at **type-check / policy gate**; RestrictedPython at compile-time AST rewrite or runtime NameError. For agent-generated code, pre-execution rejection matters when the attacker controls *both* source and trigger.
 
 ## Toolchain reference
 

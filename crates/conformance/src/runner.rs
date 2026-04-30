@@ -151,6 +151,7 @@ fn build_policy(p: &PolicyJson) -> Policy {
         allow_effects: p.allow_effects.iter().cloned().collect::<BTreeSet<_>>(),
         allow_fs_read: p.allow_fs_read.iter().map(PathBuf::from).collect(),
         allow_fs_write: p.allow_fs_write.iter().map(PathBuf::from).collect(),
+        allow_net_host: Vec::new(),
         budget: p.budget,
     }
 }

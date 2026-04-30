@@ -208,6 +208,11 @@ fn parse_run_flags(args: &[String]) -> Result<(Policy, Vec<String>, bool, Option
                 policy.allow_fs_write.push(PathBuf::from(val));
                 i += 2;
             }
+            "--allow-net-host" => {
+                let val = args.get(i + 1).ok_or_else(|| anyhow!("--allow-net-host needs a value"))?;
+                policy.allow_net_host.push(val.clone());
+                i += 2;
+            }
             "--budget" => {
                 let val = args.get(i + 1).ok_or_else(|| anyhow!("--budget needs a value"))?;
                 policy.budget = Some(val.parse().context("--budget must be an integer")?);
@@ -605,6 +610,12 @@ struct AgentToolOpts {
     /// generous enough for analytics + linreg, tight enough that
     /// runaway loops surface in <1s.
     max_steps: u64,
+    /// Per-path scope on `[fs_read]` / `[io]` reads. Empty = any.
+    allow_fs_read: Vec<PathBuf>,
+    /// Per-host scope on `[net]`. Empty = any host. Useful when a
+    /// tool needs to call api.openai.com but should not be able to
+    /// POST to attacker.example.com.
+    allow_net_host: Vec<String>,
 }
 
 enum BodySource {
@@ -665,6 +676,8 @@ fn cmd_agent_tool(args: &[String]) -> Result<()> {
     let bc = compile_program(&stages);
     let mut policy = Policy::pure();
     policy.allow_effects = opts.allowed_effects.iter().cloned().collect();
+    policy.allow_fs_read = opts.allow_fs_read.clone();
+    policy.allow_net_host = opts.allow_net_host.clone();
     if let Err(violations) = check_policy(&bc, &policy) {
         eprintln!("→ POLICY REJECTED — tool not run.");
         for v in &violations {
@@ -688,6 +701,18 @@ fn cmd_agent_tool(args: &[String]) -> Result<()> {
                 eprintln!("  (raise with --max-steps; default {})", default_max_steps());
                 std::process::exit(4);
             }
+            // Runtime scope rejections (--allow-fs-read / --allow-net-host
+            // / --allow-fs-write) surface as effect-handler errors. Exit 3
+            // matches the static-policy gate so callers can branch cleanly:
+            //   2 = type-check, 3 = policy (static or runtime), 4 = step-limit.
+            if msg.contains("outside --allow-fs-read")
+                || msg.contains("outside --allow-fs-write")
+                || msg.contains("not in --allow-net-host")
+            {
+                eprintln!("→ POLICY REJECTED (runtime scope) — tool aborted.");
+                eprintln!("  {e}");
+                std::process::exit(3);
+            }
             return Err(anyhow!("runtime: {e}"));
         }
     };
@@ -709,12 +734,24 @@ fn parse_agent_tool_args(args: &[String]) -> Result<AgentToolOpts> {
     let mut model = "claude-sonnet-4-6".to_string();
     let mut show_source = true;
     let mut max_steps: u64 = default_max_steps();
+    let mut allow_fs_read: Vec<PathBuf> = Vec::new();
+    let mut allow_net_host: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--allow-effects" => {
                 let v = args.get(i + 1).ok_or_else(|| anyhow!("--allow-effects needs a value"))?;
                 allowed_effects = v.split(',').filter(|s| !s.is_empty()).map(String::from).collect();
+                i += 2;
+            }
+            "--allow-fs-read" => {
+                let v = args.get(i + 1).ok_or_else(|| anyhow!("--allow-fs-read needs a path"))?;
+                allow_fs_read.push(PathBuf::from(v));
+                i += 2;
+            }
+            "--allow-net-host" => {
+                let v = args.get(i + 1).ok_or_else(|| anyhow!("--allow-net-host needs a host"))?;
+                allow_net_host.push(v.clone());
                 i += 2;
             }
             "--input" => {
@@ -762,6 +799,8 @@ fn parse_agent_tool_args(args: &[String]) -> Result<AgentToolOpts> {
         model,
         show_source,
         max_steps,
+        allow_fs_read,
+        allow_net_host,
     })
 }
 

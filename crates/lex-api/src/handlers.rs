@@ -250,6 +250,7 @@ impl PolicyJson {
             allow_effects: self.allow_effects.into_iter().collect::<BTreeSet<_>>(),
             allow_fs_read: self.allow_fs_read.into_iter().map(PathBuf::from).collect(),
             allow_fs_write: self.allow_fs_write.into_iter().map(PathBuf::from).collect(),
+            allow_net_host: Vec::new(),
             budget: self.budget,
         }
     }
