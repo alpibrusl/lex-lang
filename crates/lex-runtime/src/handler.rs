@@ -330,63 +330,38 @@ fn unpack_response(v: &Value) -> (u16, String) {
     (500, format!("handler returned non-record: {v:?}"))
 }
 
-/// Minimal hand-rolled HTTP/1.0 client. Supports `http://host:port/path`
-/// only (no TLS, no redirects). Returns `Result[Str, Str]` as a Lex
-/// `Value::Variant`.
+/// HTTP/1.1 client backed by `ureq` + `rustls`. Accepts both
+/// `http://` and `https://` URLs. Returns `Result[Str, Str]` as a
+/// Lex `Value::Variant`. The earlier hand-rolled HTTP/1.0 client
+/// was plain-TCP only — most public APIs are HTTPS, so the demo
+/// could fetch `example.com` but not `wttr.in` or `api.github.com`.
 fn http_request(method: &str, url: &str, body: Option<&str>) -> Value {
-    let parsed = match parse_http_url(url) {
-        Ok(u) => u,
-        Err(e) => return err_value(format!("bad url: {e}")),
-    };
-    let body_bytes = body.unwrap_or("").as_bytes();
-    let req = format!(
-        "{method} {path} HTTP/1.0\r\nHost: {host}\r\nContent-Length: {clen}\r\nConnection: close\r\n\r\n",
-        path = parsed.path,
-        host = parsed.host,
-        clen = body_bytes.len(),
-    );
-    use std::io::{Read, Write};
-    use std::net::TcpStream;
     use std::time::Duration;
-    let mut stream = match TcpStream::connect((parsed.host.as_str(), parsed.port)) {
-        Ok(s) => s,
-        Err(e) => return err_value(format!("connect: {e}")),
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(30))
+        .timeout_write(Duration::from_secs(10))
+        .build();
+    let req = agent.request(method, url);
+    let resp = match body {
+        Some(b) => req.send_string(b),
+        None => req.call(),
     };
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
-    if let Err(e) = stream.write_all(req.as_bytes()) {
-        return err_value(format!("write: {e}"));
-    }
-    if !body_bytes.is_empty() {
-        if let Err(e) = stream.write_all(body_bytes) {
-            return err_value(format!("write body: {e}"));
+    match resp {
+        Ok(r) => match r.into_string() {
+            Ok(s) => Value::Variant { name: "Ok".into(), args: vec![Value::Str(s)] },
+            Err(e) => err_value(format!("read body: {e}")),
+        },
+        // ureq surfaces 4xx/5xx as `Status` errors with the body
+        // attached. Mirror that into Lex's Result so a tool can
+        // inspect `Err("status 404: ...")` instead of getting a
+        // raw transport error.
+        Err(ureq::Error::Status(code, r)) => {
+            let body = r.into_string().unwrap_or_default();
+            err_value(format!("status {code}: {body}"))
         }
+        Err(e) => err_value(format!("transport: {e}")),
     }
-    let mut buf = String::new();
-    if let Err(e) = stream.read_to_string(&mut buf) {
-        return err_value(format!("read: {e}"));
-    }
-    // Split headers from body.
-    let body_text = match buf.split_once("\r\n\r\n") {
-        Some((_head, b)) => b.to_string(),
-        None => buf,
-    };
-    Value::Variant { name: "Ok".into(), args: vec![Value::Str(body_text)] }
-}
-
-struct ParsedUrl { host: String, port: u16, path: String }
-
-fn parse_http_url(url: &str) -> Result<ParsedUrl, String> {
-    let rest = url.strip_prefix("http://").ok_or_else(|| "must start with http://".to_string())?;
-    let (host_port, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
-    };
-    let (host, port) = match host_port.rsplit_once(':') {
-        Some((h, p)) => (h.to_string(), p.parse::<u16>().map_err(|e| format!("port: {e}"))?),
-        None => (host_port.to_string(), 80),
-    };
-    Ok(ParsedUrl { host, port, path: path.to_string() })
 }
 
 fn err_value(msg: String) -> Value {
