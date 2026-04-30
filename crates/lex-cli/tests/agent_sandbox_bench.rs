@@ -192,7 +192,7 @@ fn run_lex(case: &Case) -> Verdict {
     Verdict::from_exit(out.status.code().unwrap_or(-1))
 }
 
-fn run_python(case: &Case) -> Verdict {
+fn run_python_naive(case: &Case) -> Verdict {
     let script = workspace_root().join("bench/python_naive_sandbox.py");
     let mut child = Command::new("python3")
         .arg(&script)
@@ -208,54 +208,99 @@ fn run_python(case: &Case) -> Verdict {
     Verdict::from_exit(out.status.code().unwrap_or(-1))
 }
 
+fn run_python_restricted(case: &Case) -> Verdict {
+    let script = workspace_root().join("bench/python_restricted_sandbox.py");
+    let mut child = match Command::new("python3")
+        .arg("-W").arg("ignore")
+        .arg(&script)
+        .args(["--input", "pybench-input"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return Verdict::Errored, // RestrictedPython not installed
+    };
+    child.stdin.as_mut().unwrap().write_all(case.python_code.as_bytes()).unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().expect("python output");
+    Verdict::from_exit(out.status.code().unwrap_or(-1))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct CaseResult {
     lex: Verdict,
-    python: Verdict,
+    naive: Verdict,
+    restricted: Verdict,
 }
 
 fn run_all() -> Vec<(&'static Case, CaseResult)> {
     let _ = fs::remove_file("/tmp/lex_bench_leak");
     let _ = fs::remove_file("/tmp/py_bench_leak");
+    let _ = fs::remove_file("/tmp/py_restricted_leak");
     cases().iter()
-        .map(|c| (c, CaseResult { lex: run_lex(c), python: run_python(c) }))
+        .map(|c| (c, CaseResult {
+            lex: run_lex(c),
+            naive: run_python_naive(c),
+            restricted: run_python_restricted(c),
+        }))
         .collect()
 }
 
 fn write_report(results: &[(&Case, CaseResult)]) {
     let path = workspace_root().join("bench/REPORT.md");
     let mut s = String::new();
-    s.push_str("# Agent sandbox bench — Lex vs. naive Python\n\n");
-    s.push_str("Each row runs the same conceptual attack through `lex agent-tool` and ");
-    s.push_str("through a naive Python `exec()`-based sandbox. The point isn't ");
-    s.push_str("\"Python is bad\" (real production setups use Docker/WASM/RestrictedPython); ");
-    s.push_str("it's that **static effect typing catches whole classes of agent-generated ");
-    s.push_str("attacks at type-check time**, while source-text filters and shrunken ");
-    s.push_str("`__builtins__` don't.\n\n");
-    s.push_str("Regenerate: `cargo test -p lex-cli --test agent_sandbox_bench`. ");
-    s.push_str("The naive Python sandbox lives at `bench/python_naive_sandbox.py`.\n\n");
+    s.push_str("# Agent sandbox bench — Lex vs. Python sandboxes\n\n");
+    s.push_str("Each row runs the same conceptual attack (or benign tool) through ");
+    s.push_str("three sandboxes:\n\n");
+    s.push_str("1. **Lex (effect types)** — `lex agent-tool` rejects undeclared effects ");
+    s.push_str("at *type-check time*, before bytecode emission.\n");
+    s.push_str("2. **Python (naive exec)** — `bench/python_naive_sandbox.py`. ");
+    s.push_str("`exec()` with restricted `__builtins__` and a source-text blocklist; ");
+    s.push_str("representative of common DIY attempts.\n");
+    s.push_str("3. **Python (RestrictedPython)** — `bench/python_restricted_sandbox.py`. ");
+    s.push_str("Uses `compile_restricted` + `safe_builtins` + `safer_getattr`; the ");
+    s.push_str("most-reached-for credible Python sandbox library.\n\n");
+    s.push_str("Regenerate: `cargo test -p lex-cli --test agent_sandbox_bench`.\n\n");
 
     let attacks: Vec<_> = results.iter()
         .filter(|(c, _)| c.intent == Intent::Adversarial).collect();
-    let lex_blocks = attacks.iter().filter(|(_, r)| r.lex != Verdict::Ran).count();
-    let py_blocks  = attacks.iter().filter(|(_, r)| r.python != Verdict::Ran).count();
+    let lex_blocks   = attacks.iter().filter(|(_, r)| r.lex != Verdict::Ran).count();
+    let naive_blocks = attacks.iter().filter(|(_, r)| r.naive != Verdict::Ran).count();
+    let rp_blocks    = attacks.iter().filter(|(_, r)| r.restricted != Verdict::Ran).count();
     let benign: Vec<_> = results.iter()
         .filter(|(c, _)| c.intent == Intent::Benign).collect();
-    let lex_benign_pass = benign.iter().filter(|(_, r)| r.lex == Verdict::Ran).count();
-    let py_benign_pass  = benign.iter().filter(|(_, r)| r.python == Verdict::Ran).count();
+    let lex_b   = benign.iter().filter(|(_, r)| r.lex == Verdict::Ran).count();
+    let naive_b = benign.iter().filter(|(_, r)| r.naive == Verdict::Ran).count();
+    let rp_b    = benign.iter().filter(|(_, r)| r.restricted == Verdict::Ran).count();
 
     s.push_str("## Summary\n\n");
     s.push_str(&format!(
-        "| | Adversarial blocked | Benign allowed |\n|---|---|---|\n\
-         | **Lex (effect types)** | **{}/{}** | {}/{} |\n\
-         | **Python (naive exec sandbox)** | {}/{} | {}/{} |\n\n",
-        lex_blocks, attacks.len(), lex_benign_pass, benign.len(),
-        py_blocks, attacks.len(), py_benign_pass, benign.len(),
+        "|  | Adversarial blocked | Benign allowed | Mechanism |\n|---|---|---|---|\n\
+         | **Lex** | **{}/{}** | {}/{} | static effect typing — pre-execution |\n\
+         | Python (naive exec) | {}/{} | {}/{} | `__builtins__` allowlist + string blocklist |\n\
+         | Python (RestrictedPython) | {}/{} | {}/{} | AST rewrite + `safe_builtins` + `safer_getattr` |\n\n",
+        lex_blocks, attacks.len(), lex_b, benign.len(),
+        naive_blocks, attacks.len(), naive_b, benign.len(),
+        rp_blocks, attacks.len(), rp_b, benign.len(),
     ));
+    s.push_str("**Reading this:** RestrictedPython is genuinely strong on capability-style ");
+    s.push_str("attacks. Lex matches it on these cases, but the *kind* of guarantee differs:\n\n");
+    s.push_str("- RestrictedPython is opt-in *restriction* of an unrestricted base. The host ");
+    s.push_str("must keep `safe_builtins` audited as Python evolves; if a new built-in lands ");
+    s.push_str("in stdlib, the allowlist needs updating.\n");
+    s.push_str("- Lex is opt-in *granting* from a sandboxed default. Effects are part of the ");
+    s.push_str("language type system; the policy lives in the function signature, not in a ");
+    s.push_str("library config the host has to maintain.\n");
+    s.push_str("- Lex rejects at *type-check*; RestrictedPython rejects at compile + runtime. ");
+    s.push_str("For agent-generated code, type-check rejection means the sandbox ran zero ");
+    s.push_str("user code — useful when the attacker controls *both* the source text and the ");
+    s.push_str("decision of when to trigger the bad effect.\n\n");
 
     s.push_str("## Cases\n\n");
-    s.push_str("| # | Name | Intent | Lex (`[effects]`) | Python (blocklist) |\n");
-    s.push_str("|---|---|---|---|---|\n");
+    s.push_str("| # | Name | Intent | Lex `[effects]` | Naive | RestrictedPython |\n");
+    s.push_str("|---|---|---|---|---|---|\n");
     for (i, (c, r)) in results.iter().enumerate() {
         let intent = match c.intent {
             Intent::Benign => "benign",
@@ -263,12 +308,12 @@ fn write_report(results: &[(&Case, CaseResult)]) {
             Intent::AdversarialOutOfScope => "adversarial†",
         };
         let lex_eff = if c.lex_effects.is_empty() { "(none)" } else { c.lex_effects };
-        let py_bl = if c.python_blocklist.is_empty() { "(none)" } else { c.python_blocklist };
         s.push_str(&format!(
-            "| {} | `{}` | {} | {} `[{}]` | {} `[{}]` |\n",
+            "| {} | `{}` | {} | {} `[{}]` | {} | {} |\n",
             i + 1, c.name, intent,
             r.lex.icon(), lex_eff,
-            r.python.icon(), py_bl,
+            r.naive.icon(),
+            r.restricted.icon(),
         ));
     }
     s.push_str("\n† This case is granted the very effect the attack uses ");
@@ -279,14 +324,15 @@ fn write_report(results: &[(&Case, CaseResult)]) {
     s.push_str("## Per-case detail\n\n");
     for (i, (c, r)) in results.iter().enumerate() {
         s.push_str(&format!("### {}. `{}` — {}\n\n", i + 1, c.name, c.summary));
-        s.push_str(&format!("**Lex** (`--allow-effects {}`):\n\n```lex\n{}\n```\n\n",
+        s.push_str(&format!("**Lex** (`--allow-effects {}`):\n\n```lex\n{}\n```\n\nVerdict: **{}**\n\n",
             if c.lex_effects.is_empty() { "(none)" } else { c.lex_effects },
-            c.lex_body.trim()));
-        s.push_str(&format!("Verdict: **{}**\n\n", r.lex.icon()));
-        s.push_str(&format!("**Python** (blocklist: `{}`):\n\n```python\n{}\n```\n\n",
+            c.lex_body.trim(), r.lex.icon()));
+        s.push_str(&format!("**Python**:\n\n```python\n{}\n```\n\n", c.python_code.trim()));
+        s.push_str(&format!(
+            "- Naive `exec` (blocklist `{}`): **{}**\n- RestrictedPython: **{}**\n\n",
             if c.python_blocklist.is_empty() { "(none)" } else { c.python_blocklist },
-            c.python_code.trim()));
-        s.push_str(&format!("Verdict: **{}**\n\n", r.python.icon()));
+            r.naive.icon(), r.restricted.icon(),
+        ));
     }
     fs::create_dir_all(path.parent().unwrap()).ok();
     fs::write(&path, s).expect("write report");
@@ -320,16 +366,24 @@ fn agent_sandbox_benchmark() {
         }
     }
 
-    // Headline assertion: across all targeted-adversarial cases, Lex blocks
-    // strictly more than the naive Python sandbox.
+    // Headline assertion: every targeted-adversarial case is blocked by Lex,
+    // and Lex blocks at least as many as the naive Python sandbox. We do
+    // *not* assert Lex strictly outperforms RestrictedPython — it doesn't,
+    // and the report is honest about that. The pitch is about the *kind*
+    // of guarantee, not the count.
     let attacks: Vec<_> = results.iter()
         .filter(|(c, _)| c.intent == Intent::Adversarial).collect();
-    let lex_blocks = attacks.iter().filter(|(_, r)| r.lex != Verdict::Ran).count();
-    let py_blocks  = attacks.iter().filter(|(_, r)| r.python != Verdict::Ran).count();
+    let lex_blocks   = attacks.iter().filter(|(_, r)| r.lex != Verdict::Ran).count();
+    let naive_blocks = attacks.iter().filter(|(_, r)| r.naive != Verdict::Ran).count();
+    assert_eq!(
+        lex_blocks, attacks.len(),
+        "Lex must block all targeted-adversarial cases; got {lex_blocks}/{}",
+        attacks.len(),
+    );
     assert!(
-        lex_blocks > py_blocks,
-        "Lex must block strictly more attacks than the naive Python sandbox; \
-         got Lex={lex_blocks}/{} vs. Python={py_blocks}/{}",
+        lex_blocks >= naive_blocks,
+        "Lex must block at least as many attacks as the naive Python sandbox; \
+         got Lex={lex_blocks}/{} vs. naive={naive_blocks}/{}",
         attacks.len(), attacks.len(),
     );
 }

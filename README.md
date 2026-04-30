@@ -242,14 +242,21 @@ This pattern works for plugin marketplaces (per-plugin effect manifests), multi-
 
 ### Adversarial benchmark
 
-`bench/REPORT.md` runs 6 attacks and 2 benign cases through both `lex agent-tool` and a naive Python `exec()`-with-blocklist sandbox (`bench/python_naive_sandbox.py`). Regenerate with `cargo test -p lex-cli --test agent_sandbox_bench`.
+`bench/REPORT.md` runs 6 attacks and 2 benign cases through three sandboxes side-by-side. Regenerate with `cargo test -p lex-cli --test agent_sandbox_bench`.
 
-| | Adversarial blocked | Benign allowed |
-|---|---|---|
-| **Lex (effect types)** | **5 / 5** | 2 / 2 |
-| **Python (naive exec sandbox)** | 1 / 5 | 2 / 2 |
+|  | Adversarial blocked | Benign allowed | Mechanism |
+|---|---|---|---|
+| **Lex** | **5 / 5** | 2 / 2 | static effect typing — pre-execution |
+| Python (naive `exec`) | 1 / 5 | 2 / 2 | `__builtins__` allowlist + string blocklist |
+| Python (RestrictedPython) | 5 / 5 | 2 / 2 | AST rewrite + `safe_builtins` + `safer_getattr` |
 
-Lex catches all 5 targeted attacks at type-check time (file read/write, shell exec, blocklist bypass, object-graph escape) without running them. The naive Python sandbox catches one and is bypassed by all four others — including the classic `().__class__.__base__.__subclasses__()` walk to `Popen`. The 6th attack is *out of scope*: when Lex grants `[io]` and the attack uses `io.read`, the sandbox lets it through. Lex's capability granularity is per-effect; for finer-grained scopes use `--allow-fs-read PATH`. The point of including the case is to show what the sandbox **doesn't** claim.
+RestrictedPython is the most-reached-for credible Python sandbox, and on these capability-style attacks it matches Lex 5/5. The interesting comparison is the *kind* of guarantee:
+
+- RestrictedPython is opt-in **restriction** of an unrestricted base. The host has to keep `safe_builtins` audited as Python evolves; a new built-in landing in stdlib means updating the allowlist.
+- Lex is opt-in **granting** from a sandboxed default. Effects are part of the language's type system; the policy lives in the function signature.
+- Lex rejects at **type-check** (zero user code runs); RestrictedPython rejects at compile + runtime. For agent-generated code this matters when the attacker controls *both* the source and the trigger.
+
+The 6th attack is intentionally **out of scope**: when Lex grants `[io]`, the attack uses `io.read` legitimately. Lex's capability granularity is per-effect; for finer-grained scopes use `--allow-fs-read PATH`. Listed to show what the sandbox does **not** claim.
 
 ## Toolchain reference
 
