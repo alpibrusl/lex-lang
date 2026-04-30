@@ -10,6 +10,7 @@ struct ConstPool {
     pool: Vec<Const>,
     fields: IndexMap<String, u32>,
     variants: IndexMap<String, u32>,
+    node_ids: IndexMap<String, u32>,
     ints: IndexMap<i64, u32>,
     bools: IndexMap<u8, u32>,
     strs: IndexMap<String, u32>,
@@ -28,6 +29,13 @@ impl ConstPool {
         let i = self.pool.len() as u32;
         self.pool.push(Const::VariantName(name.into()));
         self.variants.insert(name.into(), i);
+        i
+    }
+    fn node_id(&mut self, name: &str) -> u32 {
+        if let Some(i) = self.node_ids.get(name) { return *i; }
+        let i = self.pool.len() as u32;
+        self.pool.push(Const::NodeId(name.into()));
+        self.node_ids.insert(name.into(), i);
         i
     }
     fn int(&mut self, n: i64) -> u32 {
@@ -109,7 +117,11 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
     let module_aliases = p.module_aliases.clone();
 
     for s in stages {
-        if let a::Stage::FnDecl(fd) = s {
+        if let a::Stage::FnDecl(_) = s {
+            // Build a NodeId map for *this* stage so the compiler can stamp
+            // each Call/EffectCall opcode with the originating AST node.
+            let id_map = lex_ast::expr_ids(s);
+            let fd = match s { a::Stage::FnDecl(fd) => fd, _ => unreachable!() };
             let mut fc = FnCompiler {
                 code: Vec::new(),
                 locals: IndexMap::new(),
@@ -118,6 +130,7 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
                 pool: &mut pool,
                 function_names: &function_names,
                 module_aliases: &module_aliases,
+                id_map: &id_map,
             };
             for param in &fd.params {
                 let i = fc.next_local;
@@ -145,6 +158,8 @@ struct FnCompiler<'a> {
     pool: &'a mut ConstPool,
     function_names: &'a IndexMap<String, u32>,
     module_aliases: &'a IndexMap<String, String>,
+    /// CExpr address → NodeId, populated per stage via `lex_ast::expr_ids`.
+    id_map: &'a std::collections::HashMap<*const a::CExpr, lex_ast::NodeId>,
 }
 
 impl<'a> FnCompiler<'a> {
@@ -177,7 +192,7 @@ impl<'a> FnCompiler<'a> {
                 }
                 self.compile_expr(result, tail);
             }
-            a::CExpr::Call { callee, args } => self.compile_call(callee, args, tail),
+            a::CExpr::Call { callee, args } => self.compile_call(e, callee, args, tail),
             a::CExpr::Constructor { name, args } => {
                 for a in args { self.compile_expr(a, false); }
                 let name_idx = self.pool.variant(name);
@@ -242,7 +257,14 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::PushConst(i));
     }
 
-    fn compile_call(&mut self, callee: &a::CExpr, args: &[a::CExpr], tail: bool) {
+    fn compile_call(&mut self, call_expr: &a::CExpr, callee: &a::CExpr, args: &[a::CExpr], tail: bool) {
+        let node_id = self
+            .id_map
+            .get(&(call_expr as *const a::CExpr))
+            .map(|n| n.as_str().to_string())
+            .unwrap_or_else(|| "n_?".into());
+        let node_id_idx = self.pool.node_id(&node_id);
+
         // Module function call: `alias.op(args)` where `alias` is an imported
         // module ⇒ EffectCall(kind=module_name, op=field_name).
         if let a::CExpr::FieldAccess { value, field } = callee {
@@ -255,6 +277,7 @@ impl<'a> FnCompiler<'a> {
                         kind_idx,
                         op_idx,
                         arity: args.len() as u16,
+                        node_id_idx,
                     });
                     let _ = tail; // EffectCall doesn't tail-optimize.
                     return;
@@ -266,9 +289,9 @@ impl<'a> FnCompiler<'a> {
                 for a in args { self.compile_expr(a, false); }
                 let fn_id = self.function_names[name];
                 if tail {
-                    self.emit(Op::TailCall { fn_id, arity: args.len() as u16 });
+                    self.emit(Op::TailCall { fn_id, arity: args.len() as u16, node_id_idx });
                 } else {
-                    self.emit(Op::Call { fn_id, arity: args.len() as u16 });
+                    self.emit(Op::Call { fn_id, arity: args.len() as u16, node_id_idx });
                 }
             }
             other => panic!("unsupported callee: {other:?}"),

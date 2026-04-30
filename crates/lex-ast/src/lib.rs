@@ -11,7 +11,7 @@ pub mod ids;
 pub use canonical::*;
 pub use canonicalize::{canonicalize_program, canonicalize_item};
 pub use canon_print::print_stages;
-pub use ids::{collect_ids, NodeId, NodeRef};
+pub use ids::{collect_ids, expr_ids, NodeId, NodeRef};
 
 /// SHA-256 over the canonical-JSON encoding of a stage. Excludes NodeIds
 /// (the canonical AST data does not carry IDs; they're derived).

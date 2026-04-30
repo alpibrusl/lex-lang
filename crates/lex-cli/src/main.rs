@@ -38,6 +38,8 @@ fn run(args: &[String]) -> Result<()> {
         "hash" => cmd_hash(&args[1..]),
         "publish" => cmd_publish(&args[1..]),
         "store" => cmd_store(&args[1..]),
+        "trace" => cmd_trace(&args[1..]),
+        "diff" => cmd_diff(&args[1..]),
         "help" | "--help" | "-h" => { print_usage(); Ok(()) }
         other => bail!("unknown command `{other}`. try `lex help`"),
     }
@@ -103,7 +105,7 @@ fn cmd_check(args: &[String]) -> Result<()> {
 }
 
 fn cmd_run(args: &[String]) -> Result<()> {
-    let (policy, positional) = parse_run_flags(args)?;
+    let (policy, positional, trace) = parse_run_flags(args)?;
     let path = positional.first().ok_or_else(|| anyhow!("usage: lex run [policy] <file> <fn> [args]"))?;
     let func = positional.get(1).ok_or_else(|| anyhow!("missing function name"))?;
     let src = read_source(path)?;
@@ -118,8 +120,6 @@ fn cmd_run(args: &[String]) -> Result<()> {
     }
     let bc = compile_program(&stages);
 
-    // M5: capability/policy gate. Refuse to run programs whose declared
-    // effects exceed the policy.
     if let Err(violations) = check_policy(&bc, &policy) {
         for v in &violations {
             let json = serde_json::to_string(v)?;
@@ -130,6 +130,10 @@ fn cmd_run(args: &[String]) -> Result<()> {
 
     let handler = DefaultHandler::new(policy);
     let mut vm = Vm::with_handler(&bc, Box::new(handler));
+    let recorder = lex_trace::Recorder::new();
+    let trace_handle = recorder.handle();
+    if trace { vm.set_tracer(Box::new(recorder)); }
+
     let vargs: Vec<Value> = positional[2..]
         .iter()
         .map(|a| {
@@ -138,14 +142,31 @@ fn cmd_run(args: &[String]) -> Result<()> {
             Ok(json_to_value(&v))
         })
         .collect::<Result<Vec<_>>>()?;
-    let r = vm.call(func, vargs).map_err(|e| anyhow!("runtime: {e}"))?;
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let result = vm.call(func, vargs);
+    let ended = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    if trace {
+        let store = lex_store::Store::open(default_store_root())?;
+        let (root_out, root_err) = match &result {
+            Ok(v) => (Some(value_to_json(v)), None),
+            Err(e) => (None, Some(format!("{e}"))),
+        };
+        let tree = trace_handle.finalize(func.clone(), serde_json::Value::Null,
+            root_out, root_err, started, ended);
+        let id = store.save_trace(&tree)?;
+        eprintln!("trace saved: {id}");
+    }
+    let r = result.map_err(|e| anyhow!("runtime: {e}"))?;
     println!("{}", value_to_json_string(&r));
     Ok(())
 }
 
-fn parse_run_flags(args: &[String]) -> Result<(Policy, Vec<String>)> {
+fn parse_run_flags(args: &[String]) -> Result<(Policy, Vec<String>, bool)> {
     let mut policy = Policy::pure();
     let mut positional = Vec::new();
+    let mut trace = false;
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -171,10 +192,34 @@ fn parse_run_flags(args: &[String]) -> Result<(Policy, Vec<String>)> {
                 policy.budget = Some(val.parse().context("--budget must be an integer")?);
                 i += 2;
             }
+            "--trace" => { trace = true; i += 1; }
             _ => { positional.push(a.clone()); i += 1; }
         }
     }
-    Ok((policy, positional))
+    Ok((policy, positional, trace))
+}
+
+fn cmd_trace(args: &[String]) -> Result<()> {
+    let id = args.first().ok_or_else(|| anyhow!("usage: lex trace <run_id>"))?;
+    let store = lex_store::Store::open(default_store_root())?;
+    let tree = store.load_trace(id)?;
+    println!("{}", serde_json::to_string_pretty(&tree)?);
+    Ok(())
+}
+
+fn cmd_diff(args: &[String]) -> Result<()> {
+    let a = args.first().ok_or_else(|| anyhow!("usage: lex diff <run_a> <run_b>"))?;
+    let b = args.get(1).ok_or_else(|| anyhow!("missing second run id"))?;
+    let store = lex_store::Store::open(default_store_root())?;
+    let ta = store.load_trace(a)?;
+    let tb = store.load_trace(b)?;
+    match lex_trace::diff_runs(&ta, &tb) {
+        Some(d) => {
+            println!("{}", serde_json::to_string_pretty(&d)?);
+            Ok(())
+        }
+        None => { println!("{{\"divergence\":null}}"); Ok(()) }
+    }
 }
 
 fn cmd_hash(args: &[String]) -> Result<()> {

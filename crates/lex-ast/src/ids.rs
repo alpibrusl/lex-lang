@@ -3,6 +3,7 @@
 //! children array.
 
 use crate::canonical::*;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NodeId(pub String);
@@ -20,6 +21,18 @@ pub fn collect_ids(stage: &Stage) -> Vec<(NodeId, NodeRef<'_>)> {
     let root = NodeId::root();
     out.push((root.clone(), NodeRef::Stage(stage)));
     walk_stage(stage, &root, &mut out);
+    out
+}
+
+/// Map every CExpr in a stage to its NodeId, keyed by the CExpr's address.
+/// Caller borrows the same `stage` instance the bytecode compiler walks.
+pub fn expr_ids(stage: &Stage) -> HashMap<*const CExpr, NodeId> {
+    let mut out = HashMap::new();
+    for (id, n) in collect_ids(stage) {
+        if let NodeRef::CExpr(p) = n {
+            out.insert(p as *const CExpr, id);
+        }
+    }
     out
 }
 
