@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>lex chat</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2em auto; padding: 0 1em; }
+  #log { border: 1px solid #ccc; padding: 0.5em; height: 320px; overflow-y: auto;
+         font-family: ui-monospace, monospace; font-size: 13px; background: #fafafa; }
+  #log div { padding: 2px 0; border-bottom: 1px dotted #eee; }
+  form { display: flex; gap: 0.5em; margin-top: 1em; }
+  input[type=text] { flex: 1; padding: 0.4em; }
+  label { font-size: 14px; }
+  .meta { color: #999; }
+</style>
+</head>
+<body>
+  <h2>lex chat</h2>
+  <p>
+    <label>room: <input id="room" value="lobby" size="10" /></label>
+    &nbsp;
+    <label>server: <input id="server" value="ws://127.0.0.1:9090" size="22" /></label>
+    &nbsp;
+    <button id="connect">connect</button>
+    <span id="status" class="meta">disconnected</span>
+  </p>
+  <div id="log"></div>
+  <form id="send-form">
+    <input id="msg" type="text" placeholder="say something…" autocomplete="off" />
+    <button type="submit">send</button>
+  </form>
+
+<script>
+const log = document.getElementById('log');
+const status = document.getElementById('status');
+const roomEl = document.getElementById('room');
+const serverEl = document.getElementById('server');
+const msgEl = document.getElementById('msg');
+let ws = null;
+
+function append(text, cls) {
+  const d = document.createElement('div');
+  if (cls) d.className = cls;
+  d.textContent = text;
+  log.appendChild(d);
+  log.scrollTop = log.scrollHeight;
+}
+
+document.getElementById('connect').onclick = () => {
+  if (ws) ws.close();
+  const url = `${serverEl.value}/${roomEl.value}`;
+  append(`→ connecting to ${url}`, 'meta');
+  ws = new WebSocket(url);
+  ws.onopen    = () => { status.textContent = 'connected'; append('→ open', 'meta'); };
+  ws.onmessage = ev => append(ev.data);
+  ws.onclose   = () => { status.textContent = 'disconnected'; append('→ closed', 'meta'); ws = null; };
+  ws.onerror   = e  => append(`→ error: ${e.message || 'unknown'}`, 'meta');
+};
+
+document.getElementById('send-form').onsubmit = e => {
+  e.preventDefault();
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(msgEl.value);
+  msgEl.value = '';
+};
+</script>
+</body>
+</html>

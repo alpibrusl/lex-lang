@@ -205,6 +205,28 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::singleton("net"),
                 Ty::Unit,
             ));
+            // serve_ws :: (Int, Str) -> [net] Unit
+            //             port  on_message_handler_name
+            // The handler is looked up by name at runtime.
+            fields.insert("serve_ws".into(), Ty::function(
+                vec![Ty::int(), Ty::str()],
+                EffectSet::singleton("net"),
+                Ty::Unit,
+            ));
+            Some(Ty::Record(fields))
+        }
+        "chat" => {
+            let mut fields = IndexMap::new();
+            fields.insert("broadcast".into(), Ty::function(
+                vec![Ty::str(), Ty::str()],
+                EffectSet::singleton("chat"),
+                Ty::Unit,
+            ));
+            fields.insert("send".into(), Ty::function(
+                vec![Ty::int(), Ty::str()],
+                EffectSet::singleton("chat"),
+                Ty::bool(),
+            ));
             Some(Ty::Record(fields))
         }
         "json" => {
@@ -321,6 +343,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "flow" => "flow",
         "bytes" => "bytes",
         "net" => "net",
+        "chat" => "chat",
         _ => return None,
     })
 }
