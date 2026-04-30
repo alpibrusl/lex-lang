@@ -161,3 +161,32 @@ fn fetch(u :: Str) -> [net] Result[Str, Str] { net.get(u) }
     let (name, _) = match r { Value::Variant { name, args } => (name, args), other => panic!("{other:?}") };
     assert_eq!(name, "Err");
 }
+
+#[test]
+fn net_get_accepts_https_scheme() {
+    // Pre-HTTPS support, the runtime errored with "bad url: must start
+    // with http://". This test pins the scheme acceptance: pointing at
+    // a local TCP port that nobody serves on must produce a *transport*
+    // error, not a URL parse error. Demonstrates net.get now accepts
+    // https:// scheme even though TLS handshake will fail without a
+    // peer.
+    let src = r#"
+import "std.net" as net
+fn fetch(u :: Str) -> [net] Result[Str, Str] { net.get(u) }
+"#;
+    let r = run(src, "fetch",
+        vec![Value::Str("https://127.0.0.1:1/".into())],
+        allow(&["net"]));
+    let (name, args) = match r {
+        Value::Variant { name, args } => (name, args),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(name, "Err", "expected Err from unreachable HTTPS endpoint");
+    let msg = match &args[0] { Value::Str(s) => s.clone(), _ => panic!() };
+    // Must be a transport-class error (connect refused / timeout /
+    // tls), not the legacy URL-format rejection.
+    assert!(
+        !msg.contains("must start with"),
+        "https:// must be accepted as a URL scheme; got: {msg}",
+    );
+}
