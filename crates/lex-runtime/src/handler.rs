@@ -177,25 +177,41 @@ fn serve_http(port: u16, handler_name: String, program: Arc<Program>, policy: Po
     let server = tiny_http::Server::http(("127.0.0.1", port))
         .map_err(|e| format!("net.serve bind {port}: {e}"))?;
     eprintln!("net.serve: listening on http://127.0.0.1:{port}");
-    for mut req in server.incoming_requests() {
-        let lex_req = build_request_value(&mut req);
-        let handler = DefaultHandler::new(policy.clone()).with_program(Arc::clone(&program));
-        let mut vm = Vm::with_handler(&program, Box::new(handler));
-        match vm.call(&handler_name, vec![lex_req]) {
-            Ok(resp) => {
-                let (status, body) = unpack_response(&resp);
-                let response = tiny_http::Response::from_string(body)
-                    .with_status_code(status);
-                let _ = req.respond(response);
-            }
-            Err(e) => {
-                let response = tiny_http::Response::from_string(format!("internal error: {e}"))
-                    .with_status_code(500);
-                let _ = req.respond(response);
-            }
-        }
+    // Thread-per-request: the main loop accepts; each request runs on
+    // its own worker thread with its own fresh Vm. The Program is
+    // shared via Arc; Policy and handler_name are cloned per request.
+    // Lex's immutability means there's no shared mutable state at the
+    // language level — workers don't race.
+    for req in server.incoming_requests() {
+        let program = Arc::clone(&program);
+        let policy = policy.clone();
+        let handler_name = handler_name.clone();
+        std::thread::spawn(move || handle_request(req, program, policy, handler_name));
     }
     Ok(Value::Unit)
+}
+
+fn handle_request(
+    mut req: tiny_http::Request,
+    program: Arc<Program>,
+    policy: Policy,
+    handler_name: String,
+) {
+    let lex_req = build_request_value(&mut req);
+    let handler = DefaultHandler::new(policy).with_program(Arc::clone(&program));
+    let mut vm = Vm::with_handler(&program, Box::new(handler));
+    match vm.call(&handler_name, vec![lex_req]) {
+        Ok(resp) => {
+            let (status, body) = unpack_response(&resp);
+            let response = tiny_http::Response::from_string(body).with_status_code(status);
+            let _ = req.respond(response);
+        }
+        Err(e) => {
+            let response = tiny_http::Response::from_string(format!("internal error: {e}"))
+                .with_status_code(500);
+            let _ = req.respond(response);
+        }
+    }
 }
 
 fn build_request_value(req: &mut tiny_http::Request) -> Value {
