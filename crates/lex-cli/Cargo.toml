@@ -21,3 +21,4 @@ lex-runtime = { path = "../lex-runtime" }
 lex-store = { path = "../lex-store" }
 lex-trace = { path = "../lex-trace" }
 lex-api = { path = "../lex-api" }
+conformance = { path = "../conformance" }

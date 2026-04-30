@@ -8,7 +8,10 @@ license.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
+indexmap.workspace = true
+thiserror.workspace = true
 lex-syntax = { path = "../lex-syntax" }
 lex-ast = { path = "../lex-ast" }
 lex-types = { path = "../lex-types" }
 lex-bytecode = { path = "../lex-bytecode" }
+lex-runtime = { path = "../lex-runtime" }

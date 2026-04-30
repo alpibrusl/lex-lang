@@ -1,0 +1,8 @@
+{
+  "name": "d_shape_circle",
+  "language": "lex",
+  "source_file": "../examples/d_shape.lex",
+  "fn": "area",
+  "input": [{"$variant": "Circle", "args": [{"radius": 1.0}]}],
+  "expected_output": 3.14159
+}

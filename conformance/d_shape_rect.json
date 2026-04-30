@@ -1,0 +1,8 @@
+{
+  "name": "d_shape_rect",
+  "language": "lex",
+  "source_file": "../examples/d_shape.lex",
+  "fn": "area",
+  "input": [{"$variant": "Rect", "args": [{"width": 2.0, "height": 3.0}]}],
+  "expected_output": 6.0
+}

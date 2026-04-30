@@ -1,0 +1,11 @@
+{
+  "name": "b_double_input_empty",
+  "language": "lex",
+  "source_file": "../examples/b_parse_int.lex",
+  "fn": "double_input",
+  "input": [""],
+  "expected_output": {
+    "$variant": "Err",
+    "args": [{"$variant": "Empty", "args": []}]
+  }
+}

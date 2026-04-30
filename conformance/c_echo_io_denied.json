@@ -1,0 +1,9 @@
+{
+  "name": "c_echo_io_denied",
+  "language": "lex",
+  "source_file": "../examples/c_echo.lex",
+  "fn": "echo",
+  "input": ["hello"],
+  "policy": {},
+  "expected_status": {"error_kind": "effect_not_allowed"}
+}

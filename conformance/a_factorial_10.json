@@ -1,0 +1,8 @@
+{
+  "name": "factorial_10",
+  "language": "lex",
+  "source_file": "../examples/a_factorial.lex",
+  "fn": "factorial",
+  "input": [10],
+  "expected_output": 3628800
+}
