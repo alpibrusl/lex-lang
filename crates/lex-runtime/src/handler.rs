@@ -45,6 +45,10 @@ pub struct DefaultHandler {
     /// handler can spin up fresh VMs to dispatch incoming requests.
     /// `None` if the handler was constructed without a program.
     pub program: Option<Arc<Program>>,
+    /// Chat registry; populated by `net.serve_ws`'s per-message
+    /// dispatch so `chat.broadcast` / `chat.send` work from inside
+    /// a handler invocation.
+    pub chat_registry: Option<Arc<crate::ws::ChatRegistry>>,
 }
 
 impl DefaultHandler {
@@ -55,11 +59,16 @@ impl DefaultHandler {
             read_root: None,
             budget_used: RefCell::new(0),
             program: None,
+            chat_registry: None,
         }
     }
 
     pub fn with_program(mut self, program: Arc<Program>) -> Self {
         self.program = Some(program); self
+    }
+
+    pub fn with_chat_registry(mut self, registry: Arc<crate::ws::ChatRegistry>) -> Self {
+        self.chat_registry = Some(registry); self
     }
 
     pub fn with_sink(mut self, sink: Box<dyn IoSink>) -> Self {
@@ -176,6 +185,36 @@ impl EffectHandler for DefaultHandler {
                 let key = std::fs::read(&key_path)
                     .map_err(|e| format!("net.serve_tls: read key {key_path}: {e}"))?;
                 serve_http(port, handler_name, program, policy, Some(TlsConfig { cert, key }))
+            }
+            ("net", "serve_ws") => {
+                let port = match args.first() {
+                    Some(Value::Int(n)) if (0..=65535).contains(n) => *n as u16,
+                    _ => return Err("net.serve_ws(port, on_message): port must be Int 0..=65535".into()),
+                };
+                let handler_name = expect_str(args.get(1))?.to_string();
+                let program = self.program.clone()
+                    .ok_or_else(|| "net.serve_ws requires a Program reference".to_string())?;
+                let policy = self.policy.clone();
+                let registry = Arc::new(crate::ws::ChatRegistry::default());
+                crate::ws::serve_ws(port, handler_name, program, policy, registry)
+            }
+            ("chat", "broadcast") => {
+                let registry = self.chat_registry.as_ref()
+                    .ok_or_else(|| "chat.broadcast called outside a net.serve_ws handler".to_string())?;
+                let room = expect_str(args.first())?;
+                let body = expect_str(args.get(1))?;
+                crate::ws::chat_broadcast(registry, room, body);
+                Ok(Value::Unit)
+            }
+            ("chat", "send") => {
+                let registry = self.chat_registry.as_ref()
+                    .ok_or_else(|| "chat.send called outside a net.serve_ws handler".to_string())?;
+                let conn_id = match args.first() {
+                    Some(Value::Int(n)) if *n >= 0 => *n as u64,
+                    _ => return Err("chat.send: conn_id must be non-negative Int".into()),
+                };
+                let body = expect_str(args.get(1))?;
+                Ok(Value::Bool(crate::ws::chat_send(registry, conn_id, body)))
             }
             other => Err(format!("unsupported effect {}.{}", other.0, other.1)),
         }
