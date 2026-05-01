@@ -1,6 +1,7 @@
 //! Runtime values.
 
 use indexmap::IndexMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -24,6 +25,48 @@ pub enum Value {
     /// matmul perf hits the §13.7 #1 100ms target without paying for
     /// 2M Value boxings at the call boundary.
     F64Array { rows: u32, cols: u32, data: Vec<f64> },
+    /// Persistent map keyed by `MapKey` (`Str` or `Int`). Insertion-
+    /// independent equality (sorted by `BTreeMap`'s `Ord`), so two
+    /// maps built from the same pairs in different orders compare
+    /// equal. Restricting keys to two primitive variants keeps
+    /// `Eq + Hash` requirements off `Value` itself, which has
+    /// closures and floats and can't be hashed soundly.
+    Map(BTreeMap<MapKey, Value>),
+    /// Persistent set with the same key-type discipline as `Map`.
+    Set(BTreeSet<MapKey>),
+}
+
+/// Hashable, ordered key for `Value::Map` / `Value::Set`. v1
+/// supports `Str` and `Int`; extending to other primitives or to
+/// records is forward-compatible since the type is not exposed
+/// to user code beyond the surface API.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MapKey {
+    Str(String),
+    Int(i64),
+}
+
+impl MapKey {
+    pub fn from_value(v: &Value) -> Result<Self, String> {
+        match v {
+            Value::Str(s) => Ok(MapKey::Str(s.clone())),
+            Value::Int(n) => Ok(MapKey::Int(*n)),
+            other => Err(format!(
+                "map/set key must be Str or Int, got {other:?}")),
+        }
+    }
+    pub fn into_value(self) -> Value {
+        match self {
+            MapKey::Str(s) => Value::Str(s),
+            MapKey::Int(n) => Value::Int(n),
+        }
+    }
+    pub fn as_value(&self) -> Value {
+        match self {
+            MapKey::Str(s) => Value::Str(s.clone()),
+            MapKey::Int(n) => Value::Int(*n),
+        }
+    }
 }
 
 impl Value {

@@ -2,13 +2,51 @@
 
 use indexmap::IndexMap;
 use lex_ast::canonicalize_program;
-use lex_bytecode::{compile_program, Value, Vm};
+use lex_bytecode::{compile_program, Value, Vm, VmError, MAX_CALL_DEPTH};
 use lex_syntax::parse_source;
 
 fn compile(src: &str) -> lex_bytecode::Program {
     let p = parse_source(src).unwrap();
     let stages = canonicalize_program(&p);
     compile_program(&stages)
+}
+
+#[test]
+fn unbounded_recursion_yields_call_stack_overflow_not_segfault() {
+    // Non-tail recursion (the `+ 1` forces the call to return before
+    // we can use its result), so each call pushes a fresh frame.
+    // Pre-fix the VM would push frames until the host's native stack
+    // exploded; post-fix we get a clean `CallStackOverflow` once we
+    // hit `MAX_CALL_DEPTH`.
+    //
+    // Run on a thread with a small stack so a regression (a recursion
+    // path that bypasses `push_frame`) shows up as a SIGSEGV rather
+    // than passing because the host stack happens to be 8 MiB.
+    let src = "fn deep() -> Int { 1 + deep() }\n";
+    let p = compile(src);
+    let handle = std::thread::Builder::new()
+        .stack_size(512 * 1024)
+        .spawn(move || {
+            let mut vm = Vm::new(&p);
+            vm.call("deep", vec![])
+        })
+        .expect("spawn worker thread");
+    let r = handle.join().expect("worker panicked").expect_err("expected overflow");
+    match r {
+        VmError::CallStackOverflow(n) => assert_eq!(n, MAX_CALL_DEPTH),
+        other => panic!("expected CallStackOverflow, got {other:?}"),
+    }
+}
+
+#[test]
+fn modest_recursion_under_cap_still_runs() {
+    // factorial(20) recurses 20 frames — well under MAX_CALL_DEPTH.
+    // Sanity check that the gate doesn't reject legitimate code.
+    let src = "fn factorial(n :: Int) -> Int { match n { 0 => 1, _ => n * factorial(n - 1) } }\n";
+    let p = compile(src);
+    let mut vm = Vm::new(&p);
+    let r = vm.call("factorial", vec![Value::Int(20)]).unwrap();
+    assert_eq!(r, Value::Int(2_432_902_008_176_640_000));
 }
 
 #[test]

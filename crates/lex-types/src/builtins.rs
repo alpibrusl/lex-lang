@@ -422,6 +422,90 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             ));
             Some(Ty::Record(fields))
         }
+        "map" => {
+            // Persistent map. Keys are `Str` or `Int` only — Lex's
+            // type system tracks them polymorphically as Var(0)
+            // ("K") and lets the runtime check the key shape; both
+            // cases fit into `MapKey`.
+            //
+            // Type variables: 0 = K, 1 = V.
+            let mt   = || Ty::Con("Map".into(), vec![Ty::Var(0), Ty::Var(1)]);
+            let pair = || Ty::Tuple(vec![Ty::Var(0), Ty::Var(1)]);
+            let mut fields = IndexMap::new();
+            // new :: () -> Map[K, V]
+            fields.insert("new".into(), Ty::function(
+                vec![], EffectSet::empty(), mt()));
+            // size :: Map[K, V] -> Int
+            fields.insert("size".into(), Ty::function(
+                vec![mt()], EffectSet::empty(), Ty::int()));
+            // has :: Map[K, V], K -> Bool
+            fields.insert("has".into(), Ty::function(
+                vec![mt(), Ty::Var(0)], EffectSet::empty(), Ty::bool()));
+            // get :: Map[K, V], K -> Option[V]
+            fields.insert("get".into(), Ty::function(
+                vec![mt(), Ty::Var(0)], EffectSet::empty(),
+                Ty::Con("Option".into(), vec![Ty::Var(1)])));
+            // set :: Map[K, V], K, V -> Map[K, V]
+            fields.insert("set".into(), Ty::function(
+                vec![mt(), Ty::Var(0), Ty::Var(1)],
+                EffectSet::empty(), mt()));
+            // delete :: Map[K, V], K -> Map[K, V]
+            fields.insert("delete".into(), Ty::function(
+                vec![mt(), Ty::Var(0)], EffectSet::empty(), mt()));
+            // keys :: Map[K, V] -> List[K]
+            fields.insert("keys".into(), Ty::function(
+                vec![mt()], EffectSet::empty(),
+                Ty::List(Box::new(Ty::Var(0)))));
+            // values :: Map[K, V] -> List[V]
+            fields.insert("values".into(), Ty::function(
+                vec![mt()], EffectSet::empty(),
+                Ty::List(Box::new(Ty::Var(1)))));
+            // entries :: Map[K, V] -> List[(K, V)]
+            fields.insert("entries".into(), Ty::function(
+                vec![mt()], EffectSet::empty(),
+                Ty::List(Box::new(pair()))));
+            // from_list :: List[(K, V)] -> Map[K, V]
+            fields.insert("from_list".into(), Ty::function(
+                vec![Ty::List(Box::new(pair()))],
+                EffectSet::empty(), mt()));
+            Some(Ty::Record(fields))
+        }
+        "set" => {
+            // Persistent set with the same key-type discipline as map.
+            // Type variable: 0 = T (the element type, also the key type).
+            let st   = || Ty::Con("Set".into(), vec![Ty::Var(0)]);
+            let mut fields = IndexMap::new();
+            // new :: () -> Set[T]
+            fields.insert("new".into(), Ty::function(
+                vec![], EffectSet::empty(), st()));
+            // size :: Set[T] -> Int
+            fields.insert("size".into(), Ty::function(
+                vec![st()], EffectSet::empty(), Ty::int()));
+            // has :: Set[T], T -> Bool
+            fields.insert("has".into(), Ty::function(
+                vec![st(), Ty::Var(0)], EffectSet::empty(), Ty::bool()));
+            // add :: Set[T], T -> Set[T]
+            fields.insert("add".into(), Ty::function(
+                vec![st(), Ty::Var(0)], EffectSet::empty(), st()));
+            // delete :: Set[T], T -> Set[T]
+            fields.insert("delete".into(), Ty::function(
+                vec![st(), Ty::Var(0)], EffectSet::empty(), st()));
+            // to_list :: Set[T] -> List[T]
+            fields.insert("to_list".into(), Ty::function(
+                vec![st()], EffectSet::empty(),
+                Ty::List(Box::new(Ty::Var(0)))));
+            // from_list :: List[T] -> Set[T]
+            fields.insert("from_list".into(), Ty::function(
+                vec![Ty::List(Box::new(Ty::Var(0)))],
+                EffectSet::empty(), st()));
+            // union :: Set[T], Set[T] -> Set[T]
+            fields.insert("union".into(), Ty::function(
+                vec![st(), st()], EffectSet::empty(), st()));
+            // intersect :: Set[T], Set[T] -> Set[T]
+            fields.insert("intersect".into(), Ty::function(
+                vec![st(), st()], EffectSet::empty(), st()));
+            Some(Ty::Record(fields))
+        }
         "flow" => {
             // Orchestration primitives (spec §11.2). Each takes one or
             // more closures and returns a closure with a derived shape.
@@ -496,6 +580,8 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "net" => "net",
         "chat" => "chat",
         "math" => "math",
+        "map" => "map",
+        "set" => "set",
         _ => return None,
     })
 }

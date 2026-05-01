@@ -220,5 +220,9 @@ fn value_to_json(v: &Value) -> serde_json::Value {
             m.insert("data".into(), J::Array(data.iter().map(|f| J::from(*f)).collect()));
             J::Object(m)
         }
+        Value::Map(m) => J::Array(m.iter().map(|(k, v)| {
+            J::Array(vec![value_to_json(&k.as_value()), value_to_json(v)])
+        }).collect()),
+        Value::Set(s) => J::Array(s.iter().map(|k| value_to_json(&k.as_value())).collect()),
     }
 }

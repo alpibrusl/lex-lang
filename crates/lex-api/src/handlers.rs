@@ -405,6 +405,26 @@ fn value_to_json(v: &Value) -> serde_json::Value {
             m.insert("data".into(), J::Array(data.iter().map(|f| J::from(*f)).collect()));
             J::Object(m)
         }
+        Value::Map(m) => {
+            // API output: emit Str-keyed maps as JSON objects (most
+            // ergonomic for HTTP consumers); fall back to a list of
+            // [key, value] pairs when keys are Int.
+            let all_str = m.keys().all(|k| matches!(k, lex_bytecode::MapKey::Str(_)));
+            if all_str {
+                let mut out = serde_json::Map::new();
+                for (k, v) in m {
+                    if let lex_bytecode::MapKey::Str(s) = k {
+                        out.insert(s.clone(), value_to_json(v));
+                    }
+                }
+                J::Object(out)
+            } else {
+                J::Array(m.iter().map(|(k, v)| {
+                    J::Array(vec![value_to_json(&k.as_value()), value_to_json(v)])
+                }).collect())
+            }
+        }
+        Value::Set(s) => J::Array(s.iter().map(|k| value_to_json(&k.as_value())).collect()),
     }
 }
 

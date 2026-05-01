@@ -51,8 +51,14 @@ bound:
   (good for infinite loops); it does **not** cap memory allocations.
   A program declared `pure` can still allocate a list of 10^9 ints
   and OOM the host.
-- **Stack overflow.** Deep recursion eventually overflows. There's
-  no Lex-level recursion-depth limit.
+- **Stack overflow.** The parser caps recursion at `MAX_DEPTH=96`
+  and the VM caps call-frame depth at `MAX_CALL_DEPTH=1024` —
+  both refuse cleanly with structured errors instead of unwinding
+  the host. Tail calls reuse frames, so productive
+  tail-recursive code is unaffected. (Native-stack work the host
+  performs *outside* a VM call — e.g. handling arbitrarily nested
+  JSON in `lex parse` — is not bounded; for adversarial input
+  layer container memory caps.)
 - **CPU time.** `--max-steps` bounds dispatched ops; the per-op
   cost varies. Tight on its own is not a hard wall-clock bound.
 - **Logic bugs that don't cross effect boundaries.** A `[net]`

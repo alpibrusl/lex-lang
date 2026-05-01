@@ -17,7 +17,17 @@ pub enum VmError {
     UnknownFunction(u32),
     #[error("effect handler error: {0}")]
     Effect(String),
+    #[error("call stack overflow: recursion depth exceeded ({0})")]
+    CallStackOverflow(u32),
 }
+
+/// Maximum simultaneous call frames. Defends against unbounded
+/// recursion in agent-emitted code: a body that calls itself
+/// without a base case would otherwise blow the host's native
+/// stack and crash the process. Real Lex code rarely exceeds
+/// ~30 frames; 1024 is generous headroom while still well under
+/// the OS stack limit at any per-frame size we use.
+pub const MAX_CALL_DEPTH: u32 = 1024;
 
 /// Host-side effect dispatch. Implementors decide what `kind`/`op` mean
 /// and how arguments map to side effects.
@@ -136,11 +146,23 @@ impl<'a> Vm<'a> {
         }
         let mut locals = vec![Value::Unit; f.locals_count.max(f.arity) as usize];
         for (i, v) in args.into_iter().enumerate() { locals[i] = v; }
-        self.frames.push(Frame {
+        self.push_frame(Frame {
             fn_id, pc: 0, locals, stack_base: self.stack.len(),
             trace_kind: FrameKind::Entry,
-        });
+        })?;
         self.run()
+    }
+
+    /// All call-frame pushes funnel through here so the depth
+    /// check can't be skipped by a missing branch. Returns
+    /// `CallStackOverflow` instead of letting recursion blow the
+    /// host's native stack.
+    fn push_frame(&mut self, frame: Frame) -> Result<(), VmError> {
+        if self.frames.len() as u32 >= MAX_CALL_DEPTH {
+            return Err(VmError::CallStackOverflow(MAX_CALL_DEPTH));
+        }
+        self.frames.push(frame);
+        Ok(())
     }
 
     fn run(&mut self) -> Result<Value, VmError> {
@@ -362,10 +384,10 @@ impl<'a> Vm<'a> {
                     let f = &self.program.functions[fn_id as usize];
                     let mut locals = vec![Value::Unit; f.locals_count.max(f.arity) as usize];
                     for (i, v) in combined.into_iter().enumerate() { locals[i] = v; }
-                    self.frames.push(Frame {
+                    self.push_frame(Frame {
                         fn_id, pc: 0, locals, stack_base: self.stack.len(),
                         trace_kind: FrameKind::Call(node_id),
-                    });
+                    })?;
                 }
                 Op::Call { fn_id, arity, node_id_idx } => {
                     let mut args: Vec<Value> = (0..arity).map(|_| Value::Unit).collect();
@@ -376,10 +398,10 @@ impl<'a> Vm<'a> {
                     let f = &self.program.functions[fn_id as usize];
                     let mut locals = vec![Value::Unit; f.locals_count.max(f.arity) as usize];
                     for (i, v) in args.into_iter().enumerate() { locals[i] = v; }
-                    self.frames.push(Frame {
+                    self.push_frame(Frame {
                         fn_id, pc: 0, locals, stack_base: self.stack.len(),
                         trace_kind: FrameKind::Call(node_id),
-                    });
+                    })?;
                 }
                 Op::TailCall { fn_id, arity, node_id_idx } => {
                     let mut args: Vec<Value> = (0..arity).map(|_| Value::Unit).collect();
