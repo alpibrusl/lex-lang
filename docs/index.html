@@ -3,10 +3,10 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Lex — sandbox for agent-written code, via static effect typing</title>
-<meta name="description" content="Run LLM-generated tools without trusting the LLM. Lex's effect-typed function signatures double as a runtime sandbox: type-check rejects undeclared effects before any code runs." />
-<meta property="og:title" content="Lex — sandbox for agent-written code" />
-<meta property="og:description" content="Type-check rejects malicious LLM-generated code before it runs. 7/7 actively blocked vs RestrictedPython 3/7." />
+<title>Lex — a language for code no one will read</title>
+<meta name="description" content="When AI agents write more code than humans review, the function signature has to be the contract. Lex's effects are part of the type; type-check, runtime policy, and Spec proofs verify the body without anyone reading it." />
+<meta property="og:title" content="Lex — a language for code no one will read" />
+<meta property="og:description" content="Effects in the function signature are the contract. Verified mechanically, no body review needed. 7/7 actively blocked vs RestrictedPython 3/7." />
 <style>
   :root {
     --fg: #1d1f24;
@@ -124,13 +124,14 @@
 <div class="wrap">
 
 <header>
-  <h1>Sandbox for <span class="accent">agent-written code</span>,<br />via static effect typing.</h1>
+  <h1>A language for code <span class="accent">no one will read</span>.</h1>
   <p class="sub">
-    Lex is a small functional language whose function signatures
-    declare their effects. Hand an LLM a request, splice its output
-    into <code>fn tool(input :: Str) -&gt; [&lt;allowed&gt;] Str</code>,
-    and the type checker rejects any effect outside the declared set
-    <em>before the body runs</em>.
+    AI agents will write more code than humans review. Lex's bet:
+    when nobody reads bodies, the function signature has to be the
+    contract. Effects are part of the type
+    (<code>fn handle(req) -&gt; [net, fs_read("/data")] Resp</code>);
+    the type checker, the runtime policy gate, and Spec proofs
+    verify the body honors it — without anyone reading the body.
   </p>
   <div class="actions">
     <a href="https://github.com/alpibrusl/lex-lang" class="primary">GitHub →</a>
@@ -140,7 +141,13 @@
 </header>
 
 <section>
-  <h2>The pitch in one demo</h2>
+  <h2>One demo: machine-checkable contracts</h2>
+  <p class="lede">
+    The host declares <code>--allow-effects net</code>. The agent emits
+    a tool body. Lex's type checker decides whether the body honors
+    the contract. No human reads the code; the verdict is mechanical
+    and pre-execution.
+  </p>
   <div class="pair">
     <div>
       <h4>Benign request</h4>
@@ -220,7 +227,7 @@
   </p>
   <ul class="tight">
     <li><strong>Pre-execution.</strong> Type-check rejection runs zero user code. A multi-tool agent that runs N tools per request rejects N malicious tools without ever invoking them.</li>
-    <li><strong>Auditable.</strong> A function's effect set is in its signature, readable by humans (and by the next LLM in the loop).</li>
+    <li><strong>Auditable.</strong> A function's effect set is in its signature, readable by humans <em>and by the next LLM in the loop</em>. Multi-agent pipelines: stage A's effects propagate into stage B's signature; composition is type-checked, not body-reviewed.</li>
     <li><strong>Scoped.</strong> <code>--allow-fs-read /tmp/safe</code>, <code>--allow-net-host api.openai.com</code>, <code>--max-steps 1_000_000</code> compose with the effect set.</li>
     <li><strong>No allowlist to maintain.</strong> RestrictedPython's <code>safe_builtins</code> needs auditing as Python evolves. Lex's effect catalog is fixed by the language.</li>
   </ul>
@@ -229,6 +236,31 @@
     op count via <code>--max-steps</code> but doesn't yet bound
     pure-builtin allocations. For full untrusted multi-tenant
     production, layer Lex inside a container.
+  </p>
+</section>
+
+<section>
+  <h2>Capability ≠ correctness</h2>
+  <p>
+    Effect typing answers <em>what your code touches</em>, not
+    <em>what it does</em>. A <code>[net]</code>-typed function
+    scraping the wrong site is well-typed; a <code>[fs_read("/data")]</code>
+    function returning random bytes is well-typed. The signature is
+    one rung of the ladder. There are higher rungs:
+  </p>
+  <ul class="tight">
+    <li><strong>Spec proofs (§14 of <code>langspecs.md</code>).</strong> Attach a behavioral contract — <code>forall x :: Int, lo, hi where lo &lt;= hi: clamp(x, lo, hi) &gt;= lo and ... &lt;= hi</code> — and the checker discharges it via Z3 (or property-tests when SMT can't decide). Verdict travels with the stage in the store, so downstream agents can require <em>spec-proven</em> dependencies, not just well-typed ones.</li>
+    <li><strong>Examples-driven verification.</strong> The host hands the agent a small set of <code>{input → expected_output}</code> pairs. Lex runs the emitted body against each before trusting it for live traffic. Catches <em>wrong-but-consistent</em> behavior (the wrong-site scrape) at minimal cost; doesn't need SMT.</li>
+    <li><strong>Differential evaluation.</strong> Run two agent-emitted bodies on the same inputs and flag divergence. Cheap regression detection across model upgrades.</li>
+    <li><strong>Capability scoping.</strong> <code>--allow-net-host github.com</code> means the wrong-site scraping case can't even <em>reach</em> attacker.com — the blast radius of a behavioral bug is bounded.</li>
+  </ul>
+  <p>
+    Today Lex ships rungs 1 (effects) and 4 (scoping); rung 2 (Spec)
+    is implemented for explicit specs but not yet wired into
+    <code>agent-tool</code>; rungs 2–3 against agent-emitted code are
+    on the near roadmap. The point isn't that capability typing solves
+    correctness — it doesn't — it's that it's the only rung where the
+    contract is part of the language and free of inference cost.
   </p>
 </section>
 
