@@ -1,0 +1,15 @@
+# Build output and runtime artifacts. The seed corpus under
+# `corpus/<target>/seed_*.lex` is committed; fuzzer-generated
+# inputs are not (libFuzzer regenerates them on each run).
+target/
+Cargo.lock
+artifacts/
+# Ignore everything in corpus/ except the committed seed_* files
+# and the directory itself.
+corpus/*/
+!corpus/parser/
+!corpus/type_checker/
+corpus/parser/*
+corpus/type_checker/*
+!corpus/parser/seed_*.lex
+!corpus/type_checker/seed_*.lex
