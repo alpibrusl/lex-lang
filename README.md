@@ -227,7 +227,7 @@ lex agent-tool --allow-effects net --input "x" \
 #   exit 2
 ```
 
-Flags: `--body '<src>'` / `--body-file <path>` skip the API call; `--request '<q>'` needs `ANTHROPIC_API_KEY`. `--max-steps N` (default 1M) caps op count as a runtime DoS guard. `--allow-fs-read PATH` and `--allow-net-host HOST` add per-path / per-host scopes on top of `--allow-effects`.
+Flags: `--body '<src>'` / `--body-file <path>` skip the API call; `--request '<q>'` needs `ANTHROPIC_API_KEY`. `--max-steps N` (default 1M) caps op count as a runtime DoS guard. `--allow-fs-read PATH` and `--allow-net-host HOST` add per-path / per-host scopes on top of `--allow-effects`. `--examples FILE` runs the tool against a JSON list of `{input, expected}` pairs and rejects on any mismatch (exit 5) — closes the well-typed-but-wrong-behavior gap.
 
 ### Adversarial benchmark
 

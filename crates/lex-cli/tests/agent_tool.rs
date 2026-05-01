@@ -136,3 +136,66 @@ fn benign_compute_runs_within_default_step_limit() {
     // sum 0..100 = 4950
     assert_eq!(stdout.trim(), "4950");
 }
+
+#[test]
+fn examples_pass_when_body_matches_expected() {
+    use std::io::Write;
+    let mut tmp = std::env::temp_dir();
+    tmp.push("lex_examples_pass.json");
+    let mut f = std::fs::File::create(&tmp).expect("create tmp");
+    f.write_all(br#"[{"input":"21","expected":"42"},{"input":"100","expected":"200"}]"#)
+        .expect("write tmp");
+
+    let (code, stdout, stderr) = run(&[
+        "agent-tool",
+        "--allow-effects", "",
+        "--quiet",
+        "--examples", tmp.to_str().unwrap(),
+        "--input", "5",
+        "--body",
+        "match str.to_int(input) { Some(n) => int.to_str(n * 2), None => \"err\" }",
+    ]);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    // The single-shot --input run prints 10 (5 * 2) to stdout.
+    assert_eq!(stdout.trim(), "10");
+}
+
+#[test]
+fn examples_reject_wrong_behavior_with_exit_5() {
+    use std::io::Write;
+    let mut tmp = std::env::temp_dir();
+    tmp.push("lex_examples_fail.json");
+    let mut f = std::fs::File::create(&tmp).expect("create tmp");
+    f.write_all(br#"[{"input":"21","expected":"42"},{"input":"100","expected":"200"}]"#)
+        .expect("write tmp");
+
+    // Body triples instead of doubling — well-typed but wrong behavior.
+    // Type-check passes; --examples catches it before live use.
+    let (code, _stdout, stderr) = run(&[
+        "agent-tool",
+        "--allow-effects", "",
+        "--quiet",
+        "--examples", tmp.to_str().unwrap(),
+        "--input", "5",
+        "--body",
+        "match str.to_int(input) { Some(n) => int.to_str(n * 3), None => \"err\" }",
+    ]);
+    assert_eq!(code, 5, "expected exit 5; stderr:\n{stderr}");
+    assert!(stderr.contains("EXAMPLES FAILED"), "stderr:\n{stderr}");
+    assert!(stderr.contains("expected=\"42\""), "stderr:\n{stderr}");
+    assert!(stderr.contains("got     =\"63\""), "stderr:\n{stderr}");
+}
+
+#[test]
+fn examples_missing_file_errors_clearly() {
+    let (code, _stdout, stderr) = run(&[
+        "agent-tool",
+        "--allow-effects", "",
+        "--quiet",
+        "--examples", "/no/such/path/examples.json",
+        "--input", "x",
+        "--body", "input",
+    ]);
+    assert_ne!(code, 0);
+    assert!(stderr.contains("read examples file"), "stderr:\n{stderr}");
+}

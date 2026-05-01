@@ -250,16 +250,18 @@
   </p>
   <ul class="tight">
     <li><strong>Spec proofs (§14 of <code>langspecs.md</code>).</strong> Attach a behavioral contract — <code>forall x :: Int, lo, hi where lo &lt;= hi: clamp(x, lo, hi) &gt;= lo and ... &lt;= hi</code> — and the checker discharges it via Z3 (or property-tests when SMT can't decide). Verdict travels with the stage in the store, so downstream agents can require <em>spec-proven</em> dependencies, not just well-typed ones.</li>
-    <li><strong>Examples-driven verification.</strong> The host hands the agent a small set of <code>{input → expected_output}</code> pairs. Lex runs the emitted body against each before trusting it for live traffic. Catches <em>wrong-but-consistent</em> behavior (the wrong-site scrape) at minimal cost; doesn't need SMT.</li>
+    <li><strong>Examples-driven verification.</strong> Pass <code>--examples FILE</code>; the host hands the agent a small set of <code>{input → expected}</code> pairs and Lex runs the emitted body against each before trusting it for live traffic. Any mismatch exits 5 with a per-case diff. Catches <em>wrong-but-consistent</em> behavior (the wrong-site scrape) at minimal cost; doesn't need SMT.</li>
     <li><strong>Differential evaluation.</strong> Run two agent-emitted bodies on the same inputs and flag divergence. Cheap regression detection across model upgrades.</li>
     <li><strong>Capability scoping.</strong> <code>--allow-net-host github.com</code> means the wrong-site scraping case can't even <em>reach</em> attacker.com — the blast radius of a behavioral bug is bounded.</li>
   </ul>
   <p>
-    Today Lex ships rungs 1 (effects) and 4 (scoping); rung 2 (Spec)
-    is implemented for explicit specs but not yet wired into
-    <code>agent-tool</code>; rungs 2–3 against agent-emitted code are
-    on the near roadmap. The point isn't that capability typing solves
-    correctness — it doesn't — it's that it's the only rung where the
+    Today Lex ships rungs 1 (effects), 2 (examples-driven, via
+    <code>--examples</code>), and 4 (scoping); rung 3 (differential
+    eval) and Spec proofs against agent-emitted bodies are on the
+    near roadmap (Spec works for explicit specs already, just not
+    yet wired into <code>agent-tool</code>). The point isn't that
+    capability typing solves correctness — it doesn't — it's that
+    it's the only rung where the
     contract is part of the language and free of inference cost.
   </p>
 </section>
