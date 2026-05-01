@@ -251,18 +251,17 @@
   <ul class="tight">
     <li><strong>Spec proofs (§14 of <code>langspecs.md</code>).</strong> Attach a behavioral contract — <code>forall x :: Int, lo, hi where lo &lt;= hi: clamp(x, lo, hi) &gt;= lo and ... &lt;= hi</code> — and the checker discharges it via Z3 (or property-tests when SMT can't decide). Verdict travels with the stage in the store, so downstream agents can require <em>spec-proven</em> dependencies, not just well-typed ones.</li>
     <li><strong>Examples-driven verification.</strong> Pass <code>--examples FILE</code>; the host hands the agent a small set of <code>{input → expected}</code> pairs and Lex runs the emitted body against each before trusting it for live traffic. Any mismatch exits 5 with a per-case diff. Catches <em>wrong-but-consistent</em> behavior (the wrong-site scrape) at minimal cost; doesn't need SMT.</li>
-    <li><strong>Differential evaluation.</strong> Run two agent-emitted bodies on the same inputs and flag divergence. Cheap regression detection across model upgrades.</li>
+    <li><strong>Spec proofs.</strong> Pass <code>--spec FILE</code>; the host attaches a behavioral contract — <code>forall x :: Int where x &gt;= 0: tool(x) == expected(x)</code> — and the spec checker discharges it via Z3 (or a randomized fallback). Counterexamples abort with exit 5; inconclusive proofs abort with 6 unless <code>--spec-allow-inconclusive</code> is set. Strongest available pre-execution check on behavior.</li>
     <li><strong>Capability scoping.</strong> <code>--allow-net-host github.com</code> means the wrong-site scraping case can't even <em>reach</em> attacker.com — the blast radius of a behavioral bug is bounded.</li>
+    <li><strong>Differential evaluation.</strong> Run two agent-emitted bodies on the same inputs and flag divergence. Cheap regression detection across model upgrades. (Roadmap.)</li>
   </ul>
   <p>
-    Today Lex ships rungs 1 (effects), 2 (examples-driven, via
-    <code>--examples</code>), and 4 (scoping); rung 3 (differential
-    eval) and Spec proofs against agent-emitted bodies are on the
-    near roadmap (Spec works for explicit specs already, just not
-    yet wired into <code>agent-tool</code>). The point isn't that
-    capability typing solves correctness — it doesn't — it's that
-    it's the only rung where the
-    contract is part of the language and free of inference cost.
+    Today Lex ships effects, capability scoping, examples-driven
+    verification, and Spec proofs against agent-emitted bodies.
+    Differential evaluation is the remaining roadmap item. The point
+    isn't that capability typing solves correctness — it doesn't — it's
+    that the contract lives in the language, free of inference cost,
+    and each higher rung composes on top of the previous one.
   </p>
 </section>
 

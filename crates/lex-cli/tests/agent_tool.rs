@@ -199,3 +199,61 @@ fn examples_missing_file_errors_clearly() {
     assert_ne!(code, 0);
     assert!(stderr.contains("read examples file"), "stderr:\n{stderr}");
 }
+
+#[test]
+fn spec_proved_against_correct_body() {
+    use std::io::Write;
+    let mut tmp = std::env::temp_dir();
+    tmp.push("lex_spec_ok.spec");
+    let mut f = std::fs::File::create(&tmp).expect("create spec");
+    f.write_all(br#"spec is_ok { forall s :: Str: tool(s) == "ok" }"#)
+        .expect("write spec");
+
+    let (code, stdout, stderr) = run(&[
+        "agent-tool",
+        "--allow-effects", "",
+        "--quiet",
+        "--spec", tmp.to_str().unwrap(),
+        "--input", "x",
+        "--body", r#""ok""#,
+    ]);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert_eq!(stdout.trim(), "ok");
+}
+
+#[test]
+fn spec_counterexample_aborts_with_exit_5() {
+    use std::io::Write;
+    let mut tmp = std::env::temp_dir();
+    tmp.push("lex_spec_fail.spec");
+    let mut f = std::fs::File::create(&tmp).expect("create spec");
+    f.write_all(br#"spec is_ok { forall s :: Str: tool(s) == "ok" }"#)
+        .expect("write spec");
+
+    // Body always returns "oops" — spec asserts "ok"; randomized prover
+    // immediately finds a counterexample (any input string).
+    let (code, _stdout, stderr) = run(&[
+        "agent-tool",
+        "--allow-effects", "",
+        "--quiet",
+        "--spec", tmp.to_str().unwrap(),
+        "--input", "x",
+        "--body", r#""oops""#,
+    ]);
+    assert_eq!(code, 5, "expected exit 5; stderr:\n{stderr}");
+    assert!(stderr.contains("SPEC COUNTEREXAMPLE"), "stderr:\n{stderr}");
+}
+
+#[test]
+fn spec_missing_file_errors_clearly() {
+    let (code, _stdout, stderr) = run(&[
+        "agent-tool",
+        "--allow-effects", "",
+        "--quiet",
+        "--spec", "/no/such/path/some.spec",
+        "--input", "x",
+        "--body", r#""ok""#,
+    ]);
+    assert_ne!(code, 0);
+    assert!(stderr.contains("read spec file"), "stderr:\n{stderr}");
+}
