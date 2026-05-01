@@ -9,12 +9,13 @@ use lex_bytecode::{compile_program, vm::Vm};
 use lex_runtime::{DefaultHandler, Policy};
 use lex_syntax::parse_source;
 use std::collections::BTreeSet;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tungstenite::{connect, Message};
 
-fn spawn_chat_server(src: &str) {
+fn spawn_chat_server(src: &str, port: u16) {
     let prog = parse_source(src).expect("parse");
     let stages = canonicalize_program(&prog);
     if let Err(errs) = lex_types::check_program(&stages) {
@@ -28,7 +29,30 @@ fn spawn_chat_server(src: &str) {
         let mut vm = Vm::with_handler(&bc, Box::new(handler));
         let _ = vm.call("main", vec![]);
     });
-    thread::sleep(Duration::from_millis(200));
+    wait_for_bind(port, Duration::from_secs(5));
+}
+
+/// Poll-connect to `port` until the listener accepts a TCP
+/// connection or the deadline expires. Replaces a fixed sleep so
+/// the test passes whether the WS bind takes 5ms or 500ms,
+/// without slowing the fast path. Same shape as `net_serve.rs`.
+fn wait_for_bind(port: u16, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut backoff = Duration::from_millis(20);
+    loop {
+        if let Ok(s) = TcpStream::connect_timeout(
+            &("127.0.0.1", port).to_socket_addrs().unwrap().next().unwrap(),
+            Duration::from_millis(200),
+        ) {
+            drop(s);
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("ws server on :{port} did not bind within {timeout:?}");
+        }
+        thread::sleep(backoff);
+        backoff = (backoff * 2).min(Duration::from_millis(200));
+    }
 }
 
 const CHAT_SRC_TEMPLATE: &str = r#"
@@ -84,13 +108,20 @@ fn set_read_timeout(
 #[test]
 fn broadcast_reaches_other_clients_in_same_room() {
     let port = 19101;
-    spawn_chat_server(&chat_src(port));
+    spawn_chat_server(&chat_src(port), port);
 
     // Two clients join the same room.
     let mut alice = dial(port, "lobby");
     let mut bob = dial(port, "lobby");
     set_read_timeout(&mut alice, Duration::from_secs(2));
     set_read_timeout(&mut bob, Duration::from_secs(2));
+
+    // The WS handshake completes from the client's perspective
+    // before the server has finished its own bookkeeping (room
+    // registration). Give the server a moment to record both
+    // before alice sends — otherwise her broadcast can race the
+    // registration of the second client.
+    thread::sleep(Duration::from_millis(100));
 
     // alice sends; both alice and bob should receive (server echoes
     // to all in the room, including the sender).
@@ -110,12 +141,14 @@ fn broadcast_reaches_other_clients_in_same_room() {
 #[test]
 fn rooms_are_isolated() {
     let port = 19102;
-    spawn_chat_server(&chat_src(port));
+    spawn_chat_server(&chat_src(port), port);
 
     let mut a_lobby = dial(port, "lobby");
     let mut a_general = dial(port, "general");
     set_read_timeout(&mut a_lobby, Duration::from_millis(500));
     set_read_timeout(&mut a_general, Duration::from_millis(500));
+    // Same handshake-vs-registration race as `broadcast_*`.
+    thread::sleep(Duration::from_millis(100));
 
     a_lobby.send(Message::Text("for-lobby-only".into())).unwrap();
 
@@ -131,7 +164,7 @@ fn rooms_are_isolated() {
 #[test]
 fn many_clients_fan_out() {
     let port = 19103;
-    spawn_chat_server(&chat_src(port));
+    spawn_chat_server(&chat_src(port), port);
 
     const N: usize = 8;
     let mut clients = Vec::with_capacity(N);
@@ -140,6 +173,10 @@ fn many_clients_fan_out() {
         set_read_timeout(&mut ws, Duration::from_secs(2));
         clients.push(ws);
     }
+    // Server-side registration races the client-side handshake;
+    // wait briefly so all 8 clients are registered before the first
+    // client broadcasts.
+    thread::sleep(Duration::from_millis(150));
     // First client sends a message.
     clients[0].send(Message::Text("ping".into())).unwrap();
 
