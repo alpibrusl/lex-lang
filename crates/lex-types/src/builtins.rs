@@ -237,6 +237,31 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             ));
             Some(Ty::Record(fields))
         }
+        "time" => {
+            // time.now() -> [time] Int — unix timestamp seconds.
+            // Reading the clock is an effect for two reasons: it's
+            // non-deterministic (replay needs the captured value) and
+            // it's a side-channel surface (see "Capability ≠
+            // correctness" on the landing page).
+            let mut fields = IndexMap::new();
+            fields.insert("now".into(), Ty::function(
+                vec![],
+                EffectSet::singleton("time"),
+                Ty::int(),
+            ));
+            Some(Ty::Record(fields))
+        }
+        "rand" => {
+            // rand.int_in(lo, hi) -> [rand] Int — currently a deterministic
+            // stub (midpoint) per spec §13; replaced when randomness lands.
+            let mut fields = IndexMap::new();
+            fields.insert("int_in".into(), Ty::function(
+                vec![Ty::int(), Ty::int()],
+                EffectSet::singleton("rand"),
+                Ty::int(),
+            ));
+            Some(Ty::Record(fields))
+        }
         "net" => {
             let mut fields = IndexMap::new();
             // get :: Str -> [net] Result[Str, Str]
@@ -451,6 +476,8 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "json" => "json",
         "flow" => "flow",
         "tuple" => "tuple",
+        "time" => "time",
+        "rand" => "rand",
         "bytes" => "bytes",
         "net" => "net",
         "chat" => "chat",
