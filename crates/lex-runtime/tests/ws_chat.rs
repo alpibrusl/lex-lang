@@ -120,8 +120,9 @@ fn broadcast_reaches_other_clients_in_same_room() {
     // before the server has finished its own bookkeeping (room
     // registration). Give the server a moment to record both
     // before alice sends — otherwise her broadcast can race the
-    // registration of the second client.
-    thread::sleep(Duration::from_millis(100));
+    // registration of the second client. CI runners can be ~3x
+    // slower than dev hardware; budget is generous.
+    thread::sleep(Duration::from_millis(500));
 
     // alice sends; both alice and bob should receive (server echoes
     // to all in the room, including the sender).
@@ -148,7 +149,7 @@ fn rooms_are_isolated() {
     set_read_timeout(&mut a_lobby, Duration::from_millis(500));
     set_read_timeout(&mut a_general, Duration::from_millis(500));
     // Same handshake-vs-registration race as `broadcast_*`.
-    thread::sleep(Duration::from_millis(100));
+    thread::sleep(Duration::from_millis(500));
 
     a_lobby.send(Message::Text("for-lobby-only".into())).unwrap();
 
@@ -174,9 +175,9 @@ fn many_clients_fan_out() {
         clients.push(ws);
     }
     // Server-side registration races the client-side handshake;
-    // wait briefly so all 8 clients are registered before the first
-    // client broadcasts.
-    thread::sleep(Duration::from_millis(150));
+    // wait so all 8 clients are registered before the first
+    // client broadcasts. 8 clients × handshake → bigger budget.
+    thread::sleep(Duration::from_millis(750));
     // First client sends a message.
     clients[0].send(Message::Text("ping".into())).unwrap();
 
