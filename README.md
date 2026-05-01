@@ -372,8 +372,8 @@ lex/
 | M8 — CLI + agent API server | ✅ |
 | M9 — Core | Phase 1 (shape solver, sized numerics) ✅ ; Phase 2 (mutation analysis, native matmul) ✅ ; Cranelift JIT, source-level `mut`/`for` syntax deferred |
 | M10 — Spec | ✅ randomized + SMT-LIB export ; `--spec` wired into `agent-tool` ; in-process Z3 deferred |
-| M11 — Stdlib MVP | ✅ pure builtins + closures + higher-order list ops + `std.flow` orchestration ; `std.math` (linalg + scalar floats) ; `std.tuple` ; **effect polymorphism** on `list.map` / `list.filter` / `list.fold` / `option.map` / `result.map` / `result.and_then` / `result.map_err` ; `flow.parallel` ✅ (sequential v1 — true threading deferred) ; `flow.parallel_record` deferred (needs row polymorphism on records) ; `std.map` / `std.set` deferred (need `Value` variants) |
-| M16 — Conformance harness + token budget | ✅ |
+| Stdlib MVP | ✅ pure builtins + closures + higher-order list ops + `std.flow` orchestration ; `std.math` (linalg + scalar floats) ; `std.tuple` ; **effect polymorphism** on `list.map` / `list.filter` / `list.fold` / `option.map` / `result.map` / `result.and_then` / `result.map_err` ; `flow.parallel` ✅ (sequential v1 — true threading deferred) ; `flow.parallel_record` deferred (needs row polymorphism on records) ; `std.map` / `std.set` deferred (need `Value` variants) |
+| Conformance harness + token budget | ✅ |
 | Agent integration (post-spec) | `lex agent-tool` (sandbox) ✅ ; `lex tool-registry serve` (HTTP registry) ✅ ; correctness ladder: `--examples` ✅ `--spec` ✅ `--diff-body` ✅ ; AST tooling: `lex audit` ✅ `lex ast-diff` ✅ `lex ast-merge` ✅ |
 
 **Workspace test count:** 251 passing, 0 failing. `cargo clippy --workspace --all-targets -- -D warnings` clean.
