@@ -66,7 +66,26 @@ pub struct Branch {
     /// have this populated.
     #[serde(default)]
     pub fork_base: Option<BTreeMap<String, String>>,
+    /// Append-only journal of merges committed *into* this branch.
+    /// Read by `Store::branch_log` / `lex log`. `#[serde(default)]`
+    /// for back-compat with branch files written before this field.
+    #[serde(default)]
+    pub merges: Vec<MergeRecord>,
     pub created_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MergeRecord {
+    /// The branch the merge pulled *from*.
+    pub src: String,
+    /// Wall-clock seconds since the Unix epoch.
+    pub at: u64,
+    /// Number of (SigId, StageId) entries the merge resolved cleanly.
+    pub merged: usize,
+    /// Number of conflicts at merge-record time. Always 0 for a
+    /// committed merge (commit_merge refuses with conflicts), but
+    /// preserved here for symmetry and future "uncommitted" entries.
+    pub conflicts: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -82,6 +101,14 @@ pub struct MergeSummary {
     pub clean: usize,
     pub conflicts: usize,
     pub base: Option<String>,
+    /// The branch the merge was sourced from. Empty by default
+    /// (back-compat); populated by `Store::merge`. Used by
+    /// `commit_merge` to journal a `MergeRecord` on `dst`.
+    #[serde(default)]
+    pub src: String,
+    /// The destination branch.
+    #[serde(default)]
+    pub dst: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -173,6 +200,19 @@ impl Store {
         Err(StoreError::UnknownBranch(name.into()))
     }
 
+    /// Read the journal of merges committed *into* `name`. Returns
+    /// the records in insertion order (oldest first). For `main`
+    /// without an explicit branch file, returns an empty Vec —
+    /// merges into main only get journaled once main has been
+    /// materialized via `set_branch_head_entry` or `commit_merge`.
+    pub fn branch_log(&self, name: &str) -> Result<Vec<MergeRecord>, StoreError> {
+        match self.get_branch(name)? {
+            Some(b) => Ok(b.merges),
+            None if name == DEFAULT_BRANCH => Ok(Vec::new()),
+            None => Err(StoreError::UnknownBranch(name.into())),
+        }
+    }
+
     /// Snapshot the source branch's head into a new named branch.
     /// Errors if the branch already exists. Sets `parent` to `from`.
     pub fn create_branch(&self, name: &str, from: &str) -> Result<(), StoreError> {
@@ -191,6 +231,7 @@ impl Store {
             parent: Some(from.into()),
             fork_base: Some(head.clone()),
             head,
+            merges: Vec::new(),
             created_at: now(),
         };
         fs::write(self.branch_path(name), serde_json::to_string_pretty(&b)?)?;
@@ -231,6 +272,7 @@ impl Store {
                 parent: None,
                 head: self.branch_head(DEFAULT_BRANCH)?,
                 fork_base: None,
+                merges: Vec::new(),
                 created_at: now(),
             },
             None => return Err(StoreError::UnknownBranch(name.into())),
@@ -255,6 +297,8 @@ impl Store {
         let mut report = MergeReport {
             summary: MergeSummary {
                 base: base_name.clone(),
+                src: src.into(),
+                dst: dst.into(),
                 ..Default::default()
             },
             merged: Vec::new(),
@@ -356,6 +400,7 @@ impl Store {
                 parent: None,
                 head: self.branch_head(DEFAULT_BRANCH)?,
                 fork_base: None,
+                merges: Vec::new(),
                 created_at: now(),
             },
             None => return Err(StoreError::UnknownBranch(dst.into())),
@@ -366,6 +411,17 @@ impl Store {
             head.insert(m.sig_id.clone(), m.stage_id.clone());
         }
         b.head = head;
+        // Journal the merge so `lex log` can show it. `summary.src`
+        // is empty for the legacy `Store::merge` callers (pre-this
+        // field); skip the record in that case to avoid noise.
+        if !report.summary.src.is_empty() {
+            b.merges.push(MergeRecord {
+                src: report.summary.src.clone(),
+                at: now(),
+                merged: report.merged.len(),
+                conflicts: 0,
+            });
+        }
         fs::create_dir_all(self.branches_dir())?;
         fs::write(self.branch_path(dst), serde_json::to_string_pretty(&b)?)?;
         Ok(())

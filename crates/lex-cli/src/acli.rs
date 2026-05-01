@@ -127,6 +127,7 @@ fn commands() -> Vec<CommandInfo> {
         cmd_ast_merge(),
         cmd_branch(),
         cmd_store_merge(),
+        cmd_log(),
     ]
 }
 
@@ -386,14 +387,29 @@ fn cmd_branch() -> CommandInfo {
         .add_option("--store", "string", "store root", None);
     let current = CommandInfo::new("current", "print the current branch").idempotent(true)
         .add_option("--store", "string", "store root", None);
+    let log = CommandInfo::new("log", "print the merge journal of a branch").idempotent(true)
+        .add_argument("name", "string", "branch name (default: current)", false)
+        .add_option("--store", "string", "store root", None);
     let mut info = CommandInfo::new("branch", "snapshot branches in lex-store (tier-1 agent-native VC)")
         .with_examples(vec![
             ("List branches", "lex branch list"),
             ("Create a feature", "lex branch create feature --from main"),
         ])
-        .with_see_also(vec!["store-merge", "store"]);
-    info.subcommands = vec![list, show, create, delete, use_b, current];
+        .with_see_also(vec!["store-merge", "store", "log"]);
+    info.subcommands = vec![list, show, create, delete, use_b, current, log];
     info
+}
+
+fn cmd_log() -> CommandInfo {
+    CommandInfo::new("log", "show the merge journal of a branch (top-level alias for `lex branch log`)")
+        .idempotent(true)
+        .add_argument("name", "string", "branch name (default: current)", false)
+        .add_option("--store", "string", "store root", None)
+        .with_examples(vec![
+            ("Log of the current branch", "lex log"),
+            ("Log of a named branch as JSON", "lex --output json log feature"),
+        ])
+        .with_see_also(vec!["branch", "store-merge"])
 }
 
 fn cmd_store_merge() -> CommandInfo {
