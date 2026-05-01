@@ -622,6 +622,20 @@ struct AgentToolOpts {
     /// wrong-behavior gap: the type system says what code touches; the
     /// examples say what it should return.
     examples_file: Option<PathBuf>,
+    /// Path to a Spec file (`spec name { forall …: <bool expr> }`) to
+    /// prove against the emitted body before trusting it. Counterexamples
+    /// abort with exit 5 (same family as examples-failed); inconclusive
+    /// proofs abort with exit 6 unless `--spec-allow-inconclusive` is
+    /// set. This is the strongest behavioral check available — it lifts
+    /// rung 2 from "show me the answer for these N cases" to "show me
+    /// the answer for *all* cases the spec ranges over."
+    spec_file: Option<PathBuf>,
+    /// If true, an inconclusive Spec proof doesn't abort the run.
+    /// Useful when SMT can't decide a property but you still want
+    /// to ship; the spec's own evidence record stays in the trace.
+    spec_allow_inconclusive: bool,
+    /// Trials for randomized fallback when SMT can't decide.
+    spec_trials: u32,
 }
 
 enum BodySource {
@@ -690,6 +704,52 @@ fn cmd_agent_tool(args: &[String]) -> Result<()> {
             eprintln!("  {}", serde_json::to_string(v).unwrap_or_default());
         }
         std::process::exit(3);
+    }
+
+    // 4b) Spec proof. Strongest behavioral guarantee available pre-run:
+    // a quantified property attached to `tool` is checked against the
+    // emitted body before the tool ever executes on real inputs. SMT
+    // (via Z3, when available) handles structural+integer cases;
+    // randomized fallback covers the rest. Counterexamples abort with
+    // exit 5; inconclusive aborts with 6 unless --spec-allow-inconclusive.
+    if let Some(path) = opts.spec_file.as_ref() {
+        let spec_text = fs::read_to_string(path)
+            .with_context(|| format!("read spec file {}", path.display()))?;
+        let spec = spec_checker::parse_spec(&spec_text)
+            .map_err(|e| anyhow!("spec parse: {e}"))?;
+        if opts.show_source {
+            eprintln!("→ checking spec `{}`…", spec.name);
+        }
+        let report = spec_checker::check_spec(&spec, &src, opts.spec_trials);
+        match report.status {
+            spec_checker::ProofStatus::Proved => {
+                if opts.show_source {
+                    eprintln!("  spec proved ({} method, {} trials)",
+                        report.evidence.method, report.evidence.trials);
+                }
+            }
+            spec_checker::ProofStatus::Counterexample => {
+                eprintln!("→ SPEC COUNTEREXAMPLE — tool not run.");
+                if let Some(cx) = &report.evidence.counterexample {
+                    for (k, v) in cx { eprintln!("  {k} = {v}"); }
+                }
+                if let Some(note) = &report.evidence.note {
+                    eprintln!("  ({note})");
+                }
+                std::process::exit(5);
+            }
+            spec_checker::ProofStatus::Inconclusive => {
+                eprintln!("→ SPEC INCONCLUSIVE — could not decide property.");
+                if let Some(note) = &report.evidence.note {
+                    eprintln!("  ({note})");
+                }
+                if !opts.spec_allow_inconclusive {
+                    eprintln!("  (pass --spec-allow-inconclusive to ship anyway)");
+                    std::process::exit(6);
+                }
+                eprintln!("  (continuing because --spec-allow-inconclusive is set)");
+            }
+        }
     }
 
     // 5) Run with a step-limit cap. This is the runtime DoS guard:
@@ -801,6 +861,9 @@ fn parse_agent_tool_args(args: &[String]) -> Result<AgentToolOpts> {
     let mut allow_fs_read: Vec<PathBuf> = Vec::new();
     let mut allow_net_host: Vec<String> = Vec::new();
     let mut examples_file: Option<PathBuf> = None;
+    let mut spec_file: Option<PathBuf> = None;
+    let mut spec_allow_inconclusive = false;
+    let mut spec_trials: u32 = 1000;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -856,6 +919,17 @@ fn parse_agent_tool_args(args: &[String]) -> Result<AgentToolOpts> {
                 examples_file = Some(PathBuf::from(v));
                 i += 2;
             }
+            "--spec" => {
+                let v = args.get(i + 1).ok_or_else(|| anyhow!("--spec needs a path"))?;
+                spec_file = Some(PathBuf::from(v));
+                i += 2;
+            }
+            "--spec-allow-inconclusive" => { spec_allow_inconclusive = true; i += 1; }
+            "--spec-trials" => {
+                spec_trials = args.get(i + 1).ok_or_else(|| anyhow!("--spec-trials needs an integer"))?
+                    .parse().context("--spec-trials must be a u32")?;
+                i += 2;
+            }
             "--quiet" => { show_source = false; i += 1; }
             other => bail!("unknown agent-tool flag: {other}"),
         }
@@ -872,6 +946,9 @@ fn parse_agent_tool_args(args: &[String]) -> Result<AgentToolOpts> {
         allow_fs_read,
         allow_net_host,
         examples_file,
+        spec_file,
+        spec_allow_inconclusive,
+        spec_trials,
     })
 }
 
