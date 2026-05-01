@@ -25,8 +25,11 @@ pub fn check_program(stages: &[a::Stage]) -> Result<ProgramTypes, Vec<TypeError>
             if let Some(mod_name) = module_for_import(&i.reference) {
                 if let Some(ty) = module_scope(mod_name, &tcx.type_env) {
                     tcx.globals.insert(i.alias.clone(), Scheme {
-                        // Module-level signatures use Var(0..n); generalize all.
+                        // Module-level signatures use Var(0..n) and
+                        // effect-vars on stdlib HOFs (list.map's `[E]`
+                        // etc.); generalize both.
                         vars: collect_vars(&ty),
+                        eff_vars: collect_eff_vars(&ty),
                         ty,
                     });
                 }
@@ -92,18 +95,49 @@ fn collect_vars(t: &Ty) -> Vec<TyVarId> {
     out
 }
 
+/// Walk a type and collect every effect-row variable id that appears
+/// inside any function-type's effect set. Used to generalize stdlib
+/// HOF schemes alongside ordinary type vars.
+fn collect_eff_vars(t: &Ty) -> Vec<u32> {
+    let mut out = Vec::new();
+    fn walk(t: &Ty, out: &mut Vec<u32>) {
+        match t {
+            Ty::Var(_) | Ty::Prim(_) | Ty::Unit | Ty::Never => {}
+            Ty::List(inner) => walk(inner, out),
+            Ty::Tuple(items) => for it in items { walk(it, out); },
+            Ty::Record(fs) => for v in fs.values() { walk(v, out); },
+            Ty::Con(_, args) => for a in args { walk(a, out); },
+            Ty::Function { params, effects, ret } => {
+                if let Some(v) = effects.var {
+                    if !out.contains(&v) { out.push(v); }
+                }
+                for p in params { walk(p, out); }
+                walk(ret, out);
+            }
+        }
+    }
+    walk(t, &mut out);
+    out
+}
+
 fn function_scheme(fd: &a::FnDecl) -> Scheme {
     // Collect type-param ids in order; map their names to fresh Var(idx).
     let params: Vec<Ty> = fd.params.iter().map(|p| ty_from_canon(&p.ty, &fd.type_params)).collect();
     let ret = ty_from_canon(&fd.return_type, &fd.type_params);
-    let effects = EffectSet({
-        let mut s = std::collections::BTreeSet::new();
-        for e in &fd.effects { s.insert(e.name.clone()); }
-        s
-    });
+    let effects = EffectSet {
+        concrete: {
+            let mut s = std::collections::BTreeSet::new();
+            for e in &fd.effects { s.insert(e.name.clone()); }
+            s
+        },
+        var: None,
+    };
     let ty = Ty::Function { params, effects, ret: Box::new(ret) };
     let vars: Vec<TyVarId> = (0..fd.type_params.len() as u32).collect();
-    Scheme { vars, ty }
+    // User-declared functions don't carry effect-row variables today
+    // (the surface syntax has no `[E]` form for user types). Only
+    // stdlib HOFs do, and those are loaded via module_scope.
+    Scheme { vars, eff_vars: Vec::new(), ty }
 }
 
 struct Checker {
@@ -169,8 +203,8 @@ impl Checker {
 
         if !inferred_effects.is_subset(&declared_effects) {
             // Pick the first undeclared effect for the error.
-            for e in inferred_effects.0.iter() {
-                if !declared_effects.0.contains(e) {
+            for e in inferred_effects.concrete.iter() {
+                if !declared_effects.concrete.contains(e) {
                     return Err(vec![TypeError::EffectNotDeclared {
                         at_node: "n_0".into(),
                         effect: e.clone(),
@@ -302,11 +336,14 @@ impl Checker {
             a::CExpr::Lambda { params, return_type, effects: l_effects, body } => {
                 let param_tys: Vec<Ty> = params.iter().map(|p| ty_from_canon(&p.ty, &[])).collect();
                 let ret_ty = ty_from_canon(return_type, &[]);
-                let declared = EffectSet({
-                    let mut s = std::collections::BTreeSet::new();
-                    for e in l_effects { s.insert(e.name.clone()); }
-                    s
-                });
+                let declared = EffectSet {
+                    concrete: {
+                        let mut s = std::collections::BTreeSet::new();
+                        for e in l_effects { s.insert(e.name.clone()); }
+                        s
+                    },
+                    var: None,
+                };
                 let mut inner_locals = locals.clone();
                 for (p, t) in params.iter().zip(param_tys.iter()) {
                     inner_locals.insert(p.name.clone(), t.clone());
@@ -317,8 +354,8 @@ impl Checker {
                     return Err(mismatch_err(node_id, err, &self.u, vec!["in lambda body".into()]));
                 }
                 if !inner_effs.is_subset(&declared) {
-                    for e in inner_effs.0.iter() {
-                        if !declared.0.contains(e) {
+                    for e in inner_effs.concrete.iter() {
+                        if !declared.concrete.contains(e) {
                             return Err(TypeError::EffectNotDeclared {
                                 at_node: node_id.into(),
                                 effect: e.clone(),
@@ -450,7 +487,12 @@ impl Checker {
                         return Err(mismatch_err(node_id, err, &self.u, vec![format!("argument {} of call", i + 1)]));
                     }
                 }
-                effs.extend(&effects);
+                // Re-resolve effects after unifying args: an effect-row
+                // variable on the function type may have been bound by
+                // an argument's closure type, and we want the
+                // *post-binding* set when propagating to the caller.
+                let resolved_effects = self.u.resolve_effects(&effects);
+                effs.extend(&resolved_effects);
                 Ok(*ret)
             }
             Ty::Var(_) => {
@@ -506,7 +548,7 @@ impl Checker {
         match (payload, args) {
             (None, []) => Ok(Ty::Con(owning, con_args)),
             (Some(payload), args) => {
-                let inst_payload = subst_vars(&payload, &subst);
+                let inst_payload = subst_vars(&payload, &subst, &IndexMap::new());
                 let arg_count = match &inst_payload {
                     Ty::Tuple(items) => items.len(),
                     _ => 1,
@@ -578,7 +620,7 @@ impl Checker {
                 match (payload, args.as_slice()) {
                     (None, []) => Ok(()),
                     (Some(payload), args) => {
-                        let inst = subst_vars(&payload, &subst);
+                        let inst = subst_vars(&payload, &subst, &IndexMap::new());
                         if args.len() == 1 {
                             self.bind_pattern(&args[0], &inst, locals, node_id)?;
                         } else if let Ty::Tuple(items) = inst {
@@ -658,28 +700,43 @@ fn lit_type(l: &a::CLit) -> Ty {
 }
 
 fn instantiate(s: &Scheme, u: &mut Unifier) -> Ty {
-    let mut subst = IndexMap::new();
-    for v in &s.vars { subst.insert(*v, u.fresh()); }
-    subst_vars(&s.ty, &subst)
+    let mut ty_subst = IndexMap::new();
+    for v in &s.vars { ty_subst.insert(*v, u.fresh()); }
+    let mut eff_subst = IndexMap::new();
+    for v in &s.eff_vars { eff_subst.insert(*v, u.fresh_eff_id()); }
+    subst_vars(&s.ty, &ty_subst, &eff_subst)
 }
 
-fn subst_vars(t: &Ty, subst: &IndexMap<TyVarId, Ty>) -> Ty {
+fn subst_vars(
+    t: &Ty,
+    subst: &IndexMap<TyVarId, Ty>,
+    eff_subst: &IndexMap<u32, u32>,
+) -> Ty {
     match t {
         Ty::Var(v) => subst.get(v).cloned().unwrap_or_else(|| Ty::Var(*v)),
         Ty::Prim(_) | Ty::Unit | Ty::Never => t.clone(),
-        Ty::List(inner) => Ty::List(Box::new(subst_vars(inner, subst))),
-        Ty::Tuple(items) => Ty::Tuple(items.iter().map(|t| subst_vars(t, subst)).collect()),
+        Ty::List(inner) => Ty::List(Box::new(subst_vars(inner, subst, eff_subst))),
+        Ty::Tuple(items) => Ty::Tuple(items.iter().map(|t| subst_vars(t, subst, eff_subst)).collect()),
         Ty::Record(fs) => {
             let mut out = IndexMap::new();
-            for (k, v) in fs { out.insert(k.clone(), subst_vars(v, subst)); }
+            for (k, v) in fs { out.insert(k.clone(), subst_vars(v, subst, eff_subst)); }
             Ty::Record(out)
         }
-        Ty::Con(n, args) => Ty::Con(n.clone(), args.iter().map(|t| subst_vars(t, subst)).collect()),
-        Ty::Function { params, effects, ret } => Ty::Function {
-            params: params.iter().map(|t| subst_vars(t, subst)).collect(),
-            effects: effects.clone(),
-            ret: Box::new(subst_vars(ret, subst)),
-        },
+        Ty::Con(n, args) => Ty::Con(n.clone(),
+            args.iter().map(|t| subst_vars(t, subst, eff_subst)).collect()),
+        Ty::Function { params, effects, ret } => {
+            // Refresh the effect-row variable if it's quantified in the
+            // scheme; concrete kinds carry through unchanged.
+            let new_effects = EffectSet {
+                concrete: effects.concrete.clone(),
+                var: effects.var.and_then(|v| eff_subst.get(&v).copied()).or(effects.var),
+            };
+            Ty::Function {
+                params: params.iter().map(|t| subst_vars(t, subst, eff_subst)).collect(),
+                effects: new_effects,
+                ret: Box::new(subst_vars(ret, subst, eff_subst)),
+            }
+        }
     }
 }
 
@@ -692,5 +749,21 @@ fn mismatch_err(node_id: &str, e: UnifyError, u: &Unifier, context: Vec<String>)
             context,
         },
         UnifyError::Infinite { .. } => TypeError::InfiniteType { at_node: node_id.into() },
+        UnifyError::EffectMismatch { a, b } => {
+            // Render effect mismatches as a type-mismatch in compact
+            // form, e.g. `[net]` vs `[]`. Avoids inventing a new
+            // TypeError variant + wire format right now.
+            let render = |e: &EffectSet| -> String {
+                let mut parts: Vec<String> = e.concrete.iter().cloned().collect();
+                if let Some(v) = e.var { parts.push(format!("?e{}", v)); }
+                if parts.is_empty() { "[]".into() } else { format!("[{}]", parts.join(", ")) }
+            };
+            TypeError::TypeMismatch {
+                at_node: node_id.into(),
+                expected: render(&b),
+                got: render(&a),
+                context,
+            }
+        }
     }
 }

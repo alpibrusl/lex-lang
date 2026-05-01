@@ -8,12 +8,11 @@
 #   POST /classify          pure       keyword classifier
 #   POST /summarize         pure       first N chars
 #   GET  /weather/:city     [net]      external weather call
+#   GET  /digest            [net, io]  read bookmarks, fetch each
 #
-# (A planned /digest route — read a bookmarks file, fetch each URL —
-# is deferred. It needs `list.map` over an effectful closure, which
-# requires effect polymorphism in stdlib higher-order signatures.
-# Spec §7.3 designs this; the type system doesn't yet implement it.
-# Tracked as follow-up.)
+# /digest exercises effect-polymorphic `list.map` — the closure
+# passed to it has effects [net], and those propagate to the
+# enclosing fn's signature. Spec §7.3.
 #
 # Compare to a Python flask app where every route gets the union of
 # capabilities (the whole process). Here, /classify *physically cannot*
@@ -56,7 +55,7 @@ fn ok(msg :: Str) -> Response {
 # ---- pure routes ---------------------------------------------------
 
 fn route_help() -> Response {
-  let body := "{\"endpoints\":[\"GET /now\",\"POST /classify\",\"POST /summarize\",\"GET /weather/:city\"]}"
+  let body := "{\"endpoints\":[\"GET /now\",\"POST /classify\",\"POST /summarize\",\"GET /weather/:city\",\"GET /digest\"]}"
   { body: body, status: 200 }
 }
 
@@ -109,17 +108,44 @@ fn route_weather(city :: Str) -> [net] Response {
   }
 }
 
+# ---- [net, io] route -----------------------------------------------
+
+# Reads URLs from /tmp/lex_bookmarks.txt and fetches each, returning
+# a JSON object of `{ url: response_length }`. Demonstrates
+# effect-polymorphic `list.map`: the closure has [net], and
+# list.map propagates that effect to its caller (route_digest's
+# signature is [net, io] — net for the fetches, io for the file
+# read). With pure-only HOF signatures this would be a type error.
+fn route_digest() -> [net, io] Response {
+  let csv := match io.read("/tmp/lex_bookmarks.txt") {
+    Ok(s)  => s,
+    Err(_) => "",
+  }
+  let urls := list.filter(str.split(csv, "\n"),
+    fn (s :: Str) -> Bool { not str.is_empty(str.trim(s)) })
+  let entries := list.map(urls, fn (u :: Str) -> [net] Str {
+    let url := str.trim(u)
+    match net.get(url) {
+      Ok(body) => str.concat(str.concat("\"", url),
+                             str.concat("\":", int.to_str(str.len(body)))),
+      Err(_)   => str.concat(str.concat("\"", url), "\":-1"),
+    }
+  })
+  ok(str.concat("{", str.concat(str.join(entries, ","), "}")))
+}
+
 # ---- dispatcher ----------------------------------------------------
 
 # Top-level handler's effect set is the union of every route. If you
 # add a new route that uses an effect not already declared here, the
 # checker forces you to update this signature — the policy stays in
 # sync with the code, mechanically.
-fn handle(req :: Request) -> [net, time] Response {
+fn handle(req :: Request) -> [net, time, io] Response {
   match req.method {
     "GET" => match req.path {
-      "/"     => route_help(),
-      "/now"  => route_now(),
+      "/"       => route_help(),
+      "/now"    => route_now(),
+      "/digest" => route_digest(),
       _ => match str.strip_prefix(req.path, "/weather/") {
         Some(city) => route_weather(city),
         None       => err("{\"error\":\"not found\"}", 404),
@@ -134,6 +160,6 @@ fn handle(req :: Request) -> [net, time] Response {
   }
 }
 
-fn main() -> [net, time] Nil {
+fn main() -> [net, time, io] Nil {
   net.serve(8210, "handle")
 }

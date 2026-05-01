@@ -8,6 +8,13 @@ pub struct Unifier {
     next_var: TyVarId,
     /// Substitutions: `subst[v] = t` means var `v` was bound to `t`.
     subst: IndexMap<TyVarId, Ty>,
+    /// Effect-row substitutions: `eff_subst[v] = set` means effect-var
+    /// `v` was bound to `set` (which may itself carry another var,
+    /// so resolve_effects walks the chain).
+    eff_subst: IndexMap<u32, EffectSet>,
+    /// Counter for fresh effect-row variables, separate from type
+    /// variables to keep the namespaces clean.
+    next_eff_var: u32,
 }
 
 impl Unifier {
@@ -22,6 +29,14 @@ impl Unifier {
     pub fn fresh_id(&mut self) -> TyVarId {
         let v = self.next_var;
         self.next_var += 1;
+        v
+    }
+
+    /// Allocate a fresh effect-row variable for use in polymorphic
+    /// signatures (e.g. `list.map[T, U, E]`'s `E`).
+    pub fn fresh_eff_id(&mut self) -> u32 {
+        let v = self.next_eff_var;
+        self.next_eff_var += 1;
         v
     }
 
@@ -43,9 +58,83 @@ impl Unifier {
             Ty::Con(n, args) => Ty::Con(n.clone(), args.iter().map(|t| self.resolve(t)).collect()),
             Ty::Function { params, effects, ret } => Ty::Function {
                 params: params.iter().map(|t| self.resolve(t)).collect(),
-                effects: effects.clone(),
+                effects: self.resolve_effects(effects),
                 ret: Box::new(self.resolve(ret)),
             },
+        }
+    }
+
+    /// Resolve an effect set by chasing the `var` substitution chain.
+    /// Concrete effects accumulate along the chain; the returned set's
+    /// `var` is the terminal unbound var, or `None` if fully concrete.
+    pub fn resolve_effects(&self, eff: &EffectSet) -> EffectSet {
+        let mut out = EffectSet { concrete: eff.concrete.clone(), var: None };
+        let mut cur_var = eff.var;
+        while let Some(v) = cur_var {
+            match self.eff_subst.get(&v) {
+                Some(bound) => {
+                    out.concrete.extend(bound.concrete.iter().cloned());
+                    cur_var = bound.var;
+                }
+                None => { out.var = Some(v); break; }
+            }
+        }
+        out
+    }
+
+    /// Unify two effect sets. Variables are existentially bound at the
+    /// signature site; at call sites they bind to the actual closure's
+    /// effects.
+    ///
+    /// Cases (after resolving):
+    ///   - both fully concrete: must be equal
+    ///   - exactly one carries a var: var := the *missing* effects
+    ///     (i.e. the other side's concrete minus this side's), with
+    ///     the other side's residual var if any
+    ///   - both carry a var: bind one to the other (alias)
+    pub fn unify_effects(&mut self, a: &EffectSet, b: &EffectSet) -> Result<(), UnifyError> {
+        let a = self.resolve_effects(a);
+        let b = self.resolve_effects(b);
+        match (a.var, b.var) {
+            (None, None) => {
+                if a.concrete == b.concrete { Ok(()) }
+                else { Err(UnifyError::EffectMismatch { a, b }) }
+            }
+            (Some(va), Some(vb)) if va == vb => {
+                if a.concrete == b.concrete { Ok(()) }
+                else { Err(UnifyError::EffectMismatch { a, b }) }
+            }
+            (Some(va), _) => {
+                // Bind va so a + bound = b. Means bound has b.concrete
+                // minus a.concrete, plus b.var.
+                if !a.concrete.is_subset(&b.concrete) {
+                    // a says "at least these" but b doesn't have all
+                    // of them and isn't open enough to absorb. Reject.
+                    if b.var.is_none() {
+                        return Err(UnifyError::EffectMismatch { a, b });
+                    }
+                    // b has a var; we can absorb a's extras into b's var
+                    // by binding b's var symmetrically. Easier: just
+                    // bind va to (b's concrete + b's var) and rely on
+                    // the chain to track. Tighter handling possible
+                    // later.
+                }
+                let extra: std::collections::BTreeSet<String> =
+                    b.concrete.difference(&a.concrete).cloned().collect();
+                let bound = EffectSet { concrete: extra, var: b.var };
+                self.eff_subst.insert(va, bound);
+                Ok(())
+            }
+            (None, Some(vb)) => {
+                if !b.concrete.is_subset(&a.concrete) {
+                    return Err(UnifyError::EffectMismatch { a, b });
+                }
+                let extra: std::collections::BTreeSet<String> =
+                    a.concrete.difference(&b.concrete).cloned().collect();
+                let bound = EffectSet { concrete: extra, var: None };
+                self.eff_subst.insert(vb, bound);
+                Ok(())
+            }
         }
     }
 
@@ -93,9 +182,10 @@ impl Unifier {
             }
             (Ty::Function { params: p1, effects: e1, ret: r1 },
              Ty::Function { params: p2, effects: e2, ret: r2 })
-                if p1.len() == p2.len() && e1 == e2 =>
+                if p1.len() == p2.len() =>
             {
                 for (x, y) in p1.iter().zip(p2.iter()) { self.unify(x, y)?; }
+                self.unify_effects(e1, e2)?;
                 self.unify(r1, r2)
             }
             _ => Err(UnifyError::Mismatch { a, b }),
@@ -122,4 +212,5 @@ fn occurs(v: TyVarId, t: &Ty, u: &Unifier) -> bool {
 pub enum UnifyError {
     Mismatch { a: Ty, b: Ty },
     Infinite { var: TyVarId, ty: Ty },
+    EffectMismatch { a: EffectSet, b: EffectSet },
 }

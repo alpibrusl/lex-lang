@@ -161,30 +161,35 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             // list polymorphic functions need fresh vars at use sites; we
             // encode them with placeholder Var ids that get instantiated.
             let mut fields = IndexMap::new();
-            // map :: List[a], (a) -> b -> List[b]
+            // Effect polymorphism: each HOF carries an effect-row
+            // variable so an effectful closure (e.g. one that calls
+            // net.get inside list.map's lambda) propagates its
+            // effects to the result type. Spec §7.3.
+            //
+            // map :: [E] List[a], (a) -> [E] b -> [E] List[b]
             fields.insert("map".into(), Ty::function(
                 vec![
                     Ty::List(Box::new(Ty::Var(0))),
-                    Ty::function(vec![Ty::Var(0)], EffectSet::empty(), Ty::Var(1)),
+                    Ty::function(vec![Ty::Var(0)], EffectSet::open_var(2), Ty::Var(1)),
                 ],
-                EffectSet::empty(),
+                EffectSet::open_var(2),
                 Ty::List(Box::new(Ty::Var(1))),
             ));
             fields.insert("filter".into(), Ty::function(
                 vec![
                     Ty::List(Box::new(Ty::Var(0))),
-                    Ty::function(vec![Ty::Var(0)], EffectSet::empty(), Ty::bool()),
+                    Ty::function(vec![Ty::Var(0)], EffectSet::open_var(3), Ty::bool()),
                 ],
-                EffectSet::empty(),
+                EffectSet::open_var(3),
                 Ty::List(Box::new(Ty::Var(0))),
             ));
             fields.insert("fold".into(), Ty::function(
                 vec![
                     Ty::List(Box::new(Ty::Var(0))),
                     Ty::Var(1),
-                    Ty::function(vec![Ty::Var(1), Ty::Var(0)], EffectSet::empty(), Ty::Var(1)),
+                    Ty::function(vec![Ty::Var(1), Ty::Var(0)], EffectSet::open_var(4), Ty::Var(1)),
                 ],
-                EffectSet::empty(),
+                EffectSet::open_var(4),
                 Ty::Var(1),
             ));
             fields.insert("len".into(), Ty::function(
@@ -336,42 +341,45 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
         }
         "result" => {
             let mut fields = IndexMap::new();
-            // result.map :: Result[T, E], (T) -> U -> Result[U, E]
+            // result.map :: Result[T, E], (T) -> [E2] U -> [E2] Result[U, E]
+            // Effect-polymorphic on the closure: result.map et al.
+            // propagate the closure's effects to the surrounding call.
             fields.insert("map".into(), Ty::function(
                 vec![
                     Ty::Con("Result".into(), vec![Ty::Var(0), Ty::Var(1)]),
-                    Ty::function(vec![Ty::Var(0)], EffectSet::empty(), Ty::Var(2)),
+                    Ty::function(vec![Ty::Var(0)], EffectSet::open_var(3), Ty::Var(2)),
                 ],
-                EffectSet::empty(),
+                EffectSet::open_var(3),
                 Ty::Con("Result".into(), vec![Ty::Var(2), Ty::Var(1)]),
             ));
             fields.insert("and_then".into(), Ty::function(
                 vec![
                     Ty::Con("Result".into(), vec![Ty::Var(0), Ty::Var(1)]),
-                    Ty::function(vec![Ty::Var(0)], EffectSet::empty(),
+                    Ty::function(vec![Ty::Var(0)], EffectSet::open_var(4),
                         Ty::Con("Result".into(), vec![Ty::Var(2), Ty::Var(1)])),
                 ],
-                EffectSet::empty(),
+                EffectSet::open_var(4),
                 Ty::Con("Result".into(), vec![Ty::Var(2), Ty::Var(1)]),
             ));
             fields.insert("map_err".into(), Ty::function(
                 vec![
                     Ty::Con("Result".into(), vec![Ty::Var(0), Ty::Var(1)]),
-                    Ty::function(vec![Ty::Var(1)], EffectSet::empty(), Ty::Var(2)),
+                    Ty::function(vec![Ty::Var(1)], EffectSet::open_var(5), Ty::Var(2)),
                 ],
-                EffectSet::empty(),
+                EffectSet::open_var(5),
                 Ty::Con("Result".into(), vec![Ty::Var(0), Ty::Var(2)]),
             ));
             Some(Ty::Record(fields))
         }
         "option" => {
             let mut fields = IndexMap::new();
+            // option.map :: Option[T], (T) -> [E] U -> [E] Option[U]
             fields.insert("map".into(), Ty::function(
                 vec![
                     Ty::Con("Option".into(), vec![Ty::Var(0)]),
-                    Ty::function(vec![Ty::Var(0)], EffectSet::empty(), Ty::Var(1)),
+                    Ty::function(vec![Ty::Var(0)], EffectSet::open_var(2), Ty::Var(1)),
                 ],
-                EffectSet::empty(),
+                EffectSet::open_var(2),
                 Ty::Con("Option".into(), vec![Ty::Var(1)]),
             ));
             fields.insert("unwrap_or".into(), Ty::function(

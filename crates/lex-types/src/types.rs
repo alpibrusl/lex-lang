@@ -30,21 +30,50 @@ pub enum Ty {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Prim { Int, Float, Bool, Str, Bytes }
 
+/// Effect set with an optional row variable.
+///
+/// `concrete` is the closed lower bound — effect kinds the function
+/// definitely uses. `var` is an open extension point used for effect
+/// polymorphism on stdlib higher-order functions: `list.map[T, U, E]`
+/// declares its callback as `(T) -> [E] U` where `E` is `var: Some(id)`.
+/// At call sites the variable unifies with whatever effect set the
+/// actual closure carries, then propagates to the result.
+///
+/// All call sites that compare or merge concrete-only sets continue to
+/// work via the helper methods, which delegate to `concrete`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct EffectSet(pub BTreeSet<String>);
+pub struct EffectSet {
+    pub concrete: BTreeSet<String>,
+    pub var: Option<u32>,
+}
 
 impl EffectSet {
-    pub fn empty() -> Self { Self(BTreeSet::new()) }
+    pub fn empty() -> Self { Self::default() }
     pub fn singleton(s: impl Into<String>) -> Self {
         let mut bs = BTreeSet::new();
         bs.insert(s.into());
-        Self(bs)
+        Self { concrete: bs, var: None }
+    }
+    /// An open effect set: just a row variable, no concrete lower
+    /// bound. Used by stdlib HOF signatures (list.map, list.filter,
+    /// list.fold, option.map, result.map, result.and_then).
+    pub fn open_var(id: u32) -> Self {
+        Self { concrete: BTreeSet::new(), var: Some(id) }
     }
     pub fn union(&self, other: &EffectSet) -> EffectSet {
-        EffectSet(self.0.union(&other.0).cloned().collect())
+        EffectSet {
+            concrete: self.concrete.union(&other.concrete).cloned().collect(),
+            var: self.var.or(other.var),
+        }
     }
-    pub fn is_subset(&self, other: &EffectSet) -> bool { self.0.is_subset(&other.0) }
-    pub fn extend(&mut self, other: &EffectSet) { self.0.extend(other.0.iter().cloned()); }
+    pub fn is_subset(&self, other: &EffectSet) -> bool {
+        self.concrete.is_subset(&other.concrete)
+    }
+    pub fn extend(&mut self, other: &EffectSet) {
+        self.concrete.extend(other.concrete.iter().cloned());
+        if self.var.is_none() { self.var = other.var; }
+    }
+    pub fn is_open(&self) -> bool { self.var.is_some() }
 }
 
 impl Ty {
@@ -84,8 +113,11 @@ impl Ty {
             }
             Ty::Function { params, effects, ret } => {
                 let parts: Vec<_> = params.iter().map(|t| t.pretty()).collect();
-                let eff = if effects.0.is_empty() { String::new() } else {
-                    let es: Vec<_> = effects.0.iter().cloned().collect();
+                let eff = if effects.concrete.is_empty() && effects.var.is_none() {
+                    String::new()
+                } else {
+                    let mut es: Vec<String> = effects.concrete.iter().cloned().collect();
+                    if let Some(v) = effects.var { es.push(format!("?e{}", v)); }
                     format!("[{}] ", es.join(", "))
                 };
                 format!("({}) -> {}{}", parts.join(", "), eff, ret.pretty())
@@ -94,9 +126,11 @@ impl Ty {
     }
 }
 
-/// A polymorphic scheme: type with universally-quantified type variables.
+/// A polymorphic scheme: type with universally-quantified type
+/// variables and effect-row variables.
 #[derive(Debug, Clone)]
 pub struct Scheme {
     pub vars: Vec<TyVarId>,
+    pub eff_vars: Vec<u32>,
     pub ty: Ty,
 }
