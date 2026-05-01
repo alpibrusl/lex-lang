@@ -258,6 +258,7 @@ Flags: `--body '<src>'` / `--body-file <path>` skip the API call; `--request '<q
 | `lex spec smt <spec>` | Emit SMT-LIB 2 for external Z3 |
 | `lex serve [--port N] [--store DIR]` | Run the agent HTTP/JSON API |
 | `lex agent-tool --allow-effects ks (--request 'q' \| --body 'src' \| --body-file F)` | Run an LLM-emitted tool body under declared effects |
+| `lex tool-registry serve [--port N]` | HTTP service to register Lex tools at runtime; `POST /tools` validates + stores, `POST /tools/{id}/invoke` runs |
 
 ### Policy flags (run / replay)
 

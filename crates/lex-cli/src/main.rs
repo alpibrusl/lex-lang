@@ -10,6 +10,8 @@
 //!   lex store list [--store DIR]
 //!   lex store get [--store DIR] <stage_id>
 
+mod tool_registry;
+
 use anyhow::{anyhow, bail, Context, Result};
 use lex_ast::{canonicalize_program, sig_id, stage_canonical_hash_hex, stage_id, Stage};
 use lex_bytecode::{compile_program, vm::Vm, Value};
@@ -45,6 +47,7 @@ fn run(args: &[String]) -> Result<()> {
         "conformance" => cmd_conformance(&args[1..]),
         "spec" => cmd_spec(&args[1..]),
         "agent-tool" => cmd_agent_tool(&args[1..]),
+        "tool-registry" => tool_registry::cmd_tool_registry(&args[1..]),
         "help" | "--help" | "-h" => { print_usage(); Ok(()) }
         other => bail!("unknown command `{other}`. try `lex help`"),
     }
@@ -73,6 +76,8 @@ fn print_usage() {
     println!("                                     have an LLM emit a Lex tool body, run it");
     println!("                                     under the declared effects (rejected at");
     println!("                                     type-check if it tries anything else)");
+    println!("  tool-registry serve [--port N]    HTTP service to register Lex tools at runtime");
+    println!("                                     and invoke them via /tools/{{id}}/invoke");
     println!();
     println!("policy flags (run, replay):");
     println!("  --allow-effects k1,k2,...   permit these effect kinds");

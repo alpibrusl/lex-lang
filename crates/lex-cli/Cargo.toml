@@ -14,6 +14,7 @@ serde_json.workspace = true
 anyhow.workspace = true
 indexmap.workspace = true
 ureq = { version = "2.10", default-features = false, features = ["tls", "json"] }
+tiny_http = "0.12"
 lex-syntax = { path = "../lex-syntax" }
 lex-ast = { path = "../lex-ast" }
 lex-types = { path = "../lex-types" }
