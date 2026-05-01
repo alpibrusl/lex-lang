@@ -253,15 +253,15 @@
     <li><strong>Examples-driven verification.</strong> Pass <code>--examples FILE</code>; the host hands the agent a small set of <code>{input → expected}</code> pairs and Lex runs the emitted body against each before trusting it for live traffic. Any mismatch exits 5 with a per-case diff. Catches <em>wrong-but-consistent</em> behavior (the wrong-site scrape) at minimal cost; doesn't need SMT.</li>
     <li><strong>Spec proofs.</strong> Pass <code>--spec FILE</code>; the host attaches a behavioral contract — <code>forall x :: Int where x &gt;= 0: tool(x) == expected(x)</code> — and the spec checker discharges it via Z3 (or a randomized fallback). Counterexamples abort with exit 5; inconclusive proofs abort with 6 unless <code>--spec-allow-inconclusive</code> is set. Strongest available pre-execution check on behavior.</li>
     <li><strong>Capability scoping.</strong> <code>--allow-net-host github.com</code> means the wrong-site scraping case can't even <em>reach</em> attacker.com — the blast radius of a behavioral bug is bounded.</li>
-    <li><strong>Differential evaluation.</strong> Run two agent-emitted bodies on the same inputs and flag divergence. Cheap regression detection across model upgrades. (Roadmap.)</li>
+    <li><strong>Differential evaluation.</strong> Pass <code>--diff-body 'src'</code> (or <code>--diff-body-file</code>); both bodies run on each input (single <code>--input</code> or every entry from <code>--examples</code>); any output divergence aborts with exit 7. Cheap regression detection across model upgrades — no oracle needed.</li>
   </ul>
   <p>
-    Today Lex ships effects, capability scoping, examples-driven
-    verification, and Spec proofs against agent-emitted bodies.
-    Differential evaluation is the remaining roadmap item. The point
-    isn't that capability typing solves correctness — it doesn't — it's
-    that the contract lives in the language, free of inference cost,
-    and each higher rung composes on top of the previous one.
+    All four rungs ship today: effects, capability scoping,
+    examples-driven verification, Spec proofs, and differential
+    evaluation. The point isn't that capability typing solves
+    correctness — it doesn't — it's that the contract lives in the
+    language, free of inference cost, and each higher rung composes
+    on top of the previous one.
   </p>
 </section>
 

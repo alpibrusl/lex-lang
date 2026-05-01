@@ -636,6 +636,12 @@ struct AgentToolOpts {
     spec_allow_inconclusive: bool,
     /// Trials for randomized fallback when SMT can't decide.
     spec_trials: u32,
+    /// Optional second body to compare against. When set, both bodies
+    /// run on each input (single `--input` or every entry from
+    /// `--examples`); any output divergence aborts with exit 7.
+    /// Catches model-version regressions when v1's emission and v2's
+    /// emission disagree on at least one case the host cares about.
+    diff_body_source: Option<BodySource>,
 }
 
 enum BodySource {
@@ -756,6 +762,77 @@ fn cmd_agent_tool(args: &[String]) -> Result<()> {
     // type-check rejects effects, max_steps rejects runaway compute.
     let bc = std::sync::Arc::new(bc);
 
+    // 5-diff) Differential evaluation: if --diff-body is set, compile
+    // the second body through the same gates and run both on each input
+    // (single --input or every entry from --examples). Any output
+    // divergence aborts with exit 7. Use case: detect regressions when
+    // model v2's emission disagrees with v1's on inputs the host cares
+    // about, without needing a full Spec proof.
+    if let Some(diff_src) = opts.diff_body_source.as_ref() {
+        let diff_body_text = match diff_src {
+            BodySource::Literal(b) => b.clone(),
+            BodySource::File(p) => fs::read_to_string(p)
+                .with_context(|| format!("read diff body from {}", p.display()))?,
+            BodySource::Request(_) => bail!(
+                "--diff-body and --diff-body-file accept literal source; \
+                 invoke Claude separately and pass the body in"),
+        };
+        let diff_body_text = strip_code_fences(&diff_body_text);
+        let diff_src = build_tool_program(&diff_body_text, &opts.allowed_effects);
+        let prog_b = parse_source(&diff_src).context("parse diff body")?;
+        let stages_b = canonicalize_program(&prog_b);
+        if let Err(errs) = lex_types::check_program(&stages_b) {
+            eprintln!("→ DIFF BODY type-check rejected.");
+            for e in &errs { eprintln!("  {e}"); }
+            std::process::exit(2);
+        }
+        let bc_b = compile_program(&stages_b);
+        if let Err(violations) = check_policy(&bc_b, &policy) {
+            eprintln!("→ DIFF BODY policy rejected.");
+            for v in &violations {
+                eprintln!("  {}", serde_json::to_string(v).unwrap_or_default());
+            }
+            std::process::exit(3);
+        }
+        let bc_b = std::sync::Arc::new(bc_b);
+
+        // Inputs: --examples list or single --input.
+        let inputs: Vec<String> = match opts.examples_file.as_ref() {
+            Some(p) => load_examples(p)?.into_iter().map(|e| e.input).collect(),
+            None => vec![opts.user_input.clone()],
+        };
+
+        if opts.show_source {
+            eprintln!("→ comparing two bodies on {} input(s)…", inputs.len());
+        }
+        let mut diverged: Vec<(String, String, String)> = Vec::new();
+        for input in &inputs {
+            let out_a = run_tool_once(&bc, &policy, opts.max_steps, input)?;
+            let out_b = run_tool_once(&bc_b, &policy, opts.max_steps, input)?;
+            if out_a != out_b {
+                diverged.push((input.clone(), out_a, out_b));
+            }
+        }
+        if !diverged.is_empty() {
+            eprintln!("→ DIFFERENTIAL DIVERGENCE — {} of {} inputs differ.",
+                diverged.len(), inputs.len());
+            for (input, a, b) in &diverged {
+                eprintln!("  input={input:?}");
+                eprintln!("    body A → {a:?}");
+                eprintln!("    body B → {b:?}");
+            }
+            std::process::exit(7);
+        }
+        if opts.show_source {
+            eprintln!("→ no divergence on {} input(s)", inputs.len());
+        }
+        // Print body A's output on the first input — single-shot mode.
+        let chosen = inputs.first().cloned().unwrap_or_default();
+        let out = run_tool_once(&bc, &policy, opts.max_steps, &chosen)?;
+        println!("{out}");
+        return Ok(());
+    }
+
     // 5a) If --examples is set, behavioral-verify before trusting the tool
     // for live traffic. Catches the well-typed-but-wrong-behavior gap:
     // the type system says what code touches; the examples say what it
@@ -864,6 +941,7 @@ fn parse_agent_tool_args(args: &[String]) -> Result<AgentToolOpts> {
     let mut spec_file: Option<PathBuf> = None;
     let mut spec_allow_inconclusive = false;
     let mut spec_trials: u32 = 1000;
+    let mut diff_body: Option<BodySource> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -930,6 +1008,16 @@ fn parse_agent_tool_args(args: &[String]) -> Result<AgentToolOpts> {
                     .parse().context("--spec-trials must be a u32")?;
                 i += 2;
             }
+            "--diff-body" => {
+                diff_body = Some(BodySource::Literal(args.get(i + 1)
+                    .ok_or_else(|| anyhow!("--diff-body needs a value"))?.clone()));
+                i += 2;
+            }
+            "--diff-body-file" => {
+                diff_body = Some(BodySource::File(PathBuf::from(args.get(i + 1)
+                    .ok_or_else(|| anyhow!("--diff-body-file needs a path"))?)));
+                i += 2;
+            }
             "--quiet" => { show_source = false; i += 1; }
             other => bail!("unknown agent-tool flag: {other}"),
         }
@@ -949,6 +1037,7 @@ fn parse_agent_tool_args(args: &[String]) -> Result<AgentToolOpts> {
         spec_file,
         spec_allow_inconclusive,
         spec_trials,
+        diff_body_source: diff_body,
     })
 }
 

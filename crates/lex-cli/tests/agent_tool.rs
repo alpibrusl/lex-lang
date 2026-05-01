@@ -257,3 +257,75 @@ fn spec_missing_file_errors_clearly() {
     assert_ne!(code, 0);
     assert!(stderr.contains("read spec file"), "stderr:\n{stderr}");
 }
+
+#[test]
+fn diff_two_matching_bodies_exit_zero() {
+    let (code, stdout, stderr) = run(&[
+        "agent-tool",
+        "--allow-effects", "",
+        "--quiet",
+        "--input", "world",
+        "--body", "str.concat(\"hi, \", input)",
+        "--diff-body", "str.concat(\"hi, \", input)",
+    ]);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert_eq!(stdout.trim(), "hi, world");
+}
+
+#[test]
+fn diff_two_disagreeing_bodies_exit_7() {
+    let (code, _stdout, stderr) = run(&[
+        "agent-tool",
+        "--allow-effects", "",
+        "--quiet",
+        "--input", "world",
+        "--body", "str.concat(\"hi, \", input)",
+        "--diff-body", "str.concat(\"hello, \", input)",
+    ]);
+    assert_eq!(code, 7, "expected exit 7; stderr:\n{stderr}");
+    assert!(stderr.contains("DIFFERENTIAL DIVERGENCE"), "stderr:\n{stderr}");
+    assert!(stderr.contains("body A"), "stderr:\n{stderr}");
+    assert!(stderr.contains("body B"), "stderr:\n{stderr}");
+}
+
+#[test]
+fn diff_with_examples_runs_each_input() {
+    use std::io::Write;
+    let mut tmp = std::env::temp_dir();
+    tmp.push("lex_diff_examples.json");
+    let mut f = std::fs::File::create(&tmp).expect("create tmp");
+    f.write_all(br#"[{"input":"1","expected":""},{"input":"2","expected":""}]"#)
+        .expect("write tmp");
+
+    // Two algebraically-equivalent bodies (n*2 vs n+n). Per-case diff
+    // should pass on every input.
+    let (code, _stdout, stderr) = run(&[
+        "agent-tool",
+        "--allow-effects", "",
+        "--quiet",
+        "--examples", tmp.to_str().unwrap(),
+        "--input", "1",
+        "--body",
+        "match str.to_int(input) { Some(n) => int.to_str(n * 2), None => \"x\" }",
+        "--diff-body",
+        "match str.to_int(input) { Some(n) => int.to_str(n + n), None => \"x\" }",
+    ]);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+}
+
+#[test]
+fn diff_body_type_check_failure_exits_2() {
+    // Diff body uses io.read but the host only allows the empty effect
+    // set — the type checker rejects on the diff body.
+    let (code, _stdout, stderr) = run(&[
+        "agent-tool",
+        "--allow-effects", "",
+        "--quiet",
+        "--input", "x",
+        "--body", "input",
+        "--diff-body",
+        "match io.read(\"/etc/passwd\") { Ok(s) => s, Err(e) => e }",
+    ]);
+    assert_eq!(code, 2, "expected type-check rejection on diff body; stderr:\n{stderr}");
+    assert!(stderr.contains("DIFF BODY"), "stderr:\n{stderr}");
+}

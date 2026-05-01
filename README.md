@@ -227,7 +227,7 @@ lex agent-tool --allow-effects net --input "x" \
 #   exit 2
 ```
 
-Flags: `--body '<src>'` / `--body-file <path>` skip the API call; `--request '<q>'` needs `ANTHROPIC_API_KEY`. `--max-steps N` (default 1M) caps op count as a runtime DoS guard. `--allow-fs-read PATH` and `--allow-net-host HOST` add per-path / per-host scopes on top of `--allow-effects`. `--examples FILE` runs the tool against a JSON list of `{input, expected}` pairs (exit 5 on mismatch). `--spec FILE` proves a behavioral contract against the emitted body via the spec checker (exit 5 on counterexample, 6 on inconclusive — pass `--spec-allow-inconclusive` to ship anyway).
+Flags: `--body '<src>'` / `--body-file <path>` skip the API call; `--request '<q>'` needs `ANTHROPIC_API_KEY`. `--max-steps N` (default 1M) caps op count as a runtime DoS guard. `--allow-fs-read PATH` and `--allow-net-host HOST` add per-path / per-host scopes on top of `--allow-effects`. `--examples FILE` runs the tool against a JSON list of `{input, expected}` pairs (exit 5 on mismatch). `--spec FILE` proves a behavioral contract against the emitted body via the spec checker (exit 5 on counterexample, 6 on inconclusive). `--diff-body 'src'` / `--diff-body-file FILE` runs a second body on the same inputs and exits 7 on output divergence — regression detection across model upgrades.
 
 ### Adversarial benchmark
 
