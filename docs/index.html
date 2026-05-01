@@ -286,6 +286,50 @@ $ lex audit --uses-host attacker.com .   # check before you ship
 </section>
 
 <section>
+  <h2>Diffing what an agent changed: <code>lex ast-diff</code></h2>
+  <p class="lede">
+    Git diffs are line-based. When an agent renames a function or
+    moves a match arm, you get 50 deleted lines + 50 inserted lines
+    that a reviewing agent has to re-parse. <code>lex ast-diff</code>
+    walks the canonical AST and reports what *actually* changed in
+    tree shape: stages added, removed, renamed, modified — and inside
+    a modified body, which expression kinds were replaced.
+  </p>
+  <pre><code>$ lex ast-diff before.lex after.lex
++ added    fn greet(name :: Str) -> Str
+- removed  fn shouted(s :: Str) -> Str
+→ renamed  squared → cubed
+           fn cubed(n :: Int) -> Int
+~ modified fn doubled(n :: Int) -> Int
+             @ body: BinOp edited
+
+$ lex ast-diff --json before.lex after.lex
+{
+  "added":   [{"name": "greet",   "signature": "fn greet(...)"}],
+  "removed": [{"name": "shouted", "signature": "fn shouted(...)"}],
+  "renamed": [{"from": "squared", "to": "cubed",
+               "signature": "fn cubed(n :: Int) -> Int"}],
+  "modified": [{
+    "name": "doubled",
+    "signature_before": "fn doubled(n :: Int) -> Int",
+    "signature_after":  "fn doubled(n :: Int) -> Int",
+    "signature_changed": false,
+    "body_patches": [
+      {"op": "Replace", "node_path": "body",
+       "from_kind": "BinOp", "to_kind": "BinOp"}
+    ]
+  }]
+}</code></pre>
+  <p>
+    Renames are detected by hashing the FnDecl with the name field
+    cleared — same body + same signature + different name = rename,
+    not a delete-add. Two reviewing agents looking at the same change
+    no longer have to argue about whether <em>moved</em> or
+    <em>rewritten</em>.
+  </p>
+</section>
+
+<section>
   <h2>Capability ≠ correctness</h2>
   <p>
     Effect typing answers <em>what your code touches</em>, not

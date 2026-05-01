@@ -260,6 +260,7 @@ Flags: `--body '<src>'` / `--body-file <path>` skip the API call; `--request '<q
 | `lex agent-tool --allow-effects ks (--request 'q' \| --body 'src' \| --body-file F)` | Run an LLM-emitted tool body under declared effects |
 | `lex tool-registry serve [--port N]` | HTTP service to register Lex tools at runtime; `POST /tools` validates + stores, `POST /tools/{id}/invoke` runs |
 | `lex audit [paths...] [--effect K] [--calls FN] [--uses-host H] [--kind K]` | Structural code search by effect / call / hostname / AST kind. `--json` for agent-pipe output |
+| `lex ast-diff <file_a> <file_b> [--json] [--no-body]` | AST-native diff: added / removed / renamed / modified fns, plus body-level patches. Renames detected by body-hash with name normalized |
 
 ### Policy flags (run / replay)
 

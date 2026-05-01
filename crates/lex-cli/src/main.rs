@@ -12,6 +12,7 @@
 
 mod tool_registry;
 mod audit;
+mod diff;
 
 use anyhow::{anyhow, bail, Context, Result};
 use lex_ast::{canonicalize_program, sig_id, stage_canonical_hash_hex, stage_id, Stage};
@@ -50,6 +51,7 @@ fn run(args: &[String]) -> Result<()> {
         "agent-tool" => cmd_agent_tool(&args[1..]),
         "tool-registry" => tool_registry::cmd_tool_registry(&args[1..]),
         "audit" => audit::cmd_audit(&args[1..]),
+        "ast-diff" => diff::cmd_diff(&args[1..]),
         "help" | "--help" | "-h" => { print_usage(); Ok(()) }
         other => bail!("unknown command `{other}`. try `lex help`"),
     }
@@ -82,6 +84,8 @@ fn print_usage() {
     println!("                                     and invoke them via /tools/{{id}}/invoke");
     println!("  audit [paths...] [filters]        structural code search by effect / call /");
     println!("                                     hostname / AST kind. --json for machine-readable.");
+    println!("  ast-diff <file_a> <file_b>        AST-native diff: added/removed/renamed/modified");
+    println!("                                     fns, plus body-level patches per modified body.");
     println!();
     println!("policy flags (run, replay):");
     println!("  --allow-effects k1,k2,...   permit these effect kinds");
