@@ -1,10 +1,10 @@
 # lex-lang
 
-A small family of programming languages designed for LLMs as primary writers, readers, and debuggers. **Lex** is the general-purpose surface; **Core** covers performance-critical work (sized numerics, tensor shapes); **Spec** carries proof annotations.
+A language family designed for code no one will read. AI agents write more than humans review; Lex's bet is that when nobody reads bodies, the function signature has to be the contract. Effects are part of the type; the type checker, runtime policy gate, and Spec proofs verify the body honors it — without anyone reading the body.
 
-Implementation of `langspecs.md`. The design rules and milestone definitions all come from that document; this README focuses on what currently runs.
+**Lex** is the general-purpose surface; **Core** covers performance-critical work (sized numerics, tensor shapes); **Spec** carries proof annotations. Implementation of `langspecs.md`; this README focuses on what currently runs.
 
-> Looking for the pitch? See [`docs/index.html`](docs/index.html) — single static page, dark-mode-ready, self-contained. Once GitHub Pages is enabled (run `bash scripts/setup-pages.sh` or click through Settings → Pages → Source: `main` / `/docs`), it'll be live at `https://alpibrusl.github.io/lex-lang/`.
+> Looking for the full pitch? See [`docs/index.html`](docs/index.html) — single static page, dark-mode-ready, self-contained. Once GitHub Pages is enabled (run `bash scripts/setup-pages.sh` or click through Settings → Pages → Source: `main` / `/docs`), it'll be live at `https://alpibrusl.github.io/lex-lang/`.
 
 ## Design rules at a glance
 
