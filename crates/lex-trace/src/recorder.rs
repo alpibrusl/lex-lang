@@ -197,6 +197,21 @@ fn value_to_json(v: &Value) -> serde_json::Value {
             m.insert("data".into(), J::Array(data.iter().map(|f| J::from(*f)).collect()));
             J::Object(m)
         }
+        Value::Map(m) => {
+            let mut o = serde_json::Map::new();
+            o.insert("$map".into(), J::Bool(true));
+            o.insert("entries".into(), J::Array(m.iter().map(|(k, v)| {
+                J::Array(vec![value_to_json(&k.as_value()), value_to_json(v)])
+            }).collect()));
+            J::Object(o)
+        }
+        Value::Set(s) => {
+            let mut o = serde_json::Map::new();
+            o.insert("$set".into(), J::Bool(true));
+            o.insert("items".into(), J::Array(
+                s.iter().map(|k| value_to_json(&k.as_value())).collect()));
+            J::Object(o)
+        }
     }
 }
 

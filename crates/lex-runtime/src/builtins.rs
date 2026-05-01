@@ -3,7 +3,8 @@
 //! without policy gates (they have no observable side effects).
 
 use indexmap::IndexMap;
-use lex_bytecode::Value;
+use lex_bytecode::{MapKey, Value};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Returns Some(...) if `(kind, op)` names a known pure builtin.
 /// `None` means "not handled here; fall through to effect dispatch".
@@ -15,13 +16,9 @@ pub fn try_pure_builtin(kind: &str, op: &str, args: &[Value]) -> Option<Result<V
 /// `kind` is one of the known pure module aliases — used by the policy
 /// walk to skip pure builtins that programs reference via imports.
 pub fn is_pure_module(kind: &str) -> bool {
-    // `map` and `set` are listed in the spec (§11.1) but defer to v1.1
-    // alongside refinement types — they need new `Value` variants for
-    // proper hashing semantics, which is a larger change. Until then,
-    // `import "std.map"` / `"std.set"` resolves to None so users get a
-    // clear "module not found" rather than silently-empty stubs.
     matches!(kind, "str" | "int" | "float" | "bool" | "list"
-        | "option" | "result" | "tuple" | "json" | "bytes" | "flow" | "math")
+        | "option" | "result" | "tuple" | "json" | "bytes" | "flow" | "math"
+        | "map" | "set")
 }
 
 fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
@@ -414,7 +411,122 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             Ok(Value::F64Array { rows: r as u32, cols: c as u32, data })
         }
 
+        // -- map --
+        ("map", "new") => Ok(Value::Map(BTreeMap::new())),
+        ("map", "size") => Ok(Value::Int(expect_map(args.first())?.len() as i64)),
+        ("map", "has") => {
+            let m = expect_map(args.first())?;
+            let k = MapKey::from_value(args.get(1).ok_or("map.has: missing key")?)?;
+            Ok(Value::Bool(m.contains_key(&k)))
+        }
+        ("map", "get") => {
+            let m = expect_map(args.first())?;
+            let k = MapKey::from_value(args.get(1).ok_or("map.get: missing key")?)?;
+            Ok(match m.get(&k) {
+                Some(v) => some(v.clone()),
+                None    => none(),
+            })
+        }
+        ("map", "set") => {
+            let mut m = expect_map(args.first())?.clone();
+            let k = MapKey::from_value(args.get(1).ok_or("map.set: missing key")?)?;
+            let v = args.get(2).ok_or("map.set: missing value")?.clone();
+            m.insert(k, v);
+            Ok(Value::Map(m))
+        }
+        ("map", "delete") => {
+            let mut m = expect_map(args.first())?.clone();
+            let k = MapKey::from_value(args.get(1).ok_or("map.delete: missing key")?)?;
+            m.remove(&k);
+            Ok(Value::Map(m))
+        }
+        ("map", "keys") => {
+            let m = expect_map(args.first())?;
+            Ok(Value::List(m.keys().cloned().map(MapKey::into_value).collect()))
+        }
+        ("map", "values") => {
+            let m = expect_map(args.first())?;
+            Ok(Value::List(m.values().cloned().collect()))
+        }
+        ("map", "entries") => {
+            let m = expect_map(args.first())?;
+            Ok(Value::List(m.iter()
+                .map(|(k, v)| Value::Tuple(vec![k.as_value(), v.clone()]))
+                .collect()))
+        }
+        ("map", "from_list") => {
+            let pairs = expect_list(args.first())?;
+            let mut m = BTreeMap::new();
+            for p in pairs {
+                let items = match p {
+                    Value::Tuple(items) if items.len() == 2 => items,
+                    other => return Err(format!(
+                        "map.from_list element must be a 2-tuple, got {other:?}")),
+                };
+                let k = MapKey::from_value(&items[0])?;
+                m.insert(k, items[1].clone());
+            }
+            Ok(Value::Map(m))
+        }
+
+        // -- set --
+        ("set", "new") => Ok(Value::Set(BTreeSet::new())),
+        ("set", "size") => Ok(Value::Int(expect_set(args.first())?.len() as i64)),
+        ("set", "has") => {
+            let s = expect_set(args.first())?;
+            let k = MapKey::from_value(args.get(1).ok_or("set.has: missing element")?)?;
+            Ok(Value::Bool(s.contains(&k)))
+        }
+        ("set", "add") => {
+            let mut s = expect_set(args.first())?.clone();
+            let k = MapKey::from_value(args.get(1).ok_or("set.add: missing element")?)?;
+            s.insert(k);
+            Ok(Value::Set(s))
+        }
+        ("set", "delete") => {
+            let mut s = expect_set(args.first())?.clone();
+            let k = MapKey::from_value(args.get(1).ok_or("set.delete: missing element")?)?;
+            s.remove(&k);
+            Ok(Value::Set(s))
+        }
+        ("set", "to_list") => {
+            let s = expect_set(args.first())?;
+            Ok(Value::List(s.iter().cloned().map(MapKey::into_value).collect()))
+        }
+        ("set", "from_list") => {
+            let xs = expect_list(args.first())?;
+            let mut s = BTreeSet::new();
+            for x in xs {
+                s.insert(MapKey::from_value(x)?);
+            }
+            Ok(Value::Set(s))
+        }
+        ("set", "union") => {
+            let a = expect_set(args.first())?;
+            let b = expect_set(args.get(1))?;
+            Ok(Value::Set(a.union(b).cloned().collect()))
+        }
+        ("set", "intersect") => {
+            let a = expect_set(args.first())?;
+            let b = expect_set(args.get(1))?;
+            Ok(Value::Set(a.intersection(b).cloned().collect()))
+        }
+
         _ => Err(format!("unknown pure builtin: {kind}.{op}")),
+    }
+}
+
+fn expect_map(v: Option<&Value>) -> Result<&BTreeMap<MapKey, Value>, String> {
+    match v {
+        Some(Value::Map(m)) => Ok(m),
+        other => Err(format!("expected Map, got {other:?}")),
+    }
+}
+
+fn expect_set(v: Option<&Value>) -> Result<&BTreeSet<MapKey>, String> {
+    match v {
+        Some(Value::Set(s)) => Ok(s),
+        other => Err(format!("expected Set, got {other:?}")),
     }
 }
 
@@ -545,6 +657,23 @@ fn value_to_json(v: &Value) -> serde_json::Value {
             m.insert("data".into(), J::Array(data.iter().map(|f| J::from(*f)).collect()));
             J::Object(m)
         }
+        Value::Map(m) => {
+            let all_str = m.keys().all(|k| matches!(k, MapKey::Str(_)));
+            if all_str {
+                let mut out = serde_json::Map::new();
+                for (k, v) in m {
+                    if let MapKey::Str(s) = k {
+                        out.insert(s.clone(), value_to_json(v));
+                    }
+                }
+                J::Object(out)
+            } else {
+                J::Array(m.iter().map(|(k, v)| {
+                    J::Array(vec![value_to_json(&k.as_value()), value_to_json(v)])
+                }).collect())
+            }
+        }
+        Value::Set(s) => J::Array(s.iter().map(|k| value_to_json(&k.as_value())).collect()),
     }
 }
 

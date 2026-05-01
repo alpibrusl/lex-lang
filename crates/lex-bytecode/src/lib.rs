@@ -9,5 +9,5 @@ pub mod vm;
 pub use compiler::compile_program;
 pub use op::{Const, Op};
 pub use program::{Function, Program};
-pub use value::Value;
-pub use vm::{Vm, VmError};
+pub use value::{MapKey, Value};
+pub use vm::{Vm, VmError, MAX_CALL_DEPTH};
