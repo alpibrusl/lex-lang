@@ -104,6 +104,22 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                 None => none(),
             })
         }
+        ("str", "slice") => {
+            // Half-open byte-range slice. Out-of-range or non-UTF-8
+            // boundaries error rather than panic, so caller code can
+            // recover via Result. Spec §11.1 doesn't pin a name; this
+            // matches the bytes.slice helper added earlier.
+            let s = expect_str(args.first())?;
+            let lo = expect_int(args.get(1))? as usize;
+            let hi = expect_int(args.get(2))? as usize;
+            if lo > hi || hi > s.len() {
+                return Err(format!("str.slice: out of range [{lo}..{hi}] of len {}", s.len()));
+            }
+            if !s.is_char_boundary(lo) || !s.is_char_boundary(hi) {
+                return Err(format!("str.slice: [{lo}..{hi}] not on char boundaries"));
+            }
+            Ok(Value::Str(s[lo..hi].to_string()))
+        }
 
         // -- int / float --
         ("int", "to_str") => Ok(Value::Str(expect_int(args.first())?.to_string())),
