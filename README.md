@@ -74,10 +74,38 @@ lex ast-diff before.lex after.lex
 # Three-way structural merge. Conflicts are JSON, not <<<<<< HEAD markers.
 lex ast-merge base.lex ours.lex theirs.lex
 
+# Snapshot branches in the store. SigId → StageId map per branch;
+# three-way merge with structured JSON conflicts.
+lex branch create feature
+lex branch use feature
+# … publish edits to the feature branch …
+lex store-merge feature main          # preview the merge
+lex store-merge feature main --commit # apply when clean
+
 # Runtime tool registry: register Lex tools over HTTP, get back a stable
 # /tools/{id}/invoke endpoint with the effect manifest at /tools/{id}.
 lex tool-registry serve --port 8390
 ```
+
+### LLM-agnostic discovery
+
+Lex implements the [ACLI](https://github.com/alpibrusl/acli) spec, so
+**any** LLM agent (Claude Code, Codex, Gemini, Qwen, Mistral, ...)
+can discover the surface and call subcommands without a bespoke skill
+file:
+
+```bash
+lex --output json introspect           # full command tree as JSON
+lex skill > LEX.md                     # agentskills.io markdown
+lex --output json run app.lex main --dry-run
+# {"ok": true, "dry_run": true, "planned_actions": [...]}
+```
+
+Every state-modifying command supports `--dry-run` (exit code 9 +
+planned-actions envelope); errors come back as ACLI error envelopes
+with semantic exit codes. The auto-generated `.cli/` folder is
+committed in this repo so agents browsing GitHub can read
+`commands.json` without running the binary.
 
 ## Examples
 
@@ -301,7 +329,12 @@ Flags: `--body '<src>'` / `--body-file <path>` skip the API call; `--request '<q
 | `lex tool-registry serve [--port N]` | HTTP service to register Lex tools at runtime; `POST /tools` validates + stores, `POST /tools/{id}/invoke` runs |
 | `lex audit [paths...] [--effect K] [--calls FN] [--uses-host H] [--kind K]` | Structural code search by effect / call / hostname / AST kind. `--json` for agent-pipe output |
 | `lex ast-diff <file_a> <file_b> [--json] [--no-body]` | AST-native diff: added / removed / renamed / modified fns, plus body-level patches. Renames detected by body-hash with name normalized |
-| `lex ast-merge <base> <ours> <theirs> [--json] [--output PATH]` | Three-way structural merge. Conflicts surface as JSON (4 kinds: modify-modify, modify-delete, delete-modify, add-add). Exit 2 on any conflict; `--output` writes merged source when clean |
+| `lex ast-merge <base> <ours> <theirs> [--json] [--write PATH] [--dry-run]` | Three-way structural merge. Conflicts surface as JSON (4 kinds: modify-modify, modify-delete, delete-modify, add-add). Exit 2 on any conflict; `--write` materializes merged source when clean |
+| `lex branch <list \| show \| create \| delete \| use \| current> [--store DIR]` | Snapshot branches in the store. Each branch is a SigId → StageId map persisted at `<store>/branches/<name>.json`. Default `main` materializes from the existing lifecycle |
+| `lex store-merge <src> <dst> [--commit] [--json]` | Three-way merge between two branches; common ancestor is the source branch's `fork_base` snapshot, not the parent's current head. Conflict kinds match `ast-merge`. `--commit` applies a clean merge to dst |
+| `lex introspect [--output text\|json\|table]` | Full command tree per ACLI §1.2 (name, description, args, options, idempotency, examples, see-also). Auto-generated `.cli/commands.json` is also committed in the repo |
+| `lex skill` | agentskills.io-compliant Markdown for Claude Code / Codex / Gemini skill directories |
+| `lex version [--output json]` | Tool version + ACLI spec version, JSON-enveloped under `--output json` |
 
 ### Policy flags (run / replay)
 
@@ -374,9 +407,12 @@ lex/
 | M10 — Spec | ✅ randomized + SMT-LIB export ; `--spec` wired into `agent-tool` ; in-process Z3 deferred |
 | Stdlib MVP | ✅ pure builtins + closures + higher-order list ops + `std.flow` orchestration ; `std.math` (linalg + scalar floats) ; `std.tuple` ; **effect polymorphism** on `list.map` / `list.filter` / `list.fold` / `option.map` / `result.map` / `result.and_then` / `result.map_err` ; `flow.parallel` ✅ (sequential v1 — true threading deferred) ; `flow.parallel_record` deferred (needs row polymorphism on records) ; `std.map` / `std.set` deferred (need `Value` variants) |
 | Conformance harness + token budget | ✅ |
-| Agent integration (post-spec) | `lex agent-tool` (sandbox) ✅ ; `lex tool-registry serve` (HTTP registry) ✅ ; correctness ladder: `--examples` ✅ `--spec` ✅ `--diff-body` ✅ ; AST tooling: `lex audit` ✅ `lex ast-diff` ✅ `lex ast-merge` ✅ |
+| Agent integration (post-spec) | `lex agent-tool` (sandbox) ✅ ; `lex tool-registry serve` (HTTP registry) ✅ ; correctness ladder: `--examples` ✅ `--spec` ✅ `--diff-body` ✅ ; AST tooling: `lex audit` ✅ `lex ast-diff` (with effect-change highlighting) ✅ `lex ast-merge` ✅ |
+| Agent-native version control | tier-1 ✅ — `lex branch` + `lex store-merge` with `fork_base` snapshots and structured JSON conflicts ; commit history (`lex log`), distributed sync, body-level merge deferred |
+| LLM-agnostic discovery | ✅ — full [ACLI](https://github.com/alpibrusl/acli) compliance: `lex introspect` / `lex skill` / `lex version`, `--output text\|json\|table` on every subcommand, `--dry-run` on state-modifying ones, error envelopes with semantic exit codes |
+| Hardening | [`SECURITY.md`](SECURITY.md) threat model ✅ ; parser-recursion DoS gate (`MAX_DEPTH=96`) ✅ ; libFuzzer CI for parser + type checker ✅ ; VM-level memory / stack bounds and runtime body-merge are open |
 
-**Workspace test count:** 251 passing, 0 failing. `cargo clippy --workspace --all-targets -- -D warnings` clean.
+**Workspace test count:** 270 passing, 0 failing. `cargo clippy --workspace --all-targets -- -D warnings` clean. Fuzz CI: 60 s/PR, 5 min nightly across both targets.
 
 ## Building from source
 
@@ -384,8 +420,12 @@ Requires a recent Rust toolchain (any 1.80+ stable should work).
 
 ```bash
 cargo build --release       # full toolchain
-cargo test --workspace      # 251 tests
+cargo test --workspace      # 270 tests
 cargo test --release -p core-compiler -- --ignored   # release-only matmul perf gates
+
+# Optional: run the fuzz suite locally (nightly + cargo-fuzz needed).
+cargo install cargo-fuzz --locked
+cd fuzz && cargo +nightly fuzz run parser -- -max_total_time=60
 ```
 
 ## License
