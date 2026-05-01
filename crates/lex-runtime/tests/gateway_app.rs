@@ -25,7 +25,7 @@ fn spawn_gateway(port: u16) {
     }
     let bc = Arc::new(compile_program(&stages));
     let mut policy = Policy::pure();
-    policy.allow_effects = ["net".into(), "time".into()]
+    policy.allow_effects = ["net".into(), "time".into(), "io".into()]
         .into_iter().collect::<BTreeSet<_>>();
     thread::spawn(move || {
         let handler = DefaultHandler::new(policy).with_program(Arc::clone(&bc));
@@ -57,7 +57,7 @@ fn help_lists_all_endpoints() {
     spawn_gateway(port);
     let (status, body) = http(port, "GET", "/", "");
     assert_eq!(status, 200);
-    for endpoint in &["/now", "/classify", "/summarize", "/weather"] {
+    for endpoint in &["/now", "/classify", "/summarize", "/weather", "/digest"] {
         assert!(body.contains(endpoint), "help missing `{endpoint}`: {body}");
     }
 }

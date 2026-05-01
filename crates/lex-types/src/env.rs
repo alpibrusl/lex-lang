@@ -146,11 +146,14 @@ pub fn ty_from_canon(t: &lex_ast::TypeExpr, params: &[String]) -> Ty {
         }
         lex_ast::TypeExpr::Tuple { items } => Ty::Tuple(items.iter().map(|t| ty_from_canon(t, params)).collect()),
         lex_ast::TypeExpr::Function { params: ps, effects, ret } => {
-            let effs = EffectSet({
-                let mut s = std::collections::BTreeSet::new();
-                for e in effects { s.insert(e.name.clone()); }
-                s
-            });
+            let effs = EffectSet {
+                concrete: {
+                    let mut s = std::collections::BTreeSet::new();
+                    for e in effects { s.insert(e.name.clone()); }
+                    s
+                },
+                var: None,
+            };
             Ty::Function {
                 params: ps.iter().map(|t| ty_from_canon(t, params)).collect(),
                 effects: effs,
