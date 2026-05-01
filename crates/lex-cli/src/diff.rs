@@ -21,12 +21,24 @@
 //!       "signature_before": "...",
 //!       "signature_after":  "...",
 //!       "signature_changed": true|false,
+//!       "effect_changes": {
+//!         "before":  ["..."],
+//!         "after":   ["..."],
+//!         "added":   ["..."],
+//!         "removed": ["..."]
+//!       },
 //!       "body_patches": [{"op": "Replace", "node_path": "...",
 //!                         "from_kind": "...", "to_kind": "..."}]
 //!     }
 //!   ]
 //! }
 //! ```
+//!
+//! Effect changes are surfaced as a dedicated field — separate from
+//! `signature_changed` — because for security review they're the
+//! single most important kind of change. A reviewer (human or agent)
+//! scanning a diff for "did this fn newly gain `[net]`?" should not
+//! have to re-parse the rendered signature string.
 
 use anyhow::{anyhow, Context, Result};
 use lex_ast::{
@@ -67,7 +79,21 @@ struct Modified {
     signature_before: String,
     signature_after: String,
     signature_changed: bool,
+    effect_changes: EffectChanges,
     body_patches: Vec<BodyPatch>,
+}
+
+/// Effect-set delta for a modified fn. Empty `added`/`removed`
+/// means effect-equivalent (the body or non-effect parts of the
+/// signature changed). Renderings include the effect arg, so e.g.
+/// `fs_read("/tmp")` vs. `fs_read("/etc")` show up as one removed
+/// + one added.
+#[derive(Serialize, Default)]
+struct EffectChanges {
+    before:  Vec<String>,
+    after:   Vec<String>,
+    added:   Vec<String>,
+    removed: Vec<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -121,6 +147,14 @@ pub fn cmd_diff(args: &[String]) -> Result<()> {
             m.signature_after.clone()
         };
         println!("~ modified {sig}");
+        if !m.effect_changes.added.is_empty() {
+            println!("             ⚠ effects gained: [{}]",
+                m.effect_changes.added.join(", "));
+        }
+        if !m.effect_changes.removed.is_empty() {
+            println!("             ✓ effects dropped: [{}]",
+                m.effect_changes.removed.join(", "));
+        }
         for p in &m.body_patches {
             if p.from_kind == p.to_kind {
                 println!("             @ {}: {} edited", p.node_path, p.from_kind);
@@ -234,11 +268,13 @@ fn compute_diff(
             patches
         } else { Vec::new() };
 
+        let effect_changes = effect_diff(&fa.effects, &fb.effects);
         report.modified.push(Modified {
             name: (*n).clone(),
             signature_before: sig_a.clone(),
             signature_after: sig_b.clone(),
             signature_changed: sig_a != sig_b,
+            effect_changes,
             body_patches,
         });
     }
@@ -404,11 +440,41 @@ fn render_signature(fd: &FnDecl) -> String {
     let params: Vec<String> = fd.params.iter()
         .map(|p| format!("{} :: {}", p.name, render_type(&p.ty))).collect();
     let eff = if fd.effects.is_empty() { String::new() } else {
-        let names: Vec<&str> = fd.effects.iter().map(|e: &Effect| e.name.as_str()).collect();
-        format!("[{}] ", names.join(", "))
+        let labels: Vec<String> = fd.effects.iter().map(effect_label).collect();
+        format!("[{}] ", labels.join(", "))
     };
     format!("fn {}({}) -> {}{}", fd.name, params.join(", "),
         eff, render_type(&fd.return_type))
+}
+
+/// Render an effect with its arg if present: `fs_read("/tmp")`,
+/// `net("api.example.com")`, or just `io`. Used by both signature
+/// rendering and effect-diff so the same string identifies the
+/// same effect in either context.
+fn effect_label(e: &Effect) -> String {
+    use lex_ast::EffectArg;
+    match &e.arg {
+        Some(EffectArg::Str { value })   => format!("{}({:?})", e.name, value),
+        Some(EffectArg::Int { value })   => format!("{}({})",   e.name, value),
+        Some(EffectArg::Ident { value }) => format!("{}({})",   e.name, value),
+        None => e.name.clone(),
+    }
+}
+
+/// Set-style diff over two effect lists. Order-insensitive within
+/// the lists; ordering of the output is sorted-by-label so the
+/// JSON is stable.
+fn effect_diff(a: &[Effect], b: &[Effect]) -> EffectChanges {
+    let labels_a: BTreeSet<String> = a.iter().map(effect_label).collect();
+    let labels_b: BTreeSet<String> = b.iter().map(effect_label).collect();
+    let added:   Vec<String> = labels_b.difference(&labels_a).cloned().collect();
+    let removed: Vec<String> = labels_a.difference(&labels_b).cloned().collect();
+    EffectChanges {
+        before:  labels_a.into_iter().collect(),
+        after:   labels_b.into_iter().collect(),
+        added,
+        removed,
+    }
 }
 
 fn render_type(t: &TypeExpr) -> String {
