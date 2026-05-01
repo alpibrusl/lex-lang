@@ -82,4 +82,73 @@ impl Value {
     pub fn as_str(&self) -> &str {
         match self { Value::Str(s) => s, other => panic!("expected Str, got {other:?}") }
     }
+
+    /// Render this `Value` as a `serde_json::Value` for emission to
+    /// CLI output, the agent API, conformance harness reports, etc.
+    /// Canonical mapping shared across crates; previously every
+    /// boundary had its own copy.
+    ///
+    /// Encoding:
+    /// - `Variant { name, args }` → `{"$variant": name, "args": [...]}`
+    /// - `F64Array { ... }` → `{"$f64_array": true, rows, cols, data}`
+    /// - `Closure { fn_id, .. }` → `"<closure fn_N>"`
+    /// - `Bytes` → lowercase hex string
+    /// - `Map` with all-`Str` keys → JSON object; otherwise array of
+    ///   `[key, value]` pairs (Int keys can't be JSON-object keys)
+    /// - `Set` → JSON array of elements
+    /// - other variants → their natural JSON shape
+    ///
+    /// Note: this form is **not** round-trippable for traces (see
+    /// `lex-trace`'s recorder, which uses a richer marker form).
+    pub fn to_json(&self) -> serde_json::Value {
+        use serde_json::Value as J;
+        match self {
+            Value::Int(n) => J::from(*n),
+            Value::Float(f) => J::from(*f),
+            Value::Bool(b) => J::Bool(*b),
+            Value::Str(s) => J::String(s.clone()),
+            Value::Bytes(b) => J::String(b.iter().map(|b| format!("{:02x}", b)).collect()),
+            Value::Unit => J::Null,
+            Value::List(items) => J::Array(items.iter().map(Value::to_json).collect()),
+            Value::Tuple(items) => J::Array(items.iter().map(Value::to_json).collect()),
+            Value::Record(fields) => {
+                let mut m = serde_json::Map::new();
+                for (k, v) in fields { m.insert(k.clone(), v.to_json()); }
+                J::Object(m)
+            }
+            Value::Variant { name, args } => {
+                let mut m = serde_json::Map::new();
+                m.insert("$variant".into(), J::String(name.clone()));
+                m.insert("args".into(), J::Array(args.iter().map(Value::to_json).collect()));
+                J::Object(m)
+            }
+            Value::Closure { fn_id, .. } => J::String(format!("<closure fn_{fn_id}>")),
+            Value::F64Array { rows, cols, data } => {
+                let mut m = serde_json::Map::new();
+                m.insert("$f64_array".into(), J::Bool(true));
+                m.insert("rows".into(), J::from(*rows));
+                m.insert("cols".into(), J::from(*cols));
+                m.insert("data".into(), J::Array(data.iter().map(|f| J::from(*f)).collect()));
+                J::Object(m)
+            }
+            Value::Map(m) => {
+                let all_str = m.keys().all(|k| matches!(k, MapKey::Str(_)));
+                if all_str {
+                    let mut out = serde_json::Map::new();
+                    for (k, v) in m {
+                        if let MapKey::Str(s) = k {
+                            out.insert(s.clone(), v.to_json());
+                        }
+                    }
+                    J::Object(out)
+                } else {
+                    J::Array(m.iter().map(|(k, v)| {
+                        J::Array(vec![k.as_value().to_json(), v.to_json()])
+                    }).collect())
+                }
+            }
+            Value::Set(s) => J::Array(
+                s.iter().map(|k| k.as_value().to_json()).collect()),
+        }
+    }
 }

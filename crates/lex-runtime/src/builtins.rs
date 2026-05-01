@@ -626,56 +626,7 @@ fn none() -> Value { Value::Variant { name: "None".into(), args: Vec::new() } }
 fn ok_v(v: Value) -> Value { Value::Variant { name: "Ok".into(), args: vec![v] } }
 fn err_v(v: Value) -> Value { Value::Variant { name: "Err".into(), args: vec![v] } }
 
-fn value_to_json(v: &Value) -> serde_json::Value {
-    use serde_json::Value as J;
-    match v {
-        Value::Int(n) => J::from(*n),
-        Value::Float(f) => J::from(*f),
-        Value::Bool(b) => J::Bool(*b),
-        Value::Str(s) => J::String(s.clone()),
-        Value::Bytes(b) => J::String(b.iter().map(|b| format!("{:02x}", b)).collect()),
-        Value::Unit => J::Null,
-        Value::List(items) => J::Array(items.iter().map(value_to_json).collect()),
-        Value::Tuple(items) => J::Array(items.iter().map(value_to_json).collect()),
-        Value::Record(fields) => {
-            let mut m = serde_json::Map::new();
-            for (k, v) in fields { m.insert(k.clone(), value_to_json(v)); }
-            J::Object(m)
-        }
-        Value::Variant { name, args } => {
-            let mut m = serde_json::Map::new();
-            m.insert("$variant".into(), J::String(name.clone()));
-            m.insert("args".into(), J::Array(args.iter().map(value_to_json).collect()));
-            J::Object(m)
-        }
-        Value::Closure { fn_id, .. } => J::String(format!("<closure fn_{fn_id}>")),
-        Value::F64Array { rows, cols, data } => {
-            let mut m = serde_json::Map::new();
-            m.insert("$f64_array".into(), J::Bool(true));
-            m.insert("rows".into(), J::from(*rows));
-            m.insert("cols".into(), J::from(*cols));
-            m.insert("data".into(), J::Array(data.iter().map(|f| J::from(*f)).collect()));
-            J::Object(m)
-        }
-        Value::Map(m) => {
-            let all_str = m.keys().all(|k| matches!(k, MapKey::Str(_)));
-            if all_str {
-                let mut out = serde_json::Map::new();
-                for (k, v) in m {
-                    if let MapKey::Str(s) = k {
-                        out.insert(s.clone(), value_to_json(v));
-                    }
-                }
-                J::Object(out)
-            } else {
-                J::Array(m.iter().map(|(k, v)| {
-                    J::Array(vec![value_to_json(&k.as_value()), value_to_json(v)])
-                }).collect())
-            }
-        }
-        Value::Set(s) => J::Array(s.iter().map(|k| value_to_json(&k.as_value())).collect()),
-    }
-}
+fn value_to_json(v: &Value) -> serde_json::Value { v.to_json() }
 
 fn json_to_value(v: &serde_json::Value) -> Value {
     use serde_json::Value as J;
