@@ -13,6 +13,8 @@
 //! defaults are tuned for piping into another agent's eval loop:
 //! one fn per line, fully-qualified.
 
+use crate::acli as acli_mod;
+use ::acli::OutputFormat;
 use anyhow::{anyhow, Context, Result};
 use lex_ast::{canonicalize_program, CExpr, CLit, Effect, FnDecl, Stage, TypeExpr};
 use lex_syntax::parse_source;
@@ -56,8 +58,9 @@ struct AuditReport {
     hits: Vec<FnHit>,
 }
 
-pub fn cmd_audit(args: &[String]) -> Result<()> {
-    let opts = parse_audit_args(args)?;
+pub fn cmd_audit(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let mut opts = parse_audit_args(args)?;
+    if matches!(fmt, OutputFormat::Json) { opts.json = true; }
     if opts.paths.is_empty() {
         return Err(anyhow!("usage: lex audit [paths...] [--effect KIND] [--calls FN] [--uses-host HOST] [--kind NODE] [--json]"));
     }
@@ -104,7 +107,14 @@ pub fn cmd_audit(args: &[String]) -> Result<()> {
         }
     }
 
+    if matches!(fmt, OutputFormat::Json) {
+        // Top-level `--output json` → ACLI envelope.
+        let data = serde_json::to_value(&report)?;
+        acli_mod::emit_or_text("audit", data, fmt, || {});
+        return Ok(());
+    }
     if opts.json {
+        // Legacy `--json` (without `--output json`): raw report.
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }

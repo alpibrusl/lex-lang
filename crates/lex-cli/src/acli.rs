@@ -24,14 +24,86 @@
 //! migrating ~1000 lines of hand-rolled arg parsing.
 
 use acli::introspect::CommandInfo;
+use acli::output::{emit, error_envelope, success_envelope, OutputFormat};
 use acli::AcliApp;
+use serde_json::Value;
+
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn build_app() -> AcliApp {
-    let mut app = AcliApp::new("lex", env!("CARGO_PKG_VERSION"));
+    let mut app = AcliApp::new("lex", VERSION);
     for cmd in commands() {
         app.register_command(cmd);
     }
     app
+}
+
+/// Emit a successful JSON envelope when the format is JSON; otherwise
+/// run the supplied text printer. Centralizes the
+/// "if json then envelope, else text" branch each subcommand needs.
+pub fn emit_or_text<F: FnOnce()>(cmd: &str, data: Value, fmt: &OutputFormat, text: F) {
+    match fmt {
+        OutputFormat::Json => {
+            let env = success_envelope(cmd, data, VERSION, None, None);
+            emit(&env, fmt);
+        }
+        OutputFormat::Text | OutputFormat::Table => text(),
+    }
+}
+
+/// Emit a "dry run" envelope (exit code 9 per ACLI spec §3) for
+/// state-modifying commands invoked with `--dry-run`. In text mode
+/// we render the planned actions as a bullet list so a human
+/// running by hand still sees what would happen.
+pub fn emit_dry_run(
+    cmd: &str,
+    fmt: &OutputFormat,
+    summary: &str,
+    actions: Vec<Value>,
+) {
+    match fmt {
+        OutputFormat::Json => {
+            // Build the envelope manually — the SDK's success_envelope
+            // doesn't accept a `dry_run` flag; we serialize directly.
+            let env = serde_json::json!({
+                "ok": true,
+                "command": cmd,
+                "dry_run": true,
+                "planned_actions": actions,
+                "data": null,
+                "meta": { "duration_ms": 0, "version": VERSION },
+            });
+            println!("{}", serde_json::to_string_pretty(&env).unwrap());
+        }
+        OutputFormat::Text | OutputFormat::Table => {
+            eprintln!("dry-run: {summary}");
+            for a in &actions {
+                eprintln!("  • {}", a);
+            }
+        }
+    }
+    std::process::exit(9);
+}
+
+/// Emit an error envelope for the top-level error path.
+/// Maps anyhow's display string into ACLI's error structure;
+/// the exit code is the caller's responsibility.
+pub fn emit_error(cmd: &str, msg: &str, fmt: &OutputFormat, code: acli::ExitCode) {
+    if matches!(fmt, OutputFormat::Json) {
+        let env = error_envelope(
+            cmd,
+            code,
+            msg,
+            None,
+            None,
+            None,
+            VERSION,
+            None,
+        );
+        emit(&env, fmt);
+    } else {
+        eprintln!("error: {msg}");
+    }
 }
 
 fn commands() -> Vec<CommandInfo> {

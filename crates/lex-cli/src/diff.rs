@@ -28,6 +28,8 @@
 //! }
 //! ```
 
+use crate::acli as acli_mod;
+use ::acli::OutputFormat;
 use anyhow::{anyhow, Context, Result};
 use lex_ast::{
     canonicalize_program, CExpr, Effect, FnDecl, Stage, TypeExpr,
@@ -86,7 +88,7 @@ struct DiffReport {
     modified: Vec<Modified>,
 }
 
-pub fn cmd_diff(args: &[String]) -> Result<()> {
+pub fn cmd_diff(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let opts = parse_diff_args(args)?;
     if opts.files.len() != 2 {
         return Err(anyhow!("usage: lex diff <file_a> <file_b> [--json] [--no-body]"));
@@ -95,6 +97,11 @@ pub fn cmd_diff(args: &[String]) -> Result<()> {
     let b = load_fns(&opts.files[1])?;
     let report = compute_diff(&a, &b, opts.body_patches);
 
+    if matches!(fmt, OutputFormat::Json) {
+        let data = serde_json::to_value(&report)?;
+        acli_mod::emit_or_text("ast-diff", data, fmt, || {});
+        return Ok(());
+    }
     if opts.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
