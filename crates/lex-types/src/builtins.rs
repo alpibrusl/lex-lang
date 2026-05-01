@@ -350,6 +350,39 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             ));
             Some(Ty::Record(fields))
         }
+        "tuple" => {
+            // Tuple accessors per §11.1. Polymorphic in the tuple's
+            // element types; we use the same row-variable shape used
+            // by list helpers. Tuples are heterogeneous, so each
+            // accessor is statically typed via independent type
+            // variables for each position.
+            let mut fields = IndexMap::new();
+            // fst :: (T0, T1) -> T0
+            fields.insert("fst".into(), Ty::function(
+                vec![Ty::Tuple(vec![Ty::Var(0), Ty::Var(1)])],
+                EffectSet::empty(),
+                Ty::Var(0),
+            ));
+            // snd :: (T0, T1) -> T1
+            fields.insert("snd".into(), Ty::function(
+                vec![Ty::Tuple(vec![Ty::Var(0), Ty::Var(1)])],
+                EffectSet::empty(),
+                Ty::Var(1),
+            ));
+            // third :: (T0, T1, T2) -> T2
+            fields.insert("third".into(), Ty::function(
+                vec![Ty::Tuple(vec![Ty::Var(0), Ty::Var(1), Ty::Var(2)])],
+                EffectSet::empty(),
+                Ty::Var(2),
+            ));
+            // len :: (T0, T1) -> Int  (covers any pair shape; Int back)
+            fields.insert("len".into(), Ty::function(
+                vec![Ty::Tuple(vec![Ty::Var(0), Ty::Var(1)])],
+                EffectSet::empty(),
+                Ty::int(),
+            ));
+            Some(Ty::Record(fields))
+        }
         "flow" => {
             // Orchestration primitives (spec §11.2). Each takes one or
             // more closures and returns a closure with a derived shape.
@@ -402,6 +435,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "option" => "option",
         "json" => "json",
         "flow" => "flow",
+        "tuple" => "tuple",
         "bytes" => "bytes",
         "net" => "net",
         "chat" => "chat",

@@ -15,7 +15,12 @@ pub fn try_pure_builtin(kind: &str, op: &str, args: &[Value]) -> Option<Result<V
 /// `kind` is one of the known pure module aliases — used by the policy
 /// walk to skip pure builtins that programs reference via imports.
 pub fn is_pure_module(kind: &str) -> bool {
-    matches!(kind, "str" | "int" | "float" | "bool" | "list" | "map" | "set"
+    // `map` and `set` are listed in the spec (§11.1) but defer to v1.1
+    // alongside refinement types — they need new `Value` variants for
+    // proper hashing semantics, which is a larger change. Until then,
+    // `import "std.map"` / `"std.set"` resolves to None so users get a
+    // clear "module not found" rather than silently-empty stubs.
+    matches!(kind, "str" | "int" | "float" | "bool" | "list"
         | "option" | "result" | "tuple" | "json" | "bytes" | "flow" | "math")
 }
 
@@ -138,6 +143,18 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             out.extend(expect_list(args.get(1))?.iter().cloned());
             Ok(Value::List(out))
         }
+
+        // -- tuple --
+        // Per §11.1: fst, snd, third for 2- and 3-tuples. Index out of
+        // range is an error rather than a panic so calling `tuple.third`
+        // on a 2-tuple is a clean failure instead of a host crash.
+        ("tuple", "fst")   => tuple_index(first_arg(args)?, 0),
+        ("tuple", "snd")   => tuple_index(first_arg(args)?, 1),
+        ("tuple", "third") => tuple_index(first_arg(args)?, 2),
+        ("tuple", "len") => match first_arg(args)? {
+            Value::Tuple(items) => Ok(Value::Int(items.len() as i64)),
+            other => Err(format!("tuple.len: expected Tuple, got {other:?}")),
+        },
 
         // -- option --
         ("option", "unwrap_or") => {
@@ -434,6 +451,14 @@ fn expect_bytes(v: Option<&Value>) -> Result<&Vec<u8>, String> {
 
 fn first_arg(args: &[Value]) -> Result<&Value, String> {
     args.first().ok_or_else(|| "missing argument".into())
+}
+
+fn tuple_index(v: &Value, i: usize) -> Result<Value, String> {
+    match v {
+        Value::Tuple(items) => items.get(i).cloned()
+            .ok_or_else(|| format!("tuple index {i} out of range (len={})", items.len())),
+        other => Err(format!("expected Tuple, got {other:?}")),
+    }
 }
 
 fn expect_str(v: Option<&Value>) -> Result<String, String> {
