@@ -261,6 +261,7 @@ Flags: `--body '<src>'` / `--body-file <path>` skip the API call; `--request '<q
 | `lex tool-registry serve [--port N]` | HTTP service to register Lex tools at runtime; `POST /tools` validates + stores, `POST /tools/{id}/invoke` runs |
 | `lex audit [paths...] [--effect K] [--calls FN] [--uses-host H] [--kind K]` | Structural code search by effect / call / hostname / AST kind. `--json` for agent-pipe output |
 | `lex ast-diff <file_a> <file_b> [--json] [--no-body]` | AST-native diff: added / removed / renamed / modified fns, plus body-level patches. Renames detected by body-hash with name normalized |
+| `lex ast-merge <base> <ours> <theirs> [--json] [--output PATH]` | Three-way structural merge. Conflicts surface as JSON (4 kinds: modify-modify, modify-delete, delete-modify, add-add). Exit 2 on any conflict; `--output` writes merged source when clean |
 
 ### Policy flags (run / replay)
 
