@@ -4,7 +4,7 @@ A small family of programming languages designed for LLMs as primary writers, re
 
 Implementation of `langspecv2.md`. The design rules and milestone definitions all come from that document; this README focuses on what currently runs.
 
-> Looking for the pitch? See [`docs/index.html`](docs/index.html) — single static page, dark-mode-ready, self-contained. Once GitHub Pages is enabled (Settings → Pages → Source: `main` / `/docs`), it'll be live at `https://alpibrusl.github.io/lex-lang/`.
+> Looking for the pitch? See [`docs/index.html`](docs/index.html) — single static page, dark-mode-ready, self-contained. Once GitHub Pages is enabled (run `bash scripts/setup-pages.sh` or click through Settings → Pages → Source: `main` / `/docs`), it'll be live at `https://alpibrusl.github.io/lex-lang/`.
 
 ## Design rules at a glance
 
