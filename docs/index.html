@@ -330,6 +330,58 @@ $ lex ast-diff --json before.lex after.lex
 </section>
 
 <section>
+  <h2>Reconciling two agents: <code>lex ast-merge</code></h2>
+  <p class="lede">
+    When two agents change the same file independently, Git serves
+    you broken source with <code>&lt;&lt;&lt;&lt;&lt;&lt;&lt; HEAD</code>
+    markers — text the receiving agent has to re-parse around.
+    <code>lex ast-merge</code> is a three-way structural merge: clean
+    changes land automatically, real conflicts come back as
+    structured JSON the agent can resolve programmatically.
+  </p>
+  <pre><code>$ lex ast-merge base.lex ours.lex theirs.lex
+→ 1 conflict(s), 3 clean merge(s)
+  ✓ base         helper
+  ✓ added-ours   ours_added
+  ✓ added-theirs theirs_added
+  ✗ modify-modify process (both sides modified)
+exit 2
+
+$ lex ast-merge --json base.lex ours.lex theirs.lex
+{
+  "summary": { "total_fns": 4, "clean": 3, "conflicts": 1 },
+  "merged": [
+    { "name": "helper",       "from": "base" },
+    { "name": "ours_added",   "from": "added-ours" },
+    { "name": "theirs_added", "from": "added-theirs" }
+  ],
+  "conflicts": [{
+    "kind":   "modify-modify",
+    "name":   "process",
+    "base":   "fn process(n :: Int) -> Int { n }\n",
+    "ours":   "fn process(n :: Int) -> Int { n + 1 }\n",
+    "theirs": "fn process(n :: Int) -> Int { n + 2 }\n"
+  }]
+}</code></pre>
+  <p>
+    Four conflict kinds are recognized:
+    <code>modify-modify</code>, <code>modify-delete</code>,
+    <code>delete-modify</code>, <code>add-add</code>. Clean cases —
+    *"both sides made the same edit"*, *"only one side touched it"*,
+    *"both added it identically"* — merge automatically with
+    provenance recorded in the <code>from</code> field. With
+    <code>--output PATH</code> the tool writes the merged source for
+    a clean merge and refuses (exit 1) when conflicts remain.
+  </p>
+  <p>
+    Together with <code>lex audit</code> and <code>lex ast-diff</code>,
+    this is the AST-tooling trio: <em>what's in this codebase</em>,
+    <em>what changed</em>, and <em>how do two agents reconcile their
+    changes</em>. Three primitives an agent uses without parsing text.
+  </p>
+</section>
+
+<section>
   <h2>Capability ≠ correctness</h2>
   <p>
     Effect typing answers <em>what your code touches</em>, not
