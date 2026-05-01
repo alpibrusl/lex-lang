@@ -1,0 +1,28 @@
+[package]
+name = "lex-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+lex-syntax = { path = "../crates/lex-syntax" }
+lex-ast = { path = "../crates/lex-ast" }
+lex-types = { path = "../crates/lex-types" }
+
+[[bin]]
+name = "parser"
+path = "fuzz_targets/parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "type_checker"
+path = "fuzz_targets/type_checker.rs"
+test = false
+doc = false
+bench = false

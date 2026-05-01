@@ -16,6 +16,10 @@ members = [
     "crates/spec-checker",
     "crates/conformance",
 ]
+# `fuzz/` is a separate crate driven by `cargo fuzz` (libFuzzer +
+# nightly). Excluded from the main workspace so `cargo build/test
+# --workspace` on stable doesn't try to compile it.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"
