@@ -15,7 +15,9 @@ mod audit;
 mod diff;
 mod ast_merge;
 mod branch;
+mod acli;
 
+use ::acli::OutputFormat;
 use anyhow::{anyhow, bail, Context, Result};
 use lex_ast::{canonicalize_program, sig_id, stage_canonical_hash_hex, stage_id, Stage};
 use lex_bytecode::{compile_program, vm::Vm, Value};
@@ -36,8 +38,25 @@ fn main() {
 }
 
 fn run(args: &[String]) -> Result<()> {
+    // Pull off ACLI's top-level `--output text|json|table` flag (it
+    // also appears on individual built-ins below). The output format
+    // is consumed only by the introspect/skill/version handlers in
+    // tier-1; subcommand-level structured output remains a follow-up.
+    let (output, args) = parse_output_format(args)?;
+
     let cmd = args.first().ok_or_else(|| anyhow!("usage: lex <command> ..."))?;
     match cmd.as_str() {
+        // ACLI built-ins — emit JSON envelopes via the SDK.
+        "introspect" => { acli::build_app().handle_introspect(&output); Ok(()) }
+        "skill" => {
+            let out_path = args.get(1).map(|s| s.as_str());
+            acli::build_app().handle_skill(out_path, &output);
+            Ok(())
+        }
+        "version" | "--version" | "-V" => {
+            acli::build_app().handle_version(&output);
+            Ok(())
+        }
         "parse" => cmd_parse(&args[1..]),
         "check" => cmd_check(&args[1..]),
         "run" => cmd_run(&args[1..]),
@@ -60,6 +79,34 @@ fn run(args: &[String]) -> Result<()> {
         "help" | "--help" | "-h" => { print_usage(); Ok(()) }
         other => bail!("unknown command `{other}`. try `lex help`"),
     }
+}
+
+/// Strip a leading `--output FORMAT` (or `--output=FORMAT`) from
+/// `args`. Accepts `text` / `json` / `table`. Defaults to text.
+/// We only scan up to the first non-`--output` token so we don't
+/// swallow per-subcommand `--output` flags (e.g. `lex ast-merge
+/// --output merged.lex`, which is a path, not a format).
+fn parse_output_format(args: &[String]) -> Result<(OutputFormat, Vec<String>)> {
+    use std::str::FromStr;
+    let mut out: Vec<String> = Vec::with_capacity(args.len());
+    let mut format = OutputFormat::Text;
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--output" && i + 1 < args.len() {
+            format = OutputFormat::from_str(&args[i + 1]).map_err(|e| anyhow!(e))?;
+            i += 2;
+        } else if let Some(v) = a.strip_prefix("--output=") {
+            format = OutputFormat::from_str(v).map_err(|e| anyhow!(e))?;
+            i += 1;
+        } else {
+            // Stop scanning at first positional / unrelated flag — the
+            // remaining `--output` (if any) belongs to a subcommand.
+            out.extend_from_slice(&args[i..]);
+            break;
+        }
+    }
+    Ok((format, out))
 }
 
 fn print_usage() {
