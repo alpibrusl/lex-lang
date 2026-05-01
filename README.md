@@ -413,7 +413,7 @@ lex/
 | LLM-agnostic discovery | ✅ — full [ACLI](https://github.com/alpibrusl/acli) compliance: `lex introspect` / `lex skill` / `lex version`, `--output text\|json\|table` on every subcommand, `--dry-run` on state-modifying ones, error envelopes with semantic exit codes |
 | Hardening | [`SECURITY.md`](SECURITY.md) threat model ✅ ; parser-recursion DoS gate (`MAX_DEPTH=96`) ✅ ; **VM call-stack depth gate (`MAX_CALL_DEPTH=1024`) ✅** ; libFuzzer CI for parser + type checker ✅ ; VM-level memory bounds remain delegated to the host (container memory caps) |
 
-**Workspace test count:** 288 passing, 0 failing. `cargo clippy --workspace --all-targets -- -D warnings` clean. Fuzz CI: 60 s/PR, 5 min nightly across both targets.
+**Workspace test count:** 285 passing, 0 failing, 3 ignored (WS chat example, flaky on CI runners — pass locally with `--ignored`). `cargo clippy --workspace --all-targets -- -D warnings` clean. Fuzz CI: 60 s/PR, 5 min nightly across both targets.
 
 ## Building from source
 
@@ -421,7 +421,7 @@ Requires a recent Rust toolchain (any 1.80+ stable should work).
 
 ```bash
 cargo build --release       # full toolchain
-cargo test --workspace      # 288 tests
+cargo test --workspace      # 285 tests (+ 3 ws_chat ignored — `--ignored` to run locally)
 cargo test --release -p core-compiler -- --ignored   # release-only matmul perf gates
 
 # Optional: run the fuzz suite locally (nightly + cargo-fuzz needed).
