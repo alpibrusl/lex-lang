@@ -9,14 +9,18 @@ use lex_runtime::{DefaultHandler, Policy};
 use lex_syntax::parse_source;
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 /// Spawn the Lex source's `entry` function on a background thread.
-/// Returns the bound port (0 means "let OS choose"; we use a fixed
-/// port chosen by the test).
+/// The thread is detached; it dies when the test process exits.
+///
+/// Caller must follow with `wait_for_bind(port, ...)` to make sure
+/// the listener is up before driving traffic — a fixed sleep was
+/// flaky under TLS (cert + key parsing + rustls init can exceed
+/// any reasonable static delay).
 fn spawn_lex_server(src: &str, entry: &str) {
     let prog = parse_source(src).expect("parse");
     let stages = canonicalize_program(&prog);
@@ -32,8 +36,29 @@ fn spawn_lex_server(src: &str, entry: &str) {
         let mut vm = Vm::with_handler(&bc, Box::new(handler));
         let _ = vm.call(&entry, vec![]);
     });
-    // Give the server a moment to bind.
-    thread::sleep(Duration::from_millis(150));
+}
+
+/// Poll-connect to `port` until the listener accepts a TCP
+/// connection or the deadline expires. Replaces a fixed sleep so
+/// the test passes whether bind takes 5ms (plain HTTP) or 500ms
+/// (TLS with cold cert load) without slowing the fast path.
+fn wait_for_bind(port: u16, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut backoff = Duration::from_millis(20);
+    loop {
+        if let Ok(s) = TcpStream::connect_timeout(
+            &("127.0.0.1", port).to_socket_addrs().unwrap().next().unwrap(),
+            Duration::from_millis(200),
+        ) {
+            drop(s);
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("server on :{port} did not bind within {timeout:?}");
+        }
+        thread::sleep(backoff);
+        backoff = (backoff * 2).min(Duration::from_millis(200));
+    }
 }
 
 fn http(port: u16, method: &str, path: &str, body: &str) -> (u16, String) {
@@ -69,6 +94,7 @@ fn main() -> [net] Nil { net.serve(18091, "handle") }
 #[test]
 fn net_serve_dispatches_request_and_returns_response() {
     spawn_lex_server(ECHO_SRC, "main");
+    wait_for_bind(18091, Duration::from_secs(5));
     let (status, body) = http(18091, "GET", "/hello", "");
     assert_eq!(status, 200);
     assert_eq!(body, "GET /hello");
@@ -86,6 +112,7 @@ fn handle(req :: { body :: Str, method :: Str, path :: Str, query :: Str }) -> {
 fn main() -> [net] Nil { net.serve(18092, "handle") }
 "#;
     spawn_lex_server(src, "main");
+    wait_for_bind(18092, Duration::from_secs(5));
     let (status, body) = http(18092, "POST", "/widgets", "hello-payload");
     assert_eq!(status, 201);
     assert_eq!(body, "got: hello-payload");
@@ -97,6 +124,7 @@ fn weather_app_responds_to_routes() {
     // Patch the example's port so the test owns its own.
     let src = src.replace("net.serve(8080,", "net.serve(18093,");
     spawn_lex_server(&src, "main");
+    wait_for_bind(18093, Duration::from_secs(5));
 
     let (status, body) = http(18093, "GET", "/weather/SF", "");
     assert_eq!(status, 200);
@@ -142,6 +170,7 @@ fn handle(req :: { body :: Str, method :: Str, path :: Str, query :: Str }) -> {
 fn main() -> [net] Nil { net.serve(18094, "handle") }
 "#;
     spawn_lex_server(src, "main");
+    wait_for_bind(18094, Duration::from_secs(5));
 
     // Fire 32 requests across 8 client threads.
     let mut handles = Vec::new();
@@ -182,6 +211,7 @@ fn handle(req :: { body :: Str, method :: Str, path :: Str, query :: Str }) -> {
 fn main() -> [net] Nil { net.serve(18095, "handle") }
 "#;
     spawn_lex_server(src, "main");
+    wait_for_bind(18095, Duration::from_secs(5));
 
     let start = std::time::Instant::now();
     let mut handles = Vec::new();
@@ -228,7 +258,8 @@ fn main() -> [net] Nil {{ net.serve_tls(18099, "{cert_path}", "{key_path}", "han
     // test crate (heavy) or a child openssl process. Since the spec
     // wraps tiny_http's well-tested SSL path, we treat the bind as a
     // sufficient smoke for this PR.
-    let conn = TcpStream::connect(("127.0.0.1", 18099));
-    assert!(conn.is_ok(), "TLS server did not bind: {conn:?}");
-    drop(conn);
+    //
+    // TLS bind is slower than plain HTTP (cert/key parsing + rustls
+    // init) — generous timeout to accommodate cold starts on CI.
+    wait_for_bind(18099, Duration::from_secs(10));
 }
