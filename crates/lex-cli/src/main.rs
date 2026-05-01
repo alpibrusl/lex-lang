@@ -616,6 +616,12 @@ struct AgentToolOpts {
     /// tool needs to call api.openai.com but should not be able to
     /// POST to attacker.example.com.
     allow_net_host: Vec<String>,
+    /// Path to a JSON file of `[{"input": "...", "expected": "..."}, ...]`
+    /// pairs. When set, the tool runs once per case and is rejected
+    /// if any output mismatches `expected`. Closes the well-typed-but-
+    /// wrong-behavior gap: the type system says what code touches; the
+    /// examples say what it should return.
+    examples_file: Option<PathBuf>,
 }
 
 enum BodySource {
@@ -689,22 +695,82 @@ fn cmd_agent_tool(args: &[String]) -> Result<()> {
     // 5) Run with a step-limit cap. This is the runtime DoS guard:
     // type-check rejects effects, max_steps rejects runaway compute.
     let bc = std::sync::Arc::new(bc);
-    let handler = DefaultHandler::new(policy).with_program(std::sync::Arc::clone(&bc));
-    let mut vm = Vm::with_handler(&bc, Box::new(handler));
-    vm.set_step_limit(opts.max_steps);
-    let result = match vm.call("tool", vec![Value::Str(opts.user_input.clone())]) {
+
+    // 5a) If --examples is set, behavioral-verify before trusting the tool
+    // for live traffic. Catches the well-typed-but-wrong-behavior gap:
+    // the type system says what code touches; the examples say what it
+    // should return. On any mismatch, exit 5 (distinct from 2/3/4).
+    if let Some(path) = opts.examples_file.as_ref() {
+        let examples = load_examples(path)?;
+        if opts.show_source {
+            eprintln!("→ checking {} example(s)…", examples.len());
+        }
+        let mut failures: Vec<(usize, &Example, String)> = Vec::new();
+        for (idx, ex) in examples.iter().enumerate() {
+            let out = run_tool_once(&bc, &policy, opts.max_steps, &ex.input)?;
+            if out != ex.expected {
+                failures.push((idx, ex, out));
+            }
+        }
+        if !failures.is_empty() {
+            eprintln!("→ EXAMPLES FAILED — tool not trusted ({} of {} mismatched).",
+                failures.len(), examples.len());
+            for (i, ex, got) in &failures {
+                eprintln!("  [{i}] input={:?}", ex.input);
+                eprintln!("       expected={:?}", ex.expected);
+                eprintln!("       got     ={got:?}");
+            }
+            std::process::exit(5);
+        }
+        if opts.show_source {
+            eprintln!("→ examples passed: {}/{}", examples.len(), examples.len());
+        }
+    }
+
+    // 5b) Single-shot run with the user_input. With --examples this
+    // doubles as a sanity invocation; without examples it's the only run.
+    let result = run_tool_once(&bc, &policy, opts.max_steps, &opts.user_input)?;
+    println!("{result}");
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct Example {
+    input: String,
+    expected: String,
+}
+
+fn load_examples(path: &std::path::Path) -> Result<Vec<Example>> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("read examples file {}", path.display()))?;
+    let cases: Vec<Example> = serde_json::from_str(&raw)
+        .with_context(|| format!("parse examples file {}; expected JSON array of {{input, expected}}", path.display()))?;
+    Ok(cases)
+}
+
+fn run_tool_once(
+    bc: &std::sync::Arc<lex_bytecode::Program>,
+    policy: &Policy,
+    max_steps: u64,
+    input: &str,
+) -> Result<String> {
+    let handler = DefaultHandler::new(policy.clone()).with_program(std::sync::Arc::clone(bc));
+    let mut vm = Vm::with_handler(bc, Box::new(handler));
+    vm.set_step_limit(max_steps);
+    let result = match vm.call("tool", vec![Value::Str(input.to_string())]) {
         Ok(v) => v,
         Err(e) => {
             let msg = format!("{e}");
             if msg.contains("step limit") {
-                eprintln!("→ STEP-LIMIT EXCEEDED — tool aborted at {} steps.", opts.max_steps);
+                eprintln!("→ STEP-LIMIT EXCEEDED — tool aborted at {max_steps} steps.");
                 eprintln!("  (raise with --max-steps; default {})", default_max_steps());
                 std::process::exit(4);
             }
             // Runtime scope rejections (--allow-fs-read / --allow-net-host
             // / --allow-fs-write) surface as effect-handler errors. Exit 3
             // matches the static-policy gate so callers can branch cleanly:
-            //   2 = type-check, 3 = policy (static or runtime), 4 = step-limit.
+            //   2 = type-check, 3 = policy (static or runtime), 4 = step-limit,
+            //   5 = examples failed.
             if msg.contains("outside --allow-fs-read")
                 || msg.contains("outside --allow-fs-write")
                 || msg.contains("not in --allow-net-host")
@@ -716,12 +782,10 @@ fn cmd_agent_tool(args: &[String]) -> Result<()> {
             return Err(anyhow!("runtime: {e}"));
         }
     };
-
-    match result {
-        Value::Str(s) => println!("{s}"),
-        other => println!("{}", value_to_json_string(&other)),
-    }
-    Ok(())
+    Ok(match result {
+        Value::Str(s) => s,
+        other => value_to_json_string(&other),
+    })
 }
 
 const fn default_max_steps() -> u64 { 1_000_000 }
@@ -736,6 +800,7 @@ fn parse_agent_tool_args(args: &[String]) -> Result<AgentToolOpts> {
     let mut max_steps: u64 = default_max_steps();
     let mut allow_fs_read: Vec<PathBuf> = Vec::new();
     let mut allow_net_host: Vec<String> = Vec::new();
+    let mut examples_file: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -786,6 +851,11 @@ fn parse_agent_tool_args(args: &[String]) -> Result<AgentToolOpts> {
                     .parse().context("--max-steps must be an integer")?;
                 i += 2;
             }
+            "--examples" => {
+                let v = args.get(i + 1).ok_or_else(|| anyhow!("--examples needs a path"))?;
+                examples_file = Some(PathBuf::from(v));
+                i += 2;
+            }
             "--quiet" => { show_source = false; i += 1; }
             other => bail!("unknown agent-tool flag: {other}"),
         }
@@ -801,6 +871,7 @@ fn parse_agent_tool_args(args: &[String]) -> Result<AgentToolOpts> {
         max_steps,
         allow_fs_read,
         allow_net_host,
+        examples_file,
     })
 }
 
