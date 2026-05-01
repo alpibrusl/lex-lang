@@ -92,6 +92,7 @@ fn run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "ast-merge" => ast_merge::cmd_ast_merge(fmt, &args[1..]),
         "branch" => branch::cmd_branch(fmt, &args[1..]),
         "store-merge" => branch::cmd_store_merge(fmt, &args[1..]),
+        "log" => branch::cmd_log(fmt, &args[1..]),
         "help" | "--help" | "-h" => { print_usage(); Ok(()) }
         other => bail!("unknown command `{other}`. try `lex help`"),
     }

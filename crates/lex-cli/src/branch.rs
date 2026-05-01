@@ -9,7 +9,7 @@
 use crate::acli as acli_mod;
 use ::acli::OutputFormat;
 use anyhow::{anyhow, bail, Result};
-use lex_store::{MergeReport, Store};
+use lex_store::{MergeReport, Store, DEFAULT_BRANCH};
 use std::path::PathBuf;
 
 fn open_store(args_iter: &mut dyn Iterator<Item = String>) -> Result<(Store, Vec<String>)> {
@@ -51,8 +51,19 @@ pub fn cmd_branch(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "delete"  => delete(fmt, &store, &rest, dry_run),
         "use"     => use_branch(fmt, &store, &rest, dry_run),
         "current" => current(fmt, &store),
+        "log"     => log(fmt, &store, &rest),
         other     => bail!("unknown `lex branch` subcommand `{other}`"),
     }
+}
+
+/// Top-level `lex log [branch]` shortcut. Defaults to the current
+/// branch when no name is given. Equivalent to `lex branch log [name]`.
+pub fn cmd_log(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let mut iter = args.iter().cloned();
+    let raw: Vec<String> = iter.by_ref().collect();
+    let mut filtered: std::vec::IntoIter<String> = raw.into_iter().collect::<Vec<_>>().into_iter();
+    let (store, rest) = open_store(&mut filtered)?;
+    log(fmt, &store, &rest)
 }
 
 pub fn cmd_store_merge(fmt: &OutputFormat, args: &[String]) -> Result<()> {
@@ -138,6 +149,68 @@ fn current(fmt: &OutputFormat, store: &Store) -> Result<()> {
     let data = serde_json::json!({ "current": &cur });
     acli_mod::emit_or_text("branch", data, fmt, || println!("{cur}"));
     Ok(())
+}
+
+fn log(fmt: &OutputFormat, store: &Store, args: &[String]) -> Result<()> {
+    // Default to the current branch when no name is given. `lex log`
+    // alone is then "show me the merge history of where I am".
+    let name = args.first().cloned()
+        .unwrap_or_else(|| store.current_branch());
+    let entries = store.branch_log(&name)
+        .map_err(|e| anyhow!("log {name}: {e}"))?;
+    let data = serde_json::json!({
+        "branch": &name,
+        "merges": entries.iter().map(|m| serde_json::json!({
+            "src": m.src,
+            "at": m.at,
+            "merged": m.merged,
+            "conflicts": m.conflicts,
+        })).collect::<Vec<_>>(),
+    });
+    let entries_for_text = entries.clone();
+    acli_mod::emit_or_text("branch", data, fmt, move || {
+        if entries_for_text.is_empty() {
+            // Render "no merges yet" instead of an empty list so a
+            // human running by hand gets a useful signal. main with
+            // no explicit merges is the common case.
+            let suffix = if name == DEFAULT_BRANCH { " (no merges yet)" } else { "" };
+            println!("{name}: no merge history{suffix}");
+            return;
+        }
+        println!("{name}: {} merge(s)", entries_for_text.len());
+        for m in &entries_for_text {
+            println!("  • {} → {name}    {} fns @ {}",
+                m.src, m.merged, format_ts(m.at));
+        }
+    });
+    Ok(())
+}
+
+/// Render a Unix timestamp as a compact ISO-8601-ish string in UTC.
+/// Avoids pulling chrono into the workspace; we only need
+/// minute-resolution output for log display.
+fn format_ts(secs: u64) -> String {
+    // Compute Y/M/D/h/m from the Unix epoch directly.
+    let mut s = secs as i64;
+    let mut days = s.div_euclid(86_400);
+    s = s.rem_euclid(86_400);
+    let h = s / 3600; s %= 3600;
+    let m = s / 60;
+    let mut y: i64 = 1970;
+    loop {
+        let yd = if is_leap(y) { 366 } else { 365 };
+        if days < yd { break; }
+        days -= yd;
+        y += 1;
+    }
+    let mdays = [31, if is_leap(y) { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut mo = 0usize;
+    while mo < 12 && days >= mdays[mo] { days -= mdays[mo]; mo += 1; }
+    format!("{y:04}-{:02}-{:02}T{:02}:{:02}Z", mo + 1, days + 1, h, m)
+}
+
+fn is_leap(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
 fn show(fmt: &OutputFormat, store: &Store, args: &[String]) -> Result<()> {

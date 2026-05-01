@@ -184,3 +184,60 @@ fn commit_merge_refuses_when_conflicts_remain() {
     let report = s.merge("feature", DEFAULT_BRANCH).unwrap();
     assert!(s.commit_merge(DEFAULT_BRANCH, &report).is_err());
 }
+
+#[test]
+fn branch_log_records_committed_merges() {
+    let (s, _tmp) = fresh_store("log-records");
+    put_head(&s, DEFAULT_BRANCH, "sig1", "stageA");
+    s.create_branch("feature", DEFAULT_BRANCH).expect("create");
+    put_head(&s, "feature", "sig1", "stageB");
+
+    // Pre-merge: log on main is empty (no commits yet).
+    assert!(s.branch_log(DEFAULT_BRANCH).expect("log").is_empty());
+
+    let report = s.merge("feature", DEFAULT_BRANCH).expect("merge");
+    s.commit_merge(DEFAULT_BRANCH, &report).expect("commit");
+
+    let entries = s.branch_log(DEFAULT_BRANCH).expect("log after commit");
+    assert_eq!(entries.len(), 1, "one merge committed → one record");
+    assert_eq!(entries[0].src, "feature");
+    assert_eq!(entries[0].merged, 1, "sig1 was merged");
+    assert_eq!(entries[0].conflicts, 0);
+    assert!(entries[0].at > 0, "timestamp populated");
+}
+
+#[test]
+fn branch_log_grows_across_multiple_merges() {
+    let (s, _tmp) = fresh_store("log-multi");
+    s.create_branch("a", DEFAULT_BRANCH).unwrap();
+    s.create_branch("b", DEFAULT_BRANCH).unwrap();
+    put_head(&s, "a", "sigA", "stage1");
+    put_head(&s, "b", "sigB", "stage2");
+
+    let r1 = s.merge("a", DEFAULT_BRANCH).unwrap();
+    s.commit_merge(DEFAULT_BRANCH, &r1).unwrap();
+    let r2 = s.merge("b", DEFAULT_BRANCH).unwrap();
+    s.commit_merge(DEFAULT_BRANCH, &r2).unwrap();
+
+    let entries = s.branch_log(DEFAULT_BRANCH).unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].src, "a");
+    assert_eq!(entries[1].src, "b");
+    assert!(entries[0].at <= entries[1].at, "entries in chronological order");
+}
+
+#[test]
+fn branch_log_for_unknown_branch_errors() {
+    let (s, _tmp) = fresh_store("log-unknown");
+    assert!(s.branch_log("does-not-exist").is_err());
+}
+
+#[test]
+fn branch_log_for_main_without_branch_file_returns_empty() {
+    // Fresh store: main has no explicit branch file. `branch_log`
+    // returns an empty vec rather than erroring, since main is a
+    // valid branch reference even without an explicit file.
+    let (s, _tmp) = fresh_store("log-main-empty");
+    let entries = s.branch_log(DEFAULT_BRANCH).expect("log main");
+    assert!(entries.is_empty());
+}
