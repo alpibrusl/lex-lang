@@ -4,8 +4,10 @@
 # rows. Demonstrates io.read + str.split + list.fold/filter/map + JSON
 # over HTTP — pure-functional analytics on a real CSV.
 #
-# Run:
-#   lex run --allow-effects io,net examples/analytics_app.lex main
+# Run (production-style, with path scoping):
+#   lex run --allow-effects io,net \
+#           --allow-fs-read examples/orders.csv \
+#           examples/analytics_app.lex main
 #
 # Try:
 #   curl http://127.0.0.1:8090/count
@@ -13,6 +15,17 @@
 #   curl http://127.0.0.1:8090/regions
 #   curl http://127.0.0.1:8090/by_region/EU
 #   curl http://127.0.0.1:8090/by_product/widget
+#
+# Adversarial scenario:
+#   The handler has [io] (it reads orders.csv). If a contributor
+#   patches read_orders() to fetch /etc/passwd or write to the
+#   filesystem, --allow-fs-read scopes io.read to exactly the CSV
+#   path. Reading anywhere else — including paths that just *look*
+#   close like ../orders.csv or /tmp/orders.csv — surfaces:
+#       read of `/etc/passwd` outside --allow-fs-read
+#   The capability is granted only for the data the service
+#   legitimately needs, and the runtime gate honors that scope
+#   even when the source code disagrees with the policy.
 
 import "std.io"   as io
 import "std.net"  as net

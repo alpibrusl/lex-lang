@@ -15,8 +15,14 @@ use std::thread;
 use std::time::Duration;
 
 fn spawn_inbox_server(port: u16) {
+    // Per-port tmp paths so parallel tests don't collide on shared
+    // log files. Each test owns its own port → owns its own logs.
     let src = include_str!("../../../examples/inbox_app.lex")
-        .replace("net.serve(8200,", &format!("net.serve({port},"));
+        .replace("net.serve(8200,", &format!("net.serve({port},"))
+        .replace("/tmp/lex_inbox_spam.log",
+                 &format!("/tmp/lex_inbox_spam_{port}.log"))
+        .replace("/tmp/lex_inbox_followups.log",
+                 &format!("/tmp/lex_inbox_followups_{port}.log"));
     let prog = parse_source(&src).expect("parse");
     let stages = canonicalize_program(&prog);
     if let Err(errs) = lex_types::check_program(&stages) {
@@ -52,21 +58,21 @@ fn post(port: u16, path: &str, body: &str) -> (u16, String) {
     (status, body.to_string())
 }
 
-fn cleanup() {
-    let _ = std::fs::remove_file("/tmp/lex_inbox_spam.log");
-    let _ = std::fs::remove_file("/tmp/lex_inbox_followups.log");
+fn cleanup(port: u16) {
+    let _ = std::fs::remove_file(format!("/tmp/lex_inbox_spam_{port}.log"));
+    let _ = std::fs::remove_file(format!("/tmp/lex_inbox_followups_{port}.log"));
 }
 
 #[test]
 fn spam_subject_routes_to_spam_handler_and_writes_log() {
-    cleanup();
     let port = 18401;
+    cleanup(port);
     spawn_inbox_server(port);
     let (status, body) = post(port, "/hook",
         r#"{"from":"a@b","subject":"win a prize today","body":"x"}"#);
     assert_eq!(status, 200, "body: {body}");
     assert!(body.contains("\"logged\""), "body: {body}");
-    let log = std::fs::read_to_string("/tmp/lex_inbox_spam.log")
+    let log = std::fs::read_to_string(format!("/tmp/lex_inbox_spam_{port}.log"))
         .expect("spam log written");
     assert!(log.contains("a@b"), "log content: {log}");
     assert!(log.contains("win a prize"), "log content: {log}");
@@ -74,14 +80,14 @@ fn spam_subject_routes_to_spam_handler_and_writes_log() {
 
 #[test]
 fn followup_subject_writes_followup_log_with_timestamp() {
-    cleanup();
     let port = 18402;
+    cleanup(port);
     spawn_inbox_server(port);
     let (status, body) = post(port, "/hook",
         r#"{"from":"a@b","subject":"please follow up next week","body":"x"}"#);
     assert_eq!(status, 200, "body: {body}");
     assert!(body.contains("scheduled at"), "body: {body}");
-    let log = std::fs::read_to_string("/tmp/lex_inbox_followups.log")
+    let log = std::fs::read_to_string(format!("/tmp/lex_inbox_followups_{port}.log"))
         .expect("followup log written");
     assert!(log.contains("follow-up"), "log content: {log}");
     // timestamp is a unix-epoch integer, so the line starts with digits.
@@ -91,16 +97,16 @@ fn followup_subject_writes_followup_log_with_timestamp() {
 
 #[test]
 fn other_subject_returns_pure_ignored_response() {
-    cleanup();
     let port = 18403;
+    cleanup(port);
     spawn_inbox_server(port);
     let (status, body) = post(port, "/hook",
         r#"{"from":"a@b","subject":"weekly newsletter","body":"x"}"#);
     assert_eq!(status, 200);
     assert!(body.contains("ignored"), "body: {body}");
-    // No side effects on disk.
-    assert!(!PathBuf::from("/tmp/lex_inbox_spam.log").exists());
-    assert!(!PathBuf::from("/tmp/lex_inbox_followups.log").exists());
+    // No side effects on disk *for this port's log files*.
+    assert!(!PathBuf::from(format!("/tmp/lex_inbox_spam_{port}.log")).exists());
+    assert!(!PathBuf::from(format!("/tmp/lex_inbox_followups_{port}.log")).exists());
 }
 
 #[test]

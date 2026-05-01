@@ -10,6 +10,17 @@
 # Handler logic is one typed Lex function; routing is `match` on
 # req.path and req.method. Weather data is mocked to keep the example
 # dependency-free.
+#
+# Adversarial scenario:
+#   handle()'s declared effects are exactly [net] (for net.serve to
+#   bind). If a future contributor edits handle() to log requests via
+#   io.write("/var/log/access.log", req.path), the type checker
+#   rejects at compile time:
+#       effect `io` not declared at <handle>
+#   The host process never grew an io capability; the source review
+#   isn't trusting the contributor — the type system is enforcing the
+#   contract. To run with logging, *both* the signature and the policy
+#   must be updated together.
 
 import "std.net" as net
 import "std.str" as str

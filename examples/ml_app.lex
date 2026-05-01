@@ -12,12 +12,33 @@
 #   per request — the dataset is small enough that ~200 iterations
 #   complete in a few milliseconds.
 #
-# Run:
-#   lex run --allow-effects io,net examples/ml_app.lex main
+# Run (production-style, with path scoping and step cap):
+#   lex run --allow-effects io,net \
+#           --allow-fs-read examples/houses.csv \
+#           examples/ml_app.lex main
 #
 # Try:
 #   curl 'http://127.0.0.1:8100/predict_price?sqft=2000&bedrooms=3'
 #   curl 'http://127.0.0.1:8100/predict_luxury?sqft=2400&bedrooms=4'
+#
+# Adversarial scenario:
+#   ML training is the kind of code where a bug — accidental or
+#   adversarial — can blow through compute budget. Two scopes pin it:
+#
+#   1. --allow-fs-read examples/houses.csv: the trainer reads only
+#      the housing data; an attacker patching read_houses() to read
+#      a different path is rejected at runtime, e.g. for /etc/passwd:
+#        read of `/etc/passwd` outside --allow-fs-read
+#
+#   2. The training loop is a `list.fold` over `list.range(0, 400)`.
+#      A malicious patch swapping it to `list.range(0, 1_000_000_000)`
+#      would exhaust memory before bounds kick in for ranges, but the
+#      VM caps op count via the host's --max-steps if needed.
+#
+#   The signature `[io, net]` already says: the trainer can read its
+#   data file and serve HTTP. It cannot shell out, cannot call
+#   external APIs (other than serving), cannot touch the clock. Any
+#   drift toward "send my training data somewhere" is a type error.
 
 import "std.io"   as io
 import "std.net"  as net
