@@ -130,6 +130,11 @@ pub fn ty_from_canon(t: &lex_ast::TypeExpr, params: &[String]) -> Ty {
                 "Unit" | "Nil" => return Ty::Unit,
                 "Never" => return Ty::Never,
                 "List" if args.len() == 1 => return Ty::List(Box::new(ty_from_canon(&args[0], params))),
+                // `Tuple[T0, T1, ...]` is the constructor surface for
+                // tuples; canonicalize to the structural Ty::Tuple so
+                // it unifies with `(T0, T1)` literal-tuple syntax and
+                // with std.tuple's signatures.
+                "Tuple" => return Ty::Tuple(args.iter().map(|a| ty_from_canon(a, params)).collect()),
                 _ => {}
             }
             Ty::Con(name.clone(), args.iter().map(|a| ty_from_canon(a, params)).collect())

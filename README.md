@@ -4,7 +4,7 @@ A language family designed for code no one will read. AI agents write more than 
 
 **Lex** is the general-purpose surface; **Core** covers performance-critical work (sized numerics, tensor shapes); **Spec** carries proof annotations. Implementation of `langspecs.md`; this README focuses on what currently runs.
 
-> Looking for the full pitch? See [`docs/index.html`](docs/index.html) — single static page, dark-mode-ready, self-contained. Once GitHub Pages is enabled (run `bash scripts/setup-pages.sh` or click through Settings → Pages → Source: `main` / `/docs`), it'll be live at `https://alpibrusl.github.io/lex-lang/`.
+Full pitch lives at [`docs/index.html`](docs/index.html) (also published via GitHub Pages — see the repo About panel for the live URL).
 
 ## Design rules at a glance
 
