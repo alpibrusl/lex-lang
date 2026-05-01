@@ -24,11 +24,26 @@ pub struct ParseError {
 struct Parser {
     tokens: Vec<Token>,
     idx: usize,
+    /// Recursion depth across `parse_expr`. Capped at `MAX_DEPTH`
+    /// to defend against adversarial input like a long sequence of
+    /// `[[[{{{...` that would otherwise blow the stack. Found by
+    /// the libFuzzer parser target — see `fuzz/fuzz_targets/parser.rs`.
+    depth: u32,
 }
+
+/// Maximum nesting depth the parser will accept before refusing
+/// with a parse error. Real Lex code rarely exceeds 30; 96 leaves
+/// generous headroom for legitimate generated code.
+///
+/// Each `parse_expr` level produces ~4-5 stack frames through the
+/// `parse_binary_expr → parse_unary_expr → parse_postfix →
+/// parse_primary → ...` chain, so this caps the actual frame
+/// count around 400-500 — well below even a 2 MiB test stack.
+const MAX_DEPTH: u32 = 96;
 
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, idx: 0 }
+        Self { tokens, idx: 0, depth: 0 }
     }
 
     fn at_eof(&self) -> bool {
@@ -383,6 +398,25 @@ impl Parser {
     // --- expressions ---
 
     fn parse_expr(&mut self) -> Result<Expr, ParseError> {
+        // Recursion gate: every nested expression — match arms,
+        // tuple/list/record/block elements, function args, etc. —
+        // enters here, so this is the right place to bound depth.
+        // Decrement happens whether the inner call succeeds or fails.
+        if self.depth >= MAX_DEPTH {
+            return Err(ParseError {
+                pos: self.current_pos(),
+                msg: format!(
+                    "expression nests too deeply (max {MAX_DEPTH}); \
+                     malformed or hand-crafted input?"),
+            });
+        }
+        self.depth += 1;
+        let r = self.parse_expr_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_expr_inner(&mut self) -> Result<Expr, ParseError> {
         // Pipes are left-associative and bind less tightly than binary ops.
         let mut left = self.parse_binary_expr(0)?;
         while matches!(self.peek_skip_newlines(), Some(TokenKind::Pipe)) {
