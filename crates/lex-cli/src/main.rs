@@ -14,6 +14,7 @@ mod tool_registry;
 mod audit;
 mod diff;
 mod ast_merge;
+mod branch;
 
 use anyhow::{anyhow, bail, Context, Result};
 use lex_ast::{canonicalize_program, sig_id, stage_canonical_hash_hex, stage_id, Stage};
@@ -54,6 +55,8 @@ fn run(args: &[String]) -> Result<()> {
         "audit" => audit::cmd_audit(&args[1..]),
         "ast-diff" => diff::cmd_diff(&args[1..]),
         "ast-merge" => ast_merge::cmd_ast_merge(&args[1..]),
+        "branch" => branch::cmd_branch(&args[1..]),
+        "store-merge" => branch::cmd_store_merge(&args[1..]),
         "help" | "--help" | "-h" => { print_usage(); Ok(()) }
         other => bail!("unknown command `{other}`. try `lex help`"),
     }
@@ -90,6 +93,12 @@ fn print_usage() {
     println!("                                     fns, plus body-level patches per modified body.");
     println!("  ast-merge <base> <ours> <theirs>  three-way structural merge; structured-JSON");
     println!("                                     conflicts via --json; --output writes merged source.");
+    println!("  branch <subcommand> ...           snapshot branches in lex-store. subcommands:");
+    println!("                                     list | show <name> | create <name> [--from B] |");
+    println!("                                     delete <name> | use <name> | current");
+    println!("  store-merge <src> <dst> [--commit] [--json]  three-way merge between two branches in");
+    println!("                                     the store; conflicts as JSON. --commit applies a");
+    println!("                                     clean merge; refuses if any conflicts remain.");
     println!();
     println!("policy flags (run, replay):");
     println!("  --allow-effects k1,k2,...   permit these effect kinds");

@@ -28,6 +28,8 @@ pub enum StoreError {
     UnknownSig(String),
     #[error("invalid lifecycle transition: {0}")]
     InvalidTransition(String),
+    #[error("unknown branch `{0}`")]
+    UnknownBranch(String),
 }
 
 pub struct Store {

@@ -27,6 +27,10 @@
 
 mod store;
 mod model;
+mod branches;
 
 pub use model::{Lifecycle, Metadata, Spec, StageStatus, Test, Transition};
 pub use store::{Store, StoreError};
+pub use branches::{
+    Branch, MergeConflict, MergeEntry, MergeReport, MergeSummary, DEFAULT_BRANCH,
+};
