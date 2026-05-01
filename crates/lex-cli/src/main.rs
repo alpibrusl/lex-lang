@@ -11,6 +11,7 @@
 //!   lex store get [--store DIR] <stage_id>
 
 mod tool_registry;
+mod audit;
 
 use anyhow::{anyhow, bail, Context, Result};
 use lex_ast::{canonicalize_program, sig_id, stage_canonical_hash_hex, stage_id, Stage};
@@ -48,6 +49,7 @@ fn run(args: &[String]) -> Result<()> {
         "spec" => cmd_spec(&args[1..]),
         "agent-tool" => cmd_agent_tool(&args[1..]),
         "tool-registry" => tool_registry::cmd_tool_registry(&args[1..]),
+        "audit" => audit::cmd_audit(&args[1..]),
         "help" | "--help" | "-h" => { print_usage(); Ok(()) }
         other => bail!("unknown command `{other}`. try `lex help`"),
     }
@@ -78,6 +80,8 @@ fn print_usage() {
     println!("                                     type-check if it tries anything else)");
     println!("  tool-registry serve [--port N]    HTTP service to register Lex tools at runtime");
     println!("                                     and invoke them via /tools/{{id}}/invoke");
+    println!("  audit [paths...] [filters]        structural code search by effect / call /");
+    println!("                                     hostname / AST kind. --json for machine-readable.");
     println!();
     println!("policy flags (run, replay):");
     println!("  --allow-effects k1,k2,...   permit these effect kinds");
