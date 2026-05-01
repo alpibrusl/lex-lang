@@ -1,0 +1,402 @@
+//! `lex audit` — structural code search across one or more Lex files.
+//!
+//! Pitch: when an LLM writes the code, the function signature is the
+//! contract. `lex audit` queries that contract:
+//!
+//!     lex audit examples/                      # summary by effect set
+//!     lex audit --effect net,fs_read examples/ # everything touching net or fs_read
+//!     lex audit --calls net.post examples/     # every fn that calls net.post
+//!     lex audit --uses-host attacker.com .     # any string literal containing this host
+//!     lex audit --kind Match examples/         # AST-kind filter
+//!
+//! Output is plain text by default and JSON with `--json`. The
+//! defaults are tuned for piping into another agent's eval loop:
+//! one fn per line, fully-qualified.
+
+use anyhow::{anyhow, Context, Result};
+use lex_ast::{canonicalize_program, CExpr, CLit, Effect, FnDecl, Stage, TypeExpr};
+use lex_syntax::parse_source;
+use serde::Serialize;
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+#[derive(Default)]
+struct AuditOpts {
+    paths: Vec<PathBuf>,
+    /// Effect kinds to filter by. Set semantics: include the fn if *any*
+    /// of its effects appear here. Empty = no filter.
+    effects: Vec<String>,
+    /// Fully-qualified callee names like "net.post" or "io.read".
+    /// Match is on the literal trailing `.fn` of any FieldAccess
+    /// chain inside the body.
+    calls: Vec<String>,
+    /// Hostnames (or any substring) to look for inside string literals.
+    /// Surfaces `--allow-net-host`-relevant references at audit time.
+    hosts: Vec<String>,
+    /// AST node-kind name (e.g. "Match", "Lambda", "Constructor").
+    kinds: Vec<String>,
+    json: bool,
+    no_summary: bool,
+}
+
+#[derive(Serialize)]
+struct FnHit {
+    file: String,
+    name: String,
+    effects: Vec<String>,
+    signature: String,
+    /// Why this fn matched the filter (one or more reasons).
+    matched: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct AuditReport {
+    summary: BTreeMap<String, usize>,
+    hits: Vec<FnHit>,
+}
+
+pub fn cmd_audit(args: &[String]) -> Result<()> {
+    let opts = parse_audit_args(args)?;
+    if opts.paths.is_empty() {
+        return Err(anyhow!("usage: lex audit [paths...] [--effect KIND] [--calls FN] [--uses-host HOST] [--kind NODE] [--json]"));
+    }
+    let files = collect_lex_files(&opts.paths)?;
+    let mut report = AuditReport { summary: BTreeMap::new(), hits: Vec::new() };
+
+    for path in &files {
+        let src = match fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        // Parse + canonicalize. Errors are printed once, then we keep
+        // going — partial audits over a half-broken codebase are
+        // strictly more useful than refusing to run.
+        let prog = match parse_source(&src) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("warning: parse error in {}: {e}", path.display());
+                continue;
+            }
+        };
+        let stages = canonicalize_program(&prog);
+        for stage in &stages {
+            if let Stage::FnDecl(fd) = stage {
+                let info = scan_fn(fd);
+                let key = effect_key(&info.effects);
+                *report.summary.entry(key).or_insert(0) += 1;
+
+                let matched = filter_match(&opts, fd, &info);
+                let always = opts.effects.is_empty()
+                    && opts.calls.is_empty()
+                    && opts.hosts.is_empty()
+                    && opts.kinds.is_empty();
+                if !matched.is_empty() || always {
+                    report.hits.push(FnHit {
+                        file: path.display().to_string(),
+                        name: fd.name.clone(),
+                        effects: info.effects.clone(),
+                        signature: render_signature(fd),
+                        matched: if always { vec!["all".into()] } else { matched },
+                    });
+                }
+            }
+        }
+    }
+
+    if opts.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    if !opts.no_summary {
+        println!("SUMMARY: {} stages across {} files",
+            report.summary.values().sum::<usize>(), files.len());
+        let max_key = report.summary.keys().map(|k| k.len()).max().unwrap_or(0);
+        for (k, v) in &report.summary {
+            let pad = ".".repeat((max_key + 4).saturating_sub(k.len()));
+            println!("  {k} {pad} {v} stages");
+        }
+        println!();
+    }
+
+    for hit in &report.hits {
+        let why = if opts.effects.is_empty() && opts.calls.is_empty()
+            && opts.hosts.is_empty() && opts.kinds.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", hit.matched.join(", "))
+        };
+        println!("{}::{}{why}", hit.file, hit.name);
+        println!("  {}", hit.signature);
+    }
+    Ok(())
+}
+
+// ---- arg parsing ---------------------------------------------------
+
+fn parse_audit_args(args: &[String]) -> Result<AuditOpts> {
+    let mut o = AuditOpts::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--effect" => {
+                let v = args.get(i + 1).ok_or_else(|| anyhow!("--effect needs a value"))?;
+                o.effects.extend(v.split(',').map(String::from));
+                i += 2;
+            }
+            "--calls" => {
+                let v = args.get(i + 1).ok_or_else(|| anyhow!("--calls needs a value"))?;
+                o.calls.extend(v.split(',').map(String::from));
+                i += 2;
+            }
+            "--uses-host" => {
+                let v = args.get(i + 1).ok_or_else(|| anyhow!("--uses-host needs a value"))?;
+                o.hosts.extend(v.split(',').map(String::from));
+                i += 2;
+            }
+            "--kind" => {
+                let v = args.get(i + 1).ok_or_else(|| anyhow!("--kind needs a value"))?;
+                o.kinds.extend(v.split(',').map(String::from));
+                i += 2;
+            }
+            "--json"        => { o.json = true;        i += 1; }
+            "--no-summary"  => { o.no_summary = true;  i += 1; }
+            other => { o.paths.push(PathBuf::from(other)); i += 1; }
+        }
+    }
+    Ok(o)
+}
+
+// ---- file discovery ------------------------------------------------
+
+fn collect_lex_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for p in paths {
+        let meta = fs::metadata(p)
+            .with_context(|| format!("stat {}", p.display()))?;
+        if meta.is_file() {
+            if p.extension().is_some_and(|e| e == "lex") {
+                out.push(p.clone());
+            }
+        } else if meta.is_dir() {
+            walk_dir(p, &mut out);
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn walk_dir(dir: &Path, out: &mut Vec<PathBuf>) {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            // Skip target/ and hidden dirs by default.
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if name.starts_with('.') || name == "target" { continue; }
+            walk_dir(&path, out);
+        } else if path.extension().is_some_and(|e| e == "lex") {
+            out.push(path);
+        }
+    }
+}
+
+// ---- analysis ------------------------------------------------------
+
+#[derive(Default)]
+struct FnInfo {
+    effects: Vec<String>,
+    calls: Vec<String>,
+    string_lits: Vec<String>,
+    kinds: Vec<&'static str>,
+}
+
+fn scan_fn(fd: &FnDecl) -> FnInfo {
+    let mut info = FnInfo {
+        effects: fd.effects.iter().map(|e: &Effect| e.name.clone()).collect(),
+        ..Default::default()
+    };
+    walk_expr(&fd.body, &mut info);
+    info.calls.sort();
+    info.calls.dedup();
+    info.effects.sort();
+    info.effects.dedup();
+    info
+}
+
+fn walk_expr(e: &CExpr, out: &mut FnInfo) {
+    out.kinds.push(node_kind(e));
+    match e {
+        CExpr::Literal { value: CLit::Str { value } } => {
+            out.string_lits.push(value.clone());
+        }
+        CExpr::Literal { .. } | CExpr::Var { .. } => {}
+        CExpr::Call { callee, args } => {
+            if let Some(qn) = qualified_callee(callee) {
+                out.calls.push(qn);
+            }
+            walk_expr(callee, out);
+            for a in args { walk_expr(a, out); }
+        }
+        CExpr::Let { value, body, .. } => { walk_expr(value, out); walk_expr(body, out); }
+        CExpr::Match { scrutinee, arms } => {
+            walk_expr(scrutinee, out);
+            for arm in arms { walk_expr(&arm.body, out); }
+        }
+        CExpr::Block { statements, result } => {
+            for s in statements { walk_expr(s, out); }
+            walk_expr(result, out);
+        }
+        CExpr::Constructor { args, .. } => for a in args { walk_expr(a, out); },
+        CExpr::RecordLit { fields } => for f in fields { walk_expr(&f.value, out); },
+        CExpr::TupleLit { items } | CExpr::ListLit { items } => {
+            for it in items { walk_expr(it, out); }
+        }
+        CExpr::FieldAccess { value, .. } => walk_expr(value, out),
+        CExpr::Lambda { body, effects, .. } => {
+            // Lambda effects propagate to the enclosing fn (the type
+            // checker enforces this); lift them so audit accurately
+            // reflects what the function can do.
+            for e in effects { out.effects.push(e.name.clone()); }
+            walk_expr(body, out);
+        }
+        CExpr::BinOp { lhs, rhs, .. } => { walk_expr(lhs, out); walk_expr(rhs, out); }
+        CExpr::UnaryOp { expr, .. } => walk_expr(expr, out),
+        CExpr::Return { value } => walk_expr(value, out),
+    }
+}
+
+/// If a callee expression is a `module.fn` field access, return
+/// "module.fn"; otherwise None.
+fn qualified_callee(callee: &CExpr) -> Option<String> {
+    if let CExpr::FieldAccess { value, field } = callee {
+        if let CExpr::Var { name } = value.as_ref() {
+            return Some(format!("{name}.{field}"));
+        }
+    }
+    None
+}
+
+fn node_kind(e: &CExpr) -> &'static str {
+    match e {
+        CExpr::Literal { .. }    => "Literal",
+        CExpr::Var { .. }        => "Var",
+        CExpr::Call { .. }       => "Call",
+        CExpr::Let { .. }        => "Let",
+        CExpr::Match { .. }      => "Match",
+        CExpr::Block { .. }      => "Block",
+        CExpr::Constructor { .. } => "Constructor",
+        CExpr::RecordLit { .. }  => "RecordLit",
+        CExpr::TupleLit { .. }   => "TupleLit",
+        CExpr::ListLit { .. }    => "ListLit",
+        CExpr::FieldAccess { .. } => "FieldAccess",
+        CExpr::Lambda { .. }     => "Lambda",
+        CExpr::BinOp { .. }      => "BinOp",
+        CExpr::UnaryOp { .. }    => "UnaryOp",
+        CExpr::Return { .. }     => "Return",
+    }
+}
+
+// ---- filtering -----------------------------------------------------
+
+fn filter_match(opts: &AuditOpts, fd: &FnDecl, info: &FnInfo) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if !opts.effects.is_empty() {
+        let hits: Vec<&String> = info.effects.iter()
+            .filter(|e| opts.effects.iter().any(|q| q == *e)).collect();
+        if !hits.is_empty() {
+            reasons.push(format!("effect={}", hits.iter().map(|s| s.as_str())
+                .collect::<Vec<_>>().join(",")));
+        }
+    }
+    if !opts.calls.is_empty() {
+        let hits: Vec<&String> = info.calls.iter()
+            .filter(|c| opts.calls.iter().any(|q| q == *c)).collect();
+        if !hits.is_empty() {
+            reasons.push(format!("calls={}", hits.iter().map(|s| s.as_str())
+                .collect::<Vec<_>>().join(",")));
+        }
+    }
+    if !opts.hosts.is_empty() {
+        let hits: Vec<&String> = info.string_lits.iter()
+            .filter(|s| opts.hosts.iter().any(|h| s.contains(h))).collect();
+        if !hits.is_empty() {
+            reasons.push(format!("uses-host=\"{}\"", hits[0]));
+        }
+    }
+    if !opts.kinds.is_empty() {
+        for k in &opts.kinds {
+            if info.kinds.contains(&k.as_str()) {
+                reasons.push(format!("kind={k}"));
+                break;
+            }
+        }
+    }
+    let _ = fd;
+    reasons
+}
+
+// ---- pretty rendering ----------------------------------------------
+
+fn effect_key(effects: &[String]) -> String {
+    if effects.is_empty() { "pure".into() }
+    else {
+        let mut sorted = effects.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        format!("[{}]", sorted.join(", "))
+    }
+}
+
+fn render_signature(fd: &FnDecl) -> String {
+    let params: Vec<String> = fd.params.iter()
+        .map(|p| format!("{} :: {}", p.name, render_type(&p.ty))).collect();
+    let eff = if fd.effects.is_empty() { String::new() } else {
+        let names: Vec<&str> = fd.effects.iter().map(|e| e.name.as_str()).collect();
+        format!("[{}] ", names.join(", "))
+    };
+    format!("fn {}({}) -> {}{}", fd.name, params.join(", "),
+        eff, render_type(&fd.return_type))
+}
+
+fn render_type(t: &TypeExpr) -> String {
+    match t {
+        TypeExpr::Named { name, args } => {
+            if args.is_empty() { name.clone() }
+            else {
+                let parts: Vec<String> = args.iter().map(render_type).collect();
+                format!("{name}[{}]", parts.join(", "))
+            }
+        }
+        TypeExpr::Tuple { items } => {
+            let parts: Vec<String> = items.iter().map(render_type).collect();
+            format!("({})", parts.join(", "))
+        }
+        TypeExpr::Record { fields } => {
+            let parts: Vec<String> = fields.iter()
+                .map(|f| format!("{} :: {}", f.name, render_type(&f.ty))).collect();
+            format!("{{ {} }}", parts.join(", "))
+        }
+        TypeExpr::Function { params, effects, ret } => {
+            let parts: Vec<String> = params.iter().map(render_type).collect();
+            let eff = if effects.is_empty() { String::new() } else {
+                let names: Vec<&str> = effects.iter().map(|e| e.name.as_str()).collect();
+                format!("[{}] ", names.join(", "))
+            };
+            format!("({}) -> {}{}", parts.join(", "), eff, render_type(ret))
+        }
+        TypeExpr::Union { variants } => {
+            let parts: Vec<String> = variants.iter().map(|v| {
+                match &v.payload {
+                    Some(p) => format!("{}({})", v.name, render_type(p)),
+                    None => v.name.clone(),
+                }
+            }).collect();
+            parts.join(" | ")
+        }
+    }
+}

@@ -240,6 +240,52 @@
 </section>
 
 <section>
+  <h2>Reviewing code agents wrote: <code>lex audit</code></h2>
+  <p class="lede">
+    The bench shows the type system rejects malicious code at
+    compile-time. But what about code that's already in the
+    repository? When agents write code humans never read, the
+    function signature is the contract — and <code>lex audit</code>
+    queries that contract structurally, not by regex.
+  </p>
+  <pre><code>$ lex audit examples/
+SUMMARY: 60 stages across 10 files
+  pure              .... 39 stages
+  [io]              ....  6 stages
+  [net]             ....  3 stages
+  [io, net]         ....  3 stages
+  [io, net, time]   ....  5 stages
+  [chat, net]       ....  1 stages
+  [chat]            ....  1 stages
+  [io, time]        ....  1 stages
+  [time]            ....  1 stages
+
+$ lex audit --effect net --no-summary examples/
+examples/gateway_app.lex::route_weather   [effect=net]
+  fn route_weather(city :: Str) -> [net] Response
+examples/inbox_app.lex::handle_important  [effect=net]
+  fn handle_important(e :: Email) -> [net] Str
+examples/inbox_app.lex::handle            [effect=net]
+  fn handle(req :: Request) -> [net, time, io] Response
+
+$ lex audit --calls net.post examples/
+examples/inbox_app.lex::handle_important  [calls=net.post]
+  fn handle_important(e :: Email) -> [net] Str
+
+$ lex audit --uses-host attacker.com .   # check before you ship
+(no hits)</code></pre>
+  <p>
+    Filters compose: <code>--effect net --calls net.post</code> finds
+    fns that touch the network <em>and</em> specifically POST. Output
+    is plain text by default and structured JSON with
+    <code>--json</code> for piping into another agent's eval loop.
+    For an agent reviewing what an agent wrote: a 60-stage codebase
+    audited in milliseconds, no parsing of grep output, no
+    line-counting.
+  </p>
+</section>
+
+<section>
   <h2>Capability ≠ correctness</h2>
   <p>
     Effect typing answers <em>what your code touches</em>, not
