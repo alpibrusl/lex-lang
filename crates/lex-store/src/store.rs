@@ -233,7 +233,7 @@ impl Store {
         }
         let mut out: Vec<StageHistoryEntry> = by_stage.into_values().collect();
         // Sort newest first so `lex blame` shows recent activity at top.
-        out.sort_by(|a, b| b.last_at.cmp(&a.last_at));
+        out.sort_by_key(|e| std::cmp::Reverse(e.last_at));
         Ok(out)
     }
 
