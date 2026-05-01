@@ -307,6 +307,20 @@ Flags: `--body '<src>'` / `--body-file <path>` skip the API call; `--request '<q
 
 7 attacks + 2 benign cases through three sandboxes. Full report at [`bench/REPORT.md`](bench/REPORT.md); regenerate with `cargo test -p lex-cli --test agent_sandbox_bench`. The structural pitch — *opt-in granting from a sandboxed default* vs *opt-in restriction of an unrestricted base*, type-check rejection vs runtime NameError — is on the [project landing page](docs/index.html).
 
+### Live demos
+
+Two asciinema scripts ship under `bench/`:
+
+- **[`bench/RECORDING.md`](bench/RECORDING.md)** — `lex agent-tool` blocking
+  Claude-emitted code that tries to escape the declared effect set.
+- **[`bench/RECORDING_VC.md`](bench/RECORDING_VC.md)** — agent-native VC
+  walkthrough: ACLI discovery, structural diff with effect highlighting,
+  `lex branch` + `lex store-merge` with a JSON conflict, `lex log`,
+  `lex blame`. The workflow companion to the security demo.
+
+Recorded `.cast` files live under `bench/` once captured; `agg` converts
+them to GIFs for README / Twitter / LinkedIn.
+
 ## Toolchain reference
 
 | Command | Purpose |
