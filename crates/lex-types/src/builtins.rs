@@ -416,6 +416,21 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::empty(),
                 Ty::function(vec![Ty::Var(0)], EffectSet::empty(), result_ty),
             ));
+            // parallel[A, B](fa: () -> A, fb: () -> B) -> () -> (A, B)
+            // Sequential implementation today; spec §11.2 reserves the
+            // option of a true-threaded scheduler. parallel_record is
+            // listed in the spec but not yet implemented — it needs row
+            // polymorphism over the input record's fields plus a
+            // record-iteration trampoline; tracked as follow-up.
+            fields.insert("parallel".into(), Ty::function(
+                vec![
+                    Ty::function(vec![], EffectSet::empty(), Ty::Var(0)),
+                    Ty::function(vec![], EffectSet::empty(), Ty::Var(1)),
+                ],
+                EffectSet::empty(),
+                Ty::function(vec![], EffectSet::empty(),
+                    Ty::Tuple(vec![Ty::Var(0), Ty::Var(1)])),
+            ));
             Some(Ty::Record(fields))
         }
         _ => None,

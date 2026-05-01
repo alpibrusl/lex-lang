@@ -176,3 +176,41 @@ fn sign_and_double(x :: Int) -> Int {
     // minus: (-3) -> -(-3)*2 = 6
     assert_eq!(run(src, "sign_and_double", vec![Value::Int(-3)]), Value::Int(6));
 }
+
+// -- parallel ---------------------------------------------------------
+
+#[test]
+fn flow_parallel_returns_tuple_of_both_results() {
+    // Two 0-arg closures; flow.parallel returns a closure that returns
+    // their results as a 2-tuple.
+    let src = r#"
+import "std.flow" as flow
+fn run_pair() -> Tuple[Int, Int] {
+  let p := flow.parallel(
+    fn () -> Int { 7 },
+    fn () -> Int { 11 }
+  )
+  p()
+}
+"#;
+    let r = run(src, "run_pair", vec![]);
+    assert_eq!(r, Value::Tuple(vec![Value::Int(7), Value::Int(11)]));
+}
+
+#[test]
+fn flow_parallel_handles_heterogeneous_return_types() {
+    // Type variables A and B unify independently — first closure returns
+    // Int, second returns Str; the resulting tuple is Tuple[Int, Str].
+    let src = r#"
+import "std.flow" as flow
+fn pair() -> Tuple[Int, Str] {
+  let p := flow.parallel(
+    fn () -> Int { 42 },
+    fn () -> Str { "hello" }
+  )
+  p()
+}
+"#;
+    let r = run(src, "pair", vec![]);
+    assert_eq!(r, Value::Tuple(vec![Value::Int(42), Value::Str("hello".into())]));
+}

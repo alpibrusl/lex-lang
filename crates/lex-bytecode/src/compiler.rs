@@ -577,6 +577,7 @@ impl<'a> FnCompiler<'a> {
             ("flow", "sequential") => self.emit_flow_sequential(args),
             ("flow", "branch") => self.emit_flow_branch(args),
             ("flow", "retry") => self.emit_flow_retry(args),
+            ("flow", "parallel") => self.emit_flow_parallel(args),
             _ => return false,
         }
         true
@@ -871,6 +872,31 @@ impl<'a> FnCompiler<'a> {
             Op::Return,
         ];
         let fn_id = self.install_trampoline("__flow_sequential", 3, 4, code);
+        self.emit(Op::MakeClosure { fn_id, capture_count: 2 });
+    }
+
+    /// `flow.parallel(fa, fb)` returns a closure `() -> (fa(), fb())`.
+    /// Implementation is sequential: each function is called in order
+    /// and the results are packed into a 2-tuple. The spec (§11.2)
+    /// allows the runtime to apply true parallelism here; that needs
+    /// a thread-safe handler split and is left to a follow-up. The
+    /// signature is what users program against — sequential vs threaded
+    /// is an implementation detail invisible to the type system.
+    fn emit_flow_parallel(&mut self, args: &[a::CExpr]) {
+        // Push fa, fb; build a 0-arg trampoline closure with 2 captures.
+        self.compile_expr(&args[0], false);
+        self.compile_expr(&args[1], false);
+        let nid = self.pool.node_id("n_flow_parallel");
+        let code = vec![
+            // Locals: [fa=0, fb=1]
+            Op::LoadLocal(0),                                  // push fa
+            Op::CallClosure { arity: 0, node_id_idx: nid },    // a = fa()
+            Op::LoadLocal(1),                                  // push fb
+            Op::CallClosure { arity: 0, node_id_idx: nid },    // b = fb()
+            Op::MakeTuple(2),                                  // (a, b)
+            Op::Return,
+        ];
+        let fn_id = self.install_trampoline("__flow_parallel", 2, 2, code);
         self.emit(Op::MakeClosure { fn_id, capture_count: 2 });
     }
 
