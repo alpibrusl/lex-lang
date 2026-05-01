@@ -56,6 +56,29 @@ lex conformance conformance/
 lex serve
 ```
 
+### Quickstart: agent-native tooling
+
+```bash
+# Sandbox an LLM-emitted tool body. Effects outside --allow-effects are
+# rejected at type-check, before any code runs.
+lex agent-tool --allow-effects net --input "x" \
+  --body 'match io.read("/etc/passwd") { Ok(s) => s, Err(e) => e }'
+# → TYPE-CHECK REJECTED — tool not run.   exit 2
+
+# Audit a codebase by structure: every fn that touches the network.
+lex audit --effect net examples/
+
+# AST-native diff. Renames register as "renamed", not "delete + add".
+lex ast-diff before.lex after.lex
+
+# Three-way structural merge. Conflicts are JSON, not <<<<<< HEAD markers.
+lex ast-merge base.lex ours.lex theirs.lex
+
+# Runtime tool registry: register Lex tools over HTTP, get back a stable
+# /tools/{id}/invoke endpoint with the effect manifest at /tools/{id}.
+lex tool-registry serve --port 8390
+```
+
 ## Examples
 
 ### 1. Factorial — recursion + pattern match
@@ -192,7 +215,24 @@ lex spec smt clamp.spec
 # (SMT-LIB 2 script for `z3 -smt2 -`)
 ```
 
-### 8. Core — tensor shape solver
+### 8. Real-world examples
+
+Eight runnable example apps live in `examples/`:
+
+| File | Shape |
+|---|---|
+| `weather_app.lex` | Single-handler REST API with [net]-only effects |
+| `chat_app.lex` | Multi-user WebSocket chat with [chat] effect + room registry |
+| `analytics_app.lex` | CSV → group-by → JSON over HTTP, with `--allow-fs-read` scope |
+| `ml_app.lex` | Linear + logistic regression trained on a 25-row CSV; `/predict_*` endpoints |
+| `inbox_app.lex` | Webhook-driven typed-handler router (4 handlers, 4 effect signatures) |
+| `gateway_app.lex` | Multi-route service; each route has its own narrow effect set |
+| `agent_tool` (binary) | LLM-emitted tool sandbox — see `Sandboxing agent-generated code` below |
+| `tool-registry` (binary) | HTTP service for runtime tool registration with effect manifests |
+
+Each example header contains an *Adversarial scenario* spelling out what the runtime gates would reject and the verbatim error string.
+
+### 9. Core — tensor shape solver
 
 The Core sibling adds sized numerics (`U8`–`U64`, `I8`–`I64`, `F32`/`F64`) and tensors with type-level shape arithmetic. Shape mismatches are caught at compile time:
 
@@ -282,6 +322,7 @@ A long-running HTTP/JSON server that exposes the same operations as the CLI. The
 | `POST /v1/parse` | `{source}` → CanonicalAst \| 4xx |
 | `POST /v1/check` | `{source}` → `{ok}` \| 422 with structured TypeError list |
 | `POST /v1/publish` | `{source, activate?}` → `[{name, sig_id, stage_id, status}, ...]` |
+| `POST /v1/patch` | `{stage_id, patch}` → `{new_stage_id}` \| 422 with structured TypeError list if the patched AST doesn't type-check |
 | `GET  /v1/stage/<id>` | `{metadata, ast, status}` |
 | `POST /v1/run` | `{source, fn, args, policy}` → `{run_id, output \| error}`; 403 with structured policy violation if disallowed |
 | `GET  /v1/trace/<run_id>` | TraceTree |
@@ -299,11 +340,13 @@ lex/
 │   ├── lex-ast/        # M2: canonical AST, NodeIds, canonical-JSON, SigId/StageId
 │   ├── lex-types/      # M3: HM type checker + effect system
 │   ├── lex-bytecode/   # M4: bytecode definition, compiler, stack VM
-│   ├── lex-runtime/    # M5: capability policy, effect handlers, pure stdlib builtins
+│   ├── lex-runtime/    # M5: capability policy, effect handlers, all stdlib builtins live here
 │   ├── lex-store/      # M6: content-addressed store (filesystem)
 │   ├── lex-trace/      # M7: trace tree + replay + diff
-│   ├── lex-stdlib/     # M11: stdlib stages (in progress; many ops live in lex-runtime)
-│   ├── lex-cli/        # M8/M12: command-line tool
+│   ├── lex-stdlib/     # M11: reserved for stdlib stages-as-store-entries (currently a stub;
+│   │                   #      pure stdlib lives in lex-runtime/builtins.rs)
+│   ├── lex-cli/        # M8/M12: command-line tool (also hosts agent-tool, tool-registry,
+│   │                   #         audit, ast-diff, ast-merge subcommands)
 │   ├── lex-api/        # M8/M12: agent HTTP/JSON server
 │   ├── core-syntax/    # M13: Core lexer/parser (stub; reuses lex-syntax)
 │   ├── core-compiler/  # M9:  Core type system (shape solver, sized numerics, mut analysis, native matmul)
@@ -328,11 +371,12 @@ lex/
 | M7 — Trace tree + replay + diff | ✅ |
 | M8 — CLI + agent API server | ✅ |
 | M9 — Core | Phase 1 (shape solver, sized numerics) ✅ ; Phase 2 (mutation analysis, native matmul) ✅ ; Cranelift JIT, source-level `mut`/`for` syntax deferred |
-| M10 — Spec | ✅ randomized + SMT-LIB export ; in-process Z3 deferred |
-| M11 — Stdlib MVP | ✅ pure builtins + closures + higher-order list ops + `std.flow` orchestration ; `flow.parallel`/`parallel_record` deferred |
+| M10 — Spec | ✅ randomized + SMT-LIB export ; `--spec` wired into `agent-tool` ; in-process Z3 deferred |
+| M11 — Stdlib MVP | ✅ pure builtins + closures + higher-order list ops + `std.flow` orchestration ; `std.math` (linalg + scalar floats) ; `std.tuple` ; **effect polymorphism** on `list.map` / `list.filter` / `list.fold` / `option.map` / `result.map` / `result.and_then` / `result.map_err` ; `flow.parallel` ✅ (sequential v1 — true threading deferred) ; `flow.parallel_record` deferred (needs row polymorphism on records) ; `std.map` / `std.set` deferred (need `Value` variants) |
 | M16 — Conformance harness + token budget | ✅ |
+| Agent integration (post-spec) | `lex agent-tool` (sandbox) ✅ ; `lex tool-registry serve` (HTTP registry) ✅ ; correctness ladder: `--examples` ✅ `--spec` ✅ `--diff-body` ✅ ; AST tooling: `lex audit` ✅ `lex ast-diff` ✅ `lex ast-merge` ✅ |
 
-**Workspace test count:** 125 passing, 0 failing. `cargo clippy --workspace --all-targets -- -D warnings` clean.
+**Workspace test count:** 251 passing, 0 failing. `cargo clippy --workspace --all-targets -- -D warnings` clean.
 
 ## Building from source
 
@@ -340,7 +384,7 @@ Requires a recent Rust toolchain (any 1.80+ stable should work).
 
 ```bash
 cargo build --release       # full toolchain
-cargo test --workspace      # 125 tests
+cargo test --workspace      # 251 tests
 cargo test --release -p core-compiler -- --ignored   # release-only matmul perf gates
 ```
 

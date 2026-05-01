@@ -391,19 +391,18 @@ $ lex ast-merge --json base.lex ours.lex theirs.lex
     one rung of the ladder. There are higher rungs:
   </p>
   <ul class="tight">
-    <li><strong>Spec proofs (§14 of <code>langspecs.md</code>).</strong> Attach a behavioral contract — <code>forall x :: Int, lo, hi where lo &lt;= hi: clamp(x, lo, hi) &gt;= lo and ... &lt;= hi</code> — and the checker discharges it via Z3 (or property-tests when SMT can't decide). Verdict travels with the stage in the store, so downstream agents can require <em>spec-proven</em> dependencies, not just well-typed ones.</li>
     <li><strong>Examples-driven verification.</strong> Pass <code>--examples FILE</code>; the host hands the agent a small set of <code>{input → expected}</code> pairs and Lex runs the emitted body against each before trusting it for live traffic. Any mismatch exits 5 with a per-case diff. Catches <em>wrong-but-consistent</em> behavior (the wrong-site scrape) at minimal cost; doesn't need SMT.</li>
-    <li><strong>Spec proofs.</strong> Pass <code>--spec FILE</code>; the host attaches a behavioral contract — <code>forall x :: Int where x &gt;= 0: tool(x) == expected(x)</code> — and the spec checker discharges it via Z3 (or a randomized fallback). Counterexamples abort with exit 5; inconclusive proofs abort with 6 unless <code>--spec-allow-inconclusive</code> is set. Strongest available pre-execution check on behavior.</li>
+    <li><strong>Spec proofs.</strong> Pass <code>--spec FILE</code>; attach a behavioral contract — <code>forall x :: Int, lo, hi where lo &lt;= hi: clamp(x, lo, hi) &gt;= lo and ... &lt;= hi</code> — and the spec checker discharges it via Z3 (or a randomized fallback when SMT can't decide). Counterexamples abort with exit 5; inconclusive proofs abort with 6 unless <code>--spec-allow-inconclusive</code> is set. Strongest available pre-execution check on behavior.</li>
+    <li><strong>Differential evaluation.</strong> Pass <code>--diff-body 'src'</code> (or <code>--diff-body-file</code>); both bodies run on each input and any output divergence aborts with exit 7. Cheap regression detection across model upgrades — no oracle needed.</li>
     <li><strong>Capability scoping.</strong> <code>--allow-net-host github.com</code> means the wrong-site scraping case can't even <em>reach</em> attacker.com — the blast radius of a behavioral bug is bounded.</li>
-    <li><strong>Differential evaluation.</strong> Pass <code>--diff-body 'src'</code> (or <code>--diff-body-file</code>); both bodies run on each input (single <code>--input</code> or every entry from <code>--examples</code>); any output divergence aborts with exit 7. Cheap regression detection across model upgrades — no oracle needed.</li>
   </ul>
   <p>
-    All four rungs ship today: effects, capability scoping,
-    examples-driven verification, Spec proofs, and differential
-    evaluation. The point isn't that capability typing solves
-    correctness — it doesn't — it's that the contract lives in the
-    language, free of inference cost, and each higher rung composes
-    on top of the previous one.
+    All four rungs ship today, on top of the effect-typing base:
+    examples-driven verification, Spec proofs, differential evaluation,
+    and capability scoping. The point isn't that capability typing
+    solves correctness — it doesn't — it's that the contract lives
+    in the language, free of inference cost, and each higher rung
+    composes on top of the previous one.
   </p>
 </section>
 
@@ -418,7 +417,16 @@ lex agent-tool --allow-effects net --input x \
   --body 'match io.read("/etc/passwd") { Ok(s) =&gt; s, Err(e) =&gt; e }'
 # → TYPE-CHECK REJECTED — tool not run.
 
-# Run the live demo (needs ANTHROPIC_API_KEY):
+# AST tooling — review/diff/merge what an agent wrote, no text parsing:
+lex audit --effect net examples/                  # find all [net] fns
+lex ast-diff before.lex after.lex                 # structural diff
+lex ast-merge base.lex ours.lex theirs.lex        # 3-way merge → JSON conflicts
+
+# Runtime tool registry — register tools over HTTP, get a stable URL +
+# public effect manifest at /tools/{id}:
+lex tool-registry serve --port 8390
+
+# Run the live agent demo (needs ANTHROPIC_API_KEY):
 export ANTHROPIC_API_KEY=sk-ant-...
 lex agent-tool --allow-effects net \
   --request 'fetch https://api.github.com/zen and return its first line'</code></pre>
@@ -426,15 +434,18 @@ lex agent-tool --allow-effects net \
     Source is at <a href="https://github.com/alpibrusl/lex-lang">github.com/alpibrusl/lex-lang</a>.
     The <a href="https://github.com/alpibrusl/lex-lang/blob/main/README.md">README</a> covers
     the full toolchain (parse, check, run, hash, publish, trace, replay,
-    serve, conformance, spec).
+    serve, conformance, spec, agent-tool, tool-registry, audit, ast-diff, ast-merge).
   </p>
 </section>
 
 <footer>
   <div class="wrap">
     Lex is implemented in Rust under <a href="https://github.com/alpibrusl/lex-lang/blob/main/LICENSE">EUPL-1.2</a>.
-    Status: experimental. Agent integration ships in <code>lex agent-tool</code>; full spec lives in
-    <code>langspecs.md</code>.
+    Status: experimental. Agent integration ships across
+    <code>lex agent-tool</code>, <code>lex tool-registry</code>,
+    <code>lex audit</code>, <code>lex ast-diff</code>, and
+    <code>lex ast-merge</code>. Full spec lives in <code>langspecs.md</code>.
+    251 workspace tests passing as of this writing.
   </div>
 </footer>
 
