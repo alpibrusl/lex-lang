@@ -178,6 +178,111 @@ fn no_body_flag_skips_body_patches() {
 }
 
 #[test]
+fn effect_changes_surface_added_and_removed() {
+    // before: pure `safe`, [net] `risky`.
+    // after:  [io] `safe`,  [net, fs_read] `risky`.
+    // Expected: safe gains [io]; risky gains [fs_read].
+    let a = tmp("a_eff",
+        "fn safe(x :: Int) -> Int { x }\n\
+         fn risky() -> [net] Int { 0 }\n");
+    let b = tmp("b_eff",
+        "fn safe(x :: Int) -> [io] Int { x }\n\
+         fn risky() -> [net, fs_read] Int { 0 }\n");
+    let (code, stdout, _) = run(&[
+        "ast-diff", "--json", a.to_str().unwrap(), b.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    let modified = v["modified"].as_array().expect("modified array");
+    assert_eq!(modified.len(), 2);
+
+    let by_name: std::collections::BTreeMap<&str, &serde_json::Value> =
+        modified.iter()
+            .map(|m| (m["name"].as_str().unwrap(), m))
+            .collect();
+
+    let safe = by_name["safe"];
+    let added: Vec<&str> = safe["effect_changes"]["added"].as_array().unwrap()
+        .iter().map(|x| x.as_str().unwrap()).collect();
+    assert_eq!(added, vec!["io"]);
+    assert!(safe["effect_changes"]["removed"].as_array().unwrap().is_empty());
+
+    let risky = by_name["risky"];
+    let added: Vec<&str> = risky["effect_changes"]["added"].as_array().unwrap()
+        .iter().map(|x| x.as_str().unwrap()).collect();
+    assert_eq!(added, vec!["fs_read"]);
+}
+
+#[test]
+fn effect_dropped_shows_in_removed() {
+    // [io, net] → [net]: io is dropped.
+    let a = tmp("a_drop", "fn f() -> [io, net] Int { 0 }\n");
+    let b = tmp("b_drop", "fn f() -> [net] Int { 0 }\n");
+    let (code, stdout, _) = run(&[
+        "ast-diff", "--json", a.to_str().unwrap(), b.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    let m = &v["modified"][0];
+    let removed: Vec<&str> = m["effect_changes"]["removed"].as_array().unwrap()
+        .iter().map(|x| x.as_str().unwrap()).collect();
+    assert_eq!(removed, vec!["io"]);
+    assert!(m["effect_changes"]["added"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn effect_arg_change_surfaces_as_paired_add_remove() {
+    // fs_read("/tmp") → fs_read("/etc"): semantically distinct
+    // scopes; show as one removed + one added so reviewers see the
+    // path change explicitly.
+    let a = tmp("a_arg",
+        "fn f(p :: Str) -> [fs_read(\"/tmp\")] Str { p }\n");
+    let b = tmp("b_arg",
+        "fn f(p :: Str) -> [fs_read(\"/etc\")] Str { p }\n");
+    let (code, stdout, _) = run(&[
+        "ast-diff", "--json", a.to_str().unwrap(), b.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    let m = &v["modified"][0];
+    let added: Vec<&str> = m["effect_changes"]["added"].as_array().unwrap()
+        .iter().map(|x| x.as_str().unwrap()).collect();
+    let removed: Vec<&str> = m["effect_changes"]["removed"].as_array().unwrap()
+        .iter().map(|x| x.as_str().unwrap()).collect();
+    assert_eq!(added.len(), 1);
+    assert_eq!(removed.len(), 1);
+    assert!(added[0].contains("/etc"), "added: {added:?}");
+    assert!(removed[0].contains("/tmp"), "removed: {removed:?}");
+}
+
+#[test]
+fn effects_unchanged_yields_empty_added_removed() {
+    // Only the body changed; effects are identical.
+    let a = tmp("a_body_only", "fn f() -> [io] Int { 1 }\n");
+    let b = tmp("b_body_only", "fn f() -> [io] Int { 2 }\n");
+    let (code, stdout, _) = run(&[
+        "ast-diff", "--json", a.to_str().unwrap(), b.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    let m = &v["modified"][0];
+    assert!(m["effect_changes"]["added"].as_array().unwrap().is_empty());
+    assert!(m["effect_changes"]["removed"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn text_mode_flags_effect_gain() {
+    let a = tmp("a_text_eff", "fn f() -> Int { 1 }\n");
+    let b = tmp("b_text_eff", "fn f() -> [io] Int { 1 }\n");
+    let (code, stdout, _) = run(&[
+        "ast-diff", a.to_str().unwrap(), b.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("effects gained"), "stdout: {stdout}");
+    assert!(stdout.contains("io"), "stdout: {stdout}");
+}
+
+#[test]
 fn parse_errors_surface_clearly() {
     let a = tmp("a_bad", "fn ok() -> Int { 1 }\n");
     let b = tmp("b_bad", "fn broken( - this is not valid lex\n");
