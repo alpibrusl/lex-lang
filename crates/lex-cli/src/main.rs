@@ -15,7 +15,9 @@ mod audit;
 mod diff;
 mod ast_merge;
 mod branch;
+mod acli;
 
+use ::acli::OutputFormat;
 use anyhow::{anyhow, bail, Context, Result};
 use lex_ast::{canonicalize_program, sig_id, stage_canonical_hash_hex, stage_id, Stage};
 use lex_bytecode::{compile_program, vm::Vm, Value};
@@ -29,37 +31,98 @@ use std::path::PathBuf;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if let Err(e) = run(&args) {
-        eprintln!("error: {e:#}");
+    // Pre-parse `--output` so we can route errors through ACLI's
+    // error envelope when the agent asked for JSON. Errors here
+    // (e.g. invalid format) fall back to text reporting since we
+    // haven't yet committed to a format.
+    let (fmt, rest_after_format) = match parse_output_format(&args) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            std::process::exit(2);
+        }
+    };
+    let cmd_for_err = rest_after_format.first().cloned()
+        .unwrap_or_else(|| "lex".into());
+    if let Err(e) = run(&fmt, &rest_after_format) {
+        acli::emit_error(&cmd_for_err, &format!("{e:#}"), &fmt,
+            ::acli::ExitCode::GeneralError);
         std::process::exit(1);
     }
 }
 
-fn run(args: &[String]) -> Result<()> {
+fn run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let cmd = args.first().ok_or_else(|| anyhow!("usage: lex <command> ..."))?;
     match cmd.as_str() {
-        "parse" => cmd_parse(&args[1..]),
-        "check" => cmd_check(&args[1..]),
-        "run" => cmd_run(&args[1..]),
-        "hash" => cmd_hash(&args[1..]),
-        "publish" => cmd_publish(&args[1..]),
-        "store" => cmd_store(&args[1..]),
-        "trace" => cmd_trace(&args[1..]),
-        "replay" => cmd_replay(&args[1..]),
-        "diff" => cmd_diff(&args[1..]),
+        // ACLI built-ins — emit JSON envelopes via the SDK.
+        "introspect" => { acli::build_app().handle_introspect(fmt); Ok(()) }
+        "skill" => {
+            let out_path = args.get(1).map(|s| s.as_str());
+            acli::build_app().handle_skill(out_path, fmt);
+            Ok(())
+        }
+        "version" | "--version" | "-V" => {
+            acli::build_app().handle_version(fmt);
+            Ok(())
+        }
+        "parse" => cmd_parse(fmt, &args[1..]),
+        "check" => cmd_check(fmt, &args[1..]),
+        "run" => cmd_run(fmt, &args[1..]),
+        "hash" => cmd_hash(fmt, &args[1..]),
+        "publish" => cmd_publish(fmt, &args[1..]),
+        "store" => cmd_store(fmt, &args[1..]),
+        "trace" => cmd_trace(fmt, &args[1..]),
+        "replay" => cmd_replay(fmt, &args[1..]),
+        "diff" => cmd_diff(fmt, &args[1..]),
         "serve" => cmd_serve(&args[1..]),
-        "conformance" => cmd_conformance(&args[1..]),
-        "spec" => cmd_spec(&args[1..]),
-        "agent-tool" => cmd_agent_tool(&args[1..]),
+        "conformance" => cmd_conformance(fmt, &args[1..]),
+        "spec" => cmd_spec(fmt, &args[1..]),
+        "agent-tool" => {
+            // agent-tool has its own `--json`; propagate `--output json`
+            // into it without breaking the legacy flag.
+            let mut a: Vec<String> = args[1..].to_vec();
+            if matches!(fmt, OutputFormat::Json) && !a.iter().any(|s| s == "--json") {
+                a.push("--json".into());
+            }
+            cmd_agent_tool(&a)
+        }
         "tool-registry" => tool_registry::cmd_tool_registry(&args[1..]),
-        "audit" => audit::cmd_audit(&args[1..]),
-        "ast-diff" => diff::cmd_diff(&args[1..]),
-        "ast-merge" => ast_merge::cmd_ast_merge(&args[1..]),
-        "branch" => branch::cmd_branch(&args[1..]),
-        "store-merge" => branch::cmd_store_merge(&args[1..]),
+        "audit" => audit::cmd_audit(fmt, &args[1..]),
+        "ast-diff" => diff::cmd_diff(fmt, &args[1..]),
+        "ast-merge" => ast_merge::cmd_ast_merge(fmt, &args[1..]),
+        "branch" => branch::cmd_branch(fmt, &args[1..]),
+        "store-merge" => branch::cmd_store_merge(fmt, &args[1..]),
         "help" | "--help" | "-h" => { print_usage(); Ok(()) }
         other => bail!("unknown command `{other}`. try `lex help`"),
     }
+}
+
+/// Strip a leading `--output FORMAT` (or `--output=FORMAT`) from
+/// `args`. Accepts `text` / `json` / `table`. Defaults to text.
+/// We only scan up to the first non-`--output` token so we don't
+/// swallow per-subcommand `--output` flags (e.g. `lex ast-merge
+/// --output merged.lex`, which is a path, not a format).
+fn parse_output_format(args: &[String]) -> Result<(OutputFormat, Vec<String>)> {
+    use std::str::FromStr;
+    let mut out: Vec<String> = Vec::with_capacity(args.len());
+    let mut format = OutputFormat::Text;
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--output" && i + 1 < args.len() {
+            format = OutputFormat::from_str(&args[i + 1]).map_err(|e| anyhow!(e))?;
+            i += 2;
+        } else if let Some(v) = a.strip_prefix("--output=") {
+            format = OutputFormat::from_str(v).map_err(|e| anyhow!(e))?;
+            i += 1;
+        } else {
+            // Stop scanning at first positional / unrelated flag — the
+            // remaining `--output` (if any) belongs to a subcommand.
+            out.extend_from_slice(&args[i..]);
+            break;
+        }
+    }
+    Ok((format, out))
 }
 
 fn print_usage() {
@@ -118,57 +181,93 @@ fn read_source(path: &str) -> Result<String> {
     }
 }
 
-fn cmd_parse(args: &[String]) -> Result<()> {
+fn cmd_parse(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let path = args.first().ok_or_else(|| anyhow!("usage: lex parse <file>"))?;
     let src = read_source(path)?;
     let prog = parse_source(&src)?;
     let stages = canonicalize_program(&prog);
-    let json = serde_json::to_string_pretty(&stages)?;
-    println!("{json}");
+    let data = serde_json::to_value(&stages)?;
+    acli::emit_or_text("parse", data.clone(), fmt, || {
+        println!("{}", serde_json::to_string_pretty(&data).unwrap());
+    });
     Ok(())
 }
 
-fn cmd_check(args: &[String]) -> Result<()> {
+fn cmd_check(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let path = args.first().ok_or_else(|| anyhow!("usage: lex check <file>"))?;
     let src = read_source(path)?;
     let prog = parse_source(&src)?;
     let stages = canonicalize_program(&prog);
     match lex_types::check_program(&stages) {
         Ok(_) => {
-            println!("ok");
+            let data = serde_json::json!({ "ok": true, "stages": stages.len() });
+            acli::emit_or_text("check", data, fmt, || println!("ok"));
             Ok(())
         }
         Err(errs) => {
-            for e in &errs {
-                let json = serde_json::to_string(e)?;
-                println!("{json}");
-            }
+            let arr: Vec<serde_json::Value> = errs.iter()
+                .map(|e| serde_json::to_value(e).unwrap()).collect();
+            let data = serde_json::json!({ "ok": false, "errors": arr });
+            acli::emit_or_text("check", data, fmt, || {
+                for e in &errs {
+                    if let Ok(j) = serde_json::to_string(e) {
+                        println!("{j}");
+                    }
+                }
+            });
             std::process::exit(2);
         }
     }
 }
 
-fn cmd_run(args: &[String]) -> Result<()> {
-    let (policy, positional, trace, max_steps) = parse_run_flags(args)?;
+fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let (policy, positional, trace, max_steps, dry_run) = parse_run_flags(args)?;
     let path = positional.first().ok_or_else(|| anyhow!("usage: lex run [policy] <file> <fn> [args]"))?;
     let func = positional.get(1).ok_or_else(|| anyhow!("missing function name"))?;
+    if dry_run {
+        let actions = vec![serde_json::json!({
+            "action": "execute",
+            "file": path,
+            "function": func,
+            "args": &positional[2..],
+            "policy": {
+                "allow_effects": policy.allow_effects.iter().collect::<Vec<_>>(),
+                "allow_fs_read": policy.allow_fs_read.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                "allow_fs_write": policy.allow_fs_write.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                "allow_net_host": &policy.allow_net_host,
+                "budget": policy.budget,
+            },
+            "trace": trace,
+            "max_steps": max_steps,
+        })];
+        acli::emit_dry_run("run", fmt,
+            &format!("would call `{func}` in {path}"), actions);
+    }
     let src = read_source(path)?;
     let prog = parse_source(&src)?;
     let stages = canonicalize_program(&prog);
     if let Err(errs) = lex_types::check_program(&stages) {
-        for e in &errs {
-            let json = serde_json::to_string(e)?;
-            eprintln!("{json}");
-        }
+        let arr: Vec<serde_json::Value> = errs.iter()
+            .map(|e| serde_json::to_value(e).unwrap()).collect();
+        let data = serde_json::json!({ "phase": "type-check", "errors": arr });
+        acli::emit_or_text("run", data, fmt, || {
+            for e in &errs {
+                if let Ok(j) = serde_json::to_string(e) { eprintln!("{j}"); }
+            }
+        });
         std::process::exit(2);
     }
     let bc = compile_program(&stages);
 
     if let Err(violations) = check_policy(&bc, &policy) {
-        for v in &violations {
-            let json = serde_json::to_string(v)?;
-            eprintln!("{json}");
-        }
+        let arr: Vec<serde_json::Value> = violations.iter()
+            .map(|v| serde_json::to_value(v).unwrap()).collect();
+        let data = serde_json::json!({ "phase": "policy", "violations": arr });
+        acli::emit_or_text("run", data, fmt, || {
+            for v in &violations {
+                if let Ok(j) = serde_json::to_string(v) { eprintln!("{j}"); }
+            }
+        });
         std::process::exit(3);
     }
 
@@ -193,6 +292,7 @@ fn cmd_run(args: &[String]) -> Result<()> {
     let result = vm.call(func, vargs);
     let ended = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let mut trace_id: Option<String> = None;
     if trace {
         let store = lex_store::Store::open(default_store_root())?;
         let (root_out, root_err) = match &result {
@@ -202,18 +302,26 @@ fn cmd_run(args: &[String]) -> Result<()> {
         let tree = trace_handle.finalize(func.clone(), serde_json::Value::Null,
             root_out, root_err, started, ended);
         let id = store.save_trace(&tree)?;
-        eprintln!("trace saved: {id}");
+        trace_id = Some(id.clone());
+        if !matches!(fmt, OutputFormat::Json) { eprintln!("trace saved: {id}"); }
     }
     let r = result.map_err(|e| anyhow!("runtime: {e}"))?;
-    println!("{}", value_to_json_string(&r));
+    let result_json = value_to_json(&r);
+    let data = match &trace_id {
+        Some(id) => serde_json::json!({ "result": result_json, "trace_id": id }),
+        None => serde_json::json!({ "result": result_json }),
+    };
+    acli::emit_or_text("run", data, fmt, || println!("{}", value_to_json_string(&r)));
     Ok(())
 }
 
-fn parse_run_flags(args: &[String]) -> Result<(Policy, Vec<String>, bool, Option<u64>)> {
+#[allow(clippy::type_complexity)]
+fn parse_run_flags(args: &[String]) -> Result<(Policy, Vec<String>, bool, Option<u64>, bool)> {
     let mut policy = Policy::pure();
     let mut positional = Vec::new();
     let mut trace = false;
     let mut max_steps: Option<u64> = None;
+    let mut dry_run = false;
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -250,46 +358,64 @@ fn parse_run_flags(args: &[String]) -> Result<(Policy, Vec<String>, bool, Option
                 i += 2;
             }
             "--trace" => { trace = true; i += 1; }
+            "--dry-run" => { dry_run = true; i += 1; }
             _ => { positional.push(a.clone()); i += 1; }
         }
     }
-    Ok((policy, positional, trace, max_steps))
+    Ok((policy, positional, trace, max_steps, dry_run))
 }
 
-fn cmd_trace(args: &[String]) -> Result<()> {
+fn cmd_trace(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let id = args.first().ok_or_else(|| anyhow!("usage: lex trace <run_id>"))?;
     let store = lex_store::Store::open(default_store_root())?;
     let tree = store.load_trace(id)?;
-    println!("{}", serde_json::to_string_pretty(&tree)?);
+    let data = serde_json::to_value(&tree)?;
+    acli::emit_or_text("trace", data.clone(), fmt, || {
+        println!("{}", serde_json::to_string_pretty(&data).unwrap());
+    });
     Ok(())
 }
 
-fn cmd_diff(args: &[String]) -> Result<()> {
+fn cmd_diff(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let a = args.first().ok_or_else(|| anyhow!("usage: lex diff <run_a> <run_b>"))?;
     let b = args.get(1).ok_or_else(|| anyhow!("missing second run id"))?;
     let store = lex_store::Store::open(default_store_root())?;
     let ta = store.load_trace(a)?;
     let tb = store.load_trace(b)?;
-    match lex_trace::diff_runs(&ta, &tb) {
-        Some(d) => {
-            println!("{}", serde_json::to_string_pretty(&d)?);
-            Ok(())
-        }
-        None => { println!("{{\"divergence\":null}}"); Ok(()) }
-    }
+    let data = match lex_trace::diff_runs(&ta, &tb) {
+        Some(d) => serde_json::to_value(&d)?,
+        None => serde_json::json!({ "divergence": null }),
+    };
+    acli::emit_or_text("diff", data.clone(), fmt, || {
+        println!("{}", serde_json::to_string_pretty(&data).unwrap());
+    });
+    Ok(())
 }
 
-fn cmd_hash(args: &[String]) -> Result<()> {
+fn cmd_hash(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let path = args.first().ok_or_else(|| anyhow!("usage: lex hash <file>"))?;
     let src = read_source(path)?;
     let prog = parse_source(&src)?;
     let stages = canonicalize_program(&prog);
-    for s in &stages {
+    let entries: Vec<serde_json::Value> = stages.iter().map(|s| {
         let name = stage_name(s);
         let h = stage_canonical_hash_hex(s);
         let sid = stage_id(s).unwrap_or_else(|| "-".into());
-        println!("{name}\tcanonical_ast={h}\tstage_id={sid}");
-    }
+        serde_json::json!({
+            "name": name,
+            "canonical_ast": h,
+            "stage_id": sid,
+        })
+    }).collect();
+    let data = serde_json::json!({ "stages": entries });
+    acli::emit_or_text("hash", data, fmt, || {
+        for s in &stages {
+            let name = stage_name(s);
+            let h = stage_canonical_hash_hex(s);
+            let sid = stage_id(s).unwrap_or_else(|| "-".into());
+            println!("{name}\tcanonical_ast={h}\tstage_id={sid}");
+        }
+    });
     Ok(())
 }
 
@@ -369,10 +495,11 @@ fn default_store_root() -> PathBuf {
     PathBuf::from(".lex-store")
 }
 
-fn parse_store_flag(args: &[String]) -> (PathBuf, Vec<String>, bool) {
-    // Returns (store_root, remaining_args, activate).
+fn parse_store_flag(args: &[String]) -> (PathBuf, Vec<String>, bool, bool) {
+    // Returns (store_root, remaining_args, activate, dry_run).
     let mut root = default_store_root();
     let mut activate = false;
+    let mut dry_run = false;
     let mut rest = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -381,23 +508,46 @@ fn parse_store_flag(args: &[String]) -> (PathBuf, Vec<String>, bool) {
                 if let Some(v) = args.get(i + 1) { root = PathBuf::from(v); i += 2; } else { i += 1; }
             }
             "--activate" => { activate = true; i += 1; }
+            "--dry-run" => { dry_run = true; i += 1; }
             _ => { rest.push(args[i].clone()); i += 1; }
         }
     }
-    (root, rest, activate)
+    (root, rest, activate, dry_run)
 }
 
-fn cmd_publish(args: &[String]) -> Result<()> {
-    let (root, rest, activate) = parse_store_flag(args);
+fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let (root, rest, activate, dry_run) = parse_store_flag(args);
     let path = rest.first().ok_or_else(|| anyhow!("usage: lex publish [--store DIR] [--activate] <file>"))?;
     let src = read_source(path)?;
     let prog = parse_source(&src)?;
     let stages = canonicalize_program(&prog);
     if let Err(errs) = lex_types::check_program(&stages) {
-        for e in &errs {
-            eprintln!("{}", serde_json::to_string(e)?);
-        }
+        let arr: Vec<serde_json::Value> = errs.iter()
+            .map(|e| serde_json::to_value(e).unwrap()).collect();
+        let data = serde_json::json!({ "phase": "type-check", "errors": arr });
+        acli::emit_or_text("publish", data, fmt, || {
+            for e in &errs {
+                if let Ok(j) = serde_json::to_string(e) { eprintln!("{j}"); }
+            }
+        });
         std::process::exit(2);
+    }
+    if dry_run {
+        let actions: Vec<serde_json::Value> = stages.iter()
+            .filter(|s| !matches!(s, Stage::Import(_)))
+            .map(|s| {
+                let name = match s { Stage::FnDecl(fd) => &fd.name, Stage::TypeDecl(td) => &td.name, _ => "?" };
+                serde_json::json!({
+                    "action": "publish",
+                    "name": name,
+                    "sig_id": sig_id(s).unwrap_or_else(|| "-".into()),
+                    "store": root.display().to_string(),
+                    "activate": activate,
+                })
+            }).collect();
+        acli::emit_dry_run("publish", fmt,
+            &format!("would publish {} stage(s) to {}", actions.len(), root.display()),
+            actions);
     }
     let store = Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
     let mut out = Vec::new();
@@ -418,26 +568,36 @@ fn cmd_publish(args: &[String]) -> Result<()> {
         });
         out.push(entry);
     }
-    println!("{}", serde_json::to_string_pretty(&out)?);
+    let data = serde_json::json!({ "published": out });
+    acli::emit_or_text("publish", data, fmt, || {
+        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+    });
     Ok(())
 }
 
-fn cmd_store(args: &[String]) -> Result<()> {
+fn cmd_store(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let sub = args.first().ok_or_else(|| anyhow!("usage: lex store {{list|get}} ..."))?;
     let rest = &args[1..];
     match sub.as_str() {
         "list" => {
-            let (root, _rest, _) = parse_store_flag(rest);
+            let (root, _rest, _, _) = parse_store_flag(rest);
             let store = Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
             let sigs = store.list_sigs()?;
-            for s in sigs {
-                let active = store.resolve_sig(&s)?.unwrap_or_default();
-                println!("{s}\tactive={active}");
-            }
+            let entries: Vec<serde_json::Value> = sigs.iter().map(|s| {
+                let active = store.resolve_sig(s).ok().flatten().unwrap_or_default();
+                serde_json::json!({ "sig_id": s, "active_stage_id": active })
+            }).collect();
+            let data = serde_json::json!({ "sigs": entries });
+            acli::emit_or_text("store", data, fmt, || {
+                for s in &sigs {
+                    let active = store.resolve_sig(s).ok().flatten().unwrap_or_default();
+                    println!("{s}\tactive={active}");
+                }
+            });
             Ok(())
         }
         "get" => {
-            let (root, rest, _) = parse_store_flag(rest);
+            let (root, rest, _, _) = parse_store_flag(rest);
             let store = Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
             let id = rest.first().ok_or_else(|| anyhow!("usage: lex store get <stage_id>"))?;
             let meta = store.get_metadata(id)?;
@@ -447,19 +607,17 @@ fn cmd_store(args: &[String]) -> Result<()> {
                 "status": format!("{:?}", store.get_status(id)?).to_lowercase(),
                 "ast": serde_json::to_value(&ast)?,
             });
-            println!("{}", serde_json::to_string_pretty(&v)?);
+            acli::emit_or_text("store", v.clone(), fmt, || {
+                println!("{}", serde_json::to_string_pretty(&v).unwrap());
+            });
             Ok(())
         }
         other => bail!("unknown `lex store` subcommand: {other}"),
     }
 }
 
-fn cmd_replay(args: &[String]) -> Result<()> {
+fn cmd_replay(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     // usage: lex replay <run_id> <file> <fn> [args] [--override NODE=JSON]
-    // Re-runs the function with overrides keyed by NodeId. Saves a fresh
-    // trace and prints its run_id. The original run_id is referenced for
-    // the user's bookkeeping; we don't currently load it (the function is
-    // re-executed from source).
     let mut overrides: indexmap::IndexMap<String, serde_json::Value> = indexmap::IndexMap::new();
     let mut policy = Policy::pure();
     let mut positional: Vec<String> = Vec::new();
@@ -491,12 +649,26 @@ fn cmd_replay(args: &[String]) -> Result<()> {
     let prog = parse_source(&src)?;
     let stages = canonicalize_program(&prog);
     if let Err(errs) = lex_types::check_program(&stages) {
-        for e in &errs { eprintln!("{}", serde_json::to_string(e)?); }
+        let arr: Vec<serde_json::Value> = errs.iter()
+            .map(|e| serde_json::to_value(e).unwrap()).collect();
+        let data = serde_json::json!({ "phase": "type-check", "errors": arr });
+        acli::emit_or_text("replay", data, fmt, || {
+            for e in &errs {
+                if let Ok(j) = serde_json::to_string(e) { eprintln!("{j}"); }
+            }
+        });
         std::process::exit(2);
     }
     let bc = compile_program(&stages);
     if let Err(violations) = check_policy(&bc, &policy) {
-        for v in &violations { eprintln!("{}", serde_json::to_string(v)?); }
+        let arr: Vec<serde_json::Value> = violations.iter()
+            .map(|v| serde_json::to_value(v).unwrap()).collect();
+        let data = serde_json::json!({ "phase": "policy", "violations": arr });
+        acli::emit_or_text("replay", data, fmt, || {
+            for v in &violations {
+                if let Ok(j) = serde_json::to_string(v) { eprintln!("{j}"); }
+            }
+        });
         std::process::exit(3);
     }
 
@@ -524,9 +696,13 @@ fn cmd_replay(args: &[String]) -> Result<()> {
     };
     let tree = handle.finalize(func.clone(), serde_json::Value::Null, root_out, root_err, started, ended);
     let new_run_id = store.save_trace(&tree)?;
-    eprintln!("trace saved: {new_run_id}");
+    if !matches!(fmt, OutputFormat::Json) { eprintln!("trace saved: {new_run_id}"); }
     let r = result.map_err(|e| anyhow!("runtime: {e}"))?;
-    println!("{}", value_to_json_string(&r));
+    let data = serde_json::json!({
+        "result": value_to_json(&r),
+        "trace_id": new_run_id,
+    });
+    acli::emit_or_text("replay", data, fmt, || println!("{}", value_to_json_string(&r)));
     Ok(())
 }
 
@@ -554,17 +730,30 @@ fn cmd_serve(args: &[String]) -> Result<()> {
     lex_api::serve(port, store_root)
 }
 
-fn cmd_conformance(args: &[String]) -> Result<()> {
+fn cmd_conformance(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let dir = args.first().ok_or_else(|| anyhow!("usage: lex conformance <dir>"))?;
     let report = conformance::run_directory(dir).context("reading conformance directory")?;
-    for name in &report.passed { println!("PASS  {name}"); }
-    for (name, why) in &report.failed { println!("FAIL  {name}: {why}"); }
-    println!();
-    println!("{}/{} passed", report.passed.len(), report.total());
+    let total = report.total();
+    let passed_n = report.passed.len();
+    let failed: Vec<serde_json::Value> = report.failed.iter()
+        .map(|(n, w)| serde_json::json!({ "name": n, "reason": w })).collect();
+    let data = serde_json::json!({
+        "passed": &report.passed,
+        "failed": failed,
+        "total": total,
+        "passed_count": passed_n,
+        "ok": report.ok(),
+    });
+    acli::emit_or_text("conformance", data, fmt, || {
+        for name in &report.passed { println!("PASS  {name}"); }
+        for (name, why) in &report.failed { println!("FAIL  {name}: {why}"); }
+        println!();
+        println!("{}/{} passed", passed_n, total);
+    });
     if report.ok() { Ok(()) } else { std::process::exit(4); }
 }
 
-fn cmd_spec(args: &[String]) -> Result<()> {
+fn cmd_spec(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let sub = args.first().ok_or_else(|| anyhow!("usage: lex spec {{check|smt}} ..."))?;
     let rest = &args[1..];
     match sub.as_str() {
@@ -592,7 +781,10 @@ fn cmd_spec(args: &[String]) -> Result<()> {
             let spec = spec_checker::parse_spec(&spec_src)
                 .map_err(|e| anyhow!("spec parse: {e}"))?;
             let r = spec_checker::check_spec(&spec, &lex_src, trials);
-            println!("{}", serde_json::to_string_pretty(&r)?);
+            let data = serde_json::to_value(&r)?;
+            acli::emit_or_text("spec", data.clone(), fmt, || {
+                println!("{}", serde_json::to_string_pretty(&data).unwrap());
+            });
             // Exit code: 0 proved, 5 counterexample, 6 inconclusive.
             match r.status {
                 spec_checker::ProofStatus::Proved => Ok(()),
@@ -605,7 +797,9 @@ fn cmd_spec(args: &[String]) -> Result<()> {
             let spec_src = read_source(path)?;
             let spec = spec_checker::parse_spec(&spec_src)
                 .map_err(|e| anyhow!("spec parse: {e}"))?;
-            print!("{}", spec_checker::to_smtlib(&spec));
+            let smt = spec_checker::to_smtlib(&spec);
+            let data = serde_json::json!({ "smt_lib": &smt });
+            acli::emit_or_text("spec", data, fmt, || print!("{smt}"));
             Ok(())
         }
         other => bail!("unknown `lex spec` subcommand: {other}"),

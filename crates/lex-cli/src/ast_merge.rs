@@ -13,6 +13,8 @@
 //! and both bodies are returned in the JSON. Refining body-level
 //! patches into structural-merge is a follow-up.
 
+use crate::acli as acli_mod;
+use ::acli::OutputFormat;
 use anyhow::{anyhow, Context, Result};
 use lex_ast::{
     canon_print::print_stages, canonicalize_program, FnDecl, Stage,
@@ -28,7 +30,12 @@ use std::path::PathBuf;
 struct MergeOpts {
     files: Vec<PathBuf>, // [base, ours, theirs]
     json: bool,
+    /// Where to write the merged source. Renamed from `--output` to
+    /// `--write` to avoid colliding with ACLI's `--output FORMAT`.
+    /// Old `--output PATH` still accepted for backwards compat as
+    /// long as PATH isn't a known format keyword (text/json/table).
     output: Option<PathBuf>,
+    dry_run: bool,
 }
 
 #[derive(Serialize)]
@@ -70,39 +77,56 @@ struct MergeSummary {
     conflicts: usize,
 }
 
-pub fn cmd_ast_merge(args: &[String]) -> Result<()> {
+pub fn cmd_ast_merge(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let opts = parse_args(args)?;
     if opts.files.len() != 3 {
         return Err(anyhow!(
             "usage: lex ast-merge <base.lex> <ours.lex> <theirs.lex> \
-             [--json] [--output PATH]"));
+             [--json] [--write PATH] [--dry-run]"));
     }
     let base   = load_fns(&opts.files[0])?;
     let ours   = load_fns(&opts.files[1])?;
     let theirs = load_fns(&opts.files[2])?;
     let report = compute_merge(&base, &ours, &theirs);
+    let json = opts.json || matches!(fmt, OutputFormat::Json);
+
+    if opts.dry_run {
+        let action = serde_json::json!({
+            "action": "merge",
+            "base": opts.files[0].display().to_string(),
+            "ours": opts.files[1].display().to_string(),
+            "theirs": opts.files[2].display().to_string(),
+            "would_write": opts.output.as_ref().map(|p| p.display().to_string()),
+            "merged": report.merged.len(),
+            "conflicts": report.conflicts.len(),
+        });
+        acli_mod::emit_dry_run("ast-merge", fmt, "would compute three-way merge",
+            vec![action]);
+    }
 
     if let Some(out) = &opts.output {
         if !report.conflicts.is_empty() {
             return Err(anyhow!(
                 "{} conflicts; refusing to write merged source. \
-                 Re-run without --output to see structured JSON.",
+                 Re-run without --write to see structured JSON.",
                 report.conflicts.len()));
         }
-        // Re-emit the merged set as Lex source via the canon printer.
         let stages: Vec<Stage> = report.merged.iter()
             .map(|m| pick_fn(&m.name, &base, &ours, &theirs, m.from))
             .map(Stage::FnDecl)
             .collect();
         let src = print_stages(&stages);
         fs::write(out, src).with_context(|| format!("write {}", out.display()))?;
-        if !opts.json {
+        if !json {
             eprintln!("→ wrote merged source to {} ({} fns)",
                 out.display(), report.merged.len());
         }
     }
 
-    if opts.json {
+    if matches!(fmt, OutputFormat::Json) {
+        let data = serde_json::to_value(&report)?;
+        acli_mod::emit_or_text("ast-merge", data, fmt, || {});
+    } else if opts.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         if report.conflicts.is_empty() {
@@ -119,8 +143,6 @@ pub fn cmd_ast_merge(args: &[String]) -> Result<()> {
                 short_kind_message(c.kind));
         }
     }
-    // Exit 2 on conflicts regardless of output format — lets agent
-    // loops branch on the exit code without re-parsing the report.
     if !report.conflicts.is_empty() {
         std::process::exit(2);
     }
@@ -132,9 +154,23 @@ fn parse_args(args: &[String]) -> Result<MergeOpts> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--json"   => { o.json = true; i += 1; }
+            "--json"    => { o.json = true; i += 1; }
+            "--dry-run" => { o.dry_run = true; i += 1; }
+            "--write" => {
+                let v = args.get(i + 1).ok_or_else(|| anyhow!("--write needs a path"))?;
+                o.output = Some(PathBuf::from(v));
+                i += 2;
+            }
             "--output" => {
+                // Back-compat: accept `--output PATH` as long as PATH
+                // isn't an ACLI format keyword (which would have been
+                // consumed at the dispatcher level).
                 let v = args.get(i + 1).ok_or_else(|| anyhow!("--output needs a path"))?;
+                if matches!(v.as_str(), "text" | "json" | "table") {
+                    return Err(anyhow!(
+                        "`--output {v}` is the ACLI format flag — put it before the subcommand: \
+                         `lex --output {v} ast-merge ...`. Use `--write PATH` for the merged source path."));
+                }
                 o.output = Some(PathBuf::from(v));
                 i += 2;
             }

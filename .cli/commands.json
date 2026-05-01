@@ -1,0 +1,930 @@
+{
+  "name": "lex",
+  "version": "0.1.0",
+  "acli_version": "0.1.0",
+  "commands": [
+    {
+      "name": "parse",
+      "description": "print canonical AST as JSON",
+      "arguments": [
+        {
+          "name": "file",
+          "type": "string",
+          "description": "path to a .lex file (or `-` for stdin)",
+          "required": true
+        }
+      ],
+      "options": [],
+      "subcommands": [],
+      "idempotent": true,
+      "examples": [
+        {
+          "description": "Parse a file",
+          "invocation": "lex parse hello.lex"
+        },
+        {
+          "description": "Parse stdin",
+          "invocation": "cat hello.lex | lex parse -"
+        }
+      ],
+      "see_also": [
+        "check",
+        "hash"
+      ]
+    },
+    {
+      "name": "check",
+      "description": "type-check; exit 0 or print errors",
+      "arguments": [
+        {
+          "name": "file",
+          "type": "string",
+          "description": "path to a .lex file",
+          "required": true
+        }
+      ],
+      "options": [],
+      "subcommands": [],
+      "idempotent": true,
+      "examples": [
+        {
+          "description": "Type-check a file",
+          "invocation": "lex check hello.lex"
+        },
+        {
+          "description": "Check before running",
+          "invocation": "lex check app.lex && lex run app.lex main"
+        }
+      ],
+      "see_also": [
+        "parse",
+        "run"
+      ]
+    },
+    {
+      "name": "run",
+      "description": "execute fn under capability policy (args parsed as JSON)",
+      "arguments": [
+        {
+          "name": "file",
+          "type": "string",
+          "description": "path to a .lex file",
+          "required": true
+        },
+        {
+          "name": "fn",
+          "type": "string",
+          "description": "function name to invoke",
+          "required": true
+        },
+        {
+          "name": "args",
+          "type": "string[]",
+          "description": "JSON-encoded positional args",
+          "required": false
+        }
+      ],
+      "options": [
+        {
+          "name": "--allow-effects",
+          "type": "string",
+          "description": "comma-separated effect kinds to permit"
+        },
+        {
+          "name": "--allow-fs-read",
+          "type": "string",
+          "description": "filesystem path tree readable by fs_read"
+        },
+        {
+          "name": "--allow-fs-write",
+          "type": "string",
+          "description": "filesystem path tree writable by fs_write"
+        },
+        {
+          "name": "--allow-net-host",
+          "type": "string",
+          "description": "permit net effects to this host"
+        },
+        {
+          "name": "--budget",
+          "type": "int",
+          "description": "cap aggregate declared budget"
+        },
+        {
+          "name": "--max-steps",
+          "type": "int",
+          "description": "cap VM opcode dispatches (DoS guard)"
+        }
+      ],
+      "subcommands": [],
+      "idempotent": false,
+      "examples": [
+        {
+          "description": "Run main()",
+          "invocation": "lex run app.lex main"
+        },
+        {
+          "description": "Run with fs read scope",
+          "invocation": "lex run --allow-fs-read /tmp app.lex load \"/tmp/x.json\""
+        }
+      ],
+      "see_also": [
+        "check",
+        "replay",
+        "trace"
+      ]
+    },
+    {
+      "name": "hash",
+      "description": "print canonical SigId/StageId hashes for each function",
+      "arguments": [
+        {
+          "name": "file",
+          "type": "string",
+          "description": "path to a .lex file",
+          "required": true
+        }
+      ],
+      "options": [],
+      "subcommands": [],
+      "idempotent": true,
+      "examples": [
+        {
+          "description": "Hash a file",
+          "invocation": "lex hash app.lex"
+        },
+        {
+          "description": "Diff hashes across versions",
+          "invocation": "diff <(lex hash a.lex) <(lex hash b.lex)"
+        }
+      ],
+      "see_also": [
+        "publish",
+        "ast-diff"
+      ]
+    },
+    {
+      "name": "publish",
+      "description": "publish each stage in a file to the store as Draft",
+      "arguments": [
+        {
+          "name": "file",
+          "type": "string",
+          "description": "path to a .lex file",
+          "required": true
+        }
+      ],
+      "options": [
+        {
+          "name": "--store",
+          "type": "string",
+          "description": "store root directory (default: ~/.lex/store)"
+        },
+        {
+          "name": "--activate",
+          "type": "bool",
+          "description": "transition published stages to Active"
+        }
+      ],
+      "subcommands": [],
+      "idempotent": false,
+      "examples": [
+        {
+          "description": "Publish drafts",
+          "invocation": "lex publish app.lex"
+        },
+        {
+          "description": "Publish + activate",
+          "invocation": "lex publish --activate app.lex"
+        }
+      ],
+      "see_also": [
+        "store",
+        "branch"
+      ]
+    },
+    {
+      "name": "store",
+      "description": "browse the content-addressed code store",
+      "arguments": [],
+      "options": [],
+      "subcommands": [
+        {
+          "name": "list",
+          "description": "list SigIds in the store",
+          "arguments": [],
+          "options": [
+            {
+              "name": "--store",
+              "type": "string",
+              "description": "store root directory"
+            }
+          ],
+          "subcommands": [],
+          "idempotent": true
+        },
+        {
+          "name": "get",
+          "description": "print metadata + canonical AST for a StageId",
+          "arguments": [
+            {
+              "name": "stage",
+              "type": "string",
+              "description": "StageId hex",
+              "required": true
+            }
+          ],
+          "options": [
+            {
+              "name": "--store",
+              "type": "string",
+              "description": "store root directory"
+            }
+          ],
+          "subcommands": [],
+          "idempotent": true
+        }
+      ],
+      "examples": [
+        {
+          "description": "List sigs",
+          "invocation": "lex store list"
+        },
+        {
+          "description": "Get a stage",
+          "invocation": "lex store get abc123..."
+        }
+      ],
+      "see_also": [
+        "publish",
+        "branch",
+        "store-merge"
+      ]
+    },
+    {
+      "name": "trace",
+      "description": "print a saved execution trace tree as JSON",
+      "arguments": [
+        {
+          "name": "run_id",
+          "type": "string",
+          "description": "run identifier",
+          "required": true
+        }
+      ],
+      "options": [],
+      "subcommands": [],
+      "idempotent": true,
+      "examples": [
+        {
+          "description": "Inspect a trace",
+          "invocation": "lex trace 2024-01-15-abc"
+        }
+      ],
+      "see_also": [
+        "replay",
+        "diff"
+      ]
+    },
+    {
+      "name": "replay",
+      "description": "re-execute with effect overrides keyed by NodeId",
+      "arguments": [
+        {
+          "name": "run_id",
+          "type": "string",
+          "description": "run identifier",
+          "required": true
+        },
+        {
+          "name": "file",
+          "type": "string",
+          "description": "source file",
+          "required": true
+        },
+        {
+          "name": "fn",
+          "type": "string",
+          "description": "function name",
+          "required": true
+        },
+        {
+          "name": "args",
+          "type": "string[]",
+          "description": "JSON-encoded positional args",
+          "required": false
+        }
+      ],
+      "options": [
+        {
+          "name": "--override",
+          "type": "string",
+          "description": "NODE=JSON override (repeatable)"
+        }
+      ],
+      "subcommands": [],
+      "idempotent": false,
+      "examples": [
+        {
+          "description": "Replay verbatim",
+          "invocation": "lex replay 2024-01-15-abc app.lex main"
+        },
+        {
+          "description": "Replay with override",
+          "invocation": "lex replay 2024-01-15-abc app.lex main --override 7=42"
+        }
+      ],
+      "see_also": [
+        "run",
+        "trace",
+        "diff"
+      ]
+    },
+    {
+      "name": "diff",
+      "description": "first NodeId where two execution traces diverge",
+      "arguments": [
+        {
+          "name": "run_a",
+          "type": "string",
+          "description": "first run id",
+          "required": true
+        },
+        {
+          "name": "run_b",
+          "type": "string",
+          "description": "second run id",
+          "required": true
+        }
+      ],
+      "options": [],
+      "subcommands": [],
+      "idempotent": true,
+      "examples": [
+        {
+          "description": "Compare two runs",
+          "invocation": "lex diff run-1 run-2"
+        }
+      ],
+      "see_also": [
+        "replay",
+        "trace",
+        "ast-diff"
+      ]
+    },
+    {
+      "name": "serve",
+      "description": "start the agent API HTTP server",
+      "arguments": [],
+      "options": [
+        {
+          "name": "--port",
+          "type": "int",
+          "description": "TCP port (default: 7000)"
+        },
+        {
+          "name": "--store",
+          "type": "string",
+          "description": "store root directory"
+        }
+      ],
+      "subcommands": [],
+      "idempotent": false,
+      "examples": [
+        {
+          "description": "Start with defaults",
+          "invocation": "lex serve"
+        },
+        {
+          "description": "Pin port + store",
+          "invocation": "lex serve --port 8080 --store /var/lex"
+        }
+      ],
+      "see_also": [
+        "tool-registry"
+      ]
+    },
+    {
+      "name": "conformance",
+      "description": "run all JSON test descriptors under a directory",
+      "arguments": [
+        {
+          "name": "dir",
+          "type": "string",
+          "description": "directory of conformance descriptors",
+          "required": true
+        }
+      ],
+      "options": [],
+      "subcommands": [],
+      "idempotent": true,
+      "examples": [
+        {
+          "description": "Run shipped suite",
+          "invocation": "lex conformance crates/conformance/tests/data"
+        }
+      ],
+      "see_also": [
+        "check",
+        "spec"
+      ]
+    },
+    {
+      "name": "spec",
+      "description": "Spec proof checker (randomized + SMT-LIB export)",
+      "arguments": [],
+      "options": [],
+      "subcommands": [
+        {
+          "name": "check",
+          "description": "check a Spec against a Lex source",
+          "arguments": [
+            {
+              "name": "spec",
+              "type": "string",
+              "description": "spec file",
+              "required": true
+            }
+          ],
+          "options": [
+            {
+              "name": "--source",
+              "type": "string",
+              "description": "source file to verify against"
+            }
+          ],
+          "subcommands": [],
+          "idempotent": true
+        },
+        {
+          "name": "smt",
+          "description": "emit SMT-LIB for external Z3",
+          "arguments": [
+            {
+              "name": "spec",
+              "type": "string",
+              "description": "spec file",
+              "required": true
+            }
+          ],
+          "options": [],
+          "subcommands": [],
+          "idempotent": true
+        }
+      ],
+      "examples": [
+        {
+          "description": "Check a spec",
+          "invocation": "lex spec check sort.spec --source sort.lex"
+        },
+        {
+          "description": "Export SMT-LIB",
+          "invocation": "lex spec smt sort.spec"
+        }
+      ],
+      "see_also": [
+        "check",
+        "conformance"
+      ]
+    },
+    {
+      "name": "agent-tool",
+      "description": "have an LLM emit a Lex tool body, run it under declared effects",
+      "arguments": [],
+      "options": [
+        {
+          "name": "--allow-effects",
+          "type": "string",
+          "description": "permitted effect kinds"
+        },
+        {
+          "name": "--request",
+          "type": "string",
+          "description": "natural-language request"
+        },
+        {
+          "name": "--body",
+          "type": "string",
+          "description": "inline tool body"
+        },
+        {
+          "name": "--body-file",
+          "type": "string",
+          "description": "tool body in a file"
+        },
+        {
+          "name": "--spec",
+          "type": "string",
+          "description": "spec file for behavioral verification"
+        },
+        {
+          "name": "--examples",
+          "type": "string",
+          "description": "JSON examples for behavioral checking"
+        },
+        {
+          "name": "--diff-body",
+          "type": "string",
+          "description": "differential evaluation: alternate body"
+        },
+        {
+          "name": "--diff-body-file",
+          "type": "string",
+          "description": "differential evaluation: alternate body file"
+        },
+        {
+          "name": "--json",
+          "type": "bool",
+          "description": "machine-readable output"
+        }
+      ],
+      "subcommands": [],
+      "idempotent": false,
+      "examples": [
+        {
+          "description": "Run with allow-list",
+          "invocation": "lex agent-tool --allow-effects fs_read --request \"sum lines of /tmp/log\""
+        },
+        {
+          "description": "Verify against spec",
+          "invocation": "lex agent-tool --spec sort.spec --body-file body.lex --json"
+        }
+      ],
+      "see_also": [
+        "check",
+        "spec",
+        "run"
+      ]
+    },
+    {
+      "name": "tool-registry",
+      "description": "runtime tool registration over HTTP",
+      "arguments": [],
+      "options": [],
+      "subcommands": [
+        {
+          "name": "serve",
+          "description": "HTTP service to register Lex tools and invoke them",
+          "arguments": [],
+          "options": [
+            {
+              "name": "--port",
+              "type": "int",
+              "description": "TCP port"
+            }
+          ],
+          "subcommands": [],
+          "idempotent": false
+        }
+      ],
+      "examples": [
+        {
+          "description": "Run on default port",
+          "invocation": "lex tool-registry serve"
+        }
+      ],
+      "see_also": [
+        "serve",
+        "agent-tool"
+      ]
+    },
+    {
+      "name": "audit",
+      "description": "structural code search by effect / call / hostname / AST kind",
+      "arguments": [
+        {
+          "name": "paths",
+          "type": "string[]",
+          "description": "files / directories to scan",
+          "required": false
+        }
+      ],
+      "options": [
+        {
+          "name": "--effect",
+          "type": "string",
+          "description": "effect kind filter"
+        },
+        {
+          "name": "--call",
+          "type": "string",
+          "description": "called-function filter"
+        },
+        {
+          "name": "--host",
+          "type": "string",
+          "description": "hostname filter (literal)"
+        },
+        {
+          "name": "--kind",
+          "type": "string",
+          "description": "AST node kind filter"
+        },
+        {
+          "name": "--json",
+          "type": "bool",
+          "description": "machine-readable output"
+        }
+      ],
+      "subcommands": [],
+      "idempotent": true,
+      "examples": [
+        {
+          "description": "Find network calls",
+          "invocation": "lex audit --effect net examples"
+        },
+        {
+          "description": "Find a host as JSON",
+          "invocation": "lex audit --host api.example.com --json src"
+        }
+      ],
+      "see_also": [
+        "ast-diff",
+        "ast-merge"
+      ]
+    },
+    {
+      "name": "ast-diff",
+      "description": "AST-native diff: added/removed/renamed/modified fns + body patches",
+      "arguments": [
+        {
+          "name": "file_a",
+          "type": "string",
+          "description": "left source file",
+          "required": true
+        },
+        {
+          "name": "file_b",
+          "type": "string",
+          "description": "right source file",
+          "required": true
+        }
+      ],
+      "options": [
+        {
+          "name": "--json",
+          "type": "bool",
+          "description": "structured JSON output"
+        }
+      ],
+      "subcommands": [],
+      "idempotent": true,
+      "examples": [
+        {
+          "description": "Compare two versions",
+          "invocation": "lex ast-diff a.lex b.lex"
+        },
+        {
+          "description": "Machine-readable",
+          "invocation": "lex ast-diff --json a.lex b.lex"
+        }
+      ],
+      "see_also": [
+        "audit",
+        "ast-merge"
+      ]
+    },
+    {
+      "name": "ast-merge",
+      "description": "three-way structural merge with structured JSON conflicts",
+      "arguments": [
+        {
+          "name": "base",
+          "type": "string",
+          "description": "common ancestor source",
+          "required": true
+        },
+        {
+          "name": "ours",
+          "type": "string",
+          "description": "our side",
+          "required": true
+        },
+        {
+          "name": "theirs",
+          "type": "string",
+          "description": "their side",
+          "required": true
+        }
+      ],
+      "options": [
+        {
+          "name": "--output",
+          "type": "string",
+          "description": "write merged source to a file"
+        },
+        {
+          "name": "--json",
+          "type": "bool",
+          "description": "emit conflicts as JSON"
+        }
+      ],
+      "subcommands": [],
+      "idempotent": false,
+      "examples": [
+        {
+          "description": "Merge three versions",
+          "invocation": "lex ast-merge base.lex ours.lex theirs.lex"
+        },
+        {
+          "description": "Materialize merge",
+          "invocation": "lex ast-merge base.lex ours.lex theirs.lex --output merged.lex"
+        }
+      ],
+      "see_also": [
+        "ast-diff",
+        "store-merge"
+      ]
+    },
+    {
+      "name": "branch",
+      "description": "snapshot branches in lex-store (tier-1 agent-native VC)",
+      "arguments": [],
+      "options": [],
+      "subcommands": [
+        {
+          "name": "list",
+          "description": "list branches in the store",
+          "arguments": [],
+          "options": [
+            {
+              "name": "--store",
+              "type": "string",
+              "description": "store root"
+            }
+          ],
+          "subcommands": [],
+          "idempotent": true
+        },
+        {
+          "name": "show",
+          "description": "show a branch's head map",
+          "arguments": [
+            {
+              "name": "name",
+              "type": "string",
+              "description": "branch name",
+              "required": true
+            }
+          ],
+          "options": [
+            {
+              "name": "--store",
+              "type": "string",
+              "description": "store root"
+            }
+          ],
+          "subcommands": [],
+          "idempotent": true
+        },
+        {
+          "name": "create",
+          "description": "create a branch",
+          "arguments": [
+            {
+              "name": "name",
+              "type": "string",
+              "description": "branch name",
+              "required": true
+            }
+          ],
+          "options": [
+            {
+              "name": "--from",
+              "type": "string",
+              "description": "parent branch (default: main)"
+            },
+            {
+              "name": "--store",
+              "type": "string",
+              "description": "store root"
+            }
+          ],
+          "subcommands": [],
+          "idempotent": false
+        },
+        {
+          "name": "delete",
+          "description": "delete a non-current, non-default branch",
+          "arguments": [
+            {
+              "name": "name",
+              "type": "string",
+              "description": "branch name",
+              "required": true
+            }
+          ],
+          "options": [
+            {
+              "name": "--store",
+              "type": "string",
+              "description": "store root"
+            }
+          ],
+          "subcommands": [],
+          "idempotent": false
+        },
+        {
+          "name": "use",
+          "description": "set the current branch",
+          "arguments": [
+            {
+              "name": "name",
+              "type": "string",
+              "description": "branch name",
+              "required": true
+            }
+          ],
+          "options": [
+            {
+              "name": "--store",
+              "type": "string",
+              "description": "store root"
+            }
+          ],
+          "subcommands": [],
+          "idempotent": false
+        },
+        {
+          "name": "current",
+          "description": "print the current branch",
+          "arguments": [],
+          "options": [
+            {
+              "name": "--store",
+              "type": "string",
+              "description": "store root"
+            }
+          ],
+          "subcommands": [],
+          "idempotent": true
+        }
+      ],
+      "examples": [
+        {
+          "description": "List branches",
+          "invocation": "lex branch list"
+        },
+        {
+          "description": "Create a feature",
+          "invocation": "lex branch create feature --from main"
+        }
+      ],
+      "see_also": [
+        "store-merge",
+        "store"
+      ]
+    },
+    {
+      "name": "store-merge",
+      "description": "three-way merge between two branches in the store",
+      "arguments": [
+        {
+          "name": "src",
+          "type": "string",
+          "description": "source branch",
+          "required": true
+        },
+        {
+          "name": "dst",
+          "type": "string",
+          "description": "destination branch",
+          "required": true
+        }
+      ],
+      "options": [
+        {
+          "name": "--commit",
+          "type": "bool",
+          "description": "apply a clean merge to dst (refused if conflicts)"
+        },
+        {
+          "name": "--json",
+          "type": "bool",
+          "description": "emit the merge report as JSON"
+        },
+        {
+          "name": "--store",
+          "type": "string",
+          "description": "store root directory"
+        }
+      ],
+      "subcommands": [],
+      "idempotent": false,
+      "examples": [
+        {
+          "description": "Preview a merge",
+          "invocation": "lex store-merge feature main"
+        },
+        {
+          "description": "Commit a clean merge",
+          "invocation": "lex store-merge feature main --commit"
+        }
+      ],
+      "see_also": [
+        "branch",
+        "ast-merge"
+      ]
+    }
+  ]
+}
