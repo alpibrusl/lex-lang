@@ -4,7 +4,7 @@ A small family of programming languages designed for LLMs as primary writers, re
 
 Implementation of `langspecv2.md`. The design rules and milestone definitions all come from that document; this README focuses on what currently runs.
 
-> **Looking for the pitch?** The [project landing page](docs/index.html) is a single static HTML — open it locally, or visit it via GitHub Pages once enabled (Settings → Pages → Source: `main` / `/docs`). It frames Lex as a sandbox for agent-written code: type-check rejects malicious LLM-generated bodies before they run.
+> Looking for the pitch? See [`docs/index.html`](docs/index.html) — single static page, dark-mode-ready, self-contained. Once GitHub Pages is enabled (Settings → Pages → Source: `main` / `/docs`), it'll be live at `https://alpibrusl.github.io/lex-lang/`.
 
 ## Design rules at a glance
 
@@ -213,38 +213,23 @@ A native `matmul` (via `matrixmultiply::dgemm`) is registered in Core's `NativeR
 
 ## Sandboxing agent-generated code
 
-Lex's effect system + capability gate compose into a sandbox for code an LLM emits at runtime. `lex agent-tool` asks Claude for a tool body, splices it into a fixed signature, and runs it under a declared effect set — the type checker rejects any body that reaches outside that set, **before a single byte runs**.
+`lex agent-tool` asks Claude for a tool body, splices it into a fixed signature, and runs it under a declared effect set. The type checker rejects any body that reaches outside that set, **before a single byte runs**.
 
 ```bash
-# Benign request — fits in `[net]`, runs.
 lex agent-tool --allow-effects net \
   --request 'fetch http://example.com and return its length'
 # → ok len=1256
 
-# Malicious body — uses io even though only net was granted. The
-# type checker rejects before execution.
 lex agent-tool --allow-effects net --input "x" \
   --body 'match io.read("/etc/passwd") { Ok(s) => s, Err(e) => e }'
 # → TYPE-CHECK REJECTED — tool not run.
 #     effect `io` not declared at n_0
-#       (the body uses effect `io` but the host only allows ["net"])
 #   exit 2
 ```
 
-The flow is:
-
-1. **Build** a fixed program: `fn tool(input :: Str) -> [<allowed>] Str { <BODY> }` with every std module pre-imported, so the agent can syntactically reach any effect — the *signature* is what gates use.
-2. **Type-check.** Any effect appearing in the body but not declared on `tool` produces `EffectNotDeclared`.
-3. **Policy-check.** A second gate at the runtime policy layer.
-4. **Run** with a step-limit cap (`--max-steps`, default 1M). Closes the runaway-compute hole — an LLM-emitted `list.fold(list.range(0, 1e9), …)` aborts at the cap with exit code 4, before the host hangs.
-
-`--body '<src>'` and `--body-file <path>` skip the API call (handy for testing or when the body is already on hand). `--request '<query>'` calls the Anthropic API; needs `ANTHROPIC_API_KEY` (or pass `--api-key`). The default model is `claude-sonnet-4-6`; override with `--model`.
-
-This pattern works for plugin marketplaces (per-plugin effect manifests), multi-tenant code runners (per-tenant effect quotas), and any flow where untrusted code lands on your machine and you'd rather not trust it.
+Flags: `--body '<src>'` / `--body-file <path>` skip the API call; `--request '<q>'` needs `ANTHROPIC_API_KEY`. `--max-steps N` (default 1M) caps op count as a runtime DoS guard. `--allow-fs-read PATH` and `--allow-net-host HOST` add per-path / per-host scopes on top of `--allow-effects`.
 
 ### Adversarial benchmark
-
-`bench/REPORT.md` runs 7 attacks and 2 benign cases through three sandboxes side-by-side. "Actively blocked" means the sandbox pre-emptively rejected (type-check, AST rewrite, or policy gate) — it excludes cases that fail at runtime via NameError. Regenerate with `cargo test -p lex-cli --test agent_sandbox_bench`.
 
 |  | Actively blocked | Benign allowed | Mechanism |
 |---|---|---|---|
@@ -252,15 +237,7 @@ This pattern works for plugin marketplaces (per-plugin effect manifests), multi-
 | Python (naive `exec`) | 0 / 7 | 2 / 2 | `__builtins__` allowlist + string blocklist |
 | Python (RestrictedPython) | 3 / 7 | 2 / 2 | AST rewrite + `safe_builtins` + `safer_getattr` |
 
-The headline is now uniformly active rejection: Lex catches every attack at type-check or policy gate. RestrictedPython actively catches the AST-traversal patterns; the rest rely on `safe_builtins` making the dangerous symbol unreachable at runtime (still safe — just passive).
-
-Cases 6 and 7 demonstrate **per-path** and **per-host** scopes — `--allow-fs-read /tmp/safe` and `--allow-net-host api.openai.com`. A tool granted `[io]` can be locked to a specific directory; a tool granted `[net]` can be pinned to a specific host. RestrictedPython has no per-path or per-host scope: once `open` or `urllib` is in globals, it's available for any target.
-
-The structural pitch:
-
-- RestrictedPython is opt-in **restriction** of an unrestricted base. The host must keep `safe_builtins` audited as Python evolves.
-- Lex is opt-in **granting** from a sandboxed default. Effects are part of the language's type system.
-- Lex rejects at **type-check / policy gate**; RestrictedPython at compile-time AST rewrite or runtime NameError. For agent-generated code, pre-execution rejection matters when the attacker controls *both* source and trigger.
+7 attacks + 2 benign cases through three sandboxes. Full report at [`bench/REPORT.md`](bench/REPORT.md); regenerate with `cargo test -p lex-cli --test agent_sandbox_bench`. The structural pitch — *opt-in granting from a sandboxed default* vs *opt-in restriction of an unrestricted base*, type-check rejection vs runtime NameError — is on the [project landing page](docs/index.html).
 
 ## Toolchain reference
 
