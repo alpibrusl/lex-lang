@@ -78,6 +78,12 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                     Ty::Con("Option".into(), vec![Ty::str()]),
                 ));
             }
+            // slice :: (Str, Int, Int) -> Str  — byte-range half-open
+            fields.insert("slice".into(), Ty::function(
+                vec![Ty::str(), Ty::int(), Ty::int()],
+                EffectSet::empty(),
+                Ty::str(),
+            ));
             Some(Ty::Record(fields))
         }
         "int" => {
