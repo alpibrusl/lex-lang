@@ -112,6 +112,7 @@ fn commands() -> Vec<CommandInfo> {
         cmd_check(),
         cmd_run(),
         cmd_hash(),
+        cmd_blame(),
         cmd_publish(),
         cmd_store(),
         cmd_trace(),
@@ -183,6 +184,18 @@ fn cmd_hash() -> CommandInfo {
             ("Diff hashes across versions", "diff <(lex hash a.lex) <(lex hash b.lex)"),
         ])
         .with_see_also(vec!["publish", "ast-diff"])
+}
+
+fn cmd_blame() -> CommandInfo {
+    CommandInfo::new("blame", "show each fn's stage history from the store")
+        .idempotent(true)
+        .add_argument("file", "string", "path to a .lex file", true)
+        .add_option("--store", "string", "store root directory", None)
+        .with_examples(vec![
+            ("Blame a file", "lex blame app.lex"),
+            ("Machine-readable", "lex --output json blame app.lex"),
+        ])
+        .with_see_also(vec!["hash", "publish", "store", "log"])
 }
 
 fn cmd_publish() -> CommandInfo {

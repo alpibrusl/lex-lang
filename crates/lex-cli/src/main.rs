@@ -69,6 +69,7 @@ fn run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "check" => cmd_check(fmt, &args[1..]),
         "run" => cmd_run(fmt, &args[1..]),
         "hash" => cmd_hash(fmt, &args[1..]),
+        "blame" => cmd_blame(fmt, &args[1..]),
         "publish" => cmd_publish(fmt, &args[1..]),
         "store" => cmd_store(fmt, &args[1..]),
         "trace" => cmd_trace(fmt, &args[1..]),
@@ -418,6 +419,106 @@ fn cmd_hash(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         }
     });
     Ok(())
+}
+
+fn cmd_blame(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    // usage: lex blame [--store DIR] <file>
+    let (root, rest, _, _) = parse_store_flag(args);
+    let path = rest.first().ok_or_else(|| anyhow!("usage: lex blame [--store DIR] <file>"))?;
+    let src = read_source(path)?;
+    let prog = parse_source(&src)?;
+    let stages = canonicalize_program(&prog);
+    let store = Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
+
+    let mut entries = Vec::new();
+    for s in &stages {
+        // Imports don't have stage identities.
+        if matches!(s, Stage::Import(_)) { continue; }
+        let name = stage_name(s).to_string();
+        let sig = match lex_ast::sig_id(s) { Some(id) => id, None => continue };
+        let here_stage = stage_id(s).unwrap_or_default();
+        let history = store.sig_history(&sig)?;
+        let active_stage = store.resolve_sig(&sig).ok().flatten();
+
+        // Where does this source's stage stand?
+        let here_status = history.iter().find(|h| h.stage_id == here_stage)
+            .map(|h| format!("{:?}", h.status).to_lowercase());
+
+        entries.push(serde_json::json!({
+            "name": name,
+            "sig_id": sig,
+            "here_stage_id": here_stage,
+            "here_status": here_status,    // None => unpublished
+            "active_stage_id": active_stage,
+            "history": history.iter().map(|h| serde_json::json!({
+                "stage_id": h.stage_id,
+                "status": format!("{:?}", h.status).to_lowercase(),
+                "last_at": h.last_at,
+                "published_at": h.published_at,
+            })).collect::<Vec<_>>(),
+        }));
+    }
+    let data = serde_json::json!({ "blame": entries });
+    let entries_for_text = entries.clone();
+    acli::emit_or_text("blame", data, fmt, move || {
+        for e in &entries_for_text {
+            print_blame_entry(e);
+        }
+    });
+    Ok(())
+}
+
+fn print_blame_entry(e: &serde_json::Value) {
+    let name = e["name"].as_str().unwrap_or("?");
+    let sig = e["sig_id"].as_str().unwrap_or("");
+    let here = e["here_stage_id"].as_str().unwrap_or("");
+    let status = e["here_status"].as_str().unwrap_or("unpublished");
+    let active = e["active_stage_id"].as_str();
+    let history = e["history"].as_array().map(|a| a.as_slice()).unwrap_or(&[]);
+
+    println!("fn {name}");
+    println!("  sig:     {sig:.16}…");
+    if active.map(|a| a == here).unwrap_or(false) {
+        println!("  current: {here:.16}…  ({status})");
+    } else {
+        println!("  current: {here:.16}…  ({status} in store)");
+        if let Some(a) = active {
+            println!("  active in store: {a:.16}…");
+        }
+    }
+    if history.is_empty() {
+        println!("  history: (not in store)");
+    } else {
+        println!("  history: {} stage(s)", history.len());
+        for h in history {
+            let sid = h["stage_id"].as_str().unwrap_or("");
+            let st  = h["status"].as_str().unwrap_or("?");
+            let at  = h["last_at"].as_u64().unwrap_or(0);
+            let marker = if sid == here { " ←" } else { "" };
+            println!("    {sid:.16}…  {st:<10} {}{marker}", format_blame_ts(at));
+        }
+    }
+    println!();
+}
+
+fn format_blame_ts(secs: u64) -> String {
+    let mut s = secs as i64;
+    let mut days = s.div_euclid(86_400);
+    s = s.rem_euclid(86_400);
+    let h = s / 3600; s %= 3600;
+    let m = s / 60;
+    let mut y: i64 = 1970;
+    loop {
+        let yd = if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 { 366 } else { 365 };
+        if days < yd { break; }
+        days -= yd; y += 1;
+    }
+    let mdays = [31,
+        if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 { 29 } else { 28 },
+        31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut mo = 0usize;
+    while mo < 12 && days >= mdays[mo] { days -= mdays[mo]; mo += 1; }
+    format!("{y:04}-{:02}-{:02}T{:02}:{:02}Z", mo + 1, days + 1, h, m)
 }
 
 fn stage_name(s: &Stage) -> &str {
