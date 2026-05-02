@@ -18,42 +18,55 @@ want a technical critique.
 ## Post
 
 ```text
-Most security tooling assumes humans review the code that runs.
+Sharing something I've been working on for a while.
 
-Agents are about to break that assumption — and once they do,
-the function signature has to become the contract.
+I run agent-generated code locally as part of my workflow,
+and I kept wanting a sandbox where the host could say "this
+body can touch the network and nothing else" and have a type
+checker enforce it — not catch it as a runtime exception
+after something already escaped.
 
-I've been building Lex, a small functional language whose type
-system encodes effects in the signature itself:
+Lex is the small language that fell out of that. A function
+annotated
 
    fn fetch(url) -> [net] Result[Str, Str]
 
-If the body tries to touch the filesystem, the program is
-rejected at type-check, before any byte runs.
+cannot reach the filesystem. If the body tries to read a
+file, the program is rejected at type-check, before it runs.
 
-To test the idea, I ran 7 adversarial attacks + 2 benign cases
-through three sandboxes:
+To check whether the idea actually held, I ran a small
+adversarial bench: 7 attacks + 2 benign cases through three
+sandboxes. Numbers below — methodology and per-case detail
+in the repo's bench/REPORT.md:
 
-  • Naive Python exec:        0 / 7 attacks blocked
-  • RestrictedPython:         3 / 7 attacks blocked
-  • Lex:                      7 / 7 attacks blocked
+  • Naive Python exec:    0 / 7 attacks blocked
+  • RestrictedPython:     3 / 7 attacks blocked
+  • Lex:                  7 / 7 attacks blocked
 
-The difference isn't cleverer rules. It's where the rejection
-happens:
+The honest read is that most of the gap isn't cleverer rules.
+It's where the rejection happens: RestrictedPython rejects at
+runtime after the body has started; Lex rejects at type-check
+before it runs. Different layer, not necessarily a better
+idea — and I picked the attacks myself, so the numbers come
+with that grain of salt.
 
-  • RestrictedPython rejects at runtime — a NameError after the
-    AST has been rewritten and execution has started.
-  • Lex rejects at type-check — pre-execution. The body never
-    runs.
+Two things I want to be upfront about:
 
-The motivating workflow is `lex agent-tool`: ask Claude or
-Codex for a tool body, splice it into a fixed signature, and
-run it under a declared effect set. Anything outside the set
-fails to compile.
+Capability ≠ correctness. A function granted [net] can still
+exfiltrate data; the type system answers what your code
+touches, not whether the touch is wise. Spec proofs cover
+some of that gap. The rest is unclaimed.
 
-I'd love feedback from anyone running LLM-generated code in
-production — what's your current sandboxing layer, and where
-does it leak?
+A new language is a real ask. The pitch isn't "rewrite your
+stack" — it's "the AI-emitted tool body lives in a 30-line
+Lex fragment under a known effect set, and the rest of your
+code keeps doing what it's doing." If that framing doesn't
+help, this probably isn't for you.
+
+If you run LLM-generated code in production, I'd genuinely
+like to hear what your current sandboxing layer is and
+where it leaks. Trying to learn what the gap actually looks
+like in practice, not just in benchmarks.
 
 Repo (open source, EUPL-1.2):
 https://github.com/alpibrusl/lex-lang
