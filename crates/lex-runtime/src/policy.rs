@@ -26,6 +26,14 @@ pub struct Policy {
     /// scoped to e.g. `api.openai.com` only — without this, [net]
     /// is a blank check to exfiltrate anywhere.
     pub allow_net_host: Vec<String>,
+    /// Per-binary scope on the [proc] effect. Empty = ANY binary
+    /// allowed once [proc] is granted (treat as a global escape
+    /// hatch; only acceptable for trusted code). Non-empty =
+    /// `proc.spawn(cmd, args)` must match `cmd` against the
+    /// basename portion of one of these entries. Per-arg validation
+    /// is the *caller's* responsibility — see SECURITY.md's
+    /// "argument injection" note.
+    pub allow_proc: Vec<String>,
     pub budget: Option<u64>,
 }
 
@@ -42,6 +50,7 @@ impl Policy {
             allow_fs_read: Vec::new(),
             allow_fs_write: Vec::new(),
             allow_net_host: Vec::new(),
+            allow_proc: Vec::new(),
             budget: None,
         }
     }

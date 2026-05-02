@@ -78,6 +78,77 @@ bound:
 Treat Lex's effect system as **the innermost ring of defense in
 depth**, not as a complete sandbox.
 
+## The `[proc]` effect: read this before you grant it
+
+`[proc]` (subprocess spawn, `proc.spawn(cmd, args)`) is the
+**escape hatch** in Lex's effect system. A function with `[proc]`
+in its signature can do anything the spawned binary can do —
+which, for a general-purpose tool like `git` or `bash`, is
+*everything*. Once `[proc]` is in scope, the effect system stops
+making strong claims about what the function does.
+
+What `[proc]` **does** still gate:
+
+- **Effect declaration** is mandatory. A function that calls
+  `proc.spawn` without `[proc]` in its signature is rejected at
+  type-check.
+- **Binary basename allow-list** via `--allow-proc=git,gh,cargo`.
+  An empty list means "any binary" (escape hatch — only for
+  trusted code); a non-empty list rejects pre-spawn anything
+  whose basename isn't on the list.
+- **Per-arg length** capped at 64 KiB and **arg-count** capped at
+  1024 — runtime DoS guards.
+- **Type-checked argv shape**: `args :: List[Str]`. No
+  shell-interpolation; the runtime calls `Command::new(cmd).args(args)`
+  which passes argv directly to `execve`, no `/bin/sh -c` in the
+  middle.
+
+What `[proc]` **does not** gate:
+
+- **Argument injection.** A binary that itself accepts an
+  `--exec=...` or `-e ...` flag (think `bash -c`, `git -c
+  alias.x=!sh`, `sed e ...`) can be subverted by attacker-controlled
+  args. The allow-list says "you may run `git`"; it does not say
+  "with these specific subcommands."
+- **Environment variables.** The spawned process inherits the
+  parent's env. A binary that reads `LD_PRELOAD`, `PATH`, or
+  `GIT_*` vars can be redirected by manipulating those.
+- **Working directory.** Inherits the parent's `cwd`. A binary
+  that does `git status` runs against whatever repo your process
+  is in.
+- **Network, filesystem, signals.** Whatever the spawned binary
+  does, the OS does. The Lex effect system doesn't follow
+  execution into the child.
+
+### Best practices when granting `[proc]`
+
+1. **Always pass an explicit `--allow-proc` list.** Empty-list
+   "escape hatch" mode is for one-off scripts you wrote, not for
+   anything that runs LLM-emitted bodies.
+2. **Allow-list narrowly.** `--allow-proc git,gh` is much
+   narrower than `--allow-proc bash`. Avoid shells, interpreters,
+   and any binary with a `--exec`-style flag.
+3. **Validate argv at the Lex layer** before passing it to
+   `proc.spawn`. If an attacker can inject into the args, the
+   binary can do whatever its argv accepts.
+4. **Layer with OS-level isolation.** Run the parent process in
+   a container (`docker run --memory=...`), under gVisor, or
+   with `nsjail` / `bubblewrap`. `[proc]` punches a hole in
+   Lex's effect system; the container is what catches what
+   falls through.
+5. **Audit spawned-binary surfaces.** `lex audit --calls
+   proc.spawn` finds every call site; pair with code review for
+   the args.
+6. **Treat `[proc]` as "I'm writing infrastructure, not running
+   an agent."** Agent-emitted code that needs to call
+   subprocesses should go through a Lex-side adapter that
+   validates the cmd + args, not get `[proc]` directly.
+
+We took the trade because `[proc]` unlocks real workflows
+(orchestrating other CLI agents, running tests, talking to
+`git`) that the existing effect set can't serve. The honesty
+above is the price.
+
 ## Recommended deployment
 
 For untrusted code paths (especially `lex agent-tool` and

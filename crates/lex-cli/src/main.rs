@@ -349,6 +349,15 @@ fn parse_run_flags(args: &[String]) -> Result<(Policy, Vec<String>, bool, Option
                 policy.allow_net_host.push(val.clone());
                 i += 2;
             }
+            "--allow-proc" => {
+                // Comma-separated binary basenames the [proc] effect
+                // is allowed to spawn. Read SECURITY.md before granting.
+                let val = args.get(i + 1).ok_or_else(|| anyhow!("--allow-proc needs a value"))?;
+                for name in val.split(',').filter(|s| !s.is_empty()) {
+                    policy.allow_proc.push(name.to_string());
+                }
+                i += 2;
+            }
             "--budget" => {
                 let val = args.get(i + 1).ok_or_else(|| anyhow!("--budget needs a value"))?;
                 policy.budget = Some(val.parse().context("--budget must be an integer")?);

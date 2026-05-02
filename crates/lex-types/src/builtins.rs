@@ -326,6 +326,31 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             ));
             Some(Ty::Record(fields))
         }
+        "proc" => {
+            // Subprocess dispatch. Effect: [proc]. Returns a Result
+            // with a record on success carrying stdout / stderr /
+            // exit_code. The runtime allow-lists which binary
+            // basenames are spawnable — `cmd` is the program to
+            // run, `args` is the literal argv (no shell parsing).
+            //
+            // Read SECURITY.md before adding [proc] to a policy:
+            // it weakens the "we know what this fn does" claim.
+            let mut fields = IndexMap::new();
+            let mut result_rec = IndexMap::new();
+            result_rec.insert("stdout".into(), Ty::str());
+            result_rec.insert("stderr".into(), Ty::str());
+            result_rec.insert("exit_code".into(), Ty::int());
+            // spawn :: Str, List[Str] -> [proc] Result[{stdout, stderr, exit_code}, Str]
+            fields.insert("spawn".into(), Ty::function(
+                vec![Ty::str(), Ty::List(Box::new(Ty::str()))],
+                EffectSet::singleton("proc"),
+                Ty::Con("Result".into(), vec![
+                    Ty::Record(result_rec),
+                    Ty::str(),
+                ]),
+            ));
+            Some(Ty::Record(fields))
+        }
         "json" => {
             let mut fields = IndexMap::new();
             // stringify :: T -> Str  (polymorphic on input)
@@ -582,6 +607,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "math" => "math",
         "map" => "map",
         "set" => "set",
+        "proc" => "proc",
         _ => return None,
     })
 }

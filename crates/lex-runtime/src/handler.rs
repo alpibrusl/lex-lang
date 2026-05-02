@@ -257,6 +257,76 @@ impl EffectHandler for DefaultHandler {
                 let body = expect_str(args.get(1))?;
                 Ok(Value::Bool(crate::ws::chat_send(registry, conn_id, body)))
             }
+            ("proc", "spawn") => {
+                // The escape hatch effect. Spawns a child process,
+                // collects its stdout/stderr, returns a structured
+                // record. Allow-list is the binary basename: anything
+                // outside `--allow-proc` is rejected pre-spawn.
+                //
+                // What this does NOT validate (per SECURITY.md):
+                // - per-arg content (a script-like CLI invoked via
+                //   --eval=... can run anything)
+                // - environment variables (inherited from the parent)
+                // - working directory (the parent's)
+                //
+                // For untrusted input, layer with OS-level
+                // sandboxing — gVisor / nsjail / a container.
+                let cmd = expect_str(args.first())?.to_string();
+                let raw_args = match args.get(1) {
+                    Some(Value::List(items)) => items,
+                    Some(other) => return Err(format!(
+                        "proc.spawn: args must be List[Str], got {other:?}")),
+                    None => return Err("proc.spawn: missing args list".into()),
+                };
+                let str_args: Vec<String> = raw_args.iter().map(|v| match v {
+                    Value::Str(s) => Ok(s.clone()),
+                    other => Err(format!("proc.spawn: arg must be Str, got {other:?}")),
+                }).collect::<Result<Vec<_>, _>>()?;
+
+                // Allow-list check: empty list = any binary (escape
+                // hatch); non-empty = basename of cmd must match an
+                // entry exactly.
+                if !self.policy.allow_proc.is_empty() {
+                    let basename = std::path::Path::new(&cmd)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(&cmd);
+                    if !self.policy.allow_proc.iter().any(|a| a == basename) {
+                        return Ok(err(Value::Str(format!(
+                            "proc.spawn: `{cmd}` not in --allow-proc {:?}",
+                            self.policy.allow_proc
+                        ))));
+                    }
+                }
+
+                // Hard caps: the spec doesn't pin numbers, but
+                // unbounded argv is a DoS vector.
+                if str_args.len() > 1024 {
+                    return Ok(err(Value::Str(
+                        "proc.spawn: arg-count exceeds 1024".into())));
+                }
+                if str_args.iter().any(|a| a.len() > 65_536) {
+                    return Ok(err(Value::Str(
+                        "proc.spawn: per-arg length exceeds 64 KiB".into())));
+                }
+
+                let output = std::process::Command::new(&cmd)
+                    .args(&str_args)
+                    .output();
+                match output {
+                    Ok(o) => {
+                        let mut rec = indexmap::IndexMap::new();
+                        rec.insert("stdout".into(), Value::Str(
+                            String::from_utf8_lossy(&o.stdout).to_string()));
+                        rec.insert("stderr".into(), Value::Str(
+                            String::from_utf8_lossy(&o.stderr).to_string()));
+                        rec.insert("exit_code".into(), Value::Int(
+                            o.status.code().unwrap_or(-1) as i64));
+                        Ok(ok(Value::Record(rec)))
+                    }
+                    Err(e) => Ok(err(Value::Str(format!("spawn `{cmd}`: {e}")))),
+                }
+            }
             other => Err(format!("unsupported effect {}.{}", other.0, other.1)),
         }
     }

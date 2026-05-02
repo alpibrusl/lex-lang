@@ -152,6 +152,7 @@ fn build_policy(p: &PolicyJson) -> Policy {
         allow_fs_read: p.allow_fs_read.iter().map(PathBuf::from).collect(),
         allow_fs_write: p.allow_fs_write.iter().map(PathBuf::from).collect(),
         allow_net_host: Vec::new(),
+        allow_proc: Vec::new(),
         budget: p.budget,
     }
 }
