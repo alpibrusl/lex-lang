@@ -327,6 +327,8 @@ them to GIFs for README / Twitter / LinkedIn.
 |---|---|
 | `lex parse <file>` | Print the canonical AST as JSON |
 | `lex check <file>` | Type-check; exit 0 or print structured errors |
+| `lex repl` | Interactive evaluator. `fn`/`type`/`import` extend the session; expressions are evaluated under a permissive policy. `.help`, `.list`, `.reset`, `.quit` |
+| `lex watch <file> [check\|run] [args...]` | Re-run on every save. Default action is `check`; `run` re-executes. Forwarded args (`--allow-effects ...`) pass through to the underlying subcommand |
 | `lex hash <file>` | Print SigId / StageId per stage |
 | `lex blame [--store DIR] <file>` | Per-fn stage history from the store: which StageId is currently in source, which is Active, predecessors with statuses + timestamps |
 | `lex run [policy] <file> <fn> [args]` | Execute a function (args are JSON) |
@@ -428,6 +430,23 @@ lex/
 | Hardening | [`SECURITY.md`](SECURITY.md) threat model ✅ ; parser-recursion DoS gate (`MAX_DEPTH=96`) ✅ ; **VM call-stack depth gate (`MAX_CALL_DEPTH=1024`) ✅** ; libFuzzer CI for parser + type checker ✅ ; VM-level memory bounds remain delegated to the host (container memory caps) |
 
 **Workspace test count:** 285 passing, 0 failing, 3 ignored (WS chat example, flaky on CI runners — pass locally with `--ignored`). `cargo clippy --workspace --all-targets -- -D warnings` clean. Fuzz CI: 60 s/PR, 5 min nightly across both targets.
+
+## Install
+
+**Pre-built binaries** (no Rust toolchain needed) are attached to
+[GitHub Releases](https://github.com/alpibrusl/lex-lang/releases)
+for Linux (x86_64 / aarch64), macOS (x86_64 / aarch64), and
+Windows (x86_64). Each archive contains the `lex` binary plus
+README / LICENSE / CHANGELOG. SHA-256 sums are uploaded alongside
+each tarball.
+
+```bash
+# Pick the right archive for your platform from the Releases page,
+# then:
+tar -xzf lex-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz
+mv lex-vX.Y.Z-x86_64-unknown-linux-gnu/lex /usr/local/bin/
+lex version
+```
 
 ## Building from source
 

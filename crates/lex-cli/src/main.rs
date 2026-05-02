@@ -16,6 +16,8 @@ mod diff;
 mod ast_merge;
 mod branch;
 mod acli;
+mod repl;
+mod watch;
 
 use ::acli::OutputFormat;
 use anyhow::{anyhow, bail, Context, Result};
@@ -94,6 +96,8 @@ fn run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "branch" => branch::cmd_branch(fmt, &args[1..]),
         "store-merge" => branch::cmd_store_merge(fmt, &args[1..]),
         "log" => branch::cmd_log(fmt, &args[1..]),
+        "repl" => repl::cmd_repl(&args[1..]),
+        "watch" => watch::cmd_watch(&args[1..]),
         "help" | "--help" | "-h" => { print_usage(); Ok(()) }
         other => bail!("unknown command `{other}`. try `lex help`"),
     }

@@ -1,0 +1,123 @@
+name: release
+
+# Triggers on `v*` tags. Build cross-platform binaries, attach
+# them to a GitHub Release. Manual `workflow_dispatch` lets us
+# rehearse without tagging.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (e.g. v0.1.0). Required for manual runs."
+        required: true
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross (linux aarch64 only)
+        if: matrix.cross
+        run: cargo install cross --locked
+
+      - name: Build (cargo)
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --target ${{ matrix.target }} --bin lex
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }} --bin lex
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          set -e
+          TAG="${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}"
+          NAME="lex-${TAG}-${{ matrix.target }}"
+          mkdir -p "dist/${NAME}"
+          cp README.md LICENSE CHANGELOG.md "dist/${NAME}/" 2>/dev/null || true
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            cp "target/${{ matrix.target }}/release/lex.exe" "dist/${NAME}/"
+            (cd dist && 7z a "${NAME}.zip" "${NAME}")
+          else
+            cp "target/${{ matrix.target }}/release/lex" "dist/${NAME}/"
+            tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
+          fi
+          ls -la dist/
+
+      - name: Compute sha256
+        shell: bash
+        run: |
+          cd dist
+          for f in *.tar.gz *.zip; do
+            [ -f "$f" ] || continue
+            shasum -a 256 "$f" > "${f}.sha256" 2>/dev/null || sha256sum "$f" > "${f}.sha256"
+          done
+          ls -la
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lex-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    name: publish to GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List downloaded
+        run: ls -la dist/
+
+      - name: Create / update Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name || github.event.inputs.tag }}
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
