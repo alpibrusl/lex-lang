@@ -129,7 +129,32 @@ fn commands() -> Vec<CommandInfo> {
         cmd_branch(),
         cmd_store_merge(),
         cmd_log(),
+        cmd_repl(),
+        cmd_watch(),
     ]
+}
+
+fn cmd_repl() -> CommandInfo {
+    CommandInfo::new("repl", "interactive evaluator (Lex source line-by-line)")
+        .idempotent(false)
+        .with_examples(vec![
+            ("Start a session", "lex repl"),
+            ("Evaluate at the prompt", "lex> 1 + 2 * 3"),
+        ])
+        .with_see_also(vec!["check", "run"])
+}
+
+fn cmd_watch() -> CommandInfo {
+    CommandInfo::new("watch", "re-run check or run on file save (agent inner loop)")
+        .idempotent(false)
+        .add_argument("file", "string", "file or directory to watch", true)
+        .add_argument("action", "enum[check|run]", "what to re-run on change (default: check)", false)
+        .add_argument("forwarded", "string[]", "forwarded to the underlying subcommand", false)
+        .with_examples(vec![
+            ("Watch + check", "lex watch app.lex"),
+            ("Watch + run", "lex watch app.lex run main"),
+        ])
+        .with_see_also(vec!["check", "run"])
 }
 
 // ---- per-command metadata -----------------------------------------
