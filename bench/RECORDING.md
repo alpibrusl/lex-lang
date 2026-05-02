@@ -7,8 +7,10 @@ attempt to escape the declared effect set.
 
 For the **agent-native VC** companion piece (branches, structural
 merge with JSON conflicts, `lex log` + `lex blame`, ACLI discovery)
-see [`RECORDING_VC.md`](RECORDING_VC.md). The two recordings are
-designed to live side-by-side on the landing page.
+see [`RECORDING_VC.md`](RECORDING_VC.md). For the **`[proc]`
+escape-hatch** demo (subprocess dispatch with binary allow-list)
+see [`RECORDING_PROC.md`](RECORDING_PROC.md). The three recordings
+are designed to live side-by-side on the landing page.
 
 ## What you need
 
