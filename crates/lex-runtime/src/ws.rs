@@ -185,7 +185,7 @@ fn run_loop(
         loop {
             match rx.try_recv() {
                 Ok(msg) => {
-                    if let Err(e) = ws.send(Message::Text(msg)) {
+                    if let Err(e) = ws.send(Message::Text(msg.into())) {
                         return Err(format!("ws send: {e}"));
                     }
                 }

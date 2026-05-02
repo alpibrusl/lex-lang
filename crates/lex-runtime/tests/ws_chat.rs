@@ -79,7 +79,7 @@ fn read_text(
     // short read timeout once after connect.
     let _ = timeout;
     match ws.read() {
-        Ok(Message::Text(s)) => Some(s),
+        Ok(Message::Text(s)) => Some(s.to_string()),
         _ => None,
     }
 }

@@ -1433,12 +1433,13 @@ Hard constraints:
         "messages": [{ "role": "user", "content": user_request }],
     });
     let resp: serde_json::Value = ureq::post("https://api.anthropic.com/v1/messages")
-        .set("x-api-key", api_key)
-        .set("anthropic-version", "2023-06-01")
-        .set("content-type", "application/json")
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
         .send_json(body)
         .map_err(|e| anyhow!("claude api: {e}"))?
-        .into_json()
+        .body_mut()
+        .read_json::<serde_json::Value>()
         .context("decode claude response")?;
     let text = resp.get("content")
         .and_then(|c| c.as_array())
