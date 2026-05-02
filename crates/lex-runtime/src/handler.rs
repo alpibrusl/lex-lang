@@ -448,28 +448,32 @@ fn unpack_response(v: &Value) -> (u16, String) {
 /// could fetch `example.com` but not `wttr.in` or `api.github.com`.
 fn http_request(method: &str, url: &str, body: Option<&str>) -> Value {
     use std::time::Duration;
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout_read(Duration::from_secs(30))
-        .timeout_write(Duration::from_secs(10))
-        .build();
-    let req = agent.request(method, url);
-    let resp = match body {
-        Some(b) => req.send_string(b),
-        None => req.call(),
+    // ureq 3 puts 4xx/5xx behind `Error::StatusCode(code)` and consumes
+    // the response, so the body would be lost. Disabling
+    // `http_status_as_error` lets us check the status manually and
+    // surface `Err("status 404: <body>")` like the old code did.
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(10)))
+        .timeout_recv_body(Some(Duration::from_secs(30)))
+        .timeout_send_body(Some(Duration::from_secs(10)))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let resp = match (method, body) {
+        ("GET", _) => agent.get(url).call(),
+        ("POST", Some(b)) => agent.post(url).send(b),
+        ("POST", None) => agent.post(url).send(""),
+        (m, _) => return err_value(format!("unsupported method: {m}")),
     };
     match resp {
-        Ok(r) => match r.into_string() {
-            Ok(s) => Value::Variant { name: "Ok".into(), args: vec![Value::Str(s)] },
-            Err(e) => err_value(format!("read body: {e}")),
-        },
-        // ureq surfaces 4xx/5xx as `Status` errors with the body
-        // attached. Mirror that into Lex's Result so a tool can
-        // inspect `Err("status 404: ...")` instead of getting a
-        // raw transport error.
-        Err(ureq::Error::Status(code, r)) => {
-            let body = r.into_string().unwrap_or_default();
-            err_value(format!("status {code}: {body}"))
+        Ok(mut r) => {
+            let status = r.status().as_u16();
+            let body = r.body_mut().read_to_string().unwrap_or_default();
+            if (200..300).contains(&status) {
+                Value::Variant { name: "Ok".into(), args: vec![Value::Str(body)] }
+            } else {
+                err_value(format!("status {status}: {body}"))
+            }
         }
         Err(e) => err_value(format!("transport: {e}")),
     }

@@ -3,7 +3,7 @@ use std::ops::Range;
 
 #[derive(Logos, Debug, Clone, PartialEq)]
 #[logos(skip r"[ \t\r\f]+")]
-#[logos(skip r"#[^\n]*")]
+#[logos(skip(r"#[^\n]*", allow_greedy = true))]
 pub enum TokenKind {
     // keywords
     #[token("fn")]      Fn,
