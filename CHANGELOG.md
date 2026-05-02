@@ -1,0 +1,86 @@
+# Changelog
+
+All notable changes to lex-lang. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
+versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
+bumps may carry breaking changes when justified).
+
+## [Unreleased]
+
+### Added
+
+- `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, GitHub issue / PR
+  templates, Dependabot config — open-source housekeeping.
+
+### Documentation
+
+- Badges row at the top of the README (CI, fuzz, tests, license,
+  Rust MSRV).
+- Worked `lex serve` example with `curl /v1/check` and `/v1/run`
+  in the Quickstart.
+
+## [0.1.0] — 2026-05
+
+The pre-launch baseline. Everything below is what shipped before
+the changelog itself was started; entries are coarse-grained.
+
+### Added
+
+- **Agent-native VC, tier 1.** `lex branch` (`list` / `show` /
+  `create` / `delete` / `use` / `current`), `lex store-merge`
+  with three-way structural merge over branch heads using
+  `fork_base` snapshots, `lex log` per-branch merge journal,
+  `lex blame` per-fn stage history.
+- **LLM-agnostic discovery.** Full [ACLI](https://github.com/alpibrusl/acli)
+  compliance: `lex introspect` / `lex skill` / `lex version`,
+  `--output text|json|table` on every subcommand, `--dry-run` on
+  state-modifying ones, ACLI error envelopes with semantic exit
+  codes. Auto-generated `.cli/` folder is committed.
+- **AST tooling.** `lex audit` (structural search by effect / call
+  / hostname / AST kind), `lex ast-diff` (with effect-change
+  highlighting), `lex ast-merge` (three-way structural merge with
+  JSON conflicts).
+- **Persistent collections.** `std.map` and `std.set` with `Str`
+  or `Int` keys (via `MapKey` so `Value` itself stays free of
+  `Eq + Hash` constraints).
+- **Effect polymorphism** on stdlib HOFs (`list.map`, `list.filter`,
+  `list.fold`, `option.map`, `result.map`, `result.and_then`,
+  `result.map_err`).
+- **`lex agent-tool`.** Sandboxed runner for LLM-emitted tool
+  bodies with effect declaration. Correctness ladder: `--examples`,
+  `--spec`, `--diff-body`. Adversarial benchmark vs Python sandboxes.
+- **`lex tool-registry serve`.** HTTP service to register Lex tools
+  at runtime + invoke via `/tools/{id}/invoke`.
+- **`lex spec`.** Randomized property checking + SMT-LIB export
+  for external Z3.
+- **Trace tree + replay + diff** (`lex run --trace`, `lex trace`,
+  `lex replay`, `lex diff`).
+- **Content-addressed store** (`lex publish`, `lex store list/get`)
+  with stage lifecycle (Draft / Active / Deprecated / Tombstone).
+- **Capability runtime + effect system** (`--allow-effects`,
+  `--allow-fs-read PATH`, `--allow-fs-write PATH`,
+  `--allow-net-host HOST`, `--budget`, `--max-steps`).
+- **Type system**: HM inference, sized numerics, tensor shape
+  solver, mutation analysis (Core), native matmul.
+- **Stdlib MVP**: `std.str`, `std.int`, `std.float`, `std.bool`,
+  `std.list`, `std.option`, `std.result`, `std.tuple`, `std.json`,
+  `std.bytes`, `std.flow`, `std.math`, `std.io`, `std.net`,
+  `std.chat`, `std.time`, `std.rand`.
+- **Example apps**: weather REST API, multi-user WebSocket chat,
+  CSV analytics, ML (linreg + logistic), webhook router, gateway
+  service.
+- **Conformance harness** with property tests.
+- **Agent API server** (`lex serve` / `/v1/{parse,check,run,
+  publish,patch,trace,replay,diff,stage}`).
+
+### Hardening
+
+- Parser recursion-depth gate (`MAX_DEPTH = 96`); closes a
+  stack-overflow DoS the libFuzzer parser target found.
+- VM call-stack depth gate (`MAX_CALL_DEPTH = 1024`); refuses with
+  `VmError::CallStackOverflow` instead of unwinding the host.
+- `SECURITY.md` threat model with deployment recommendations.
+- `cargo fuzz` CI for parser + type checker (60 s/PR, 5 min nightly).
+
+[Unreleased]: https://github.com/alpibrusl/lex-lang/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/alpibrusl/lex-lang/releases/tag/v0.1.0
