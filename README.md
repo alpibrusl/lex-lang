@@ -1,5 +1,11 @@
 # lex-lang
 
+[![CI](https://github.com/alpibrusl/lex-lang/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/alpibrusl/lex-lang/actions/workflows/ci.yml)
+[![fuzz](https://github.com/alpibrusl/lex-lang/actions/workflows/fuzz.yml/badge.svg?branch=main)](https://github.com/alpibrusl/lex-lang/actions/workflows/fuzz.yml)
+[![tests](https://img.shields.io/badge/tests-285_passing-success.svg)](#building-from-source)
+[![License: EUPL-1.2](https://img.shields.io/badge/license-EUPL--1.2-blue.svg)](LICENSE)
+[![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](#building-from-source)
+
 A language family designed for code no one will read. AI agents write more than humans review; Lex's bet is that when nobody reads bodies, the function signature has to be the contract. Effects are part of the type; the type checker, runtime policy gate, and Spec proofs verify the body honors it — without anyone reading the body.
 
 **Lex** is the general-purpose surface; **Core** covers performance-critical work (sized numerics, tensor shapes); **Spec** carries proof annotations. Implementation of `langspecs.md`; this README focuses on what currently runs.
@@ -53,7 +59,20 @@ lex store get <stage_id>
 lex conformance conformance/
 
 # Start the agent API server (HTTP/JSON, port 4040 by default).
-lex serve
+lex serve &
+
+# In another shell — type-check a snippet over HTTP:
+curl -sX POST http://localhost:4040/v1/check \
+  -H 'content-type: application/json' \
+  -d '{"source":"fn add(x :: Int, y :: Int) -> Int { x + y }"}'
+# → {"ok": true}
+
+# Run a function over HTTP with policy:
+curl -sX POST http://localhost:4040/v1/run \
+  -H 'content-type: application/json' \
+  -d '{"source":"fn add(x :: Int, y :: Int) -> Int { x + y }",
+       "fn":"add", "args":[2,3], "policy":{"allow_effects":[]}}'
+# → {"run_id":"...","output":5}
 ```
 
 ### Quickstart: agent-native tooling

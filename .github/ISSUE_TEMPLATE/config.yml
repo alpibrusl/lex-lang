@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/alpibrusl/lex-lang/security/advisories/new
+    about: Don't open a public issue for security bugs. Use a Security Advisory.
+  - name: Question / discussion
+    url: https://github.com/alpibrusl/lex-lang/discussions
+    about: For open-ended questions about Lex's design or roadmap.
