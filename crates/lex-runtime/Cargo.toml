@@ -10,7 +10,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 indexmap.workspace = true
 tiny_http = { version = "0.12", features = ["ssl-rustls"] }
-tungstenite = "0.21"
+tungstenite = "0.29"
 ureq = { version = "2.10", default-features = false, features = ["tls", "native-certs"] }
 lex-bytecode = { path = "../lex-bytecode" }
 
