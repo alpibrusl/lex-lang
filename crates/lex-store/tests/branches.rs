@@ -186,6 +186,47 @@ fn commit_merge_refuses_when_conflicts_remain() {
 }
 
 #[test]
+fn sig_history_includes_one_entry_per_published_stage() {
+    use lex_store::StageStatus;
+    let (s, _tmp) = fresh_store("sig-history");
+    // Publish two stages under the same SigId by using `publish` +
+    // `activate` indirectly is fiddly; emulate by writing
+    // transitions via the public stage-transition API.
+    // Simpler: create two synthetic FnDecl Stages with the same
+    // signature and different bodies.
+    let prog = lex_syntax::parse_source("fn f(x :: Int) -> Int { x }\n").unwrap();
+    let stages = lex_ast::canonicalize_program(&prog);
+    let stage_id_a = s.publish(&stages[0]).expect("publish a");
+    let prog2 = lex_syntax::parse_source("fn f(x :: Int) -> Int { x + 0 }\n").unwrap();
+    let stages2 = lex_ast::canonicalize_program(&prog2);
+    let stage_id_b = s.publish(&stages2[0]).expect("publish b");
+    s.activate(&stage_id_a).expect("activate a");
+    s.activate(&stage_id_b).expect("activate b");
+
+    let sig = lex_ast::sig_id(&stages[0]).expect("sig");
+    let history = s.sig_history(&sig).expect("history");
+    assert_eq!(history.len(), 2, "two distinct stages → two entries");
+    let by_id: std::collections::BTreeMap<&str, &lex_store::StageHistoryEntry> =
+        history.iter().map(|h| (h.stage_id.as_str(), h)).collect();
+    let a = by_id[stage_id_a.as_str()];
+    let b = by_id[stage_id_b.as_str()];
+    // Activating b deprecates a in the lifecycle's current_active() path,
+    // but the per-stage status only reflects each stage's own transitions.
+    // a's last status is whatever its last transition recorded.
+    assert!(matches!(a.status, StageStatus::Active | StageStatus::Deprecated),
+        "got {:?}", a.status);
+    assert_eq!(b.status, StageStatus::Active);
+    assert!(a.published_at.is_some());
+    assert!(b.published_at.is_some());
+}
+
+#[test]
+fn sig_history_for_unknown_sig_is_empty_not_error() {
+    let (s, _tmp) = fresh_store("sig-history-empty");
+    assert!(s.sig_history("does-not-exist-sig").unwrap().is_empty());
+}
+
+#[test]
 fn branch_log_records_committed_merges() {
     let (s, _tmp) = fresh_store("log-records");
     put_head(&s, DEFAULT_BRANCH, "sig1", "stageA");

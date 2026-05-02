@@ -32,6 +32,24 @@ pub enum StoreError {
     UnknownBranch(String),
 }
 
+/// One entry in the per-`SigId` stage history surfaced by
+/// `Store::sig_history`. Newest-first ordering is the responsibility
+/// of the producer.
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+pub struct StageHistoryEntry {
+    pub stage_id: String,
+    pub status: StageStatus,
+    /// Wall-clock seconds of the most recent transition.
+    pub last_at: u64,
+    /// Wall-clock seconds when this stage was first written to the
+    /// store (its initial Draft transition). `None` for stages
+    /// whose lifecycle log doesn't include an explicit Draft entry
+    /// — shouldn't happen for stages published via `Store::publish`,
+    /// but the type allows hand-edited stores.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<u64>,
+}
+
 pub struct Store {
     root: PathBuf,
 }
@@ -178,6 +196,45 @@ impl Store {
             Err(_) => return Ok(None),
         };
         Ok(life.current_active().map(|s| s.to_string()))
+    }
+
+    /// Per-stage history for a SigId, ordered chronologically by
+    /// the *last* transition timestamp. Returns one entry per
+    /// distinct StageId that has ever been published under `sig`.
+    /// `Ok(vec![])` if the SigId doesn't exist in the store.
+    ///
+    /// Used by `lex blame` to render "where does this fn come from".
+    pub fn sig_history(&self, sig: &str) -> Result<Vec<StageHistoryEntry>, StoreError> {
+        let life = match self.read_lifecycle(sig) {
+            Ok(l) => l,
+            Err(_) => return Ok(Vec::new()),
+        };
+        // Collapse transitions: latest status + last_at per stage,
+        // plus the timestamp of the first Draft transition (≈ when
+        // the stage was published) when one exists.
+        let mut by_stage: indexmap::IndexMap<String, StageHistoryEntry> =
+            indexmap::IndexMap::new();
+        for t in &life.transitions {
+            let entry = by_stage.entry(t.stage_id.clone()).or_insert(StageHistoryEntry {
+                stage_id: t.stage_id.clone(),
+                status: t.to,
+                last_at: t.at,
+                published_at: None,
+            });
+            entry.status = t.to;
+            entry.last_at = t.at;
+            if t.from == StageStatus::Draft && entry.published_at.is_none() {
+                entry.published_at = Some(t.at);
+            }
+            if t.to == StageStatus::Draft && entry.published_at.is_none() {
+                // Initial publication: Draft is the *destination*.
+                entry.published_at = Some(t.at);
+            }
+        }
+        let mut out: Vec<StageHistoryEntry> = by_stage.into_values().collect();
+        // Sort newest first so `lex blame` shows recent activity at top.
+        out.sort_by_key(|e| std::cmp::Reverse(e.last_at));
+        Ok(out)
     }
 
     pub fn get_ast(&self, stage_id: &str) -> Result<Stage, StoreError> {

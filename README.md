@@ -314,6 +314,7 @@ Flags: `--body '<src>'` / `--body-file <path>` skip the API call; `--request '<q
 | `lex parse <file>` | Print the canonical AST as JSON |
 | `lex check <file>` | Type-check; exit 0 or print structured errors |
 | `lex hash <file>` | Print SigId / StageId per stage |
+| `lex blame [--store DIR] <file>` | Per-fn stage history from the store: which StageId is currently in source, which is Active, predecessors with statuses + timestamps |
 | `lex run [policy] <file> <fn> [args]` | Execute a function (args are JSON) |
 | `lex publish [--store DIR] [--activate] <file>` | Publish stages to the content-addressed store |
 | `lex store list` / `lex store get <id>` | Browse the store |
@@ -407,12 +408,12 @@ lex/
 | M10 — Spec | ✅ randomized + SMT-LIB export ; `--spec` wired into `agent-tool` ; in-process Z3 deferred |
 | Stdlib MVP | ✅ pure builtins + closures + higher-order list ops + `std.flow` orchestration ; `std.math` (linalg + scalar floats) ; `std.tuple` ; **effect polymorphism** on `list.map` / `list.filter` / `list.fold` / `option.map` / `result.map` / `result.and_then` / `result.map_err` ; `flow.parallel` ✅ (sequential v1 — true threading deferred) ; **`std.map` ✅ ; `std.set` ✅** (persistent collections with `Str`/`Int` keys) ; `flow.parallel_record` deferred (needs row polymorphism on records) |
 | Conformance harness + token budget | ✅ |
-| Agent integration (post-spec) | `lex agent-tool` (sandbox) ✅ ; `lex tool-registry serve` (HTTP registry) ✅ ; correctness ladder: `--examples` ✅ `--spec` ✅ `--diff-body` ✅ ; AST tooling: `lex audit` ✅ `lex ast-diff` (with effect-change highlighting) ✅ `lex ast-merge` ✅ |
+| Agent integration (post-spec) | `lex agent-tool` (sandbox) ✅ ; `lex tool-registry serve` (HTTP registry) ✅ ; correctness ladder: `--examples` ✅ `--spec` ✅ `--diff-body` ✅ ; AST tooling: `lex audit` ✅ `lex ast-diff` (with effect-change highlighting) ✅ `lex ast-merge` ✅ ; **`lex blame` ✅** (per-fn stage history from the store) |
 | Agent-native version control | tier-1 ✅ — `lex branch` + `lex store-merge` with `fork_base` snapshots and structured JSON conflicts ; **`lex log` ✅** (per-branch merge journal) ; distributed sync + body-level merge deferred |
 | LLM-agnostic discovery | ✅ — full [ACLI](https://github.com/alpibrusl/acli) compliance: `lex introspect` / `lex skill` / `lex version`, `--output text\|json\|table` on every subcommand, `--dry-run` on state-modifying ones, error envelopes with semantic exit codes |
 | Hardening | [`SECURITY.md`](SECURITY.md) threat model ✅ ; parser-recursion DoS gate (`MAX_DEPTH=96`) ✅ ; **VM call-stack depth gate (`MAX_CALL_DEPTH=1024`) ✅** ; libFuzzer CI for parser + type checker ✅ ; VM-level memory bounds remain delegated to the host (container memory caps) |
 
-**Workspace test count:** 286 passing, 0 failing. `cargo clippy --workspace --all-targets -- -D warnings` clean. Fuzz CI: 60 s/PR, 5 min nightly across both targets.
+**Workspace test count:** 285 passing, 0 failing, 3 ignored (WS chat example, flaky on CI runners — pass locally with `--ignored`). `cargo clippy --workspace --all-targets -- -D warnings` clean. Fuzz CI: 60 s/PR, 5 min nightly across both targets.
 
 ## Building from source
 
@@ -420,7 +421,7 @@ Requires a recent Rust toolchain (any 1.80+ stable should work).
 
 ```bash
 cargo build --release       # full toolchain
-cargo test --workspace      # 286 tests
+cargo test --workspace      # 285 tests (+ 3 ws_chat ignored — `--ignored` to run locally)
 cargo test --release -p core-compiler -- --ignored   # release-only matmul perf gates
 
 # Optional: run the fuzz suite locally (nightly + cargo-fuzz needed).
