@@ -33,7 +33,7 @@ use anyhow::{anyhow, Result};
 use lex_ast::canonicalize_program;
 use lex_bytecode::{compile_program, vm::Vm, Program, Value};
 use lex_runtime::{check_program as check_policy, DefaultHandler, Policy};
-use lex_syntax::parse_source;
+use lex_syntax::load_program_from_str;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeSet;
@@ -189,7 +189,7 @@ fn post_tools(body_str: &str, registry: &Registry) -> Response<std::io::Cursor<V
     let src = build_tool_program(&parsed.body, &parsed.allowed_effects);
 
     // 2) Parse + type-check.
-    let prog = match parse_source(&src) {
+    let prog = match load_program_from_str(&src) {
         Ok(p) => p,
         Err(e) => return json_response(400, json!({
             "error_kind": "parse", "detail": e.to_string(),

@@ -18,3 +18,4 @@ lex-bytecode = { path = "../lex-bytecode" }
 lex-syntax = { path = "../lex-syntax" }
 lex-ast = { path = "../lex-ast" }
 lex-types = { path = "../lex-types" }
+tempfile = "3"

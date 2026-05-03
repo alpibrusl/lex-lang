@@ -20,7 +20,7 @@ use lex_ast::{
     canon_print::print_stages, canonicalize_program, FnDecl, Stage,
     stage_canonical_hash_hex,
 };
-use lex_syntax::parse_source;
+use lex_syntax::load_program;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs;
@@ -181,10 +181,8 @@ fn parse_args(args: &[String]) -> Result<MergeOpts> {
 }
 
 fn load_fns(path: &std::path::Path) -> Result<BTreeMap<String, FnDecl>> {
-    let src = fs::read_to_string(path)
-        .with_context(|| format!("read {}", path.display()))?;
-    let prog = parse_source(&src)
-        .map_err(|e| anyhow!("parse {}: {e}", path.display()))?;
+    let prog = load_program(path)
+        .map_err(|e| anyhow!("load {}: {e}", path.display()))?;
     let stages = canonicalize_program(&prog);
     let mut out = BTreeMap::new();
     for stage in stages {

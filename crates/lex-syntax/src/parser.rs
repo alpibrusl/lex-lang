@@ -205,7 +205,17 @@ impl Parser {
             Some(TokenKind::LBrace) => self.parse_record_type(),
             Some(TokenKind::LParen) => self.parse_paren_type_or_function(),
             Some(TokenKind::Ident(_)) => {
-                let name = self.expect_ident("in type expr")?;
+                let mut name = self.expect_ident("in type expr")?;
+                // Module-qualified type: `m.Type` or `m.n.Type`. We accept
+                // dotted names here and let the loader rewrite them to the
+                // file-local mangled form. After the loader pass, all type
+                // names referenced by the type checker are single segments.
+                while matches!(self.peek(), Some(TokenKind::Dot)) {
+                    self.bump();
+                    let next = self.expect_ident("after `.` in qualified type")?;
+                    name.push('.');
+                    name.push_str(&next);
+                }
                 let args = if matches!(self.peek(), Some(TokenKind::LBracket)) {
                     self.bump();
                     let mut args = Vec::new();
