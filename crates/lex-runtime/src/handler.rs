@@ -97,6 +97,188 @@ impl DefaultHandler {
         }
     }
 
+    fn dispatch_fs(&mut self, op: &str, args: Vec<Value>) -> Result<Value, String> {
+        match op {
+            "exists" => {
+                let path = expect_str(args.first())?.to_string();
+                if let Err(e) = self.ensure_fs_walk_path(&path) {
+                    return Ok(err(Value::Str(e)));
+                }
+                Ok(Value::Bool(std::path::Path::new(&path).exists()))
+            }
+            "is_file" => {
+                let path = expect_str(args.first())?.to_string();
+                if let Err(e) = self.ensure_fs_walk_path(&path) {
+                    return Ok(err(Value::Str(e)));
+                }
+                Ok(Value::Bool(std::path::Path::new(&path).is_file()))
+            }
+            "is_dir" => {
+                let path = expect_str(args.first())?.to_string();
+                if let Err(e) = self.ensure_fs_walk_path(&path) {
+                    return Ok(err(Value::Str(e)));
+                }
+                Ok(Value::Bool(std::path::Path::new(&path).is_dir()))
+            }
+            "stat" => {
+                let path = expect_str(args.first())?.to_string();
+                if let Err(e) = self.ensure_fs_walk_path(&path) {
+                    return Ok(err(Value::Str(e)));
+                }
+                match std::fs::metadata(&path) {
+                    Ok(md) => {
+                        let mtime = md.modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        let mut rec = indexmap::IndexMap::new();
+                        rec.insert("size".into(), Value::Int(md.len() as i64));
+                        rec.insert("mtime".into(), Value::Int(mtime));
+                        rec.insert("is_dir".into(), Value::Bool(md.is_dir()));
+                        rec.insert("is_file".into(), Value::Bool(md.is_file()));
+                        Ok(ok(Value::Record(rec)))
+                    }
+                    Err(e) => Ok(err(Value::Str(format!("fs.stat `{path}`: {e}")))),
+                }
+            }
+            "list_dir" => {
+                let path = expect_str(args.first())?.to_string();
+                if let Err(e) = self.ensure_fs_walk_path(&path) {
+                    return Ok(err(Value::Str(e)));
+                }
+                match std::fs::read_dir(&path) {
+                    Ok(rd) => {
+                        let mut entries: Vec<Value> = Vec::new();
+                        for ent in rd {
+                            match ent {
+                                Ok(e) => {
+                                    let p = e.path();
+                                    entries.push(Value::Str(p.to_string_lossy().into_owned()));
+                                }
+                                Err(e) => return Ok(err(Value::Str(format!("fs.list_dir: {e}")))),
+                            }
+                        }
+                        Ok(ok(Value::List(entries)))
+                    }
+                    Err(e) => Ok(err(Value::Str(format!("fs.list_dir `{path}`: {e}")))),
+                }
+            }
+            "walk" => {
+                let path = expect_str(args.first())?.to_string();
+                if let Err(e) = self.ensure_fs_walk_path(&path) {
+                    return Ok(err(Value::Str(e)));
+                }
+                let mut paths: Vec<Value> = Vec::new();
+                for ent in walkdir::WalkDir::new(&path) {
+                    match ent {
+                        Ok(e) => paths.push(Value::Str(
+                            e.path().to_string_lossy().into_owned())),
+                        Err(e) => return Ok(err(Value::Str(format!("fs.walk: {e}")))),
+                    }
+                }
+                Ok(ok(Value::List(paths)))
+            }
+            "glob" => {
+                let pattern = expect_str(args.first())?.to_string();
+                // Glob patterns can't be path-scoped at parse time
+                // (`**/*.rs` doesn't pin a directory); we filter the
+                // per-result paths after expansion against
+                // `--allow-fs-read`.
+                let entries = match glob::glob(&pattern) {
+                    Ok(e) => e,
+                    Err(e) => return Ok(err(Value::Str(format!("fs.glob: {e}")))),
+                };
+                let mut paths: Vec<Value> = Vec::new();
+                for ent in entries {
+                    match ent {
+                        Ok(p) => {
+                            let s = p.to_string_lossy().into_owned();
+                            if self.policy.allow_fs_read.is_empty()
+                                || self.policy.allow_fs_read.iter().any(|root| p.starts_with(root))
+                            {
+                                paths.push(Value::Str(s));
+                            }
+                        }
+                        Err(e) => return Ok(err(Value::Str(format!("fs.glob: {e}")))),
+                    }
+                }
+                Ok(ok(Value::List(paths)))
+            }
+            "mkdir_p" => {
+                let path = expect_str(args.first())?.to_string();
+                if let Err(e) = self.ensure_fs_write_path(&path) {
+                    return Ok(err(Value::Str(e)));
+                }
+                match std::fs::create_dir_all(&path) {
+                    Ok(_) => Ok(ok(Value::Unit)),
+                    Err(e) => Ok(err(Value::Str(format!("fs.mkdir_p `{path}`: {e}")))),
+                }
+            }
+            "remove" => {
+                let path = expect_str(args.first())?.to_string();
+                if let Err(e) = self.ensure_fs_write_path(&path) {
+                    return Ok(err(Value::Str(e)));
+                }
+                let p = std::path::Path::new(&path);
+                let result = if p.is_dir() {
+                    std::fs::remove_dir_all(p)
+                } else {
+                    std::fs::remove_file(p)
+                };
+                match result {
+                    Ok(_) => Ok(ok(Value::Unit)),
+                    Err(e) => Ok(err(Value::Str(format!("fs.remove `{path}`: {e}")))),
+                }
+            }
+            "copy" => {
+                let src = expect_str(args.first())?.to_string();
+                let dst = expect_str(args.get(1))?.to_string();
+                if let Err(e) = self.ensure_fs_walk_path(&src) {
+                    return Ok(err(Value::Str(e)));
+                }
+                if let Err(e) = self.ensure_fs_write_path(&dst) {
+                    return Ok(err(Value::Str(e)));
+                }
+                match std::fs::copy(&src, &dst) {
+                    Ok(_) => Ok(ok(Value::Unit)),
+                    Err(e) => Ok(err(Value::Str(format!("fs.copy {src} -> {dst}: {e}")))),
+                }
+            }
+            other => Err(format!("unsupported fs.{other}")),
+        }
+    }
+
+    /// Path scope for walk-style operations. `[fs_walk]` reuses the
+    /// `--allow-fs-read` allowlist — listing a directory is an
+    /// information disclosure on the same path tree as reading file
+    /// content, so the same scope applies. Empty allowlist = any path.
+    fn ensure_fs_walk_path(&self, path: &str) -> Result<(), String> {
+        if self.policy.allow_fs_read.is_empty() {
+            return Ok(());
+        }
+        let p = std::path::Path::new(path);
+        if self.policy.allow_fs_read.iter().any(|a| p.starts_with(a)) {
+            Ok(())
+        } else {
+            Err(format!("fs path `{path}` outside --allow-fs-read"))
+        }
+    }
+
+    /// Path scope for mutating operations. `[fs_write]` uses the
+    /// existing `--allow-fs-write` allowlist.
+    fn ensure_fs_write_path(&self, path: &str) -> Result<(), String> {
+        if self.policy.allow_fs_write.is_empty() {
+            return Ok(());
+        }
+        let p = std::path::Path::new(path);
+        if self.policy.allow_fs_write.iter().any(|a| p.starts_with(a)) {
+            Ok(())
+        } else {
+            Err(format!("fs path `{path}` outside --allow-fs-write"))
+        }
+    }
+
     /// Enforce `--allow-net-host` against an outgoing URL. Empty
     /// allowlist = any host. Non-empty = the URL's host must match
     /// (substring; port-agnostic) at least one entry.
@@ -133,6 +315,24 @@ impl EffectHandler for DefaultHandler {
         // by the type system as effects.
         if let Some(r) = try_pure_builtin(kind, op, &args) {
             return r;
+        }
+        // `std.fs` ops use the fine-grained `[fs_walk]` and `[fs_write]`
+        // effect kinds (distinct from the module name `fs`); the
+        // policy check uses the per-op kind, not the module's.
+        if kind == "fs" {
+            let effect_kind = match op {
+                "exists" | "is_file" | "is_dir" | "stat"
+                | "list_dir" | "walk" | "glob" => "fs_walk",
+                "mkdir_p" | "remove" => "fs_write",
+                "copy" => {
+                    self.ensure_kind_allowed("fs_walk")?;
+                    self.ensure_kind_allowed("fs_write")?;
+                    return self.dispatch_fs(op, args);
+                }
+                other => return Err(format!("unsupported fs.{other}")),
+            };
+            self.ensure_kind_allowed(effect_kind)?;
+            return self.dispatch_fs(op, args);
         }
         // `crypto.random` is the lone effectful op in `std.crypto`. Its
         // declared effect kind is `random` (fine-grained on purpose so
