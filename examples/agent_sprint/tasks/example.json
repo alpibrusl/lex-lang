@@ -1,0 +1,5 @@
+{
+  "id": "demo-haiku-1",
+  "prompt": "Write a haiku about effect types in programming languages.",
+  "criteria": "haiku"
+}
