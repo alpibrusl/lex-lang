@@ -149,3 +149,59 @@ fn primitives_round_trip() {
     roundtrip(Value::Str("hi".into()));
     roundtrip(Value::Unit);
 }
+
+#[test]
+fn bytes_round_trip_via_dollar_bytes_marker() {
+    // The marker disambiguates bytes from a string-that-happens-to-be-hex.
+    roundtrip(Value::Bytes(vec![]));
+    roundtrip(Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef]));
+    roundtrip(Value::Bytes((0..=255u8).collect()));
+}
+
+#[test]
+fn bytes_encode_uses_dollar_bytes_object() {
+    let j = Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef]).to_json();
+    assert_eq!(j, json!({ "$bytes": "deadbeef" }));
+}
+
+#[test]
+fn dollar_bytes_decodes_as_bytes() {
+    let j = json!({ "$bytes": "deadbeef" });
+    assert_eq!(Value::from_json(&j), Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef]));
+}
+
+#[test]
+fn bare_hex_string_still_decodes_as_str() {
+    // No marker → no bytes. Avoids accidentally classifying user strings
+    // that happen to be valid hex.
+    let j = json!("deadbeef");
+    assert_eq!(Value::from_json(&j), Value::Str("deadbeef".into()));
+}
+
+#[test]
+fn dollar_bytes_with_invalid_hex_falls_through_to_record() {
+    // Odd length → invalid hex → record fallback (parallels the
+    // malformed-`$variant` fallback above).
+    let j = json!({ "$bytes": "abc" });
+    let v = Value::from_json(&j);
+    let expected = {
+        let mut m = indexmap::IndexMap::new();
+        m.insert("$bytes".into(), Value::Str("abc".into()));
+        Value::Record(m)
+    };
+    assert_eq!(v, expected);
+}
+
+#[test]
+fn dollar_bytes_with_extra_keys_stays_record() {
+    // Extra keys signal it's not the marker shape.
+    let j = json!({ "$bytes": "dead", "note": "x" });
+    let v = Value::from_json(&j);
+    let expected = {
+        let mut m = indexmap::IndexMap::new();
+        m.insert("$bytes".into(), Value::Str("dead".into()));
+        m.insert("note".into(), Value::Str("x".into()));
+        Value::Record(m)
+    };
+    assert_eq!(v, expected);
+}

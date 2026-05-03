@@ -99,7 +99,10 @@ impl Value {
     /// - `Variant { name, args }` → `{"$variant": name, "args": [...]}`
     /// - `F64Array { ... }` → `{"$f64_array": true, rows, cols, data}`
     /// - `Closure { fn_id, .. }` → `"<closure fn_N>"`
-    /// - `Bytes` → lowercase hex string
+    /// - `Bytes` → `{"$bytes": "deadbeef"}` (lowercase hex). Round-trips
+    ///   through `from_json`. Bare hex strings decode as `Str`, so the
+    ///   marker is required to disambiguate bytes from a string that
+    ///   happens to look like hex.
     /// - `Map` with all-`Str` keys → JSON object; otherwise array of
     ///   `[key, value]` pairs (Int keys can't be JSON-object keys)
     /// - `Set` → JSON array of elements
@@ -114,7 +117,12 @@ impl Value {
             Value::Float(f) => J::from(*f),
             Value::Bool(b) => J::Bool(*b),
             Value::Str(s) => J::String(s.clone()),
-            Value::Bytes(b) => J::String(b.iter().map(|b| format!("{:02x}", b)).collect()),
+            Value::Bytes(b) => {
+                let hex: String = b.iter().map(|b| format!("{:02x}", b)).collect();
+                let mut m = serde_json::Map::new();
+                m.insert("$bytes".into(), J::String(hex));
+                J::Object(m)
+            }
             Value::Unit => J::Null,
             Value::List(items) => J::Array(items.iter().map(Value::to_json).collect()),
             Value::Tuple(items) => J::Array(items.iter().map(Value::to_json).collect()),
@@ -164,16 +172,18 @@ impl Value {
     /// [`to_json`](Self::to_json) for the shapes Lex round-trips:
     ///
     /// - `{"$variant": "Name", "args": [...]}` → `Value::Variant`
+    /// - `{"$bytes": "deadbeef"}` → `Value::Bytes` (lowercase hex; an
+    ///   odd-length string or non-hex character falls through to
+    ///   `Value::Record`, matching the malformed-`$variant` fallback)
     /// - JSON object → `Value::Record`
     /// - JSON array → `Value::List`
     /// - JSON null → `Value::Unit`
     /// - JSON string / bool / number → the corresponding scalar
     ///
-    /// Bytes (hex), Map, Set, F64Array, and Closure don't round-trip
-    /// — they decode as their natural JSON shape (Str / Object / Array
-    /// / Object / Str respectively), since the CLI / HTTP / VM
-    /// callers building Values from JSON don't have those shapes in
-    /// their input vocabulary.
+    /// Map, Set, F64Array, and Closure don't round-trip — they decode
+    /// as their natural JSON shape (Object / Array / Object / Str
+    /// respectively), since the CLI / HTTP / VM callers building Values
+    /// from JSON don't have those shapes in their input vocabulary.
     pub fn from_json(v: &serde_json::Value) -> Value {
         use serde_json::Value as J;
         match v {
@@ -195,6 +205,13 @@ impl Value {
                         args: args.iter().map(Value::from_json).collect(),
                     };
                 }
+                if map.len() == 1 {
+                    if let Some(J::String(hex)) = map.get("$bytes") {
+                        if let Some(bytes) = decode_hex(hex) {
+                            return Value::Bytes(bytes);
+                        }
+                    }
+                }
                 let mut out = indexmap::IndexMap::new();
                 for (k, v) in map {
                     out.insert(k.clone(), Value::from_json(v));
@@ -203,4 +220,18 @@ impl Value {
             }
         }
     }
+}
+
+/// Lowercase-hex → bytes. Returns `None` for odd length or non-hex chars
+/// (callers fall through to a record decode rather than erroring).
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) { return None; }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let bytes = s.as_bytes();
+    for pair in bytes.chunks(2) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Some(out)
 }
