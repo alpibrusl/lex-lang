@@ -687,6 +687,60 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 Ty::List(Box::new(Ty::Var(0)))));
             Some(Ty::Record(fields))
         }
+        "fs" => {
+            // Filesystem walk + mutate. Walk-style ops (exists, walk,
+            // glob, …) declare [fs_walk] — distinct from [fs_read]
+            // (which is content reads via io.read), so reviewers can
+            // separately track directory traversal vs file-content
+            // exposure. Mutating ops (mkdir_p, remove, copy) declare
+            // [fs_write]. Path scoping uses --allow-fs-read for walk
+            // (a directory listing is an information disclosure on
+            // the same path tree) and --allow-fs-write for mutations.
+            let stat_t = || {
+                let mut fs = IndexMap::new();
+                fs.insert("size".into(), Ty::int());
+                fs.insert("mtime".into(), Ty::int());
+                fs.insert("is_dir".into(), Ty::bool());
+                fs.insert("is_file".into(), Ty::bool());
+                Ty::Record(fs)
+            };
+            let result_str = |t: Ty| Ty::Con("Result".into(), vec![t, Ty::str()]);
+            let mut fields = IndexMap::new();
+            // Walk-style queries [fs_walk]
+            fields.insert("exists".into(), Ty::function(
+                vec![Ty::str()], EffectSet::singleton("fs_walk"), Ty::bool()));
+            fields.insert("is_file".into(), Ty::function(
+                vec![Ty::str()], EffectSet::singleton("fs_walk"), Ty::bool()));
+            fields.insert("is_dir".into(), Ty::function(
+                vec![Ty::str()], EffectSet::singleton("fs_walk"), Ty::bool()));
+            fields.insert("stat".into(), Ty::function(
+                vec![Ty::str()], EffectSet::singleton("fs_walk"),
+                result_str(stat_t())));
+            fields.insert("list_dir".into(), Ty::function(
+                vec![Ty::str()], EffectSet::singleton("fs_walk"),
+                result_str(Ty::List(Box::new(Ty::str())))));
+            fields.insert("walk".into(), Ty::function(
+                vec![Ty::str()], EffectSet::singleton("fs_walk"),
+                result_str(Ty::List(Box::new(Ty::str())))));
+            fields.insert("glob".into(), Ty::function(
+                vec![Ty::str()], EffectSet::singleton("fs_walk"),
+                result_str(Ty::List(Box::new(Ty::str())))));
+            // Mutations [fs_write]
+            fields.insert("mkdir_p".into(), Ty::function(
+                vec![Ty::str()], EffectSet::singleton("fs_write"),
+                result_str(Ty::Unit)));
+            fields.insert("remove".into(), Ty::function(
+                vec![Ty::str()], EffectSet::singleton("fs_write"),
+                result_str(Ty::Unit)));
+            fields.insert("copy".into(), Ty::function(
+                vec![Ty::str(), Ty::str()],
+                EffectSet {
+                    concrete: ["fs_walk".to_string(), "fs_write".to_string()].into_iter().collect(),
+                    var: None,
+                },
+                result_str(Ty::Unit)));
+            Some(Ty::Record(fields))
+        }
         "kv" => {
             // Embedded key-value store. The opaque `Kv` type is
             // backed by an Int handle into a process-wide registry.
@@ -805,6 +859,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "regex" => "regex",
         "deque" => "deque",
         "kv" => "kv",
+        "fs" => "fs",
         _ => return None,
     })
 }
