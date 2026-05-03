@@ -634,24 +634,12 @@ fn stage_name(s: &Stage) -> &str {
     }
 }
 
+/// Decode a CLI argument's JSON into a `Value`. Delegates to
+/// `Value::from_json` so the CLI, the `lex serve` HTTP API, and
+/// in-program `json.parse` all share the same convention — including
+/// `{"$variant": "Name", "args": [...]}` for variants. (Closes #93.)
 fn json_to_value(v: &serde_json::Value) -> Value {
-    use serde_json::Value as J;
-    match v {
-        J::Null => Value::Unit,
-        J::Bool(b) => Value::Bool(*b),
-        J::Number(n) => {
-            if let Some(i) = n.as_i64() { Value::Int(i) }
-            else if let Some(f) = n.as_f64() { Value::Float(f) }
-            else { Value::Unit }
-        }
-        J::String(s) => Value::Str(s.clone()),
-        J::Array(items) => Value::List(items.iter().map(json_to_value).collect()),
-        J::Object(map) => {
-            let mut out = indexmap::IndexMap::new();
-            for (k, v) in map { out.insert(k.clone(), json_to_value(v)); }
-            Value::Record(out)
-        }
-    }
+    Value::from_json(v)
 }
 
 fn value_to_json_string(v: &Value) -> String {

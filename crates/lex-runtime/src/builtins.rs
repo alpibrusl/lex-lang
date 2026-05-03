@@ -2,7 +2,6 @@
 //! ops dispatched via the same `EffectHandler` interface as effects, but
 //! without policy gates (they have no observable side effects).
 
-use indexmap::IndexMap;
 use lex_bytecode::{MapKey, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -628,30 +627,4 @@ fn err_v(v: Value) -> Value { Value::Variant { name: "Err".into(), args: vec![v]
 
 fn value_to_json(v: &Value) -> serde_json::Value { v.to_json() }
 
-fn json_to_value(v: &serde_json::Value) -> Value {
-    use serde_json::Value as J;
-    match v {
-        J::Null => Value::Unit,
-        J::Bool(b) => Value::Bool(*b),
-        J::Number(n) => {
-            if let Some(i) = n.as_i64() { Value::Int(i) }
-            else if let Some(f) = n.as_f64() { Value::Float(f) }
-            else { Value::Unit }
-        }
-        J::String(s) => Value::Str(s.clone()),
-        J::Array(items) => Value::List(items.iter().map(json_to_value).collect()),
-        J::Object(map) => {
-            if let (Some(J::String(name)), Some(J::Array(args))) =
-                (map.get("$variant"), map.get("args"))
-            {
-                return Value::Variant {
-                    name: name.clone(),
-                    args: args.iter().map(json_to_value).collect(),
-                };
-            }
-            let mut out = IndexMap::new();
-            for (k, v) in map { out.insert(k.clone(), json_to_value(v)); }
-            Value::Record(out)
-        }
-    }
-}
+fn json_to_value(v: &serde_json::Value) -> Value { Value::from_json(v) }
