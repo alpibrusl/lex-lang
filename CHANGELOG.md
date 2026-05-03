@@ -9,6 +9,23 @@ bumps may carry breaking changes when justified).
 
 ### Added
 
+- **`std.toml` — TOML config parser.** First slice of the
+  `std.config` umbrella requested by the OSS Auditor team
+  (priority: TOML > YAML > dotenv > CSV; TOML alone clears 80%
+  of the use case). Adds:
+  - `toml.parse[T](s :: Str) -> Result[T, Str]` — polymorphic on
+    the parsed shape, mirroring `json.parse`. Routes through
+    `serde_json::Value` so the parsed result composes with the
+    existing JSON tooling and decodes into the same `Value`
+    shape (Str / Int / Float / Bool / List / Record).
+  - `toml.stringify[T](v :: T) -> Result[Str, Str]` — Result
+    rather than Str because TOML's grammar is stricter than
+    JSON's (top level must be a table; no nulls; no mixed-type
+    arrays), so unrepresentable values surface as `Err` rather
+    than panic.
+  - TOML datetimes deserialize to RFC 3339 strings (the only
+    info-losing step); callers who want an `Instant` pipe the
+    string through `datetime.parse_iso`.
 - **`std.http` — rich HTTP client.** Adds:
   - Wire ops: `http.send(req)`, `http.get(url)`, `http.post(url,
     body, content_type)` — all gated on `[net]` and respecting
