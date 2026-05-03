@@ -25,6 +25,7 @@ rand = { version = "0.9", features = ["os_rng"] }
 tiny_http = { version = "0.12", features = ["ssl-rustls"] }
 tungstenite = "0.29"
 ureq = { version = "3.3", default-features = false, features = ["rustls", "platform-verifier"] }
+toml = "0.9"
 lex-bytecode = { path = "../lex-bytecode" }
 
 [dev-dependencies]

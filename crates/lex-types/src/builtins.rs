@@ -1083,6 +1083,41 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             ));
             Some(Ty::Record(fields))
         }
+        "toml" => {
+            // TOML config parser. Mirrors `std.json`'s shape: parse
+            // is polymorphic so callers annotate the expected
+            // record / list / scalar shape and the type checker
+            // unifies. The parsed TOML maps to the same Lex Value
+            // shape as JSON does:
+            //
+            //   TOML String   → Value::Str
+            //   TOML Integer  → Value::Int
+            //   TOML Float    → Value::Float
+            //   TOML Boolean  → Value::Bool
+            //   TOML Array    → Value::List
+            //   TOML Table    → Value::Record
+            //   TOML Datetime → Value::Str (RFC 3339, lossless)
+            //
+            // The Datetime → Str fallback is the one info-losing
+            // step; callers who want a real `Instant` can pipe the
+            // string through `datetime.parse_iso`.
+            let mut fields = IndexMap::new();
+            // parse :: Str -> Result[T, Str]
+            fields.insert("parse".into(), Ty::function(
+                vec![Ty::str()], EffectSet::empty(),
+                Ty::Con("Result".into(), vec![Ty::Var(0), Ty::str()]),
+            ));
+            // stringify :: T -> Result[Str, Str]
+            // Returns Result (not Str) because not every Lex Value
+            // has a TOML representation — top-level scalars,
+            // closures, mixed-key maps etc. surface as Err rather
+            // than panic.
+            fields.insert("stringify".into(), Ty::function(
+                vec![Ty::Var(0)], EffectSet::empty(),
+                Ty::Con("Result".into(), vec![Ty::str(), Ty::str()]),
+            ));
+            Some(Ty::Record(fields))
+        }
         _ => None,
     }
 }
@@ -1119,6 +1154,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "datetime" => "datetime",
         "log" => "log",
         "http" => "http",
+        "toml" => "toml",
         _ => return None,
     })
 }

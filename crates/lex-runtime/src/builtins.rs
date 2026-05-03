@@ -30,7 +30,8 @@ pub fn try_pure_builtin(kind: &str, op: &str, args: &[Value]) -> Option<Result<V
 pub fn is_pure_module(kind: &str) -> bool {
     matches!(kind, "str" | "int" | "float" | "bool" | "list"
         | "option" | "result" | "tuple" | "json" | "bytes" | "flow" | "math"
-        | "map" | "set" | "crypto" | "regex" | "deque" | "datetime" | "http")
+        | "map" | "set" | "crypto" | "regex" | "deque" | "datetime" | "http"
+        | "toml")
 }
 
 fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
@@ -229,6 +230,34 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             match serde_json::from_str::<serde_json::Value>(&s) {
                 Ok(v) => Ok(ok_v(json_to_value(&v))),
                 Err(e) => Ok(err_v(Value::Str(format!("{e}")))),
+            }
+        }
+
+        // -- toml (config parser; routes through serde_json::Value
+        // so the parsed shape composes with the existing json
+        // tooling. Datetimes become RFC 3339 strings — the only
+        // info-losing step) --
+        ("toml", "parse") => {
+            let s = expect_str(args.first())?;
+            match toml::from_str::<serde_json::Value>(&s) {
+                Ok(mut v) => {
+                    unwrap_toml_datetime_markers(&mut v);
+                    Ok(ok_v(json_to_value(&v)))
+                }
+                Err(e) => Ok(err_v(Value::Str(format!("{e}")))),
+            }
+        }
+        ("toml", "stringify") => {
+            let v = first_arg(args)?;
+            // serde_json::Value → toml::Value via its serde impls.
+            // TOML's grammar is stricter than JSON's (top-level
+            // must be a table; no `null`; no mixed-type arrays),
+            // so the conversion can fail — surface as Result::Err
+            // rather than panic.
+            let json = value_to_json(v);
+            match toml::to_string(&json) {
+                Ok(s)  => Ok(ok_v(Value::Str(s))),
+                Err(e) => Ok(err_v(Value::Str(format!("toml.stringify: {e}")))),
             }
         }
 
@@ -1151,6 +1180,40 @@ fn url_encode(s: &str) -> String {
 }
 
 fn value_to_json(v: &Value) -> serde_json::Value { v.to_json() }
+
+/// The `toml` crate's serde adapter wraps datetimes in a sentinel
+/// object `{"$__toml_private_datetime": "<rfc3339>"}` so that the
+/// `Datetime` type round-trips through `serde::Value`. For Lex's
+/// purposes a plain RFC-3339 string is what we want — callers can
+/// then pipe through `datetime.parse_iso` if they need an
+/// `Instant`. Walk the tree and replace each wrapper with its
+/// inner string, in-place.
+fn unwrap_toml_datetime_markers(v: &mut serde_json::Value) {
+    use serde_json::Value as J;
+    match v {
+        J::Object(map) => {
+            // Detect single-key marker objects and replace them
+            // with their inner string. We have to take care to
+            // avoid borrow conflicts.
+            if map.len() == 1 {
+                if let Some(J::String(s)) = map.get("$__toml_private_datetime") {
+                    let s = s.clone();
+                    *v = J::String(s);
+                    return;
+                }
+            }
+            for (_, child) in map.iter_mut() {
+                unwrap_toml_datetime_markers(child);
+            }
+        }
+        J::Array(items) => {
+            for item in items.iter_mut() {
+                unwrap_toml_datetime_markers(item);
+            }
+        }
+        _ => {}
+    }
+}
 
 fn json_to_value(v: &serde_json::Value) -> Value { Value::from_json(v) }
 
