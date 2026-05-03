@@ -32,8 +32,15 @@ cargo build --release
 # Add the binary to your path (or invoke ./target/release/lex directly).
 export PATH="$(pwd)/target/release:$PATH"
 
-# Type-check a program.
+# Type-check a program. Pure programs print `ok`; non-pure ones add
+# the effects you'll need to grant when running, plus a suggested
+# `lex run` command.
 lex check examples/a_factorial.lex
+# → ok
+lex check examples/c_echo.lex
+# → ok
+#   required effects: io
+#   hint: lex run --allow-effects io examples/c_echo.lex <fn> [args]
 
 # Run a function with JSON arguments.
 lex run examples/a_factorial.lex factorial 5
@@ -74,6 +81,38 @@ curl -sX POST http://localhost:4040/v1/run \
        "fn":"add", "args":[2,3], "policy":{"allow_effects":[]}}'
 # → {"run_id":"...","output":5}
 ```
+
+### Multi-file projects
+
+Local imports work the same way as `std.*`, just with a path:
+
+```bash
+# models.lex
+type Status = Healthy | Sick
+fn label(s :: Status) -> Str {
+  match s { Healthy => "ok", Sick => "nope" }
+}
+
+# main.lex
+import "./models" as m
+
+fn describe(s :: m.Status) -> Str { m.label(s) }
+```
+
+```bash
+lex check main.lex   # ok — both files are loaded and merged
+lex run main.lex describe '{"$variant":"Healthy","args":[]}'
+```
+
+Path imports are resolved relative to the importer's directory; the
+`.lex` extension is auto-appended. `../`, `/abs/path.lex`, and
+multi-level nesting (`f.g.h`) all work, with cycle detection that
+reports the full path chain. Stdlib imports are unchanged.
+
+> Each imported function is currently identified by its alias path,
+> so `lex blame` doesn't yet follow a function across imports — see
+> [`#82`](https://github.com/alpibrusl/lex-lang/issues/82) for the
+> store-native sharing model that will fix this.
 
 ### Quickstart: agent-native tooling
 

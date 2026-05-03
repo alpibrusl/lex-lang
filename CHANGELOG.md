@@ -9,8 +9,53 @@ bumps may carry breaking changes when justified).
 
 ### Added
 
+- **Local file imports** between `.lex` modules
+  (`import "./helpers" as h`, `../`, `/abs/`). Imported files'
+  top-level fns and types are mangled with the alias path so they
+  don't collide with the importer's names; references — including
+  `m.foo(...)` calls and `m.Type` annotations — get rewritten in
+  place. Cycle detection reports the full path chain. Stdlib
+  imports unchanged. Multi-file programs no longer collapse into a
+  single file. (#83, closes #78)
+- **`lex check` surfaces required `--allow-effects` grants** in
+  both text and JSON output. The text mode adds a one-line summary
+  plus a ready-to-run `lex run --allow-effects ...` suggestion;
+  the JSON adds `required_effects`, `required_fs_read`,
+  `required_fs_write`, and `required_net_host`. Pure programs
+  stay silent on effects to keep the existing single-line `ok`
+  clean. (#85, closes #81)
 - `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, GitHub issue / PR
   templates, Dependabot config — open-source housekeeping.
+
+### Changed
+
+- **Anonymous record literals coerce to nominal record aliases at
+  every position** — function argument, nested record field, list
+  element, `let p :: T := { ... }`, constructor payload, pattern.
+  Previously this only worked at function-return position, forcing
+  POCs to write explicit `mk_*` constructor functions for every
+  nominal record type. Two distinct nominal types with the same
+  shape stay nominally distinct. (#86, closes #79)
+- **Trailing commas** are now allowed in every comma-separated
+  list (fn params, call args, lambda params, type args, effects,
+  function type params, constructor type payloads, constructor
+  patterns, tuple patterns) — previously they were accepted in
+  match arms / list / record literals only. (#84, closes #80)
+
+### Dependencies
+
+- logos `0.14` → `0.16`, tungstenite `0.21` → `0.29`, ureq
+  `2.10` → `3.3`, sha2 `0.10` → `0.11`, thiserror `1` → `2`.
+  Source changes for tungstenite (`Message::Text` now wraps
+  `Utf8Bytes`) and ureq (full API rewrite — `Agent::config_builder`,
+  `body_mut().read_to_string()`, `Error::StatusCode`). For ureq,
+  `http_status_as_error(false)` preserves the prior
+  `Err("status NNN: <body>")` shape. Features renamed to
+  `rustls,platform-verifier`. (#75, #76)
+- `actions/checkout@v4` → `@v6`, `actions/upload-artifact@v4`
+  → `@v7`, `actions/download-artifact@v4` → `@v8`. (#84 build,
+  bumped together because v8 download validates the
+  upload side's content-type.)
 
 ### Documentation
 
@@ -18,6 +63,9 @@ bumps may carry breaking changes when justified).
   Rust MSRV).
 - Worked `lex serve` example with `curl /v1/check` and `/v1/run`
   in the Quickstart.
+- Multi-file project example in the Quickstart, demonstrating
+  local imports.
+- `lex check` examples updated to show the effect summary.
 
 ## [0.1.0] — 2026-05
 
