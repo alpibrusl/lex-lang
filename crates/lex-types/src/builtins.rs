@@ -581,6 +581,50 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             ));
             Some(Ty::Record(fields))
         }
+        "crypto" => {
+            let mut fields = IndexMap::new();
+            // Hashes: Bytes -> Bytes (digest as raw bytes)
+            for name in &["sha256", "sha512", "md5"] {
+                fields.insert((*name).into(), Ty::function(
+                    vec![Ty::bytes()],
+                    EffectSet::empty(),
+                    Ty::bytes(),
+                ));
+            }
+            // HMAC: (key :: Bytes, data :: Bytes) -> Bytes
+            for name in &["hmac_sha256", "hmac_sha512"] {
+                fields.insert((*name).into(), Ty::function(
+                    vec![Ty::bytes(), Ty::bytes()],
+                    EffectSet::empty(),
+                    Ty::bytes(),
+                ));
+            }
+            // base64 / hex
+            fields.insert("base64_encode".into(), Ty::function(
+                vec![Ty::bytes()], EffectSet::empty(), Ty::str()));
+            fields.insert("base64_decode".into(), Ty::function(
+                vec![Ty::str()], EffectSet::empty(),
+                Ty::Con("Result".into(), vec![Ty::bytes(), Ty::str()])));
+            fields.insert("hex_encode".into(), Ty::function(
+                vec![Ty::bytes()], EffectSet::empty(), Ty::str()));
+            fields.insert("hex_decode".into(), Ty::function(
+                vec![Ty::str()], EffectSet::empty(),
+                Ty::Con("Result".into(), vec![Ty::bytes(), Ty::str()])));
+            // constant-time equality (for HMAC verification etc.)
+            fields.insert("constant_time_eq".into(), Ty::function(
+                vec![Ty::bytes(), Ty::bytes()], EffectSet::empty(), Ty::bool()));
+            // Cryptographically-secure random bytes — OS RNG, not the
+            // deterministic `rand.int_in` stub. The new `[random]`
+            // effect is fine-grained on purpose so reviewers can find
+            // every token-generating call via `lex audit --effect
+            // random`.
+            fields.insert("random".into(), Ty::function(
+                vec![Ty::int()],
+                EffectSet::singleton("random"),
+                Ty::bytes(),
+            ));
+            Some(Ty::Record(fields))
+        }
         _ => None,
     }
 }
@@ -608,6 +652,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "map" => "map",
         "set" => "set",
         "proc" => "proc",
+        "crypto" => "crypto",
         _ => return None,
     })
 }

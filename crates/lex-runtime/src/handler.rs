@@ -131,6 +131,22 @@ impl EffectHandler for DefaultHandler {
         if let Some(r) = try_pure_builtin(kind, op, &args) {
             return r;
         }
+        // `crypto.random` is the lone effectful op in `std.crypto`. Its
+        // declared effect kind is `random` (fine-grained on purpose so
+        // `lex audit --effect random` flags every token-generating
+        // call), distinct from the `crypto` module name.
+        if kind == "crypto" && op == "random" {
+            self.ensure_kind_allowed("random")?;
+            let n = expect_int(args.first())?;
+            if !(0..=1_048_576).contains(&n) {
+                return Err("crypto.random: n must be in 0..=1048576".into());
+            }
+            use rand::{rngs::OsRng, TryRngCore};
+            let mut buf = vec![0u8; n as usize];
+            OsRng.try_fill_bytes(&mut buf)
+                .map_err(|e| format!("crypto.random: OS RNG: {e}"))?;
+            return Ok(Value::Bytes(buf));
+        }
         self.ensure_kind_allowed(kind)?;
         match (kind, op) {
             ("io", "print") => {
