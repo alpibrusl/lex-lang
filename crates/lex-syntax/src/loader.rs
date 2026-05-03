@@ -2,15 +2,22 @@
 //! `import "/abs/..."` statements relative to the importer, recursively
 //! parses, and produces a single [`Program`] with all stages merged.
 //!
-//! Names that are local to an imported file are mangled with the alias
-//! path so they don't collide with the importer's names. Stdlib imports
-//! (`import "std.foo" as bar`) pass through unchanged.
+//! Names that are local to an imported file are mangled with a
+//! **per-file-path** prefix, so the same module imported via multiple
+//! aliases (or from multiple parents in a diamond shape) collapses to
+//! one set of mangled names — same SigId, same nominal identity.
+//! Stdlib imports (`import "std.foo" as bar`) pass through unchanged.
 //!
 //! ## Mangling
 //!
-//! Each loaded file has an "alias path" — empty for the root file, `f`
-//! for `import "./X" as f` from the root, `f.g` for `import "./Y" as g`
-//! inside X, etc. Within a file at alias path `P`:
+//! Each loaded file gets a prefix derived from its canonical filesystem
+//! path. The entry file's prefix is empty (so `lex run main.lex
+//! process` works unchanged). Imported files use `<stem>_<hash>`
+//! where `hash` is the first 8 hex chars of SHA-256 of the canonical
+//! path string. The hash disambiguates same-stem files in different
+//! directories without forcing a project manifest.
+//!
+//! Within a file at prefix `P`:
 //!
 //! - `fn foo` declared in this file becomes `<P>.foo` (just `foo` at root).
 //! - `type T` declared in this file becomes `<P>.T`.
@@ -18,23 +25,36 @@
 //!   name is shadowed by a binder (let, fn param, lambda param, or
 //!   pattern binder) in scope.
 //! - `m.foo` where `m` is a path-import alias is rewritten to the
-//!   imported file's alias-path-qualified name.
+//!   imported file's prefix-qualified name. Two parents importing the
+//!   same file see the same prefix → calls and types unify.
 //! - `m.foo` where `m` is a stdlib alias is unchanged.
 //!
 //! Variant constructors are **not** mangled — they live in a global
 //! namespace, and a collision between two imported types' constructors
 //! surfaces later as a type-check error. Same for record field names.
 //!
+//! ## Diamond imports
+//!
+//! `main.lex` imports `./left` and `./right`, both of which import
+//! `./shared`. `shared.lex` is parsed once per resolution, but its
+//! mangled items are merged into the output exactly once (subsequent
+//! loads from the same canonical path return an empty Program). This
+//! is what makes `s.build_report(...)` and `v.read_score(...)` agree
+//! on `Report`'s nominal identity.
+//!
 //! ## Limitations (tracked separately)
 //!
-//! Mangling means the SigId / StageId of an imported function depends
-//! on the alias chain the importer chose. `lex blame` across imports
-//! is not stable yet — see the future-work tracker for store-native
-//! imports (`import "stage:..."`).
+//! The mangling key is the canonical filesystem path. Moving a file
+//! changes its SigId; renaming changes the file-stem half of the
+//! prefix. The eventual fix — content-addressed identity decoupled
+//! from filesystem layout — lives with store-native imports
+//! (`import "stage:..."`); see the corresponding follow-up tracker.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+
+use sha2::{Digest, Sha256};
 
 use crate::syntax::*;
 use crate::{parse_source, SyntaxError};
@@ -64,10 +84,19 @@ pub enum LoadError {
 /// Load a multi-file Lex program, expanding local imports relative to
 /// the entry path. Stdlib imports (`std.*`) pass through unchanged.
 pub fn load_program(entry: &Path) -> Result<Program, LoadError> {
+    let entry_canonical = entry.canonicalize().map_err(|source| LoadError::Io {
+        path: entry.display().to_string(),
+        source,
+    })?;
     let mut state = LoaderState {
         in_progress: Vec::new(),
+        loaded: HashSet::new(),
+        prefixes: HashMap::new(),
     };
-    state.load(entry, "")
+    // Entry file's prefix is empty so `lex run main.lex process` works
+    // without users typing the hashed prefix.
+    state.prefixes.insert(entry_canonical.clone(), String::new());
+    state.load(&entry_canonical)
 }
 
 /// Load a Lex program from a string source. Local-path imports are
@@ -89,15 +118,36 @@ pub fn load_program_from_str(src: &str) -> Result<Program, LoadError> {
 
 struct LoaderState {
     in_progress: Vec<PathBuf>,
+    /// Canonical paths that have already been merged into the output.
+    /// A second `import "./shared"` from a different parent skips
+    /// re-merging — the file's mangled items are already there.
+    loaded: HashSet<PathBuf>,
+    /// Stable mangling prefix per canonical path. Computed lazily;
+    /// the entry file is seeded with an empty prefix.
+    prefixes: HashMap<PathBuf, String>,
 }
 
 impl LoaderState {
-    fn load(&mut self, path: &Path, alias_path: &str) -> Result<Program, LoadError> {
-        let canonical = path.canonicalize().map_err(|source| LoadError::Io {
-            path: path.display().to_string(),
-            source,
-        })?;
-        if self.in_progress.contains(&canonical) {
+    fn prefix_for(&mut self, canonical: &Path) -> String {
+        if let Some(p) = self.prefixes.get(canonical) {
+            return p.clone();
+        }
+        let stem = canonical
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("module");
+        let mut hasher = Sha256::new();
+        hasher.update(canonical.to_string_lossy().as_bytes());
+        let digest = hasher.finalize();
+        let prefix = format!("{stem}_{:08x}", u32::from_be_bytes([
+            digest[0], digest[1], digest[2], digest[3],
+        ]));
+        self.prefixes.insert(canonical.to_path_buf(), prefix.clone());
+        prefix
+    }
+
+    fn load(&mut self, canonical: &Path) -> Result<Program, LoadError> {
+        if self.in_progress.contains(&canonical.to_path_buf()) {
             let mut chain: Vec<String> = self
                 .in_progress
                 .iter()
@@ -108,9 +158,18 @@ impl LoaderState {
                 chain: chain.join(" -> "),
             });
         }
-        self.in_progress.push(canonical.clone());
+        // Diamond dedupe: if this file was already merged on another
+        // path through the import graph, its items are already in the
+        // output Vec — return an empty Program so the caller's
+        // `merged_children.extend(...)` is a no-op for items, but the
+        // call still resolves so the parent's `path_imports` map gets
+        // populated below.
+        if self.loaded.contains(canonical) {
+            return Ok(Program { items: Vec::new() });
+        }
+        self.in_progress.push(canonical.to_path_buf());
 
-        let src = std::fs::read_to_string(&canonical).map_err(|source| LoadError::Io {
+        let src = std::fs::read_to_string(canonical).map_err(|source| LoadError::Io {
             path: canonical.display().to_string(),
             source,
         })?;
@@ -129,6 +188,7 @@ impl LoaderState {
             })
             .collect();
 
+        // alias used by this file → mangling prefix of the imported file
         let mut path_imports: HashMap<String, String> = HashMap::new();
         let mut merged_children: Vec<Item> = Vec::new();
         let mut std_imports: Vec<Item> = Vec::new();
@@ -137,14 +197,10 @@ impl LoaderState {
         for item in prog.items {
             match item {
                 Item::Import(ref imp) if is_path_import(&imp.reference) => {
-                    let resolved = resolve_import(&canonical, &imp.reference)?;
-                    let child_alias_path = if alias_path.is_empty() {
-                        imp.alias.clone()
-                    } else {
-                        format!("{alias_path}.{}", imp.alias)
-                    };
-                    path_imports.insert(imp.alias.clone(), child_alias_path.clone());
-                    let child_prog = self.load(&resolved, &child_alias_path)?;
+                    let resolved = resolve_import(canonical, &imp.reference)?;
+                    let child_prefix = self.prefix_for(&resolved);
+                    path_imports.insert(imp.alias.clone(), child_prefix);
+                    let child_prog = self.load(&resolved)?;
                     merged_children.extend(child_prog.items);
                 }
                 Item::Import(_) => std_imports.push(item),
@@ -152,8 +208,9 @@ impl LoaderState {
             }
         }
 
+        let my_prefix = self.prefix_for(canonical);
         let mangler = Mangler {
-            alias_path: alias_path.to_string(),
+            prefix: my_prefix,
             local_names: &local_names,
             path_imports: &path_imports,
         };
@@ -163,6 +220,7 @@ impl LoaderState {
             .collect();
 
         self.in_progress.pop();
+        self.loaded.insert(canonical.to_path_buf());
 
         // Output order: std imports first (deduped against children's),
         // then merged children's items, then this file's items.
@@ -202,18 +260,22 @@ fn resolve_import(importer: &Path, reference: &str) -> Result<PathBuf, LoadError
 }
 
 struct Mangler<'a> {
-    alias_path: String,
+    /// Mangling prefix for items declared in this file. Empty for the
+    /// entry file, `<stem>_<hash8>` for imported files.
+    prefix: String,
     local_names: &'a HashSet<String>,
-    /// Map from local alias to the imported file's alias path.
+    /// Map from local alias to the imported file's mangling prefix.
+    /// `m.foo` rewrites to `<imported_prefix>.foo` regardless of which
+    /// alias `m` was, so two parents importing the same module agree.
     path_imports: &'a HashMap<String, String>,
 }
 
 impl<'a> Mangler<'a> {
     fn qualify(&self, name: &str) -> String {
-        if self.alias_path.is_empty() {
+        if self.prefix.is_empty() {
             name.to_string()
         } else {
-            format!("{}.{}", self.alias_path, name)
+            format!("{}.{}", self.prefix, name)
         }
     }
 
