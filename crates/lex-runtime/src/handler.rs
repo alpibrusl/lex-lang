@@ -875,6 +875,58 @@ impl EffectHandler for DefaultHandler {
                 }
                 Ok(Value::List(keys))
             }
+            ("sql", "open") => {
+                let path = expect_str(args.first())?.to_string();
+                // Same shape as `kv.open`: opening creates the
+                // SQLite file, so the fs-write allowlist applies
+                // (in-memory paths are exempt).
+                if path != ":memory:" && !self.policy.allow_fs_write.is_empty() {
+                    let p = std::path::Path::new(&path);
+                    if !self.policy.allow_fs_write.iter().any(|a| p.starts_with(a)) {
+                        return Ok(err(Value::Str(format!(
+                            "sql.open: `{path}` outside --allow-fs-write"))));
+                    }
+                }
+                match rusqlite::Connection::open(&path) {
+                    Ok(conn) => {
+                        let handle = next_sql_handle();
+                        sql_registry().lock().unwrap().insert(handle, conn);
+                        Ok(ok(Value::Int(handle as i64)))
+                    }
+                    Err(e) => Ok(err(Value::Str(format!("sql.open: {e}")))),
+                }
+            }
+            ("sql", "close") => {
+                let h = expect_sql_handle(args.first())?;
+                sql_registry().lock().unwrap().remove(h);
+                Ok(Value::Unit)
+            }
+            ("sql", "exec") => {
+                let h = expect_sql_handle(args.first())?;
+                let stmt = expect_str(args.get(1))?.to_string();
+                let params = expect_str_list(args.get(2))?;
+                let arc = sql_registry().lock().unwrap()
+                    .touch_get(h)
+                    .ok_or_else(|| "sql.exec: closed or unknown Db handle".to_string())?;
+                let conn = arc.lock().unwrap();
+                let bind: Vec<&dyn rusqlite::ToSql> = params.iter()
+                    .map(|s| s as &dyn rusqlite::ToSql)
+                    .collect();
+                match conn.execute(&stmt, rusqlite::params_from_iter(bind.iter())) {
+                    Ok(n)  => Ok(ok(Value::Int(n as i64))),
+                    Err(e) => Ok(err(Value::Str(format!("sql.exec: {e}")))),
+                }
+            }
+            ("sql", "query") => {
+                let h = expect_sql_handle(args.first())?;
+                let stmt_str = expect_str(args.get(1))?.to_string();
+                let params = expect_str_list(args.get(2))?;
+                let arc = sql_registry().lock().unwrap()
+                    .touch_get(h)
+                    .ok_or_else(|| "sql.query: closed or unknown Db handle".to_string())?;
+                let conn = arc.lock().unwrap();
+                Ok(sql_run_query(&conn, &stmt_str, &params))
+            }
             ("proc", "spawn") => {
                 // The escape hatch effect. Spawns a child process,
                 // collects its stdout/stderr, returns a structured
@@ -1313,6 +1365,81 @@ fn expect_kv_handle(v: Option<&Value>) -> Result<u64, String> {
     }
 }
 
+fn expect_sql_handle(v: Option<&Value>) -> Result<u64, String> {
+    match v {
+        Some(Value::Int(n)) if *n >= 0 => Ok(*n as u64),
+        Some(other) => Err(format!("expected Db handle (Int), got {other:?}")),
+        None => Err("missing Db argument".into()),
+    }
+}
+
+fn expect_str_list(v: Option<&Value>) -> Result<Vec<String>, String> {
+    match v {
+        Some(Value::List(items)) => items.iter().map(|x| match x {
+            Value::Str(s) => Ok(s.clone()),
+            other => Err(format!("expected List[Str] element, got {other:?}")),
+        }).collect(),
+        Some(other) => Err(format!("expected List[Str], got {other:?}")),
+        None => Err("missing List[Str] argument".into()),
+    }
+}
+
+/// Run a `SELECT` (or any returning statement) and pack the rows
+/// into `Value::List(Value::Record(...))` shape — column-name keys,
+/// SQLite-typed values mapped one-for-one to Lex value variants
+/// (Null → Unit, Integer → Int, Real → Float, Text → Str, Blob →
+/// Bytes). Returns the standard `Result[List[T], Str]` Lex shape.
+fn sql_run_query(
+    conn: &rusqlite::Connection,
+    stmt_str: &str,
+    params: &[String],
+) -> Value {
+    let mut stmt = match conn.prepare(stmt_str) {
+        Ok(s)  => s,
+        Err(e) => return err(Value::Str(format!("sql.query: {e}"))),
+    };
+    let column_count = stmt.column_count();
+    let column_names: Vec<String> = (0..column_count)
+        .map(|i| stmt.column_name(i).unwrap_or("").to_string())
+        .collect();
+    let bind: Vec<&dyn rusqlite::ToSql> = params.iter()
+        .map(|s| s as &dyn rusqlite::ToSql)
+        .collect();
+    let mut rows = match stmt.query(rusqlite::params_from_iter(bind.iter())) {
+        Ok(r)  => r,
+        Err(e) => return err(Value::Str(format!("sql.query: {e}"))),
+    };
+    let mut out: Vec<Value> = Vec::new();
+    loop {
+        let row = match rows.next() {
+            Ok(Some(r)) => r,
+            Ok(None)    => break,
+            Err(e)      => return err(Value::Str(format!("sql.query: {e}"))),
+        };
+        let mut rec = indexmap::IndexMap::new();
+        for (i, name) in column_names.iter().enumerate() {
+            let cell = match row.get_ref(i) {
+                Ok(c)  => sql_value_ref_to_lex(c),
+                Err(e) => return err(Value::Str(format!("sql.query: column {i}: {e}"))),
+            };
+            rec.insert(name.clone(), cell);
+        }
+        out.push(Value::Record(rec));
+    }
+    ok(Value::List(out))
+}
+
+fn sql_value_ref_to_lex(v: rusqlite::types::ValueRef<'_>) -> Value {
+    use rusqlite::types::ValueRef;
+    match v {
+        ValueRef::Null       => Value::Unit,
+        ValueRef::Integer(n) => Value::Int(n),
+        ValueRef::Real(f)    => Value::Float(f),
+        ValueRef::Text(s)    => Value::Str(String::from_utf8_lossy(s).into_owned()),
+        ValueRef::Blob(b)    => Value::Bytes(b.to_vec()),
+    }
+}
+
 // -- log state (process-wide; configurable via log.set_*) --
 
 #[derive(Clone, Copy, PartialEq, PartialOrd)]
@@ -1641,6 +1768,110 @@ impl KvRegistry {
 fn next_kv_handle() -> u64 {
     static COUNTER: AtomicU64 = AtomicU64::new(1);
     COUNTER.fetch_add(1, Ordering::SeqCst)
+}
+
+/// Process-wide registry of open `Db` handles. Same shape as the kv
+/// and process registries: per-handle `Arc<Mutex<…>>` so dispatch
+/// only briefly holds the global lock and ops on different
+/// connections don't serialize. LRU-bounded at
+/// [`MAX_SQL_HANDLES`] to avoid leaks from long-running programs
+/// that open many short-lived databases.
+fn sql_registry() -> &'static Mutex<SqlRegistry> {
+    static REGISTRY: OnceLock<Mutex<SqlRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(SqlRegistry::with_capacity(MAX_SQL_HANDLES)))
+}
+
+const MAX_SQL_HANDLES: usize = 256;
+
+type SharedConn = Arc<Mutex<rusqlite::Connection>>;
+
+pub(crate) struct SqlRegistry {
+    entries: indexmap::IndexMap<u64, SharedConn>,
+    cap: usize,
+}
+
+impl SqlRegistry {
+    pub(crate) fn with_capacity(cap: usize) -> Self {
+        Self { entries: indexmap::IndexMap::new(), cap }
+    }
+
+    pub(crate) fn insert(&mut self, handle: u64, conn: rusqlite::Connection) {
+        if self.entries.len() >= self.cap {
+            self.entries.shift_remove_index(0);
+        }
+        self.entries.insert(handle, Arc::new(Mutex::new(conn)));
+    }
+
+    /// Look up a handle, marking it MRU on hit. Returns a clone of
+    /// the shared `Arc` so callers release the global registry
+    /// lock before locking the per-handle mutex.
+    pub(crate) fn touch_get(&mut self, handle: u64) -> Option<SharedConn> {
+        let idx = self.entries.get_index_of(&handle)?;
+        self.entries.move_index(idx, self.entries.len() - 1);
+        self.entries.get(&handle).cloned()
+    }
+
+    pub(crate) fn remove(&mut self, handle: u64) {
+        self.entries.shift_remove(&handle);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize { self.entries.len() }
+}
+
+fn next_sql_handle() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    COUNTER.fetch_add(1, Ordering::SeqCst)
+}
+
+#[cfg(test)]
+mod sql_registry_tests {
+    use super::SqlRegistry;
+
+    fn fresh() -> rusqlite::Connection {
+        rusqlite::Connection::open_in_memory().expect("open in-memory sqlite")
+    }
+
+    #[test]
+    fn insert_and_get_round_trip() {
+        let mut r = SqlRegistry::with_capacity(4);
+        r.insert(1, fresh());
+        assert!(r.touch_get(1).is_some());
+        assert!(r.touch_get(2).is_none());
+    }
+
+    #[test]
+    fn cap_evicts_lru_on_overflow() {
+        let mut r = SqlRegistry::with_capacity(2);
+        r.insert(1, fresh());
+        r.insert(2, fresh());
+        let _ = r.touch_get(1);
+        r.insert(3, fresh());
+        assert!(r.touch_get(1).is_some(), "1 was MRU, should survive");
+        assert!(r.touch_get(2).is_none(), "2 was LRU, should be evicted");
+        assert!(r.touch_get(3).is_some(), "3 just inserted");
+        assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn remove_drops_entry() {
+        let mut r = SqlRegistry::with_capacity(4);
+        r.insert(1, fresh());
+        r.remove(1);
+        assert!(r.touch_get(1).is_none());
+        assert_eq!(r.len(), 0);
+    }
+
+    #[test]
+    fn many_inserts_stay_bounded_at_cap() {
+        let cap = 8;
+        let mut r = SqlRegistry::with_capacity(cap);
+        for i in 0..(cap as u64 * 3) {
+            r.insert(i, fresh());
+            assert!(r.len() <= cap);
+        }
+        assert_eq!(r.len(), cap);
+    }
 }
 
 #[cfg(test)]

@@ -9,6 +9,34 @@ bumps may carry breaking changes when justified).
 
 ### Added
 
+- **`std.sql` — embedded SQL (SQLite).** Second of the OSS-Auditor
+  stdlib follow-ups. Wraps `rusqlite` with the bundled SQLite
+  feature so no system lib is required. Surface:
+  - `sql.open(path) -> [sql, fs_write] Result[Db, Str]` — `Db`
+    is an opaque Int handle into a process-wide LRU-bounded
+    registry (256-handle cap with FIFO eviction, same shape as
+    `Kv`). `":memory:"` is exempt from the `--allow-fs-write`
+    scope; on-disk paths must fall under it.
+  - `sql.close(db) -> [sql] Nil` — explicit cleanup; the LRU cap
+    bounds leaks for code that forgets.
+  - `sql.exec(db, sql, params: List[Str]) -> [sql] Result[Int, Str]`
+    — INSERT / UPDATE / DELETE / DDL. Returns the affected row
+    count (`rusqlite::execute`).
+  - `sql.query[T](db, sql, params: List[Str]) -> [sql] Result[List[T], Str]`
+    — polymorphic on the row record shape, decoded column-by-
+    column into a record keyed by column name. SQLite types map
+    one-for-one to Lex `Value` variants: `Null → Unit`,
+    `Integer → Int`, `Real → Float`, `Text → Str`, `Blob →
+    Bytes`. Same shape as `json.parse` / `toml.parse`.
+  - Per-handle `Arc<Mutex<…>>` lock pattern from the v1.5
+    process-registry refactor — global lookup mutex held only
+    during dispatch; ops on different connections don't
+    serialize.
+  - v1 caveats deferred to v1.5: SQL transactions (HOF), typed
+    heterogeneous parameter binding (`SqlValue` variant),
+    named parameters. Today's `List[Str]` surface relies on
+    SQLite's column-type-affinity coercion; users stringify
+    Int / Float values before binding.
 - **`std.toml` — TOML config parser.** First slice of the
   `std.config` umbrella requested by the OSS Auditor team
   (priority: TOML > YAML > dotenv > CSV; TOML alone clears 80%
