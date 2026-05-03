@@ -151,4 +151,48 @@ impl Value {
                 s.iter().map(|k| k.as_value().to_json()).collect()),
         }
     }
+
+    /// Decode a `serde_json::Value` into a `Value`. The inverse of
+    /// [`to_json`](Self::to_json) for the shapes Lex round-trips:
+    ///
+    /// - `{"$variant": "Name", "args": [...]}` → `Value::Variant`
+    /// - JSON object → `Value::Record`
+    /// - JSON array → `Value::List`
+    /// - JSON null → `Value::Unit`
+    /// - JSON string / bool / number → the corresponding scalar
+    ///
+    /// Bytes (hex), Map, Set, F64Array, and Closure don't round-trip
+    /// — they decode as their natural JSON shape (Str / Object / Array
+    /// / Object / Str respectively), since the CLI / HTTP / VM
+    /// callers building Values from JSON don't have those shapes in
+    /// their input vocabulary.
+    pub fn from_json(v: &serde_json::Value) -> Value {
+        use serde_json::Value as J;
+        match v {
+            J::Null => Value::Unit,
+            J::Bool(b) => Value::Bool(*b),
+            J::Number(n) => {
+                if let Some(i) = n.as_i64() { Value::Int(i) }
+                else if let Some(f) = n.as_f64() { Value::Float(f) }
+                else { Value::Unit }
+            }
+            J::String(s) => Value::Str(s.clone()),
+            J::Array(items) => Value::List(items.iter().map(Value::from_json).collect()),
+            J::Object(map) => {
+                if let (Some(J::String(name)), Some(J::Array(args))) =
+                    (map.get("$variant"), map.get("args"))
+                {
+                    return Value::Variant {
+                        name: name.clone(),
+                        args: args.iter().map(Value::from_json).collect(),
+                    };
+                }
+                let mut out = indexmap::IndexMap::new();
+                for (k, v) in map {
+                    out.insert(k.clone(), Value::from_json(v));
+                }
+                Value::Record(out)
+            }
+        }
+    }
 }
