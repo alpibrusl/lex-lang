@@ -97,6 +97,198 @@ impl DefaultHandler {
         }
     }
 
+    fn dispatch_process(&mut self, op: &str, args: Vec<Value>) -> Result<Value, String> {
+        match op {
+            "spawn" => {
+                let cmd = expect_str(args.first())?.to_string();
+                let raw_args = match args.get(1) {
+                    Some(Value::List(items)) => items.clone(),
+                    _ => return Err("process.spawn: args must be List[Str]".into()),
+                };
+                let str_args: Result<Vec<String>, String> = raw_args.iter().map(|v| match v {
+                    Value::Str(s) => Ok(s.clone()),
+                    other => Err(format!("process.spawn: arg must be Str, got {other:?}")),
+                }).collect();
+                let str_args = str_args?;
+                let opts = match args.get(2) {
+                    Some(Value::Record(r)) => r.clone(),
+                    _ => return Err("process.spawn: missing or invalid opts record".into()),
+                };
+
+                // Allow-list check, mirroring the existing proc.spawn.
+                if !self.policy.allow_proc.is_empty() {
+                    let basename = std::path::Path::new(&cmd)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(&cmd);
+                    if !self.policy.allow_proc.iter().any(|a| a == basename) {
+                        return Ok(err(Value::Str(format!(
+                            "process.spawn: `{cmd}` not in --allow-proc {:?}",
+                            self.policy.allow_proc
+                        ))));
+                    }
+                }
+
+                let mut command = std::process::Command::new(&cmd);
+                command.args(&str_args);
+                command.stdin(std::process::Stdio::piped());
+                command.stdout(std::process::Stdio::piped());
+                command.stderr(std::process::Stdio::piped());
+
+                if let Some(Value::Variant { name, args: vargs }) = opts.get("cwd") {
+                    if name == "Some" {
+                        if let Some(Value::Str(s)) = vargs.first() {
+                            command.current_dir(s);
+                        }
+                    }
+                }
+                if let Some(Value::Map(env)) = opts.get("env") {
+                    for (k, v) in env {
+                        if let (lex_bytecode::MapKey::Str(ks), Value::Str(vs)) = (k, v) {
+                            command.env(ks, vs);
+                        }
+                    }
+                }
+
+                let stdin_payload: Option<Vec<u8>> = match opts.get("stdin") {
+                    Some(Value::Variant { name, args: vargs }) if name == "Some" => {
+                        match vargs.first() {
+                            Some(Value::Bytes(b)) => Some(b.clone()),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+
+                let mut child = match command.spawn() {
+                    Ok(c) => c,
+                    Err(e) => return Ok(err(Value::Str(format!("process.spawn `{cmd}`: {e}")))),
+                };
+
+                if let Some(payload) = stdin_payload {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        use std::io::Write;
+                        let _ = stdin.write_all(&payload);
+                        // Drop closes stdin; the child sees EOF.
+                    }
+                }
+
+                let stdout = child.stdout.take().map(std::io::BufReader::new);
+                let stderr = child.stderr.take().map(std::io::BufReader::new);
+                let handle = next_process_handle();
+                process_registry().lock().unwrap().insert(handle, ProcessState {
+                    child,
+                    stdout,
+                    stderr,
+                });
+                Ok(ok(Value::Int(handle as i64)))
+            }
+            "read_stdout_line" => Self::read_line_op(args, true),
+            "read_stderr_line" => Self::read_line_op(args, false),
+            "wait" => {
+                let h = expect_process_handle(args.first())?;
+                let mut reg = process_registry().lock().unwrap();
+                let state = reg.get_mut(&h)
+                    .ok_or_else(|| "process.wait: closed or unknown ProcessHandle".to_string())?;
+                let status = state.child.wait().map_err(|e| format!("process.wait: {e}"))?;
+                let mut rec = indexmap::IndexMap::new();
+                rec.insert("code".into(), Value::Int(status.code().unwrap_or(-1) as i64));
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    rec.insert("signaled".into(), Value::Bool(status.signal().is_some()));
+                }
+                #[cfg(not(unix))]
+                {
+                    rec.insert("signaled".into(), Value::Bool(false));
+                }
+                Ok(Value::Record(rec))
+            }
+            "kill" => {
+                let h = expect_process_handle(args.first())?;
+                let _signal = expect_str(args.get(1))?;
+                let mut reg = process_registry().lock().unwrap();
+                let state = reg.get_mut(&h)
+                    .ok_or_else(|| "process.kill: closed or unknown ProcessHandle".to_string())?;
+                // Cross-platform: only `kill` (SIGKILL-equivalent on
+                // Windows). Signal-name dispatch is a v1.5 follow-up.
+                match state.child.kill() {
+                    Ok(_) => Ok(ok(Value::Unit)),
+                    Err(e) => Ok(err(Value::Str(format!("process.kill: {e}")))),
+                }
+            }
+            "run" => {
+                let cmd = expect_str(args.first())?.to_string();
+                let raw_args = match args.get(1) {
+                    Some(Value::List(items)) => items.clone(),
+                    _ => return Err("process.run: args must be List[Str]".into()),
+                };
+                let str_args: Result<Vec<String>, String> = raw_args.iter().map(|v| match v {
+                    Value::Str(s) => Ok(s.clone()),
+                    other => Err(format!("process.run: arg must be Str, got {other:?}")),
+                }).collect();
+                let str_args = str_args?;
+                if !self.policy.allow_proc.is_empty() {
+                    let basename = std::path::Path::new(&cmd)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(&cmd);
+                    if !self.policy.allow_proc.iter().any(|a| a == basename) {
+                        return Ok(err(Value::Str(format!(
+                            "process.run: `{cmd}` not in --allow-proc {:?}",
+                            self.policy.allow_proc
+                        ))));
+                    }
+                }
+                match std::process::Command::new(&cmd).args(&str_args).output() {
+                    Ok(o) => {
+                        let mut rec = indexmap::IndexMap::new();
+                        rec.insert("stdout".into(), Value::Str(
+                            String::from_utf8_lossy(&o.stdout).to_string()));
+                        rec.insert("stderr".into(), Value::Str(
+                            String::from_utf8_lossy(&o.stderr).to_string()));
+                        rec.insert("exit_code".into(), Value::Int(
+                            o.status.code().unwrap_or(-1) as i64));
+                        Ok(ok(Value::Record(rec)))
+                    }
+                    Err(e) => Ok(err(Value::Str(format!("process.run `{cmd}`: {e}")))),
+                }
+            }
+            other => Err(format!("unsupported process.{other}")),
+        }
+    }
+
+    /// Read one line from the child's stdout (`is_stdout = true`) or
+    /// stderr. Returns `None` (Lex `Option`) at EOF; subsequent calls
+    /// keep returning `None`.
+    fn read_line_op(args: Vec<Value>, is_stdout: bool) -> Result<Value, String> {
+        let h = expect_process_handle(args.first())?;
+        let mut reg = process_registry().lock().unwrap();
+        let state = reg.get_mut(&h)
+            .ok_or_else(|| format!(
+                "process.read_{}_line: closed or unknown ProcessHandle",
+                if is_stdout { "stdout" } else { "stderr" }))?;
+        let reader_opt = if is_stdout {
+            state.stdout.as_mut().map(|r| -> &mut dyn std::io::BufRead { r })
+        } else {
+            state.stderr.as_mut().map(|r| -> &mut dyn std::io::BufRead { r })
+        };
+        let reader = match reader_opt {
+            Some(r) => r,
+            None => return Ok(none()),
+        };
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => Ok(none()),
+            Ok(_) => {
+                if line.ends_with('\n') { line.pop(); }
+                if line.ends_with('\r') { line.pop(); }
+                Ok(some(Value::Str(line)))
+            }
+            Err(e) => Err(format!("process.read_*_line: {e}")),
+        }
+    }
+
     fn dispatch_fs(&mut self, op: &str, args: Vec<Value>) -> Result<Value, String> {
         match op {
             "exists" => {
@@ -319,6 +511,10 @@ impl EffectHandler for DefaultHandler {
         // `std.fs` ops use the fine-grained `[fs_walk]` and `[fs_write]`
         // effect kinds (distinct from the module name `fs`); the
         // policy check uses the per-op kind, not the module's.
+        if kind == "process" {
+            self.ensure_kind_allowed("proc")?;
+            return self.dispatch_process(op, args);
+        }
         if kind == "fs" {
             let effect_kind = match op {
                 "exists" | "is_file" | "is_dir" | "stat"
@@ -826,6 +1022,30 @@ fn expect_kv_handle(v: Option<&Value>) -> Result<u64, String> {
         Some(Value::Int(n)) if *n >= 0 => Ok(*n as u64),
         Some(other) => Err(format!("expected Kv handle (Int), got {other:?}")),
         None => Err("missing Kv argument".into()),
+    }
+}
+
+struct ProcessState {
+    child: std::process::Child,
+    stdout: Option<std::io::BufReader<std::process::ChildStdout>>,
+    stderr: Option<std::io::BufReader<std::process::ChildStderr>>,
+}
+
+fn process_registry() -> &'static Mutex<HashMap<u64, ProcessState>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<u64, ProcessState>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn next_process_handle() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    COUNTER.fetch_add(1, Ordering::SeqCst)
+}
+
+fn expect_process_handle(v: Option<&Value>) -> Result<u64, String> {
+    match v {
+        Some(Value::Int(n)) if *n >= 0 => Ok(*n as u64),
+        Some(other) => Err(format!("expected ProcessHandle (Int), got {other:?}")),
+        None => Err("missing ProcessHandle argument".into()),
     }
 }
 
