@@ -514,7 +514,7 @@ lex/
 | LLM-agnostic discovery | ✅ — full [ACLI](https://github.com/alpibrusl/acli) compliance: `lex introspect` / `lex skill` / `lex version`, `--output text\|json\|table` on every subcommand, `--dry-run` on state-modifying ones, error envelopes with semantic exit codes |
 | Hardening | [`SECURITY.md`](SECURITY.md) threat model ✅ ; parser-recursion DoS gate (`MAX_DEPTH=96`) ✅ ; **VM call-stack depth gate (`MAX_CALL_DEPTH=1024`) ✅** ; libFuzzer CI for parser + type checker ✅ ; VM-level memory bounds remain delegated to the host (container memory caps) |
 
-**Workspace test count:** 527 passing, 0 failing, 5 ignored (WS chat example + handful of slow examples, flaky on CI runners — pass locally with `--ignored`). `cargo clippy --workspace --all-targets -- -D warnings` clean. Fuzz CI: 60 s/PR, 5 min nightly across both targets.
+**Workspace test count:** 537 passing, 0 failing, 5 ignored (WS chat example + handful of slow examples, flaky on CI runners — pass locally with `--ignored`). `cargo clippy --workspace --all-targets -- -D warnings` clean. Fuzz CI: 60 s/PR, 5 min nightly across both targets.
 
 ## Install
 
