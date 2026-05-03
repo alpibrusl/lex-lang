@@ -1021,12 +1021,6 @@ fn format_iso(n: i64) -> String {
     chrono_from_instant(n).to_rfc3339()
 }
 
-/// Materialize the `DateTime` record from an Instant under the named
-/// timezone. `tz_name` accepts:
-///   - "UTC"
-///   - "Local"
-///   - an IANA name like "America/New_York"
-///   - a fixed offset like "+05:30" or "-08:00"
 /// Parsed form of the user-side `Tz` variant. Mirrors the type
 /// registered in `TypeEnv::new_with_builtins`.
 enum TzArg {
@@ -1078,7 +1072,7 @@ fn resolve_tz_to_components(n: i64, tz: &TzArg) -> Result<Value, String> {
              d.nanosecond() as i32, off)
         }
         TzArg::Offset(off_min) => {
-            let off_secs = (*off_min as i32).saturating_mul(60);
+            let off_secs = off_min.saturating_mul(60);
             let fixed = chrono::FixedOffset::east_opt(off_secs)
                 .ok_or("to_components: offset out of range")?;
             let d = utc_dt.with_timezone(&fixed);
