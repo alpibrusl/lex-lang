@@ -162,6 +162,70 @@ fn run_capture_exit_for_succeeding_command() {
 }
 
 #[test]
+fn wait_evicts_handle_so_subsequent_read_fails() {
+    // After `process.wait` returns, the handle is terminal — the
+    // registry drops it. A read on the same handle should now hit
+    // the "closed or unknown ProcessHandle" path, surfaced here as
+    // a Rust-level VM error (the handler returns Err out-of-band).
+    //
+    // We probe that by comparing the success path (read-then-wait,
+    // with no post-wait read) against the failure path (read,
+    // wait, read again). The failure path produces a VM error
+    // which `vm.call` reports as Err.
+    let src = r#"
+import "std.process" as process
+import "std.map" as map
+import "std.option" as option
+
+fn empty_opts() -> { cwd :: Option[Str], env :: Map[Str, Str], stdin :: Option[Bytes] } {
+  { cwd: None, env: map.new(), stdin: None }
+}
+
+fn read_after_wait(cmd :: Str, args :: List[Str]) -> [proc] Bool {
+  match process.spawn(cmd, args, empty_opts()) {
+    Ok(h) => {
+      # Drain output, then wait.
+      let drained := drain(h)
+      let exited := process.wait(h)
+      # Try one more read; the registry has dropped `h` so this
+      # short-circuits to a runtime error before reaching the body.
+      match process.read_stdout_line(h) {
+        Some(_) => true,
+        None    => false,
+      }
+    },
+    Err(_) => false,
+  }
+}
+
+fn drain(h :: ProcessHandle) -> [proc] Int {
+  match process.read_stdout_line(h) {
+    Some(_) => drain(h),
+    None    => 0,
+  }
+}
+"#;
+    let prog = parse_source(src).expect("parse");
+    let stages = canonicalize_program(&prog);
+    if let Err(errs) = lex_types::check_program(&stages) {
+        panic!("type errors:\n{errs:#?}");
+    }
+    let bc = Arc::new(compile_program(&stages));
+    let handler = DefaultHandler::new(policy_with_proc()).with_program(Arc::clone(&bc));
+    let mut vm = Vm::with_handler(&bc, Box::new(handler));
+    let r = vm.call("read_after_wait", vec![
+        Value::Str("printf".into()),
+        Value::List(vec![Value::Str("a\n".into())]),
+    ]);
+    let err = r.expect_err("post-wait read should hit closed-or-unknown");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("closed or unknown ProcessHandle"),
+        "expected closed-or-unknown message, got {msg}"
+    );
+}
+
+#[test]
 fn allow_proc_basename_blocks_unlisted() {
     let mut p = policy_with_proc();
     p.allow_proc = ["allowed_command_zzz".to_string()].into_iter().collect();
