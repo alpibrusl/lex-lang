@@ -22,7 +22,7 @@ pub fn try_pure_builtin(kind: &str, op: &str, args: &[Value]) -> Option<Result<V
 pub fn is_pure_module(kind: &str) -> bool {
     matches!(kind, "str" | "int" | "float" | "bool" | "list"
         | "option" | "result" | "tuple" | "json" | "bytes" | "flow" | "math"
-        | "map" | "set" | "crypto" | "regex")
+        | "map" | "set" | "crypto" | "regex" | "deque")
 }
 
 fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
@@ -515,6 +515,96 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let b = expect_set(args.get(1))?;
             Ok(Value::Set(a.intersection(b).cloned().collect()))
         }
+        ("set", "diff") => {
+            let a = expect_set(args.first())?;
+            let b = expect_set(args.get(1))?;
+            Ok(Value::Set(a.difference(b).cloned().collect()))
+        }
+        ("set", "is_empty") => Ok(Value::Bool(expect_set(args.first())?.is_empty())),
+        ("set", "is_subset") => {
+            let a = expect_set(args.first())?;
+            let b = expect_set(args.get(1))?;
+            Ok(Value::Bool(a.is_subset(b)))
+        }
+
+        // -- map helpers --
+        ("map", "merge") => {
+            // b's entries override a's. We construct a new BTreeMap
+            // by extending a with b's pairs.
+            let a = expect_map(args.first())?.clone();
+            let b = expect_map(args.get(1))?;
+            let mut out = a;
+            for (k, v) in b {
+                out.insert(k.clone(), v.clone());
+            }
+            Ok(Value::Map(out))
+        }
+        ("map", "is_empty") => Ok(Value::Bool(expect_map(args.first())?.is_empty())),
+
+        // -- deque --
+        ("deque", "new") => Ok(Value::Deque(std::collections::VecDeque::new())),
+        ("deque", "size") => Ok(Value::Int(expect_deque(args.first())?.len() as i64)),
+        ("deque", "is_empty") => Ok(Value::Bool(expect_deque(args.first())?.is_empty())),
+        ("deque", "push_back") => {
+            let mut d = expect_deque(args.first())?.clone();
+            let x = args.get(1).ok_or("deque.push_back: missing value")?.clone();
+            d.push_back(x);
+            Ok(Value::Deque(d))
+        }
+        ("deque", "push_front") => {
+            let mut d = expect_deque(args.first())?.clone();
+            let x = args.get(1).ok_or("deque.push_front: missing value")?.clone();
+            d.push_front(x);
+            Ok(Value::Deque(d))
+        }
+        ("deque", "pop_back") => {
+            let mut d = expect_deque(args.first())?.clone();
+            match d.pop_back() {
+                Some(x) => Ok(Value::Variant {
+                    name: "Some".into(),
+                    args: vec![Value::Tuple(vec![x, Value::Deque(d)])],
+                }),
+                None => Ok(Value::Variant { name: "None".into(), args: vec![] }),
+            }
+        }
+        ("deque", "pop_front") => {
+            let mut d = expect_deque(args.first())?.clone();
+            match d.pop_front() {
+                Some(x) => Ok(Value::Variant {
+                    name: "Some".into(),
+                    args: vec![Value::Tuple(vec![x, Value::Deque(d)])],
+                }),
+                None => Ok(Value::Variant { name: "None".into(), args: vec![] }),
+            }
+        }
+        ("deque", "peek_back") => {
+            let d = expect_deque(args.first())?;
+            match d.back() {
+                Some(x) => Ok(Value::Variant {
+                    name: "Some".into(),
+                    args: vec![x.clone()],
+                }),
+                None => Ok(Value::Variant { name: "None".into(), args: vec![] }),
+            }
+        }
+        ("deque", "peek_front") => {
+            let d = expect_deque(args.first())?;
+            match d.front() {
+                Some(x) => Ok(Value::Variant {
+                    name: "Some".into(),
+                    args: vec![x.clone()],
+                }),
+                None => Ok(Value::Variant { name: "None".into(), args: vec![] }),
+            }
+        }
+        ("deque", "from_list") => {
+            let xs = expect_list(args.first())?;
+            Ok(Value::Deque(xs.iter().cloned().collect()))
+        }
+        ("deque", "to_list") => {
+            let d = expect_deque(args.first())?;
+            Ok(Value::List(d.iter().cloned().collect()))
+        }
 
         // -- crypto (pure ops; crypto.random is effectful and routes
         // through the handler under [random], see try_pure_builtin) --
@@ -806,6 +896,14 @@ fn expect_list(v: Option<&Value>) -> Result<&Vec<Value>, String> {
     match v {
         Some(Value::List(xs)) => Ok(xs),
         Some(other) => Err(format!("expected List, got {other:?}")),
+        None => Err("missing argument".into()),
+    }
+}
+
+fn expect_deque(v: Option<&Value>) -> Result<&std::collections::VecDeque<Value>, String> {
+    match v {
+        Some(Value::Deque(d)) => Ok(d),
+        Some(other) => Err(format!("expected Deque, got {other:?}")),
         None => Err("missing argument".into()),
     }
 }

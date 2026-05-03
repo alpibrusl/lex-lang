@@ -1,7 +1,7 @@
 //! Runtime values.
 
 use indexmap::IndexMap;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -34,6 +34,13 @@ pub enum Value {
     Map(BTreeMap<MapKey, Value>),
     /// Persistent set with the same key-type discipline as `Map`.
     Set(BTreeSet<MapKey>),
+    /// Double-ended queue. O(1) push/pop on both ends; otherwise
+    /// behaves like `List` for iteration / equality / JSON shape.
+    /// Lex's type system tracks `Deque[T]` separately from `List[T]`
+    /// so users explicitly opt in to deque semantics; the runtime
+    /// uses this dedicated variant rather than backing a deque on top
+    /// of `Value::List` (which would make `push_front` O(n)).
+    Deque(VecDeque<Value>),
 }
 
 /// Hashable, ordered key for `Value::Map` / `Value::Set`. v1
@@ -149,6 +156,7 @@ impl Value {
             }
             Value::Set(s) => J::Array(
                 s.iter().map(|k| k.as_value().to_json()).collect()),
+            Value::Deque(items) => J::Array(items.iter().map(Value::to_json).collect()),
         }
     }
 
