@@ -578,6 +578,7 @@ impl<'a> FnCompiler<'a> {
             ("flow", "branch") => self.emit_flow_branch(args),
             ("flow", "retry") => self.emit_flow_retry(args),
             ("flow", "parallel") => self.emit_flow_parallel(args),
+            ("flow", "parallel_list") => self.emit_flow_parallel_list(args),
             _ => return false,
         }
         true
@@ -898,6 +899,68 @@ impl<'a> FnCompiler<'a> {
         ];
         let fn_id = self.install_trampoline("__flow_parallel", 2, 2, code);
         self.emit(Op::MakeClosure { fn_id, capture_count: 2 });
+    }
+
+    /// `flow.parallel_list(actions)` runs each 0-arg closure in `actions`
+    /// and returns the results as a list in input order. Variadic
+    /// counterpart to `flow.parallel`. Sequential under the hood — the
+    /// spec (§11.2) reserves true threading for a future scheduler.
+    /// Compiled inline (mirrors `list.map`) so closure args can flow
+    /// through `CallClosure` without a heap-allocated trampoline.
+    fn emit_flow_parallel_list(&mut self, args: &[a::CExpr]) {
+        // xs := actions
+        self.compile_expr(&args[0], false);
+        let xs = self.alloc_local("__fpl_xs");
+        self.emit(Op::StoreLocal(xs));
+
+        // out := []
+        self.emit(Op::MakeList(0));
+        let out = self.alloc_local("__fpl_out");
+        self.emit(Op::StoreLocal(out));
+
+        // i := 0
+        let zero = self.pool.int(0);
+        self.emit(Op::PushConst(zero));
+        let i = self.alloc_local("__fpl_i");
+        self.emit(Op::StoreLocal(i));
+
+        // loop_top: while i < len(xs) { ... }
+        let loop_top = self.code.len();
+        self.emit(Op::LoadLocal(i));
+        self.emit(Op::LoadLocal(xs));
+        self.emit(Op::GetListLen);
+        self.emit(Op::NumLt);
+        let j_exit = self.code.len();
+        self.emit(Op::JumpIfNot(0));
+
+        // body: out := out ++ [xs[i]()]
+        let nid = self.pool.node_id("n_flow_parallel_list");
+        self.emit(Op::LoadLocal(out));
+        self.emit(Op::LoadLocal(xs));
+        self.emit(Op::LoadLocal(i));
+        self.emit(Op::GetListElemDyn);
+        self.emit(Op::CallClosure { arity: 0, node_id_idx: nid });
+        self.emit(Op::ListAppend);
+        self.emit(Op::StoreLocal(out));
+
+        // i := i + 1
+        self.emit(Op::LoadLocal(i));
+        let one = self.pool.int(1);
+        self.emit(Op::PushConst(one));
+        self.emit(Op::NumAdd);
+        self.emit(Op::StoreLocal(i));
+
+        // jump back
+        let jump_back = self.code.len();
+        let back = (loop_top as i32) - (jump_back as i32 + 1);
+        self.emit(Op::Jump(back));
+
+        // exit: patch j_exit, push out
+        let exit_target = self.code.len() as i32;
+        if let Op::JumpIfNot(off) = &mut self.code[j_exit] {
+            *off = exit_target - (j_exit as i32 + 1);
+        }
+        self.emit(Op::LoadLocal(out));
     }
 
     /// `flow.branch(cond, t, f)` returns a closure `(x) -> if cond(x) then t(x) else f(x)`.
