@@ -17,6 +17,11 @@ pub fn try_pure_builtin(kind: &str, op: &str, args: &[Value]) -> Option<Result<V
     // Same shape: `datetime.now` is the only effectful op in
     // `std.datetime` (all the parse/format/arithmetic ops are pure).
     if (kind, op) == ("datetime", "now") { return None; }
+    // `std.http` is mostly pure (builders + decoders); only the
+    // wire ops `send`/`get`/`post` need the [net] effect handler.
+    if (kind, "send") == (kind, op) && kind == "http" { return None; }
+    if (kind, "get")  == (kind, op) && kind == "http" { return None; }
+    if (kind, "post") == (kind, op) && kind == "http" { return None; }
     Some(dispatch(kind, op, args))
 }
 
@@ -25,7 +30,7 @@ pub fn try_pure_builtin(kind: &str, op: &str, args: &[Value]) -> Option<Result<V
 pub fn is_pure_module(kind: &str) -> bool {
     matches!(kind, "str" | "int" | "float" | "bool" | "list"
         | "option" | "result" | "tuple" | "json" | "bytes" | "flow" | "math"
-        | "map" | "set" | "crypto" | "regex" | "deque" | "datetime")
+        | "map" | "set" | "crypto" | "regex" | "deque" | "datetime" | "http")
 }
 
 fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
@@ -827,6 +832,68 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             Ok(Value::List(parts))
         }
 
+        // -- http (builders + decoders; wire ops live in the
+        // effect handler under `[net]`) --
+        ("http", "with_header") => {
+            let req = expect_record_pure(args.first())?.clone();
+            let k = expect_str(args.get(1))?;
+            let v = expect_str(args.get(2))?;
+            Ok(Value::Record(http_set_header(req, &k, &v)))
+        }
+        ("http", "with_auth") => {
+            let req = expect_record_pure(args.first())?.clone();
+            let scheme = expect_str(args.get(1))?;
+            let token = expect_str(args.get(2))?;
+            let value = format!("{scheme} {token}");
+            Ok(Value::Record(http_set_header(req, "Authorization", &value)))
+        }
+        ("http", "with_query") => {
+            let req = expect_record_pure(args.first())?.clone();
+            let params = match args.get(1) {
+                Some(Value::Map(m)) => m.clone(),
+                Some(other) => return Err(format!(
+                    "http.with_query: params must be Map[Str, Str], got {other:?}")),
+                None => return Err("http.with_query: missing params argument".into()),
+            };
+            Ok(Value::Record(http_append_query(req, &params)))
+        }
+        ("http", "with_timeout_ms") => {
+            let req = expect_record_pure(args.first())?.clone();
+            let ms = expect_int(args.get(1))?;
+            let mut out = req;
+            out.insert("timeout_ms".into(), Value::Variant {
+                name: "Some".into(),
+                args: vec![Value::Int(ms)],
+            });
+            Ok(Value::Record(out))
+        }
+        ("http", "json_body") => {
+            let resp = expect_record_pure(args.first())?;
+            let body = match resp.get("body") {
+                Some(Value::Bytes(b)) => b.clone(),
+                _ => return Err("http.json_body: HttpResponse.body must be Bytes".into()),
+            };
+            let s = match std::str::from_utf8(&body) {
+                Ok(s) => s,
+                Err(e) => return Ok(http_decode_err_pure(format!("body not UTF-8: {e}"))),
+            };
+            match serde_json::from_str::<serde_json::Value>(s) {
+                Ok(j) => Ok(ok_v(Value::from_json(&j))),
+                Err(e) => Ok(http_decode_err_pure(format!("json parse: {e}"))),
+            }
+        }
+        ("http", "text_body") => {
+            let resp = expect_record_pure(args.first())?;
+            let body = match resp.get("body") {
+                Some(Value::Bytes(b)) => b.clone(),
+                _ => return Err("http.text_body: HttpResponse.body must be Bytes".into()),
+            };
+            match String::from_utf8(body) {
+                Ok(s) => Ok(ok_v(Value::Str(s))),
+                Err(e) => Ok(http_decode_err_pure(format!("body not UTF-8: {e}"))),
+            }
+        }
+
         _ => Err(format!("unknown pure builtin: {kind}.{op}")),
     }
 }
@@ -993,6 +1060,95 @@ fn some(v: Value) -> Value { Value::Variant { name: "Some".into(), args: vec![v]
 fn none() -> Value { Value::Variant { name: "None".into(), args: Vec::new() } }
 fn ok_v(v: Value) -> Value { Value::Variant { name: "Ok".into(), args: vec![v] } }
 fn err_v(v: Value) -> Value { Value::Variant { name: "Err".into(), args: vec![v] } }
+
+// -- helpers for `std.http` builders / decoders --
+
+fn expect_record_pure(v: Option<&Value>) -> Result<&indexmap::IndexMap<String, Value>, String> {
+    match v {
+        Some(Value::Record(r)) => Ok(r),
+        Some(other) => Err(format!("expected Record, got {other:?}")),
+        None => Err("missing Record argument".into()),
+    }
+}
+
+fn http_decode_err_pure(msg: String) -> Value {
+    let inner = Value::Variant {
+        name: "DecodeError".into(),
+        args: vec![Value::Str(msg)],
+    };
+    err_v(inner)
+}
+
+/// Apply or replace a header in an `HttpRequest` record's `headers`
+/// field. Header names are normalized to lowercase to match HTTP/1.1
+/// case-insensitivity; an existing entry under any casing is
+/// overwritten by the new value.
+fn http_set_header(
+    mut req: indexmap::IndexMap<String, Value>,
+    name: &str,
+    value: &str,
+) -> indexmap::IndexMap<String, Value> {
+    use lex_bytecode::MapKey;
+    let mut headers = match req.shift_remove("headers") {
+        Some(Value::Map(m)) => m,
+        _ => std::collections::BTreeMap::new(),
+    };
+    let key = MapKey::Str(name.to_lowercase());
+    // Drop any case variant of the same header name first so casing
+    // flips don't accumulate duplicates.
+    let lowered = name.to_lowercase();
+    headers.retain(|k, _| match k {
+        MapKey::Str(s) => s.to_lowercase() != lowered,
+        _ => true,
+    });
+    headers.insert(key, Value::Str(value.to_string()));
+    req.insert("headers".into(), Value::Map(headers));
+    req
+}
+
+/// Append `?k=v&...` (URL-encoded) to the `url` field of an
+/// `HttpRequest` record. Existing query string is preserved and
+/// extended with `&`. Iteration order is the input map's natural
+/// order (`BTreeMap` → sorted by key) so the produced URL is
+/// deterministic.
+fn http_append_query(
+    mut req: indexmap::IndexMap<String, Value>,
+    params: &std::collections::BTreeMap<lex_bytecode::MapKey, Value>,
+) -> indexmap::IndexMap<String, Value> {
+    use lex_bytecode::MapKey;
+    let url = match req.get("url") {
+        Some(Value::Str(s)) => s.clone(),
+        _ => return req,
+    };
+    let mut pieces = Vec::new();
+    for (k, v) in params {
+        let kk = match k { MapKey::Str(s) => s.clone(), _ => continue };
+        let vv = match v { Value::Str(s) => s.clone(), _ => continue };
+        pieces.push(format!("{}={}", url_encode(&kk), url_encode(&vv)));
+    }
+    if pieces.is_empty() { return req; }
+    let sep = if url.contains('?') { '&' } else { '?' };
+    let new_url = format!("{url}{sep}{}", pieces.join("&"));
+    req.insert("url".into(), Value::Str(new_url));
+    req
+}
+
+/// Minimal RFC-3986 percent-encode for `application/x-www-form-
+/// urlencoded` query values. Pulling in `urlencoding` for one
+/// callsite would drag a dep into the runtime; the inline version is
+/// short and easy to audit.
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
 
 fn value_to_json(v: &Value) -> serde_json::Value { v.to_json() }
 

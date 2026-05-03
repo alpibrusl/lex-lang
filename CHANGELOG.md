@@ -9,6 +9,27 @@ bumps may carry breaking changes when justified).
 
 ### Added
 
+- **`std.http` — rich HTTP client.** Adds:
+  - Wire ops: `http.send(req)`, `http.get(url)`, `http.post(url,
+    body, content_type)` — all gated on `[net]` and respecting
+    `--allow-net-host`.
+  - Builders (pure record transforms): `http.with_header`,
+    `http.with_auth(req, scheme, token)` (renders
+    `Authorization: <scheme> <token>`), `http.with_query` (URL-
+    encodes the params and appends `?k=v&...`), and
+    `http.with_timeout_ms`.
+  - Decoders: `http.text_body(resp) -> Result[Str, HttpError]` and
+    polymorphic `http.json_body(resp) -> Result[T, HttpError]`
+    (mirrors `json.parse`).
+  - `HttpRequest` / `HttpResponse` registered as built-in record
+    aliases, `HttpError = NetworkError(Str) | TimeoutError |
+    TlsError(Str) | DecodeError(Str)` as a built-in variant.
+    Anonymous record literals coerce to `HttpRequest` so users
+    write `{ method: ..., url: ..., headers: map.new(), body:
+    None, timeout_ms: None }` without a dedicated constructor.
+  - Multipart upload + streaming response bodies are deferred to
+    v1.5; the v1 surface covers the common cases (auth, headers,
+    query, timeouts, JSON / text decoding). Closes #98.
 - **`std.flow.parallel_list[T](actions: List[() -> T]) -> List[T]`** —
   variadic counterpart to `flow.parallel`. Runs each 0-arg closure
   in input order and returns the results as a list. Sequential under
