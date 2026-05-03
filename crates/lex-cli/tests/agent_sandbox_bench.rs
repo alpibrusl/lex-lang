@@ -301,7 +301,7 @@ fn write_report(results: &[(&Case, CaseResult)]) {
     s.push_str("3. **Python (RestrictedPython)** — `bench/python_restricted_sandbox.py`. ");
     s.push_str("Uses `compile_restricted` + `safe_builtins` + `safer_getattr`; the ");
     s.push_str("most-reached-for credible Python sandbox library.\n\n");
-    s.push_str("Regenerate: `cargo test -p lex-cli --test agent_sandbox_bench`.\n\n");
+    s.push_str("Regenerate: `BENCH_WRITE_REPORT=1 cargo test -p lex-cli --test agent_sandbox_bench`.\n\n");
 
     let attacks: Vec<_> = results.iter()
         .filter(|(c, _)| c.intent == Intent::Adversarial).collect();
@@ -408,7 +408,15 @@ fn agent_sandbox_benchmark() {
         return;
     }
     let results = run_all();
-    write_report(&results);
+    // Writing the report is a side effect on `bench/REPORT.md`, which
+    // makes a routine `cargo test --workspace` mutate the working
+    // tree. Gate it behind an env var so the test is idempotent by
+    // default. Regenerate the published report with:
+    //
+    //     BENCH_WRITE_REPORT=1 cargo test -p lex-cli --test agent_sandbox_bench
+    if std::env::var("BENCH_WRITE_REPORT").is_ok() {
+        write_report(&results);
+    }
 
     // Per-case assertions: every adversarial case must be Blocked or Errored
     // by Lex. Benign cases must be Ran by Lex. Python's outcome is recorded
