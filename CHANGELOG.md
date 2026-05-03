@@ -11,12 +11,12 @@ bumps may carry breaking changes when justified).
 
 - **Local file imports** between `.lex` modules
   (`import "./helpers" as h`, `../`, `/abs/`). Imported files'
-  top-level fns and types are mangled with the alias path so they
-  don't collide with the importer's names; references — including
-  `m.foo(...)` calls and `m.Type` annotations — get rewritten in
-  place. Cycle detection reports the full path chain. Stdlib
-  imports unchanged. Multi-file programs no longer collapse into a
-  single file. (#83, closes #78)
+  top-level fns and types are mangled with a stable per-file prefix
+  so they don't collide with the importer's names; references —
+  including `m.foo(...)` calls and `m.Type` annotations — get
+  rewritten in place. Cycle detection reports the full path chain.
+  Stdlib imports unchanged. Multi-file programs no longer collapse
+  into a single file. (#83, closes #78)
 - **`lex check` surfaces required `--allow-effects` grants** in
   both text and JSON output. The text mode adds a one-line summary
   plus a ready-to-run `lex run --allow-effects ...` suggestion;
@@ -29,6 +29,16 @@ bumps may carry breaking changes when justified).
 
 ### Changed
 
+- **Diamond imports collapse to one nominal identity per file.**
+  The loader's mangling key is now the canonical filesystem path
+  (`<stem>_<8hex of sha256>`) rather than the alias chain, and the
+  loader dedupes second loads of the same path. The natural
+  `types/ + behavior/ + runner/` layout — where two siblings each
+  import the same `models.lex` — now works: `Report` resolved
+  through `scorer.m` and `verdict.m` is the same nominal type. The
+  entry file is special-cased to an empty prefix so
+  `lex run main.lex process` keeps working without users typing the
+  hash. (#91, closes #88)
 - **Anonymous record literals coerce to nominal record aliases at
   every position** — function argument, nested record field, list
   element, `let p :: T := { ... }`, constructor payload, pattern.
@@ -36,6 +46,11 @@ bumps may carry breaking changes when justified).
   POCs to write explicit `mk_*` constructor functions for every
   nominal record type. Two distinct nominal types with the same
   shape stay nominally distinct. (#86, closes #79)
+- **Bare record patterns now match nominal record aliases.**
+  `match v { { idea: pat, ... } => … }` works when `v` has a
+  `type T = { ... }` annotation — mirror of the literal-coercion
+  fix above. Unblocks the flat decision-table pattern (otherwise
+  forced into a nested-match-per-axis tree). (#90, closes #89)
 - **Trailing commas** are now allowed in every comma-separated
   list (fn params, call args, lambda params, type args, effects,
   function type params, constructor type payloads, constructor

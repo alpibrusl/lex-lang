@@ -106,13 +106,19 @@ lex run main.lex describe '{"$variant":"Healthy","args":[]}'
 
 Path imports are resolved relative to the importer's directory; the
 `.lex` extension is auto-appended. `../`, `/abs/path.lex`, and
-multi-level nesting (`f.g.h`) all work, with cycle detection that
-reports the full path chain. Stdlib imports are unchanged.
+multi-level nesting all work, with cycle detection that reports the
+full path chain. Stdlib imports are unchanged.
 
-> Each imported function is currently identified by its alias path,
-> so `lex blame` doesn't yet follow a function across imports — see
-> [`#82`](https://github.com/alpibrusl/lex-lang/issues/82) for the
-> store-native sharing model that will fix this.
+The natural `types/ + behavior/ + runner/` layout works too: when
+two siblings each `import "./models" as m`, both reach the same
+`Report` nominal type — the loader keys mangling on the canonical
+filesystem path and dedupes second loads, so diamond-shaped imports
+collapse to one identity.
+
+> Identity is per-file-path today: moving or renaming a `.lex` file
+> changes the prefix used in mangled names. The future
+> [store-native imports](https://github.com/alpibrusl/lex-lang/issues/82)
+> tracker is where content-addressed identity will eventually live.
 
 ### Quickstart: agent-native tooling
 
@@ -226,6 +232,21 @@ fn area(s :: Shape) -> Float {
   match s {
     Circle({ radius }) => 3.14159 * radius * radius,
     Rect({ width, height }) => width * height,
+  }
+}
+```
+
+A bare record pattern matches a nominal record alias too — useful
+for flat decision tables over a fixed set of fields:
+
+```
+type Bands = { idea :: Str, execution :: Str }
+
+fn verdict(b :: Bands) -> Str {
+  match b {
+    { idea: "high", execution: "high" } => "ship",
+    { idea: "high", execution: _      } => "iterate",
+    _                                   => "park",
   }
 }
 ```

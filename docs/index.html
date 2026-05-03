@@ -423,6 +423,8 @@ lex check examples/c_echo.lex
 #   import "./helpers" as h
 # Sibling .lex files are loaded and merged. Cycle detection,
 # transitive imports, and `m.Type` qualified types all work.
+# Diamond imports (two siblings importing the same module) collapse
+# to one nominal identity, so `types/ + behavior/ + runner/` works.
 
 # Reject a malicious tool without an API key:
 lex agent-tool --allow-effects net --input x \
