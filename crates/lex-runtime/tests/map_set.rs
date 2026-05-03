@@ -179,3 +179,95 @@ fn build() -> Map[Str, Int] { map.set(map.set(map.new(), "x", 7), "y", 11) }
     assert_eq!(m.get(&MapKey::Str("x".into())), Some(&Value::Int(7)));
     assert_eq!(m.get(&MapKey::Str("y".into())), Some(&Value::Int(11)));
 }
+
+#[test]
+fn map_fold_sums_values() {
+    // Combiner uses only `v`, ignores `k`. Smoke test the wiring.
+    let src = r#"
+import "std.map" as map
+fn sum_values() -> Int {
+  let m := map.set(map.set(map.set(map.new(), "a", 1), "b", 2), "c", 3)
+  map.fold(m, 0, fn (acc :: Int, k :: Str, v :: Int) -> Int { acc + v })
+}
+"#;
+    assert_eq!(run(src, "sum_values", vec![]), Value::Int(6));
+}
+
+#[test]
+fn map_fold_on_empty_returns_init() {
+    let src = r#"
+import "std.map" as map
+fn fold_empty() -> Int {
+  map.fold(map.new(), 42, fn (acc :: Int, k :: Str, v :: Int) -> Int { acc + v })
+}
+"#;
+    assert_eq!(run(src, "fold_empty", vec![]), Value::Int(42));
+}
+
+#[test]
+fn map_fold_passes_both_key_and_value_to_combiner() {
+    // Combiner uses both: `acc + parse(k) * v`. With keys "1","2","3"
+    // and values 10,20,30 → 1*10 + 2*20 + 3*30 = 140.
+    let src = r#"
+import "std.map" as map
+import "std.str" as str
+fn weighted_sum() -> Int {
+  let m := map.set(map.set(map.set(map.new(), "1", 10), "2", 20), "3", 30)
+  map.fold(m, 0, fn (acc :: Int, k :: Str, v :: Int) -> Int {
+    let kn := match str.to_int(k) { Some(n) => n, None => 0 }
+    acc + kn * v
+  })
+}
+"#;
+    assert_eq!(run(src, "weighted_sum", vec![]), Value::Int(140));
+}
+
+#[test]
+fn map_fold_iterates_in_btreemap_key_order() {
+    // BTreeMap iteration is sorted by key. Folding into a list shows
+    // the order: insertion was "z","a","m" but iteration is "a","m","z".
+    let src = r#"
+import "std.map" as map
+import "std.list" as list
+fn keys_in_iter_order() -> List[Str] {
+  let m := map.set(map.set(map.set(map.new(), "z", 1), "a", 2), "m", 3)
+  map.fold(m, [], fn (acc :: List[Str], k :: Str, v :: Int) -> List[Str] {
+    list.concat(acc, [k])
+  })
+}
+"#;
+    assert_eq!(
+        run(src, "keys_in_iter_order", vec![]),
+        Value::List(vec![
+            Value::Str("a".into()),
+            Value::Str("m".into()),
+            Value::Str("z".into()),
+        ])
+    );
+}
+
+#[test]
+fn map_fold_works_with_int_keys() {
+    let src = r#"
+import "std.map" as map
+fn sum_int_keys() -> Int {
+  let m := map.set(map.set(map.set(map.new(), 10, 100), 20, 200), 30, 300)
+  map.fold(m, 0, fn (acc :: Int, k :: Int, v :: Int) -> Int { acc + k + v })
+}
+"#;
+    // 10+100 + 20+200 + 30+300 = 660
+    assert_eq!(run(src, "sum_int_keys", vec![]), Value::Int(660));
+}
+
+#[test]
+fn map_fold_combiner_can_capture_outer_locals() {
+    let src = r#"
+import "std.map" as map
+fn weighted() -> Int {
+  let weight := 100
+  let m := map.set(map.set(map.new(), "a", 1), "b", 2)
+  map.fold(m, 0, fn (acc :: Int, k :: Str, v :: Int) -> Int { acc + v * weight })
+}
+"#;
+    assert_eq!(run(src, "weighted", vec![]), Value::Int(300));
+}

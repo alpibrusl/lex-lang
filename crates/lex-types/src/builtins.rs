@@ -499,10 +499,23 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             // is_empty :: Map[K, V] -> Bool
             fields.insert("is_empty".into(), Ty::function(
                 vec![mt()], EffectSet::empty(), Ty::bool()));
-            // map.fold is a HOF — needs the same special-cased bytecode
-            // emit as `list.fold` to thread the closure through the
-            // VM's call protocol. Tracked as follow-up; not in this
-            // PR's scope.
+            // fold :: Map[K, V], A, (A, K, V) -> [E] A -> [E] A
+            // Iteration order matches `map.entries` (BTreeMap-sorted by
+            // key). Effect-polymorphic on the combiner like `list.fold`.
+            // Type variable 2 = A (accumulator), effect row 3.
+            fields.insert("fold".into(), Ty::function(
+                vec![
+                    mt(),
+                    Ty::Var(2),
+                    Ty::function(
+                        vec![Ty::Var(2), Ty::Var(0), Ty::Var(1)],
+                        EffectSet::open_var(3),
+                        Ty::Var(2),
+                    ),
+                ],
+                EffectSet::open_var(3),
+                Ty::Var(2),
+            ));
             Some(Ty::Record(fields))
         }
         "set" => {

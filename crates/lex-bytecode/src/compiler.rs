@@ -563,7 +563,7 @@ impl<'a> FnCompiler<'a> {
         module: &str,
         op: &str,
         args: &[a::CExpr],
-        _node_id_idx: u32,
+        node_id_idx: u32,
     ) -> bool {
         match (module, op) {
             ("result", "map") => self.emit_variant_map(args, "Ok", true),
@@ -574,6 +574,7 @@ impl<'a> FnCompiler<'a> {
             ("list", "map") => self.emit_list_map(args),
             ("list", "filter") => self.emit_list_filter(args),
             ("list", "fold") => self.emit_list_fold(args),
+            ("map", "fold") => self.emit_map_fold(args, node_id_idx),
             ("flow", "sequential") => self.emit_flow_sequential(args),
             ("flow", "branch") => self.emit_flow_branch(args),
             ("flow", "retry") => self.emit_flow_retry(args),
@@ -748,6 +749,86 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(i));
         self.emit(Op::GetListElemDyn);
         self.emit(Op::CallClosure { arity: 2, node_id_idx: nid });
+        self.emit(Op::StoreLocal(acc));
+
+        // i := i + 1
+        self.emit(Op::LoadLocal(i));
+        let one = self.pool.int(1);
+        self.emit(Op::PushConst(one));
+        self.emit(Op::NumAdd);
+        self.emit(Op::StoreLocal(i));
+
+        let jump_back = self.code.len();
+        let back = (loop_top as i32) - (jump_back as i32 + 1);
+        self.emit(Op::Jump(back));
+
+        let exit_target = self.code.len() as i32;
+        if let Op::JumpIfNot(off) = &mut self.code[j_exit] {
+            *off = exit_target - (j_exit as i32 + 1);
+        }
+        self.emit(Op::LoadLocal(acc));
+    }
+
+    /// `map.fold(m, init, f)` — left fold over `Map[K, V]` entries with a
+    /// three-arg combiner `f(acc, k, v)`. Iteration order matches
+    /// `map.entries` (BTreeMap-sorted by key). Materializes the entry
+    /// list once via the runtime's `("map", "entries")` op, then runs
+    /// the same inline loop as `list.fold`.
+    fn emit_map_fold(&mut self, args: &[a::CExpr], node_id_idx: u32) {
+        // xs := map.entries(m)
+        self.compile_expr(&args[0], false);
+        let map_kind = self.pool.str("map");
+        let entries_op = self.pool.str("entries");
+        self.emit(Op::EffectCall {
+            kind_idx: map_kind,
+            op_idx: entries_op,
+            arity: 1,
+            node_id_idx,
+        });
+        let xs = self.alloc_local("__mf_xs");
+        self.emit(Op::StoreLocal(xs));
+
+        // acc := init
+        self.compile_expr(&args[1], false);
+        let acc = self.alloc_local("__mf_acc");
+        self.emit(Op::StoreLocal(acc));
+
+        // f := <closure>
+        self.compile_expr(&args[2], false);
+        let f = self.alloc_local("__mf_f");
+        self.emit(Op::StoreLocal(f));
+
+        // i := 0
+        let zero = self.pool.int(0);
+        self.emit(Op::PushConst(zero));
+        let i = self.alloc_local("__mf_i");
+        self.emit(Op::StoreLocal(i));
+
+        // loop_top: while i < len(xs)
+        let loop_top = self.code.len();
+        self.emit(Op::LoadLocal(i));
+        self.emit(Op::LoadLocal(xs));
+        self.emit(Op::GetListLen);
+        self.emit(Op::NumLt);
+        let j_exit = self.code.len();
+        self.emit(Op::JumpIfNot(0));
+
+        // pair := xs[i]
+        self.emit(Op::LoadLocal(xs));
+        self.emit(Op::LoadLocal(i));
+        self.emit(Op::GetListElemDyn);
+        let pair = self.alloc_local("__mf_pair");
+        self.emit(Op::StoreLocal(pair));
+
+        // acc := f(acc, pair.0, pair.1)
+        let nid = self.pool.node_id("n_map_fold");
+        self.emit(Op::LoadLocal(f));
+        self.emit(Op::LoadLocal(acc));
+        self.emit(Op::LoadLocal(pair));
+        self.emit(Op::GetElem(0));
+        self.emit(Op::LoadLocal(pair));
+        self.emit(Op::GetElem(1));
+        self.emit(Op::CallClosure { arity: 3, node_id_idx: nid });
         self.emit(Op::StoreLocal(acc));
 
         // i := i + 1
