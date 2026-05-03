@@ -9,6 +9,10 @@ use std::collections::{BTreeMap, BTreeSet};
 /// `None` means "not handled here; fall through to effect dispatch".
 pub fn try_pure_builtin(kind: &str, op: &str, args: &[Value]) -> Option<Result<Value, String>> {
     if !is_pure_module(kind) { return None; }
+    // `crypto.random` is the lone effectful op in an otherwise-pure
+    // module; let the handler dispatch it under the `[random]` effect
+    // kind instead of the pure-builtin bypass.
+    if (kind, op) == ("crypto", "random") { return None; }
     Some(dispatch(kind, op, args))
 }
 
@@ -17,7 +21,7 @@ pub fn try_pure_builtin(kind: &str, op: &str, args: &[Value]) -> Option<Result<V
 pub fn is_pure_module(kind: &str) -> bool {
     matches!(kind, "str" | "int" | "float" | "bool" | "list"
         | "option" | "result" | "tuple" | "json" | "bytes" | "flow" | "math"
-        | "map" | "set")
+        | "map" | "set" | "crypto")
 }
 
 fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
@@ -509,6 +513,89 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let a = expect_set(args.first())?;
             let b = expect_set(args.get(1))?;
             Ok(Value::Set(a.intersection(b).cloned().collect()))
+        }
+
+        // -- crypto (pure ops; crypto.random is effectful and routes
+        // through the handler under [random], see try_pure_builtin) --
+        ("crypto", "sha256") => {
+            use sha2::{Digest, Sha256};
+            let data = expect_bytes(args.first())?;
+            let mut h = Sha256::new();
+            h.update(data);
+            Ok(Value::Bytes(h.finalize().to_vec()))
+        }
+        ("crypto", "sha512") => {
+            use sha2::{Digest, Sha512};
+            let data = expect_bytes(args.first())?;
+            let mut h = Sha512::new();
+            h.update(data);
+            Ok(Value::Bytes(h.finalize().to_vec()))
+        }
+        ("crypto", "md5") => {
+            use md5::{Digest, Md5};
+            let data = expect_bytes(args.first())?;
+            let mut h = Md5::new();
+            h.update(data);
+            Ok(Value::Bytes(h.finalize().to_vec()))
+        }
+        ("crypto", "hmac_sha256") => {
+            use hmac::{Hmac, KeyInit, Mac};
+            type HmacSha256 = Hmac<sha2::Sha256>;
+            let key = expect_bytes(args.first())?;
+            let data = expect_bytes(args.get(1))?;
+            let mut mac = HmacSha256::new_from_slice(key)
+                .map_err(|e| format!("hmac_sha256 key: {e}"))?;
+            mac.update(data);
+            Ok(Value::Bytes(mac.finalize().into_bytes().to_vec()))
+        }
+        ("crypto", "hmac_sha512") => {
+            use hmac::{Hmac, KeyInit, Mac};
+            type HmacSha512 = Hmac<sha2::Sha512>;
+            let key = expect_bytes(args.first())?;
+            let data = expect_bytes(args.get(1))?;
+            let mut mac = HmacSha512::new_from_slice(key)
+                .map_err(|e| format!("hmac_sha512 key: {e}"))?;
+            mac.update(data);
+            Ok(Value::Bytes(mac.finalize().into_bytes().to_vec()))
+        }
+        ("crypto", "base64_encode") => {
+            use base64::{Engine, engine::general_purpose::STANDARD};
+            let data = expect_bytes(args.first())?;
+            Ok(Value::Str(STANDARD.encode(data)))
+        }
+        ("crypto", "base64_decode") => {
+            use base64::{Engine, engine::general_purpose::STANDARD};
+            let s = expect_str(args.first())?;
+            match STANDARD.decode(s) {
+                Ok(b)  => Ok(ok_v(Value::Bytes(b))),
+                Err(e) => Ok(err_v(Value::Str(format!("base64: {e}")))),
+            }
+        }
+        ("crypto", "hex_encode") => {
+            let data = expect_bytes(args.first())?;
+            Ok(Value::Str(hex::encode(data)))
+        }
+        ("crypto", "hex_decode") => {
+            let s = expect_str(args.first())?;
+            match hex::decode(s) {
+                Ok(b)  => Ok(ok_v(Value::Bytes(b))),
+                Err(e) => Ok(err_v(Value::Str(format!("hex: {e}")))),
+            }
+        }
+        ("crypto", "constant_time_eq") => {
+            use subtle::ConstantTimeEq;
+            let a = expect_bytes(args.first())?;
+            let b = expect_bytes(args.get(1))?;
+            // `subtle` returns Choice; comparison only meaningful when
+            // lengths match. For mismatched lengths return false in
+            // constant time (length itself isn't secret, but we want
+            // a single comparison shape).
+            let eq = if a.len() == b.len() {
+                a.ct_eq(b).into()
+            } else {
+                false
+            };
+            Ok(Value::Bool(eq))
         }
 
         _ => Err(format!("unknown pure builtin: {kind}.{op}")),
