@@ -625,6 +625,48 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             ));
             Some(Ty::Record(fields))
         }
+        "regex" => {
+            // The compiled `Regex` is stored as a `Str` at runtime
+            // (the pattern source) plus a process-wide cache of the
+            // actual `regex::Regex`. So `Regex` is a nominal type at
+            // the language level but its value is just the pattern.
+            let regex_t = || Ty::Con("Regex".into(), vec![]);
+            let match_t = || {
+                let mut fs = IndexMap::new();
+                fs.insert("text".into(), Ty::str());
+                fs.insert("start".into(), Ty::int());
+                fs.insert("end".into(), Ty::int());
+                fs.insert("groups".into(), Ty::List(Box::new(Ty::str())));
+                Ty::Record(fs)
+            };
+            let mut fields = IndexMap::new();
+            // compile :: Str -> Result[Regex, Str]
+            fields.insert("compile".into(), Ty::function(
+                vec![Ty::str()], EffectSet::empty(),
+                Ty::Con("Result".into(), vec![regex_t(), Ty::str()])));
+            // is_match :: Regex, Str -> Bool
+            fields.insert("is_match".into(), Ty::function(
+                vec![regex_t(), Ty::str()], EffectSet::empty(), Ty::bool()));
+            // find :: Regex, Str -> Option[Match]
+            fields.insert("find".into(), Ty::function(
+                vec![regex_t(), Ty::str()], EffectSet::empty(),
+                Ty::Con("Option".into(), vec![match_t()])));
+            // find_all :: Regex, Str -> List[Match]
+            fields.insert("find_all".into(), Ty::function(
+                vec![regex_t(), Ty::str()], EffectSet::empty(),
+                Ty::List(Box::new(match_t()))));
+            // replace :: Regex, Str, Str -> Str
+            fields.insert("replace".into(), Ty::function(
+                vec![regex_t(), Ty::str(), Ty::str()], EffectSet::empty(), Ty::str()));
+            // replace_all :: Regex, Str, Str -> Str
+            fields.insert("replace_all".into(), Ty::function(
+                vec![regex_t(), Ty::str(), Ty::str()], EffectSet::empty(), Ty::str()));
+            // split :: Regex, Str -> List[Str]
+            fields.insert("split".into(), Ty::function(
+                vec![regex_t(), Ty::str()], EffectSet::empty(),
+                Ty::List(Box::new(Ty::str()))));
+            Some(Ty::Record(fields))
+        }
         _ => None,
     }
 }
@@ -653,6 +695,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "set" => "set",
         "proc" => "proc",
         "crypto" => "crypto",
+        "regex" => "regex",
         _ => return None,
     })
 }
