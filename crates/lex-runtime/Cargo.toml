@@ -12,6 +12,7 @@ indexmap.workspace = true
 sha2.workspace = true
 hmac = "0.13"
 regex = "1"
+sled = "0.34"
 md-5 = "0.11"
 base64 = "0.22"
 hex = "0.4"

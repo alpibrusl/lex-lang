@@ -687,6 +687,51 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 Ty::List(Box::new(Ty::Var(0)))));
             Some(Ty::Record(fields))
         }
+        "kv" => {
+            // Embedded key-value store. The opaque `Kv` type is
+            // backed by an Int handle into a process-wide registry.
+            let kv_t = || Ty::Con("Kv".into(), vec![]);
+            let mut fields = IndexMap::new();
+            // open :: Str -> [kv, fs_write] Result[Kv, Str]
+            fields.insert("open".into(), Ty::function(
+                vec![Ty::str()],
+                EffectSet {
+                    concrete: ["kv".to_string(), "fs_write".to_string()].into_iter().collect(),
+                    var: None,
+                },
+                Ty::Con("Result".into(), vec![kv_t(), Ty::str()])));
+            // close :: Kv -> [kv] Nil
+            fields.insert("close".into(), Ty::function(
+                vec![kv_t()],
+                EffectSet::singleton("kv"),
+                Ty::Unit));
+            // get :: Kv, Str -> [kv] Option[Bytes]
+            fields.insert("get".into(), Ty::function(
+                vec![kv_t(), Ty::str()],
+                EffectSet::singleton("kv"),
+                Ty::Con("Option".into(), vec![Ty::bytes()])));
+            // put :: Kv, Str, Bytes -> [kv] Result[Nil, Str]
+            fields.insert("put".into(), Ty::function(
+                vec![kv_t(), Ty::str(), Ty::bytes()],
+                EffectSet::singleton("kv"),
+                Ty::Con("Result".into(), vec![Ty::Unit, Ty::str()])));
+            // delete :: Kv, Str -> [kv] Result[Nil, Str]
+            fields.insert("delete".into(), Ty::function(
+                vec![kv_t(), Ty::str()],
+                EffectSet::singleton("kv"),
+                Ty::Con("Result".into(), vec![Ty::Unit, Ty::str()])));
+            // contains :: Kv, Str -> [kv] Bool
+            fields.insert("contains".into(), Ty::function(
+                vec![kv_t(), Ty::str()],
+                EffectSet::singleton("kv"),
+                Ty::bool()));
+            // list_prefix :: Kv, Str -> [kv] List[Str]
+            fields.insert("list_prefix".into(), Ty::function(
+                vec![kv_t(), Ty::str()],
+                EffectSet::singleton("kv"),
+                Ty::List(Box::new(Ty::str()))));
+            Some(Ty::Record(fields))
+        }
         "regex" => {
             // The compiled `Regex` is stored as a `Str` at runtime
             // (the pattern source) plus a process-wide cache of the
@@ -759,6 +804,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "crypto" => "crypto",
         "regex" => "regex",
         "deque" => "deque",
+        "kv" => "kv",
         _ => return None,
     })
 }
