@@ -7,7 +7,10 @@
 use lex_bytecode::vm::{EffectHandler, Vm};
 use lex_bytecode::{Program, Value};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -273,6 +276,87 @@ impl EffectHandler for DefaultHandler {
                 let body = expect_str(args.get(1))?;
                 Ok(Value::Bool(crate::ws::chat_send(registry, conn_id, body)))
             }
+            ("kv", "open") => {
+                let path = expect_str(args.first())?.to_string();
+                // Honor write-allowlist: opening a Kv writes its
+                // backing files at `path`, so the same scoping that
+                // applies to `io.write` applies here.
+                if !self.policy.allow_fs_write.is_empty() {
+                    let p = std::path::Path::new(&path);
+                    if !self.policy.allow_fs_write.iter().any(|a| p.starts_with(a)) {
+                        return Ok(err(Value::Str(format!(
+                            "kv.open: `{path}` outside --allow-fs-write"))));
+                    }
+                }
+                match sled::open(&path) {
+                    Ok(db) => {
+                        let handle = next_kv_handle();
+                        kv_registry().lock().unwrap().insert(handle, db);
+                        Ok(ok(Value::Int(handle as i64)))
+                    }
+                    Err(e) => Ok(err(Value::Str(format!("kv.open: {e}")))),
+                }
+            }
+            ("kv", "close") => {
+                let h = expect_kv_handle(args.first())?;
+                kv_registry().lock().unwrap().remove(&h);
+                Ok(Value::Unit)
+            }
+            ("kv", "get") => {
+                let h = expect_kv_handle(args.first())?;
+                let key = expect_str(args.get(1))?;
+                let reg = kv_registry().lock().unwrap();
+                let db = reg.get(&h).ok_or_else(|| "kv.get: closed or unknown Kv handle".to_string())?;
+                match db.get(key.as_bytes()) {
+                    Ok(Some(ivec)) => Ok(some(Value::Bytes(ivec.to_vec()))),
+                    Ok(None) => Ok(none()),
+                    Err(e) => Err(format!("kv.get: {e}")),
+                }
+            }
+            ("kv", "put") => {
+                let h = expect_kv_handle(args.first())?;
+                let key = expect_str(args.get(1))?.to_string();
+                let val = expect_bytes(args.get(2))?.clone();
+                let reg = kv_registry().lock().unwrap();
+                let db = reg.get(&h).ok_or_else(|| "kv.put: closed or unknown Kv handle".to_string())?;
+                match db.insert(key.as_bytes(), val) {
+                    Ok(_) => Ok(ok(Value::Unit)),
+                    Err(e) => Ok(err(Value::Str(format!("kv.put: {e}")))),
+                }
+            }
+            ("kv", "delete") => {
+                let h = expect_kv_handle(args.first())?;
+                let key = expect_str(args.get(1))?;
+                let reg = kv_registry().lock().unwrap();
+                let db = reg.get(&h).ok_or_else(|| "kv.delete: closed or unknown Kv handle".to_string())?;
+                match db.remove(key.as_bytes()) {
+                    Ok(_) => Ok(ok(Value::Unit)),
+                    Err(e) => Ok(err(Value::Str(format!("kv.delete: {e}")))),
+                }
+            }
+            ("kv", "contains") => {
+                let h = expect_kv_handle(args.first())?;
+                let key = expect_str(args.get(1))?;
+                let reg = kv_registry().lock().unwrap();
+                let db = reg.get(&h).ok_or_else(|| "kv.contains: closed or unknown Kv handle".to_string())?;
+                match db.contains_key(key.as_bytes()) {
+                    Ok(present) => Ok(Value::Bool(present)),
+                    Err(e) => Err(format!("kv.contains: {e}")),
+                }
+            }
+            ("kv", "list_prefix") => {
+                let h = expect_kv_handle(args.first())?;
+                let prefix = expect_str(args.get(1))?;
+                let reg = kv_registry().lock().unwrap();
+                let db = reg.get(&h).ok_or_else(|| "kv.list_prefix: closed or unknown Kv handle".to_string())?;
+                let mut keys: Vec<Value> = Vec::new();
+                for kv in db.scan_prefix(prefix.as_bytes()) {
+                    let (k, _) = kv.map_err(|e| format!("kv.list_prefix: {e}"))?;
+                    let s = String::from_utf8_lossy(&k).to_string();
+                    keys.push(Value::Str(s));
+                }
+                Ok(Value::List(keys))
+            }
             ("proc", "spawn") => {
                 // The escape hatch effect. Spawns a child process,
                 // collects its stdout/stderr, returns a structured
@@ -520,4 +604,40 @@ fn ok(v: Value) -> Value {
 }
 fn err(v: Value) -> Value {
     Value::Variant { name: "Err".into(), args: vec![v] }
+}
+
+fn some(v: Value) -> Value {
+    Value::Variant { name: "Some".into(), args: vec![v] }
+}
+fn none() -> Value {
+    Value::Variant { name: "None".into(), args: vec![] }
+}
+
+fn expect_bytes(v: Option<&Value>) -> Result<&Vec<u8>, String> {
+    match v {
+        Some(Value::Bytes(b)) => Ok(b),
+        Some(other) => Err(format!("expected Bytes arg, got {other:?}")),
+        None => Err("missing argument".into()),
+    }
+}
+
+fn expect_kv_handle(v: Option<&Value>) -> Result<u64, String> {
+    match v {
+        Some(Value::Int(n)) if *n >= 0 => Ok(*n as u64),
+        Some(other) => Err(format!("expected Kv handle (Int), got {other:?}")),
+        None => Err("missing Kv argument".into()),
+    }
+}
+
+/// Process-wide registry of open `Kv` handles. Each `kv.open` allocates
+/// a new u64 handle via [`next_kv_handle`] and stores the `sled::Db`
+/// here; subsequent ops fetch by handle. `kv.close` removes the entry.
+fn kv_registry() -> &'static Mutex<HashMap<u64, sled::Db>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<u64, sled::Db>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn next_kv_handle() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    COUNTER.fetch_add(1, Ordering::SeqCst)
 }
