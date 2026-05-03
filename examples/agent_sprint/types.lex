@@ -6,5 +6,6 @@
 type Task = {
   id :: Str,
   prompt :: Str,
+  args :: List[Str],
   criteria :: Str,
 }

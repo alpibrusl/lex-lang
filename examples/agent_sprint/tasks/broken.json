@@ -1,0 +1,6 @@
+{
+  "id": "dogfood-check-nonexistent",
+  "prompt": "check",
+  "args": ["./tasks/example.json"],
+  "criteria": "ok"
+}

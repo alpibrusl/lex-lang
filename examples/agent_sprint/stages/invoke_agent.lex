@@ -6,11 +6,13 @@
 # a prompt-injected agent that emits `process.run("rm", ["-rf",
 # "/"])` fails at the policy gate, not in user-space.
 
-import "../types"     as t
-import "std.process"  as process
+import "../types"    as t
+import "std.process" as process
+import "std.list"    as list
 
 fn run(agent_cmd :: Str, task :: t.Task) -> [proc] Result[Str, Str] {
-  match process.run(agent_cmd, [task.prompt]) {
+  let all_args := list.concat([task.prompt], task.args)
+  match process.run(agent_cmd, all_args) {
     Ok(o)  => Ok(o.stdout),
     Err(e) => Err(e),
   }

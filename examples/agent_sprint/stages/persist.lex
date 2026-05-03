@@ -17,11 +17,12 @@ fn run(
   output  :: Str,
   verdict :: Bool,
 ) -> [kv, fs_write, log] Result[Str, Str] {
+  let tag := if verdict { "PASS" } else { "FAIL" }
   match kv.open(db_path) {
     Ok(db) => match kv.put(db, task.id, bytes.from_str(output)) {
       Ok(_) => {
-        log.info(str.concat("persisted ", task.id))
-        Ok(task.id)
+        log.info(str.concat(str.concat(tag, ": "), task.id))
+        Ok(str.concat(str.concat(task.id, " => "), tag))
       },
       Err(e) => Err(e),
     },

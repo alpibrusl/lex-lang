@@ -30,8 +30,12 @@ fs_write, log]` — exactly the union.
 
 ## Run it
 
-The example task uses `echo` as the "agent" so the demo runs
-without claude-code / cursor / etc. installed:
+### Smoke test (`echo` as the agent)
+
+The simplest task uses `echo` so the demo runs without
+claude-code / cursor / etc. installed. The criteria is "haiku"
+and the prompt contains "haiku", so the verifier returns true.
+This is purely a wires-work check.
 
 ```sh
 cd examples/agent_sprint
@@ -41,12 +45,57 @@ lex run sprint.lex sprint \
   --allow-fs-read  ./tasks \
   --allow-fs-write ./sprint.db \
   --allow-proc     echo
+# → Ok("demo-haiku-1 => PASS")
 ```
 
-Swap `"echo"` and `--allow-proc echo` for `"claude-code"` (or
-`cursor-cli` / `gemini-cli` / `codex-cli`) once the agent CLI is
-installed and on `$PATH`. The sprint script doesn't change — only
-the host policy.
+### Dogfood (the language type-checks itself)
+
+A more substantive run: use the lex CLI itself as the "agent."
+The task says "run `lex check ./stages/verify.lex`," and the
+verifier checks for "ok" in the output. Lex type-checks the
+verifier's source via the same Lex compiler the sprint is
+running on; on success, `lex check` prints `ok` and verify
+returns true.
+
+```sh
+lex run sprint.lex sprint \
+  '"./tasks/dogfood.json"' "$(which lex)" '"./sprint.db"' \
+  --allow-effects io,proc,kv,fs_write,log \
+  --allow-fs-read  ./tasks \
+  --allow-fs-write ./sprint.db \
+  --allow-proc     lex
+# → Ok("dogfood-check-verify-stage => PASS")
+```
+
+Swap `dogfood.json`'s `args` field to point at a file that
+isn't valid Lex (e.g. `./tasks/example.json`) and the verdict
+flips:
+
+```sh
+# tasks/broken.json sets args=["./tasks/example.json"]
+lex run sprint.lex sprint \
+  '"./tasks/broken.json"' "$(which lex)" '"./sprint.db"' \
+  --allow-effects io,proc,kv,fs_write,log \
+  --allow-fs-read  ./tasks \
+  --allow-fs-write ./sprint.db \
+  --allow-proc     lex
+# → Ok("dogfood-check-nonexistent => FAIL")
+```
+
+The `=> PASS` / `=> FAIL` suffix in the result string comes from
+the `verdict :: Bool` that `verify.run` produced. The persist
+stage logs the verdict (`info: PASS: ...` / `info: FAIL: ...`)
+and threads it into the final return value. The agent stage
+*always* returns `Ok` for a successfully-spawned process — the
+distinction between "agent ran" and "agent ran *correctly*" is
+made by the verifier, by signature.
+
+### Real agents
+
+Swap the second argument and `--allow-proc` for any installed
+agent CLI (`claude-code`, `cursor-cli`, `gemini-cli`,
+`codex-cli`, ...). The sprint script doesn't change — only the
+host policy.
 
 ## Why this is interesting
 
@@ -165,5 +214,7 @@ examples/agent_sprint/
 │   ├── verify.lex       ← pure
 │   └── persist.lex      ← [kv, fs_write, log]
 └── tasks/
-    └── example.json     ← sample input
+    ├── example.json     ← echo smoke test
+    ├── dogfood.json     ← lex check verify.lex (passes)
+    └── broken.json      ← lex check example.json (fails)
 ```
