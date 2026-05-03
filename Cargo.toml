@@ -6,6 +6,7 @@ members = [
     "crates/lex-types",
     "crates/lex-bytecode",
     "crates/lex-store",
+    "crates/lex-vcs",
     "crates/lex-trace",
     "crates/lex-runtime",
     "crates/lex-stdlib",

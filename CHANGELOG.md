@@ -9,6 +9,19 @@ bumps may carry breaking changes when justified).
 
 ### Added
 
+- **`lex-vcs` crate — foundation for agent-native VCS tier-2 (#129).**
+  New workspace crate at `crates/lex-vcs/`. Defines `Operation` (the
+  typed-delta unit replacing snapshot-of-tree) plus content-addressed
+  `OpId` (SHA-256 over canonical-form `(kind, payload, sorted parents)`).
+  Initial operation kinds match #129's spec: `AddFunction`,
+  `RemoveFunction`, `ModifyBody`, `RenameSymbol`, `ChangeEffectSig`,
+  `AddImport` / `RemoveImport`, `AddType` / `RemoveType` /
+  `ModifyType`. Two agents producing the same logical change against
+  the same parent state get the same `OpId` — the automatic-dedup
+  property the rest of tier-2 (#130-#134) relies on. This slice is
+  data-model only; subsequent slices add the apply pass, the
+  store-write gate, intent linkage, attestations, predicate branches,
+  and the programmatic merge API.
 - **`std.sql` — embedded SQL (SQLite).** Second of the OSS-Auditor
   stdlib follow-ups. Wraps `rusqlite` with the bundled SQLite
   feature so no system lib is required. Surface:
