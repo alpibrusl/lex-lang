@@ -598,6 +598,22 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 Ty::function(vec![], EffectSet::empty(),
                     Ty::Tuple(vec![Ty::Var(0), Ty::Var(1)])),
             ));
+            // parallel_list[T](actions: List[() -> T]) -> List[T]
+            // Variadic counterpart to `parallel`. Runs each action and
+            // collects results in input order. Sequential under the
+            // hood (same caveat as `parallel`); spec §11.2 reserves
+            // true threading for a future scheduler. Unlike `parallel`,
+            // this returns the result list directly rather than a
+            // closure, since the input arity is dynamic.
+            fields.insert("parallel_list".into(), Ty::function(
+                vec![
+                    Ty::List(Box::new(
+                        Ty::function(vec![], EffectSet::empty(), Ty::Var(0)),
+                    )),
+                ],
+                EffectSet::empty(),
+                Ty::List(Box::new(Ty::Var(0))),
+            ));
             Some(Ty::Record(fields))
         }
         "crypto" => {
