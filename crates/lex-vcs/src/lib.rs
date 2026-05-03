@@ -1,0 +1,37 @@
+//! Agent-native version control for Lex (#128 tier-2).
+//!
+//! The unit of writing is an [`Operation`] — a typed delta on the AST
+//! identified by `(kind, payload, parents)`. Two agents producing the
+//! same logical change against the same parent state get the same
+//! [`OpId`], so the store can dedup automatically and surface "we
+//! agree" without a merge.
+//!
+//! This crate is the foundation slice of #129. It defines the
+//! operation enum and content-addressed identity. Subsequent slices
+//! add: applying ops to a store state (#129 cont'd), the write-time
+//! type-check gate (#130), intent linkage (#131), attestations
+//! (#132), predicate branches (#133), and the programmatic merge API
+//! (#134).
+//!
+//! # Identity
+//!
+//! [`OpId`] is the lowercase-hex SHA-256 of the canonical JSON form
+//! of `(kind, payload, parents)`. The serializer is deterministic
+//! by construction (struct fields are emitted in declaration order;
+//! [`EffectSet`] is a `BTreeSet`; parents are sorted before
+//! hashing), so two independent runs producing the same logical
+//! operation produce byte-identical canonical bytes.
+//!
+//! `lex-store` already uses SHA-256 (via the `sha2` crate) for stage
+//! and signature identity, so we reuse that here for consistency
+//! and to avoid pulling in a second hash dependency. The issue text
+//! mentions Blake3; if that becomes load-bearing for performance we
+//! can swap with a one-line crate change since `OpId` is opaque.
+
+mod canonical;
+mod operation;
+
+pub use operation::{
+    EffectSet, ModuleRef, OpId, Operation, OperationRecord, OperationKind, SigId, StageId,
+    StageTransition,
+};
