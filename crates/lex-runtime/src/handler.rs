@@ -97,6 +97,64 @@ impl DefaultHandler {
         }
     }
 
+    fn dispatch_log(&mut self, op: &str, args: Vec<Value>) -> Result<Value, String> {
+        match op {
+            "debug" | "info" | "warn" | "error" => {
+                let msg = expect_str(args.first())?;
+                let level = match op {
+                    "debug" => LogLevel::Debug,
+                    "info" => LogLevel::Info,
+                    "warn" => LogLevel::Warn,
+                    _ => LogLevel::Error,
+                };
+                emit_log(level, msg);
+                Ok(Value::Unit)
+            }
+            "set_level" => {
+                let s = expect_str(args.first())?;
+                match parse_log_level(s) {
+                    Some(l) => {
+                        log_state().lock().unwrap().level = l;
+                        Ok(ok(Value::Unit))
+                    }
+                    None => Ok(err(Value::Str(format!(
+                        "log.set_level: unknown level `{s}`; expected debug|info|warn|error")))),
+                }
+            }
+            "set_format" => {
+                let s = expect_str(args.first())?;
+                let fmt = match s {
+                    "text" => LogFormat::Text,
+                    "json" => LogFormat::Json,
+                    other => return Ok(err(Value::Str(format!(
+                        "log.set_format: unknown format `{other}`; expected text|json")))),
+                };
+                log_state().lock().unwrap().format = fmt;
+                Ok(ok(Value::Unit))
+            }
+            "set_sink" => {
+                let path = expect_str(args.first())?;
+                if path == "-" {
+                    log_state().lock().unwrap().sink = LogSink::Stderr;
+                    return Ok(ok(Value::Unit));
+                }
+                if let Err(e) = self.ensure_fs_write_path(path) {
+                    return Ok(err(Value::Str(e)));
+                }
+                match std::fs::OpenOptions::new()
+                    .create(true).append(true).open(path)
+                {
+                    Ok(f) => {
+                        log_state().lock().unwrap().sink = LogSink::File(std::sync::Arc::new(Mutex::new(f)));
+                        Ok(ok(Value::Unit))
+                    }
+                    Err(e) => Ok(err(Value::Str(format!("log.set_sink `{path}`: {e}")))),
+                }
+            }
+            other => Err(format!("unsupported log.{other}")),
+        }
+    }
+
     fn dispatch_process(&mut self, op: &str, args: Vec<Value>) -> Result<Value, String> {
         match op {
             "spawn" => {
@@ -514,6 +572,22 @@ impl EffectHandler for DefaultHandler {
         if kind == "process" {
             self.ensure_kind_allowed("proc")?;
             return self.dispatch_process(op, args);
+        }
+        if kind == "log" {
+            // Emit ops are [log]; config ops are [io] (set_sink also
+            // [fs_write]). The dispatch picks the right kind per op.
+            let effect_kind = match op {
+                "debug" | "info" | "warn" | "error" => "log",
+                "set_level" | "set_format" => "io",
+                "set_sink" => {
+                    self.ensure_kind_allowed("io")?;
+                    self.ensure_kind_allowed("fs_write")?;
+                    return self.dispatch_log(op, args);
+                }
+                other => return Err(format!("unsupported log.{other}")),
+            };
+            self.ensure_kind_allowed(effect_kind)?;
+            return self.dispatch_log(op, args);
         }
         if kind == "fs" {
             let effect_kind = match op {
@@ -1030,6 +1104,93 @@ fn expect_kv_handle(v: Option<&Value>) -> Result<u64, String> {
         Some(Value::Int(n)) if *n >= 0 => Ok(*n as u64),
         Some(other) => Err(format!("expected Kv handle (Int), got {other:?}")),
         None => Err("missing Kv argument".into()),
+    }
+}
+
+// -- log state (process-wide; configurable via log.set_*) --
+
+#[derive(Clone, Copy, PartialEq, PartialOrd)]
+enum LogLevel { Debug, Info, Warn, Error }
+
+#[derive(Clone, Copy, PartialEq)]
+enum LogFormat { Text, Json }
+
+#[derive(Clone)]
+enum LogSink {
+    Stderr,
+    File(std::sync::Arc<Mutex<std::fs::File>>),
+}
+
+struct LogState {
+    level: LogLevel,
+    format: LogFormat,
+    sink: LogSink,
+}
+
+fn log_state() -> &'static Mutex<LogState> {
+    static STATE: OnceLock<Mutex<LogState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(LogState {
+        level: LogLevel::Info,
+        format: LogFormat::Text,
+        sink: LogSink::Stderr,
+    }))
+}
+
+fn parse_log_level(s: &str) -> Option<LogLevel> {
+    match s {
+        "debug" => Some(LogLevel::Debug),
+        "info" => Some(LogLevel::Info),
+        "warn" => Some(LogLevel::Warn),
+        "error" => Some(LogLevel::Error),
+        _ => None,
+    }
+}
+
+fn level_label(l: LogLevel) -> &'static str {
+    match l {
+        LogLevel::Debug => "debug",
+        LogLevel::Info => "info",
+        LogLevel::Warn => "warn",
+        LogLevel::Error => "error",
+    }
+}
+
+fn emit_log(level: LogLevel, msg: &str) {
+    let state = log_state().lock().unwrap();
+    if level < state.level {
+        return;
+    }
+    let ts = chrono::Utc::now().to_rfc3339();
+    let line = match state.format {
+        LogFormat::Text => format!("[{}] {}: {}\n", ts, level_label(level), msg),
+        LogFormat::Json => {
+            // Hand-rolled JSON to avoid pulling serde_json into the
+            // hot path; msg gets minimal escaping (the four common
+            // cases that break a JSON line).
+            let escaped = msg
+                .replace('\\', "\\\\")
+                .replace('"',  "\\\"")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r");
+            format!(
+                "{{\"ts\":\"{ts}\",\"level\":\"{}\",\"msg\":\"{escaped}\"}}\n",
+                level_label(level),
+            )
+        }
+    };
+    let sink = state.sink.clone();
+    drop(state);
+    match sink {
+        LogSink::Stderr => {
+            use std::io::Write;
+            let _ = std::io::stderr().write_all(line.as_bytes());
+        }
+        LogSink::File(f) => {
+            use std::io::Write;
+            if let Ok(mut g) = f.lock() {
+                let _ = g.write_all(line.as_bytes());
+            }
+        }
     }
 }
 

@@ -687,6 +687,40 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 Ty::List(Box::new(Ty::Var(0)))));
             Some(Ty::Record(fields))
         }
+        "log" => {
+            // Structured logging behind a [log] effect. Emit ops route
+            // through a runtime-configured sink (stderr by default;
+            // can be redirected via set_sink). Configuration ops
+            // mutate the global sink and so are gated [io].
+            let result_str = |t: Ty| Ty::Con("Result".into(), vec![t, Ty::str()]);
+            let mut fields = IndexMap::new();
+            for level in &["debug", "info", "warn", "error"] {
+                fields.insert((*level).into(), Ty::function(
+                    vec![Ty::str()],
+                    EffectSet::singleton("log"),
+                    Ty::Unit,
+                ));
+            }
+            // set_level :: Str -> [io] Result[Nil, Str]
+            fields.insert("set_level".into(), Ty::function(
+                vec![Ty::str()],
+                EffectSet::singleton("io"),
+                result_str(Ty::Unit)));
+            // set_format :: Str -> [io] Result[Nil, Str]
+            fields.insert("set_format".into(), Ty::function(
+                vec![Ty::str()],
+                EffectSet::singleton("io"),
+                result_str(Ty::Unit)));
+            // set_sink :: Str -> [io, fs_write] Result[Nil, Str]
+            fields.insert("set_sink".into(), Ty::function(
+                vec![Ty::str()],
+                EffectSet {
+                    concrete: ["io".to_string(), "fs_write".to_string()].into_iter().collect(),
+                    var: None,
+                },
+                result_str(Ty::Unit)));
+            Some(Ty::Record(fields))
+        }
         "datetime" => {
             // Instant and Duration are nominal opaque Ints under the
             // hood (nanoseconds-since-UTC-epoch and signed nanoseconds
@@ -970,6 +1004,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "fs" => "fs",
         "process" => "process",
         "datetime" => "datetime",
+        "log" => "log",
         _ => return None,
     })
 }
