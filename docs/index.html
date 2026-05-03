@@ -412,6 +412,18 @@ $ lex ast-merge --json base.lex ours.lex theirs.lex
 cargo build --release
 export PATH="$(pwd)/target/release:$PATH"
 
+# Type-check a program. Effects you'll need at run time are surfaced
+# alongside `ok` so the first run doesn't trip on `effect_not_allowed`:
+lex check examples/c_echo.lex
+# → ok
+#   required effects: io
+#   hint: lex run --allow-effects io examples/c_echo.lex &lt;fn&gt; [args]
+
+# Multi-file projects work like std imports, with a path:
+#   import "./helpers" as h
+# Sibling .lex files are loaded and merged. Cycle detection,
+# transitive imports, and `m.Type` qualified types all work.
+
 # Reject a malicious tool without an API key:
 lex agent-tool --allow-effects net --input x \
   --body 'match io.read("/etc/passwd") { Ok(s) =&gt; s, Err(e) =&gt; e }'
