@@ -71,7 +71,7 @@ fn diff_is_45_minutes(start :: Str, end :: Str) -> Bool {
 
 fn year_in_utc(iso :: Str) -> Int {
   match datetime.parse_iso(iso) {
-    Ok(t) => match datetime.to_components(t, "UTC") {
+    Ok(t) => match datetime.to_components(t, Utc) {
       Ok(c)  => c.year,
       Err(_) => 0 - 1,
     },
@@ -79,7 +79,7 @@ fn year_in_utc(iso :: Str) -> Int {
   }
 }
 
-fn iana_offset(iso :: Str, tz :: Str) -> Int {
+fn tz_offset_for(iso :: Str, tz :: Tz) -> Int {
   match datetime.parse_iso(iso) {
     Ok(t) => match datetime.to_components(t, tz) {
       Ok(c)  => c.tz_offset_minutes,
@@ -91,12 +91,44 @@ fn iana_offset(iso :: Str, tz :: Str) -> Int {
 
 fn round_trip_components(iso :: Str) -> Str {
   match datetime.parse_iso(iso) {
-    Ok(t) => match datetime.to_components(t, "UTC") {
+    Ok(t) => match datetime.to_components(t, Utc) {
       Ok(c) => match datetime.from_components(c) {
         Ok(t2) => datetime.format_iso(t2),
         Err(_) => "<from_components fail>",
       },
       Err(_) => "<to_components fail>",
+    },
+    Err(_) => "<bad iso>",
+  }
+}
+
+# Tag-only summary of what each Tz variant carries — exercises a
+# match across every constructor.
+fn tz_tag(tz :: Tz) -> Str {
+  match tz {
+    Utc       => "utc",
+    Local     => "local",
+    Offset(_) => "offset",
+    Iana(_)   => "iana",
+  }
+}
+
+# Surface the IANA name back out — exercises constructor-with-payload
+# binding.
+fn iana_name_or(tz :: Tz, fallback :: Str) -> Str {
+  match tz {
+    Iana(s) => s,
+    _       => fallback,
+  }
+}
+
+# Exercises the failure path: an unrecognized IANA name now produces
+# the documented `Err` payload through the existing parse path.
+fn tz_offset_or_err(iso :: Str, tz :: Tz) -> Str {
+  match datetime.parse_iso(iso) {
+    Ok(t) => match datetime.to_components(t, tz) {
+      Ok(_)  => "<ok>",
+      Err(e) => e,
     },
     Err(_) => "<bad iso>",
   }
@@ -171,15 +203,29 @@ fn to_components_yields_year() {
     assert_eq!(v, Value::Int(2026));
 }
 
+fn iana(name: &str) -> Value {
+    Value::Variant {
+        name: "Iana".into(),
+        args: vec![Value::Str(name.into())],
+    }
+}
+
+fn offset_minutes(m: i64) -> Value {
+    Value::Variant {
+        name: "Offset".into(),
+        args: vec![Value::Int(m)],
+    }
+}
+
 #[test]
 fn iana_timezone_offset() {
     // 2026-01-15 (winter) New York is UTC-05:00 → -300 minutes.
     let v = run(
         SRC,
-        "iana_offset",
+        "tz_offset_for",
         vec![
             Value::Str("2026-01-15T12:00:00+00:00".into()),
-            Value::Str("America/New_York".into()),
+            iana("America/New_York"),
         ],
         Policy::pure(),
     );
@@ -191,10 +237,10 @@ fn iana_timezone_offset_dst() {
     // 2026-07-15 (summer) New York is UTC-04:00 → -240 minutes.
     let v = run(
         SRC,
-        "iana_offset",
+        "tz_offset_for",
         vec![
             Value::Str("2026-07-15T12:00:00+00:00".into()),
-            Value::Str("America/New_York".into()),
+            iana("America/New_York"),
         ],
         Policy::pure(),
     );
@@ -203,12 +249,13 @@ fn iana_timezone_offset_dst() {
 
 #[test]
 fn fixed_offset_components() {
+    // +05:30 → 330 minutes east.
     let v = run(
         SRC,
-        "iana_offset",
+        "tz_offset_for",
         vec![
             Value::Str("2026-05-03T12:00:00+00:00".into()),
-            Value::Str("+05:30".into()),
+            offset_minutes(330),
         ],
         Policy::pure(),
     );
@@ -241,4 +288,84 @@ fn now_iso() -> [time] Str { datetime.format_iso(datetime.now()) }
     let year: i32 = iso.get(..4).and_then(|y| y.parse().ok())
         .unwrap_or_else(|| panic!("could not parse year from {iso}"));
     assert!((2020..2100).contains(&year), "now()'s year out of range: {year}");
+}
+
+#[test]
+fn tz_match_returns_correct_tag_per_variant() {
+    let utc   = Value::Variant { name: "Utc".into(),   args: vec![] };
+    let local = Value::Variant { name: "Local".into(), args: vec![] };
+    assert_eq!(s(run(SRC, "tz_tag", vec![utc],   Policy::pure())), "utc");
+    assert_eq!(s(run(SRC, "tz_tag", vec![local], Policy::pure())), "local");
+    assert_eq!(
+        s(run(SRC, "tz_tag", vec![offset_minutes(60)], Policy::pure())),
+        "offset",
+    );
+    assert_eq!(
+        s(run(SRC, "tz_tag", vec![iana("UTC")], Policy::pure())),
+        "iana",
+    );
+}
+
+#[test]
+fn iana_payload_is_destructurable() {
+    let v = run(
+        SRC,
+        "iana_name_or",
+        vec![iana("Europe/Paris"), Value::Str("none".into())],
+        Policy::pure(),
+    );
+    assert_eq!(s(v), "Europe/Paris");
+    // Non-Iana variant falls through to fallback.
+    let v = run(
+        SRC,
+        "iana_name_or",
+        vec![
+            Value::Variant { name: "Utc".into(), args: vec![] },
+            Value::Str("none".into()),
+        ],
+        Policy::pure(),
+    );
+    assert_eq!(s(v), "none");
+}
+
+#[test]
+fn unknown_iana_name_returns_err_with_message() {
+    // The Tz variant statically guarantees the *shape* of the input,
+    // but an `Iana(...)` payload can still hold an invalid name.
+    let v = run(
+        SRC,
+        "tz_offset_or_err",
+        vec![
+            Value::Str("2026-05-03T12:00:00+00:00".into()),
+            iana("Not/Real_Place"),
+        ],
+        Policy::pure(),
+    );
+    let msg = s(v);
+    assert!(
+        msg.contains("Not/Real_Place") && msg.contains("unknown"),
+        "expected unknown-timezone error, got: {msg}",
+    );
+}
+
+#[test]
+fn local_variant_returns_components_without_panicking() {
+    // `Local` resolves against the host's current timezone; we don't
+    // know what offset that produces in CI, so just assert it
+    // returns a reasonable offset (within ±840 minutes — covers all
+    // real timezones on Earth).
+    let local = Value::Variant { name: "Local".into(), args: vec![] };
+    let v = run(
+        SRC,
+        "tz_offset_for",
+        vec![Value::Str("2026-05-03T12:00:00+00:00".into()), local],
+        Policy::pure(),
+    );
+    match v {
+        Value::Int(off) => assert!(
+            (-840..=840).contains(&off),
+            "Local offset out of plausible range: {off}",
+        ),
+        other => panic!("expected Int offset, got {other:?}"),
+    }
 }

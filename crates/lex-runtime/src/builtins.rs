@@ -776,8 +776,11 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         }
         ("datetime", "to_components") => {
             let n = expect_int(args.first())?;
-            let tz_name = expect_str(args.get(1))?;
-            match resolve_tz_to_components(n, &tz_name) {
+            let tz = match parse_tz_arg(args.get(1)) {
+                Ok(t) => t,
+                Err(e) => return Ok(err_v(Value::Str(e))),
+            };
+            match resolve_tz_to_components(n, &tz) {
                 Ok(rec) => Ok(ok_v(rec)),
                 Err(e) => Ok(err_v(Value::Str(e))),
             }
@@ -1018,43 +1021,68 @@ fn format_iso(n: i64) -> String {
     chrono_from_instant(n).to_rfc3339()
 }
 
-/// Materialize the `DateTime` record from an Instant under the named
-/// timezone. `tz_name` accepts:
-///   - "UTC"
-///   - "Local"
-///   - an IANA name like "America/New_York"
-///   - a fixed offset like "+05:30" or "-08:00"
-fn resolve_tz_to_components(n: i64, tz_name: &str) -> Result<Value, String> {
+/// Parsed form of the user-side `Tz` variant. Mirrors the type
+/// registered in `TypeEnv::new_with_builtins`.
+enum TzArg {
+    Utc,
+    Local,
+    /// Fixed offset in minutes east of UTC.
+    Offset(i32),
+    /// IANA name like `"America/New_York"`.
+    Iana(String),
+}
+
+fn parse_tz_arg(v: Option<&Value>) -> Result<TzArg, String> {
+    match v {
+        Some(Value::Variant { name, args }) => match (name.as_str(), args.as_slice()) {
+            ("Utc", []) => Ok(TzArg::Utc),
+            ("Local", []) => Ok(TzArg::Local),
+            ("Offset", [Value::Int(m)]) => {
+                let m = i32::try_from(*m).map_err(|_| {
+                    format!("Tz::Offset: minutes out of range: {m}")
+                })?;
+                Ok(TzArg::Offset(m))
+            }
+            ("Iana", [Value::Str(s)]) => Ok(TzArg::Iana(s.clone())),
+            (other, _) => Err(format!(
+                "expected Tz variant (Utc | Local | Offset(Int) | Iana(Str)), got `{other}` with {} arg(s)",
+                args.len()
+            )),
+        },
+        Some(other) => Err(format!("expected Tz variant, got {other:?}")),
+        None => Err("missing Tz argument".into()),
+    }
+}
+
+fn resolve_tz_to_components(n: i64, tz: &TzArg) -> Result<Value, String> {
     use chrono::{TimeZone, Datelike, Timelike, Offset};
     let utc_dt = chrono_from_instant(n);
-    let (y, m, d, hh, mm, ss, ns, off_min) = match tz_name {
-        "UTC" => {
+    let (y, m, d, hh, mm, ss, ns, off_min) = match tz {
+        TzArg::Utc => {
             let d = utc_dt;
             (d.year(), d.month() as i32, d.day() as i32,
              d.hour() as i32, d.minute() as i32, d.second() as i32,
              d.nanosecond() as i32, 0)
         }
-        "Local" => {
+        TzArg::Local => {
             let d = utc_dt.with_timezone(&chrono::Local);
             let off = d.offset().fix().local_minus_utc() / 60;
             (d.year(), d.month() as i32, d.day() as i32,
              d.hour() as i32, d.minute() as i32, d.second() as i32,
              d.nanosecond() as i32, off)
         }
-        name if name.starts_with('+') || name.starts_with('-') => {
-            // Fixed offset like "+05:30" / "-08:00".
-            let off_secs = parse_fixed_offset(name)
-                .ok_or_else(|| format!("to_components: bad offset `{name}`"))?;
+        TzArg::Offset(off_min) => {
+            let off_secs = off_min.saturating_mul(60);
             let fixed = chrono::FixedOffset::east_opt(off_secs)
                 .ok_or("to_components: offset out of range")?;
             let d = utc_dt.with_timezone(&fixed);
             (d.year(), d.month() as i32, d.day() as i32,
              d.hour() as i32, d.minute() as i32, d.second() as i32,
-             d.nanosecond() as i32, off_secs / 60)
+             d.nanosecond() as i32, *off_min)
         }
-        iana => {
-            let tz: chrono_tz::Tz = iana.parse()
-                .map_err(|e| format!("to_components: unknown timezone `{iana}`: {e}"))?;
+        TzArg::Iana(name) => {
+            let tz: chrono_tz::Tz = name.parse()
+                .map_err(|e| format!("to_components: unknown timezone `{name}`: {e}"))?;
             let d = utc_dt.with_timezone(&tz);
             let off = d.offset().fix().local_minus_utc() / 60;
             (d.year(), d.month() as i32, d.day() as i32,
@@ -1075,14 +1103,6 @@ fn resolve_tz_to_components(n: i64, tz_name: &str) -> Result<Value, String> {
     Ok(Value::Record(rec))
 }
 
-fn parse_fixed_offset(s: &str) -> Option<i32> {
-    let sign: i32 = if s.starts_with('+') { 1 } else { -1 };
-    let rest = &s[1..];
-    let (h, m) = rest.split_once(':')?;
-    let h: i32 = h.parse().ok()?;
-    let m: i32 = m.parse().ok()?;
-    Some(sign * (h * 3600 + m * 60))
-}
 
 fn instant_from_components(rec: &indexmap::IndexMap<String, Value>) -> Result<i64, String> {
     use chrono::TimeZone;

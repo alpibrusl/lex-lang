@@ -62,6 +62,24 @@ impl TypeEnv {
         e.types.insert("Map".into(), TypeDef { params: vec!["K".into(), "V".into()], kind: TypeDefKind::Opaque });
         e.types.insert("Set".into(), TypeDef { params: vec!["T".into()], kind: TypeDefKind::Opaque });
 
+        // Tz = Utc | Local | Offset(Int) | Iana(Str).
+        // Used by std.datetime; the variant-typed alternative to the
+        // pre-v1 stringly Tz ("UTC" / "Local" / "+05:30" / IANA name).
+        // Registered globally so users don't have to import a module
+        // to mention `Utc` / `Iana("America/New_York")` etc.
+        let mut tz_variants = IndexMap::new();
+        tz_variants.insert("Utc".into(), None);
+        tz_variants.insert("Local".into(), None);
+        tz_variants.insert("Offset".into(), Some(Ty::int()));
+        tz_variants.insert("Iana".into(), Some(Ty::str()));
+        e.types.insert("Tz".into(), TypeDef {
+            params: vec![],
+            kind: TypeDefKind::Union(tz_variants),
+        });
+        for ctor in &["Utc", "Local", "Offset", "Iana"] {
+            e.ctor_to_type.insert((*ctor).into(), "Tz".into());
+        }
+
         // Matrix = { rows :: Int, cols :: Int, data :: List[Float] }.
         // Used by std.math; runtime values are the F64Array fast lane,
         // not a real record. The alias makes math.* signatures readable
