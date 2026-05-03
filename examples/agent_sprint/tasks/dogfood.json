@@ -1,0 +1,6 @@
+{
+  "id": "dogfood-check-verify-stage",
+  "prompt": "check",
+  "args": ["./stages/verify.lex"],
+  "criteria": "ok"
+}
