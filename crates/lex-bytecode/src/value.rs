@@ -225,7 +225,7 @@ impl Value {
 /// Lowercase-hex → bytes. Returns `None` for odd length or non-hex chars
 /// (callers fall through to a record decode rather than erroring).
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 { return None; }
+    if !s.len().is_multiple_of(2) { return None; }
     let mut out = Vec::with_capacity(s.len() / 2);
     let bytes = s.as_bytes();
     for pair in bytes.chunks(2) {
