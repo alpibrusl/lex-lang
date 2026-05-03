@@ -1006,6 +1006,83 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 Ty::List(Box::new(Ty::str()))));
             Some(Ty::Record(fields))
         }
+        "http" => {
+            // Rich HTTP client. `[net]` for the wire ops, pure for
+            // the builders / decoders. `--allow-net-host` gates per
+            // request. Multipart upload + streaming response bodies
+            // are deferred to v1.5; the v1 surface covers the
+            // common cases (auth, headers, query, timeouts, JSON /
+            // text decoding).
+            let req_t  = || Ty::Con("HttpRequest".into(), vec![]);
+            let resp_t = || Ty::Con("HttpResponse".into(), vec![]);
+            let err_t  = || Ty::Con("HttpError".into(), vec![]);
+            let result_he = |t: Ty| Ty::Con("Result".into(), vec![t, err_t()]);
+            let str_str_map = || Ty::Con("Map".into(), vec![Ty::str(), Ty::str()]);
+            let mut fields = IndexMap::new();
+            // -- wire ops (effectful) --
+            // send :: HttpRequest -> [net] Result[HttpResponse, HttpError]
+            fields.insert("send".into(), Ty::function(
+                vec![req_t()],
+                EffectSet::singleton("net"),
+                result_he(resp_t()),
+            ));
+            // get :: Str -> [net] Result[HttpResponse, HttpError]
+            fields.insert("get".into(), Ty::function(
+                vec![Ty::str()],
+                EffectSet::singleton("net"),
+                result_he(resp_t()),
+            ));
+            // post :: Str, Bytes, Str -> [net] Result[HttpResponse, HttpError]
+            fields.insert("post".into(), Ty::function(
+                vec![Ty::str(), Ty::bytes(), Ty::str()],
+                EffectSet::singleton("net"),
+                result_he(resp_t()),
+            ));
+            // -- pure builders (record transforms) --
+            // with_header :: HttpRequest, Str, Str -> HttpRequest
+            fields.insert("with_header".into(), Ty::function(
+                vec![req_t(), Ty::str(), Ty::str()],
+                EffectSet::empty(),
+                req_t(),
+            ));
+            // with_auth :: HttpRequest, Str, Str -> HttpRequest
+            // (Renders `<scheme> <token>` into the `Authorization`
+            // header — `Bearer <jwt>`, `Basic <b64>`, etc.)
+            fields.insert("with_auth".into(), Ty::function(
+                vec![req_t(), Ty::str(), Ty::str()],
+                EffectSet::empty(),
+                req_t(),
+            ));
+            // with_query :: HttpRequest, Map[Str, Str] -> HttpRequest
+            // (Appends a `?k=v&...` query string; values are URL-
+            // encoded so `&` / `=` / spaces in values don't escape.)
+            fields.insert("with_query".into(), Ty::function(
+                vec![req_t(), str_str_map()],
+                EffectSet::empty(),
+                req_t(),
+            ));
+            // with_timeout_ms :: HttpRequest, Int -> HttpRequest
+            fields.insert("with_timeout_ms".into(), Ty::function(
+                vec![req_t(), Ty::int()],
+                EffectSet::empty(),
+                req_t(),
+            ));
+            // -- pure decoders --
+            // json_body[T] :: HttpResponse -> Result[T, HttpError]
+            // Polymorphic on the parsed shape, matching `json.parse`.
+            fields.insert("json_body".into(), Ty::function(
+                vec![resp_t()],
+                EffectSet::empty(),
+                result_he(Ty::Var(0)),
+            ));
+            // text_body :: HttpResponse -> Result[Str, HttpError]
+            fields.insert("text_body".into(), Ty::function(
+                vec![resp_t()],
+                EffectSet::empty(),
+                result_he(Ty::str()),
+            ));
+            Some(Ty::Record(fields))
+        }
         _ => None,
     }
 }
@@ -1041,6 +1118,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "process" => "process",
         "datetime" => "datetime",
         "log" => "log",
+        "http" => "http",
         _ => return None,
     })
 }

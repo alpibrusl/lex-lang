@@ -80,6 +80,55 @@ impl TypeEnv {
             e.ctor_to_type.insert((*ctor).into(), "Tz".into());
         }
 
+        // HttpError = NetworkError(Str) | TimeoutError | TlsError(Str)
+        //           | DecodeError(Str)
+        // Used by std.http; structured failure shape so callers can
+        // discriminate transport vs. timeout vs. TLS vs. body-decode
+        // errors without parsing strings.
+        let mut http_err_variants = IndexMap::new();
+        http_err_variants.insert("NetworkError".into(), Some(Ty::str()));
+        http_err_variants.insert("TimeoutError".into(), None);
+        http_err_variants.insert("TlsError".into(), Some(Ty::str()));
+        http_err_variants.insert("DecodeError".into(), Some(Ty::str()));
+        e.types.insert("HttpError".into(), TypeDef {
+            params: vec![],
+            kind: TypeDefKind::Union(http_err_variants),
+        });
+        for ctor in &["NetworkError", "TimeoutError", "TlsError", "DecodeError"] {
+            e.ctor_to_type.insert((*ctor).into(), "HttpError".into());
+        }
+
+        // HttpRequest = { method, url, headers, body, timeout_ms }.
+        // The std.http request shape. Anonymous record literals coerce
+        // to this nominal alias at every position (per the §3.13
+        // record-coercion rules), so users write
+        // `{ method: "GET", url: u, headers: map.new(), body: None,
+        // timeout_ms: None }` rather than a dedicated constructor —
+        // builders (`http.with_header` etc.) are pure transforms over
+        // the same shape.
+        let mut req_fields = IndexMap::new();
+        req_fields.insert("method".into(), Ty::str());
+        req_fields.insert("url".into(), Ty::str());
+        req_fields.insert("headers".into(), Ty::Con("Map".into(), vec![Ty::str(), Ty::str()]));
+        req_fields.insert("body".into(), Ty::Con("Option".into(), vec![Ty::bytes()]));
+        req_fields.insert("timeout_ms".into(), Ty::Con("Option".into(), vec![Ty::int()]));
+        e.types.insert("HttpRequest".into(), TypeDef {
+            params: vec![],
+            kind: TypeDefKind::Alias(Ty::Record(req_fields)),
+        });
+
+        // HttpResponse = { status, headers, body }. Returned by every
+        // `http.{send,get,post}` happy path; also the input to
+        // `http.{json_body,text_body}`.
+        let mut resp_fields = IndexMap::new();
+        resp_fields.insert("status".into(), Ty::int());
+        resp_fields.insert("headers".into(), Ty::Con("Map".into(), vec![Ty::str(), Ty::str()]));
+        resp_fields.insert("body".into(), Ty::bytes());
+        e.types.insert("HttpResponse".into(), TypeDef {
+            params: vec![],
+            kind: TypeDefKind::Alias(Ty::Record(resp_fields)),
+        });
+
         // Matrix = { rows :: Int, cols :: Int, data :: List[Float] }.
         // Used by std.math; runtime values are the F64Array fast lane,
         // not a real record. The alias makes math.* signatures readable
