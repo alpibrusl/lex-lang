@@ -169,6 +169,57 @@ impl Checker {
         ty
     }
 
+    /// Unify two types, asymmetrically coercing an anonymous record
+    /// against a nominal record alias at any level of nesting. So a
+    /// `{ x: 1, y: 2 }` literal can be passed to a fn taking
+    /// `Inner = { x :: Int, y :: Int }`, even when the literal is the
+    /// inner field of an outer record literal.
+    ///
+    /// We deliberately keep nominal-vs-nominal mismatches strict: two
+    /// distinct `Ty::Con` names won't unify just because their record
+    /// shapes match. The coercion fires only when one side is a bare
+    /// `Ty::Record` and the other is a `Ty::Con` whose alias is a
+    /// record.
+    fn unify_with_record_coercion(&mut self, a: &Ty, b: &Ty) -> Result<(), UnifyError> {
+        let a = self.u.resolve(a);
+        let b = self.u.resolve(b);
+        self.unify_coerce_inner(a, b)
+    }
+
+    fn unify_coerce_inner(&mut self, a: Ty, b: Ty) -> Result<(), UnifyError> {
+        // Asymmetric Record↔Con(record-alias) coercion at this level.
+        let (a, b) = match (&a, &b) {
+            (Ty::Record(_), Ty::Con(_, _)) => (a, self.unfold_record_alias(b.clone())),
+            (Ty::Con(_, _), Ty::Record(_)) => (self.unfold_record_alias(a.clone()), b),
+            _ => (a, b),
+        };
+
+        match (&a, &b) {
+            (Ty::Record(fa), Ty::Record(fb)) => {
+                if fa.len() != fb.len() {
+                    return Err(UnifyError::Mismatch { a: a.clone(), b: b.clone() });
+                }
+                for (k, va) in fa.clone() {
+                    match fb.get(&k) {
+                        Some(vb) => self.unify_coerce_inner(va, vb.clone())?,
+                        None => return Err(UnifyError::Mismatch { a: a.clone(), b: b.clone() }),
+                    }
+                }
+                Ok(())
+            }
+            (Ty::List(ta), Ty::List(tb)) => {
+                self.unify_coerce_inner((**ta).clone(), (**tb).clone())
+            }
+            (Ty::Tuple(xs), Ty::Tuple(ys)) if xs.len() == ys.len() => {
+                for (x, y) in xs.clone().into_iter().zip(ys.clone()) {
+                    self.unify_coerce_inner(x, y)?;
+                }
+                Ok(())
+            }
+            _ => self.u.unify(&a, &b),
+        }
+    }
+
     fn check_fn(&mut self, fd: &a::FnDecl) -> Result<Scheme, Vec<TypeError>> {
         // Instantiate fn's signature with fresh vars for its type params.
         let scheme = function_scheme(fd);
@@ -186,19 +237,13 @@ impl Checker {
         let body_ty = self.check_expr(&fd.body, "n_0", &mut locals, &mut inferred_effects)
             .map_err(|e| vec![e])?;
 
-        // Unfold record-aliased return types so users can declare
-        //   `type Response = { ... }`
-        // and return a record literal directly. If the body itself
-        // produces an aliased Con (e.g. a value of type `Matrix`
-        // returned to a `-> Matrix` signature), the two sides should
-        // match nominally — try the un-unfolded pair first, fall
-        // back to unfolded.
-        if self.u.unify(&body_ty, &ret_ty).is_err() {
-            let ret_ty_unfolded = self.unfold_record_alias(ret_ty.clone());
-            let body_ty_unfolded = self.unfold_record_alias(self.u.resolve(&body_ty));
-            if let Err(e) = self.u.unify(&body_ty_unfolded, &ret_ty_unfolded) {
-                return Err(vec![mismatch_err("n_0", e, &self.u, vec![format!("in function `{}`", fd.name)])]);
-            }
+        // The body may produce an anonymous record literal where the
+        // signature expects a nominal record alias (and vice-versa,
+        // and at any nested level). `unify_with_record_coercion`
+        // handles that asymmetry while keeping nominal-vs-nominal
+        // mismatches strict.
+        if let Err(e) = self.unify_with_record_coercion(&body_ty, &ret_ty) {
+            return Err(vec![mismatch_err("n_0", e, &self.u, vec![format!("in function `{}`", fd.name)])]);
         }
 
         if !inferred_effects.is_subset(&declared_effects) {
@@ -240,7 +285,7 @@ impl Checker {
                 let v_ty = self.check_expr(value, node_id, locals, effs)?;
                 if let Some(declared) = ty {
                     let d = ty_from_canon(declared, &[]);
-                    if let Err(err) = self.u.unify(&v_ty, &d) {
+                    if let Err(err) = self.unify_with_record_coercion(&v_ty, &d) {
                         return Err(mismatch_err(node_id, err, &self.u, vec![format!("in let `{}`", name)]));
                     }
                 }
@@ -264,7 +309,7 @@ impl Checker {
                     let mut arm_locals = locals.clone();
                     self.bind_pattern(&arm.pattern, &scrut_ty, &mut arm_locals, node_id)?;
                     let arm_ty = self.check_expr(&arm.body, node_id, &mut arm_locals, effs)?;
-                    if let Err(err) = self.u.unify(&arm_ty, &result_ty) {
+                    if let Err(err) = self.unify_with_record_coercion(&arm_ty, &result_ty) {
                         return Err(mismatch_err(node_id, err, &self.u, vec!["in match arm".into()]));
                     }
                 }
@@ -298,7 +343,7 @@ impl Checker {
                 let elem = self.u.fresh();
                 for it in items {
                     let t = self.check_expr(it, node_id, locals, effs)?;
-                    if let Err(err) = self.u.unify(&t, &elem) {
+                    if let Err(err) = self.unify_with_record_coercion(&t, &elem) {
                         return Err(mismatch_err(node_id, err, &self.u, vec!["in list literal".into()]));
                     }
                 }
@@ -350,7 +395,7 @@ impl Checker {
                 }
                 let mut inner_effs = EffectSet::empty();
                 let body_ty = self.check_expr(body, node_id, &mut inner_locals, &mut inner_effs)?;
-                if let Err(err) = self.u.unify(&body_ty, &ret_ty) {
+                if let Err(err) = self.unify_with_record_coercion(&body_ty, &ret_ty) {
                     return Err(mismatch_err(node_id, err, &self.u, vec!["in lambda body".into()]));
                 }
                 if !inner_effs.is_subset(&declared) {
@@ -483,7 +528,7 @@ impl Checker {
                 }
                 for (i, (a, p)) in args.iter().zip(params.iter()).enumerate() {
                     let at = self.check_expr(a, node_id, locals, effs)?;
-                    if let Err(err) = self.u.unify(&at, p) {
+                    if let Err(err) = self.unify_with_record_coercion(&at, p) {
                         return Err(mismatch_err(node_id, err, &self.u, vec![format!("argument {} of call", i + 1)]));
                     }
                 }
@@ -562,12 +607,12 @@ impl Checker {
                 }
                 if args.len() == 1 {
                     let at = self.check_expr(&args[0], node_id, locals, effs)?;
-                    self.u.unify(&at, &inst_payload).map_err(|e| mismatch_err(node_id, e, &self.u, vec![format!("constructor `{}`", name)]))?;
+                    self.unify_with_record_coercion(&at, &inst_payload).map_err(|e| mismatch_err(node_id, e, &self.u, vec![format!("constructor `{}`", name)]))?;
                 } else {
                     if let Ty::Tuple(items) = inst_payload {
                         for (i, (a, t)) in args.iter().zip(items.iter()).enumerate() {
                             let at = self.check_expr(a, node_id, locals, effs)?;
-                            self.u.unify(&at, t).map_err(|e| mismatch_err(node_id, e, &self.u, vec![format!("constructor `{}` arg {}", name, i + 1)]))?;
+                            self.unify_with_record_coercion(&at, t).map_err(|e| mismatch_err(node_id, e, &self.u, vec![format!("constructor `{}` arg {}", name, i + 1)]))?;
                         }
                     }
                 }
@@ -594,7 +639,7 @@ impl Checker {
             }
             a::Pattern::PLiteral { value } => {
                 let lt = lit_type(value);
-                self.u.unify(&lt, ty).map_err(|e| mismatch_err(node_id, e, &self.u, vec!["in pattern".into()]))?;
+                self.unify_with_record_coercion(&lt, ty).map_err(|e| mismatch_err(node_id, e, &self.u, vec!["in pattern".into()]))?;
                 Ok(())
             }
             a::Pattern::PConstructor { name, args } => {
@@ -612,7 +657,7 @@ impl Checker {
                     con_args.push(fresh);
                 }
                 let con_ty = Ty::Con(owning.clone(), con_args);
-                self.u.unify(&con_ty, ty).map_err(|e| mismatch_err(node_id, e, &self.u, vec![format!("constructor pattern `{}`", name)]))?;
+                self.unify_with_record_coercion(&con_ty, ty).map_err(|e| mismatch_err(node_id, e, &self.u, vec![format!("constructor pattern `{}`", name)]))?;
                 let payload = match &def.kind {
                     TypeDefKind::Union(v) => v.get(name).cloned().flatten(),
                     _ => None,
@@ -664,7 +709,7 @@ impl Checker {
                     Ty::Var(_) => {
                         let fresh: Vec<Ty> = items.iter().map(|_| self.u.fresh()).collect();
                         let tup_ty = Ty::Tuple(fresh.clone());
-                        self.u.unify(&tup_ty, ty).map_err(|e| mismatch_err(node_id, e, &self.u, vec!["in tuple pattern".into()]))?;
+                        self.unify_with_record_coercion(&tup_ty, ty).map_err(|e| mismatch_err(node_id, e, &self.u, vec!["in tuple pattern".into()]))?;
                         fresh
                     }
                     other => return Err(TypeError::TypeMismatch {
