@@ -218,8 +218,31 @@ fn cmd_check(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let stages = canonicalize_program(&prog);
     match lex_types::check_program(&stages) {
         Ok(_) => {
-            let data = serde_json::json!({ "ok": true, "stages": stages.len() });
-            acli::emit_or_text("check", data, fmt, || println!("ok"));
+            let summary = effects_summary(&stages);
+            let data = serde_json::json!({
+                "ok": true,
+                "stages": stages.len(),
+                "required_effects": summary.kinds,
+                "required_fs_read": summary.fs_read,
+                "required_fs_write": summary.fs_write,
+                "required_net_host": summary.net_host,
+            });
+            acli::emit_or_text("check", data, fmt, || {
+                println!("ok");
+                if !summary.kinds.is_empty() {
+                    println!("required effects: {}", summary.kinds.join(", "));
+                    if !summary.fs_read.is_empty() {
+                        println!("required fs_read paths: {}", summary.fs_read.join(", "));
+                    }
+                    if !summary.fs_write.is_empty() {
+                        println!("required fs_write paths: {}", summary.fs_write.join(", "));
+                    }
+                    if !summary.net_host.is_empty() {
+                        println!("required net hosts: {}", summary.net_host.join(", "));
+                    }
+                    println!("hint: lex run {} {path} <fn> [args]", suggest_grants(&summary));
+                }
+            });
             Ok(())
         }
         Err(errs) => {
@@ -236,6 +259,66 @@ fn cmd_check(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             std::process::exit(2);
         }
     }
+}
+
+/// Effects required by a program, broken out by kind so the user can
+/// see which `--allow-*` flags they'll need at run time. We aggregate
+/// across every fn declaration in the program: more permissive than
+/// strictly necessary (a single fn might need fewer effects), but
+/// matches the common case of "I just want to run main".
+struct EffectsSummary {
+    kinds: Vec<String>,
+    fs_read: Vec<String>,
+    fs_write: Vec<String>,
+    net_host: Vec<String>,
+}
+
+fn effects_summary(stages: &[lex_ast::Stage]) -> EffectsSummary {
+    use std::collections::BTreeSet;
+    let mut kinds: BTreeSet<String> = BTreeSet::new();
+    let mut fs_read: BTreeSet<String> = BTreeSet::new();
+    let mut fs_write: BTreeSet<String> = BTreeSet::new();
+    let mut net_host: BTreeSet<String> = BTreeSet::new();
+    for s in stages {
+        if let lex_ast::Stage::FnDecl(fd) = s {
+            for e in &fd.effects {
+                kinds.insert(e.name.clone());
+                if let Some(arg) = &e.arg {
+                    let arg_str = match arg {
+                        lex_ast::EffectArg::Str { value } => value.clone(),
+                        lex_ast::EffectArg::Int { value } => value.to_string(),
+                        lex_ast::EffectArg::Ident { value } => value.clone(),
+                    };
+                    match e.name.as_str() {
+                        "fs_read" => { fs_read.insert(arg_str); }
+                        "fs_write" => { fs_write.insert(arg_str); }
+                        "net" => { net_host.insert(arg_str); }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    EffectsSummary {
+        kinds: kinds.into_iter().collect(),
+        fs_read: fs_read.into_iter().collect(),
+        fs_write: fs_write.into_iter().collect(),
+        net_host: net_host.into_iter().collect(),
+    }
+}
+
+fn suggest_grants(s: &EffectsSummary) -> String {
+    let mut parts = vec![format!("--allow-effects {}", s.kinds.join(","))];
+    for p in &s.fs_read {
+        parts.push(format!("--allow-fs-read {p}"));
+    }
+    for p in &s.fs_write {
+        parts.push(format!("--allow-fs-write {p}"));
+    }
+    for h in &s.net_host {
+        parts.push(format!("--allow-net-host {h}"));
+    }
+    parts.join(" ")
 }
 
 fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
