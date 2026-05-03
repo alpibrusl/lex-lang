@@ -46,6 +46,12 @@ lex check examples/c_echo.lex
 lex run examples/a_factorial.lex factorial 5
 # → 120
 
+# Variants are passed as `{"$variant": "Name", "args": [...]}` —
+# the same shape the runtime emits on output, so `lex run` results
+# can be piped back as inputs to other calls.
+lex run examples/b_parse_int.lex double_input '"21"'
+# → {"$variant":"Ok","args":[42]}
+
 # Run a program that uses effects (the runtime refuses without a grant).
 lex run examples/c_echo.lex echo '"hello, lex"'
 # → {"kind":"effect_not_allowed", ...}; exit 3

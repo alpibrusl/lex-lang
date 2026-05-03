@@ -57,6 +57,20 @@ bumps may carry breaking changes when justified).
   patterns, tuple patterns) — previously they were accepted in
   match arms / list / record literals only. (#84, closes #80)
 
+### Fixed
+
+- **`lex run` now decodes the `{"$variant": "Name", "args": [...]}`
+  JSON convention** for variant arguments. Three crates each had
+  their own copy of the JSON → `Value` decoder; only the CLI's was
+  missing the variant-detection branch, so `lex run path.lex fn
+  '{"$variant":"Red","args":[]}'` materialized as a `Value::Record`
+  and tripped `TestVariant on non-variant` at the first match arm.
+  Promoted the helper to `Value::from_json` in `lex-bytecode`
+  (alongside the existing `to_json` it inverts); CLI, runtime
+  (`json.parse`), and `lex serve` HTTP body all delegate. One
+  source of truth for the JSON ↔ `Value` convention. (#94, closes
+  #93)
+
 ### Dependencies
 
 - logos `0.14` → `0.16`, tungstenite `0.21` → `0.29`, ureq
