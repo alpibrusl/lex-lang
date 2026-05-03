@@ -964,6 +964,61 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 Ty::List(Box::new(Ty::str()))));
             Some(Ty::Record(fields))
         }
+        "sql" => {
+            // Embedded SQL (SQLite). The opaque `Db` type is backed
+            // by an Int handle into a process-wide registry, same
+            // shape as `Kv`. v1 surface focuses on read-heavy and
+            // simple-write workloads — the kind that drove the
+            // requirement (audit history, "filter by verdict where
+            // score > 60", joins). Transactions, heterogeneous
+            // typed parameter binding, and named params are
+            // deferred to v1.5.
+            //
+            // Params are `List[Str]` for v1: callers stringify Int /
+            // Float values before binding, and SQLite's column type
+            // affinity coerces back at insert time. This is the one
+            // honest ergonomics caveat; the alternative (a tagged
+            // `SqlValue` variant) is forward-compatible but adds a
+            // type to the global scope that v1 doesn't need.
+            let db_t = || Ty::Con("Db".into(), vec![]);
+            let mut fields = IndexMap::new();
+            // open :: Str -> [sql, fs_write] Result[Db, Str]
+            // Path is the SQLite filename; ":memory:" works for
+            // ephemeral stores. fs_write is required because the
+            // DB file is created on first open.
+            fields.insert("open".into(), Ty::function(
+                vec![Ty::str()],
+                EffectSet {
+                    concrete: ["sql".to_string(), "fs_write".to_string()].into_iter().collect(),
+                    var: None,
+                },
+                Ty::Con("Result".into(), vec![db_t(), Ty::str()])));
+            // close :: Db -> [sql] Nil
+            fields.insert("close".into(), Ty::function(
+                vec![db_t()],
+                EffectSet::singleton("sql"),
+                Ty::Unit));
+            // exec :: Db, Str, List[Str] -> [sql] Result[Int, Str]
+            // Returns the affected row count (rusqlite's `execute`).
+            // Suitable for INSERT / UPDATE / DELETE / DDL.
+            fields.insert("exec".into(), Ty::function(
+                vec![db_t(), Ty::str(), Ty::List(Box::new(Ty::str()))],
+                EffectSet::singleton("sql"),
+                Ty::Con("Result".into(), vec![Ty::int(), Ty::str()])));
+            // query[T] :: Db, Str, List[Str] -> [sql] Result[List[T], Str]
+            // Polymorphic on the row record shape. Each row is
+            // decoded into a record keyed by column name, with
+            // SQLite values mapped to the same Lex `Value` shape
+            // as `json.parse` and `toml.parse` produce.
+            fields.insert("query".into(), Ty::function(
+                vec![db_t(), Ty::str(), Ty::List(Box::new(Ty::str()))],
+                EffectSet::singleton("sql"),
+                Ty::Con("Result".into(), vec![
+                    Ty::List(Box::new(Ty::Var(0))),
+                    Ty::str(),
+                ])));
+            Some(Ty::Record(fields))
+        }
         "regex" => {
             // The compiled `Regex` is stored as a `Str` at runtime
             // (the pattern source) plus a process-wide cache of the
@@ -1149,6 +1204,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "regex" => "regex",
         "deque" => "deque",
         "kv" => "kv",
+        "sql" => "sql",
         "fs" => "fs",
         "process" => "process",
         "datetime" => "datetime",
