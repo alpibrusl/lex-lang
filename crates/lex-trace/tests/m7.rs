@@ -78,10 +78,10 @@ fn value_to_json(v: &Value) -> serde_json::Value {
             m.insert("data".into(), J::Array(data.iter().map(|f| J::from(*f)).collect()));
             J::Object(m)
         }
-        Value::Map(_) | Value::Set(_) => {
-            // Tests in this file don't exercise Map/Set values; render
-            // as a placeholder so the match is exhaustive.
-            J::String("<map_or_set>".into())
+        Value::Map(_) | Value::Set(_) | Value::Deque(_) => {
+            // Tests in this file don't exercise these container values;
+            // render as a placeholder so the match is exhaustive.
+            J::String("<container>".into())
         }
     }
 }

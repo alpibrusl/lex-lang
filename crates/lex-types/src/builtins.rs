@@ -493,6 +493,16 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             fields.insert("from_list".into(), Ty::function(
                 vec![Ty::List(Box::new(pair()))],
                 EffectSet::empty(), mt()));
+            // merge :: Map[K, V], Map[K, V] -> Map[K, V]   (b overrides a)
+            fields.insert("merge".into(), Ty::function(
+                vec![mt(), mt()], EffectSet::empty(), mt()));
+            // is_empty :: Map[K, V] -> Bool
+            fields.insert("is_empty".into(), Ty::function(
+                vec![mt()], EffectSet::empty(), Ty::bool()));
+            // map.fold is a HOF — needs the same special-cased bytecode
+            // emit as `list.fold` to thread the closure through the
+            // VM's call protocol. Tracked as follow-up; not in this
+            // PR's scope.
             Some(Ty::Record(fields))
         }
         "set" => {
@@ -529,6 +539,15 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             // intersect :: Set[T], Set[T] -> Set[T]
             fields.insert("intersect".into(), Ty::function(
                 vec![st(), st()], EffectSet::empty(), st()));
+            // diff :: Set[T], Set[T] -> Set[T]
+            fields.insert("diff".into(), Ty::function(
+                vec![st(), st()], EffectSet::empty(), st()));
+            // is_empty :: Set[T] -> Bool
+            fields.insert("is_empty".into(), Ty::function(
+                vec![st()], EffectSet::empty(), Ty::bool()));
+            // is_subset :: Set[T], Set[T] -> Bool   (a is subset of b)
+            fields.insert("is_subset".into(), Ty::function(
+                vec![st(), st()], EffectSet::empty(), Ty::bool()));
             Some(Ty::Record(fields))
         }
         "flow" => {
@@ -625,6 +644,49 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             ));
             Some(Ty::Record(fields))
         }
+        "deque" => {
+            // Persistent double-ended queue. Push/pop O(1) on both
+            // ends; iteration order is front-to-back.
+            // Type variable: 0 = T.
+            let dt   = || Ty::Con("Deque".into(), vec![Ty::Var(0)]);
+            let pair = || Ty::Tuple(vec![Ty::Var(0), dt()]);
+            let mut fields = IndexMap::new();
+            // new :: () -> Deque[T]
+            fields.insert("new".into(), Ty::function(
+                vec![], EffectSet::empty(), dt()));
+            // size :: Deque[T] -> Int
+            fields.insert("size".into(), Ty::function(
+                vec![dt()], EffectSet::empty(), Ty::int()));
+            // is_empty :: Deque[T] -> Bool
+            fields.insert("is_empty".into(), Ty::function(
+                vec![dt()], EffectSet::empty(), Ty::bool()));
+            // push_back / push_front :: Deque[T], T -> Deque[T]
+            for n in &["push_back", "push_front"] {
+                fields.insert((*n).into(), Ty::function(
+                    vec![dt(), Ty::Var(0)], EffectSet::empty(), dt()));
+            }
+            // pop_back / pop_front :: Deque[T] -> Option[(T, Deque[T])]
+            for n in &["pop_back", "pop_front"] {
+                fields.insert((*n).into(), Ty::function(
+                    vec![dt()], EffectSet::empty(),
+                    Ty::Con("Option".into(), vec![pair()])));
+            }
+            // peek_back / peek_front :: Deque[T] -> Option[T]
+            for n in &["peek_back", "peek_front"] {
+                fields.insert((*n).into(), Ty::function(
+                    vec![dt()], EffectSet::empty(),
+                    Ty::Con("Option".into(), vec![Ty::Var(0)])));
+            }
+            // from_list :: List[T] -> Deque[T]
+            fields.insert("from_list".into(), Ty::function(
+                vec![Ty::List(Box::new(Ty::Var(0)))],
+                EffectSet::empty(), dt()));
+            // to_list :: Deque[T] -> List[T]
+            fields.insert("to_list".into(), Ty::function(
+                vec![dt()], EffectSet::empty(),
+                Ty::List(Box::new(Ty::Var(0)))));
+            Some(Ty::Record(fields))
+        }
         "regex" => {
             // The compiled `Regex` is stored as a `Str` at runtime
             // (the pattern source) plus a process-wide cache of the
@@ -696,6 +758,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "proc" => "proc",
         "crypto" => "crypto",
         "regex" => "regex",
+        "deque" => "deque",
         _ => return None,
     })
 }
