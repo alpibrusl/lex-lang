@@ -17,7 +17,7 @@ use crate::acli as acli_mod;
 use ::acli::OutputFormat;
 use anyhow::{anyhow, Context, Result};
 use lex_ast::{canonicalize_program, CExpr, CLit, Effect, FnDecl, Stage, TypeExpr};
-use lex_syntax::parse_source;
+use lex_syntax::load_program;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs;
@@ -68,17 +68,13 @@ pub fn cmd_audit(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let mut report = AuditReport { summary: BTreeMap::new(), hits: Vec::new() };
 
     for path in &files {
-        let src = match fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
         // Parse + canonicalize. Errors are printed once, then we keep
         // going — partial audits over a half-broken codebase are
         // strictly more useful than refusing to run.
-        let prog = match parse_source(&src) {
+        let prog = match load_program(path) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("warning: parse error in {}: {e}", path.display());
+                eprintln!("warning: load error in {}: {e}", path.display());
                 continue;
             }
         };

@@ -25,7 +25,8 @@ use lex_ast::{canonicalize_program, sig_id, stage_canonical_hash_hex, stage_id, 
 use lex_bytecode::{compile_program, vm::Vm, Value};
 use lex_runtime::{check_program as check_policy, DefaultHandler, Policy};
 use lex_store::Store;
-use lex_syntax::parse_source;
+use lex_syntax::syntax::Program as SynProgram;
+use lex_syntax::{load_program, load_program_from_str};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
@@ -187,10 +188,22 @@ fn read_source(path: &str) -> Result<String> {
     }
 }
 
+/// Read a Lex program from a file path or `-` (stdin), expanding local
+/// imports relative to the file's directory. For stdin, local imports
+/// are rejected (no base path to resolve from).
+fn read_program(path: &str) -> Result<SynProgram> {
+    if path == "-" {
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s).context("reading stdin")?;
+        load_program_from_str(&s).map_err(Into::into)
+    } else {
+        load_program(std::path::Path::new(path)).map_err(Into::into)
+    }
+}
+
 fn cmd_parse(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let path = args.first().ok_or_else(|| anyhow!("usage: lex parse <file>"))?;
-    let src = read_source(path)?;
-    let prog = parse_source(&src)?;
+    let prog = read_program(path)?;
     let stages = canonicalize_program(&prog);
     let data = serde_json::to_value(&stages)?;
     acli::emit_or_text("parse", data.clone(), fmt, || {
@@ -201,8 +214,7 @@ fn cmd_parse(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 
 fn cmd_check(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let path = args.first().ok_or_else(|| anyhow!("usage: lex check <file>"))?;
-    let src = read_source(path)?;
-    let prog = parse_source(&src)?;
+    let prog = read_program(path)?;
     let stages = canonicalize_program(&prog);
     match lex_types::check_program(&stages) {
         Ok(_) => {
@@ -249,8 +261,7 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         acli::emit_dry_run("run", fmt,
             &format!("would call `{func}` in {path}"), actions);
     }
-    let src = read_source(path)?;
-    let prog = parse_source(&src)?;
+    let prog = read_program(path)?;
     let stages = canonicalize_program(&prog);
     if let Err(errs) = lex_types::check_program(&stages) {
         let arr: Vec<serde_json::Value> = errs.iter()
@@ -409,8 +420,7 @@ fn cmd_diff(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 
 fn cmd_hash(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let path = args.first().ok_or_else(|| anyhow!("usage: lex hash <file>"))?;
-    let src = read_source(path)?;
-    let prog = parse_source(&src)?;
+    let prog = read_program(path)?;
     let stages = canonicalize_program(&prog);
     let entries: Vec<serde_json::Value> = stages.iter().map(|s| {
         let name = stage_name(s);
@@ -438,8 +448,7 @@ fn cmd_blame(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     // usage: lex blame [--store DIR] <file>
     let (root, rest, _, _) = parse_store_flag(args);
     let path = rest.first().ok_or_else(|| anyhow!("usage: lex blame [--store DIR] <file>"))?;
-    let src = read_source(path)?;
-    let prog = parse_source(&src)?;
+    let prog = read_program(path)?;
     let stages = canonicalize_program(&prog);
     let store = Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
 
@@ -601,8 +610,7 @@ fn parse_store_flag(args: &[String]) -> (PathBuf, Vec<String>, bool, bool) {
 fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let (root, rest, activate, dry_run) = parse_store_flag(args);
     let path = rest.first().ok_or_else(|| anyhow!("usage: lex publish [--store DIR] [--activate] <file>"))?;
-    let src = read_source(path)?;
-    let prog = parse_source(&src)?;
+    let prog = read_program(path)?;
     let stages = canonicalize_program(&prog);
     if let Err(errs) = lex_types::check_program(&stages) {
         let arr: Vec<serde_json::Value> = errs.iter()
@@ -728,8 +736,7 @@ fn cmd_replay(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let path = positional.get(1).ok_or_else(|| anyhow!("missing <file>"))?;
     let func = positional.get(2).ok_or_else(|| anyhow!("missing <fn>"))?;
 
-    let src = read_source(path)?;
-    let prog = parse_source(&src)?;
+    let prog = read_program(path)?;
     let stages = canonicalize_program(&prog);
     if let Err(errs) = lex_types::check_program(&stages) {
         let arr: Vec<serde_json::Value> = errs.iter()
@@ -987,7 +994,7 @@ fn cmd_agent_tool(args: &[String]) -> Result<()> {
     // 3) Parse + type-check. This is where a malicious body gets caught:
     // any effect not in `[allowed_effects]` shows up as an undeclared
     // effect on `fn tool` and the checker rejects it.
-    let prog = parse_source(&src).context("parse agent-generated source")?;
+    let prog = load_program_from_str(&src).context("parse agent-generated source")?;
     let stages = canonicalize_program(&prog);
     if let Err(errs) = lex_types::check_program(&stages) {
         eprintln!("→ TYPE-CHECK REJECTED — tool not run.");
@@ -1082,7 +1089,7 @@ fn cmd_agent_tool(args: &[String]) -> Result<()> {
         };
         let diff_body_text = strip_code_fences(&diff_body_text);
         let diff_src = build_tool_program(&diff_body_text, &opts.allowed_effects);
-        let prog_b = parse_source(&diff_src).context("parse diff body")?;
+        let prog_b = load_program_from_str(&diff_src).context("parse diff body")?;
         let stages_b = canonicalize_program(&prog_b);
         if let Err(errs) = lex_types::check_program(&stages_b) {
             eprintln!("→ DIFF BODY type-check rejected.");

@@ -10,7 +10,7 @@ use lex_ast::canonicalize_program;
 use lex_bytecode::{compile_program, vm::Vm, Value};
 use lex_runtime::{check_program as check_policy, DefaultHandler, Policy};
 use lex_store::Store;
-use lex_syntax::parse_source;
+use lex_syntax::load_program_from_str;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -103,7 +103,7 @@ fn parse_handler(body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
     let req: ParseReq = match serde_json::from_str(body) {
         Ok(r) => r, Err(e) => return error_response(400, format!("bad request: {e}")),
     };
-    match parse_source(&req.source) {
+    match load_program_from_str(&req.source) {
         Ok(prog) => {
             let stages = canonicalize_program(&prog);
             json_response(200, &serde_json::to_value(&stages).unwrap())
@@ -116,7 +116,7 @@ fn check_handler(body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
     let req: ParseReq = match serde_json::from_str(body) {
         Ok(r) => r, Err(e) => return error_response(400, format!("bad request: {e}")),
     };
-    let prog = match parse_source(&req.source) {
+    let prog = match load_program_from_str(&req.source) {
         Ok(p) => p, Err(e) => return error_response(400, format!("syntax error: {e}")),
     };
     let stages = canonicalize_program(&prog);
@@ -133,7 +133,7 @@ fn publish_handler(state: &State, body: &str) -> Response<std::io::Cursor<Vec<u8
     let req: PublishReq = match serde_json::from_str(body) {
         Ok(r) => r, Err(e) => return error_response(400, format!("bad request: {e}")),
     };
-    let prog = match parse_source(&req.source) {
+    let prog = match load_program_from_str(&req.source) {
         Ok(p) => p, Err(e) => return error_response(400, format!("syntax error: {e}")),
     };
     let stages = canonicalize_program(&prog);
@@ -270,7 +270,7 @@ fn run_handler(state: &State, body: &str, with_overrides: bool) -> Response<std:
     let req: RunReq = match serde_json::from_str(body) {
         Ok(r) => r, Err(e) => return error_response(400, format!("bad request: {e}")),
     };
-    let prog = match parse_source(&req.source) {
+    let prog = match load_program_from_str(&req.source) {
         Ok(p) => p, Err(e) => return error_response(400, format!("syntax error: {e}")),
     };
     let stages = canonicalize_program(&prog);

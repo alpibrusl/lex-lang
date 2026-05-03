@@ -6,7 +6,9 @@ pub mod token;
 pub mod syntax;
 pub mod parser;
 pub mod printer;
+pub mod loader;
 
+pub use loader::{load_program, load_program_from_str, LoadError};
 pub use parser::{parse, ParseError};
 pub use printer::print_program;
 pub use syntax::*;
