@@ -1,6 +1,6 @@
 //! Multi-file loader smoke tests: two-file project, transitive imports,
-//! diamond, cycle detection, missing file, m.Type qualified types,
-//! shadowing.
+//! diamond (now deduped), cycle detection, missing file, m.Type
+//! qualified types, shadowing.
 
 use lex_syntax::syntax::*;
 use lex_syntax::{load_program, load_program_from_str, LoadError};
@@ -28,6 +28,40 @@ fn type_names(prog: &Program) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+/// Find the unique fn whose mangled name ends with `.<suffix>` (an
+/// imported fn) or equals `<suffix>` (a root-file fn). Asserts
+/// uniqueness.
+fn unique_fn<'a>(prog: &'a Program, suffix: &str) -> &'a FnDecl {
+    let matches: Vec<&FnDecl> = prog
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::FnDecl(fd) if fd.name == suffix || fd.name.ends_with(&format!(".{suffix}")) => {
+                Some(fd)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "expected exactly one fn matching `{suffix}`, found {}: {:?}",
+        matches.len(),
+        matches.iter().map(|f| &f.name).collect::<Vec<_>>(),
+    );
+    matches[0]
+}
+
+fn count_with_suffix(prog: &Program, suffix: &str) -> usize {
+    prog.items
+        .iter()
+        .filter(|i| match i {
+            Item::FnDecl(fd) => fd.name == suffix || fd.name.ends_with(&format!(".{suffix}")),
+            _ => false,
+        })
+        .count()
 }
 
 #[test]
@@ -58,11 +92,17 @@ fn main(s :: m.Status) -> Str { m.label(s) }
     let fns = fn_names(&prog);
     let types = type_names(&prog);
 
-    // Imported fn is mangled with the alias.
-    assert!(fns.contains(&"m.label".to_string()), "got fns: {fns:?}");
-    // Imported type is mangled.
-    assert!(types.contains(&"m.Status".to_string()), "got types: {types:?}");
-    // Root fn is unmangled.
+    // Imported fn is mangled (some prefix, ending in .label).
+    assert!(
+        fns.iter().any(|n| n.ends_with(".label") && n.contains('_')),
+        "expected mangled fn ending in `.label` with `_` separator, got: {fns:?}",
+    );
+    // Imported type likewise.
+    assert!(
+        types.iter().any(|n| n.ends_with(".Status") && n.contains('_')),
+        "expected mangled type ending in `.Status`, got: {types:?}",
+    );
+    // Root fn stays unmangled.
     assert!(fns.contains(&"main".to_string()), "got fns: {fns:?}");
 }
 
@@ -84,19 +124,15 @@ fn main(x :: Int) -> Int { h.double(x) }
     );
 
     let prog = load_program(&dir.path().join("main.lex")).expect("load");
-    // The call site `h.double(x)` should have been rewritten to `Var("h.double")`.
-    let main_fn = prog
-        .items
-        .iter()
-        .find_map(|i| match i {
-            Item::FnDecl(fd) if fd.name == "main" => Some(fd),
-            _ => None,
-        })
-        .expect("main fn present");
+    let main_fn = unique_fn(&prog, "main");
+    let imported = unique_fn(&prog, "double");
 
     if let Expr::Call { callee, .. } = &*main_fn.body.result {
         if let Expr::Var(name) = &**callee {
-            assert_eq!(name, "h.double");
+            assert_eq!(
+                name, &imported.name,
+                "main's call should reference the imported fn's mangled name"
+            );
             return;
         }
     }
@@ -106,8 +142,6 @@ fn main(x :: Int) -> Int { h.double(x) }
 #[test]
 fn unqualified_local_call_inside_imported_file_is_mangled() {
     let dir = tempfile::tempdir().unwrap();
-    // helpers.lex defines `inner` and calls it from `outer`. After the
-    // loader pass, both should live under the `h` alias path.
     write(
         dir.path(),
         "helpers.lex",
@@ -124,29 +158,21 @@ fn main(x :: Int) -> Int { h.outer(x) }
     );
 
     let prog = load_program(&dir.path().join("main.lex")).expect("load");
-    let outer = prog
-        .items
-        .iter()
-        .find_map(|i| match i {
-            Item::FnDecl(fd) if fd.name == "h.outer" => Some(fd),
-            _ => None,
-        })
-        .expect("h.outer present");
-    // Inside h.outer, the call to `inner(x)` should now be `h.inner(x)`.
+    let outer = unique_fn(&prog, "outer");
+    let inner = unique_fn(&prog, "inner");
+
     if let Expr::Call { callee, .. } = &*outer.body.result {
         if let Expr::Var(name) = &**callee {
-            assert_eq!(name, "h.inner");
+            assert_eq!(name, &inner.name, "outer's body should call inner via mangled name");
             return;
         }
     }
-    panic!("h.outer body not rewritten: {:?}", outer.body.result);
+    panic!("outer body not rewritten: {:?}", outer.body.result);
 }
 
 #[test]
 fn shadowed_let_binding_is_not_mangled() {
     let dir = tempfile::tempdir().unwrap();
-    // `inner` is a top-level fn AND a let binding inside `caller`.
-    // The let binding should win inside the body — no mangling.
     write(
         dir.path(),
         "helpers.lex",
@@ -166,22 +192,12 @@ fn main(x :: Int) -> Int { h.caller(x) }
     );
 
     let prog = load_program(&dir.path().join("main.lex")).expect("load");
-    let caller = prog
-        .items
-        .iter()
-        .find_map(|i| match i {
-            Item::FnDecl(fd) if fd.name == "h.caller" => Some(fd),
-            _ => None,
-        })
-        .expect("h.caller present");
+    let caller = unique_fn(&prog, "caller");
     if let Expr::Var(name) = &*caller.body.result {
-        // The let-bound `inner` shadows the top-level `h.inner`,
-        // so the result expression should reference the unmangled
-        // local binder.
         assert_eq!(name, "inner", "let-bound var should not be mangled");
         return;
     }
-    panic!("h.caller result not a Var: {:?}", caller.body.result);
+    panic!("caller result not a Var: {:?}", caller.body.result);
 }
 
 #[test]
@@ -206,8 +222,8 @@ fn main(x :: Int) -> Int { b.y(x) }
     let prog = load_program(&dir.path().join("a.lex")).expect("load");
     let fns = fn_names(&prog);
     assert!(fns.contains(&"main".to_string()));
-    assert!(fns.contains(&"b.y".to_string()));
-    assert!(fns.contains(&"b.c.z".to_string()), "got: {fns:?}");
+    assert_eq!(count_with_suffix(&prog, "y"), 1);
+    assert_eq!(count_with_suffix(&prog, "z"), 1);
 }
 
 #[test]
@@ -261,7 +277,10 @@ fn string_source_accepts_std_imports() {
 }
 
 #[test]
-fn diamond_keeps_shared_module_once() {
+fn diamond_imports_share_one_module_identity() {
+    // Closes #88: two parents importing the same file produce one
+    // (deduped) set of mangled items, so `s.util` and `r.util` both
+    // resolve to the same fn under the same mangled name.
     let dir = tempfile::tempdir().unwrap();
     write(
         dir.path(),
@@ -288,15 +307,81 @@ fn main(x :: Int) -> Int { l.lhs(x) + r.rhs(x) }
     );
 
     let prog = load_program(&dir.path().join("main.lex")).expect("load");
-    let fns = fn_names(&prog);
-    // We accept duplication of `shared.util` under each parent's path
-    // for the MVP. The test documents current behavior:
-    // - `l.s.util` and `r.s.util` both appear.
-    // (See follow-up tracker for store-native imports / SigId stability.)
-    let l_util = fns.iter().filter(|n| n == &"l.s.util").count();
-    let r_util = fns.iter().filter(|n| n == &"r.s.util").count();
-    assert_eq!(l_util, 1, "got fns: {fns:?}");
-    assert_eq!(r_util, 1, "got fns: {fns:?}");
+
+    // util appears exactly once under its mangled name (regardless of
+    // which parent's alias chain we'd have walked).
+    assert_eq!(
+        count_with_suffix(&prog, "util"),
+        1,
+        "shared.util should appear once after dedupe; got fns: {:?}",
+        fn_names(&prog),
+    );
+
+    // Both lhs and rhs call sites resolve to that same name.
+    let util = unique_fn(&prog, "util");
+    let lhs = unique_fn(&prog, "lhs");
+    let rhs = unique_fn(&prog, "rhs");
+
+    fn callee_name(body: &Block) -> &str {
+        if let Expr::Call { callee, .. } = &*body.result {
+            if let Expr::Var(name) = &**callee {
+                return name;
+            }
+        }
+        panic!("body result not a Call(Var): {:?}", body.result);
+    }
+    assert_eq!(callee_name(&lhs.body), util.name);
+    assert_eq!(callee_name(&rhs.body), util.name);
+}
+
+#[test]
+fn diamond_with_imported_type_unifies_across_branches() {
+    // The user's repro from #88: scorer builds Report, verdict
+    // consumes Report, both reach Report via different aliases.
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "models.lex", "type Report = { score :: Int }\n");
+    write(
+        dir.path(),
+        "scorer.lex",
+        "import \"./models\" as m\nfn build_report(s :: Int) -> m.Report { { score: s } }\n",
+    );
+    write(
+        dir.path(),
+        "verdict.lex",
+        "import \"./models\" as m\nfn read_score(r :: m.Report) -> Int { r.score }\n",
+    );
+    write(
+        dir.path(),
+        "main.lex",
+        r#"import "./scorer" as s
+import "./verdict" as v
+
+fn main() -> Int {
+  let r := s.build_report(7)
+  v.read_score(r)
+}
+"#,
+    );
+
+    let prog = load_program(&dir.path().join("main.lex")).expect("load");
+
+    // The build_report and read_score signatures should reference the
+    // same mangled `Report` name, so a downstream type-check unifies.
+    let builder = unique_fn(&prog, "build_report");
+    let reader = unique_fn(&prog, "read_score");
+
+    let builder_ret = match &builder.return_type {
+        TypeExpr::Named { name, .. } => name.clone(),
+        other => panic!("expected Named return type, got {other:?}"),
+    };
+    let reader_param = match &reader.params[0].ty {
+        TypeExpr::Named { name, .. } => name.clone(),
+        other => panic!("expected Named param type, got {other:?}"),
+    };
+    assert_eq!(
+        builder_ret, reader_param,
+        "diamond branches should resolve to the same nominal type",
+    );
 }
 
 #[test]
@@ -326,19 +411,11 @@ fn main(s :: Str) -> [io] Nil { h.say(s) }
             _ => None,
         })
         .collect();
-    // The std.io import should appear exactly once, even though both
-    // files would have included it.
     assert_eq!(std_imports.len(), 1, "got: {std_imports:?}");
     assert_eq!(std_imports[0].reference, "std.io");
-    // io.print inside h.say should NOT have been rewritten.
-    let say = prog
-        .items
-        .iter()
-        .find_map(|i| match i {
-            Item::FnDecl(fd) if fd.name == "h.say" => Some(fd),
-            _ => None,
-        })
-        .expect("h.say present");
+
+    // io.print inside say should NOT have been rewritten.
+    let say = unique_fn(&prog, "say");
     if let Expr::Call { callee, .. } = &*say.body.result {
         if let Expr::Field { value, field } = &**callee {
             if let Expr::Var(alias) = &**value {
@@ -348,5 +425,5 @@ fn main(s :: Str) -> [io] Nil { h.say(s) }
             }
         }
     }
-    panic!("h.say body not preserving io.print: {:?}", say.body.result);
+    panic!("say body not preserving io.print: {:?}", say.body.result);
 }
