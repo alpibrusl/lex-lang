@@ -14,6 +14,9 @@ pub fn try_pure_builtin(kind: &str, op: &str, args: &[Value]) -> Option<Result<V
     // module; let the handler dispatch it under the `[random]` effect
     // kind instead of the pure-builtin bypass.
     if (kind, op) == ("crypto", "random") { return None; }
+    // Same shape: `datetime.now` is the only effectful op in
+    // `std.datetime` (all the parse/format/arithmetic ops are pure).
+    if (kind, op) == ("datetime", "now") { return None; }
     Some(dispatch(kind, op, args))
 }
 
@@ -22,7 +25,7 @@ pub fn try_pure_builtin(kind: &str, op: &str, args: &[Value]) -> Option<Result<V
 pub fn is_pure_module(kind: &str) -> bool {
     matches!(kind, "str" | "int" | "float" | "bool" | "list"
         | "option" | "result" | "tuple" | "json" | "bytes" | "flow" | "math"
-        | "map" | "set" | "crypto" | "regex" | "deque")
+        | "map" | "set" | "crypto" | "regex" | "deque" | "datetime")
 }
 
 fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
@@ -738,6 +741,81 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let re = get_or_compile_regex(&pat).map_err(|e| format!("regex.replace_all: {e}"))?;
             Ok(Value::Str(re.replace_all(&s, rep.as_str()).into_owned()))
         }
+        // -- datetime (pure ops; datetime.now is effectful and routes
+        // through the handler under [time]) --
+        ("datetime", "parse_iso") => {
+            let s = expect_str(args.first())?;
+            match chrono::DateTime::parse_from_rfc3339(&s) {
+                Ok(dt) => Ok(ok_v(Value::Int(instant_from_chrono(dt)))),
+                Err(e) => Ok(err_v(Value::Str(format!("parse_iso: {e}")))),
+            }
+        }
+        ("datetime", "format_iso") => {
+            let n = expect_int(args.first())?;
+            Ok(Value::Str(format_iso(n)))
+        }
+        ("datetime", "parse") => {
+            let s = expect_str(args.first())?;
+            let fmt = expect_str(args.get(1))?;
+            match chrono::NaiveDateTime::parse_from_str(&s, &fmt) {
+                Ok(naive) => {
+                    use chrono::TimeZone;
+                    match chrono::Utc.from_local_datetime(&naive).single() {
+                        Some(dt) => Ok(ok_v(Value::Int(instant_from_chrono(dt)))),
+                        None => Ok(err_v(Value::Str("parse: ambiguous local time".into()))),
+                    }
+                }
+                Err(e) => Ok(err_v(Value::Str(format!("parse: {e}")))),
+            }
+        }
+        ("datetime", "format") => {
+            let n = expect_int(args.first())?;
+            let fmt = expect_str(args.get(1))?;
+            let dt = chrono_from_instant(n);
+            Ok(Value::Str(dt.format(&fmt).to_string()))
+        }
+        ("datetime", "to_components") => {
+            let n = expect_int(args.first())?;
+            let tz_name = expect_str(args.get(1))?;
+            match resolve_tz_to_components(n, &tz_name) {
+                Ok(rec) => Ok(ok_v(rec)),
+                Err(e) => Ok(err_v(Value::Str(e))),
+            }
+        }
+        ("datetime", "from_components") => {
+            let rec = match args.first() {
+                Some(Value::Record(r)) => r.clone(),
+                _ => return Err("from_components: expected DateTime record".into()),
+            };
+            match instant_from_components(&rec) {
+                Ok(n) => Ok(ok_v(Value::Int(n))),
+                Err(e) => Ok(err_v(Value::Str(e))),
+            }
+        }
+        ("datetime", "add") => {
+            let a = expect_int(args.first())?;
+            let d = expect_int(args.get(1))?;
+            Ok(Value::Int(a.saturating_add(d)))
+        }
+        ("datetime", "diff") => {
+            let a = expect_int(args.first())?;
+            let b = expect_int(args.get(1))?;
+            Ok(Value::Int(a.saturating_sub(b)))
+        }
+        ("datetime", "duration_seconds") => {
+            let s = expect_float(args.first())?;
+            let nanos = (s * 1_000_000_000.0) as i64;
+            Ok(Value::Int(nanos))
+        }
+        ("datetime", "duration_minutes") => {
+            let m = expect_int(args.first())?;
+            Ok(Value::Int(m.saturating_mul(60_000_000_000)))
+        }
+        ("datetime", "duration_days") => {
+            let d = expect_int(args.first())?;
+            Ok(Value::Int(d.saturating_mul(86_400_000_000_000)))
+        }
+
         ("regex", "split") => {
             let pat = expect_str(args.first())?;
             let s = expect_str(args.get(1))?;
@@ -916,3 +994,118 @@ fn err_v(v: Value) -> Value { Value::Variant { name: "Err".into(), args: vec![v]
 fn value_to_json(v: &Value) -> serde_json::Value { v.to_json() }
 
 fn json_to_value(v: &serde_json::Value) -> Value { Value::from_json(v) }
+
+// -- datetime helpers (Instant ↔ chrono::DateTime<Utc>) --
+
+/// Convert a `chrono::DateTime` (any `TimeZone`) into a Lex `Instant`,
+/// represented as nanoseconds since the UTC unix epoch. Saturates on
+/// out-of-range timestamps so the runtime never panics.
+fn instant_from_chrono<Tz: chrono::TimeZone>(dt: chrono::DateTime<Tz>) -> i64 {
+    dt.timestamp_nanos_opt().unwrap_or(i64::MAX)
+}
+
+fn chrono_from_instant(n: i64) -> chrono::DateTime<chrono::Utc> {
+    let secs = n.div_euclid(1_000_000_000);
+    let nanos = n.rem_euclid(1_000_000_000) as u32;
+    use chrono::TimeZone;
+    chrono::Utc
+        .timestamp_opt(secs, nanos)
+        .single()
+        .unwrap_or_else(chrono::Utc::now)
+}
+
+fn format_iso(n: i64) -> String {
+    chrono_from_instant(n).to_rfc3339()
+}
+
+/// Materialize the `DateTime` record from an Instant under the named
+/// timezone. `tz_name` accepts:
+///   - "UTC"
+///   - "Local"
+///   - an IANA name like "America/New_York"
+///   - a fixed offset like "+05:30" or "-08:00"
+fn resolve_tz_to_components(n: i64, tz_name: &str) -> Result<Value, String> {
+    use chrono::{TimeZone, Datelike, Timelike, Offset};
+    let utc_dt = chrono_from_instant(n);
+    let (y, m, d, hh, mm, ss, ns, off_min) = match tz_name {
+        "UTC" => {
+            let d = utc_dt;
+            (d.year(), d.month() as i32, d.day() as i32,
+             d.hour() as i32, d.minute() as i32, d.second() as i32,
+             d.nanosecond() as i32, 0)
+        }
+        "Local" => {
+            let d = utc_dt.with_timezone(&chrono::Local);
+            let off = d.offset().fix().local_minus_utc() / 60;
+            (d.year(), d.month() as i32, d.day() as i32,
+             d.hour() as i32, d.minute() as i32, d.second() as i32,
+             d.nanosecond() as i32, off)
+        }
+        name if name.starts_with('+') || name.starts_with('-') => {
+            // Fixed offset like "+05:30" / "-08:00".
+            let off_secs = parse_fixed_offset(name)
+                .ok_or_else(|| format!("to_components: bad offset `{name}`"))?;
+            let fixed = chrono::FixedOffset::east_opt(off_secs)
+                .ok_or("to_components: offset out of range")?;
+            let d = utc_dt.with_timezone(&fixed);
+            (d.year(), d.month() as i32, d.day() as i32,
+             d.hour() as i32, d.minute() as i32, d.second() as i32,
+             d.nanosecond() as i32, off_secs / 60)
+        }
+        iana => {
+            let tz: chrono_tz::Tz = iana.parse()
+                .map_err(|e| format!("to_components: unknown timezone `{iana}`: {e}"))?;
+            let d = utc_dt.with_timezone(&tz);
+            let off = d.offset().fix().local_minus_utc() / 60;
+            (d.year(), d.month() as i32, d.day() as i32,
+             d.hour() as i32, d.minute() as i32, d.second() as i32,
+             d.nanosecond() as i32, off)
+        }
+    };
+    let mut rec = indexmap::IndexMap::new();
+    rec.insert("year".into(),    Value::Int(y as i64));
+    rec.insert("month".into(),   Value::Int(m as i64));
+    rec.insert("day".into(),     Value::Int(d as i64));
+    rec.insert("hour".into(),    Value::Int(hh as i64));
+    rec.insert("minute".into(),  Value::Int(mm as i64));
+    rec.insert("second".into(),  Value::Int(ss as i64));
+    rec.insert("nano".into(),    Value::Int(ns as i64));
+    rec.insert("tz_offset_minutes".into(), Value::Int(off_min as i64));
+    let _ = chrono::Utc.timestamp_opt(0, 0); // touch TimeZone to suppress unused-import lint paths
+    Ok(Value::Record(rec))
+}
+
+fn parse_fixed_offset(s: &str) -> Option<i32> {
+    let sign: i32 = if s.starts_with('+') { 1 } else { -1 };
+    let rest = &s[1..];
+    let (h, m) = rest.split_once(':')?;
+    let h: i32 = h.parse().ok()?;
+    let m: i32 = m.parse().ok()?;
+    Some(sign * (h * 3600 + m * 60))
+}
+
+fn instant_from_components(rec: &indexmap::IndexMap<String, Value>) -> Result<i64, String> {
+    use chrono::TimeZone;
+    fn get_int(rec: &indexmap::IndexMap<String, Value>, k: &str) -> Result<i64, String> {
+        match rec.get(k) {
+            Some(Value::Int(n)) => Ok(*n),
+            other => Err(format!("from_components: missing or non-int field `{k}`: {other:?}")),
+        }
+    }
+    let y = get_int(rec, "year")? as i32;
+    let m = get_int(rec, "month")? as u32;
+    let d = get_int(rec, "day")? as u32;
+    let hh = get_int(rec, "hour")? as u32;
+    let mm = get_int(rec, "minute")? as u32;
+    let ss = get_int(rec, "second")? as u32;
+    let ns = get_int(rec, "nano")? as u32;
+    let off_min = get_int(rec, "tz_offset_minutes")? as i32;
+    let off = chrono::FixedOffset::east_opt(off_min * 60)
+        .ok_or("from_components: offset out of range")?;
+    let dt = off
+        .with_ymd_and_hms(y, m, d, hh, mm, ss)
+        .single()
+        .ok_or("from_components: invalid or ambiguous date/time")?;
+    let dt = dt + chrono::Duration::nanoseconds(ns as i64);
+    Ok(instant_from_chrono(dt))
+}

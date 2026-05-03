@@ -687,6 +687,55 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 Ty::List(Box::new(Ty::Var(0)))));
             Some(Ty::Record(fields))
         }
+        "datetime" => {
+            // Instant and Duration are nominal opaque Ints under the
+            // hood (nanoseconds-since-UTC-epoch and signed nanoseconds
+            // respectively); the type checker tracks the distinction
+            // even though both values look like Int at runtime. Tz is
+            // a Str — "UTC", "Local", an IANA name like
+            // "America/New_York", or a fixed-offset like "+05:30".
+            let inst   = || Ty::Con("Instant".into(), vec![]);
+            let dur    = || Ty::Con("Duration".into(), vec![]);
+            let result_str = |t: Ty| Ty::Con("Result".into(), vec![t, Ty::str()]);
+            let dt_t = || {
+                let mut fs = IndexMap::new();
+                fs.insert("year".into(),    Ty::int());
+                fs.insert("month".into(),   Ty::int());
+                fs.insert("day".into(),     Ty::int());
+                fs.insert("hour".into(),    Ty::int());
+                fs.insert("minute".into(),  Ty::int());
+                fs.insert("second".into(),  Ty::int());
+                fs.insert("nano".into(),    Ty::int());
+                fs.insert("tz_offset_minutes".into(), Ty::int());
+                Ty::Record(fs)
+            };
+            let mut fields = IndexMap::new();
+            fields.insert("now".into(), Ty::function(
+                vec![], EffectSet::singleton("time"), inst()));
+            fields.insert("parse_iso".into(), Ty::function(
+                vec![Ty::str()], EffectSet::empty(), result_str(inst())));
+            fields.insert("format_iso".into(), Ty::function(
+                vec![inst()], EffectSet::empty(), Ty::str()));
+            fields.insert("parse".into(), Ty::function(
+                vec![Ty::str(), Ty::str()], EffectSet::empty(), result_str(inst())));
+            fields.insert("format".into(), Ty::function(
+                vec![inst(), Ty::str()], EffectSet::empty(), Ty::str()));
+            fields.insert("to_components".into(), Ty::function(
+                vec![inst(), Ty::str()], EffectSet::empty(), result_str(dt_t())));
+            fields.insert("from_components".into(), Ty::function(
+                vec![dt_t()], EffectSet::empty(), result_str(inst())));
+            fields.insert("add".into(), Ty::function(
+                vec![inst(), dur()], EffectSet::empty(), inst()));
+            fields.insert("diff".into(), Ty::function(
+                vec![inst(), inst()], EffectSet::empty(), dur()));
+            fields.insert("duration_seconds".into(), Ty::function(
+                vec![Ty::float()], EffectSet::empty(), dur()));
+            fields.insert("duration_minutes".into(), Ty::function(
+                vec![Ty::int()], EffectSet::empty(), dur()));
+            fields.insert("duration_days".into(), Ty::function(
+                vec![Ty::int()], EffectSet::empty(), dur()));
+            Some(Ty::Record(fields))
+        }
         "process" => {
             // Streaming subprocess. The opaque `ProcessHandle` type
             // is an Int handle into a process-wide registry holding
@@ -920,6 +969,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "kv" => "kv",
         "fs" => "fs",
         "process" => "process",
+        "datetime" => "datetime",
         _ => return None,
     })
 }
