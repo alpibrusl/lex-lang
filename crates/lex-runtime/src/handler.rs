@@ -534,6 +534,14 @@ impl EffectHandler for DefaultHandler {
         // declared effect kind is `random` (fine-grained on purpose so
         // `lex audit --effect random` flags every token-generating
         // call), distinct from the `crypto` module name.
+        // datetime.now is the only effectful op in std.datetime;
+        // declared kind is `time`, matching the existing `time.now`.
+        if kind == "datetime" && op == "now" {
+            self.ensure_kind_allowed("time")?;
+            let now = chrono::Utc::now();
+            let nanos = now.timestamp_nanos_opt().unwrap_or(i64::MAX);
+            return Ok(Value::Int(nanos));
+        }
         if kind == "crypto" && op == "random" {
             self.ensure_kind_allowed("random")?;
             let n = expect_int(args.first())?;
