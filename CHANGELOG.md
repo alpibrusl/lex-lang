@@ -9,6 +9,21 @@ bumps may carry breaking changes when justified).
 
 ### Added
 
+- **`std.flow.parallel_list[T](actions: List[() -> T]) -> List[T]`** —
+  variadic counterpart to `flow.parallel`. Runs each 0-arg closure
+  in input order and returns the results as a list. Sequential under
+  the hood (same caveat as `flow.parallel`); spec §11.2 reserves
+  true threading for a future scheduler. Compiled inline (mirroring
+  `list.map`) so closure args flow through `CallClosure` rather than
+  a heap-allocated trampoline. Unlike `parallel`, the result is the
+  list itself rather than a closure, since input arity is dynamic.
+  (#116, refs #105)
+- **`std.map.fold(m, init, fn (acc, k, v) -> acc')`** — three-arg
+  left fold over `Map[K, V]` entries. Iteration order matches
+  `map.entries` (BTreeMap-sorted by key). Effect-polymorphic on the
+  combiner like `list.fold`. Compiled inline; materializes the entry
+  list once via the existing `("map", "entries")` runtime op, then
+  runs the same loop as `list.fold`. (#118, closes item 1 of #115)
 - **Local file imports** between `.lex` modules
   (`import "./helpers" as h`, `../`, `/abs/`). Imported files'
   top-level fns and types are mangled with a stable per-file prefix
@@ -29,6 +44,51 @@ bumps may carry breaking changes when justified).
 
 ### Changed
 
+- **`std.datetime.to_components` now takes a typed `Tz` variant**
+  (breaking) — `Utc | Local | Offset(Int) | Iana(Str)` instead of
+  the prior stringly form (`"UTC"` / `"Local"` / IANA name /
+  `"+05:30"`). `Tz` is registered as a built-in nominal type so
+  users mention `Utc` / `Iana("America/New_York")` without an
+  import; a typo in `Utc` / `Local` is now caught at type-check
+  time rather than producing a runtime "unknown timezone" error.
+  Migration: `to_components(t, "UTC")` → `to_components(t, Utc)`;
+  `"+05:30"` → `Offset(330)` (minutes east of UTC). (#122, closes
+  item 6 of #115)
+- **`Value::Bytes` now round-trips through JSON via the `$bytes`
+  marker** (breaking on the wire). `to_json` emits
+  `{"$bytes": "deadbeef"}` instead of a bare lowercase-hex string,
+  mirroring the existing `$variant` / `$f64_array` shapes;
+  `from_json` decodes the marker back to `Value::Bytes`. Bare
+  strings continue to decode as `Value::Str`, so user strings that
+  happen to be valid hex aren't reclassified. Malformed marker
+  objects (odd-length hex, non-hex chars, extra keys) fall through
+  to the `Record` decode. (#117, closes item 5 of #115)
+- **`std.kv` registry is now LRU-bounded.** Capped at 256 open
+  handles with FIFO eviction; long-running programs that opened
+  many short-lived stores no longer leak `sled::Db` instances. Any
+  `kv.{get,put,delete,contains,list_prefix}` touches the LRU
+  order; `kv.open` past the cap drops the least-recently-used
+  entry. Evicted handles return the standard "closed or unknown
+  Kv handle" error on subsequent ops. (#119, closes item 3 of
+  #115)
+- **`std.process` registry now uses per-handle locks + bounded
+  GC.** Each `ProcessState` is wrapped in `Arc<Mutex<…>>`, so the
+  global registry mutex is held only briefly during dispatch
+  lookup; reads / waits on different handles no longer block each
+  other. Capped at 256 entries with LRU eviction.
+  `process.wait` removes its entry on completion since the handle
+  is terminal once the child exits — calling
+  `read_stdout_line(h)` after `wait(h)` now returns the closed-
+  handle error rather than draining buffered output. (#120,
+  closes item 2 of #115)
+- **`bench/REPORT.md` regeneration is now opt-in.** The
+  `agent_sandbox_benchmark` test wrote the report as a side
+  effect on every `cargo test --workspace`, so the file diff
+  bled into unrelated PR branches. Gate the write behind
+  `BENCH_WRITE_REPORT=1`; the test still runs and assertions
+  still execute, only the file emission is opt-in. Regenerate
+  with `BENCH_WRITE_REPORT=1 cargo test -p lex-cli --test
+  agent_sandbox_bench`. (#121)
 - **Diamond imports collapse to one nominal identity per file.**
   The loader's mangling key is now the canonical filesystem path
   (`<stem>_<8hex of sha256>`) rather than the alias chain, and the
