@@ -169,6 +169,7 @@ impl Parser {
         let mut out = Vec::new();
         out.push(self.expect_ident("in identifier list")?);
         while self.eat(&TokenKind::Comma) {
+            if matches!(self.peek_skip_newlines(), Some(TokenKind::RBracket)) { break; }
             out.push(self.expect_ident("in identifier list")?);
         }
         Ok(out)
@@ -221,6 +222,7 @@ impl Parser {
                     let mut args = Vec::new();
                     args.push(self.parse_type_expr()?);
                     while self.eat(&TokenKind::Comma) {
+                        if matches!(self.peek_skip_newlines(), Some(TokenKind::RBracket)) { break; }
                         args.push(self.parse_type_expr()?);
                     }
                     self.expect(&TokenKind::RBracket, "after type args")?;
@@ -232,6 +234,7 @@ impl Parser {
                     if !matches!(self.peek_skip_newlines(), Some(TokenKind::RParen)) {
                         args.push(self.parse_type_expr()?);
                         while self.eat(&TokenKind::Comma) {
+                            if matches!(self.peek_skip_newlines(), Some(TokenKind::RParen)) { break; }
                             args.push(self.parse_type_expr()?);
                         }
                     }
@@ -271,6 +274,7 @@ impl Parser {
         if !matches!(self.peek_skip_newlines(), Some(TokenKind::RParen)) {
             args.push(self.parse_type_expr()?);
             while self.eat(&TokenKind::Comma) {
+                if matches!(self.peek_skip_newlines(), Some(TokenKind::RParen)) { break; }
                 args.push(self.parse_type_expr()?);
             }
         }
@@ -309,6 +313,7 @@ impl Parser {
         if !matches!(self.peek_skip_newlines(), Some(TokenKind::RParen)) {
             params.push(self.parse_param()?);
             while self.eat(&TokenKind::Comma) {
+                if matches!(self.peek_skip_newlines(), Some(TokenKind::RParen)) { break; }
                 params.push(self.parse_param()?);
             }
         }
@@ -335,6 +340,7 @@ impl Parser {
         if !matches!(self.peek_skip_newlines(), Some(TokenKind::RBracket)) {
             out.push(self.parse_effect()?);
             while self.eat(&TokenKind::Comma) {
+                if matches!(self.peek_skip_newlines(), Some(TokenKind::RBracket)) { break; }
                 out.push(self.parse_effect()?);
             }
         }
@@ -505,6 +511,7 @@ impl Parser {
                     if !matches!(self.peek_skip_newlines(), Some(TokenKind::RParen)) {
                         args.push(self.parse_expr()?);
                         while self.eat(&TokenKind::Comma) {
+                            if matches!(self.peek_skip_newlines(), Some(TokenKind::RParen)) { break; }
                             args.push(self.parse_expr()?);
                         }
                     }
@@ -633,6 +640,7 @@ impl Parser {
         if !matches!(self.peek_skip_newlines(), Some(TokenKind::RParen)) {
             params.push(self.parse_param()?);
             while self.eat(&TokenKind::Comma) {
+                if matches!(self.peek_skip_newlines(), Some(TokenKind::RParen)) { break; }
                 params.push(self.parse_param()?);
             }
         }
@@ -718,6 +726,7 @@ impl Parser {
                     if !matches!(self.peek_skip_newlines(), Some(TokenKind::RParen)) {
                         args.push(self.parse_pattern()?);
                         while self.eat(&TokenKind::Comma) {
+                            if matches!(self.peek_skip_newlines(), Some(TokenKind::RParen)) { break; }
                             args.push(self.parse_pattern()?);
                         }
                     }
@@ -760,6 +769,7 @@ impl Parser {
         if !matches!(self.peek_skip_newlines(), Some(TokenKind::RParen)) {
             items.push(self.parse_pattern()?);
             while self.eat(&TokenKind::Comma) {
+                if matches!(self.peek_skip_newlines(), Some(TokenKind::RParen)) { break; }
                 items.push(self.parse_pattern()?);
             }
         }
