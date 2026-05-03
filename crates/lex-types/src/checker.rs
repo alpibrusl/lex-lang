@@ -681,7 +681,11 @@ impl Checker {
                 }
             }
             a::Pattern::PRecord { fields } => {
-                let resolved = self.u.resolve(ty);
+                // Unfold a record-aliased Con (`type Bands = { ... }`)
+                // so a structural `{ idea: pat, ... }` pattern can match
+                // a nominal-typed scrutinee, mirror of #79's literal
+                // coercion at every position.
+                let resolved = self.unfold_record_alias(self.u.resolve(ty));
                 let rec = match resolved {
                     Ty::Record(r) => r,
                     _ => return Err(TypeError::TypeMismatch {
