@@ -725,11 +725,18 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             // Instant and Duration are nominal opaque Ints under the
             // hood (nanoseconds-since-UTC-epoch and signed nanoseconds
             // respectively); the type checker tracks the distinction
-            // even though both values look like Int at runtime. Tz is
-            // a Str — "UTC", "Local", an IANA name like
-            // "America/New_York", or a fixed-offset like "+05:30".
+            // even though both values look like Int at runtime.
+            //
+            // Tz is the variant
+            //     Utc | Local | Offset(Int) | Iana(Str)
+            // registered as a built-in nominal type in
+            // `TypeEnv::new_with_builtins`. The pre-v1 stringly Tz
+            // ("UTC"/"Local"/IANA-name/"+05:30") is no longer accepted
+            // — passing a `Str` to `to_components` is now a type
+            // error.
             let inst   = || Ty::Con("Instant".into(), vec![]);
             let dur    = || Ty::Con("Duration".into(), vec![]);
+            let tz     = || Ty::Con("Tz".into(), vec![]);
             let result_str = |t: Ty| Ty::Con("Result".into(), vec![t, Ty::str()]);
             let dt_t = || {
                 let mut fs = IndexMap::new();
@@ -755,7 +762,7 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             fields.insert("format".into(), Ty::function(
                 vec![inst(), Ty::str()], EffectSet::empty(), Ty::str()));
             fields.insert("to_components".into(), Ty::function(
-                vec![inst(), Ty::str()], EffectSet::empty(), result_str(dt_t())));
+                vec![inst(), tz()], EffectSet::empty(), result_str(dt_t())));
             fields.insert("from_components".into(), Ty::function(
                 vec![dt_t()], EffectSet::empty(), result_str(inst())));
             fields.insert("add".into(), Ty::function(
