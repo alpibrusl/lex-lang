@@ -3,7 +3,8 @@
 //! without policy gates (they have no observable side effects).
 
 use lex_bytecode::{MapKey, Value};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Mutex, OnceLock};
 
 /// Returns Some(...) if `(kind, op)` names a known pure builtin.
 /// `None` means "not handled here; fall through to effect dispatch".
@@ -21,7 +22,7 @@ pub fn try_pure_builtin(kind: &str, op: &str, args: &[Value]) -> Option<Result<V
 pub fn is_pure_module(kind: &str) -> bool {
     matches!(kind, "str" | "int" | "float" | "bool" | "list"
         | "option" | "result" | "tuple" | "json" | "bytes" | "flow" | "math"
-        | "map" | "set" | "crypto")
+        | "map" | "set" | "crypto" | "regex")
 }
 
 fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
@@ -598,8 +599,110 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             Ok(Value::Bool(eq))
         }
 
+        // -- regex (the compiled `Regex` is stored as the pattern
+        // string; the runtime caches the actual `regex::Regex` so
+        // ops don't re-compile on every call) --
+        ("regex", "compile") => {
+            let pat = expect_str(args.first())?;
+            match get_or_compile_regex(&pat) {
+                Ok(_) => Ok(ok_v(Value::Str(pat))),
+                Err(e) => Ok(err_v(Value::Str(e))),
+            }
+        }
+        ("regex", "is_match") => {
+            let pat = expect_str(args.first())?;
+            let s = expect_str(args.get(1))?;
+            let re = get_or_compile_regex(&pat).map_err(|e| format!("regex.is_match: {e}"))?;
+            Ok(Value::Bool(re.is_match(&s)))
+        }
+        ("regex", "find") => {
+            let pat = expect_str(args.first())?;
+            let s = expect_str(args.get(1))?;
+            let re = get_or_compile_regex(&pat).map_err(|e| format!("regex.find: {e}"))?;
+            match re.captures(&s) {
+                Some(caps) => Ok(Value::Variant {
+                    name: "Some".into(),
+                    args: vec![match_value(&caps)],
+                }),
+                None => Ok(Value::Variant { name: "None".into(), args: vec![] }),
+            }
+        }
+        ("regex", "find_all") => {
+            let pat = expect_str(args.first())?;
+            let s = expect_str(args.get(1))?;
+            let re = get_or_compile_regex(&pat).map_err(|e| format!("regex.find_all: {e}"))?;
+            let items: Vec<Value> = re.captures_iter(&s).map(|caps| match_value(&caps)).collect();
+            Ok(Value::List(items))
+        }
+        ("regex", "replace") => {
+            let pat = expect_str(args.first())?;
+            let s = expect_str(args.get(1))?;
+            let rep = expect_str(args.get(2))?;
+            let re = get_or_compile_regex(&pat).map_err(|e| format!("regex.replace: {e}"))?;
+            Ok(Value::Str(re.replace(&s, rep.as_str()).into_owned()))
+        }
+        ("regex", "replace_all") => {
+            let pat = expect_str(args.first())?;
+            let s = expect_str(args.get(1))?;
+            let rep = expect_str(args.get(2))?;
+            let re = get_or_compile_regex(&pat).map_err(|e| format!("regex.replace_all: {e}"))?;
+            Ok(Value::Str(re.replace_all(&s, rep.as_str()).into_owned()))
+        }
+        ("regex", "split") => {
+            let pat = expect_str(args.first())?;
+            let s = expect_str(args.get(1))?;
+            let re = get_or_compile_regex(&pat).map_err(|e| format!("regex.split: {e}"))?;
+            let parts: Vec<Value> = re.split(&s).map(|p| Value::Str(p.to_string())).collect();
+            Ok(Value::List(parts))
+        }
+
         _ => Err(format!("unknown pure builtin: {kind}.{op}")),
     }
+}
+
+/// Process-wide cache of compiled regexes, keyed by the pattern
+/// string. Compilation is the only cost we want to amortize; matching
+/// the same `Regex` from multiple threads is safe (`regex::Regex` is
+/// `Send + Sync`).
+fn regex_cache() -> &'static Mutex<HashMap<String, regex::Regex>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, regex::Regex>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn get_or_compile_regex(pattern: &str) -> Result<regex::Regex, String> {
+    let cache = regex_cache();
+    {
+        let guard = cache.lock().unwrap();
+        if let Some(re) = guard.get(pattern) {
+            return Ok(re.clone());
+        }
+    }
+    let re = regex::Regex::new(pattern).map_err(|e| format!("invalid regex: {e}"))?;
+    let mut guard = cache.lock().unwrap();
+    guard.insert(pattern.to_string(), re.clone());
+    Ok(re)
+}
+
+/// Build a `Match` record value: `{ text, start, end, groups }` where
+/// `groups` is the captured groups in order (group 0 is the full match).
+/// Missing optional groups become empty strings.
+fn match_value(caps: &regex::Captures) -> Value {
+    let m0 = caps.get(0).expect("regex match always has group 0");
+    let mut rec = indexmap::IndexMap::new();
+    rec.insert("text".into(), Value::Str(m0.as_str().to_string()));
+    rec.insert("start".into(), Value::Int(m0.start() as i64));
+    rec.insert("end".into(), Value::Int(m0.end() as i64));
+    let groups: Vec<Value> = (1..caps.len())
+        .map(|i| {
+            Value::Str(
+                caps.get(i)
+                    .map(|m| m.as_str().to_string())
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+    rec.insert("groups".into(), Value::List(groups));
+    Value::Record(rec)
 }
 
 fn expect_map(v: Option<&Value>) -> Result<&BTreeMap<MapKey, Value>, String> {
