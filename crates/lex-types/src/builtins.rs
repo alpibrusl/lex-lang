@@ -687,6 +687,65 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 Ty::List(Box::new(Ty::Var(0)))));
             Some(Ty::Record(fields))
         }
+        "process" => {
+            // Streaming subprocess. The opaque `ProcessHandle` type
+            // is an Int handle into a process-wide registry holding
+            // the `Child` plus its stdout/stderr `BufReader`s.
+            let ph = || Ty::Con("ProcessHandle".into(), vec![]);
+            let result_str = |t: Ty| Ty::Con("Result".into(), vec![t, Ty::str()]);
+            let opts_t = || {
+                let mut fs = IndexMap::new();
+                fs.insert("cwd".into(),
+                    Ty::Con("Option".into(), vec![Ty::str()]));
+                fs.insert("env".into(),
+                    Ty::Con("Map".into(), vec![Ty::str(), Ty::str()]));
+                fs.insert("stdin".into(),
+                    Ty::Con("Option".into(), vec![Ty::bytes()]));
+                Ty::Record(fs)
+            };
+            let exit_t = || {
+                let mut fs = IndexMap::new();
+                fs.insert("code".into(), Ty::int());
+                fs.insert("signaled".into(), Ty::bool());
+                Ty::Record(fs)
+            };
+            let output_t = || {
+                let mut fs = IndexMap::new();
+                fs.insert("stdout".into(), Ty::str());
+                fs.insert("stderr".into(), Ty::str());
+                fs.insert("exit_code".into(), Ty::int());
+                Ty::Record(fs)
+            };
+            let mut fields = IndexMap::new();
+            // spawn :: Str, List[Str], Opts -> [proc] Result[ProcessHandle, Str]
+            fields.insert("spawn".into(), Ty::function(
+                vec![Ty::str(), Ty::List(Box::new(Ty::str())), opts_t()],
+                EffectSet::singleton("proc"),
+                result_str(ph())));
+            // read_stdout_line / read_stderr_line :: ProcessHandle -> [proc] Option[Str]
+            for n in &["read_stdout_line", "read_stderr_line"] {
+                fields.insert((*n).into(), Ty::function(
+                    vec![ph()], EffectSet::singleton("proc"),
+                    Ty::Con("Option".into(), vec![Ty::str()])));
+            }
+            // wait :: ProcessHandle -> [proc] ProcessExit
+            fields.insert("wait".into(), Ty::function(
+                vec![ph()], EffectSet::singleton("proc"), exit_t()));
+            // kill :: ProcessHandle, Str -> [proc] Result[Nil, Str]
+            fields.insert("kill".into(), Ty::function(
+                vec![ph(), Ty::str()],
+                EffectSet::singleton("proc"),
+                result_str(Ty::Unit)));
+            // run :: Str, List[Str] -> [proc] Result[ProcessOutput, Str]
+            // Blocking convenience that captures stdout/stderr fully
+            // and returns once the child exits. For programs that
+            // need streaming, use spawn + read_*_line + wait.
+            fields.insert("run".into(), Ty::function(
+                vec![Ty::str(), Ty::List(Box::new(Ty::str()))],
+                EffectSet::singleton("proc"),
+                result_str(output_t())));
+            Some(Ty::Record(fields))
+        }
         "fs" => {
             // Filesystem walk + mutate. Walk-style ops (exists, walk,
             // glob, …) declare [fs_walk] — distinct from [fs_read]
@@ -860,6 +919,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "deque" => "deque",
         "kv" => "kv",
         "fs" => "fs",
+        "process" => "process",
         _ => return None,
     })
 }
