@@ -6,7 +6,7 @@
 //! addressing guarantees the bytes match).
 
 use crate::operation::{OpId, OperationRecord};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -26,6 +26,17 @@ impl OpLog {
         self.dir.join(format!("{op_id}.json"))
     }
 
+    /// Persist a record. Idempotent on existing op_ids (the bytes
+    /// must match by content addressing).
+    ///
+    /// Crash safety: the tempfile's data is fsync'd before rename,
+    /// so a successful return implies a durable file at the final
+    /// path. The containing directory is not fsync'd; on a crash
+    /// between rename and the directory's metadata flush, the file
+    /// can be lost. For a content-addressed log this is acceptable
+    /// — a lost record can be re-derived from the same source — but
+    /// callers that *also* persist references to the op_id (e.g.
+    /// branch heads) should fsync those refs after `put` returns.
     pub fn put(&self, rec: &OperationRecord) -> io::Result<()> {
         let path = self.path(&rec.op_id);
         if path.exists() {
@@ -61,8 +72,8 @@ impl OpLog {
     ) -> io::Result<Vec<OperationRecord>> {
         let mut out = Vec::new();
         let mut seen = BTreeSet::new();
-        let mut frontier = vec![head.clone()];
-        while let Some(id) = frontier.pop() {
+        let mut frontier: VecDeque<OpId> = VecDeque::from([head.clone()]);
+        while let Some(id) = frontier.pop_back() {
             if !seen.insert(id.clone()) {
                 continue;
             }
@@ -72,7 +83,7 @@ impl OpLog {
                 // parents, parents of those, etc.
                 for p in &rec.op.parents {
                     if !seen.contains(p) {
-                        frontier.insert(0, p.clone());
+                        frontier.push_front(p.clone());
                     }
                 }
                 out.push(rec);
@@ -101,17 +112,30 @@ impl OpLog {
         Ok(all)
     }
 
-    /// Lowest common ancestor of two op_ids in the DAG. None if no
-    /// shared ancestor exists.
+    /// Common ancestor of two op_ids in the DAG.
+    ///
+    /// On tree-shaped histories and chain merges this is the
+    /// **lowest** common ancestor — the closest shared op. On
+    /// criss-cross merges (two ops each with two parents from
+    /// independent histories) there can be multiple
+    /// incomparable common ancestors; this picks one
+    /// deterministically (the first hit when traversing `b`'s
+    /// ancestors newest-first), but not via a recursive merge.
+    /// `None` if no shared ancestor exists.
+    ///
+    /// Tier-1 merge in #129 covers linear and tree-shaped
+    /// histories; criss-cross resolution is deferred to a
+    /// future tier (Git's `recursive` strategy is the reference).
     pub fn lca(&self, a: &OpId, b: &OpId) -> io::Result<Option<OpId>> {
         let a_anc: BTreeSet<OpId> = self
             .walk_back(a, None)?
             .into_iter()
             .map(|r| r.op_id)
             .collect();
-        // Walk b's ancestors in newest-first order; first hit is the LCA
-        // (newest-first guarantees the deepest, i.e. lowest, ancestor
-        // common to both).
+        // Walk b's ancestors newest-first; first hit is the deepest
+        // common ancestor on tree-shaped histories. In criss-cross
+        // DAGs this picks deterministically but not via recursive
+        // resolution — see the doc comment above.
         for rec in self.walk_back(b, None)? {
             if a_anc.contains(&rec.op_id) {
                 return Ok(Some(rec.op_id));
@@ -148,7 +172,7 @@ impl OpLog {
 mod tests {
     use super::*;
     use crate::operation::{Operation, OperationKind, StageTransition};
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     fn add_op() -> OperationRecord {
         let op = Operation::new(
@@ -309,5 +333,59 @@ mod tests {
         assert!(since.contains(&b.op_id));
         assert!(since.contains(&c.op_id));
         assert!(!since.contains(&a.op_id));
+    }
+
+    #[test]
+    fn walk_back_orders_ancestors_after_descendants() {
+        // Build a small DAG with a merge:
+        //
+        //     a
+        //    / \
+        //   b   c
+        //    \ /
+        //     m  (merge with parents [b, c])
+        //
+        // The merge engine relies on the property that any ancestor of
+        // X appears strictly after X in the walk_back output. Pin it.
+        let tmp = tempfile::tempdir().unwrap();
+        let log = OpLog::open(tmp.path()).unwrap();
+        let a = add_op();
+        log.put(&a).unwrap();
+        let b = modify_op(&a.op_id, "fac::Int->Int", "abc123", "b1");
+        log.put(&b).unwrap();
+        let c = OperationRecord::new(
+            Operation::new(
+                OperationKind::ModifyBody {
+                    sig_id: "double::Int->Int".into(),
+                    from_stage_id: "ddd000".into(),
+                    to_stage_id: "c1".into(),
+                },
+                [a.op_id.clone()],
+            ),
+            StageTransition::Replace {
+                sig_id: "double::Int->Int".into(),
+                from: "ddd000".into(),
+                to: "c1".into(),
+            },
+        );
+        log.put(&c).unwrap();
+        let m = OperationRecord::new(
+            Operation::new(
+                OperationKind::Merge { resolved: 0 },
+                [b.op_id.clone(), c.op_id.clone()],
+            ),
+            StageTransition::Merge { entries: BTreeMap::new() },
+        );
+        log.put(&m).unwrap();
+
+        let walked = log.walk_back(&m.op_id, None).unwrap();
+        let pos = |id: &str| walked.iter().position(|r| r.op_id == id).unwrap();
+        let (m_pos, b_pos, c_pos, a_pos) =
+            (pos(&m.op_id), pos(&b.op_id), pos(&c.op_id), pos(&a.op_id));
+        // Each ancestor must appear strictly after its descendants.
+        assert!(m_pos < b_pos, "merge before its parent b");
+        assert!(m_pos < c_pos, "merge before its parent c");
+        assert!(b_pos < a_pos, "b before its parent a");
+        assert!(c_pos < a_pos, "c before its parent a");
     }
 }
