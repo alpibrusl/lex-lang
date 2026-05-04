@@ -144,6 +144,27 @@ impl OpLog {
         Ok(None)
     }
 
+    /// Every record in the log. Order is whatever the directory
+    /// listing produces — undefined and not stable. Used by the
+    /// [`crate::predicate`] evaluator when no narrower candidate
+    /// set is available.
+    pub fn list_all(&self) -> io::Result<Vec<OperationRecord>> {
+        let mut out = Vec::new();
+        for entry in fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            let name = match entry.file_name().into_string() {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if let Some(id) = name.strip_suffix(".json") {
+                if let Some(rec) = self.get(&id.to_string())? {
+                    out.push(rec);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Ops in `head`'s history that are not in `base`'s history.
     /// `base = None` means "include all of head's history" (used for
     /// independent-histories case where the LCA is None).
