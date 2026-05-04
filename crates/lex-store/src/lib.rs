@@ -29,6 +29,7 @@ mod store;
 mod model;
 mod branches;
 
+pub use lex_vcs::{OpId, Operation, OperationKind, OperationRecord, StageTransition};
 pub use model::{Lifecycle, Metadata, Spec, StageStatus, Test, Transition};
 pub use store::{StageHistoryEntry, Store, StoreError};
 pub use branches::{

@@ -1,74 +1,29 @@
-//! Snapshot branches (tier-1 of agent-native version control).
+//! Branches: each branch is identified by a name and a head OpId.
+//! The SigId → StageId map every consumer reads is computed by
+//! replaying the op log from the head back. No materialized cache.
 //!
-//! A branch is a named map `SigId → StageId`: which implementation of
-//! each signature is "live" on that branch. Branches sit alongside
-//! the existing lifecycle (`Active` / `Deprecated` / ...) — `main`
-//! is the default branch, and operations that don't explicitly name
-//! a branch operate on `main`. The legacy lifecycle remains the
-//! source of truth for `main`'s head (we materialize it on demand);
-//! other branches store their heads explicitly under
-//! `<root>/branches/<name>.json`.
-//!
-//! What's deferred (tracked for follow-up rounds):
-//!
-//! - **Commit history.** A branch is a current-state snapshot, not
-//!   a sequence of commits. `lex log` doesn't exist yet.
-//! - **Distributed sync.** No push/pull between stores.
-//! - **Identity / authorship.** Stages don't carry author metadata.
-//! - **Body-level merge.** The merge operation pairs SigIds and
-//!   reports conflicts when both sides changed; it doesn't yet do
-//!   intra-stage AST patching (that's `lex ast-merge`'s territory).
-//!
-//! What ships:
-//!
-//! - `Store::current_branch` / `set_current_branch`
-//! - `list_branches` / `get_branch` / `create_branch` / `delete_branch`
-//! - `branch_head` reads the live head map; for `main` it walks
-//!   lifecycle.json so existing stores work without migration.
-//! - `set_branch_head_entry` updates a single (SigId, StageId) pair.
-//! - `merge` performs a top-level merge of two branches against a
-//!   common ancestor (computed from `parent` chains); conflicts come
-//!   back as structured JSON.
-//!
-//! Persistence layout adds:
-//!
-//! ```text
-//! <root>/
-//! ├── branches/<name>.json   # { name, parent, head: {SigId: StageId}, created_at }
-//! └── current_branch         # plain text: branch name
-//! ```
+//! `lifecycle.json` (Draft/Active/Deprecated/Tombstone per stage)
+//! survives as orthogonal stage-status metadata; it no longer drives
+//! branch resolution.
 
 use crate::store::{Store, StoreError};
-use indexmap::IndexMap;
+use lex_vcs::{OpId, OpLog, StageTransition};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
-/// Default branch name when no `current_branch` file exists.
 pub const DEFAULT_BRANCH: &str = "main";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Branch {
     pub name: String,
-    /// Parent branch this one was forked from. `None` means
-    /// "no parent" — the root of the branch graph (typically `main`
-    /// itself, or a branch created in a fresh store).
     pub parent: Option<String>,
-    /// SigId → StageId map for stages that are live on this branch.
-    pub head: BTreeMap<String, String>,
-    /// Snapshot of the parent branch's head at fork time. Used as
-    /// the immutable common ancestor when this branch is merged.
-    /// Default `None` means "no fork-base recorded" — back-compat
-    /// for older branch files; merge falls through to current parent
-    /// head, which can produce false-clean results if the parent
-    /// has since moved. Branches created via `create_branch` always
-    /// have this populated.
+    /// Op DAG head. `None` means the branch has never had an op
+    /// applied (empty branch).
     #[serde(default)]
-    pub fork_base: Option<BTreeMap<String, String>>,
+    pub head_op: Option<OpId>,
     /// Append-only journal of merges committed *into* this branch.
-    /// Read by `Store::branch_log` / `lex log`. `#[serde(default)]`
-    /// for back-compat with branch files written before this field.
     #[serde(default)]
     pub merges: Vec<MergeRecord>,
     pub created_at: u64,
@@ -76,15 +31,9 @@ pub struct Branch {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MergeRecord {
-    /// The branch the merge pulled *from*.
     pub src: String,
-    /// Wall-clock seconds since the Unix epoch.
     pub at: u64,
-    /// Number of (SigId, StageId) entries the merge resolved cleanly.
     pub merged: usize,
-    /// Number of conflicts at merge-record time. Always 0 for a
-    /// committed merge (commit_merge refuses with conflicts), but
-    /// preserved here for symmetry and future "uncommitted" entries.
     pub conflicts: usize,
 }
 
@@ -101,12 +50,8 @@ pub struct MergeSummary {
     pub clean: usize,
     pub conflicts: usize,
     pub base: Option<String>,
-    /// The branch the merge was sourced from. Empty by default
-    /// (back-compat); populated by `Store::merge`. Used by
-    /// `commit_merge` to journal a `MergeRecord` on `dst`.
     #[serde(default)]
     pub src: String,
-    /// The destination branch.
     #[serde(default)]
     pub dst: String,
 }
@@ -115,19 +60,16 @@ pub struct MergeSummary {
 pub struct MergeEntry {
     pub sig_id: String,
     pub stage_id: String,
-    /// "base" / "src" / "dst" / "both" / "added-src" / "added-dst" /
-    /// "added-both".
-    pub from: &'static str,
+    pub from: &'static str, // "src" | "dst" | "both"
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MergeConflict {
     pub sig_id: String,
-    /// "modify-modify" / "modify-delete" / "delete-modify" / "add-add".
     pub kind: &'static str,
-    pub base:   Option<String>,
-    pub src:    Option<String>,
-    pub dst:    Option<String>,
+    pub base: Option<String>,
+    pub src: Option<String>,
+    pub dst: Option<String>,
 }
 
 impl Store {
@@ -147,8 +89,6 @@ impl Store {
     }
 
     pub fn set_current_branch(&self, name: &str) -> Result<(), StoreError> {
-        // Lazy materialization: looking up a non-existent branch by
-        // making it current is a useful error signal.
         if name != DEFAULT_BRANCH && self.get_branch(name)?.is_none() {
             return Err(StoreError::UnknownBranch(name.into()));
         }
@@ -181,30 +121,23 @@ impl Store {
         Ok(Some(b))
     }
 
-    /// Read a branch's head map. For `main`, materialize from the
-    /// legacy lifecycle.json files if no explicit branch file exists.
+    /// Computed view: walk the op log from the branch head and
+    /// replay each transition into a SigId → StageId map.
     pub fn branch_head(&self, name: &str) -> Result<BTreeMap<String, String>, StoreError> {
-        if let Some(b) = self.get_branch(name)? {
-            return Ok(b.head);
+        let b = match self.get_branch(name)? {
+            Some(b) => b,
+            None if name == DEFAULT_BRANCH => return Ok(BTreeMap::new()),
+            None => return Err(StoreError::UnknownBranch(name.into())),
+        };
+        let Some(head) = b.head_op else { return Ok(BTreeMap::new()); };
+        let log = OpLog::open(self.root())?;
+        let mut map = BTreeMap::new();
+        for rec in log.walk_forward(&head, None)? {
+            apply_transition(&mut map, &rec.produces);
         }
-        if name == DEFAULT_BRANCH {
-            // Walk every SigId; for each, look up the current Active.
-            let mut head = BTreeMap::new();
-            for sig in self.list_sigs()? {
-                if let Some(stage) = self.resolve_sig(&sig)? {
-                    head.insert(sig, stage);
-                }
-            }
-            return Ok(head);
-        }
-        Err(StoreError::UnknownBranch(name.into()))
+        Ok(map)
     }
 
-    /// Read the journal of merges committed *into* `name`. Returns
-    /// the records in insertion order (oldest first). For `main`
-    /// without an explicit branch file, returns an empty Vec —
-    /// merges into main only get journaled once main has been
-    /// materialized via `set_branch_head_entry` or `commit_merge`.
     pub fn branch_log(&self, name: &str) -> Result<Vec<MergeRecord>, StoreError> {
         match self.get_branch(name)? {
             Some(b) => Ok(b.merges),
@@ -213,8 +146,7 @@ impl Store {
         }
     }
 
-    /// Snapshot the source branch's head into a new named branch.
-    /// Errors if the branch already exists. Sets `parent` to `from`.
+    /// Snapshot the source branch's head_op into a new named branch.
     pub fn create_branch(&self, name: &str, from: &str) -> Result<(), StoreError> {
         if name.is_empty() || name.contains('/') || name.contains('\\') {
             return Err(StoreError::InvalidTransition(
@@ -224,13 +156,12 @@ impl Store {
             return Err(StoreError::InvalidTransition(
                 format!("branch `{name}` already exists")));
         }
-        let head = self.branch_head(from)?;
+        let head_op = self.get_branch(from)?.and_then(|b| b.head_op);
         fs::create_dir_all(self.branches_dir())?;
         let b = Branch {
             name: name.into(),
             parent: Some(from.into()),
-            fork_base: Some(head.clone()),
-            head,
+            head_op,
             merges: Vec::new(),
             created_at: now(),
         };
@@ -255,269 +186,86 @@ impl Store {
         Ok(())
     }
 
-    /// Update one (SigId → StageId) entry on a named branch. For
-    /// `main`, this materializes the lazy head into an explicit
-    /// branch file before overwriting the entry, so subsequent
-    /// reads see the override.
-    pub fn set_branch_head_entry(
+    /// Atomically set a branch's `head_op`. Used by `apply_operation`
+    /// after a successful op apply. Materializes `main`'s branch file
+    /// on first call (creates `branches/main.json`).
+    // Called by apply_operation in Task 5 (#129).
+    #[allow(dead_code)]
+    pub(crate) fn set_branch_head_op(
         &self,
         name: &str,
-        sig: &str,
-        stage: &str,
+        head_op: OpId,
     ) -> Result<(), StoreError> {
         let mut b = match self.get_branch(name)? {
             Some(b) => b,
             None if name == DEFAULT_BRANCH => Branch {
                 name: DEFAULT_BRANCH.into(),
                 parent: None,
-                head: self.branch_head(DEFAULT_BRANCH)?,
-                fork_base: None,
+                head_op: None,
                 merges: Vec::new(),
                 created_at: now(),
             },
             None => return Err(StoreError::UnknownBranch(name.into())),
         };
-        b.head.insert(sig.to_string(), stage.to_string());
+        b.head_op = Some(head_op);
         fs::create_dir_all(self.branches_dir())?;
-        fs::write(self.branch_path(name), serde_json::to_string_pretty(&b)?)?;
+        write_branch_atomic(&self.branch_path(name), &b)?;
         Ok(())
-    }
-
-    /// Three-way merge of two branches; the common ancestor is
-    /// computed from the `parent` chain. If no common ancestor is
-    /// found, fall back to two-way (every divergence is a conflict).
-    /// Result is *not* committed automatically — callers inspect the
-    /// MergeReport, optionally resolve, and then write the merged
-    /// head themselves via `commit_merge`.
-    pub fn merge(&self, src: &str, dst: &str) -> Result<MergeReport, StoreError> {
-        let src_head = self.branch_head(src)?;
-        let dst_head = self.branch_head(dst)?;
-        let (base_head, base_name) = self.compute_merge_base(src, dst)?;
-
-        let mut report = MergeReport {
-            summary: MergeSummary {
-                base: base_name.clone(),
-                src: src.into(),
-                dst: dst.into(),
-                ..Default::default()
-            },
-            merged: Vec::new(),
-            conflicts: Vec::new(),
-        };
-        let names: std::collections::BTreeSet<&String> = base_head.keys()
-            .chain(src_head.keys()).chain(dst_head.keys()).collect();
-        for sig in &names {
-            let b = base_head.get(*sig);
-            let s = src_head.get(*sig);
-            let d = dst_head.get(*sig);
-            match (b, s, d) {
-                (Some(_), Some(s_id), Some(d_id)) => {
-                    if s_id == d_id {
-                        // Same on both sides — clean.
-                        let from = if Some(s_id) == b { "base" } else { "both" };
-                        report.merged.push(MergeEntry {
-                            sig_id: (*sig).clone(), stage_id: s_id.clone(), from,
-                        });
-                    } else if Some(s_id) == b {
-                        // Only dst diverged.
-                        report.merged.push(MergeEntry {
-                            sig_id: (*sig).clone(), stage_id: d_id.clone(), from: "dst",
-                        });
-                    } else if Some(d_id) == b {
-                        // Only src diverged.
-                        report.merged.push(MergeEntry {
-                            sig_id: (*sig).clone(), stage_id: s_id.clone(), from: "src",
-                        });
-                    } else {
-                        report.conflicts.push(MergeConflict {
-                            sig_id: (*sig).clone(),
-                            kind: "modify-modify",
-                            base: b.cloned(), src: Some(s_id.clone()), dst: Some(d_id.clone()),
-                        });
-                    }
-                }
-                (Some(b_id), Some(s_id), None) => {
-                    if s_id == b_id {
-                        // dst deleted, src unchanged → take dst's delete.
-                    } else {
-                        report.conflicts.push(MergeConflict {
-                            sig_id: (*sig).clone(),
-                            kind: "modify-delete",
-                            base: Some(b_id.clone()), src: Some(s_id.clone()), dst: None,
-                        });
-                    }
-                }
-                (Some(b_id), None, Some(d_id)) => {
-                    if d_id == b_id {
-                        // src deleted, dst unchanged → take src's delete.
-                    } else {
-                        report.conflicts.push(MergeConflict {
-                            sig_id: (*sig).clone(),
-                            kind: "delete-modify",
-                            base: Some(b_id.clone()), src: None, dst: Some(d_id.clone()),
-                        });
-                    }
-                }
-                (None, Some(s_id), Some(d_id)) => {
-                    if s_id == d_id {
-                        report.merged.push(MergeEntry {
-                            sig_id: (*sig).clone(), stage_id: s_id.clone(), from: "added-both",
-                        });
-                    } else {
-                        report.conflicts.push(MergeConflict {
-                            sig_id: (*sig).clone(),
-                            kind: "add-add",
-                            base: None, src: Some(s_id.clone()), dst: Some(d_id.clone()),
-                        });
-                    }
-                }
-                (None, Some(s_id), None) => report.merged.push(MergeEntry {
-                    sig_id: (*sig).clone(), stage_id: s_id.clone(), from: "added-src",
-                }),
-                (None, None, Some(d_id)) => report.merged.push(MergeEntry {
-                    sig_id: (*sig).clone(), stage_id: d_id.clone(), from: "added-dst",
-                }),
-                (Some(_), None, None) => {} // both deleted — clean removal
-                (None, None, None) => unreachable!(),
-            }
-        }
-        report.summary.clean = report.merged.len();
-        report.summary.conflicts = report.conflicts.len();
-        report.summary.total_sigs = report.merged.len() + report.conflicts.len();
-        Ok(report)
-    }
-
-    /// Apply a clean merge to `dst`. Refuses if any conflicts remain.
-    pub fn commit_merge(&self, dst: &str, report: &MergeReport) -> Result<(), StoreError> {
-        if !report.conflicts.is_empty() {
-            return Err(StoreError::InvalidTransition(format!(
-                "{} conflicts; resolve before committing", report.conflicts.len())));
-        }
-        let mut b = match self.get_branch(dst)? {
-            Some(b) => b,
-            None if dst == DEFAULT_BRANCH => Branch {
-                name: DEFAULT_BRANCH.into(),
-                parent: None,
-                head: self.branch_head(DEFAULT_BRANCH)?,
-                fork_base: None,
-                merges: Vec::new(),
-                created_at: now(),
-            },
-            None => return Err(StoreError::UnknownBranch(dst.into())),
-        };
-        // Replace head from report.merged.
-        let mut head = BTreeMap::new();
-        for m in &report.merged {
-            head.insert(m.sig_id.clone(), m.stage_id.clone());
-        }
-        b.head = head;
-        // Journal the merge so `lex log` can show it. `summary.src`
-        // is empty for the legacy `Store::merge` callers (pre-this
-        // field); skip the record in that case to avoid noise.
-        if !report.summary.src.is_empty() {
-            b.merges.push(MergeRecord {
-                src: report.summary.src.clone(),
-                at: now(),
-                merged: report.merged.len(),
-                conflicts: 0,
-            });
-        }
-        fs::create_dir_all(self.branches_dir())?;
-        fs::write(self.branch_path(dst), serde_json::to_string_pretty(&b)?)?;
-        Ok(())
-    }
-
-    /// Pick the head map to use as the three-way merge base.
-    ///
-    /// Branches forked via `create_branch` carry `fork_base`: a
-    /// snapshot of the parent's head at fork time. That snapshot is
-    /// the correct ancestor — re-resolving the parent's current head
-    /// would falsely treat post-fork changes on the parent as
-    /// "always-there", flipping genuine modify-modify conflicts into
-    /// silent clean merges.
-    fn compute_merge_base(
-        &self,
-        src: &str,
-        dst: &str,
-    ) -> Result<(BTreeMap<String, String>, Option<String>), StoreError> {
-        let src_b = self.get_branch(src)?;
-        let dst_b = self.get_branch(dst)?;
-
-        // src forked off (a chain ending at) dst → src's snapshot wins.
-        if let Some(b) = &src_b {
-            let chain = self.parent_chain(src)?;
-            if chain.iter().any(|n| n == dst) {
-                if let Some(fb) = &b.fork_base {
-                    return Ok((fb.clone(), Some(format!("{src}@fork"))));
-                }
-            }
-        }
-        // dst forked off src.
-        if let Some(b) = &dst_b {
-            let chain = self.parent_chain(dst)?;
-            if chain.iter().any(|n| n == src) {
-                if let Some(fb) = &b.fork_base {
-                    return Ok((fb.clone(), Some(format!("{dst}@fork"))));
-                }
-            }
-        }
-        // Siblings sharing a parent: prefer src's snapshot.
-        if let (Some(s), Some(d)) = (&src_b, &dst_b) {
-            if s.parent.is_some() && s.parent == d.parent {
-                if let Some(fb) = &s.fork_base {
-                    return Ok((fb.clone(), Some(format!("{src}@fork"))));
-                }
-                if let Some(fb) = &d.fork_base {
-                    return Ok((fb.clone(), Some(format!("{dst}@fork"))));
-                }
-            }
-        }
-        // Last resort: legacy parent-chain ancestor's *current* head.
-        // Used for branch files predating the `fork_base` field.
-        if let Some(name) = self.find_common_ancestor(src, dst)? {
-            let head = self.branch_head(&name)?;
-            return Ok((head, Some(name)));
-        }
-        Ok((BTreeMap::new(), None))
-    }
-
-    /// Walk parent chains to find a common ancestor. Returns the
-    /// name of the closest one if any exists; `None` if the branches
-    /// have no shared ancestry.
-    fn find_common_ancestor(&self, a: &str, b: &str) -> Result<Option<String>, StoreError> {
-        let chain_a = self.parent_chain(a)?;
-        let chain_b = self.parent_chain(b)?;
-        let set_b: std::collections::BTreeSet<&String> = chain_b.iter().collect();
-        for name in &chain_a {
-            if set_b.contains(name) { return Ok(Some(name.clone())); }
-        }
-        Ok(None)
-    }
-
-    fn parent_chain(&self, start: &str) -> Result<Vec<String>, StoreError> {
-        let mut out = vec![start.to_string()];
-        let mut cur = start.to_string();
-        let mut seen = std::collections::BTreeSet::new();
-        seen.insert(cur.clone());
-        while let Some(b) = self.get_branch(&cur)? {
-            match b.parent {
-                Some(p) if !seen.contains(&p) => {
-                    seen.insert(p.clone());
-                    out.push(p.clone());
-                    cur = p;
-                }
-                _ => break,
-            }
-        }
-        Ok(out)
     }
 }
 
-// Provide the IndexMap-iter helper used in some downstream callers.
+/// Apply a single `StageTransition` to a sig-stage map. Used by
+/// `branch_head` to replay an op log.
+fn apply_transition(map: &mut BTreeMap<String, String>, t: &StageTransition) {
+    match t {
+        StageTransition::Create { sig_id, stage_id }
+        | StageTransition::Replace { sig_id, to: stage_id, .. } => {
+            map.insert(sig_id.clone(), stage_id.clone());
+        }
+        StageTransition::Remove { sig_id, .. } => {
+            map.remove(sig_id);
+        }
+        StageTransition::Rename { from, to, body_stage_id } => {
+            map.remove(from);
+            map.insert(to.clone(), body_stage_id.clone());
+        }
+        StageTransition::ImportOnly => {}
+        StageTransition::Merge { entries } => {
+            for (sig, stage) in entries {
+                match stage {
+                    Some(s) => { map.insert(sig.clone(), s.clone()); }
+                    None    => { map.remove(sig); }
+                }
+            }
+        }
+    }
+}
+
+// Called by set_branch_head_op which is wired up in Task 5 (#129).
 #[allow(dead_code)]
-fn _ensure_indexmap() -> IndexMap<String, String> { IndexMap::new() }
+fn write_branch_atomic(path: &std::path::Path, b: &Branch) -> Result<(), StoreError> {
+    let bytes = serde_json::to_vec_pretty(b)?;
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
 
 fn now() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+// `merge` and `commit_merge` are stubbed pending the op-DAG engine
+// in Task 7 of the #129 plan.
+impl Store {
+    pub fn merge(&self, _src: &str, _dst: &str) -> Result<MergeReport, StoreError> {
+        Err(StoreError::InvalidTransition(
+            "merge: pending op-DAG engine (#129 task 7)".into()))
+    }
+
+    pub fn commit_merge(&self, _dst: &str, _report: &MergeReport) -> Result<(), StoreError> {
+        Err(StoreError::InvalidTransition(
+            "commit_merge: pending op-DAG engine (#129 task 7)".into()))
+    }
 }
