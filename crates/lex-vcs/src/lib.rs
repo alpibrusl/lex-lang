@@ -33,6 +33,7 @@ mod canonical;
 mod compute_diff;
 pub mod diff_report;
 mod diff_to_ops;
+mod gate;
 mod merge;
 mod op_log;
 mod operation;
@@ -41,6 +42,7 @@ pub use apply::{apply, ApplyError, NewHead};
 pub use compute_diff::{compute_diff, effect_label, render_signature};
 pub use diff_report::DiffReport;
 pub use diff_to_ops::{diff_to_ops, DiffInputs, DiffMappingError, ImportMap};
+pub use gate::{check_and_apply, GateError};
 pub use merge::{merge, ConflictKind, MergeOutcome, MergeOutput};
 pub use op_log::OpLog;
 pub use operation::{
