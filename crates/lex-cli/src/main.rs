@@ -562,6 +562,49 @@ fn cmd_blame(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                 "published_at": h.published_at,
             })).collect::<Vec<_>>(),
         }));
+
+        // New: causal history from the op log.
+        let log = lex_vcs::OpLog::open(store.root()).ok();
+        let head_op = store.get_branch(&store.current_branch()).ok()
+            .and_then(|opt| opt.and_then(|b| b.head_op));
+        let causal: Vec<serde_json::Value> = match (log, head_op) {
+            (Some(log), Some(head)) => {
+                log.walk_back(&head, None).unwrap_or_default()
+                    .into_iter()
+                    .filter(|r| {
+                        // Touch this sig (or, for renames, produce it as the new sig).
+                        match &r.op.kind {
+                            lex_vcs::OperationKind::AddFunction { sig_id, .. }
+                            | lex_vcs::OperationKind::ModifyBody { sig_id, .. }
+                            | lex_vcs::OperationKind::ChangeEffectSig { sig_id, .. }
+                            | lex_vcs::OperationKind::AddType { sig_id, .. }
+                            | lex_vcs::OperationKind::ModifyType { sig_id, .. }
+                            | lex_vcs::OperationKind::RemoveFunction { sig_id, .. }
+                            | lex_vcs::OperationKind::RemoveType { sig_id, .. } => sig_id == &sig,
+                            lex_vcs::OperationKind::RenameSymbol { from, to, .. } =>
+                                from == &sig || to == &sig,
+                            _ => false,
+                        }
+                    })
+                    .map(|r| {
+                        let kind_tag = serde_json::to_value(&r.op.kind).ok()
+                            .and_then(|v| v.get("op").cloned())
+                            .unwrap_or(serde_json::Value::Null);
+                        serde_json::json!({
+                            "op_id": r.op_id,
+                            "kind": kind_tag,
+                        })
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+
+        // Mutate the most-recent entries.push value to attach causal_history.
+        if let Some(last) = entries.last_mut() {
+            last.as_object_mut().unwrap()
+                .insert("causal_history".into(), serde_json::Value::Array(causal));
+        }
     }
     let data = serde_json::json!({ "blame": entries });
     let entries_for_text = entries.clone();
