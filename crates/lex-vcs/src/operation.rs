@@ -5,7 +5,7 @@
 
 use indexmap::IndexSet;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::canonical;
 
@@ -58,7 +58,7 @@ pub enum StageTransition {
     /// `Some(stage_id)` sets the head; `None` removes the sig.
     /// Sigs unaffected by the merge are not listed.
     Merge {
-        entries: std::collections::BTreeMap<SigId, Option<StageId>>,
+        entries: BTreeMap<SigId, Option<StageId>>,
     },
 }
 
@@ -428,7 +428,7 @@ mod tests {
 
     #[test]
     fn merge_stage_transition_round_trips() {
-        let mut entries = std::collections::BTreeMap::new();
+        let mut entries = BTreeMap::new();
         entries.insert("sig-a".to_string(), Some("stage-a".to_string()));
         entries.insert("sig-b".to_string(), None); // removed by merge
         let t = StageTransition::Merge { entries };
@@ -450,10 +450,14 @@ mod tests {
 
     #[test]
     fn existing_add_function_op_id_is_unchanged_after_merge_added() {
-        // Sanity: adding a new variant to the serde-tagged enum must not
-        // perturb the canonical bytes (or therefore op_id) of existing
-        // variants. The golden hash test below is also a guard, but this
-        // one fails with a clearer message if tag rendering shifts.
+        // Constructing the new Merge variant in the same enum must not
+        // perturb the canonical bytes of existing variants. The golden
+        // hash test below checks the literal value; this one verifies
+        // the property holds even after a Merge op has been built.
+        let _merge = Operation::new(
+            OperationKind::Merge { resolved: 0 },
+            ["op-x".into(), "op-y".into()],
+        );
         let op = Operation::new(add_factorial(), []);
         assert_eq!(
             op.op_id(),
