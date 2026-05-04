@@ -33,6 +33,13 @@ pub enum StoreError {
     UnknownBranch(String),
     #[error(transparent)]
     Apply(#[from] lex_vcs::ApplyError),
+    /// The candidate program — i.e. the source the caller is
+    /// publishing — doesn't typecheck. The branch head is unchanged
+    /// and no op records are persisted. Issue #130's "always-valid
+    /// HEAD" invariant: the gate runs before any side effect, so a
+    /// type-broken publish leaves no footprint.
+    #[error("type errors in published program: {} error(s)", .0.len())]
+    TypeError(Vec<lex_types::TypeError>),
 }
 
 /// The outcome returned by [`Store::publish_program`].
@@ -451,6 +458,18 @@ impl Store {
         activate: bool,
     ) -> Result<PublishOutcome, StoreError> {
         use std::collections::{BTreeMap, BTreeSet};
+
+        // #130's write-time gate: verify the candidate program
+        // typechecks (and effects are correctly declared) before
+        // any disk side-effect. If anything fails, return the
+        // structured envelope and leave the branch head unchanged
+        // — the store's "always-valid HEAD" invariant only holds
+        // because this is the only batch-publish path that
+        // advances heads. Single-op writes via the lower-level
+        // `apply_operation` are not gated yet (#130 follow-up).
+        if let Err(errors) = lex_types::check_program(stages) {
+            return Err(StoreError::TypeError(errors));
+        }
 
         // Build old-side views from the current branch.
         let old_head = self.branch_head(branch)?;
