@@ -652,9 +652,14 @@ mod tests {
         assert!(v.is_empty());
     }
 
-    /// Performance smoke test: the predicate evaluator must scale
-    /// linearly with the candidate set, not quadratically. 100 ops
-    /// with mixed intents, query-by-intent should complete fast.
+    /// Smoke test: 100-op predicate eval finishes within a generous
+    /// budget. Threshold is 5s rather than the ~50ms the engine
+    /// actually achieves on dev hardware; CI runners with shared
+    /// disk and constrained CPU are 10x slower than local on the
+    /// IO-bound `evaluate` step (which reads 100 small JSON files).
+    /// Asserting tighter than the runner's worst case turns this
+    /// into a flake source rather than a regression alarm. A real
+    /// perf regression (e.g. quadratic blow-up) still trips it.
     #[test]
     fn linear_scan_performance_smoke() {
         let tmp = tempfile::tempdir().unwrap();
@@ -680,8 +685,8 @@ mod tests {
         let elapsed = start.elapsed();
         assert!(!v.is_empty());
         assert!(
-            elapsed < std::time::Duration::from_millis(500),
-            "100-op predicate eval took {elapsed:?}, expected < 500ms",
+            elapsed < std::time::Duration::from_secs(5),
+            "100-op predicate eval took {elapsed:?}, expected < 5s",
         );
     }
 
