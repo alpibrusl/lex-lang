@@ -106,11 +106,13 @@ fn agent_loop_publish_run_trace_diff() {
     let (s, b) = http(&srv.addr, "POST", "/v1/publish", &pub_body);
     assert_eq!(s, 200, "publish status: {b}");
     let v: serde_json::Value = serde_json::from_str(&b).unwrap();
-    let stages = v.as_array().unwrap();
-    let first = &stages[0];
-    let stage_id = first["stage_id"].as_str().unwrap();
-    let _sig_id = first["sig_id"].as_str().unwrap();
-    assert_eq!(first["status"], "active");
+    // Response is {"ops": [...], "head_op": "..."}; first op is AddFunction.
+    let ops = v["ops"].as_array().unwrap();
+    assert!(!ops.is_empty(), "expected at least one op, got: {b}");
+    let first_op = &ops[0];
+    let stage_id = first_op["kind"]["stage_id"].as_str().unwrap();
+    let _sig_id = first_op["kind"]["sig_id"].as_str().unwrap();
+    assert!(v["head_op"].is_string(), "head_op should be set");
 
     // 2) get the published stage back
     let (s, b) = http(&srv.addr, "GET", &format!("/v1/stage/{stage_id}"), "");
@@ -238,7 +240,7 @@ fn patch_replaces_a_subexpression_and_publishes_new_stage() {
     let (s, b) = http(&srv.addr, "POST", "/v1/publish", &pub_body);
     assert_eq!(s, 200, "publish: {b}");
     let v: serde_json::Value = serde_json::from_str(&b).unwrap();
-    let stage_id = v[0]["stage_id"].as_str().unwrap().to_string();
+    let stage_id = v["ops"][0]["kind"]["stage_id"].as_str().unwrap().to_string();
 
     // 2. Patch the literal `1` with `100`. Body sits at n_0.2 (1 param);
     //    BinOp.rhs is at n_0.2.1.
@@ -278,7 +280,7 @@ fn patch_with_type_error_after_apply_returns_422() {
         &json!({"source": src, "activate": true}).to_string());
     assert_eq!(s, 200);
     let stage_id = serde_json::from_str::<serde_json::Value>(&b).unwrap()
-        [0]["stage_id"].as_str().unwrap().to_string();
+        ["ops"][0]["kind"]["stage_id"].as_str().unwrap().to_string();
 
     // Replace `1` (Int) with `"oops"` (Str).
     let patch_body = json!({
@@ -301,7 +303,7 @@ fn patch_with_unknown_node_returns_422() {
         &json!({"source": "fn one() -> Int { 1 }\n", "activate": true}).to_string());
     assert_eq!(s, 200);
     let stage_id = serde_json::from_str::<serde_json::Value>(&b).unwrap()
-        [0]["stage_id"].as_str().unwrap().to_string();
+        ["ops"][0]["kind"]["stage_id"].as_str().unwrap().to_string();
 
     let patch_body = json!({
         "stage_id": stage_id,

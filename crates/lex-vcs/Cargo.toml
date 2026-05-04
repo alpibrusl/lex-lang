@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+lex-ast = { path = "../lex-ast" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -12,3 +13,5 @@ thiserror.workspace = true
 indexmap.workspace = true
 
 [dev-dependencies]
+tempfile = "3"
+lex-syntax = { path = "../lex-syntax" }

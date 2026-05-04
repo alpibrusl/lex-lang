@@ -608,12 +608,10 @@ impl Checker {
                 if args.len() == 1 {
                     let at = self.check_expr(&args[0], node_id, locals, effs)?;
                     self.unify_with_record_coercion(&at, &inst_payload).map_err(|e| mismatch_err(node_id, e, &self.u, vec![format!("constructor `{}`", name)]))?;
-                } else {
-                    if let Ty::Tuple(items) = inst_payload {
-                        for (i, (a, t)) in args.iter().zip(items.iter()).enumerate() {
-                            let at = self.check_expr(a, node_id, locals, effs)?;
-                            self.unify_with_record_coercion(&at, t).map_err(|e| mismatch_err(node_id, e, &self.u, vec![format!("constructor `{}` arg {}", name, i + 1)]))?;
-                        }
+                } else if let Ty::Tuple(items) = inst_payload {
+                    for (i, (a, t)) in args.iter().zip(items.iter()).enumerate() {
+                        let at = self.check_expr(a, node_id, locals, effs)?;
+                        self.unify_with_record_coercion(&at, t).map_err(|e| mismatch_err(node_id, e, &self.u, vec![format!("constructor `{}` arg {}", name, i + 1)]))?;
                     }
                 }
                 Ok(Ty::Con(owning, con_args))

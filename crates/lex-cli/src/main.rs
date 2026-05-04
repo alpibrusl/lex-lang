@@ -16,18 +16,19 @@ mod diff;
 mod ast_merge;
 mod branch;
 mod acli;
+mod op;
 mod repl;
 mod watch;
 
 use ::acli::OutputFormat;
 use anyhow::{anyhow, bail, Context, Result};
-use lex_ast::{canonicalize_program, sig_id, stage_canonical_hash_hex, stage_id, Stage};
+use lex_ast::{canonicalize_program, stage_canonical_hash_hex, stage_id, Stage};
 use lex_bytecode::{compile_program, vm::Vm, Value};
 use lex_runtime::{check_program as check_policy, DefaultHandler, Policy};
 use lex_store::Store;
 use lex_syntax::syntax::Program as SynProgram;
 use lex_syntax::{load_program, load_program_from_str};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
@@ -97,6 +98,7 @@ fn run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "branch" => branch::cmd_branch(fmt, &args[1..]),
         "store-merge" => branch::cmd_store_merge(fmt, &args[1..]),
         "log" => branch::cmd_log(fmt, &args[1..]),
+        "op" => op::cmd_op(fmt, &args[1..]),
         "repl" => repl::cmd_repl(&args[1..]),
         "watch" => watch::cmd_watch(&args[1..]),
         "help" | "--help" | "-h" => { print_usage(); Ok(()) }
@@ -562,6 +564,49 @@ fn cmd_blame(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                 "published_at": h.published_at,
             })).collect::<Vec<_>>(),
         }));
+
+        // New: causal history from the op log.
+        let log = lex_vcs::OpLog::open(store.root()).ok();
+        let head_op = store.get_branch(&store.current_branch()).ok()
+            .and_then(|opt| opt.and_then(|b| b.head_op));
+        let causal: Vec<serde_json::Value> = match (log, head_op) {
+            (Some(log), Some(head)) => {
+                log.walk_back(&head, None).unwrap_or_default()
+                    .into_iter()
+                    .filter(|r| {
+                        // Touch this sig (or, for renames, produce it as the new sig).
+                        match &r.op.kind {
+                            lex_vcs::OperationKind::AddFunction { sig_id, .. }
+                            | lex_vcs::OperationKind::ModifyBody { sig_id, .. }
+                            | lex_vcs::OperationKind::ChangeEffectSig { sig_id, .. }
+                            | lex_vcs::OperationKind::AddType { sig_id, .. }
+                            | lex_vcs::OperationKind::ModifyType { sig_id, .. }
+                            | lex_vcs::OperationKind::RemoveFunction { sig_id, .. }
+                            | lex_vcs::OperationKind::RemoveType { sig_id, .. } => sig_id == &sig,
+                            lex_vcs::OperationKind::RenameSymbol { from, to, .. } =>
+                                from == &sig || to == &sig,
+                            _ => false,
+                        }
+                    })
+                    .map(|r| {
+                        let kind_tag = serde_json::to_value(&r.op.kind).ok()
+                            .and_then(|v| v.get("op").cloned())
+                            .unwrap_or(serde_json::Value::Null);
+                        serde_json::json!({
+                            "op_id": r.op_id,
+                            "kind": kind_tag,
+                        })
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+
+        // Mutate the most-recent entries.push value to attach causal_history.
+        if let Some(last) = entries.last_mut() {
+            last.as_object_mut().unwrap()
+                .insert("causal_history".into(), serde_json::Value::Array(causal));
+        }
     }
     let data = serde_json::json!({ "blame": entries });
     let entries_for_text = entries.clone();
@@ -679,8 +724,23 @@ fn parse_store_flag(args: &[String]) -> (PathBuf, Vec<String>, bool, bool) {
 }
 
 fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    use lex_vcs::ImportMap;
+
     let (root, rest, activate, dry_run) = parse_store_flag(args);
-    let path = rest.first().ok_or_else(|| anyhow!("usage: lex publish [--store DIR] [--activate] <file>"))?;
+    // Pull --branch off as well.
+    let mut branch: Option<String> = None;
+    let mut positional: Vec<String> = Vec::new();
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        if a == "--branch" {
+            branch = Some(it.next().ok_or_else(|| anyhow!("--branch needs a value"))?.clone());
+        } else {
+            positional.push(a.clone());
+        }
+    }
+    let path = positional.first().ok_or_else(|| anyhow!(
+        "usage: lex publish [--store DIR] [--branch NAME] [--activate] <file>"))?;
+
     let prog = read_program(path)?;
     let stages = canonicalize_program(&prog);
     if let Err(errs) = lex_types::check_program(&stages) {
@@ -694,46 +754,81 @@ fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         });
         std::process::exit(2);
     }
-    if dry_run {
-        let actions: Vec<serde_json::Value> = stages.iter()
-            .filter(|s| !matches!(s, Stage::Import(_)))
-            .map(|s| {
-                let name = match s { Stage::FnDecl(fd) => &fd.name, Stage::TypeDecl(td) => &td.name, _ => "?" };
-                serde_json::json!({
-                    "action": "publish",
-                    "name": name,
-                    "sig_id": sig_id(s).unwrap_or_else(|| "-".into()),
-                    "store": root.display().to_string(),
-                    "activate": activate,
-                })
-            }).collect();
-        acli::emit_dry_run("publish", fmt,
-            &format!("would publish {} stage(s) to {}", actions.len(), root.display()),
-            actions);
-    }
+
     let store = Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
-    let mut out = Vec::new();
+    let branch = branch.unwrap_or_else(|| store.current_branch());
+
+    // Compute the diff. We need the old fns and new fns.
+    let old_head = store.branch_head(&branch)?;
+    let old_fns: BTreeMap<String, lex_ast::FnDecl> = old_head.values()
+        .filter_map(|stg| store.get_ast(stg).ok())
+        .filter_map(|s| match s { Stage::FnDecl(fd) => Some((fd.name.clone(), fd)), _ => None })
+        .collect();
+    let new_fns: BTreeMap<String, lex_ast::FnDecl> = stages.iter()
+        .filter_map(|s| match s { Stage::FnDecl(fd) => Some((fd.name.clone(), fd.clone())), _ => None })
+        .collect();
+    let report = diff::compute_diff(&old_fns, &new_fns, /* body_patches: */ true);
+
+    // Build new imports map (one entry per source file we just read).
+    let mut new_imports: ImportMap = ImportMap::new();
+    // Stable, transport-independent key. Per-file imports are not
+    // currently tracked separately — all imports of one publish are
+    // grouped under "<source>" so that publishing the same source
+    // via CLI vs HTTP produces identical op_ids.
+    let file_key = "<source>".to_string();
+    let entry = new_imports.entry(file_key).or_default();
     for s in &stages {
-        // Imports aren't stages.
-        if matches!(s, Stage::Import(_)) { continue; }
-        let id = store.publish(s).with_context(|| "publishing stage")?;
-        if activate {
-            store.activate(&id).with_context(|| format!("activating {id}"))?;
+        if let Stage::Import(im) = s {
+            entry.insert(im.reference.clone());
         }
-        let name = match s { Stage::FnDecl(fd) => &fd.name, Stage::TypeDecl(td) => &td.name, _ => "?" };
-        let sig = sig_id(s).unwrap_or_else(|| "-".into());
-        let entry = serde_json::json!({
-            "name": name,
-            "sig_id": sig,
-            "stage_id": id,
-            "status": format!("{:?}", store.get_status(&id)?).to_lowercase(),
-        });
-        out.push(entry);
     }
-    let data = serde_json::json!({ "published": out });
-    acli::emit_or_text("publish", data, fmt, || {
-        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+
+    if dry_run {
+        // Compute the op kinds for the dry-run preview using diff_to_ops
+        // directly, without persisting anything.
+        let old_name_to_sig: BTreeMap<String, String> = old_head.iter()
+            .filter_map(|(sig, stg)| {
+                store.get_metadata(stg).ok().map(|m| (m.name, sig.clone()))
+            })
+            .collect();
+        let old_effects: BTreeMap<String, BTreeSet<String>> = old_head.iter()
+            .filter_map(|(sig, stg)| {
+                let ast = store.get_ast(stg).ok()?;
+                match ast {
+                    Stage::FnDecl(fd) => {
+                        let s: BTreeSet<String> = fd.effects.iter()
+                            .map(|e| e.name.clone()).collect();
+                        Some((sig.clone(), s))
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        let old_imports = store.derive_imports_from_oplog(&branch)?;
+        let op_kinds = lex_vcs::diff_to_ops(lex_vcs::DiffInputs {
+            old_head: &old_head,
+            old_name_to_sig: &old_name_to_sig,
+            old_effects: &old_effects,
+            old_imports: &old_imports,
+            new_stages: &stages,
+            new_imports: &new_imports,
+            diff: &report,
+        }).map_err(|e| anyhow!("diff_to_ops: {e}"))?;
+        let actions: Vec<serde_json::Value> = op_kinds.iter()
+            .map(|k| serde_json::to_value(k).unwrap())
+            .collect();
+        acli::emit_dry_run("publish", fmt,
+            &format!("would apply {} op(s) to branch {}", op_kinds.len(), branch),
+            actions);
+        return Ok(());
+    }
+
+    let outcome = store.publish_program(&branch, &stages, &report, &new_imports, activate)?;
+    let data = serde_json::json!({
+        "ops": outcome.ops,
+        "head_op": outcome.head_op,
     });
+    acli::emit_or_text("publish", data, fmt, || {});
     Ok(())
 }
 

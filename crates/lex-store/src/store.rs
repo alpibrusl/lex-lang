@@ -6,6 +6,7 @@
 //! runs aren't perf-critical and the §4.6 acceptance requires the
 //! rebuild-from-filesystem property anyway.
 
+use crate::branches::DEFAULT_BRANCH;
 use crate::model::*;
 use lex_ast::{sig_id, stage_id, Stage};
 use serde::de::DeserializeOwned;
@@ -30,6 +31,22 @@ pub enum StoreError {
     InvalidTransition(String),
     #[error("unknown branch `{0}`")]
     UnknownBranch(String),
+    #[error(transparent)]
+    Apply(#[from] lex_vcs::ApplyError),
+}
+
+/// The outcome returned by [`Store::publish_program`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PublishOutcome {
+    pub ops: Vec<PublishOp>,
+    pub head_op: Option<lex_vcs::OpId>,
+}
+
+/// One applied operation within a [`PublishOutcome`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PublishOp {
+    pub op_id: lex_vcs::OpId,
+    pub kind: serde_json::Value,
 }
 
 /// One entry in the per-`SigId` stage history surfaced by
@@ -412,6 +429,175 @@ impl Store {
     fn write_lifecycle(&self, sig: &str, life: &Lifecycle) -> Result<(), StoreError> {
         write_canonical_json(&self.lifecycle_path(sig), life)
     }
+
+    /// Apply a published program to a branch as a sequence of typed
+    /// operations. Returns the ordered list of op_ids + the new
+    /// head_op. The caller (`lex publish` CLI, `lex serve`'s HTTP
+    /// handler) is responsible for computing the `DiffReport` against
+    /// the current branch head — the diff infrastructure lives in
+    /// `lex-vcs::compute_diff` (previously `lex-cli`) to keep this
+    /// layer from owning diffing logic.
+    ///
+    /// On success: every op in the returned list is durable in the
+    /// op log and the branch's head_op points at the last one.
+    /// On a no-op (no diff): returns empty `ops` and the existing
+    /// `head_op` unchanged.
+    pub fn publish_program(
+        &self,
+        branch: &str,
+        stages: &[lex_ast::Stage],
+        diff: &lex_vcs::DiffReport,
+        new_imports: &lex_vcs::ImportMap,
+        activate: bool,
+    ) -> Result<PublishOutcome, StoreError> {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        // Build old-side views from the current branch.
+        let old_head = self.branch_head(branch)?;
+        let old_name_to_sig: BTreeMap<String, String> = old_head.iter()
+            .filter_map(|(sig, stg)| {
+                self.get_metadata(stg).ok().map(|m| (m.name, sig.clone()))
+            })
+            .collect();
+        let old_effects: BTreeMap<String, BTreeSet<String>> = old_head.iter()
+            .filter_map(|(sig, stg)| {
+                let ast = self.get_ast(stg).ok()?;
+                match ast {
+                    lex_ast::Stage::FnDecl(fd) => {
+                        let s: BTreeSet<String> = fd.effects.iter()
+                            .map(|e| e.name.clone()).collect();
+                        Some((sig.clone(), s))
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        let old_imports = self.derive_imports_from_oplog(branch)?;
+
+        let op_kinds = lex_vcs::diff_to_ops(lex_vcs::DiffInputs {
+            old_head: &old_head,
+            old_name_to_sig: &old_name_to_sig,
+            old_effects: &old_effects,
+            old_imports: &old_imports,
+            new_stages: stages,
+            new_imports,
+            diff,
+        }).map_err(|e| StoreError::InvalidTransition(format!("diff_to_ops: {e}")))?;
+
+        let mut ops_out: Vec<PublishOp> = Vec::new();
+        let mut last_op_id: Option<lex_vcs::OpId> = None;
+        for kind in op_kinds {
+            // Persist the underlying stage AST/metadata if this op
+            // produces or replaces one.
+            if let Some(stg) = stage_for_kind(&kind, stages) {
+                if !matches!(stg, lex_ast::Stage::Import(_)) {
+                    self.publish(stg)?;
+                    if activate {
+                        if let Some(stage_id_str) = stage_id(stg) {
+                            let _ = self.activate(&stage_id_str);
+                        }
+                    }
+                }
+            }
+            let transition = transition_for_kind(&kind);
+            let head_now = self.get_branch(branch)?.and_then(|b| b.head_op);
+            let op = lex_vcs::Operation::new(
+                kind.clone(),
+                head_now.into_iter().collect::<Vec<_>>(),
+            );
+            let op_id = self.apply_operation(branch, op, transition)?;
+            ops_out.push(PublishOp {
+                op_id: op_id.clone(),
+                kind: serde_json::to_value(&kind)
+                    .map_err(StoreError::Serde)?,
+            });
+            last_op_id = Some(op_id);
+        }
+
+        let head_op = match last_op_id {
+            Some(id) => Some(id),
+            // No ops applied; return whatever the head was already.
+            None => self.get_branch(branch)?.and_then(|b| b.head_op),
+        };
+
+        Ok(PublishOutcome {
+            ops: ops_out,
+            head_op,
+        })
+    }
+
+    pub fn derive_imports_from_oplog(
+        &self,
+        branch: &str,
+    ) -> Result<lex_vcs::ImportMap, StoreError> {
+        use lex_vcs::OperationKind::*;
+        let log = lex_vcs::OpLog::open(self.root())?;
+        let head = match self.get_branch(branch)?.and_then(|b| b.head_op) {
+            Some(h) => h,
+            None => return Ok(Default::default()),
+        };
+        let mut out: lex_vcs::ImportMap = Default::default();
+        for r in log.walk_forward(&head, None)? {
+            match r.op.kind {
+                AddImport { in_file, module } => {
+                    out.entry(in_file).or_default().insert(module);
+                }
+                RemoveImport { in_file, module } => {
+                    if let Some(set) = out.get_mut(&in_file) { set.remove(&module); }
+                }
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
+
+    /// Apply an operation to a branch and advance its head_op.
+    ///
+    /// The single advance path. Validates parents via `lex_vcs::apply`,
+    /// persists the operation via the op log, then atomically advances
+    /// the branch file's head_op via `set_branch_head_op`.
+    ///
+    /// Errors:
+    /// - `UnknownBranch`: branch does not exist (no op is persisted).
+    /// - `Apply(ApplyError::StaleParent)`: the op's parents don't
+    ///   match the branch head — head is unchanged. Callers that
+    ///   want retry-on-stale (e.g. `lex publish` re-running against
+    ///   a moved head) match on this variant explicitly.
+    /// - `Apply(ApplyError::UnknownMergeParent)`: a merge op's
+    ///   second parent isn't in the log.
+    /// - `Io`: filesystem error during persist or branch advance.
+    ///
+    /// Crash recovery: between op persist and branch advance, a crash
+    /// can leave an orphan op record in the log with no branch
+    /// pointing at it. The op is content-addressed and cheap to
+    /// re-derive from the same source. See
+    /// `set_branch_head_op` for the durability story on the branch
+    /// file itself.
+    pub fn apply_operation(
+        &self,
+        branch: &str,
+        op: lex_vcs::Operation,
+        transition: lex_vcs::StageTransition,
+    ) -> Result<lex_vcs::OpId, StoreError> {
+        // Pre-check: refuse to persist any op against a branch that
+        // doesn't exist. Without this, applying against a non-default
+        // ghost branch would write the op record (succeeding via
+        // lex_vcs::apply on a None head) and only fail at
+        // set_branch_head_op below — leaving an orphan op in the log
+        // with no branch pointing at it.
+        if branch != DEFAULT_BRANCH && self.get_branch(branch)?.is_none() {
+            return Err(StoreError::UnknownBranch(branch.into()));
+        }
+        let log = lex_vcs::OpLog::open(self.root())?;
+        let head_op = self.get_branch(branch)?.and_then(|b| b.head_op);
+        let new_head = lex_vcs::apply(&log, head_op.as_ref(), op, transition)
+            .map_err(|e| match e {
+                lex_vcs::ApplyError::Persist(io) => StoreError::Io(io),
+                other => StoreError::Apply(other),
+            })?;
+        self.set_branch_head_op(branch, new_head.op_id.clone())?;
+        Ok(new_head.op_id)
+    }
 }
 
 fn stage_name(stage: &Stage) -> &str {
@@ -419,6 +605,50 @@ fn stage_name(stage: &Stage) -> &str {
         Stage::FnDecl(fd) => &fd.name,
         Stage::TypeDecl(td) => &td.name,
         Stage::Import(i) => &i.alias,
+    }
+}
+
+fn stage_for_kind<'a>(
+    kind: &lex_vcs::OperationKind,
+    stages: &'a [lex_ast::Stage],
+) -> Option<&'a lex_ast::Stage> {
+    use lex_vcs::OperationKind::*;
+    let target_sig = match kind {
+        AddFunction { sig_id, .. } | ModifyBody { sig_id, .. }
+        | ChangeEffectSig { sig_id, .. } | AddType { sig_id, .. }
+        | ModifyType { sig_id, .. } => Some(sig_id.clone()),
+        RenameSymbol { to, .. } => Some(to.clone()),
+        _ => None,
+    };
+    let target_sig = target_sig?;
+    stages.iter().find(|s| sig_id(s).as_deref() == Some(target_sig.as_str()))
+}
+
+fn transition_for_kind(kind: &lex_vcs::OperationKind) -> lex_vcs::StageTransition {
+    use lex_vcs::OperationKind::*;
+    use lex_vcs::StageTransition;
+    match kind {
+        AddFunction { sig_id, stage_id, .. }
+        | AddType { sig_id, stage_id } => StageTransition::Create {
+            sig_id: sig_id.clone(), stage_id: stage_id.clone(),
+        },
+        RemoveFunction { sig_id, last_stage_id }
+        | RemoveType { sig_id, last_stage_id } => StageTransition::Remove {
+            sig_id: sig_id.clone(), last: last_stage_id.clone(),
+        },
+        ModifyBody { sig_id, from_stage_id, to_stage_id }
+        | ChangeEffectSig { sig_id, from_stage_id, to_stage_id, .. }
+        | ModifyType { sig_id, from_stage_id, to_stage_id } => StageTransition::Replace {
+            sig_id: sig_id.clone(),
+            from: from_stage_id.clone(),
+            to:   to_stage_id.clone(),
+        },
+        RenameSymbol { from, to, body_stage_id } => StageTransition::Rename {
+            from: from.clone(), to: to.clone(),
+            body_stage_id: body_stage_id.clone(),
+        },
+        AddImport { .. } | RemoveImport { .. } => StageTransition::ImportOnly,
+        Merge { .. } => StageTransition::Merge { entries: Default::default() },
     }
 }
 

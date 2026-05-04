@@ -140,30 +140,48 @@ fn publish_handler(state: &State, body: &str) -> Response<std::io::Cursor<Vec<u8
     if let Err(errs) = lex_types::check_program(&stages) {
         return error_with_detail(422, "type errors", serde_json::to_value(&errs).unwrap());
     }
+
     let store = state.store.lock().unwrap();
-    let mut out = Vec::new();
-    for s in &stages {
-        if matches!(s, lex_ast::Stage::Import(_)) { continue; }
-        match store.publish(s) {
-            Ok(id) => {
-                if req.activate {
-                    if let Err(e) = store.activate(&id) {
-                        return error_response(500, format!("activate: {e}"));
-                    }
-                }
-                let name = match s {
-                    lex_ast::Stage::FnDecl(fd) => fd.name.clone(),
-                    lex_ast::Stage::TypeDecl(td) => td.name.clone(),
-                    _ => "?".into(),
-                };
-                let sig = lex_ast::sig_id(s).unwrap_or_default();
-                let status = format!("{:?}", store.get_status(&id).unwrap_or(lex_store::StageStatus::Draft)).to_lowercase();
-                out.push(serde_json::json!({"name": name, "sig_id": sig, "stage_id": id, "status": status}));
+    let branch = store.current_branch();
+
+    // Compute diff between what's already on the branch and the new program.
+    let old_head = match store.branch_head(&branch) {
+        Ok(h) => h,
+        Err(e) => return error_response(500, format!("branch_head: {e}")),
+    };
+    let old_fns: std::collections::BTreeMap<String, lex_ast::FnDecl> = old_head.values()
+        .filter_map(|stg| store.get_ast(stg).ok())
+        .filter_map(|s| match s {
+            lex_ast::Stage::FnDecl(fd) => Some((fd.name.clone(), fd)),
+            _ => None,
+        })
+        .collect();
+    let new_fns: std::collections::BTreeMap<String, lex_ast::FnDecl> = stages.iter()
+        .filter_map(|s| match s {
+            lex_ast::Stage::FnDecl(fd) => Some((fd.name.clone(), fd.clone())),
+            _ => None,
+        })
+        .collect();
+    let report = lex_vcs::compute_diff(&old_fns, &new_fns, false);
+
+    // Build new imports map from any Import stages in the source.
+    let mut new_imports: lex_vcs::ImportMap = lex_vcs::ImportMap::new();
+    {
+        let entry = new_imports.entry("<source>".into()).or_default();
+        for s in &stages {
+            if let lex_ast::Stage::Import(im) = s {
+                entry.insert(im.reference.clone());
             }
-            Err(e) => return error_response(500, format!("publish: {e}")),
         }
     }
-    json_response(200, &serde_json::Value::Array(out))
+
+    match store.publish_program(&branch, &stages, &report, &new_imports, req.activate) {
+        Ok(outcome) => json_response(200, &serde_json::json!({
+            "ops": outcome.ops,
+            "head_op": outcome.head_op,
+        })),
+        Err(e) => error_response(500, format!("publish_program: {e}")),
+    }
 }
 
 #[derive(Deserialize)]
@@ -200,7 +218,17 @@ fn patch_handler(state: &State, body: &str) -> Response<std::io::Cursor<Vec<u8>>
             serde_json::to_value(&errs).unwrap_or_default());
     }
 
-    // 4. Publish.
+    // Routing through apply_operation so /v1/patch participates in
+    // the op DAG. We know this op is always a body change on the
+    // existing sig (a patch can't add a brand-new fn).
+    let branch = store.current_branch();
+
+    // Find the sig — patched stage's sig must match the original's.
+    let sig = match lex_ast::sig_id(&patched) {
+        Some(s) => s,
+        None => return error_response(500, "patched stage has no sig_id"),
+    };
+
     let new_id = match store.publish(&patched) {
         Ok(id) => id, Err(e) => return error_response(500, format!("publish: {e}")),
     };
@@ -209,7 +237,49 @@ fn patch_handler(state: &State, body: &str) -> Response<std::io::Cursor<Vec<u8>>
             return error_response(500, format!("activate: {e}"));
         }
     }
-    let sig = lex_ast::sig_id(&patched).unwrap_or_default();
+
+    // Determine op kind: ChangeEffectSig if effects differ, ModifyBody otherwise.
+    let original_effects: std::collections::BTreeSet<String> = match &original {
+        lex_ast::Stage::FnDecl(fd) => fd.effects.iter().map(|e| e.name.clone()).collect(),
+        _ => std::collections::BTreeSet::new(),
+    };
+    let patched_effects: std::collections::BTreeSet<String> = match &patched {
+        lex_ast::Stage::FnDecl(fd) => fd.effects.iter().map(|e| e.name.clone()).collect(),
+        _ => std::collections::BTreeSet::new(),
+    };
+    let head_now = match store.get_branch(&branch) {
+        Ok(b) => b.and_then(|b| b.head_op),
+        Err(e) => return error_response(500, format!("get_branch: {e}")),
+    };
+    let kind = if original_effects != patched_effects {
+        lex_vcs::OperationKind::ChangeEffectSig {
+            sig_id: sig.clone(),
+            from_stage_id: req.stage_id.clone(),
+            to_stage_id: new_id.clone(),
+            from_effects: original_effects,
+            to_effects: patched_effects,
+        }
+    } else {
+        lex_vcs::OperationKind::ModifyBody {
+            sig_id: sig.clone(),
+            from_stage_id: req.stage_id.clone(),
+            to_stage_id: new_id.clone(),
+        }
+    };
+    let transition = lex_vcs::StageTransition::Replace {
+        sig_id: sig.clone(),
+        from: req.stage_id.clone(),
+        to: new_id.clone(),
+    };
+    let op = lex_vcs::Operation::new(
+        kind,
+        head_now.into_iter().collect::<Vec<_>>(),
+    );
+    let op_id = match store.apply_operation(&branch, op, transition) {
+        Ok(id) => id,
+        Err(e) => return error_response(500, format!("apply_operation: {e}")),
+    };
+
     let status = format!("{:?}",
         store.get_status(&new_id).unwrap_or(lex_store::StageStatus::Draft)).to_lowercase();
     json_response(200, &serde_json::json!({
@@ -217,6 +287,7 @@ fn patch_handler(state: &State, body: &str) -> Response<std::io::Cursor<Vec<u8>>
         "new_stage_id": new_id,
         "sig_id": sig,
         "status": status,
+        "op_id": op_id,
     }))
 }
 
