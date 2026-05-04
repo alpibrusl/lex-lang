@@ -153,7 +153,9 @@ fn print_usage() {
     println!("  diff <run_a> <run_b>               first NodeId where two traces diverge");
     println!("  serve [--port N] [--store DIR]     start the agent API HTTP server");
     println!("  conformance <dir>                  run all JSON test descriptors in <dir>");
-    println!("  spec check <spec> --source <file>  check a Spec against a Lex source");
+    println!("  spec check <spec> --source <file> [--store DIR] [--trials N]");
+    println!("                                     check a Spec against a Lex source");
+    println!("                                     (--store: persist a Spec attestation)");
     println!("  spec smt <spec>                    emit SMT-LIB for external Z3");
     println!("  agent-tool [--allow-effects ks] (--request 'q' | --body-file F | --body 'B')");
     println!("                                     have an LLM emit a Lex tool body, run it");
@@ -726,6 +728,74 @@ fn json_to_value(v: &serde_json::Value) -> Value {
     Value::from_json(v)
 }
 
+/// Find the StageId of a function declared in `lex_src` whose name
+/// matches `fn_name`. Returns `None` if the source doesn't parse,
+/// the fn isn't there, or it's a non-FnDecl stage. Used by `lex
+/// spec check` to tie its Spec attestation to the exact stage the
+/// spec was verified against.
+fn find_stage_id_for_fn(lex_src: &str, fn_name: &str) -> Option<String> {
+    let prog = load_program_from_str(lex_src).ok()?;
+    let stages = canonicalize_program(&prog);
+    let stage = stages.iter().find(|s| matches!(s, Stage::FnDecl(fd) if fd.name == fn_name))?;
+    stage_id(stage)
+}
+
+/// Persist a `Spec` attestation against `stage_id` capturing the
+/// outcome of a `lex spec check` run. Emits passed / failed (with
+/// counterexample summary) / inconclusive (with note) so the
+/// evidence trail covers all three verdicts — failures are
+/// evidence too (#132 trust model).
+fn record_spec_attestation(
+    store_root: &std::path::Path,
+    stage_id: &str,
+    spec_name: &str,
+    r: &spec_checker::CheckResult,
+    trials: u32,
+) -> Result<()> {
+    use lex_vcs::{
+        Attestation, AttestationKind, AttestationResult, ProducerDescriptor, SpecMethod,
+    };
+    let store = Store::open(store_root)
+        .with_context(|| format!("opening store at {}", store_root.display()))?;
+    let log = store.attestation_log()?;
+
+    let result = match r.status {
+        spec_checker::ProofStatus::Proved => AttestationResult::Passed,
+        spec_checker::ProofStatus::Counterexample => {
+            let detail = r.evidence.counterexample.as_ref()
+                .and_then(|c| serde_json::to_string(c).ok())
+                .map(|s| format!("counterexample: {s}"))
+                .unwrap_or_else(|| "counterexample".into());
+            AttestationResult::Failed { detail }
+        }
+        spec_checker::ProofStatus::Inconclusive => AttestationResult::Inconclusive {
+            detail: r.evidence.note.clone().unwrap_or_else(|| "inconclusive".into()),
+        },
+    };
+    let kind = AttestationKind::Spec {
+        spec_id: r.spec_id.clone(),
+        method: SpecMethod::Random,
+        trials: Some(trials as usize),
+    };
+    let producer = ProducerDescriptor {
+        tool: "lex spec check".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        model: None,
+    };
+    let _ = spec_name; // Reserved for future provenance fields.
+    let attestation = Attestation::new(
+        stage_id.to_string(),
+        None,
+        None,
+        kind,
+        result,
+        producer,
+        None,
+    );
+    log.put(&attestation)?;
+    Ok(())
+}
+
 fn value_to_json_string(v: &Value) -> String {
     serde_json::to_string(&v.to_json()).unwrap()
 }
@@ -1134,6 +1204,7 @@ fn cmd_spec(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             let mut spec_path: Option<&String> = None;
             let mut src_path: Option<&String> = None;
             let mut trials: u32 = 1000;
+            let mut store_root: Option<PathBuf> = None;
             let mut i = 0;
             while i < rest.len() {
                 match rest[i].as_str() {
@@ -1141,6 +1212,10 @@ fn cmd_spec(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                     "--trials" => {
                         trials = rest.get(i + 1).and_then(|s| s.parse().ok())
                             .ok_or_else(|| anyhow!("--trials needs a u32"))?;
+                        i += 2;
+                    }
+                    "--store" => {
+                        store_root = rest.get(i + 1).map(PathBuf::from);
                         i += 2;
                     }
                     _ if spec_path.is_none() => { spec_path = Some(&rest[i]); i += 1; }
@@ -1154,6 +1229,24 @@ fn cmd_spec(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             let spec = spec_checker::parse_spec(&spec_src)
                 .map_err(|e| anyhow!("spec parse: {e}"))?;
             let r = spec_checker::check_spec(&spec, &lex_src, trials);
+
+            // #132: when --store is provided, emit a Spec attestation
+            // tied to the StageId of the function the spec targets.
+            // The attestation captures the verification result
+            // (passed / failed-with-counterexample / inconclusive)
+            // so a downstream `lex blame --with-evidence` or
+            // `GET /v1/stage/<id>/attestations` answers "has this
+            // stage ever been spec-checked?" without re-running.
+            //
+            // No-ops if `--store` is absent or the source doesn't
+            // contain a fn matching `spec.name` (the typical case
+            // is a spec referring to a fn that *is* in the source).
+            if let Some(root) = &store_root {
+                if let Some(target_stage_id) = find_stage_id_for_fn(&lex_src, &spec.name) {
+                    record_spec_attestation(root, &target_stage_id, &spec.name, &r, trials)?;
+                }
+            }
+
             let data = serde_json::to_value(&r)?;
             acli::emit_or_text("spec", data.clone(), fmt, || {
                 println!("{}", serde_json::to_string_pretty(&data).unwrap());

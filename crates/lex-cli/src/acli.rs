@@ -338,7 +338,14 @@ fn cmd_spec() -> CommandInfo {
     let check = CommandInfo::new("check", "check a Spec against a Lex source")
         .idempotent(true)
         .add_argument("spec", "string", "spec file", true)
-        .add_option("--source", "string", "source file to verify against", None);
+        .add_option("--source", "string", "source file to verify against", None)
+        .add_option("--trials", "string", "randomized trial count (default 1000)", None)
+        .add_option(
+            "--store",
+            "string",
+            "if set, persist a Spec attestation against the target stage",
+            None,
+        );
     let smt = CommandInfo::new("smt", "emit SMT-LIB for external Z3")
         .idempotent(true)
         .add_argument("spec", "string", "spec file", true);
