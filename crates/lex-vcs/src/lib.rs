@@ -28,10 +28,12 @@
 //! mentions Blake3; if that becomes load-bearing for performance we
 //! can swap with a one-line crate change since `OpId` is opaque.
 
+mod apply;
 mod canonical;
 mod op_log;
 mod operation;
 
+pub use apply::{apply, ApplyError, NewHead};
 pub use op_log::OpLog;
 pub use operation::{
     EffectSet, ModuleRef, OpId, Operation, OperationRecord, OperationKind, SigId, StageId,
