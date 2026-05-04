@@ -95,3 +95,30 @@ fn apply_operation_with_stale_parent_errors() {
     let head = s.branch_head(DEFAULT_BRANCH).unwrap();
     assert_eq!(head.get("fac"), Some(&"stg-1".to_string()));
 }
+
+#[test]
+fn apply_operation_against_unknown_branch_does_not_persist() {
+    let (s, _tmp) = fresh();
+    let op = Operation::new(
+        OperationKind::AddFunction {
+            sig_id: "fac".into(),
+            stage_id: "stg-1".into(),
+            effects: BTreeSet::new(),
+        },
+        [],
+    );
+    let err = s.apply_operation("ghost", op, StageTransition::Create {
+        sig_id: "fac".into(), stage_id: "stg-1".into(),
+    });
+    assert!(err.is_err(), "expected UnknownBranch");
+    // The ops/ directory should be empty — the pre-check refused to
+    // persist anything when the branch doesn't exist.
+    let ops_dir = _tmp.path().join("ops");
+    if ops_dir.exists() {
+        let n = std::fs::read_dir(&ops_dir).unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+            .count();
+        assert_eq!(n, 0, "no op file should be persisted against an unknown branch");
+    }
+}

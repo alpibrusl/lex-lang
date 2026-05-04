@@ -6,6 +6,7 @@
 //! runs aren't perf-critical and the §4.6 acceptance requires the
 //! rebuild-from-filesystem property anyway.
 
+use crate::branches::DEFAULT_BRANCH;
 use crate::model::*;
 use lex_ast::{sig_id, stage_id, Stage};
 use serde::de::DeserializeOwned;
@@ -30,6 +31,8 @@ pub enum StoreError {
     InvalidTransition(String),
     #[error("unknown branch `{0}`")]
     UnknownBranch(String),
+    #[error(transparent)]
+    Apply(#[from] lex_vcs::ApplyError),
 }
 
 /// One entry in the per-`SigId` stage history surfaced by
@@ -415,21 +418,47 @@ impl Store {
 
     /// Apply an operation to a branch and advance its head_op.
     ///
-    /// The single advance path. Validates parents via lex_vcs::apply,
-    /// persists the operation, then atomically advances the branch
-    /// file's head_op.
+    /// The single advance path. Validates parents via `lex_vcs::apply`,
+    /// persists the operation via the op log, then atomically advances
+    /// the branch file's head_op via `set_branch_head_op`.
+    ///
+    /// Errors:
+    /// - `UnknownBranch`: branch does not exist (no op is persisted).
+    /// - `Apply(ApplyError::StaleParent)`: the op's parents don't
+    ///   match the branch head — head is unchanged. Callers that
+    ///   want retry-on-stale (e.g. `lex publish` re-running against
+    ///   a moved head) match on this variant explicitly.
+    /// - `Apply(ApplyError::UnknownMergeParent)`: a merge op's
+    ///   second parent isn't in the log.
+    /// - `Io`: filesystem error during persist or branch advance.
+    ///
+    /// Crash recovery: between op persist and branch advance, a crash
+    /// can leave an orphan op record in the log with no branch
+    /// pointing at it. The op is content-addressed and cheap to
+    /// re-derive from the same source. See
+    /// `set_branch_head_op` for the durability story on the branch
+    /// file itself.
     pub fn apply_operation(
         &self,
         branch: &str,
         op: lex_vcs::Operation,
         transition: lex_vcs::StageTransition,
     ) -> Result<lex_vcs::OpId, StoreError> {
+        // Pre-check: refuse to persist any op against a branch that
+        // doesn't exist. Without this, applying against a non-default
+        // ghost branch would write the op record (succeeding via
+        // lex_vcs::apply on a None head) and only fail at
+        // set_branch_head_op below — leaving an orphan op in the log
+        // with no branch pointing at it.
+        if branch != DEFAULT_BRANCH && self.get_branch(branch)?.is_none() {
+            return Err(StoreError::UnknownBranch(branch.into()));
+        }
         let log = lex_vcs::OpLog::open(self.root())?;
         let head_op = self.get_branch(branch)?.and_then(|b| b.head_op);
         let new_head = lex_vcs::apply(&log, head_op.as_ref(), op, transition)
             .map_err(|e| match e {
                 lex_vcs::ApplyError::Persist(io) => StoreError::Io(io),
-                other => StoreError::InvalidTransition(other.to_string()),
+                other => StoreError::Apply(other),
             })?;
         self.set_branch_head_op(branch, new_head.op_id.clone())?;
         Ok(new_head.op_id)
