@@ -1,7 +1,108 @@
-//! Branch tests for the op-DAG model. Populated in #129 task 7
-//! (op-DAG merge engine).
+//! Branch tests over the op-DAG model.
+
+use lex_store::{Operation, OperationKind, StageTransition, Store, DEFAULT_BRANCH};
+use std::collections::BTreeSet;
+
+fn fresh() -> (Store, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let s = Store::open(tmp.path()).unwrap();
+    (s, tmp)
+}
+
+fn add(s: &Store, branch: &str, sig: &str, stg: &str) -> String {
+    let op = Operation::new(
+        OperationKind::AddFunction {
+            sig_id: sig.into(),
+            stage_id: stg.into(),
+            effects: BTreeSet::new(),
+        },
+        s.get_branch(branch).unwrap().and_then(|b| b.head_op).into_iter().collect::<Vec<_>>(),
+    );
+    let t = StageTransition::Create { sig_id: sig.into(), stage_id: stg.into() };
+    s.apply_operation(branch, op, t).unwrap()
+}
+
+fn modify(s: &Store, branch: &str, sig: &str, from: &str, to: &str) -> String {
+    let parent = s.get_branch(branch).unwrap().and_then(|b| b.head_op).unwrap();
+    let op = Operation::new(
+        OperationKind::ModifyBody {
+            sig_id: sig.into(),
+            from_stage_id: from.into(),
+            to_stage_id: to.into(),
+        },
+        [parent],
+    );
+    let t = StageTransition::Replace {
+        sig_id: sig.into(), from: from.into(), to: to.into(),
+    };
+    s.apply_operation(branch, op, t).unwrap()
+}
 
 #[test]
-fn placeholder() {
-    // Intentionally empty pending the op-DAG merge engine in task 7.
+fn fresh_store_lists_only_main() {
+    let (s, _tmp) = fresh();
+    assert_eq!(s.list_branches().unwrap(), vec![DEFAULT_BRANCH.to_string()]);
+    assert_eq!(s.current_branch(), DEFAULT_BRANCH);
+}
+
+#[test]
+fn create_branch_inherits_head_op() {
+    let (s, _tmp) = fresh();
+    let _ = add(&s, DEFAULT_BRANCH, "sig1", "stageA");
+    s.create_branch("feature-x", DEFAULT_BRANCH).unwrap();
+    assert_eq!(
+        s.branch_head("feature-x").unwrap().get("sig1"),
+        Some(&"stageA".to_string()),
+    );
+}
+
+#[test]
+fn merge_clean_when_only_one_side_modifies() {
+    let (s, _tmp) = fresh();
+    let _ = add(&s, DEFAULT_BRANCH, "sig1", "stageA");
+    s.create_branch("feature", DEFAULT_BRANCH).unwrap();
+    let _ = modify(&s, "feature", "sig1", "stageA", "stageB");
+    let report = s.merge("feature", DEFAULT_BRANCH).unwrap();
+    assert_eq!(report.conflicts.len(), 0, "report: {report:?}");
+    assert_eq!(report.merged.len(), 1);
+    assert_eq!(report.merged[0].stage_id, "stageB");
+}
+
+#[test]
+fn merge_conflict_when_both_sides_modify_same_sig() {
+    let (s, _tmp) = fresh();
+    let _ = add(&s, DEFAULT_BRANCH, "sig1", "stageA");
+    s.create_branch("feature", DEFAULT_BRANCH).unwrap();
+    let _ = modify(&s, DEFAULT_BRANCH, "sig1", "stageA", "stageB");
+    let _ = modify(&s, "feature",      "sig1", "stageA", "stageC");
+    let report = s.merge("feature", DEFAULT_BRANCH).unwrap();
+    assert_eq!(report.conflicts.len(), 1);
+    assert_eq!(report.conflicts[0].kind, "modify-modify");
+}
+
+#[test]
+fn commit_merge_advances_dst_head_op() {
+    let (s, _tmp) = fresh();
+    let _ = add(&s, DEFAULT_BRANCH, "sig1", "stageA");
+    s.create_branch("feature", DEFAULT_BRANCH).unwrap();
+    let _ = modify(&s, "feature", "sig1", "stageA", "stageB");
+    let report = s.merge("feature", DEFAULT_BRANCH).unwrap();
+    s.commit_merge(DEFAULT_BRANCH, &report).unwrap();
+    assert_eq!(
+        s.branch_head(DEFAULT_BRANCH).unwrap().get("sig1"),
+        Some(&"stageB".to_string()),
+    );
+    assert_eq!(s.branch_log(DEFAULT_BRANCH).unwrap().len(), 1);
+}
+
+#[test]
+fn delete_branch_refused_when_current_or_default() {
+    let (s, _tmp) = fresh();
+    s.create_branch("foo", DEFAULT_BRANCH).unwrap();
+    s.set_current_branch("foo").unwrap();
+    assert!(s.delete_branch("foo").is_err());
+    assert!(s.delete_branch(DEFAULT_BRANCH).is_err());
+    s.set_current_branch(DEFAULT_BRANCH).unwrap();
+    s.delete_branch("foo").unwrap();
+    assert_eq!(s.list_branches().unwrap(), vec![DEFAULT_BRANCH.to_string()]);
 }

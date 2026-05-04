@@ -32,12 +32,14 @@ mod apply;
 mod canonical;
 pub mod diff_report;
 mod diff_to_ops;
+mod merge;
 mod op_log;
 mod operation;
 
 pub use apply::{apply, ApplyError, NewHead};
 pub use diff_report::DiffReport;
 pub use diff_to_ops::{diff_to_ops, DiffInputs, DiffMappingError, ImportMap};
+pub use merge::{merge, ConflictKind, MergeOutcome, MergeOutput};
 pub use op_log::OpLog;
 pub use operation::{
     EffectSet, ModuleRef, OpId, Operation, OperationRecord, OperationKind, SigId, StageId,

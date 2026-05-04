@@ -284,16 +284,103 @@ fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-// `merge` and `commit_merge` are stubbed pending the op-DAG engine
-// in Task 7 of the #129 plan.
 impl Store {
-    pub fn merge(&self, _src: &str, _dst: &str) -> Result<MergeReport, StoreError> {
-        Err(StoreError::InvalidTransition(
-            "merge: pending op-DAG engine (#129 task 7)".into()))
+    pub fn merge(&self, src: &str, dst: &str) -> Result<MergeReport, StoreError> {
+        let log = OpLog::open(self.root())?;
+        let src_head = self.get_branch(src)?.and_then(|b| b.head_op);
+        let dst_head = match self.get_branch(dst)? {
+            Some(b) => b.head_op,
+            None if dst == DEFAULT_BRANCH => None,
+            None => return Err(StoreError::UnknownBranch(dst.into())),
+        };
+        let out = lex_vcs::merge(&log, src_head.as_ref(), dst_head.as_ref())?;
+
+        let mut report = MergeReport {
+            summary: MergeSummary {
+                base: out.lca.clone(),
+                src: src.into(),
+                dst: dst.into(),
+                ..Default::default()
+            },
+            merged: Vec::new(),
+            conflicts: Vec::new(),
+        };
+        for o in out.outcomes {
+            match o {
+                lex_vcs::MergeOutcome::Both { sig_id, stage_id } => {
+                    if let Some(stage_id) = stage_id {
+                        report.merged.push(MergeEntry { sig_id, stage_id, from: "both" });
+                    }
+                }
+                lex_vcs::MergeOutcome::Src { sig_id, stage_id } => {
+                    if let Some(stage_id) = stage_id {
+                        report.merged.push(MergeEntry { sig_id, stage_id, from: "src" });
+                    }
+                }
+                lex_vcs::MergeOutcome::Dst { sig_id, stage_id } => {
+                    if let Some(stage_id) = stage_id {
+                        report.merged.push(MergeEntry { sig_id, stage_id, from: "dst" });
+                    }
+                }
+                lex_vcs::MergeOutcome::Conflict { sig_id, kind, base, src, dst } => {
+                    let kind: &'static str = match kind {
+                        lex_vcs::ConflictKind::ModifyModify => "modify-modify",
+                        lex_vcs::ConflictKind::ModifyDelete => "modify-delete",
+                        lex_vcs::ConflictKind::DeleteModify => "delete-modify",
+                        lex_vcs::ConflictKind::AddAdd       => "add-add",
+                    };
+                    report.conflicts.push(MergeConflict {
+                        sig_id, kind, base, src, dst,
+                    });
+                }
+            }
+        }
+        report.summary.clean = report.merged.len();
+        report.summary.conflicts = report.conflicts.len();
+        report.summary.total_sigs = report.merged.len() + report.conflicts.len();
+        Ok(report)
     }
 
-    pub fn commit_merge(&self, _dst: &str, _report: &MergeReport) -> Result<(), StoreError> {
-        Err(StoreError::InvalidTransition(
-            "commit_merge: pending op-DAG engine (#129 task 7)".into()))
+    pub fn commit_merge(&self, dst: &str, report: &MergeReport) -> Result<(), StoreError> {
+        if !report.conflicts.is_empty() {
+            return Err(StoreError::InvalidTransition(format!(
+                "{} conflicts; resolve before committing", report.conflicts.len())));
+        }
+        let dst_head_map = self.branch_head(dst)?;
+        let mut entries: BTreeMap<String, Option<String>> = BTreeMap::new();
+        for m in &report.merged {
+            let cur = dst_head_map.get(&m.sig_id);
+            if cur != Some(&m.stage_id) {
+                entries.insert(m.sig_id.clone(), Some(m.stage_id.clone()));
+            }
+        }
+        let src_head = self.get_branch(&report.summary.src)?.and_then(|b| b.head_op);
+        let dst_head = self.get_branch(dst)?.and_then(|b| b.head_op);
+        let parents: Vec<_> = [src_head, dst_head].into_iter().flatten().collect();
+
+        // Skip the apply if both sides are at the same head — there's
+        // nothing structural to record. Still journal the merge below.
+        if !parents.is_empty() && parents.windows(2).all(|w| w[0] != w[1]) {
+            let op = lex_vcs::Operation::new(
+                lex_vcs::OperationKind::Merge { resolved: entries.len() },
+                parents,
+            );
+            let t = lex_vcs::StageTransition::Merge { entries };
+            let _ = self.apply_operation(dst, op, t)?;
+        }
+
+        // Journal the merge so `lex log` can show it.
+        let mut b = self.get_branch(dst)?
+            .ok_or_else(|| StoreError::UnknownBranch(dst.into()))?;
+        if !report.summary.src.is_empty() {
+            b.merges.push(MergeRecord {
+                src: report.summary.src.clone(),
+                at: now(),
+                merged: report.merged.len(),
+                conflicts: 0,
+            });
+            write_branch_atomic(&self.branch_path(dst), &b)?;
+        }
+        Ok(())
     }
 }
