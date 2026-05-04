@@ -530,12 +530,19 @@ fn cmd_hash(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 }
 
 fn cmd_blame(fmt: &OutputFormat, args: &[String]) -> Result<()> {
-    // usage: lex blame [--store DIR] <file>
-    let (root, rest, _, _) = parse_store_flag(args);
-    let path = rest.first().ok_or_else(|| anyhow!("usage: lex blame [--store DIR] <file>"))?;
+    // usage: lex blame [--store DIR] [--with-evidence] <file>
+    let (root, mut rest, _, _) = parse_store_flag(args);
+    let with_evidence = rest.iter().any(|a| a == "--with-evidence");
+    rest.retain(|a| a != "--with-evidence");
+    let path = rest.first().ok_or_else(|| anyhow!("usage: lex blame [--store DIR] [--with-evidence] <file>"))?;
     let prog = read_program(path)?;
     let stages = canonicalize_program(&prog);
     let store = Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
+    // Attestation log is opened once per blame run (not per stage)
+    // so a 1000-entry blame doesn't pay 1000 fs::create_dir_all
+    // calls. The log itself is just a path holder; reads are
+    // per-stage directory listings.
+    let att_log = if with_evidence { Some(store.attestation_log()?) } else { None };
 
     let mut entries = Vec::new();
     for s in &stages {
@@ -551,18 +558,32 @@ fn cmd_blame(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         let here_status = history.iter().find(|h| h.stage_id == here_stage)
             .map(|h| format!("{:?}", h.status).to_lowercase());
 
+        let history_json: Vec<serde_json::Value> = history.iter().map(|h| {
+            let mut entry = serde_json::json!({
+                "stage_id": h.stage_id,
+                "status": format!("{:?}", h.status).to_lowercase(),
+                "last_at": h.last_at,
+                "published_at": h.published_at,
+            });
+            if let Some(log) = &att_log {
+                let mut atts = log.list_for_stage(&h.stage_id).unwrap_or_default();
+                atts.sort_by_key(|a| std::cmp::Reverse(a.timestamp));
+                if let Some(obj) = entry.as_object_mut() {
+                    obj.insert(
+                        "attestations".into(),
+                        serde_json::to_value(&atts).unwrap_or(serde_json::Value::Null),
+                    );
+                }
+            }
+            entry
+        }).collect();
         entries.push(serde_json::json!({
             "name": name,
             "sig_id": sig,
             "here_stage_id": here_stage,
             "here_status": here_status,    // None => unpublished
             "active_stage_id": active_stage,
-            "history": history.iter().map(|h| serde_json::json!({
-                "stage_id": h.stage_id,
-                "status": format!("{:?}", h.status).to_lowercase(),
-                "last_at": h.last_at,
-                "published_at": h.published_at,
-            })).collect::<Vec<_>>(),
+            "history": history_json,
         }));
 
         // New: causal history from the op log.
@@ -646,6 +667,22 @@ fn print_blame_entry(e: &serde_json::Value) {
             let at  = h["last_at"].as_u64().unwrap_or(0);
             let marker = if sid == here { " ←" } else { "" };
             println!("    {sid:.16}…  {st:<10} {}{marker}", format_blame_ts(at));
+            // `--with-evidence` attaches attestations to each history
+            // entry. Render compactly: one line per attestation,
+            // showing kind, result, and producer.
+            if let Some(atts) = h["attestations"].as_array() {
+                if atts.is_empty() {
+                    println!("      evidence: (none)");
+                } else {
+                    for a in atts {
+                        let kind = a["kind"]["kind"].as_str().unwrap_or("?");
+                        let result = a["result"]["result"].as_str().unwrap_or("?");
+                        let tool = a["produced_by"]["tool"].as_str().unwrap_or("?");
+                        let ver = a["produced_by"]["version"].as_str().unwrap_or("?");
+                        println!("      {kind:<14} {result:<8} by {tool}@{ver}");
+                    }
+                }
+            }
         }
     }
     println!();

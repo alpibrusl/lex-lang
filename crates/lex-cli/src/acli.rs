@@ -216,11 +216,18 @@ fn cmd_blame() -> CommandInfo {
         .idempotent(true)
         .add_argument("file", "string", "path to a .lex file", true)
         .add_option("--store", "string", "store root directory", None)
+        .add_option(
+            "--with-evidence",
+            "bool",
+            "attach attestations to each history entry",
+            None,
+        )
         .with_examples(vec![
             ("Blame a file", "lex blame app.lex"),
+            ("With evidence trail", "lex blame --with-evidence app.lex"),
             ("Machine-readable", "lex --output json blame app.lex"),
         ])
-        .with_see_also(vec!["hash", "publish", "store", "log"])
+        .with_see_also(vec!["hash", "publish", "store", "stage", "log"])
 }
 
 fn cmd_publish() -> CommandInfo {
