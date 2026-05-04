@@ -27,7 +27,7 @@ use lex_runtime::{check_program as check_policy, DefaultHandler, Policy};
 use lex_store::Store;
 use lex_syntax::syntax::Program as SynProgram;
 use lex_syntax::{load_program, load_program_from_str};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
@@ -679,8 +679,23 @@ fn parse_store_flag(args: &[String]) -> (PathBuf, Vec<String>, bool, bool) {
 }
 
 fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    use lex_vcs::{diff_to_ops, DiffInputs, ImportMap, Operation};
+
     let (root, rest, activate, dry_run) = parse_store_flag(args);
-    let path = rest.first().ok_or_else(|| anyhow!("usage: lex publish [--store DIR] [--activate] <file>"))?;
+    // Pull --branch off as well.
+    let mut branch: Option<String> = None;
+    let mut positional: Vec<String> = Vec::new();
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        if a == "--branch" {
+            branch = Some(it.next().ok_or_else(|| anyhow!("--branch needs a value"))?.clone());
+        } else {
+            positional.push(a.clone());
+        }
+    }
+    let path = positional.first().ok_or_else(|| anyhow!(
+        "usage: lex publish [--store DIR] [--branch NAME] [--activate] <file>"))?;
+
     let prog = read_program(path)?;
     let stages = canonicalize_program(&prog);
     if let Err(errs) = lex_types::check_program(&stages) {
@@ -694,47 +709,183 @@ fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         });
         std::process::exit(2);
     }
-    if dry_run {
-        let actions: Vec<serde_json::Value> = stages.iter()
-            .filter(|s| !matches!(s, Stage::Import(_)))
-            .map(|s| {
-                let name = match s { Stage::FnDecl(fd) => &fd.name, Stage::TypeDecl(td) => &td.name, _ => "?" };
-                serde_json::json!({
-                    "action": "publish",
-                    "name": name,
-                    "sig_id": sig_id(s).unwrap_or_else(|| "-".into()),
-                    "store": root.display().to_string(),
-                    "activate": activate,
-                })
-            }).collect();
-        acli::emit_dry_run("publish", fmt,
-            &format!("would publish {} stage(s) to {}", actions.len(), root.display()),
-            actions);
-    }
+
     let store = Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
-    let mut out = Vec::new();
+    let branch = branch.unwrap_or_else(|| store.current_branch());
+
+    // Build "old" view from the current branch head.
+    let old_head = store.branch_head(&branch)?;
+    let old_name_to_sig: BTreeMap<String, String> = old_head.iter()
+        .filter_map(|(sig, stg)| {
+            store.get_metadata(stg).ok().map(|m| (m.name, sig.clone()))
+        })
+        .collect();
+    let old_effects: BTreeMap<String, BTreeSet<String>> = old_head.iter()
+        .filter_map(|(sig, stg)| {
+            let ast = store.get_ast(stg).ok()?;
+            match ast {
+                Stage::FnDecl(fd) => {
+                    let s: BTreeSet<String> = fd.effects.iter()
+                        .map(|e| e.name.clone()).collect();
+                    Some((sig.clone(), s))
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    // Imports — derive from the op log on this branch.
+    let old_imports: ImportMap = derive_imports_from_oplog(&store, &branch)?;
+
+    // Compute the ast-diff using BTreeMap<String, FnDecl> inputs.
+    let old_fns: BTreeMap<String, lex_ast::FnDecl> = old_head.iter()
+        .filter_map(|(_sig, stg)| {
+            let ast = store.get_ast(stg).ok()?;
+            match ast {
+                Stage::FnDecl(fd) => Some((fd.name.clone(), fd)),
+                _ => None,
+            }
+        })
+        .collect();
+    let new_fns: BTreeMap<String, lex_ast::FnDecl> = stages.iter()
+        .filter_map(|s| match s {
+            Stage::FnDecl(fd) => Some((fd.name.clone(), fd.clone())),
+            _ => None,
+        })
+        .collect();
+    let report = diff::compute_diff(&old_fns, &new_fns, /* body_patches: */ true);
+
+    // Build new imports map (one entry per source file we just read).
+    let mut new_imports: ImportMap = ImportMap::new();
+    let file_key = std::path::PathBuf::from(path).file_name()
+        .map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| path.clone());
+    let entry = new_imports.entry(file_key).or_default();
     for s in &stages {
-        // Imports aren't stages.
-        if matches!(s, Stage::Import(_)) { continue; }
-        let id = store.publish(s).with_context(|| "publishing stage")?;
-        if activate {
-            store.activate(&id).with_context(|| format!("activating {id}"))?;
+        if let Stage::Import(im) = s {
+            entry.insert(im.reference.clone());
         }
-        let name = match s { Stage::FnDecl(fd) => &fd.name, Stage::TypeDecl(td) => &td.name, _ => "?" };
-        let sig = sig_id(s).unwrap_or_else(|| "-".into());
-        let entry = serde_json::json!({
-            "name": name,
-            "sig_id": sig,
-            "stage_id": id,
-            "status": format!("{:?}", store.get_status(&id)?).to_lowercase(),
-        });
-        out.push(entry);
     }
-    let data = serde_json::json!({ "published": out });
-    acli::emit_or_text("publish", data, fmt, || {
-        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+
+    let op_kinds = diff_to_ops(DiffInputs {
+        old_head: &old_head,
+        old_name_to_sig: &old_name_to_sig,
+        old_effects: &old_effects,
+        old_imports: &old_imports,
+        new_stages: &stages,
+        new_imports: &new_imports,
+        diff: &report,
+    }).map_err(|e| anyhow!("diff_to_ops: {e}"))?;
+
+    if dry_run {
+        let actions: Vec<serde_json::Value> = op_kinds.iter()
+            .map(|k| serde_json::to_value(k).unwrap())
+            .collect();
+        acli::emit_dry_run("publish", fmt,
+            &format!("would apply {} op(s) to branch {}", op_kinds.len(), branch),
+            actions);
+        return Ok(());
+    }
+
+    // For each op: persist any new stage AST/metadata, then apply_operation.
+    let mut emitted: Vec<serde_json::Value> = Vec::new();
+    let mut last_op_id: Option<String> = None;
+    for kind in op_kinds {
+        // Find the corresponding new stage (if any) and publish it via
+        // the existing Store::publish path so the AST/metadata files exist.
+        let stage_to_publish = stage_for_kind(&kind, &stages);
+        if let Some(stg) = stage_to_publish {
+            // Skip imports — Store::publish rejects them.
+            if !matches!(stg, Stage::Import(_)) {
+                store.publish(stg).with_context(|| "publishing stage")?;
+                if activate {
+                    if let Some(stage_id_str) = stage_id(stg) {
+                        store.activate(&stage_id_str).ok();
+                    }
+                }
+            }
+        }
+        let transition = transition_for_kind(&kind);
+        let head_now = store.get_branch(&branch)?.and_then(|b| b.head_op);
+        let op = Operation::new(kind.clone(), head_now.into_iter().collect::<Vec<_>>());
+        let op_id = store.apply_operation(&branch, op, transition)?;
+        emitted.push(serde_json::json!({
+            "op_id": op_id,
+            "kind": serde_json::to_value(&kind)?,
+        }));
+        last_op_id = Some(op_id);
+    }
+
+    let data = serde_json::json!({
+        "ops": emitted,
+        "head_op": last_op_id,
     });
+    acli::emit_or_text("publish", data, fmt, || {});
     Ok(())
+}
+
+fn stage_for_kind<'a>(kind: &lex_vcs::OperationKind, stages: &'a [Stage]) -> Option<&'a Stage> {
+    use lex_vcs::OperationKind::*;
+    let target_sig = match kind {
+        AddFunction { sig_id, .. } | ModifyBody { sig_id, .. }
+        | ChangeEffectSig { sig_id, .. } | AddType { sig_id, .. }
+        | ModifyType { sig_id, .. } => Some(sig_id.clone()),
+        RenameSymbol { to, .. } => Some(to.clone()),
+        _ => None,
+    };
+    let target_sig = target_sig?;
+    stages.iter().find(|s| sig_id(s).as_deref() == Some(target_sig.as_str()))
+}
+
+fn transition_for_kind(kind: &lex_vcs::OperationKind) -> lex_vcs::StageTransition {
+    use lex_vcs::OperationKind::*;
+    use lex_vcs::StageTransition;
+    match kind {
+        AddFunction { sig_id, stage_id, .. }
+        | AddType { sig_id, stage_id } => StageTransition::Create {
+            sig_id: sig_id.clone(), stage_id: stage_id.clone(),
+        },
+        RemoveFunction { sig_id, last_stage_id }
+        | RemoveType { sig_id, last_stage_id } => StageTransition::Remove {
+            sig_id: sig_id.clone(), last: last_stage_id.clone(),
+        },
+        ModifyBody { sig_id, from_stage_id, to_stage_id }
+        | ChangeEffectSig { sig_id, from_stage_id, to_stage_id, .. }
+        | ModifyType { sig_id, from_stage_id, to_stage_id } => StageTransition::Replace {
+            sig_id: sig_id.clone(),
+            from: from_stage_id.clone(),
+            to:   to_stage_id.clone(),
+        },
+        RenameSymbol { from, to, body_stage_id } => StageTransition::Rename {
+            from: from.clone(), to: to.clone(),
+            body_stage_id: body_stage_id.clone(),
+        },
+        AddImport { .. } | RemoveImport { .. } => StageTransition::ImportOnly,
+        Merge { .. } => StageTransition::Merge { entries: Default::default() },
+    }
+}
+
+fn derive_imports_from_oplog(
+    store: &Store,
+    branch: &str,
+) -> Result<lex_vcs::ImportMap> {
+    use lex_vcs::OperationKind::*;
+    let log = lex_vcs::OpLog::open(store.root())?;
+    let head = match store.get_branch(branch)?.and_then(|b| b.head_op) {
+        Some(h) => h,
+        None => return Ok(Default::default()),
+    };
+    let mut out: lex_vcs::ImportMap = Default::default();
+    for r in log.walk_forward(&head, None)? {
+        match r.op.kind {
+            AddImport { in_file, module } => {
+                out.entry(in_file).or_default().insert(module);
+            }
+            RemoveImport { in_file, module } => {
+                if let Some(set) = out.get_mut(&in_file) { set.remove(&module); }
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
 }
 
 fn cmd_store(fmt: &OutputFormat, args: &[String]) -> Result<()> {

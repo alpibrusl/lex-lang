@@ -28,3 +28,6 @@ conformance = { path = "../conformance" }
 spec-checker = { path = "../spec-checker" }
 acli = "0.5"
 notify = { version = "6", default-features = false, features = ["macos_kqueue"] }
+
+[dev-dependencies]
+tempfile = "3"

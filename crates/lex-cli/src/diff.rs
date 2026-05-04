@@ -153,7 +153,7 @@ fn load_fns(path: &std::path::Path) -> Result<BTreeMap<String, FnDecl>> {
     Ok(out)
 }
 
-fn compute_diff(
+pub(crate) fn compute_diff(
     a: &BTreeMap<String, FnDecl>,
     b: &BTreeMap<String, FnDecl>,
     body_patches: bool,
