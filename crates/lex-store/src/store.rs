@@ -519,12 +519,14 @@ impl Store {
                 }
             }
             let transition = transition_for_kind(&kind);
+            let attestable = attestable_stage_ids(&transition);
             let head_now = self.get_branch(branch)?.and_then(|b| b.head_op);
             let op = lex_vcs::Operation::new(
                 kind.clone(),
                 head_now.into_iter().collect::<Vec<_>>(),
             );
             let op_id = self.apply_operation(branch, op, transition)?;
+            self.record_typecheck_passed(&attestable, &op_id)?;
             ops_out.push(PublishOp {
                 op_id: op_id.clone(),
                 kind: serde_json::to_value(&kind)
@@ -632,7 +634,56 @@ impl Store {
         if let Err(errors) = lex_types::check_program(candidate) {
             return Err(StoreError::TypeError(errors));
         }
-        self.apply_operation(branch, op, transition)
+        let attestable = attestable_stage_ids(&transition);
+        let op_id = self.apply_operation(branch, op, transition)?;
+        self.record_typecheck_passed(&attestable, &op_id)?;
+        Ok(op_id)
+    }
+
+    /// Open the attestation log rooted at this store. The log lives
+    /// under `<root>/attestations/`; opening is idempotent and cheap
+    /// (`fs::create_dir_all`). Exposed publicly so consumers — `lex
+    /// blame --with-evidence`, `GET /v1/stage/<id>/attestations` —
+    /// can read what the store gate emitted without round-tripping
+    /// through this crate's API surface.
+    pub fn attestation_log(&self) -> Result<lex_vcs::AttestationLog, StoreError> {
+        Ok(lex_vcs::AttestationLog::open(self.root())?)
+    }
+
+    /// Emit one `TypeCheck::Passed` attestation per stage produced by
+    /// a successful gated apply. Idempotent on `attestation_id` —
+    /// re-running the same gate run dedups via content addressing.
+    ///
+    /// Failure modes: `io::Error` from the attestation log (disk
+    /// full, perms). The op has already landed by the time this
+    /// runs; an error here means the op is durable but the evidence
+    /// is missing. We propagate so the caller sees the partial
+    /// state rather than silently swallowing — re-attesting the
+    /// same op against the same op_id is idempotent (content
+    /// addressing) so a retry is safe once the underlying issue is
+    /// fixed.
+    fn record_typecheck_passed(
+        &self,
+        stage_ids: &[String],
+        op_id: &lex_vcs::OpId,
+    ) -> Result<(), StoreError> {
+        if stage_ids.is_empty() {
+            return Ok(());
+        }
+        let log = self.attestation_log()?;
+        for stage_id in stage_ids {
+            let attestation = lex_vcs::Attestation::new(
+                stage_id.clone(),
+                Some(op_id.clone()),
+                None,
+                lex_vcs::AttestationKind::TypeCheck,
+                lex_vcs::AttestationResult::Passed,
+                typecheck_producer(),
+                None,
+            );
+            log.put(&attestation)?;
+        }
+        Ok(())
     }
 
     /// `set_branch_head_op` for the durability story on the branch
@@ -713,6 +764,38 @@ fn transition_for_kind(kind: &lex_vcs::OperationKind) -> lex_vcs::StageTransitio
         },
         AddImport { .. } | RemoveImport { .. } => StageTransition::ImportOnly,
         Merge { .. } => StageTransition::Merge { entries: Default::default() },
+    }
+}
+
+/// Producer identity for TypeCheck attestations emitted by the
+/// store-write gate. Pinned to this crate's name + version so an
+/// attestation produced by a different `lex-store` revision is
+/// distinguishable (content-hashed `produced_by`).
+fn typecheck_producer() -> lex_vcs::ProducerDescriptor {
+    lex_vcs::ProducerDescriptor {
+        tool: "lex-store".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        model: None,
+    }
+}
+
+/// The set of stage_ids a transition introduces. These are the
+/// stages a successful TypeCheck pass attests *about* — the new
+/// head produced by Create/Replace, the renamed body, or the per-
+/// sig resolution of a Merge. Removes and ImportOnly produce no
+/// attestable stage; the program typechecks but no specific stage
+/// is the subject of the claim.
+fn attestable_stage_ids(transition: &lex_vcs::StageTransition) -> Vec<String> {
+    use lex_vcs::StageTransition::*;
+    match transition {
+        Create { stage_id, .. } => vec![stage_id.clone()],
+        Replace { to, .. } => vec![to.clone()],
+        Rename { body_stage_id, .. } => vec![body_stage_id.clone()],
+        Merge { entries } => entries
+            .values()
+            .filter_map(|opt| opt.clone())
+            .collect(),
+        Remove { .. } | ImportOnly => Vec::new(),
     }
 }
 

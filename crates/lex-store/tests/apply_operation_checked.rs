@@ -7,6 +7,7 @@
 use lex_ast::canonicalize_program;
 use lex_store::{Operation, OperationKind, StageTransition, Store, StoreError, DEFAULT_BRANCH};
 use lex_syntax::parse_source;
+use lex_vcs::{AttestationKind, AttestationResult};
 use std::collections::BTreeSet;
 
 fn fresh() -> (Store, tempfile::TempDir) {
@@ -124,6 +125,103 @@ fn apply_operation_checked_does_not_advance_head_after_rejection() {
         Some(head1.as_str()),
         "branch head should still point at head1 after rejected op",
     );
+}
+
+#[test]
+fn apply_operation_checked_emits_typecheck_attestation_for_created_stage() {
+    // After a clean checked apply, the store-write gate persists a
+    // TypeCheck::Passed attestation against the produced stage.
+    // Issue #132: "Emitted by the store-write gate (#130) on every
+    // accepted op."
+    let (s, _tmp) = fresh();
+    let candidate = parse(
+        "fn factorial(n :: Int) -> Int { match n { 0 => 1, _ => n * factorial(n - 1) } }\n",
+    );
+    let (op, t) = add_fac_op();
+    let op_id = s
+        .apply_operation_checked(DEFAULT_BRANCH, op, t, &candidate)
+        .expect("clean candidate should pass the gate");
+
+    let log = s.attestation_log().unwrap();
+    let listing = log.list_for_stage(&"stg-1".to_string()).unwrap();
+    assert_eq!(listing.len(), 1, "exactly one attestation for the created stage");
+    let att = &listing[0];
+    assert!(matches!(att.kind, AttestationKind::TypeCheck));
+    assert!(matches!(att.result, AttestationResult::Passed));
+    assert_eq!(att.op_id.as_deref(), Some(op_id.as_str()));
+    assert_eq!(att.stage_id, "stg-1");
+    assert_eq!(att.produced_by.tool, "lex-store");
+}
+
+#[test]
+fn apply_operation_checked_emits_no_attestation_on_rejection() {
+    // Type-broken candidate: no op landed, no attestation written.
+    // The TypeCheck attestation is *evidence the gate passed*, so
+    // it must not appear when the gate rejected.
+    let (s, _tmp) = fresh();
+    let candidate = parse("fn broken(x :: Int) -> Int { not_defined(x) }\n");
+    let (op, t) = add_fac_op();
+    let _ = s
+        .apply_operation_checked(DEFAULT_BRANCH, op, t, &candidate)
+        .expect_err("expected TypeError");
+
+    let attestations_dir = s.root().join("attestations");
+    if attestations_dir.exists() {
+        // The dir may exist from a prior log open elsewhere; what
+        // matters is that no primary attestation file was written.
+        let primary_count = std::fs::read_dir(&attestations_dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .map(|e| e.path().extension().is_some_and(|x| x == "json"))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(primary_count, 0, "no attestation should be written on rejection");
+    }
+}
+
+#[test]
+fn apply_operation_checked_attestation_dedups_across_runs() {
+    // Re-applying the same logical op against the same parent state
+    // should produce the same attestation_id (content addressing),
+    // so the put is idempotent and the per-stage listing stays at 1.
+    // We can't directly retry `apply_operation_checked` (the second
+    // call will hit StaleParent), so we exercise dedup at the log
+    // level instead: the same attestation written twice should not
+    // produce two index entries.
+    let (s, _tmp) = fresh();
+    let candidate = parse(
+        "fn factorial(n :: Int) -> Int { match n { 0 => 1, _ => n * factorial(n - 1) } }\n",
+    );
+    let (op, t) = add_fac_op();
+    let op_id = s
+        .apply_operation_checked(DEFAULT_BRANCH, op, t, &candidate)
+        .unwrap();
+
+    let log = s.attestation_log().unwrap();
+    let listing_a = log.list_for_stage(&"stg-1".to_string()).unwrap();
+    assert_eq!(listing_a.len(), 1);
+
+    // Re-put the same attestation; idempotent on attestation_id.
+    let same = lex_vcs::Attestation::with_timestamp(
+        "stg-1".to_string(),
+        Some(op_id.clone()),
+        None,
+        AttestationKind::TypeCheck,
+        AttestationResult::Passed,
+        lex_vcs::ProducerDescriptor {
+            tool: "lex-store".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            model: None,
+        },
+        None,
+        listing_a[0].timestamp + 100,
+    );
+    log.put(&same).unwrap();
+
+    let listing_b = log.list_for_stage(&"stg-1".to_string()).unwrap();
+    assert_eq!(listing_b.len(), 1, "content addressing dedups across re-puts");
 }
 
 #[test]
