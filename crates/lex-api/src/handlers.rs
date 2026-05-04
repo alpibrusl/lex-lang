@@ -140,30 +140,48 @@ fn publish_handler(state: &State, body: &str) -> Response<std::io::Cursor<Vec<u8
     if let Err(errs) = lex_types::check_program(&stages) {
         return error_with_detail(422, "type errors", serde_json::to_value(&errs).unwrap());
     }
+
     let store = state.store.lock().unwrap();
-    let mut out = Vec::new();
-    for s in &stages {
-        if matches!(s, lex_ast::Stage::Import(_)) { continue; }
-        match store.publish(s) {
-            Ok(id) => {
-                if req.activate {
-                    if let Err(e) = store.activate(&id) {
-                        return error_response(500, format!("activate: {e}"));
-                    }
-                }
-                let name = match s {
-                    lex_ast::Stage::FnDecl(fd) => fd.name.clone(),
-                    lex_ast::Stage::TypeDecl(td) => td.name.clone(),
-                    _ => "?".into(),
-                };
-                let sig = lex_ast::sig_id(s).unwrap_or_default();
-                let status = format!("{:?}", store.get_status(&id).unwrap_or(lex_store::StageStatus::Draft)).to_lowercase();
-                out.push(serde_json::json!({"name": name, "sig_id": sig, "stage_id": id, "status": status}));
+    let branch = store.current_branch();
+
+    // Compute diff between what's already on the branch and the new program.
+    let old_head = match store.branch_head(&branch) {
+        Ok(h) => h,
+        Err(e) => return error_response(500, format!("branch_head: {e}")),
+    };
+    let old_fns: std::collections::BTreeMap<String, lex_ast::FnDecl> = old_head.values()
+        .filter_map(|stg| store.get_ast(stg).ok())
+        .filter_map(|s| match s {
+            lex_ast::Stage::FnDecl(fd) => Some((fd.name.clone(), fd)),
+            _ => None,
+        })
+        .collect();
+    let new_fns: std::collections::BTreeMap<String, lex_ast::FnDecl> = stages.iter()
+        .filter_map(|s| match s {
+            lex_ast::Stage::FnDecl(fd) => Some((fd.name.clone(), fd.clone())),
+            _ => None,
+        })
+        .collect();
+    let report = lex_vcs::compute_diff(&old_fns, &new_fns, false);
+
+    // Build new imports map from any Import stages in the source.
+    let mut new_imports: lex_vcs::ImportMap = lex_vcs::ImportMap::new();
+    {
+        let entry = new_imports.entry("api_source".to_string()).or_default();
+        for s in &stages {
+            if let lex_ast::Stage::Import(im) = s {
+                entry.insert(im.reference.clone());
             }
-            Err(e) => return error_response(500, format!("publish: {e}")),
         }
     }
-    json_response(200, &serde_json::Value::Array(out))
+
+    match store.publish_program(&branch, &stages, &report, &new_imports, req.activate) {
+        Ok(outcome) => json_response(200, &serde_json::json!({
+            "ops": outcome.ops,
+            "head_op": outcome.head_op,
+        })),
+        Err(e) => error_response(500, format!("publish_program: {e}")),
+    }
 }
 
 #[derive(Deserialize)]

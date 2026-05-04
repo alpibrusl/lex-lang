@@ -17,6 +17,7 @@ lex-bytecode = { path = "../lex-bytecode" }
 lex-runtime = { path = "../lex-runtime" }
 lex-store = { path = "../lex-store" }
 lex-trace = { path = "../lex-trace" }
+lex-vcs = { path = "../lex-vcs" }
 
 [dev-dependencies]
 tempfile = "3"

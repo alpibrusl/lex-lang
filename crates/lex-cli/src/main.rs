@@ -22,7 +22,7 @@ mod watch;
 
 use ::acli::OutputFormat;
 use anyhow::{anyhow, bail, Context, Result};
-use lex_ast::{canonicalize_program, sig_id, stage_canonical_hash_hex, stage_id, Stage};
+use lex_ast::{canonicalize_program, stage_canonical_hash_hex, stage_id, Stage};
 use lex_bytecode::{compile_program, vm::Vm, Value};
 use lex_runtime::{check_program as check_policy, DefaultHandler, Policy};
 use lex_store::Store;
@@ -724,7 +724,7 @@ fn parse_store_flag(args: &[String]) -> (PathBuf, Vec<String>, bool, bool) {
 }
 
 fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
-    use lex_vcs::{diff_to_ops, DiffInputs, ImportMap, Operation};
+    use lex_vcs::ImportMap;
 
     let (root, rest, activate, dry_run) = parse_store_flag(args);
     // Pull --branch off as well.
@@ -758,44 +758,14 @@ fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let store = Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
     let branch = branch.unwrap_or_else(|| store.current_branch());
 
-    // Build "old" view from the current branch head.
+    // Compute the diff. We need the old fns and new fns.
     let old_head = store.branch_head(&branch)?;
-    let old_name_to_sig: BTreeMap<String, String> = old_head.iter()
-        .filter_map(|(sig, stg)| {
-            store.get_metadata(stg).ok().map(|m| (m.name, sig.clone()))
-        })
-        .collect();
-    let old_effects: BTreeMap<String, BTreeSet<String>> = old_head.iter()
-        .filter_map(|(sig, stg)| {
-            let ast = store.get_ast(stg).ok()?;
-            match ast {
-                Stage::FnDecl(fd) => {
-                    let s: BTreeSet<String> = fd.effects.iter()
-                        .map(|e| e.name.clone()).collect();
-                    Some((sig.clone(), s))
-                }
-                _ => None,
-            }
-        })
-        .collect();
-    // Imports — derive from the op log on this branch.
-    let old_imports: ImportMap = derive_imports_from_oplog(&store, &branch)?;
-
-    // Compute the ast-diff using BTreeMap<String, FnDecl> inputs.
-    let old_fns: BTreeMap<String, lex_ast::FnDecl> = old_head.iter()
-        .filter_map(|(_sig, stg)| {
-            let ast = store.get_ast(stg).ok()?;
-            match ast {
-                Stage::FnDecl(fd) => Some((fd.name.clone(), fd)),
-                _ => None,
-            }
-        })
+    let old_fns: BTreeMap<String, lex_ast::FnDecl> = old_head.values()
+        .filter_map(|stg| store.get_ast(stg).ok())
+        .filter_map(|s| match s { Stage::FnDecl(fd) => Some((fd.name.clone(), fd)), _ => None })
         .collect();
     let new_fns: BTreeMap<String, lex_ast::FnDecl> = stages.iter()
-        .filter_map(|s| match s {
-            Stage::FnDecl(fd) => Some((fd.name.clone(), fd.clone())),
-            _ => None,
-        })
+        .filter_map(|s| match s { Stage::FnDecl(fd) => Some((fd.name.clone(), fd.clone())), _ => None })
         .collect();
     let report = diff::compute_diff(&old_fns, &new_fns, /* body_patches: */ true);
 
@@ -810,17 +780,37 @@ fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         }
     }
 
-    let op_kinds = diff_to_ops(DiffInputs {
-        old_head: &old_head,
-        old_name_to_sig: &old_name_to_sig,
-        old_effects: &old_effects,
-        old_imports: &old_imports,
-        new_stages: &stages,
-        new_imports: &new_imports,
-        diff: &report,
-    }).map_err(|e| anyhow!("diff_to_ops: {e}"))?;
-
     if dry_run {
+        // Compute the op kinds for the dry-run preview using diff_to_ops
+        // directly, without persisting anything.
+        let old_name_to_sig: BTreeMap<String, String> = old_head.iter()
+            .filter_map(|(sig, stg)| {
+                store.get_metadata(stg).ok().map(|m| (m.name, sig.clone()))
+            })
+            .collect();
+        let old_effects: BTreeMap<String, BTreeSet<String>> = old_head.iter()
+            .filter_map(|(sig, stg)| {
+                let ast = store.get_ast(stg).ok()?;
+                match ast {
+                    Stage::FnDecl(fd) => {
+                        let s: BTreeSet<String> = fd.effects.iter()
+                            .map(|e| e.name.clone()).collect();
+                        Some((sig.clone(), s))
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        let old_imports = lex_vcs::ImportMap::new();
+        let op_kinds = lex_vcs::diff_to_ops(lex_vcs::DiffInputs {
+            old_head: &old_head,
+            old_name_to_sig: &old_name_to_sig,
+            old_effects: &old_effects,
+            old_imports: &old_imports,
+            new_stages: &stages,
+            new_imports: &new_imports,
+            diff: &report,
+        }).map_err(|e| anyhow!("diff_to_ops: {e}"))?;
         let actions: Vec<serde_json::Value> = op_kinds.iter()
             .map(|k| serde_json::to_value(k).unwrap())
             .collect();
@@ -830,107 +820,13 @@ fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    // For each op: persist any new stage AST/metadata, then apply_operation.
-    let mut emitted: Vec<serde_json::Value> = Vec::new();
-    let mut last_op_id: Option<String> = None;
-    for kind in op_kinds {
-        // Find the corresponding new stage (if any) and publish it via
-        // the existing Store::publish path so the AST/metadata files exist.
-        let stage_to_publish = stage_for_kind(&kind, &stages);
-        if let Some(stg) = stage_to_publish {
-            // Skip imports — Store::publish rejects them.
-            if !matches!(stg, Stage::Import(_)) {
-                store.publish(stg).with_context(|| "publishing stage")?;
-                if activate {
-                    if let Some(stage_id_str) = stage_id(stg) {
-                        store.activate(&stage_id_str).ok();
-                    }
-                }
-            }
-        }
-        let transition = transition_for_kind(&kind);
-        let head_now = store.get_branch(&branch)?.and_then(|b| b.head_op);
-        let op = Operation::new(kind.clone(), head_now.into_iter().collect::<Vec<_>>());
-        let op_id = store.apply_operation(&branch, op, transition)?;
-        emitted.push(serde_json::json!({
-            "op_id": op_id,
-            "kind": serde_json::to_value(&kind)?,
-        }));
-        last_op_id = Some(op_id);
-    }
-
+    let outcome = store.publish_program(&branch, &stages, &report, &new_imports, activate)?;
     let data = serde_json::json!({
-        "ops": emitted,
-        "head_op": last_op_id,
+        "ops": outcome.ops,
+        "head_op": outcome.head_op,
     });
     acli::emit_or_text("publish", data, fmt, || {});
     Ok(())
-}
-
-fn stage_for_kind<'a>(kind: &lex_vcs::OperationKind, stages: &'a [Stage]) -> Option<&'a Stage> {
-    use lex_vcs::OperationKind::*;
-    let target_sig = match kind {
-        AddFunction { sig_id, .. } | ModifyBody { sig_id, .. }
-        | ChangeEffectSig { sig_id, .. } | AddType { sig_id, .. }
-        | ModifyType { sig_id, .. } => Some(sig_id.clone()),
-        RenameSymbol { to, .. } => Some(to.clone()),
-        _ => None,
-    };
-    let target_sig = target_sig?;
-    stages.iter().find(|s| sig_id(s).as_deref() == Some(target_sig.as_str()))
-}
-
-fn transition_for_kind(kind: &lex_vcs::OperationKind) -> lex_vcs::StageTransition {
-    use lex_vcs::OperationKind::*;
-    use lex_vcs::StageTransition;
-    match kind {
-        AddFunction { sig_id, stage_id, .. }
-        | AddType { sig_id, stage_id } => StageTransition::Create {
-            sig_id: sig_id.clone(), stage_id: stage_id.clone(),
-        },
-        RemoveFunction { sig_id, last_stage_id }
-        | RemoveType { sig_id, last_stage_id } => StageTransition::Remove {
-            sig_id: sig_id.clone(), last: last_stage_id.clone(),
-        },
-        ModifyBody { sig_id, from_stage_id, to_stage_id }
-        | ChangeEffectSig { sig_id, from_stage_id, to_stage_id, .. }
-        | ModifyType { sig_id, from_stage_id, to_stage_id } => StageTransition::Replace {
-            sig_id: sig_id.clone(),
-            from: from_stage_id.clone(),
-            to:   to_stage_id.clone(),
-        },
-        RenameSymbol { from, to, body_stage_id } => StageTransition::Rename {
-            from: from.clone(), to: to.clone(),
-            body_stage_id: body_stage_id.clone(),
-        },
-        AddImport { .. } | RemoveImport { .. } => StageTransition::ImportOnly,
-        Merge { .. } => StageTransition::Merge { entries: Default::default() },
-    }
-}
-
-fn derive_imports_from_oplog(
-    store: &Store,
-    branch: &str,
-) -> Result<lex_vcs::ImportMap> {
-    use lex_vcs::OperationKind::*;
-    let log = lex_vcs::OpLog::open(store.root())?;
-    let head = match store.get_branch(branch)?.and_then(|b| b.head_op) {
-        Some(h) => h,
-        None => return Ok(Default::default()),
-    };
-    let mut out: lex_vcs::ImportMap = Default::default();
-    for r in log.walk_forward(&head, None)? {
-        match r.op.kind {
-            AddImport { in_file, module } => {
-                out.entry(in_file).or_default().insert(module);
-            }
-            RemoveImport { in_file, module } => {
-                if let Some(set) = out.get_mut(&in_file) { set.remove(&module); }
-            }
-            _ => {}
-        }
-    }
-    Ok(out)
 }
 
 fn cmd_store(fmt: &OutputFormat, args: &[String]) -> Result<()> {
