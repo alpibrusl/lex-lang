@@ -72,8 +72,8 @@ pub fn merge(
     for sig in sigs {
         let s = src_by_sig.get(sig);
         let d = dst_by_sig.get(sig);
-        let s_stage = s.map(|recs| latest_stage(recs));
-        let d_stage = d.map(|recs| latest_stage(recs));
+        let s_stage = s.map(|recs| latest_stage(sig, recs));
+        let d_stage = d.map(|recs| latest_stage(sig, recs));
         match (s, d) {
             (Some(s_recs), Some(d_recs)) => {
                 let s_last = s_recs.last().map(|r| r.op_id.as_str()).unwrap_or("");
@@ -116,7 +116,7 @@ pub fn merge(
 fn group_by_sig(ops: &[OperationRecord]) -> BTreeMap<SigId, Vec<&OperationRecord>> {
     let mut out: BTreeMap<SigId, Vec<&OperationRecord>> = BTreeMap::new();
     for r in ops {
-        if let Some(sig) = touched_sig(&r.op.kind) {
+        for sig in touched_sigs(&r.op.kind) {
             out.entry(sig).or_default().push(r);
         }
     }
@@ -126,7 +126,7 @@ fn group_by_sig(ops: &[OperationRecord]) -> BTreeMap<SigId, Vec<&OperationRecord
     out
 }
 
-fn touched_sig(k: &OperationKind) -> Option<SigId> {
+fn touched_sigs(k: &OperationKind) -> Vec<SigId> {
     match k {
         OperationKind::AddFunction { sig_id, .. }
         | OperationKind::RemoveFunction { sig_id, .. }
@@ -134,20 +134,37 @@ fn touched_sig(k: &OperationKind) -> Option<SigId> {
         | OperationKind::ChangeEffectSig { sig_id, .. }
         | OperationKind::AddType { sig_id, .. }
         | OperationKind::RemoveType { sig_id, .. }
-        | OperationKind::ModifyType { sig_id, .. } => Some(sig_id.clone()),
-        OperationKind::RenameSymbol { to, .. } => Some(to.clone()),
+        | OperationKind::ModifyType { sig_id, .. } => vec![sig_id.clone()],
+        // A rename touches both sides — concurrent modifies on `from`
+        // must surface as a conflict, not as a disjoint set.
+        OperationKind::RenameSymbol { from, to, .. } => vec![from.clone(), to.clone()],
         OperationKind::AddImport { .. }
         | OperationKind::RemoveImport { .. }
-        | OperationKind::Merge { .. } => None,
+        | OperationKind::Merge { .. } => Vec::new(),
     }
 }
 
 /// Given a chronological (oldest-first) list of ops on a sig, return
 /// the resulting stage_id (`None` if the sig was removed).
-fn latest_stage(recs: &[&OperationRecord]) -> Option<StageId> {
-    use crate::operation::StageTransition::*;
+///
+/// The `sig` parameter is used to distinguish the `from` and `to`
+/// sides of a `RenameSymbol` operation: from the `from` sig's
+/// perspective the rename removes it; from the `to` sig's perspective
+/// it produces `body_stage_id`.
+fn latest_stage(sig: &SigId, recs: &[&OperationRecord]) -> Option<StageId> {
+    use crate::operation::{OperationKind as OK, StageTransition::*};
     let mut current: Option<StageId> = None;
     for r in recs {
+        // For renames: distinguish which side of the rename we're on.
+        if let OK::RenameSymbol { from, to, body_stage_id } = &r.op.kind {
+            if sig == from {
+                // From this sig's perspective, the rename removed it.
+                current = None;
+            } else if sig == to {
+                current = Some(body_stage_id.clone());
+            }
+            continue;
+        }
         match &r.produces {
             Create { stage_id, .. } => current = Some(stage_id.clone()),
             Replace { to, .. } => current = Some(to.clone()),
@@ -197,8 +214,15 @@ fn classify(
         (true,  true, true)  => ConflictKind::ModifyModify,
         (true,  true, false) => ConflictKind::ModifyDelete,
         (true,  false, true) => ConflictKind::DeleteModify,
-        // Other combos shouldn't happen for a "both touched" group.
-        _ => ConflictKind::ModifyModify,
+        // Other combos shouldn't happen for a "both touched" group:
+        // both sides touched the sig, so at least one should have a
+        // result, and the (false, false, false) / (true, false, false)
+        // shapes are unreachable. Surface as a panic in debug builds
+        // so future invariant violations are loud, not silent.
+        other => {
+            debug_assert!(false, "classify: unreachable shape {other:?} for sig {sig}");
+            ConflictKind::ModifyModify
+        }
     }
 }
 
@@ -283,5 +307,46 @@ mod tests {
         let b = add_fn(&log, None, "b", "sb");
         let out = merge(&log, Some(&a), Some(&b)).unwrap();
         assert!(out.lca.is_none());
+    }
+
+    #[test]
+    fn rename_on_src_with_concurrent_modify_on_dst_conflicts() {
+        // src renames fac → fac2 (same body). dst modifies fac's body.
+        // The merge must surface a conflict on `fac` (modify-delete from
+        // dst's perspective: dst modified, src "removed" via rename),
+        // not silently report disjoint outcomes that lose dst's change.
+        let (log, _tmp) = fresh();
+        let root = add_fn(&log, None, "fac", "s0");
+
+        // src: rename fac → fac2.
+        let rename_op = Operation::new(
+            OperationKind::RenameSymbol {
+                from: "fac".into(),
+                to: "fac2".into(),
+                body_stage_id: "s0".into(),
+            },
+            [root.clone()],
+        );
+        let rename_t = StageTransition::Rename {
+            from: "fac".into(), to: "fac2".into(),
+            body_stage_id: "s0".into(),
+        };
+        let src = apply(&log, Some(&root), rename_op, rename_t).unwrap().op_id;
+
+        // dst: modify fac body.
+        let dst = modify_body(&log, &root, "fac", "s0", "s-dst");
+
+        let out = merge(&log, Some(&src), Some(&dst)).unwrap();
+
+        // The `fac` sig should produce a conflict because both sides
+        // touched it (src via rename's `from`, dst via modify).
+        let fac_outcome = out.outcomes.iter().find(|o| match o {
+            MergeOutcome::Conflict { sig_id, .. }
+            | MergeOutcome::Src { sig_id, .. }
+            | MergeOutcome::Dst { sig_id, .. }
+            | MergeOutcome::Both { sig_id, .. } => sig_id == "fac",
+        });
+        assert!(matches!(fac_outcome, Some(MergeOutcome::Conflict { .. })),
+            "expected `fac` to be a conflict, got {fac_outcome:?}");
     }
 }

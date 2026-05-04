@@ -355,19 +355,38 @@ impl Store {
             }
         }
         let src_head = self.get_branch(&report.summary.src)?.and_then(|b| b.head_op);
-        let dst_head = self.get_branch(dst)?.and_then(|b| b.head_op);
-        let parents: Vec<_> = [src_head, dst_head].into_iter().flatten().collect();
+        let dst_head_op = self.get_branch(dst)?.and_then(|b| b.head_op);
 
-        // Skip the apply if both sides are at the same head — there's
-        // nothing structural to record. Still journal the merge below.
-        if !parents.is_empty() && parents.windows(2).all(|w| w[0] != w[1]) {
-            let op = lex_vcs::Operation::new(
-                lex_vcs::OperationKind::Merge { resolved: entries.len() },
-                parents,
-            );
-            let t = lex_vcs::StageTransition::Merge { entries };
-            let _ = self.apply_operation(dst, op, t)?;
+        match (src_head.clone(), dst_head_op.clone()) {
+            // Fast-forward: dst is empty, just adopt src's head.
+            (Some(s), None) => {
+                self.set_branch_head_op(dst, s)?;
+            }
+            // Both sides have heads at the same op: nothing structural
+            // to merge. Skip apply but still journal below.
+            (Some(s), Some(d)) if s == d => { /* no-op */ }
+            (Some(s), Some(d)) => {
+                let op = lex_vcs::Operation::new(
+                    lex_vcs::OperationKind::Merge { resolved: entries.len() },
+                    [s, d],
+                );
+                let t = lex_vcs::StageTransition::Merge { entries };
+                let _ = self.apply_operation(dst, op, t)?;
+            }
+            // src empty: nothing to merge in. Treat as no-op.
+            (None, _) => { /* no-op */ }
         }
+
+        // Atomicity note: the merge op is durable after apply_operation
+        // returns; the journal entry below is a separate write. A
+        // crash between leaves the merge in the op DAG but no journal
+        // row — `lex log` will be missing this merge. The branch is
+        // still functionally correct (head_op points at the merge op,
+        // which carries `entries`), so the gap is recoverable by
+        // re-running commit_merge once (which will journal but skip
+        // the apply on the same-head match arm above). Tier-1 single-
+        // writer assumption applies; multi-writer locking is on the
+        // table for #130.
 
         // Journal the merge so `lex log` can show it.
         let mut b = self.get_branch(dst)?
