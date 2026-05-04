@@ -12,3 +12,4 @@ thiserror.workspace = true
 indexmap.workspace = true
 
 [dev-dependencies]
+tempfile = "3"

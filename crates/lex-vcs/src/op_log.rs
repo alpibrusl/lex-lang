@@ -1,0 +1,313 @@
+//! Persistence + DAG queries for the operation log.
+//!
+//! Layout: `<root>/ops/<op_id>.json` — one canonical-JSON file
+//! per [`OperationRecord`]. Atomic writes via tempfile + rename.
+//! Idempotent: writing an existing op_id is a no-op (content
+//! addressing guarantees the bytes match).
+
+use crate::operation::{OpId, OperationRecord};
+use std::collections::BTreeSet;
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
+pub struct OpLog {
+    dir: PathBuf,
+}
+
+impl OpLog {
+    pub fn open(root: &Path) -> io::Result<Self> {
+        let dir = root.join("ops");
+        fs::create_dir_all(&dir)?;
+        Ok(Self { dir })
+    }
+
+    fn path(&self, op_id: &OpId) -> PathBuf {
+        self.dir.join(format!("{op_id}.json"))
+    }
+
+    pub fn put(&self, rec: &OperationRecord) -> io::Result<()> {
+        let path = self.path(&rec.op_id);
+        if path.exists() {
+            return Ok(());
+        }
+        let bytes = serde_json::to_vec(rec)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let tmp = path.with_extension("json.tmp");
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+        fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    pub fn get(&self, op_id: &OpId) -> io::Result<Option<OperationRecord>> {
+        let path = self.path(op_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&path)?;
+        let rec: OperationRecord = serde_json::from_slice(&bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        Ok(Some(rec))
+    }
+
+    /// Walk parents transitively. Newest-first, BFS, dedup'd by op_id.
+    /// Stops at parentless ops or after `limit` records.
+    pub fn walk_back(
+        &self,
+        head: &OpId,
+        limit: Option<usize>,
+    ) -> io::Result<Vec<OperationRecord>> {
+        let mut out = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut frontier = vec![head.clone()];
+        while let Some(id) = frontier.pop() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            if let Some(rec) = self.get(&id)? {
+                // Push parents before recording so traversal order is
+                // a stable BFS-by-discovery: children-first, then their
+                // parents, parents of those, etc.
+                for p in &rec.op.parents {
+                    if !seen.contains(p) {
+                        frontier.insert(0, p.clone());
+                    }
+                }
+                out.push(rec);
+                if let Some(n) = limit {
+                    if out.len() >= n {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Same set as walk_back but oldest-first. Used by branch_head
+    /// for left-to-right transition replay.
+    pub fn walk_forward(
+        &self,
+        head: &OpId,
+        limit: Option<usize>,
+    ) -> io::Result<Vec<OperationRecord>> {
+        let mut all = self.walk_back(head, None)?;
+        all.reverse();
+        if let Some(n) = limit {
+            all.truncate(n);
+        }
+        Ok(all)
+    }
+
+    /// Lowest common ancestor of two op_ids in the DAG. None if no
+    /// shared ancestor exists.
+    pub fn lca(&self, a: &OpId, b: &OpId) -> io::Result<Option<OpId>> {
+        let a_anc: BTreeSet<OpId> = self
+            .walk_back(a, None)?
+            .into_iter()
+            .map(|r| r.op_id)
+            .collect();
+        // Walk b's ancestors in newest-first order; first hit is the LCA
+        // (newest-first guarantees the deepest, i.e. lowest, ancestor
+        // common to both).
+        for rec in self.walk_back(b, None)? {
+            if a_anc.contains(&rec.op_id) {
+                return Ok(Some(rec.op_id));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Ops in `head`'s history that are not in `base`'s history.
+    /// `base = None` means "include all of head's history" (used for
+    /// independent-histories case where the LCA is None).
+    pub fn ops_since(
+        &self,
+        head: &OpId,
+        base: Option<&OpId>,
+    ) -> io::Result<Vec<OperationRecord>> {
+        let exclude: BTreeSet<OpId> = match base {
+            Some(b) => self
+                .walk_back(b, None)?
+                .into_iter()
+                .map(|r| r.op_id)
+                .collect(),
+            None => BTreeSet::new(),
+        };
+        Ok(self
+            .walk_back(head, None)?
+            .into_iter()
+            .filter(|r| !exclude.contains(&r.op_id))
+            .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::operation::{Operation, OperationKind, StageTransition};
+    use std::collections::BTreeSet;
+
+    fn add_op() -> OperationRecord {
+        let op = Operation::new(
+            OperationKind::AddFunction {
+                sig_id: "fac::Int->Int".into(),
+                stage_id: "abc123".into(),
+                effects: BTreeSet::new(),
+            },
+            [],
+        );
+        OperationRecord::new(
+            op,
+            StageTransition::Create {
+                sig_id: "fac::Int->Int".into(),
+                stage_id: "abc123".into(),
+            },
+        )
+    }
+
+    fn modify_op(parent: &OpId, sig: &str, from: &str, to: &str) -> OperationRecord {
+        let op = Operation::new(
+            OperationKind::ModifyBody {
+                sig_id: sig.into(),
+                from_stage_id: from.into(),
+                to_stage_id: to.into(),
+            },
+            [parent.clone()],
+        );
+        OperationRecord::new(
+            op,
+            StageTransition::Replace {
+                sig_id: sig.into(),
+                from: from.into(),
+                to: to.into(),
+            },
+        )
+    }
+
+    #[test]
+    fn put_then_get_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = OpLog::open(tmp.path()).unwrap();
+        let rec = add_op();
+        log.put(&rec).unwrap();
+        let back = log.get(&rec.op_id).unwrap().unwrap();
+        assert_eq!(back, rec);
+    }
+
+    #[test]
+    fn put_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = OpLog::open(tmp.path()).unwrap();
+        let rec = add_op();
+        log.put(&rec).unwrap();
+        log.put(&rec).unwrap(); // second write is a no-op
+        assert!(log.get(&rec.op_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn get_missing_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = OpLog::open(tmp.path()).unwrap();
+        assert!(log.get(&"deadbeef".to_string()).unwrap().is_none());
+    }
+
+    #[test]
+    fn walk_back_returns_newest_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = OpLog::open(tmp.path()).unwrap();
+        let a = add_op();
+        log.put(&a).unwrap();
+        let b = modify_op(&a.op_id, "fac::Int->Int", "abc123", "def456");
+        log.put(&b).unwrap();
+        let c = modify_op(&b.op_id, "fac::Int->Int", "def456", "789aaa");
+        log.put(&c).unwrap();
+
+        let walked = log.walk_back(&c.op_id, None).unwrap();
+        let ids: Vec<_> = walked.iter().map(|r| r.op_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![c.op_id.as_str(), b.op_id.as_str(), a.op_id.as_str()]
+        );
+    }
+
+    #[test]
+    fn walk_forward_returns_oldest_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = OpLog::open(tmp.path()).unwrap();
+        let a = add_op();
+        log.put(&a).unwrap();
+        let b = modify_op(&a.op_id, "fac::Int->Int", "abc123", "def456");
+        log.put(&b).unwrap();
+
+        let walked = log.walk_forward(&b.op_id, None).unwrap();
+        let ids: Vec<_> = walked.iter().map(|r| r.op_id.as_str()).collect();
+        assert_eq!(ids, vec![a.op_id.as_str(), b.op_id.as_str()]);
+    }
+
+    #[test]
+    fn lca_finds_common_ancestor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = OpLog::open(tmp.path()).unwrap();
+        let root = add_op();
+        log.put(&root).unwrap();
+        let left = modify_op(&root.op_id, "fac::Int->Int", "abc123", "left1");
+        log.put(&left).unwrap();
+        let right = modify_op(&root.op_id, "fac::Int->Int", "abc123", "right1");
+        log.put(&right).unwrap();
+
+        let lca = log.lca(&left.op_id, &right.op_id).unwrap();
+        assert_eq!(lca, Some(root.op_id));
+    }
+
+    #[test]
+    fn lca_none_for_independent_histories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = OpLog::open(tmp.path()).unwrap();
+        let a = add_op();
+        log.put(&a).unwrap();
+        // A second parentless op (different sig, so different op_id).
+        let b = OperationRecord::new(
+            Operation::new(
+                OperationKind::AddFunction {
+                    sig_id: "double::Int->Int".into(),
+                    stage_id: "ddd111".into(),
+                    effects: BTreeSet::new(),
+                },
+                [],
+            ),
+            StageTransition::Create {
+                sig_id: "double::Int->Int".into(),
+                stage_id: "ddd111".into(),
+            },
+        );
+        log.put(&b).unwrap();
+
+        assert_eq!(log.lca(&a.op_id, &b.op_id).unwrap(), None);
+    }
+
+    #[test]
+    fn ops_since_excludes_base_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = OpLog::open(tmp.path()).unwrap();
+        let a = add_op();
+        log.put(&a).unwrap();
+        let b = modify_op(&a.op_id, "fac::Int->Int", "abc123", "def456");
+        log.put(&b).unwrap();
+        let c = modify_op(&b.op_id, "fac::Int->Int", "def456", "789aaa");
+        log.put(&c).unwrap();
+
+        let since: Vec<_> = log
+            .ops_since(&c.op_id, Some(&a.op_id))
+            .unwrap()
+            .into_iter()
+            .map(|r| r.op_id)
+            .collect();
+        assert_eq!(since.len(), 2);
+        assert!(since.contains(&b.op_id));
+        assert!(since.contains(&c.op_id));
+        assert!(!since.contains(&a.op_id));
+    }
+}
