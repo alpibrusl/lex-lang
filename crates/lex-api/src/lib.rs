@@ -9,6 +9,7 @@
 //!   POST /v1/check           { source } → { ok: true } | [TypeError]
 //!   POST /v1/publish         { source, activate? } → [{ stage_id, sig_id, status }]
 //!   GET  /v1/stage/<id>      → { metadata, ast, status }
+//!   GET  /v1/stage/<id>/attestations → { attestations: [Attestation] }
 //!   POST /v1/run             { source, fn, args, policy } → { run_id, output | error }
 //!   GET  /v1/trace/<run_id>  → TraceTree
 //!   POST /v1/replay          { source, fn, args, policy, overrides } → { run_id, output | error }

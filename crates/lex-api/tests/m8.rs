@@ -119,6 +119,21 @@ fn agent_loop_publish_run_trace_diff() {
     assert_eq!(s, 200, "stage GET: {b}");
     assert!(b.contains("FnDecl"));
 
+    // 2b) #132: TypeCheck attestation written by the store-write
+    // gate is queryable via /v1/stage/<id>/attestations.
+    let (s, b) = http(&srv.addr, "GET", &format!("/v1/stage/{stage_id}/attestations"), "");
+    assert_eq!(s, 200, "attestations GET: {b}");
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    let atts = v["attestations"].as_array().expect("attestations array");
+    assert!(!atts.is_empty(), "publish should have produced a TypeCheck attestation");
+    assert_eq!(atts[0]["kind"]["kind"], "type_check");
+    assert_eq!(atts[0]["result"]["result"], "passed");
+    assert_eq!(atts[0]["produced_by"]["tool"], "lex-store");
+
+    // 2c) Unknown stage_id → 404 (matches /v1/stage/<id>'s shape).
+    let (s, _) = http(&srv.addr, "GET", "/v1/stage/nonexistent/attestations", "");
+    assert_eq!(s, 404, "unknown stage_id should 404");
+
     // 3) run the function
     let run_body = json!({"source": src, "fn": "factorial", "args": [5]}).to_string();
     let (s, b) = http(&srv.addr, "POST", "/v1/run", &run_body);

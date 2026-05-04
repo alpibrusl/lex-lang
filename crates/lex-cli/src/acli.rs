@@ -115,6 +115,7 @@ fn commands() -> Vec<CommandInfo> {
         cmd_blame(),
         cmd_publish(),
         cmd_store(),
+        cmd_stage(),
         cmd_trace(),
         cmd_replay(),
         cmd_diff(),
@@ -252,6 +253,20 @@ fn cmd_store() -> CommandInfo {
         .with_see_also(vec!["publish", "branch", "store-merge"]);
     info.subcommands = vec![list, get];
     info
+}
+
+fn cmd_stage() -> CommandInfo {
+    CommandInfo::new("stage", "print stage info, or list attestations for a stage")
+        .idempotent(true)
+        .add_argument("stage_id", "string", "StageId hex", true)
+        .add_option("--store", "string", "store root directory", None)
+        .add_option("--attestations", "bool", "list attestations instead of stage info", None)
+        .with_examples(vec![
+            ("Print stage info", "lex stage abc123..."),
+            ("List attestations", "lex stage abc123... --attestations"),
+            ("Machine-readable", "lex --output json stage abc123... --attestations"),
+        ])
+        .with_see_also(vec!["store", "blame", "publish"])
 }
 
 fn cmd_trace() -> CommandInfo {
