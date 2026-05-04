@@ -160,6 +160,19 @@ pub struct Operation {
     /// repo.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parents: Vec<OpId>,
+    /// The intent that caused this op, if known. Optional because
+    /// operations produced outside an agent harness (e.g. a human
+    /// running `lex publish` directly) don't have one.
+    ///
+    /// Including the intent in the canonical hash means the same
+    /// logical change made under different intents produces
+    /// different `OpId`s — causally distinct events should hash
+    /// distinctly. Ops with `intent_id: None` keep their existing
+    /// hashes (the field is omitted from the canonical JSON via
+    /// `skip_serializing_if`), so this is backwards-compatible
+    /// for stores written before #131.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_id: Option<crate::intent::IntentId>,
 }
 
 impl Operation {
@@ -170,13 +183,22 @@ impl Operation {
         let mut parents: Vec<OpId> = parents.into_iter().collect();
         parents.sort();
         parents.dedup();
-        Self { kind, parents }
+        Self { kind, parents, intent_id: None }
+    }
+
+    /// Tag this operation with the intent that produced it. The
+    /// builder shape keeps existing call sites untouched; agent
+    /// harnesses that record intent call this once before
+    /// applying the op.
+    pub fn with_intent(mut self, intent_id: impl Into<crate::intent::IntentId>) -> Self {
+        self.intent_id = Some(intent_id.into());
+        self
     }
 
     /// Compute this operation's content-addressed identity.
     ///
     /// Stable across runs and machines: same `(kind, payload,
-    /// sorted parents)` produces the same `OpId`. This is the
+    /// sorted parents, intent_id)` produces the same `OpId`. The
     /// invariant #129's automatic-dedup behavior relies on.
     pub fn op_id(&self) -> OpId {
         // Build a transient hashable view rather than hashing
@@ -186,6 +208,7 @@ impl Operation {
         let canonical = CanonicalView {
             kind: &self.kind,
             parents: self.parents.iter().collect::<IndexSet<_>>().into_iter().collect::<BTreeSet<_>>(),
+            intent_id: self.intent_id.as_deref(),
         };
         canonical::hash(&canonical)
     }
@@ -200,6 +223,11 @@ struct CanonicalView<'a> {
     #[serde(flatten)]
     kind: &'a OperationKind,
     parents: BTreeSet<&'a OpId>,
+    /// `skip_serializing_if = "Option::is_none"` keeps existing
+    /// `OpId`s stable for ops without an intent — the field is
+    /// omitted from the canonical JSON entirely.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    intent_id: Option<&'a str>,
 }
 
 /// An operation paired with its computed `OpId` and the resulting
@@ -391,6 +419,46 @@ mod tests {
             },
         );
         assert_eq!(rec.op_id, expected);
+    }
+
+    #[test]
+    fn intent_id_is_part_of_op_id_canonical_hash() {
+        // The dedup property: same `(kind, parents, intent_id)`
+        // produces the same OpId. Different intent_ids on
+        // otherwise-identical ops produce different OpIds, so
+        // causally distinct events (different prompts) hash
+        // distinctly.
+        let no_intent = Operation::new(add_factorial(), []);
+        let with_intent_a = Operation::new(add_factorial(), [])
+            .with_intent("intent-a");
+        let with_intent_b = Operation::new(add_factorial(), [])
+            .with_intent("intent-b");
+        let with_intent_a_again = Operation::new(add_factorial(), [])
+            .with_intent("intent-a");
+
+        // No-intent op is distinct from any intent-tagged variant.
+        assert_ne!(no_intent.op_id(), with_intent_a.op_id());
+        // Different intents → different OpIds.
+        assert_ne!(with_intent_a.op_id(), with_intent_b.op_id());
+        // Same intent → same OpId (the load-bearing dedup invariant).
+        assert_eq!(with_intent_a.op_id(), with_intent_a_again.op_id());
+    }
+
+    #[test]
+    fn op_without_intent_keeps_pre_intent_op_id() {
+        // Backwards-compat invariant: an op constructed without an
+        // intent must hash to the same value as it would have
+        // before #131 added the field. The golden test below pins
+        // the exact hash; this one asserts that adding then
+        // resetting to None doesn't drift.
+        let mut op = Operation::new(add_factorial(), []);
+        let baseline = op.op_id();
+        op.intent_id = Some("transient".into());
+        let with_intent = op.op_id();
+        assert_ne!(baseline, with_intent);
+        op.intent_id = None;
+        let back = op.op_id();
+        assert_eq!(baseline, back);
     }
 
     /// Golden hash. If this changes, the canonical form has shifted
