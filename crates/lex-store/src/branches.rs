@@ -123,6 +123,17 @@ impl Store {
 
     /// Computed view: walk the op log from the branch head and
     /// replay each transition into a SigId → StageId map.
+    ///
+    /// PERF: O(N) per call where N is the number of ops on this
+    /// branch's history. Each call: re-opens the op log (a `mkdir
+    /// -p ops/` syscall), BFS-walks the full ancestor set, allocates
+    /// a `BTreeSet<OpId>` + `Vec<OperationRecord>` + `BTreeMap`,
+    /// reverses, then linearly replays. No memoization. Tier-1 size
+    /// (a few hundred ops per branch) makes this acceptable; if
+    /// hotter consumers land (e.g. an HTTP-served `branch_head`),
+    /// memoize per-(branch_name, head_op) — the head_op tail of the
+    /// cache key is a content-addressed hash, so cache invalidation
+    /// is free.
     pub fn branch_head(&self, name: &str) -> Result<BTreeMap<String, String>, StoreError> {
         let b = match self.get_branch(name)? {
             Some(b) => b,
@@ -189,6 +200,24 @@ impl Store {
     /// Atomically set a branch's `head_op`. Used by `apply_operation`
     /// after a successful op apply. Materializes `main`'s branch file
     /// on first call (creates `branches/main.json`).
+    ///
+    /// Crash safety: the tempfile's data is fsync'd before rename
+    /// (see `write_branch_atomic`), so a successful return implies a
+    /// durable branch file at the final path. The containing directory
+    /// is not fsync'd; on a crash between rename and the directory's
+    /// metadata flush, the rename can be lost — the prior head (or
+    /// missing branch file for a fresh `main`) survives. The op record
+    /// itself is content-addressed and is independently durable in the
+    /// op log.
+    ///
+    /// Concurrency: single-writer per store. Two writers calling this
+    /// for the same branch race on read-modify-write of the JSON file
+    /// (each reads, mutates `head_op`, renames its tempfile in). Last
+    /// writer wins; the loser's head update is silently dropped, even
+    /// though both their op records survive in the op log. Tier-1
+    /// merge / `lex publish` callers run sequentially; multi-writer
+    /// safety (file locking) is on the table once `lex serve` becomes
+    /// a real concurrent producer (#130 territory).
     // Called by apply_operation in Task 5 (#129).
     #[allow(dead_code)]
     pub(crate) fn set_branch_head_op(
@@ -244,9 +273,12 @@ fn apply_transition(map: &mut BTreeMap<String, String>, t: &StageTransition) {
 // Called by set_branch_head_op which is wired up in Task 5 (#129).
 #[allow(dead_code)]
 fn write_branch_atomic(path: &std::path::Path, b: &Branch) -> Result<(), StoreError> {
+    use std::io::Write;
     let bytes = serde_json::to_vec_pretty(b)?;
     let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, bytes)?;
+    let mut f = fs::File::create(&tmp)?;
+    f.write_all(&bytes)?;
+    f.sync_all()?;
     fs::rename(&tmp, path)?;
     Ok(())
 }
