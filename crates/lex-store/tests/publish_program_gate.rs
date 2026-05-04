@@ -6,7 +6,7 @@
 use lex_ast::canonicalize_program;
 use lex_store::{Store, StoreError, DEFAULT_BRANCH};
 use lex_syntax::parse_source;
-use lex_vcs::{DiffReport, ImportMap};
+use lex_vcs::{AttestationKind, AttestationResult, DiffReport, ImportMap};
 
 fn fresh() -> (Store, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
@@ -107,4 +107,43 @@ fn publish_program_accepts_clean_program() {
     // `outcome.ops` may be empty (no diff entries to convert); the
     // load-bearing assertion is that we didn't error out.
     assert!(outcome.ops.is_empty() || !outcome.ops.is_empty());
+}
+
+#[test]
+fn publish_program_emits_typecheck_attestation_per_added_op() {
+    // A real diff that produces an `AddFunction` op should leave
+    // behind a TypeCheck::Passed attestation against the produced
+    // stage. Issue #132 specifies "every accepted op" — wired
+    // through `Store::publish_program`'s per-op apply loop.
+    let (store, _tmp) = fresh();
+    let stages = parse(
+        "fn factorial(n :: Int) -> Int { match n { 0 => 1, _ => n * factorial(n - 1) } }\n",
+    );
+
+    // Hand-construct a minimal diff that adds `factorial`. We don't
+    // exercise the diff machinery here — the `lex-vcs::compute_diff`
+    // tests cover that — we just need a non-empty diff so the
+    // publish loop produces an op.
+    let diff = lex_vcs::DiffReport {
+        added: vec![lex_vcs::diff_report::AddRemove {
+            name: "factorial".into(),
+            signature: "fn factorial(Int) -> Int".into(),
+        }],
+        ..Default::default()
+    };
+
+    let outcome = store
+        .publish_program(DEFAULT_BRANCH, &stages, &diff, &ImportMap::default(), true)
+        .expect("clean program should pass the gate");
+    assert_eq!(outcome.ops.len(), 1, "exactly one AddFunction op expected");
+
+    let log = store.attestation_log().unwrap();
+    let stage_id = lex_ast::stage_id(&stages[0]).unwrap();
+    let listing = log.list_for_stage(&stage_id).unwrap();
+    assert_eq!(listing.len(), 1, "one TypeCheck attestation per produced stage");
+    let att = &listing[0];
+    assert!(matches!(att.kind, AttestationKind::TypeCheck));
+    assert!(matches!(att.result, AttestationResult::Passed));
+    assert_eq!(att.op_id.as_ref(), Some(&outcome.ops[0].op_id));
+    assert_eq!(att.produced_by.tool, "lex-store");
 }
