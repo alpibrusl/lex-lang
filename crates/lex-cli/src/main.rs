@@ -896,7 +896,7 @@ fn cmd_stage(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             .with_context(|| format!("unknown stage `{id}`"))?;
         let log = store.attestation_log()?;
         let mut listing = log.list_for_stage(id)?;
-        listing.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        listing.sort_by_key(|a| std::cmp::Reverse(a.timestamp));
         let data = serde_json::json!({
             "stage_id": id,
             "attestations": serde_json::to_value(&listing)?,

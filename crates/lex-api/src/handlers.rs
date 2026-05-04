@@ -344,7 +344,7 @@ fn stage_attestations_handler(state: &State, id: &str) -> Response<std::io::Curs
         Ok(v) => v,
         Err(e) => return error_response(500, format!("list_for_stage: {e}")),
     };
-    listing.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    listing.sort_by_key(|a| std::cmp::Reverse(a.timestamp));
     json_response(200, &serde_json::json!({"attestations": listing}))
 }
 
