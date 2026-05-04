@@ -590,6 +590,51 @@ impl Store {
     /// can leave an orphan op record in the log with no branch
     /// pointing at it. The op is content-addressed and cheap to
     /// re-derive from the same source. See
+    /// Apply a single op against `branch`, gated on the candidate
+    /// program typechecking. The per-op variant of #130's
+    /// write-time gate — counterpart to [`Self::publish_program`]'s
+    /// batch-mode check.
+    ///
+    /// `candidate` is the sequence of `Stage`s that *would* exist
+    /// on this branch after the op is applied. Caller's
+    /// responsibility: today neither `lex-store` nor `lex-vcs`
+    /// reconstruct the candidate from the op + branch state on
+    /// behalf of the caller. The natural callers (HTTP `POST
+    /// /v1/publish` for a single op; agent harnesses driving
+    /// merges via the future #134 API) already have the candidate
+    /// in memory.
+    ///
+    /// On rejection: branch head unchanged, no op record persisted.
+    /// Same atomicity guarantee as the publish path.
+    ///
+    /// # Why a separate method, not a flag on `apply_operation`
+    ///
+    /// The merge engine in `lex-vcs::merge` calls
+    /// `Store::apply_operation` directly to land merge ops, and at
+    /// merge time the resolved program isn't a single `Vec<Stage>`
+    /// the way it is on the publish path — it's a per-sig
+    /// resolution map. Forcing a candidate through `apply_operation`
+    /// would either require the merge engine to assemble one (slow,
+    /// every active stage off disk) or accept `Option<&[Stage]>`
+    /// and silently skip the gate — the second is exactly the kind
+    /// of "secretly opt-out" path #130 is trying to remove. The
+    /// honest split is two methods: `apply_operation` for callers
+    /// that already typecheck their inputs (or don't need to —
+    /// rare, but the merge-resolve case), `apply_operation_checked`
+    /// for everyone else.
+    pub fn apply_operation_checked(
+        &self,
+        branch: &str,
+        op: lex_vcs::Operation,
+        transition: lex_vcs::StageTransition,
+        candidate: &[lex_ast::Stage],
+    ) -> Result<lex_vcs::OpId, StoreError> {
+        if let Err(errors) = lex_types::check_program(candidate) {
+            return Err(StoreError::TypeError(errors));
+        }
+        self.apply_operation(branch, op, transition)
+    }
+
     /// `set_branch_head_op` for the durability story on the branch
     /// file itself.
     pub fn apply_operation(
