@@ -29,6 +29,7 @@
 //! can swap with a one-line crate change since `OpId` is opaque.
 
 mod apply;
+mod attestation;
 mod canonical;
 mod compute_diff;
 pub mod diff_report;
@@ -40,6 +41,10 @@ mod op_log;
 mod operation;
 
 pub use apply::{apply, ApplyError, NewHead};
+pub use attestation::{
+    Attestation, AttestationId, AttestationKind, AttestationLog, AttestationResult, ContentHash,
+    Cost, ProducerDescriptor, Signature, SpecId, SpecMethod,
+};
 pub use compute_diff::{compute_diff, effect_label, render_signature};
 pub use diff_report::DiffReport;
 pub use diff_to_ops::{diff_to_ops, DiffInputs, DiffMappingError, ImportMap};
