@@ -49,8 +49,16 @@ pub enum StageTransition {
     Replace { sig_id: SigId, from: StageId, to: StageId },
     /// SigId removed; no head stage afterwards.
     Remove { sig_id: SigId, last: StageId },
-    /// SigId renamed; same body hash, different signature identity.
-    Rename { from: SigId, to: SigId, body_stage_id: StageId },
+    /// SigId renamed. Two stages produced with different `StageId`s
+    /// because the SigId hash includes the symbol name, even when
+    /// the body bytes are identical (the typical non-recursive
+    /// rename case).
+    Rename {
+        from_sig: SigId,
+        from_stage_id: StageId,
+        to_sig: SigId,
+        to_stage_id: StageId,
+    },
     /// Import-only change; doesn't touch any stage.
     ImportOnly,
 }
@@ -84,14 +92,18 @@ pub enum OperationKind {
         from_stage_id: StageId,
         to_stage_id: StageId,
     },
-    /// Symbol renamed. The body hash is preserved (`body_stage_id`)
-    /// so two renames of the same body collapse to the same OpId
-    /// and `lex blame` walks the rename as a single causal event
+    /// Symbol renamed. The body bytes are preserved (a non-recursive
+    /// rename produces the same `Stage` AST modulo the symbol name),
+    /// but the SigId hash includes the symbol name so the FROM and
+    /// TO stages have different `StageId`s. Both are recorded so
+    /// the apply pass can flip lifecycle state on each independently
+    /// and `lex blame` can walk the rename as a single causal event
     /// rather than `delete + add`.
     RenameSymbol {
-        from: SigId,
-        to: SigId,
-        body_stage_id: StageId,
+        from_sig: SigId,
+        from_stage_id: StageId,
+        to_sig: SigId,
+        to_stage_id: StageId,
     },
     /// Effect signature changed. Captures both old and new effect
     /// sets so the write-time gate (#130) can verify importers
@@ -271,15 +283,16 @@ mod tests {
     }
 
     #[test]
-    fn rename_with_same_body_hashes_equal_across_runs() {
+    fn rename_with_same_stages_hashes_equal_across_runs() {
         // Two independent runs producing the same rename against the
-        // same parent should produce the same OpId — this is the
+        // same parent should produce the same OpId — the
         // automatic-dedup property #129 relies on for distributed
         // agents.
         let kind = OperationKind::RenameSymbol {
-            from: "parse::Str->Int".into(),
-            to: "parse_int::Str->Int".into(),
-            body_stage_id: "abc123".into(),
+            from_sig: "parse::Str->Int".into(),
+            from_stage_id: "abc-from".into(),
+            to_sig: "parse_int::Str->Int".into(),
+            to_stage_id: "def-to".into(),
         };
         let a = Operation::new(kind.clone(), ["op-parent".into()]);
         let b = Operation::new(kind, ["op-parent".into()]);
@@ -293,23 +306,24 @@ mod tests {
         // AddFunction` pair. Causal history sees one event, not two.
         let rename = Operation::new(
             OperationKind::RenameSymbol {
-                from: "parse::Str->Int".into(),
-                to: "parse_int::Str->Int".into(),
-                body_stage_id: "abc123".into(),
+                from_sig: "parse::Str->Int".into(),
+                from_stage_id: "abc-from".into(),
+                to_sig: "parse_int::Str->Int".into(),
+                to_stage_id: "def-to".into(),
             },
             ["op-parent".into()],
         );
         let remove = Operation::new(
             OperationKind::RemoveFunction {
                 sig_id: "parse::Str->Int".into(),
-                last_stage_id: "abc123".into(),
+                last_stage_id: "abc-from".into(),
             },
             ["op-parent".into()],
         );
         let add = Operation::new(
             OperationKind::AddFunction {
                 sig_id: "parse_int::Str->Int".into(),
-                stage_id: "abc123".into(),
+                stage_id: "def-to".into(),
                 effects: BTreeSet::new(),
             },
             ["op-parent".into()],

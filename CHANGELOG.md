@@ -26,13 +26,17 @@ bumps may carry breaking changes when justified).
   persisting the resulting `OperationRecord` under
   `<root>/ops/<OpId>.json`. Dry-run preview via
   `compute_transition(store, &op)` returns the would-be
-  `StageTransition` without mutating anything. Supports 9 of 10
-  operation kinds; `RenameSymbol` requires a small follow-up to the
-  op enum (separate `from_stage_id` / `to_stage_id` fields, since
-  lex-store's StageId hash includes the symbol name) and currently
-  surfaces `ApplyError::NotYetImplemented` rather than corrupting
-  state. CLI surface, `diff_to_ops`, and the `lex publish` refactor
-  remain ahead.
+  `StageTransition` without mutating anything.
+- **`lex-vcs` `RenameSymbol` apply (#129 cont'd).** Tightens the
+  op enum: the `RenameSymbol` variant now carries `from_sig` /
+  `from_stage_id` / `to_sig` / `to_stage_id` (the
+  pre-rename hand-wave around a single `body_stage_id` couldn't
+  represent the recursive-rename case where call-site references
+  to the new name produce distinct stage hashes). Apply walks
+  the rename in one transition: activate the TO stage, then
+  Active → Deprecated → Tombstone the FROM stage. `lex blame`
+  sees one causal event rather than `delete + add`. The
+  `StageTransition::Rename` payload mirrors the new shape.
 - **`std.sql` — embedded SQL (SQLite).** Second of the OSS-Auditor
   stdlib follow-ups. Wraps `rusqlite` with the bundled SQLite
   feature so no system lib is required. Surface:

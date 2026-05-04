@@ -149,14 +149,26 @@ pub fn compute_transition(
             // pass has no stage-level work to do.
             Ok(StageTransition::ImportOnly)
         }
-        OperationKind::RenameSymbol { from, to, body_stage_id } => {
-            // body_stage_id is the FROM stage (lex-store's StageId
-            // hash includes the symbol name, so rename produces two
-            // stages with different ids). Tightening the op enum to
-            // carry both is a small follow-up; until then, surface
-            // a clean error rather than silently corrupting state.
-            let _ = (from, to, body_stage_id);
-            Err(ApplyError::NotYetImplemented("RenameSymbol"))
+        OperationKind::RenameSymbol {
+            from_sig,
+            from_stage_id,
+            to_sig,
+            to_stage_id,
+        } => {
+            // The TO stage must already exist (caller `Store::publish`d
+            // it before applying); the FROM stage must currently be
+            // the active head for `from_sig`. The rename collapses
+            // both into a single causal event — `lex blame` walks
+            // it as one transition rather than `delete + add`.
+            ensure_stage_present(store, to_stage_id)?;
+            ensure_active_matches(store, from_sig, from_stage_id)?;
+            ensure_no_active(store, to_sig)?;
+            Ok(StageTransition::Rename {
+                from_sig: from_sig.clone(),
+                from_stage_id: from_stage_id.clone(),
+                to_sig: to_sig.clone(),
+                to_stage_id: to_stage_id.clone(),
+            })
         }
     }
 }
@@ -200,10 +212,15 @@ fn apply_lifecycle(store: &Store, op: &Operation) -> Result<(), ApplyError> {
         OperationKind::AddImport { .. } | OperationKind::RemoveImport { .. } => {
             // No store-level mutation.
         }
-        OperationKind::RenameSymbol { .. } => {
-            // Unreachable — `compute_transition` already returned
-            // NotYetImplemented and short-circuited.
-            return Err(ApplyError::NotYetImplemented("RenameSymbol"));
+        OperationKind::RenameSymbol { from_stage_id, to_stage_id, .. } => {
+            // Activate the new TO stage (no auto-deprecate kicks in
+            // because it has a different SigId than the FROM stage).
+            // Then walk the FROM stage Active → Deprecated → Tombstone
+            // since the rename retires it. The `from_stage_id` is
+            // guaranteed Active by the precondition check.
+            store.activate(to_stage_id)?;
+            store.deprecate(from_stage_id, "renamed")?;
+            store.tombstone(from_stage_id)?;
         }
     }
     Ok(())

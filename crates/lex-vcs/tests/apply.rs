@@ -293,28 +293,153 @@ fn add_import_persists_record_without_touching_stages() {
     assert!(entries.is_empty(), "no stage directories should be created");
 }
 
-// ---- RenameSymbol (deferred) -------------------------------------
+// ---- RenameSymbol ------------------------------------------------
+
+// Recursive functions get distinct StageIds across renames because
+// the call-site references the new name (lex-store §4.6 acceptance).
+// Use them so `from_stage_id` and `to_stage_id` are guaranteed
+// distinct and `Store::activate` is unambiguous about which
+// (sig, stage) pair it's flipping.
+const FAC_FROM: &str =
+    "fn fac(n :: Int) -> Int { match n { 0 => 1, _ => n * fac(n - 1) } }\n";
+const FAC_TO: &str =
+    "fn factorial(n :: Int) -> Int { match n { 0 => 1, _ => n * factorial(n - 1) } }\n";
 
 #[test]
-fn rename_symbol_returns_not_yet_implemented() {
-    // Documented limitation: the op enum carries a single
-    // `body_stage_id`, but lex-store's StageId hash includes the
-    // symbol name, so a rename involves two stages with different
-    // ids. Tightening the op enum is a follow-up; until then the
-    // apply pass surfaces a clean error rather than silently
-    // corrupting state.
+fn rename_symbol_retires_from_sig_and_activates_to_sig() {
+    // Recursive rename: the body's `fac(n - 1)` becomes
+    // `factorial(n - 1)`, so the body bytes differ and the two
+    // stages have distinct StageIds. The apply walks the rename
+    // as a single causal event nonetheless.
     let tmp = TempDir::new().unwrap();
     let store = Store::open(tmp.path()).unwrap();
+    let s_from = one_stage(FAC_FROM, "fac");
+    let s_to = one_stage(FAC_TO, "factorial");
+    let from_sig = sig_id(&s_from).unwrap();
+    let to_sig = sig_id(&s_to).unwrap();
+    assert_ne!(from_sig, to_sig, "SigId includes the symbol name");
+    let from_stage = store.publish(&s_from).unwrap();
+    let to_stage = store.publish(&s_to).unwrap();
+    assert_ne!(
+        from_stage, to_stage,
+        "recursive rename produces distinct StageIds",
+    );
+    store.activate(&from_stage).unwrap();
+
     let op = Operation::new(
         OperationKind::RenameSymbol {
-            from: "parse::Str->Int".into(),
-            to: "parse_int::Str->Int".into(),
-            body_stage_id: "abc123".into(),
+            from_sig: from_sig.clone(),
+            from_stage_id: from_stage.clone(),
+            to_sig: to_sig.clone(),
+            to_stage_id: to_stage.clone(),
         },
         [],
     );
-    let err = apply_operation(&store, op).expect_err("expected NotYetImplemented");
-    assert!(matches!(err, ApplyError::NotYetImplemented("RenameSymbol")));
+    let record = apply_operation(&store, op).expect("apply rename");
+    assert_eq!(
+        record.produces,
+        StageTransition::Rename {
+            from_sig: from_sig.clone(),
+            from_stage_id: from_stage.clone(),
+            to_sig: to_sig.clone(),
+            to_stage_id: to_stage.clone(),
+        },
+    );
+
+    // FROM sig retired; TO sig now Active.
+    assert_eq!(store.resolve_sig(&from_sig).unwrap(), None);
+    assert_eq!(store.resolve_sig(&to_sig).unwrap(), Some(to_stage.clone()));
+    // FROM stage walked Active → Deprecated → Tombstone in one apply.
+    assert_eq!(store.get_status(&from_stage).unwrap(), StageStatus::Tombstone);
+    assert_eq!(store.get_status(&to_stage).unwrap(), StageStatus::Active);
+}
+
+#[test]
+fn rename_symbol_with_stale_from_is_rejected() {
+    let tmp = TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let s_to = one_stage(FAC_TO, "factorial");
+    let to_sig = sig_id(&s_to).unwrap();
+    let to_stage = store.publish(&s_to).unwrap();
+
+    let op = Operation::new(
+        OperationKind::RenameSymbol {
+            from_sig: "nonexistent::Int,Int->Int".into(),
+            from_stage_id: "wrong-from".into(),
+            to_sig,
+            to_stage_id: to_stage,
+        },
+        [],
+    );
+    let err = apply_operation(&store, op).expect_err("expected StaleParent");
+    assert!(matches!(err, ApplyError::StaleParent { .. }));
+}
+
+#[test]
+fn rename_symbol_against_an_already_active_to_sig_is_rejected() {
+    // If the TO sig already has an active stage, the rename would
+    // collide — surface as DuplicateAdd rather than silently
+    // overwriting.
+    let tmp = TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let s_from = one_stage(FAC_FROM, "fac");
+    let s_to = one_stage(FAC_TO, "factorial");
+    let from_sig = sig_id(&s_from).unwrap();
+    let to_sig = sig_id(&s_to).unwrap();
+    let from_stage = store.publish(&s_from).unwrap();
+    let to_stage = store.publish(&s_to).unwrap();
+    store.activate(&from_stage).unwrap();
+    store.activate(&to_stage).unwrap();
+
+    let op = Operation::new(
+        OperationKind::RenameSymbol {
+            from_sig,
+            from_stage_id: from_stage,
+            to_sig,
+            to_stage_id: to_stage,
+        },
+        [],
+    );
+    let err = apply_operation(&store, op).expect_err("expected DuplicateAdd");
+    assert!(matches!(err, ApplyError::DuplicateAdd { .. }));
+}
+
+#[test]
+fn rename_symbol_op_record_persists_with_correct_transition() {
+    let tmp = TempDir::new().unwrap();
+    let store = Store::open(tmp.path()).unwrap();
+    let s_from = one_stage(FAC_FROM, "fac");
+    let s_to = one_stage(FAC_TO, "factorial");
+    let from_sig = sig_id(&s_from).unwrap();
+    let to_sig = sig_id(&s_to).unwrap();
+    let from_stage = store.publish(&s_from).unwrap();
+    let to_stage = store.publish(&s_to).unwrap();
+    store.activate(&from_stage).unwrap();
+
+    let op = Operation::new(
+        OperationKind::RenameSymbol {
+            from_sig: from_sig.clone(),
+            from_stage_id: from_stage.clone(),
+            to_sig: to_sig.clone(),
+            to_stage_id: to_stage.clone(),
+        },
+        [],
+    );
+    let expected_id = op.op_id();
+    let record = apply_operation(&store, op).expect("apply");
+    let on_disk = load_record(&store, &expected_id).unwrap().unwrap();
+    assert_eq!(on_disk, record);
+    match on_disk.op.kind {
+        OperationKind::RenameSymbol {
+            from_sig: f, from_stage_id: fs, to_sig: t, to_stage_id: ts,
+        } => {
+            assert_eq!(f, from_sig);
+            assert_eq!(fs, from_stage);
+            assert_eq!(t, to_sig);
+            assert_eq!(ts, to_stage);
+        }
+        other => panic!("expected RenameSymbol, got {other:?}"),
+    }
 }
 
 // ---- compute_transition (preview / dry-run) ----------------------
