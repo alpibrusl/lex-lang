@@ -218,8 +218,6 @@ impl Store {
     /// merge / `lex publish` callers run sequentially; multi-writer
     /// safety (file locking) is on the table once `lex serve` becomes
     /// a real concurrent producer (#130 territory).
-    // Called by apply_operation in Task 5 (#129).
-    #[allow(dead_code)]
     pub(crate) fn set_branch_head_op(
         &self,
         name: &str,
@@ -270,8 +268,6 @@ fn apply_transition(map: &mut BTreeMap<String, String>, t: &StageTransition) {
     }
 }
 
-// Called by set_branch_head_op which is wired up in Task 5 (#129).
-#[allow(dead_code)]
 fn write_branch_atomic(path: &std::path::Path, b: &Branch) -> Result<(), StoreError> {
     use std::io::Write;
     let bytes = serde_json::to_vec_pretty(b)?;

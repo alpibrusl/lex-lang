@@ -412,6 +412,28 @@ impl Store {
     fn write_lifecycle(&self, sig: &str, life: &Lifecycle) -> Result<(), StoreError> {
         write_canonical_json(&self.lifecycle_path(sig), life)
     }
+
+    /// Apply an operation to a branch and advance its head_op.
+    ///
+    /// The single advance path. Validates parents via lex_vcs::apply,
+    /// persists the operation, then atomically advances the branch
+    /// file's head_op.
+    pub fn apply_operation(
+        &self,
+        branch: &str,
+        op: lex_vcs::Operation,
+        transition: lex_vcs::StageTransition,
+    ) -> Result<lex_vcs::OpId, StoreError> {
+        let log = lex_vcs::OpLog::open(self.root())?;
+        let head_op = self.get_branch(branch)?.and_then(|b| b.head_op);
+        let new_head = lex_vcs::apply(&log, head_op.as_ref(), op, transition)
+            .map_err(|e| match e {
+                lex_vcs::ApplyError::Persist(io) => StoreError::Io(io),
+                other => StoreError::InvalidTransition(other.to_string()),
+            })?;
+        self.set_branch_head_op(branch, new_head.op_id.clone())?;
+        Ok(new_head.op_id)
+    }
 }
 
 fn stage_name(stage: &Stage) -> &str {
