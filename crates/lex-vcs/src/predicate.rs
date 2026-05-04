@@ -312,16 +312,15 @@ fn collect_ancestor_ops(
     out: &mut std::collections::BTreeMap<OpId, std::collections::BTreeSet<OpId>>,
 ) -> std::io::Result<()> {
     match predicate {
-        Predicate::AncestorOf { op_id } => {
-            if !out.contains_key(op_id) {
-                let set: std::collections::BTreeSet<OpId> = op_log
-                    .walk_back(op_id, None)?
-                    .into_iter()
-                    .map(|r| r.op_id)
-                    .collect();
-                out.insert(op_id.clone(), set);
-            }
+        Predicate::AncestorOf { op_id } if !out.contains_key(op_id) => {
+            let set: std::collections::BTreeSet<OpId> = op_log
+                .walk_back(op_id, None)?
+                .into_iter()
+                .map(|r| r.op_id)
+                .collect();
+            out.insert(op_id.clone(), set);
         }
+        Predicate::AncestorOf { .. } => {}
         Predicate::And(ps) | Predicate::Or(ps) => {
             for p in ps {
                 collect_ancestor_ops(p, op_log, out)?;
