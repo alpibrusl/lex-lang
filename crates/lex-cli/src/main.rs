@@ -771,8 +771,11 @@ fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 
     // Build new imports map (one entry per source file we just read).
     let mut new_imports: ImportMap = ImportMap::new();
-    let file_key = std::path::PathBuf::from(path).file_name()
-        .map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| path.clone());
+    // Stable, transport-independent key. Per-file imports are not
+    // currently tracked separately — all imports of one publish are
+    // grouped under "<source>" so that publishing the same source
+    // via CLI vs HTTP produces identical op_ids.
+    let file_key = "<source>".to_string();
     let entry = new_imports.entry(file_key).or_default();
     for s in &stages {
         if let Stage::Import(im) = s {
@@ -801,7 +804,7 @@ fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                 }
             })
             .collect();
-        let old_imports = lex_vcs::ImportMap::new();
+        let old_imports = store.derive_imports_from_oplog(&branch)?;
         let op_kinds = lex_vcs::diff_to_ops(lex_vcs::DiffInputs {
             old_head: &old_head,
             old_name_to_sig: &old_name_to_sig,

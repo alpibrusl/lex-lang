@@ -526,7 +526,7 @@ impl Store {
         })
     }
 
-    fn derive_imports_from_oplog(
+    pub fn derive_imports_from_oplog(
         &self,
         branch: &str,
     ) -> Result<lex_vcs::ImportMap, StoreError> {
