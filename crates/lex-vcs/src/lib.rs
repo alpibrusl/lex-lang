@@ -37,6 +37,7 @@ mod diff_to_ops;
 mod gate;
 mod intent;
 mod merge;
+mod merge_session;
 mod op_log;
 mod operation;
 
@@ -51,6 +52,10 @@ pub use diff_to_ops::{diff_to_ops, DiffInputs, DiffMappingError, ImportMap};
 pub use gate::{check_and_apply, GateError};
 pub use intent::{Intent, IntentId, IntentLog, ModelDescriptor, SessionId};
 pub use merge::{merge, ConflictKind, MergeOutcome, MergeOutput};
+pub use merge_session::{
+    CommitError, ConflictId, ConflictRecord, MergeSession, MergeSessionId, ResolveVerdict,
+    Resolution, ResolutionRejection,
+};
 pub use op_log::OpLog;
 pub use operation::{
     EffectSet, ModuleRef, OpId, Operation, OperationRecord, OperationKind, SigId, StageId,
