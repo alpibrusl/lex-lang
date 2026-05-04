@@ -82,8 +82,14 @@ fn route(
         (Method::Post, "/v1/publish") => publish_handler(state, body),
         (Method::Post, "/v1/patch") => patch_handler(state, body),
         (Method::Get, p) if p.starts_with("/v1/stage/") => {
-            let id = &p["/v1/stage/".len()..];
-            stage_handler(state, id)
+            let suffix = &p["/v1/stage/".len()..];
+            // Match `/v1/stage/<id>/attestations` first so a literal
+            // stage_id of "attestations" can't be misrouted.
+            if let Some(id) = suffix.strip_suffix("/attestations") {
+                stage_attestations_handler(state, id)
+            } else {
+                stage_handler(state, suffix)
+            }
         }
         (Method::Post, "/v1/run") => run_handler(state, body, false),
         (Method::Post, "/v1/replay") => run_handler(state, body, true),
@@ -315,6 +321,31 @@ fn stage_handler(state: &State, id: &str) -> Response<std::io::Cursor<Vec<u8>>> 
         "ast": ast,
         "status": status,
     }))
+}
+
+/// `GET /v1/stage/<id>/attestations` — every persisted attestation
+/// for this stage, newest-first by timestamp. Issue #132's
+/// queryable-evidence consumer surface.
+///
+/// 404s on unknown stage_id (matches `/v1/stage/<id>`'s shape so a
+/// caller round-tripping both endpoints sees consistent errors).
+/// Empty list (200) is *evidence of absence*: the stage exists but
+/// no producer has attested it.
+fn stage_attestations_handler(state: &State, id: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    let store = state.store.lock().unwrap();
+    if let Err(e) = store.get_metadata(id) {
+        return error_response(404, format!("{e}"));
+    }
+    let log = match store.attestation_log() {
+        Ok(l) => l,
+        Err(e) => return error_response(500, format!("attestation log: {e}")),
+    };
+    let mut listing = match log.list_for_stage(&id.to_string()) {
+        Ok(v) => v,
+        Err(e) => return error_response(500, format!("list_for_stage: {e}")),
+    };
+    listing.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    json_response(200, &serde_json::json!({"attestations": listing}))
 }
 
 #[derive(Deserialize, Default)]

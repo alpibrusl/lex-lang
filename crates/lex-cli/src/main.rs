@@ -76,6 +76,7 @@ fn run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "blame" => cmd_blame(fmt, &args[1..]),
         "publish" => cmd_publish(fmt, &args[1..]),
         "store" => cmd_store(fmt, &args[1..]),
+        "stage" => cmd_stage(fmt, &args[1..]),
         "trace" => cmd_trace(fmt, &args[1..]),
         "replay" => cmd_replay(fmt, &args[1..]),
         "diff" => cmd_diff(fmt, &args[1..]),
@@ -145,6 +146,7 @@ fn print_usage() {
     println!("                                     publish each stage to the store as Draft");
     println!("  store list [--store DIR]           list SigIds in the store");
     println!("  store get [--store DIR] <stage>    print metadata + canonical AST for a StageId");
+    println!("  stage <stage> [--attestations]     print stage info, or list its attestations");
     println!("  trace <run_id>                     print a saved trace tree as JSON");
     println!("  replay <run_id> <file> <fn> [args] [--override NODE=JSON]...");
     println!("                                     re-execute with effect overrides keyed by NodeId");
@@ -871,6 +873,84 @@ fn cmd_store(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         }
         other => bail!("unknown `lex store` subcommand: {other}"),
     }
+}
+
+/// `lex stage <stage_id>` — print metadata + canonical AST + status.
+/// `lex stage <stage_id> --attestations` — list every attestation
+/// for the stage, newest-first by timestamp. CLI mirror of
+/// `GET /v1/stage/<id>` and `GET /v1/stage/<id>/attestations`.
+fn cmd_stage(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let (root, rest, _, _) = parse_store_flag(args);
+    let attestations_mode = rest.iter().any(|a| a == "--attestations");
+    let positional: Vec<&String> = rest.iter().filter(|a| !a.starts_with("--")).collect();
+    let id = positional
+        .first()
+        .ok_or_else(|| anyhow!("usage: lex stage <stage_id> [--attestations]"))?;
+    let store = Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
+
+    if attestations_mode {
+        // 404-equivalent: refuse to list against an unknown stage so
+        // callers can't silently get an empty list for a typo.
+        store
+            .get_metadata(id)
+            .with_context(|| format!("unknown stage `{id}`"))?;
+        let log = store.attestation_log()?;
+        let mut listing = log.list_for_stage(&(*id).clone())?;
+        listing.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        let data = serde_json::json!({
+            "stage_id": id,
+            "attestations": serde_json::to_value(&listing)?,
+        });
+        let listing_for_text = listing.clone();
+        acli::emit_or_text("stage", data, fmt, move || {
+            if listing_for_text.is_empty() {
+                println!("(no attestations)");
+                return;
+            }
+            for a in &listing_for_text {
+                let kind = match &a.kind {
+                    lex_vcs::AttestationKind::TypeCheck => "TypeCheck".to_string(),
+                    lex_vcs::AttestationKind::EffectAudit => "EffectAudit".to_string(),
+                    lex_vcs::AttestationKind::Examples { count, .. } => {
+                        format!("Examples({count})")
+                    }
+                    lex_vcs::AttestationKind::Spec { spec_id, .. } => {
+                        format!("Spec({spec_id})")
+                    }
+                    lex_vcs::AttestationKind::DiffBody { input_count, .. } => {
+                        format!("DiffBody({input_count})")
+                    }
+                    lex_vcs::AttestationKind::SandboxRun { effects } => {
+                        format!("SandboxRun([{}])", effects.iter().cloned().collect::<Vec<_>>().join(","))
+                    }
+                };
+                let result = match &a.result {
+                    lex_vcs::AttestationResult::Passed => "passed".to_string(),
+                    lex_vcs::AttestationResult::Failed { detail } => format!("failed: {detail}"),
+                    lex_vcs::AttestationResult::Inconclusive { detail } => format!("inconclusive: {detail}"),
+                };
+                println!(
+                    "{}\t{}\t{}\tby={}@{}",
+                    a.timestamp, kind, result, a.produced_by.tool, a.produced_by.version,
+                );
+            }
+        });
+        return Ok(());
+    }
+
+    // Default: stage info, mirroring `GET /v1/stage/<id>`.
+    let meta = store.get_metadata(id)?;
+    let ast = store.get_ast(id)?;
+    let status = format!("{:?}", store.get_status(id)?).to_lowercase();
+    let v = serde_json::json!({
+        "metadata": serde_json::to_value(&meta)?,
+        "ast": serde_json::to_value(&ast)?,
+        "status": status,
+    });
+    acli::emit_or_text("stage", v.clone(), fmt, || {
+        println!("{}", serde_json::to_string_pretty(&v).unwrap());
+    });
+    Ok(())
 }
 
 fn cmd_replay(fmt: &OutputFormat, args: &[String]) -> Result<()> {
