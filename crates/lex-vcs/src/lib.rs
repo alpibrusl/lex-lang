@@ -37,7 +37,7 @@ mod operation;
 
 pub use apply::{apply, ApplyError, NewHead};
 pub use diff_report::DiffReport;
-pub use diff_to_ops::{diff_to_ops, DiffInputs, ImportMap};
+pub use diff_to_ops::{diff_to_ops, DiffInputs, DiffMappingError, ImportMap};
 pub use op_log::OpLog;
 pub use operation::{
     EffectSet, ModuleRef, OpId, Operation, OperationRecord, OperationKind, SigId, StageId,
