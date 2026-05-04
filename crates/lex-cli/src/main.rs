@@ -882,9 +882,9 @@ fn cmd_store(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 fn cmd_stage(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let (root, rest, _, _) = parse_store_flag(args);
     let attestations_mode = rest.iter().any(|a| a == "--attestations");
-    let positional: Vec<&String> = rest.iter().filter(|a| !a.starts_with("--")).collect();
-    let id = positional
-        .first()
+    let id = rest
+        .iter()
+        .find(|a| !a.starts_with("--"))
         .ok_or_else(|| anyhow!("usage: lex stage <stage_id> [--attestations]"))?;
     let store = Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
 
@@ -895,19 +895,18 @@ fn cmd_stage(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             .get_metadata(id)
             .with_context(|| format!("unknown stage `{id}`"))?;
         let log = store.attestation_log()?;
-        let mut listing = log.list_for_stage(&(*id).clone())?;
+        let mut listing = log.list_for_stage(id)?;
         listing.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
         let data = serde_json::json!({
             "stage_id": id,
             "attestations": serde_json::to_value(&listing)?,
         });
-        let listing_for_text = listing.clone();
         acli::emit_or_text("stage", data, fmt, move || {
-            if listing_for_text.is_empty() {
+            if listing.is_empty() {
                 println!("(no attestations)");
                 return;
             }
-            for a in &listing_for_text {
+            for a in &listing {
                 let kind = match &a.kind {
                     lex_vcs::AttestationKind::TypeCheck => "TypeCheck".to_string(),
                     lex_vcs::AttestationKind::EffectAudit => "EffectAudit".to_string(),
@@ -921,7 +920,8 @@ fn cmd_stage(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                         format!("DiffBody({input_count})")
                     }
                     lex_vcs::AttestationKind::SandboxRun { effects } => {
-                        format!("SandboxRun([{}])", effects.iter().cloned().collect::<Vec<_>>().join(","))
+                        let joined: Vec<&str> = effects.iter().map(String::as_str).collect();
+                        format!("SandboxRun([{}])", joined.join(","))
                     }
                 };
                 let result = match &a.result {
