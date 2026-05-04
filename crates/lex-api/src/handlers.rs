@@ -180,6 +180,16 @@ fn publish_handler(state: &State, body: &str) -> Response<std::io::Cursor<Vec<u8
             "ops": outcome.ops,
             "head_op": outcome.head_op,
         })),
+        // The store-write gate (#130) also type-checks at the top
+        // of `publish_program`. The handler above already pre-checks,
+        // so this branch is reached only on a race or a state we
+        // didn't see at handler time. Surface the structured
+        // envelope (422) instead of a generic 500 — same shape the
+        // initial pre-check uses, so a client only has one error
+        // contract to handle.
+        Err(lex_store::StoreError::TypeError(errs)) => {
+            error_with_detail(422, "type errors", serde_json::to_value(&errs).unwrap())
+        }
         Err(e) => error_response(500, format!("publish_program: {e}")),
     }
 }
