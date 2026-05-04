@@ -116,6 +116,7 @@ fn commands() -> Vec<CommandInfo> {
         cmd_publish(),
         cmd_store(),
         cmd_stage(),
+        cmd_attest(),
         cmd_trace(),
         cmd_replay(),
         cmd_diff(),
@@ -274,6 +275,24 @@ fn cmd_stage() -> CommandInfo {
             ("Machine-readable", "lex --output json stage abc123... --attestations"),
         ])
         .with_see_also(vec!["store", "blame", "publish"])
+}
+
+fn cmd_attest() -> CommandInfo {
+    let filter = CommandInfo::new("filter", "list attestations matching kind / result / since filters")
+        .idempotent(true)
+        .add_option("--kind", "string", "attestation kind: type_check | spec | examples | diff_body | effect_audit | sandbox_run", None)
+        .add_option("--result", "string", "passed | failed | inconclusive", None)
+        .add_option("--since", "string", "epoch seconds or YYYY-MM-DD; only attestations on or after this time", None)
+        .add_option("--store", "string", "store root directory", None);
+    let mut info = CommandInfo::new("attest", "cross-stage attestation queries (CI / dashboards)")
+        .with_examples(vec![
+            ("All Spec verdicts that passed", "lex attest filter --kind spec --result passed"),
+            ("Recent type-check evidence", "lex attest filter --kind type_check --since 2026-05-01"),
+            ("Machine-readable", "lex --output json attest filter --kind spec"),
+        ])
+        .with_see_also(vec!["stage", "blame"]);
+    info.subcommands = vec![filter];
+    info
 }
 
 fn cmd_trace() -> CommandInfo {

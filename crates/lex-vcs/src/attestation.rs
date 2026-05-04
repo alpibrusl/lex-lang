@@ -382,6 +382,42 @@ impl AttestationLog {
         Ok(Some(attestation))
     }
 
+    /// Enumerate every attestation in the log. Walks
+    /// `<root>/attestations/*.json` directly — no per-stage index
+    /// — so cost is `O(total attestations)`. Used by `lex attest
+    /// filter` for CI / dashboard queries that span stages.
+    /// Order is not stable; callers that need stable ordering
+    /// should sort by `timestamp` or `attestation_id`.
+    pub fn list_all(&self) -> io::Result<Vec<Attestation>> {
+        let mut out = Vec::new();
+        if !self.dir.exists() {
+            return Ok(out);
+        }
+        for entry in fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            let p = entry.path();
+            // Skip the by-stage/ subdir and the .tmp staging files
+            // a crashed put might have left behind.
+            if p.is_dir() {
+                continue;
+            }
+            if p.extension().is_none_or(|e| e != "json") {
+                continue;
+            }
+            let bytes = fs::read(&p)?;
+            // A corrupt primary file shouldn't take down a filter
+            // query — log to stderr and skip.
+            match serde_json::from_slice::<Attestation>(&bytes) {
+                Ok(att) => out.push(att),
+                Err(e) => eprintln!(
+                    "warning: skipping unreadable attestation {}: {e}",
+                    p.display()
+                ),
+            }
+        }
+        Ok(out)
+    }
+
     /// Enumerate attestations for a given stage. Order is not
     /// stable across calls (it follows directory iteration order).
     /// Callers that need a stable ordering should sort by
@@ -728,6 +764,43 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let log = AttestationLog::open(tmp.path()).unwrap();
         let v = log.list_for_stage(&"never-attested".to_string()).unwrap();
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn list_all_returns_every_persisted_attestation() {
+        // Cross-stage enumeration: `list_all` walks the primary
+        // directory regardless of stage, so a CI / dashboard query
+        // can filter across the whole log without iterating the
+        // by-stage index.
+        let tmp = tempfile::tempdir().unwrap();
+        let log = AttestationLog::open(tmp.path()).unwrap();
+        let on_abc = typecheck_passed();
+        let on_xyz = Attestation::with_timestamp(
+            "stage-xyz",
+            Some("op-456".into()),
+            None,
+            AttestationKind::TypeCheck,
+            AttestationResult::Passed,
+            ci_runner(),
+            None,
+            2000,
+        );
+        log.put(&on_abc).unwrap();
+        log.put(&on_xyz).unwrap();
+        let mut all = log.list_all().unwrap();
+        all.sort_by_key(|a| a.attestation_id.clone());
+        assert_eq!(all.len(), 2);
+        let ids: BTreeSet<_> = all.iter().map(|a| a.attestation_id.clone()).collect();
+        assert!(ids.contains(&on_abc.attestation_id));
+        assert!(ids.contains(&on_xyz.attestation_id));
+    }
+
+    #[test]
+    fn list_all_on_empty_log_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = AttestationLog::open(tmp.path()).unwrap();
+        let v = log.list_all().unwrap();
         assert!(v.is_empty());
     }
 
