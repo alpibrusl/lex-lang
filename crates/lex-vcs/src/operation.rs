@@ -53,6 +53,13 @@ pub enum StageTransition {
     Rename { from: SigId, to: SigId, body_stage_id: StageId },
     /// Import-only change; doesn't touch any stage.
     ImportOnly,
+    /// Merge op result. `entries` lists only the sigs whose head
+    /// changed relative to the merge op's first parent (`dst_head`):
+    /// `Some(stage_id)` sets the head; `None` removes the sig.
+    /// Sigs unaffected by the merge are not listed.
+    Merge {
+        entries: std::collections::BTreeMap<SigId, Option<StageId>>,
+    },
 }
 
 /// The kinds of operations that produce stage transitions. Mirrors
@@ -126,6 +133,13 @@ pub enum OperationKind {
         sig_id: SigId,
         from_stage_id: StageId,
         to_stage_id: StageId,
+    },
+    /// Merge of two branch heads. Carries only an informational count
+    /// of resolved sigs so two structurally identical merges of
+    /// different sizes don't collide on op_id; the per-sig deltas live
+    /// in `OperationRecord::produces` (`StageTransition::Merge`).
+    Merge {
+        resolved: usize,
     },
 }
 
@@ -394,6 +408,53 @@ mod tests {
             },
             [],
         );
+        assert_eq!(
+            op.op_id(),
+            "f112990d31ef2a63f3e5ca5680637ed36a54bc7e8230510ae0c0e93fcb39d104"
+        );
+    }
+
+    #[test]
+    fn merge_kind_round_trips() {
+        let op = Operation::new(
+            OperationKind::Merge { resolved: 3 },
+            ["op-a".into(), "op-b".into()],
+        );
+        let json = serde_json::to_string(&op).expect("ser");
+        let back: Operation = serde_json::from_str(&json).expect("de");
+        assert_eq!(op, back);
+        assert_eq!(op.op_id(), back.op_id());
+    }
+
+    #[test]
+    fn merge_stage_transition_round_trips() {
+        let mut entries = std::collections::BTreeMap::new();
+        entries.insert("sig-a".to_string(), Some("stage-a".to_string()));
+        entries.insert("sig-b".to_string(), None); // removed by merge
+        let t = StageTransition::Merge { entries };
+        let json = serde_json::to_string(&t).expect("ser");
+        let back: StageTransition = serde_json::from_str(&json).expect("de");
+        assert_eq!(t, back);
+    }
+
+    #[test]
+    fn merge_resolved_count_changes_op_id() {
+        // Two merges with the same parents but different resolved counts
+        // must hash differently — keeps structurally distinct merges from
+        // colliding on op_id.
+        let parents: Vec<OpId> = vec!["op-a".into(), "op-b".into()];
+        let one = Operation::new(OperationKind::Merge { resolved: 1 }, parents.clone());
+        let two = Operation::new(OperationKind::Merge { resolved: 2 }, parents);
+        assert_ne!(one.op_id(), two.op_id());
+    }
+
+    #[test]
+    fn existing_add_function_op_id_is_unchanged_after_merge_added() {
+        // Sanity: adding a new variant to the serde-tagged enum must not
+        // perturb the canonical bytes (or therefore op_id) of existing
+        // variants. The golden hash test below is also a guard, but this
+        // one fails with a clearer message if tag rendering shifts.
+        let op = Operation::new(add_factorial(), []);
         assert_eq!(
             op.op_id(),
             "f112990d31ef2a63f3e5ca5680637ed36a54bc7e8230510ae0c0e93fcb39d104"
