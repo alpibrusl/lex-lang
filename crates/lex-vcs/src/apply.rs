@@ -45,6 +45,12 @@ pub fn apply(
         (0, None) => {}
         (1, Some(h)) if op.parents[0] == *h => {}
         (2, Some(h)) => {
+            if op.parents[0] == op.parents[1] {
+                return Err(ApplyError::StaleParent {
+                    expected: head_op.cloned(),
+                    op_parents: op.parents.clone(),
+                });
+            }
             if op.parents[0] != *h && op.parents[1] != *h {
                 return Err(ApplyError::StaleParent {
                     expected: head_op.cloned(),
@@ -109,7 +115,13 @@ mod tests {
         let head1 = apply(&log, None, op1, t1).unwrap();
         let (op2, t2) = add_fac(); // parentless again
         let err = apply(&log, Some(&head1.op_id), op2, t2).unwrap_err();
-        assert!(matches!(err, ApplyError::StaleParent { .. }));
+        match err {
+            ApplyError::StaleParent { expected, op_parents } => {
+                assert_eq!(expected.as_deref(), Some(head1.op_id.as_str()));
+                assert!(op_parents.is_empty());
+            }
+            other => panic!("expected StaleParent, got {other:?}"),
+        }
     }
 
     #[test]
@@ -141,7 +153,6 @@ mod tests {
         let log = OpLog::open(tmp.path()).unwrap();
         let (op1, t1) = add_fac();
         let head1 = apply(&log, None, op1, t1).unwrap();
-        // op claims a different parent than head.
         let bogus = Operation::new(
             OperationKind::ModifyBody {
                 sig_id: "fac".into(),
@@ -156,7 +167,13 @@ mod tests {
             to: "s2".into(),
         };
         let err = apply(&log, Some(&head1.op_id), bogus, t).unwrap_err();
-        assert!(matches!(err, ApplyError::StaleParent { .. }));
+        match err {
+            ApplyError::StaleParent { expected, op_parents } => {
+                assert_eq!(expected.as_deref(), Some(head1.op_id.as_str()));
+                assert_eq!(op_parents, vec!["someone-else".to_string()]);
+            }
+            other => panic!("expected StaleParent, got {other:?}"),
+        }
     }
 
     #[test]
@@ -201,6 +218,86 @@ mod tests {
         );
         let t = StageTransition::Merge { entries: Default::default() };
         let err = apply(&log, Some(&head_a.op_id), merge, t).unwrap_err();
-        assert!(matches!(err, ApplyError::UnknownMergeParent(_)));
+        match err {
+            ApplyError::UnknownMergeParent(id) => {
+                assert_eq!(id, "ghost");
+            }
+            other => panic!("expected UnknownMergeParent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn three_parent_op_is_stale() {
+        // Catch-all arm: any arity > 2 is rejected.
+        let tmp = tempfile::tempdir().unwrap();
+        let log = OpLog::open(tmp.path()).unwrap();
+        let (op_a, t_a) = add_fac();
+        let head_a = apply(&log, None, op_a, t_a).unwrap();
+
+        // Hand-construct an Operation with three parents (Operation::new
+        // dedups but accepts arbitrary count).
+        let weird = Operation::new(
+            OperationKind::ModifyBody {
+                sig_id: "fac".into(),
+                from_stage_id: "s1".into(),
+                to_stage_id: "s2".into(),
+            },
+            [head_a.op_id.clone(), "p2".into(), "p3".into()],
+        );
+        let t = StageTransition::Replace {
+            sig_id: "fac".into(), from: "s1".into(), to: "s2".into(),
+        };
+        let err = apply(&log, Some(&head_a.op_id), weird, t).unwrap_err();
+        assert!(matches!(err, ApplyError::StaleParent { .. }));
+    }
+
+    #[test]
+    fn single_parent_against_empty_head_is_stale() {
+        // Catch-all arm: 1 parent + None head is rejected.
+        let tmp = tempfile::tempdir().unwrap();
+        let log = OpLog::open(tmp.path()).unwrap();
+        let modify = Operation::new(
+            OperationKind::ModifyBody {
+                sig_id: "fac".into(),
+                from_stage_id: "s1".into(),
+                to_stage_id: "s2".into(),
+            },
+            ["claimed-parent".into()],
+        );
+        let t = StageTransition::Replace {
+            sig_id: "fac".into(), from: "s1".into(), to: "s2".into(),
+        };
+        let err = apply(&log, None, modify, t).unwrap_err();
+        match err {
+            ApplyError::StaleParent { expected, op_parents } => {
+                assert_eq!(expected, None);
+                assert_eq!(op_parents, vec!["claimed-parent".to_string()]);
+            }
+            other => panic!("expected StaleParent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn self_merge_is_stale() {
+        // Direct deserialization could produce parents = [h, h] which
+        // bypasses Operation::new's dedup. The gate must still reject.
+        let tmp = tempfile::tempdir().unwrap();
+        let log = OpLog::open(tmp.path()).unwrap();
+        let (op_a, t_a) = add_fac();
+        let head_a = apply(&log, None, op_a, t_a).unwrap();
+
+        // Construct an Operation with two equal parents *without* going
+        // through `new` (which dedups). Use serde_json round-trip.
+        let json = serde_json::json!({
+            "op": "merge",
+            "resolved": 0,
+            "parents": [head_a.op_id.clone(), head_a.op_id.clone()],
+        });
+        let weird: Operation = serde_json::from_value(json).unwrap();
+        assert_eq!(weird.parents.len(), 2,
+            "round-trip should preserve duplicates if Operation deserialization doesn't dedup");
+        let t = StageTransition::Merge { entries: Default::default() };
+        let err = apply(&log, Some(&head_a.op_id), weird, t).unwrap_err();
+        assert!(matches!(err, ApplyError::StaleParent { .. }));
     }
 }
