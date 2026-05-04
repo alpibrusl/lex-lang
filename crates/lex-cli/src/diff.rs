@@ -47,10 +47,13 @@ use lex_ast::{
     canonicalize_program, CExpr, Effect, FnDecl, Stage, TypeExpr,
 };
 use lex_syntax::parse_source;
-use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
+
+pub use lex_vcs::diff_report::{
+    AddRemove, BodyPatch, DiffReport, EffectChanges, Modified, Renamed,
+};
 
 #[derive(Default)]
 struct DiffOpts {
@@ -60,58 +63,6 @@ struct DiffOpts {
     /// because that's the wow; off via --no-body if the caller wants
     /// just signature-level deltas.
     body_patches: bool,
-}
-
-#[derive(Serialize)]
-struct AddRemove {
-    name: String,
-    signature: String,
-}
-
-#[derive(Serialize)]
-struct Renamed {
-    from: String,
-    to: String,
-    signature: String,
-}
-
-#[derive(Serialize)]
-struct Modified {
-    name: String,
-    signature_before: String,
-    signature_after: String,
-    signature_changed: bool,
-    effect_changes: EffectChanges,
-    body_patches: Vec<BodyPatch>,
-}
-
-/// Effect-set delta for a modified fn. Empty `added`/`removed`
-/// means effect-equivalent (the body or non-effect parts of the
-/// signature changed). Renderings include the effect arg, so e.g.
-/// `fs_read("/tmp")` vs. `fs_read("/etc")` show up as one removed
-/// + one added.
-#[derive(Serialize, Default)]
-struct EffectChanges {
-    before:  Vec<String>,
-    after:   Vec<String>,
-    added:   Vec<String>,
-    removed: Vec<String>,
-}
-
-#[derive(Serialize, Clone)]
-struct BodyPatch {
-    op: String,         // "Replace" | "Inserted" | "Deleted"
-    node_path: String,  // dotted path from fn body
-    from_kind: String,
-    to_kind: String,
-}
-
-#[derive(Serialize, Default)]
-struct DiffReport {
-    added: Vec<AddRemove>,
-    removed: Vec<AddRemove>,
-    renamed: Vec<Renamed>,
-    modified: Vec<Modified>,
 }
 
 pub fn cmd_diff(fmt: &OutputFormat, args: &[String]) -> Result<()> {

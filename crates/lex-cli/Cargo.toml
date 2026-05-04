@@ -21,6 +21,7 @@ lex-types = { path = "../lex-types" }
 lex-bytecode = { path = "../lex-bytecode" }
 lex-runtime = { path = "../lex-runtime" }
 lex-store = { path = "../lex-store" }
+lex-vcs = { path = "../lex-vcs" }
 lex-trace = { path = "../lex-trace" }
 lex-api = { path = "../lex-api" }
 conformance = { path = "../conformance" }
