@@ -30,7 +30,15 @@ jobs:
         with:
           workspaces: "fuzz -> target"
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        # `--locked` was pinning a stale `rustix 0.36.5` in
+        # cargo-fuzz's lockfile; that version uses
+        # `#[cfg_attr(rustc_attrs, ...)]`, which newer rustc
+        # rejects with "attributes starting with `rustc` are
+        # reserved." Drop `--locked` so cargo resolves a newer
+        # rustix transitively. cargo-fuzz isn't a runtime
+        # dependency of ours — the install is for the binary
+        # only — so a floating resolve is fine here.
+        run: cargo install cargo-fuzz
       # Smoke run: 60 seconds per target on PRs, 300 on the cron.
       # libFuzzer exits non-zero on any crash / timeout / OOM, which
       # surfaces as a CI failure with the offending input attached
