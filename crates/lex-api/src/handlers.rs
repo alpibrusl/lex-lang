@@ -27,7 +27,19 @@ pub struct State {
     /// future slice can persist them to disk so a session survives
     /// process restarts. For now an agent that gets unlucky with a
     /// restart re-runs `merge/start` and gets a fresh session.
-    pub sessions: Mutex<HashMap<MergeSessionId, MergeSession>>,
+    pub sessions: Mutex<HashMap<MergeSessionId, ApiMergeSession>>,
+}
+
+/// Server-side wrapper around [`MergeSession`] carrying the
+/// branch names that started the merge. The lex-vcs session
+/// itself only tracks `OpId` heads; commit needs the dst branch
+/// name to advance the right head, and the src branch name is
+/// kept for round-trip auditability ("which branch did we merge
+/// from?").
+pub struct ApiMergeSession {
+    pub inner: MergeSession,
+    pub src_branch: String,
+    pub dst_branch: String,
 }
 
 impl State {
@@ -114,6 +126,10 @@ fn route(
         (Method::Post, p) if p.starts_with("/v1/merge/") && p.ends_with("/resolve") => {
             let id = &p["/v1/merge/".len()..p.len() - "/resolve".len()];
             merge_resolve_handler(state, id, body)
+        }
+        (Method::Post, p) if p.starts_with("/v1/merge/") && p.ends_with("/commit") => {
+            let id = &p["/v1/merge/".len()..p.len() - "/commit".len()];
+            merge_commit_handler(state, id)
         }
         _ => error_response(404, format!("unknown route: {method:?} {path}")),
     }
@@ -538,10 +554,14 @@ fn merge_start_handler(state: &State, body: &str) -> Response<std::io::Cursor<Ve
         "conflicts": conflicts,
         "auto_resolved_count": auto_resolved_count,
     });
-    // Drop the borrow on `conflicts` before moving session into the map.
     drop(conflicts);
     drop(store);
-    state.sessions.lock().unwrap().insert(merge_id, session);
+    let wrapped = ApiMergeSession {
+        inner: session,
+        src_branch: req.src_branch,
+        dst_branch: req.dst_branch,
+    };
+    state.sessions.lock().unwrap().insert(merge_id, wrapped);
     json_response(200, &body)
 }
 
@@ -579,19 +599,171 @@ fn merge_resolve_handler(
         Ok(r) => r, Err(e) => return error_response(400, format!("bad request: {e}")),
     };
     let mut sessions = state.sessions.lock().unwrap();
-    let Some(session) = sessions.get_mut(merge_id) else {
+    let Some(wrapped) = sessions.get_mut(merge_id) else {
         return error_response(404, format!("unknown merge_id `{merge_id}`"));
     };
     let pairs: Vec<(String, lex_vcs::Resolution)> = req.resolutions.into_iter()
         .map(|e| (e.conflict_id, e.resolution))
         .collect();
-    let verdicts = session.resolve(pairs);
-    let remaining: Vec<&lex_vcs::ConflictRecord> = session.remaining_conflicts();
+    let verdicts = wrapped.inner.resolve(pairs);
+    let remaining: Vec<&lex_vcs::ConflictRecord> = wrapped.inner.remaining_conflicts();
     let body = serde_json::json!({
         "verdicts": verdicts,
         "remaining_conflicts": remaining,
     });
     json_response(200, &body)
+}
+
+/// `POST /v1/merge/<id>/commit` (#134) — finalize a merge
+/// session. Builds a `Merge` op from the auto-resolved sigs +
+/// the conflict resolutions, applies it to the dst branch, and
+/// returns the new head op id. The session is dropped on
+/// success; the caller would re-run `merge/start` to land
+/// further changes.
+///
+/// Errors:
+/// - 404: unknown `merge_id`.
+/// - 422: conflicts remaining (pass `Defer` or just don't
+///   resolve a conflict and you land here). Body carries the
+///   list so the caller knows which still need attention.
+/// - 422: a `Custom` resolution was used. The data layer
+///   supports them but landing them via HTTP needs an extra
+///   pass to apply the custom op against the dst branch
+///   first; deferred to a follow-up slice. Use TakeOurs /
+///   TakeTheirs for now.
+/// - 500: filesystem error while landing the merge op.
+fn merge_commit_handler(
+    state: &State,
+    merge_id: &str,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    use std::collections::BTreeMap;
+    let wrapped = match state.sessions.lock().unwrap().remove(merge_id) {
+        Some(w) => w,
+        None => return error_response(404, format!("unknown merge_id `{merge_id}`")),
+    };
+    let dst_branch = wrapped.dst_branch.clone();
+    let src_head = wrapped.inner.src_head.clone();
+    let dst_head = wrapped.inner.dst_head.clone();
+    let auto_resolved = wrapped.inner.auto_resolved.clone();
+
+    // Translate auto-resolved + resolutions into the StageTransition::Merge
+    // entries map. Only sigs whose head changes relative to dst go in.
+    let mut entries: BTreeMap<lex_vcs::SigId, Option<lex_vcs::StageId>> = BTreeMap::new();
+
+    // Auto-resolved: only `Src` (one-sided change on src) modifies dst.
+    for outcome in &auto_resolved {
+        if let lex_vcs::MergeOutcome::Src { sig_id, stage_id } = outcome {
+            entries.insert(sig_id.clone(), stage_id.clone());
+        }
+    }
+
+    // Conflict resolutions.
+    let resolved = match wrapped.inner.commit() {
+        Ok(r) => r,
+        Err(lex_vcs::CommitError::ConflictsRemaining(ids)) => {
+            // Re-insert isn't possible since we removed above; the
+            // caller will need to re-start. That's acceptable: a
+            // commit-with-unresolved-conflicts is operator error.
+            return error_with_detail(
+                422,
+                "conflicts remaining",
+                serde_json::json!({"unresolved": ids}),
+            );
+        }
+    };
+
+    for (conflict_id, resolution) in resolved {
+        match resolution {
+            lex_vcs::Resolution::TakeOurs => {
+                // Dst already has its head. No entry needed.
+            }
+            lex_vcs::Resolution::TakeTheirs => {
+                // Find the conflict's `theirs` stage_id in the
+                // session snapshot. We don't have direct access to
+                // it post-commit (commit consumed the session); but
+                // we can reconstruct from `auto_resolved` plus the
+                // session's pre-commit conflict map. Since we
+                // already moved the inner session, the cleanest fix
+                // for this slice is to rebuild from the on-disk
+                // graph: walk src_head, find the latest stage for
+                // the conflict's sig.
+                match resolve_take_theirs(state, &src_head, &conflict_id) {
+                    Ok(stage_id) => {
+                        entries.insert(conflict_id.clone(), stage_id);
+                    }
+                    Err(e) => return error_response(500, format!("resolve take_theirs: {e}")),
+                }
+            }
+            lex_vcs::Resolution::Custom { .. } => {
+                return error_with_detail(
+                    422,
+                    "custom resolutions not yet supported by /v1/merge/<id>/commit",
+                    serde_json::json!({"conflict_id": conflict_id}),
+                );
+            }
+            lex_vcs::Resolution::Defer => {
+                // Unreachable: commit() rejects Defer above.
+                return error_response(500, "internal: Defer slipped past commit gate");
+            }
+        }
+    }
+
+    let resolved_count = entries.len();
+    let mut parents: Vec<lex_vcs::OpId> = Vec::new();
+    if let Some(d) = dst_head { parents.push(d); }
+    if let Some(s) = src_head { parents.push(s); }
+    let op = lex_vcs::Operation::new(
+        lex_vcs::OperationKind::Merge { resolved: resolved_count },
+        parents,
+    );
+    let transition = lex_vcs::StageTransition::Merge { entries };
+    let store = state.store.lock().unwrap();
+    match store.apply_operation(&dst_branch, op, transition) {
+        Ok(new_head_op) => json_response(200, &serde_json::json!({
+            "new_head_op": new_head_op,
+            "dst_branch": dst_branch,
+        })),
+        Err(e) => error_response(500, format!("apply merge op: {e}")),
+    }
+}
+
+/// Walk the op log from `src_head` backwards to find the latest
+/// stage assigned to `sig`. Used by the commit handler to figure
+/// out what stage `TakeTheirs` should land. `Ok(None)` means src
+/// removed the sig.
+fn resolve_take_theirs(
+    state: &State,
+    src_head: &Option<lex_vcs::OpId>,
+    sig: &lex_vcs::SigId,
+) -> std::io::Result<Option<lex_vcs::StageId>> {
+    let store = state.store.lock().unwrap();
+    let log = lex_vcs::OpLog::open(store.root())?;
+    let Some(head) = src_head.as_ref() else { return Ok(None); };
+    // Walk forward from root → head, replaying each op's transition
+    // for `sig`; the last assignment wins.
+    let mut current: Option<lex_vcs::StageId> = None;
+    for record in log.walk_forward(head, None)? {
+        match &record.produces {
+            lex_vcs::StageTransition::Create { sig_id, stage_id }
+                if sig_id == sig => { current = Some(stage_id.clone()); }
+            lex_vcs::StageTransition::Replace { sig_id, to, .. }
+                if sig_id == sig => { current = Some(to.clone()); }
+            lex_vcs::StageTransition::Remove { sig_id, .. }
+                if sig_id == sig => { current = None; }
+            lex_vcs::StageTransition::Rename { from, to, body_stage_id }
+                if from == sig || to == sig => {
+                if from == sig { current = None; }
+                if to == sig   { current = Some(body_stage_id.clone()); }
+            }
+            lex_vcs::StageTransition::Merge { entries } => {
+                if let Some(opt) = entries.get(sig) {
+                    current = opt.clone();
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(current)
 }
 
 fn mint_merge_id() -> MergeSessionId {
