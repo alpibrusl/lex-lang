@@ -31,7 +31,7 @@ pub fn is_pure_module(kind: &str) -> bool {
     matches!(kind, "str" | "int" | "float" | "bool" | "list"
         | "option" | "result" | "tuple" | "json" | "bytes" | "flow" | "math"
         | "map" | "set" | "crypto" | "regex" | "deque" | "datetime" | "http"
-        | "toml" | "yaml" | "dotenv" | "csv")
+        | "toml" | "yaml" | "dotenv" | "csv" | "test")
 }
 
 fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
@@ -365,6 +365,47 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             match String::from_utf8(out) {
                 Ok(s) => Ok(ok_v(Value::Str(s))),
                 Err(e) => Ok(err_v(Value::Str(format!("csv.stringify utf8: {e}")))),
+            }
+        }
+
+        // -- test -- tiny assertion library. Each helper is pure
+        // and returns `Result[Unit, Str]` so tests are themselves
+        // functions returning a Result. A suite is a List the user
+        // iterates with `list.fold`; no Rust-side Suite/Runner
+        // types in v1, so the whole thing is 4 builtins + a few
+        // Lex-source helpers callers can copy into their tests/.
+        ("test", "assert_eq") => {
+            let a = first_arg(args)?;
+            let b = args.get(1).ok_or("test.assert_eq: missing second arg")?;
+            if a == b {
+                Ok(ok_v(Value::Unit))
+            } else {
+                Ok(err_v(Value::Str(format!("assert_eq: lhs {} != rhs {}",
+                    value_to_json(a), value_to_json(b)))))
+            }
+        }
+        ("test", "assert_ne") => {
+            let a = first_arg(args)?;
+            let b = args.get(1).ok_or("test.assert_ne: missing second arg")?;
+            if a != b {
+                Ok(ok_v(Value::Unit))
+            } else {
+                Ok(err_v(Value::Str(format!("assert_ne: both sides are {}",
+                    value_to_json(a)))))
+            }
+        }
+        ("test", "assert_true") => {
+            match first_arg(args)? {
+                Value::Bool(true) => Ok(ok_v(Value::Unit)),
+                Value::Bool(false) => Ok(err_v(Value::Str("assert_true: was false".into()))),
+                other => Err(format!("test.assert_true expects Bool, got {other:?}")),
+            }
+        }
+        ("test", "assert_false") => {
+            match first_arg(args)? {
+                Value::Bool(false) => Ok(ok_v(Value::Unit)),
+                Value::Bool(true)  => Ok(err_v(Value::Str("assert_false: was true".into()))),
+                other => Err(format!("test.assert_false expects Bool, got {other:?}")),
             }
         }
 
