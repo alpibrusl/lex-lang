@@ -389,12 +389,14 @@ fn cmd_agent_tool() -> CommandInfo {
         .add_option("--examples", "string", "JSON examples for behavioral checking", None)
         .add_option("--diff-body", "string", "differential evaluation: alternate body", None)
         .add_option("--diff-body-file", "string", "differential evaluation: alternate body file", None)
+        .add_option("--store", "string", "if set, persist verification attestations against the tool stage", None)
         .add_option("--json", "bool", "machine-readable output", None)
         .with_examples(vec![
             ("Run with allow-list", "lex agent-tool --allow-effects fs_read --request \"sum lines of /tmp/log\""),
             ("Verify against spec", "lex agent-tool --spec sort.spec --body-file body.lex --json"),
+            ("Persist attestations", "lex agent-tool --examples cases.json --body-file body.lex --store ~/.lex/store"),
         ])
-        .with_see_also(vec!["check", "spec", "run"])
+        .with_see_also(vec!["check", "spec", "run", "attest", "stage"])
 }
 
 fn cmd_tool_registry() -> CommandInfo {
