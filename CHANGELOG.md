@@ -9,19 +9,120 @@ bumps may carry breaking changes when justified).
 
 ### Added
 
-- **`lex-vcs` crate — foundation for agent-native VCS tier-2 (#129).**
-  New workspace crate at `crates/lex-vcs/`. Defines `Operation` (the
-  typed-delta unit replacing snapshot-of-tree) plus content-addressed
-  `OpId` (SHA-256 over canonical-form `(kind, payload, sorted parents)`).
-  Initial operation kinds match #129's spec: `AddFunction`,
-  `RemoveFunction`, `ModifyBody`, `RenameSymbol`, `ChangeEffectSig`,
-  `AddImport` / `RemoveImport`, `AddType` / `RemoveType` /
-  `ModifyType`. Two agents producing the same logical change against
-  the same parent state get the same `OpId` — the automatic-dedup
-  property the rest of tier-2 (#130-#134) relies on. This slice is
-  data-model only; subsequent slices add the apply pass, the
-  store-write gate, intent linkage, attestations, predicate branches,
-  and the programmatic merge API.
+- **Agent-native VCS, tier-2 — full rollout.** Closes #128 (and
+  sub-issues #129-#134). The store goes from a snapshot-of-functions
+  database to a **typed event log with first-class intent and
+  durable evidence**. Implementation arrived as ~25 small PRs
+  through #135-#162; entries below are the user-visible surfaces.
+  - **Operation log as the store's source of truth (#129).** New
+    `crates/lex-vcs/`. Typed `Operation` (the unit-of-write
+    replacing snapshot-of-tree) with content-addressed `OpId`
+    (SHA-256 over canonical-form `(kind, payload, sorted
+    parents)`). Two agents producing the same logical change
+    against the same parent state get the same `OpId` — automatic
+    dedup. Op kinds: `AddFunction`, `RemoveFunction`, `ModifyBody`,
+    `RenameSymbol`, `ChangeEffectSig`, `AddImport` / `RemoveImport`,
+    `AddType` / `RemoveType` / `ModifyType`, `Merge`. `lex publish`
+    emits typed ops; the per-branch `head_op` advances atomically.
+    `lex op show` / `lex op log` and `lex blame` causal-history
+    walk the DAG.
+  - **Write-time type-check gate (#130).** `Store::publish_program`
+    and `Store::apply_operation_checked` reject any op whose
+    candidate program doesn't typecheck. The HEAD invariant —
+    "every accepted op produces a typechecking program" — is
+    structural rather than convention. `POST /v1/publish` returns
+    422 on `StoreError::TypeError` with the structured envelope.
+  - **First-class `Intent` (#131).** Persistent record linking an
+    op to its originating prompt, agent session, and model. Ops
+    can be queried by intent via predicate branches; `lex blame`
+    surfaces "who/why" alongside "what/when".
+  - **Attestation graph — durable, queryable evidence (#132).**
+    Six attestation kinds:
+    - `TypeCheck` — auto-emitted by the store-write gate on every
+      accepted op.
+    - `Spec` — emitted by `lex spec check --store DIR` and `lex
+      agent-tool --spec --store DIR`. Records the verdict
+      (`Passed` / `Failed { detail: counterexample }` /
+      `Inconclusive`) plus method (`Random` / `Exhaustive` /
+      `Symbolic`) and trial count.
+    - `Examples` / `DiffBody` / `SandboxRun` — emitted by `lex
+      agent-tool` on each verification step (`--examples`,
+      `--diff-body`, the final sandboxed run).
+    - `EffectAudit` — emitted by `lex audit --effect K --store
+      DIR`. Per stage: `Passed` if it doesn't touch any of the
+      listed effects, `Failed { detail: "touches forbidden
+      effect(s): ..." }` otherwise.
+
+    Failures persist alongside successes — a flaky producer can't
+    overwrite negative evidence by re-running. Consumers:
+    - `GET /v1/stage/<id>/attestations` — the JSON list.
+    - `lex stage <id> --attestations` — CLI mirror.
+    - `lex blame --with-evidence` — per-stage history with
+      attestations attached to each entry.
+    - `lex attest filter --kind K --result R --since T` —
+      cross-stage queries for CI / dashboards. `--since` accepts
+      epoch seconds or `YYYY-MM-DD`.
+  - **Predicate-defined branches (#133).** Branches become saved
+    queries over the op log, not snapshots. `Branch.predicate :
+    Option[Predicate]`; the engine in `lex_vcs::predicate` handles
+    `All` / `Intent` / `Session` / `AncestorOf` / `And` / `Or` /
+    `Not`. Cheap to create + discard (`O(1)` — a small JSON file
+    per branch). New CLI surfaces:
+    - `lex branch peek <other> [--since-fork] [--vs <branch>]` —
+      read another branch's ops without switching, optionally
+      restricted to ops since the fork point. Eliminates "context
+      blindness" as a query rather than a merge.
+    - `lex branch overlay <other> [--on <branch>]` — preview a
+      merge result without committing: the dst head map projected
+      forward over auto-resolved sigs, plus the conflict list.
+    - Existing `lex branch create <name> [--from BRANCH |
+      --predicate '<json>']` learned the `--predicate` form for
+      saved-query branches.
+  - **Programmatic merge API (#134).** Stateful merge sessions
+    that agent harnesses can drive iteratively without text
+    editing or merge markers.
+    - `POST /v1/merge/start` returns conflicts as structured
+      objects with typed `ours` / `theirs` / `base` stage_ids.
+    - `POST /v1/merge/<id>/resolve` accepts batched resolutions
+      (`TakeOurs` / `TakeTheirs` / `Custom { op }` / `Defer`)
+      with per-conflict verdicts. `Custom` extracts the merge
+      target from the op kind via `OperationKind::merge_target`.
+    - `POST /v1/merge/<id>/commit` lands a `Merge` op with
+      parents `[dst_head, src_head]`; auto-resolved Src outcomes
+      and TakeTheirs resolutions become entries in the
+      `StageTransition::Merge` map.
+    - CLI mirror: `lex merge {start | status | resolve | commit}`
+      persists sessions to `<store>/merges/<merge_id>.json` so
+      each invocation is its own process.
+  - **`lex-api` POST /v1/publish returns 422 on StoreError::TypeError
+    (#146).** Same shape as `/v1/check`'s 422 — clients have one
+    error contract for both surfaces.
+  - **End-to-end example: `examples/agent_merge/`.** A scripted
+    walkthrough: two "agents" diverge on `clamp`, produce a
+    `ModifyModify` conflict, a third resolves it programmatically,
+    the final body's spec attestation lands. Maps each step to
+    the relevant tier-2 issue.
+  - **Performance budgets** (smoke tests under `tests/branch_perf.rs`
+    and `tests/merge_perf.rs`): 100 branch create+delete cycles
+    under a 1k-op store < 1s; 50-conflict resolve+commit cycle
+    < 250ms. Catches quadratic regressions; full-scale (10k-op)
+    benchmarking is left as a `cargo bench` follow-up.
+- **`lex-tea` v1 — read-only HTML browser over lex-vcs (#163).**
+  Three pages on the same `lex serve` process — no extra binary,
+  no extra port, no SPA build:
+  - `GET /` — branch list with current-branch marker.
+  - `GET /web/branch/<name>` — fns on a branch with stage_id
+    links.
+  - `GET /web/stage/<id>` — stage info plus the full attestation
+    trail (auto-emitted TypeChecks, plus any persisted Spec /
+    Examples / SandboxRun / EffectAudit).
+
+  CSS is one short embedded blob; zero JS. The point is to expose
+  what makes lex-vcs different — typed ops, attestations,
+  evidence trails — to humans without a frontend pipeline. JSON
+  API at `/v1/*` is unchanged. `lex-tea` will grow into a
+  Gitea-equivalent (merge UI, comments via Intent, basic auth)
+  in subsequent slices.
 - **`std.sql` — embedded SQL (SQLite).** Second of the OSS-Auditor
   stdlib follow-ups. Wraps `rusqlite` with the bundled SQLite
   feature so no system lib is required. Surface:
