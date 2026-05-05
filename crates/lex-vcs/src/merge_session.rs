@@ -41,6 +41,8 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::merge::{ConflictKind, MergeOutcome, MergeOutput};
 use crate::op_log::OpLog;
 use crate::operation::{OpId, Operation, SigId, StageId};
@@ -58,7 +60,7 @@ pub type MergeSessionId = String;
 pub type ConflictId = SigId;
 
 /// Snapshot of one conflict the agent needs to resolve.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConflictRecord {
     pub conflict_id: ConflictId,
     pub sig_id: SigId,
@@ -75,7 +77,8 @@ pub struct ConflictRecord {
 }
 
 /// Choice for a single conflict.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Resolution {
     /// Keep dst's stage; discard src's.
     TakeOurs,
@@ -93,7 +96,8 @@ pub enum Resolution {
 /// Why a resolution was rejected. Distinct from [`CommitError`]
 /// because a resolve call returns *per-conflict* verdicts; commit
 /// returns a single overall verdict.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ResolutionRejection {
     /// The conflict_id doesn't refer to any pending conflict in
     /// the session. Either the agent invented one, or it was
@@ -110,7 +114,7 @@ pub enum ResolutionRejection {
 }
 
 /// Per-conflict outcome of a resolve call.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolveVerdict {
     pub conflict_id: ConflictId,
     pub accepted: bool,

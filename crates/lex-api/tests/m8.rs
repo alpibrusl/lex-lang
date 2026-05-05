@@ -195,6 +195,58 @@ fn run_with_policy_succeeds() {
 }
 
 #[test]
+fn merge_start_unknown_branch_returns_404() {
+    let (srv, _tmp) = start_server();
+    let body = json!({"src_branch": "nonexistent_a", "dst_branch": "nonexistent_b"}).to_string();
+    let (s, b) = http(&srv.addr, "POST", "/v1/merge/start", &body);
+    assert_eq!(s, 404, "unknown branch should 404, got {s}: {b}");
+}
+
+#[test]
+fn merge_start_returns_session_id_and_no_conflicts_for_disjoint_branches() {
+    // Two branches that touch *different* sigs auto-resolve into a
+    // clean merge — no conflicts. The endpoint should still mint a
+    // session, return the conflict list (empty), and report the
+    // count of auto-resolved sigs so the agent can audit what the
+    // engine took unilaterally.
+    let (srv, tmp) = start_server();
+
+    // 1) Publish fn foo on main.
+    let src_main = "fn foo(n :: Int) -> Int { n + 1 }\n";
+    let pub_main = json!({"source": src_main, "activate": true}).to_string();
+    let (s, b) = http(&srv.addr, "POST", "/v1/publish", &pub_main);
+    assert_eq!(s, 200, "publish main: {b}");
+
+    // 2) Create + switch to feature, publish fn bar.
+    {
+        let store = lex_store::Store::open(tmp.path()).unwrap();
+        store.create_branch("feature", lex_store::DEFAULT_BRANCH)
+            .expect("create feature");
+        store.set_current_branch("feature").expect("switch to feature");
+    }
+    let src_feature = "fn foo(n :: Int) -> Int { n + 1 }\nfn bar(n :: Int) -> Int { n - 1 }\n";
+    let pub_feat = json!({"source": src_feature, "activate": true}).to_string();
+    let (s, b) = http(&srv.addr, "POST", "/v1/publish", &pub_feat);
+    assert_eq!(s, 200, "publish feature: {b}");
+
+    // 3) Switch back to main so it remains the dst.
+    {
+        let store = lex_store::Store::open(tmp.path()).unwrap();
+        store.set_current_branch(lex_store::DEFAULT_BRANCH).expect("switch back");
+    }
+
+    // 4) Start the merge.
+    let body = json!({"src_branch": "feature", "dst_branch": lex_store::DEFAULT_BRANCH}).to_string();
+    let (s, b) = http(&srv.addr, "POST", "/v1/merge/start", &body);
+    assert_eq!(s, 200, "merge/start: {b}");
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert!(v["merge_id"].as_str().is_some(), "merge_id should be set");
+    let conflicts = v["conflicts"].as_array().unwrap();
+    assert_eq!(conflicts.len(), 0, "disjoint adds shouldn't conflict, got {conflicts:?}");
+    assert!(v["auto_resolved_count"].as_u64().unwrap() >= 1, "at least one sig auto-resolved");
+}
+
+#[test]
 fn replay_with_overrides() {
     let (srv, _tmp) = start_server();
     let src = "import \"std.io\" as io\nfn read_one(p :: Str) -> [io] Result[Str, Str] { io.read(p) }\n";

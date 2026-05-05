@@ -11,19 +11,31 @@ use lex_bytecode::{compile_program, vm::Vm, Value};
 use lex_runtime::{check_program as check_policy, DefaultHandler, Policy};
 use lex_store::Store;
 use lex_syntax::load_program_from_str;
+use lex_vcs::{MergeSession, MergeSessionId};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tiny_http::{Header, Method, Request, Response};
 
 pub struct State {
     pub store: Mutex<Store>,
+    /// In-memory merge sessions, keyed by MergeSessionId. Sessions
+    /// are ephemeral by design (#134 foundation): they live for the
+    /// lifetime of the server process and are GC'd on commit. A
+    /// future slice can persist them to disk so a session survives
+    /// process restarts. For now an agent that gets unlucky with a
+    /// restart re-runs `merge/start` and gets a fresh session.
+    pub sessions: Mutex<HashMap<MergeSessionId, MergeSession>>,
 }
 
 impl State {
     pub fn open(root: PathBuf) -> anyhow::Result<Self> {
-        Ok(Self { store: Mutex::new(Store::open(root)?) })
+        Ok(Self {
+            store: Mutex::new(Store::open(root)?),
+            sessions: Mutex::new(HashMap::new()),
+        })
     }
 }
 
@@ -98,6 +110,7 @@ fn route(
             trace_handler(state, id)
         }
         (Method::Get, "/v1/diff") => diff_handler(state, query),
+        (Method::Post, "/v1/merge/start") => merge_start_handler(state, body),
         _ => error_response(404, format!("unknown route: {method:?} {path}")),
     }
 }
@@ -462,4 +475,80 @@ fn diff_handler(state: &State, query: &str) -> Response<std::io::Cursor<Vec<u8>>
 fn json_to_value(v: &serde_json::Value) -> Value { Value::from_json(v) }
 
 fn value_to_json(v: &Value) -> serde_json::Value { v.to_json() }
+
+#[derive(Deserialize)]
+struct MergeStartReq {
+    src_branch: String,
+    dst_branch: String,
+}
+
+/// `POST /v1/merge/start` (#134) — open a stateful merge between two
+/// branch heads and return the conflicts the agent needs to
+/// resolve. Auto-resolved sigs (one-sided changes, identical
+/// changes both sides) are returned for audit but don't block
+/// commit.
+///
+/// Response: `{ merge_id, src_head, dst_head, lca, conflicts,
+/// auto_resolved_count }`. The session is held in process memory
+/// keyed by `merge_id` for subsequent `resolve` / `commit` calls
+/// (next slices).
+fn merge_start_handler(state: &State, body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    let req: MergeStartReq = match serde_json::from_str(body) {
+        Ok(r) => r, Err(e) => return error_response(400, format!("bad request: {e}")),
+    };
+    let store = state.store.lock().unwrap();
+    let src_head = match store.get_branch(&req.src_branch) {
+        Ok(Some(b)) => b.head_op,
+        Ok(None) => return error_response(404, format!("unknown src branch `{}`", req.src_branch)),
+        Err(e) => return error_response(500, format!("src branch read: {e}")),
+    };
+    let dst_head = match store.get_branch(&req.dst_branch) {
+        Ok(Some(b)) => b.head_op,
+        Ok(None) => return error_response(404, format!("unknown dst branch `{}`", req.dst_branch)),
+        Err(e) => return error_response(500, format!("dst branch read: {e}")),
+    };
+    let log = match lex_vcs::OpLog::open(store.root()) {
+        Ok(l) => l,
+        Err(e) => return error_response(500, format!("op log: {e}")),
+    };
+    // Caller doesn't choose merge_ids — minted server-side from
+    // wall clock + a per-process counter avoids leaking session
+    // ids' shape into the public surface.
+    let merge_id = mint_merge_id();
+    let session = match MergeSession::start(
+        merge_id.clone(),
+        &log,
+        src_head.as_ref(),
+        dst_head.as_ref(),
+    ) {
+        Ok(s) => s,
+        Err(e) => return error_response(500, format!("merge start: {e}")),
+    };
+    let conflicts: Vec<&lex_vcs::ConflictRecord> = session.remaining_conflicts();
+    let auto_resolved_count = session.auto_resolved.len();
+    let body = serde_json::json!({
+        "merge_id": merge_id,
+        "src_head": session.src_head,
+        "dst_head": session.dst_head,
+        "lca":      session.lca,
+        "conflicts": conflicts,
+        "auto_resolved_count": auto_resolved_count,
+    });
+    // Drop the borrow on `conflicts` before moving session into the map.
+    drop(conflicts);
+    drop(store);
+    state.sessions.lock().unwrap().insert(merge_id, session);
+    json_response(200, &body)
+}
+
+fn mint_merge_id() -> MergeSessionId {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("merge_{nanos:x}_{n:x}")
+}
 
