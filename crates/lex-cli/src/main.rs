@@ -1050,6 +1050,12 @@ fn cmd_store(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 /// `GET /v1/stage/<id>` and `GET /v1/stage/<id>/attestations`.
 fn cmd_stage(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let (root, rest, _, _) = parse_store_flag(args);
+    // `lex stage pin <id> ...` — human override (#172). Detect it
+    // as a leading positional so the existing `lex stage <id>` and
+    // `lex stage <id> --attestations` shapes keep working unchanged.
+    if rest.first().map(String::as_str) == Some("pin") {
+        return cmd_stage_pin(fmt, &root, &rest[1..]);
+    }
     let attestations_mode = rest.iter().any(|a| a == "--attestations");
     let id = rest
         .iter()
@@ -1092,6 +1098,9 @@ fn cmd_stage(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                         let joined: Vec<&str> = effects.iter().map(String::as_str).collect();
                         format!("SandboxRun([{}])", joined.join(","))
                     }
+                    lex_vcs::AttestationKind::Override { actor, .. } => {
+                        format!("Override({actor})")
+                    }
                 };
                 let result = match &a.result {
                     lex_vcs::AttestationResult::Passed => "passed".to_string(),
@@ -1118,6 +1127,95 @@ fn cmd_stage(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     });
     acli::emit_or_text("stage", v.clone(), fmt, || {
         println!("{}", serde_json::to_string_pretty(&v).unwrap());
+    });
+    Ok(())
+}
+
+/// `lex stage pin <id> --reason "..." [--actor <name>]` —
+/// human override (#172, lex-tea v3a). Activates the stage and
+/// records an `Override` attestation alongside whatever
+/// existing attestations the stage already has. The pin
+/// itself is auditable: `lex attest filter --kind override`
+/// returns every override the human(s) have issued.
+///
+/// `actor` defaults to `$LEX_TEA_USER`; falling back errors so
+/// a pin can't land anonymously.
+fn cmd_stage_pin(
+    fmt: &OutputFormat,
+    root: &std::path::Path,
+    args: &[String],
+) -> Result<()> {
+    let mut id: Option<String> = None;
+    let mut reason: Option<String> = None;
+    let mut actor: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--reason" => { reason = args.get(i + 1).cloned(); i += 2; }
+            "--actor"  => { actor  = args.get(i + 1).cloned(); i += 2; }
+            other if id.is_none() => { id = Some(other.to_string()); i += 1; }
+            other => bail!("unexpected arg `{other}`"),
+        }
+    }
+    let id = id.ok_or_else(|| anyhow!(
+        "usage: lex stage pin <stage_id> --reason \"...\" [--actor NAME]"
+    ))?;
+    let reason = reason.ok_or_else(|| anyhow!(
+        "lex stage pin: --reason required (overrides need a paper trail)"
+    ))?;
+    let actor = actor
+        .or_else(|| std::env::var("LEX_TEA_USER").ok())
+        .ok_or_else(|| anyhow!(
+            "lex stage pin: actor unknown — pass --actor NAME or set LEX_TEA_USER"
+        ))?;
+
+    let store = Store::open(root)
+        .with_context(|| format!("opening store at {}", root.display()))?;
+    // Verify the stage exists; refuse to pin something that's not
+    // even there so a typo can't accidentally activate the wrong
+    // sig later.
+    let _ = store.get_metadata(&id)
+        .with_context(|| format!("unknown stage `{id}`"))?;
+
+    // Activate first (the actual override action), then record the
+    // audit. Order matters: if activate fails, no audit is written;
+    // if audit fails after a successful activate, the user retries
+    // and the attestation_id is content-addressed so re-puts dedup.
+    store.activate(&id)
+        .with_context(|| format!("activate stage `{id}`"))?;
+
+    let producer = lex_vcs::ProducerDescriptor {
+        tool: "lex stage pin".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        model: None,
+    };
+    let attestation = lex_vcs::Attestation::new(
+        id.clone(), None, None,
+        lex_vcs::AttestationKind::Override {
+            actor: actor.clone(),
+            reason: reason.clone(),
+            target_attestation_id: None,
+        },
+        // Override is a *fact* about the human's choice, not a
+        // pass/fail of code. Use Passed for "the override was
+        // recorded successfully" — Failed/Inconclusive don't
+        // apply to administrative actions.
+        lex_vcs::AttestationResult::Passed,
+        producer, None,
+    );
+    let log = store.attestation_log()?;
+    log.put(&attestation)?;
+
+    let data = serde_json::json!({
+        "pinned": &id,
+        "actor": &actor,
+        "reason": &reason,
+        "attestation_id": &attestation.attestation_id,
+    });
+    let id_for_text = id.clone();
+    let actor_for_text = actor.clone();
+    acli::emit_or_text("stage", data, fmt, move || {
+        println!("→ pinned `{id_for_text:.16}…` (actor: {actor_for_text})");
     });
     Ok(())
 }
@@ -1221,6 +1319,7 @@ fn attestation_kind_tag(k: &lex_vcs::AttestationKind) -> &'static str {
         TypeCheck         => "type_check",
         EffectAudit       => "effect_audit",
         SandboxRun { .. } => "sandbox_run",
+        Override { .. }   => "override",
     }
 }
 

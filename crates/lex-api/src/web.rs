@@ -556,6 +556,37 @@ pub(crate) fn stage_html_handler(state: &State, id: &str) -> Response<Cursor<Vec
         }
     }
 
+    // Override form (lex-tea v3a, #172). Renders only when a
+    // user identifier is set via `LEX_TEA_USER`; without one the
+    // pin handler refuses the action anyway, so showing a button
+    // would be misleading. Single-user-mode for v3a; v3b adds
+    // sessions + `<store>/users.json`.
+    let actor = std::env::var("LEX_TEA_USER").ok();
+    let pin_form = match &actor {
+        Some(name) => format!(
+            r#"<h2>override</h2>
+<p class="muted">Pin this stage to Active and record an Override
+attestation under your name. Auditable: shows up under
+<code>kind=override</code> in <code>lex attest filter</code>.</p>
+<form method="post" action="/web/stage/{id}/pin">
+  <p><strong>actor:</strong> <span class="mono">{actor}</span></p>
+  <p><label for="reason">reason:</label><br>
+     <input type="text" id="reason" name="reason" required
+            placeholder="e.g. spec checker is wrong here, will revisit"
+            style="width: 100%; padding: .4rem; font-family: inherit;"></p>
+  <p><button type="submit"
+       style="padding: .4rem 1rem; background: #b00; color: #fff; border: 0;
+              border-radius: 3px; cursor: pointer;">pin to Active</button></p>
+</form>"#,
+            id = esc(id),
+            actor = esc(name),
+        ),
+        None => r#"<h2>override</h2>
+<p class="muted">Set <code>LEX_TEA_USER=&lt;name&gt;</code> in the
+server's environment to enable human override actions. The
+attestation log will record the override under that name.</p>"#.into(),
+    };
+
     let body = format!(
         r#"<nav class="crumb"><a href="/">activity</a> / <strong class="mono">{id_short}…</strong></nav>
 <h1>{name}</h1>
@@ -570,7 +601,8 @@ pub(crate) fn stage_html_handler(state: &State, id: &str) -> Response<Cursor<Vec
 <table>
   <thead><tr><th>kind</th><th>result</th><th>by</th><th>ts</th></tr></thead>
   <tbody>{att_rows}</tbody>
-</table>"#,
+</table>
+{pin_form}"#,
         id_short = esc(&format!("{id:.16}")),
         name = esc(&meta.name),
         sig = esc(&meta.sig_id),
@@ -580,6 +612,108 @@ pub(crate) fn stage_html_handler(state: &State, id: &str) -> Response<Cursor<Vec
         n = atts.len(),
     );
     html_response(200, page(&meta.name, "", &body))
+}
+
+/// `POST /web/stage/<id>/pin` — handles the override form
+/// submission. Reads `LEX_TEA_USER` from the server env (since
+/// v3a is single-user mode), records an `Override` attestation,
+/// activates the stage, redirects back to the stage page so the
+/// reviewer sees the new attestation row.
+pub(crate) fn stage_pin_handler(
+    state: &State,
+    id: &str,
+    body: &str,
+) -> Response<Cursor<Vec<u8>>> {
+    let actor = match std::env::var("LEX_TEA_USER") {
+        Ok(n) if !n.is_empty() => n,
+        _ => return html_response(403, page("forbidden", "",
+            r#"<nav class="crumb"><a href="/">activity</a></nav>
+<h1>forbidden</h1>
+<p>Set <code>LEX_TEA_USER</code> on the server to enable overrides.</p>"#)),
+    };
+    // Decode the form-urlencoded `reason=...` body. Single field
+    // for v3a; multi-field forms get a real parser later.
+    let reason = body.split('&')
+        .find_map(|pair| pair.strip_prefix("reason="))
+        .map(percent_decode)
+        .filter(|s| !s.trim().is_empty());
+    let Some(reason) = reason else {
+        return html_response(400, page("bad request", "",
+            r#"<nav class="crumb"><a href="/">activity</a></nav>
+<h1>bad request</h1>
+<p>The override form requires a <code>reason</code>.</p>"#));
+    };
+
+    let store = state.store.lock().unwrap();
+    if store.get_metadata(id).is_err() {
+        return html_response(404, page("not found", "",
+            &format!(r#"<nav class="crumb"><a href="/">activity</a></nav><pre>unknown stage `{}`</pre>"#,
+                esc(id))));
+    }
+    if let Err(e) = store.activate(id) {
+        return html_response(500, page("error", "",
+            &format!("<pre>activate: {}</pre>", esc(&e.to_string()))));
+    }
+    let log = match store.attestation_log() {
+        Ok(l) => l,
+        Err(e) => return html_response(500, page("error", "",
+            &format!("<pre>{}</pre>", esc(&e.to_string())))),
+    };
+    let attestation = lex_vcs::Attestation::new(
+        id.to_string(), None, None,
+        AttestationKind::Override {
+            actor,
+            reason,
+            target_attestation_id: None,
+        },
+        AttestationResult::Passed,
+        lex_vcs::ProducerDescriptor {
+            tool: "lex-tea pin".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            model: None,
+        },
+        None,
+    );
+    if let Err(e) = log.put(&attestation) {
+        return html_response(500, page("error", "",
+            &format!("<pre>persist override: {}</pre>", esc(&e.to_string()))));
+    }
+    // 303 See Other → redirect the form POST to a GET on the
+    // stage page so a refresh doesn't repost the same override.
+    Response::from_data(Vec::new())
+        .with_status_code(303)
+        .with_header(
+            tiny_http::Header::from_bytes(&b"Location"[..],
+                format!("/web/stage/{}", id).as_bytes()).unwrap(),
+        )
+}
+
+/// Inline percent-decoder for x-www-form-urlencoded values. Just
+/// enough to handle `+` → space and `%XX` → byte. Doesn't support
+/// nested encoding or Unicode normalization; the override form
+/// has one field of free text and that's all this needs.
+fn percent_decode(s: &str) -> String {
+    let mut out = Vec::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => { out.push(b' '); i += 1; }
+            b'%' if i + 2 < bytes.len() => {
+                let hi = (bytes[i + 1] as char).to_digit(16);
+                let lo = (bytes[i + 2] as char).to_digit(16);
+                if let (Some(h), Some(l)) = (hi, lo) {
+                    out.push((h * 16 + l) as u8);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            b => { out.push(b); i += 1; }
+        }
+    }
+    String::from_utf8(out).unwrap_or_default()
 }
 
 // ---- shared helpers -----------------------------------------------
@@ -594,9 +728,10 @@ fn kind_short(k: &AttestationKind) -> String {
         AttestationKind::Examples { count, .. } => format!("Examples({count})"),
         AttestationKind::DiffBody { input_count, .. } => format!("DiffBody({input_count})"),
         AttestationKind::SandboxRun { effects } => {
-            let names: Vec<&str> = effects.iter().map(|s| s.as_str()).collect();
+            let names: Vec<&str> = effects.iter().map(String::as_str).collect();
             format!("SandboxRun([{}])", names.join(","))
         }
+        AttestationKind::Override { actor, .. } => format!("Override({actor})"),
     }
 }
 
