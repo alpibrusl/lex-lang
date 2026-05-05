@@ -227,6 +227,7 @@ fn peek(fmt: &OutputFormat, store: &Store, args: &[String]) -> Result<()> {
             name: name.clone(),
             parent: None,
             head_op: None,
+            predicate: None,
             merges: Vec::new(),
             created_at: 0,
         },
@@ -478,6 +479,7 @@ fn show(fmt: &OutputFormat, store: &Store, args: &[String]) -> Result<()> {
 fn create(fmt: &OutputFormat, store: &Store, args: &[String], dry_run: bool) -> Result<()> {
     let mut name: Option<String> = None;
     let mut from = lex_store::DEFAULT_BRANCH.to_string();
+    let mut predicate_arg: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -485,11 +487,45 @@ fn create(fmt: &OutputFormat, store: &Store, args: &[String], dry_run: bool) -> 
                 from = args.get(i + 1).ok_or_else(|| anyhow!("--from needs a branch"))?.clone();
                 i += 2;
             }
+            "--predicate" => {
+                predicate_arg = Some(args.get(i + 1)
+                    .ok_or_else(|| anyhow!("--predicate needs a JSON expression"))?.clone());
+                i += 2;
+            }
             other if name.is_none() => { name = Some(other.into()); i += 1; }
             other => bail!("unexpected `{other}`"),
         }
     }
-    let name = name.ok_or_else(|| anyhow!("usage: lex branch create <name> [--from BRANCH]"))?;
+    let name = name.ok_or_else(|| anyhow!(
+        "usage: lex branch create <name> [--from BRANCH | --predicate '<json>']"))?;
+
+    // Predicate-defined branch (#133): a saved query, not a snapshot.
+    // Cheap to create and discard — the predicate file is the source
+    // of truth; nothing is materialized until consumers ask.
+    if let Some(raw) = predicate_arg {
+        // Validate the JSON shape against lex_vcs::Predicate up front
+        // so a typo is caught at create time, not when someone tries
+        // to evaluate the branch later.
+        let value: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| anyhow!("--predicate parse: {e}"))?;
+        let _: lex_vcs::Predicate = lex_vcs::Predicate::from_value(&value)
+            .map_err(|e| anyhow!("--predicate not a valid Predicate: {e}"))?;
+        if dry_run {
+            let action = serde_json::json!({
+                "action": "create-predicate-branch", "name": name, "predicate": value,
+            });
+            acli_mod::emit_dry_run("branch", fmt,
+                &format!("would create predicate branch `{name}`"), vec![action]);
+        }
+        store.create_predicate_branch(&name, value.clone())
+            .map_err(|e| anyhow!("create predicate-branch {name}: {e}"))?;
+        let data = serde_json::json!({ "created": &name, "predicate": value });
+        acli_mod::emit_or_text("branch", data, fmt, || {
+            println!("→ created predicate branch `{name}`");
+        });
+        return Ok(());
+    }
+
     if dry_run {
         let action = serde_json::json!({ "action": "create-branch", "name": name, "from": from });
         acli_mod::emit_dry_run("branch", fmt,

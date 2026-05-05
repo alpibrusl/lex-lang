@@ -470,9 +470,15 @@ fn cmd_branch() -> CommandInfo {
     let show = CommandInfo::new("show", "show a branch's head map").idempotent(true)
         .add_argument("name", "string", "branch name", true)
         .add_option("--store", "string", "store root", None);
-    let create = CommandInfo::new("create", "create a branch").idempotent(false)
+    let create = CommandInfo::new("create", "create a branch (snapshot or predicate-defined)").idempotent(false)
         .add_argument("name", "string", "branch name", true)
         .add_option("--from", "string", "parent branch (default: main)", None)
+        .add_option(
+            "--predicate",
+            "string",
+            "JSON expression matching lex_vcs::Predicate; creates a saved query rather than a snapshot",
+            None,
+        )
         .add_option("--store", "string", "store root", None);
     let delete = CommandInfo::new("delete", "delete a non-current, non-default branch")
         .idempotent(false)
