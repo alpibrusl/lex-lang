@@ -1187,6 +1187,31 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             ));
             Some(Ty::Record(fields))
         }
+        "test" => {
+            // Tiny assertion library (#proposed-stdlib). Each helper
+            // returns Result[Unit, Str] so a test is itself a fn
+            // returning Result. Callers compose suites in user code
+            // (a List of (name, () -> Result[Unit, Str]) pairs +
+            // list.fold to accumulate verdicts). Property generators
+            // and a Rust-side Suite type are deferred to v2.
+            let mut fields = IndexMap::new();
+            // assert_eq[a, b] :: T -> T -> Result[Unit, Str]
+            // (T constrained equal by unification on the two args)
+            let unit_result = || Ty::Con("Result".into(), vec![Ty::Unit, Ty::str()]);
+            fields.insert("assert_eq".into(), Ty::function(
+                vec![Ty::Var(0), Ty::Var(0)], EffectSet::empty(), unit_result(),
+            ));
+            fields.insert("assert_ne".into(), Ty::function(
+                vec![Ty::Var(0), Ty::Var(0)], EffectSet::empty(), unit_result(),
+            ));
+            fields.insert("assert_true".into(), Ty::function(
+                vec![Ty::bool()], EffectSet::empty(), unit_result(),
+            ));
+            fields.insert("assert_false".into(), Ty::function(
+                vec![Ty::bool()], EffectSet::empty(), unit_result(),
+            ));
+            Some(Ty::Record(fields))
+        }
         "toml" => {
             // TOML config parser. Mirrors `std.json`'s shape: parse
             // is polymorphic so callers annotate the expected
@@ -1263,6 +1288,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "yaml" => "yaml",
         "dotenv" => "dotenv",
         "csv" => "csv",
+        "test" => "test",
         _ => return None,
     })
 }
