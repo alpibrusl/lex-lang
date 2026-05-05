@@ -1453,7 +1453,7 @@ fn check_required_fields(
     };
     let missing: Vec<&str> = required.iter()
         .filter(|n| !obj.contains_key(n.as_str()))
-        .map(|s| s.as_str())
+        .map(String::as_str)
         .collect();
     if missing.is_empty() {
         Ok(())
