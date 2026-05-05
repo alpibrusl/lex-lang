@@ -31,6 +31,7 @@
 
 pub mod handlers;
 mod web;
+pub mod mcp;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -40,6 +41,16 @@ pub fn serve(port: u16, store_root: PathBuf) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("bind failed: {e}"))?;
     let state = Arc::new(handlers::State::open(store_root)?);
     serve_on(server, state);
+    Ok(())
+}
+
+/// MCP server (#171). Same `State` shape as the HTTP server,
+/// stdio transport instead of TCP. Designed for hosts that
+/// spawn `lex serve --mcp` as a subprocess and pipe JSON-RPC
+/// over stdin/stdout.
+pub fn serve_mcp_stdio(store_root: PathBuf) -> anyhow::Result<()> {
+    let state = Arc::new(handlers::State::open(store_root)?);
+    mcp::serve_mcp(state)?;
     Ok(())
 }
 

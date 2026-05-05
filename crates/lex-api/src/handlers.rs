@@ -165,7 +165,7 @@ fn parse_handler(body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
     }
 }
 
-fn check_handler(body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+pub(crate) fn check_handler(body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
     let req: ParseReq = match serde_json::from_str(body) {
         Ok(r) => r, Err(e) => return error_response(400, format!("bad request: {e}")),
     };
@@ -182,7 +182,7 @@ fn check_handler(body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
 #[derive(Deserialize)]
 struct PublishReq { source: String, #[serde(default)] activate: bool }
 
-fn publish_handler(state: &State, body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+pub(crate) fn publish_handler(state: &State, body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
     let req: PublishReq = match serde_json::from_str(body) {
         Ok(r) => r, Err(e) => return error_response(400, format!("bad request: {e}")),
     };
@@ -354,7 +354,7 @@ fn patch_handler(state: &State, body: &str) -> Response<std::io::Cursor<Vec<u8>>
     }))
 }
 
-fn stage_handler(state: &State, id: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+pub(crate) fn stage_handler(state: &State, id: &str) -> Response<std::io::Cursor<Vec<u8>>> {
     let store = state.store.lock().unwrap();
     let meta = match store.get_metadata(id) {
         Ok(m) => m, Err(e) => return error_response(404, format!("{e}")),
@@ -378,7 +378,7 @@ fn stage_handler(state: &State, id: &str) -> Response<std::io::Cursor<Vec<u8>>> 
 /// caller round-tripping both endpoints sees consistent errors).
 /// Empty list (200) is *evidence of absence*: the stage exists but
 /// no producer has attested it.
-fn stage_attestations_handler(state: &State, id: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+pub(crate) fn stage_attestations_handler(state: &State, id: &str) -> Response<std::io::Cursor<Vec<u8>>> {
     let store = state.store.lock().unwrap();
     if let Err(e) = store.get_metadata(id) {
         return error_response(404, format!("{e}"));
@@ -425,7 +425,7 @@ struct RunReq {
     #[serde(default)] overrides: IndexMap<String, serde_json::Value>,
 }
 
-fn run_handler(state: &State, body: &str, with_overrides: bool) -> Response<std::io::Cursor<Vec<u8>>> {
+pub(crate) fn run_handler(state: &State, body: &str, with_overrides: bool) -> Response<std::io::Cursor<Vec<u8>>> {
     let req: RunReq = match serde_json::from_str(body) {
         Ok(r) => r, Err(e) => return error_response(400, format!("bad request: {e}")),
     };

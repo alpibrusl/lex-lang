@@ -1355,6 +1355,7 @@ fn cmd_replay(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 fn cmd_serve(args: &[String]) -> Result<()> {
     let mut port: u16 = 4040;
     let mut store_root = default_store_root();
+    let mut mcp = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1368,8 +1369,16 @@ fn cmd_serve(args: &[String]) -> Result<()> {
                 store_root = std::path::PathBuf::from(v);
                 i += 2;
             }
+            "--mcp" => { mcp = true; i += 1; }
             _ => i += 1,
         }
+    }
+    if mcp {
+        // MCP transport is stdio; --port is irrelevant. The host
+        // (Claude Code, Cursor, etc.) spawns this subprocess and
+        // pipes JSON-RPC over stdin/stdout.
+        eprintln!("lex MCP server (stdio) — store: {}", store_root.display());
+        return lex_api::serve_mcp_stdio(store_root);
     }
     eprintln!("lex agent API listening on http://127.0.0.1:{port}");
     eprintln!("store: {}", store_root.display());
