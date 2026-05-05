@@ -232,6 +232,20 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                 Err(e) => Ok(err_v(Value::Str(format!("{e}")))),
             }
         }
+        // Tactical fix for #168: validate required fields before
+        // returning Ok. The full type-driven fix (derive `required`
+        // from `T` at type-check time) tracked in #168.
+        ("json", "parse_strict") => {
+            let s = expect_str(args.first())?;
+            let required = required_field_names(args.get(1))?;
+            match serde_json::from_str::<serde_json::Value>(&s) {
+                Ok(v) => match check_required_fields(&v, &required) {
+                    Ok(()) => Ok(ok_v(json_to_value(&v))),
+                    Err(e) => Ok(err_v(Value::Str(e))),
+                },
+                Err(e) => Ok(err_v(Value::Str(format!("{e}")))),
+            }
+        }
 
         // -- toml (config parser; routes through serde_json::Value
         // so the parsed shape composes with the existing json
@@ -243,6 +257,24 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                 Ok(mut v) => {
                     unwrap_toml_datetime_markers(&mut v);
                     Ok(ok_v(json_to_value(&v)))
+                }
+                Err(e) => Ok(err_v(Value::Str(format!("{e}")))),
+            }
+        }
+        // Tactical fix for #168: validate required fields before
+        // returning Ok. Caller passes the field names explicitly
+        // so the runtime doesn't need T's shape (which lex-bytecode
+        // doesn't carry today). Full type-driven fix tracked in #168.
+        ("toml", "parse_strict") => {
+            let s = expect_str(args.first())?;
+            let required = required_field_names(args.get(1))?;
+            match toml::from_str::<serde_json::Value>(&s) {
+                Ok(mut v) => {
+                    unwrap_toml_datetime_markers(&mut v);
+                    match check_required_fields(&v, &required) {
+                        Ok(()) => Ok(ok_v(json_to_value(&v))),
+                        Err(e) => Ok(err_v(Value::Str(e))),
+                    }
                 }
                 Err(e) => Ok(err_v(Value::Str(format!("{e}")))),
             }
@@ -270,6 +302,18 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let s = expect_str(args.first())?;
             match serde_yaml::from_str::<serde_json::Value>(&s) {
                 Ok(v)  => Ok(ok_v(json_to_value(&v))),
+                Err(e) => Ok(err_v(Value::Str(format!("{e}")))),
+            }
+        }
+        // Tactical fix for #168 — same shape as toml.parse_strict.
+        ("yaml", "parse_strict") => {
+            let s = expect_str(args.first())?;
+            let required = required_field_names(args.get(1))?;
+            match serde_yaml::from_str::<serde_json::Value>(&s) {
+                Ok(v) => match check_required_fields(&v, &required) {
+                    Ok(()) => Ok(ok_v(json_to_value(&v))),
+                    Err(e) => Ok(err_v(Value::Str(e))),
+                },
                 Err(e) => Ok(err_v(Value::Str(format!("{e}")))),
             }
         }
@@ -1364,6 +1408,59 @@ fn unwrap_toml_datetime_markers(v: &mut serde_json::Value) {
 }
 
 fn json_to_value(v: &serde_json::Value) -> Value { Value::from_json(v) }
+
+/// Extract the `List[Str]` of required field names from the second
+/// argument of `*.parse_strict`. The list is allowed to be empty
+/// (the parse degenerates to plain `parse`); other shapes are a
+/// caller bug rather than a parse error.
+fn required_field_names(arg: Option<&Value>) -> Result<Vec<String>, String> {
+    let list = expect_list(arg)?;
+    let mut out = Vec::with_capacity(list.len());
+    for v in list {
+        match v {
+            Value::Str(s) => out.push(s.clone()),
+            other => return Err(format!(
+                "parse_strict: required-fields list must contain Str, got {other:?}"
+            )),
+        }
+    }
+    Ok(out)
+}
+
+/// Verify that `value`'s top level is an object containing every
+/// name in `required`. Returns a stable, human-readable error
+/// listing the missing field(s) so the agent's verifier can
+/// surface it directly.
+///
+/// Tactical fix for #168 — gives users a way to make
+/// `parse[T]` errors propagate as `Result::Err` instead of as
+/// runtime `GetField` errors at access time. The full
+/// type-driven fix (deriving `required` from `T` at type-check
+/// time so plain `parse[T]` works) tracked in #168.
+fn check_required_fields(
+    value: &serde_json::Value,
+    required: &[String],
+) -> Result<(), String> {
+    if required.is_empty() {
+        return Ok(());
+    }
+    let obj = match value {
+        serde_json::Value::Object(o) => o,
+        _ => return Err(format!(
+            "parse_strict: expected top-level object with fields {:?}, got {value}",
+            required
+        )),
+    };
+    let missing: Vec<&str> = required.iter()
+        .filter(|n| !obj.contains_key(n.as_str()))
+        .map(String::as_str)
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("missing required field(s): {}", missing.join(", ")))
+    }
+}
 
 /// Parse a `.env`-style file into key→value pairs. Accepts:
 ///

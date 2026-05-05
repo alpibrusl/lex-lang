@@ -259,7 +259,7 @@ pub(crate) fn trust_handler(state: &State) -> Response<Cursor<Vec<u8>>> {
         });
         for ((tool, model), s) in &entries {
             let total = s.passed + s.failed + s.inconclusive;
-            let pct = if total > 0 { (s.passed * 100) / total } else { 0 };
+            let pct = (s.passed * 100).checked_div(total).unwrap_or(0);
             let recent_fail = match (&s.latest_failure_ts, &s.latest_failure_stage) {
                 (Some(ts), Some(stage)) => format!(
                     r#"<a href="/web/stage/{stage}" class="mono">{stage:.16}…</a> <span class="muted">@{ts}</span>"#,
