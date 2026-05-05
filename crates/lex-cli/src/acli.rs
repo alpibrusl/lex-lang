@@ -479,13 +479,20 @@ fn cmd_branch() -> CommandInfo {
     let log = CommandInfo::new("log", "print the merge journal of a branch").idempotent(true)
         .add_argument("name", "string", "branch name (default: current)", false)
         .add_option("--store", "string", "store root", None);
+    let peek = CommandInfo::new("peek", "list ops on another branch without switching to it")
+        .idempotent(true)
+        .add_argument("name", "string", "branch to inspect", true)
+        .add_option("--since-fork", "bool", "limit to ops since the fork from --vs (or `parent`)", None)
+        .add_option("--vs", "string", "compare against this branch (default: <name>'s parent)", None)
+        .add_option("--store", "string", "store root", None);
     let mut info = CommandInfo::new("branch", "snapshot branches in lex-store (tier-1 agent-native VC)")
         .with_examples(vec![
             ("List branches", "lex branch list"),
             ("Create a feature", "lex branch create feature --from main"),
+            ("Peek what feature has done since fork", "lex branch peek feature --since-fork"),
         ])
-        .with_see_also(vec!["store-merge", "store", "log"]);
-    info.subcommands = vec![list, show, create, delete, use_b, current, log];
+        .with_see_also(vec!["store-merge", "store", "log", "merge"]);
+    info.subcommands = vec![list, show, create, delete, use_b, current, log, peek];
     info
 }
 
