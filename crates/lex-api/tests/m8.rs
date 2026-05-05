@@ -343,6 +343,57 @@ fn merge_resolve_unknown_session_returns_404() {
 }
 
 #[test]
+fn merge_commit_advances_dst_branch_after_take_theirs() {
+    // Full e2e: start → resolve(take_theirs) → commit. dst branch
+    // head must move to a new Merge op whose StageTransition picks
+    // up src's stage for the resolved sig.
+    let (srv, _tmp, merge_id) = with_modify_modify_session();
+    let path_resolve = format!("/v1/merge/{merge_id}/resolve");
+    let path_commit  = format!("/v1/merge/{merge_id}/commit");
+
+    // Pull the conflict id.
+    let (_, b) = http(&srv.addr, "POST", "/v1/merge/start", &json!({
+        "src_branch": "feature", "dst_branch": lex_store::DEFAULT_BRANCH,
+    }).to_string());
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    let conflict_id = v["conflicts"][0]["conflict_id"].as_str().unwrap().to_string();
+
+    // Resolve as take_theirs.
+    let body = json!({
+        "resolutions": [
+            {"conflict_id": conflict_id, "resolution": {"kind": "take_theirs"}}
+        ]
+    }).to_string();
+    let (s, _) = http(&srv.addr, "POST", &path_resolve, &body);
+    assert_eq!(s, 200);
+
+    // Commit.
+    let (s, b) = http(&srv.addr, "POST", &path_commit, "");
+    assert_eq!(s, 200, "commit: {b}");
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    let new_head = v["new_head_op"].as_str().expect("new_head_op set");
+    assert!(!new_head.is_empty());
+    assert_eq!(v["dst_branch"], lex_store::DEFAULT_BRANCH);
+}
+
+#[test]
+fn merge_commit_with_unresolved_conflicts_returns_422() {
+    // No resolutions submitted → conflicts remaining → 422.
+    let (srv, _tmp, merge_id) = with_modify_modify_session();
+    let path_commit = format!("/v1/merge/{merge_id}/commit");
+    let (s, b) = http(&srv.addr, "POST", &path_commit, "");
+    assert_eq!(s, 422, "expected 422 conflicts remaining: {b}");
+    assert!(b.contains("conflicts remaining"));
+}
+
+#[test]
+fn merge_commit_unknown_session_returns_404() {
+    let (srv, _tmp) = start_server();
+    let (s, _) = http(&srv.addr, "POST", "/v1/merge/no_such/commit", "");
+    assert_eq!(s, 404);
+}
+
+#[test]
 fn replay_with_overrides() {
     let (srv, _tmp) = start_server();
     let src = "import \"std.io\" as io\nfn read_one(p :: Str) -> [io] Result[Str, Str] { io.read(p) }\n";

@@ -16,6 +16,7 @@
 //!   GET  /v1/diff?a=&b=      → Divergence | { divergence: null }
 //!   POST /v1/merge/start              { src_branch, dst_branch } → { merge_id, conflicts, ... }
 //!   POST /v1/merge/<id>/resolve       { resolutions: [...] } → { verdicts, remaining_conflicts }
+//!   POST /v1/merge/<id>/commit        → { new_head_op, dst_branch } | 422 conflicts remaining
 //!   GET  /v1/health          → { ok: true }
 
 pub mod handlers;
