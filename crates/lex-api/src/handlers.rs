@@ -694,12 +694,40 @@ fn merge_commit_handler(
                     Err(e) => return error_response(500, format!("resolve take_theirs: {e}")),
                 }
             }
-            lex_vcs::Resolution::Custom { .. } => {
-                return error_with_detail(
-                    422,
-                    "custom resolutions not yet supported by /v1/merge/<id>/commit",
-                    serde_json::json!({"conflict_id": conflict_id}),
-                );
+            lex_vcs::Resolution::Custom { op } => {
+                // The agent's brand-new op carries the merge target
+                // in its kind (e.g. ModifyBody.to_stage_id). The op
+                // itself isn't separately recorded in the log here
+                // — its head-map effect is folded into the merge
+                // op's entries map. Callers that want the op as a
+                // first-class history entry should publish it via
+                // /v1/publish first and submit a TakeTheirs/TakeOurs
+                // resolution against the resulting head.
+                match op.kind.merge_target() {
+                    Some((sig, stage)) => {
+                        if sig != conflict_id {
+                            return error_with_detail(
+                                422,
+                                "custom op targets a different sig than the conflict",
+                                serde_json::json!({
+                                    "conflict_id": conflict_id,
+                                    "op_targets": sig,
+                                }),
+                            );
+                        }
+                        entries.insert(conflict_id, stage);
+                    }
+                    None => {
+                        return error_with_detail(
+                            422,
+                            "custom op kind doesn't yield a single sig→stage delta",
+                            serde_json::json!({
+                                "conflict_id": conflict_id,
+                                "kind": serde_json::to_value(&op.kind).unwrap_or(serde_json::Value::Null),
+                            }),
+                        );
+                    }
+                }
             }
             lex_vcs::Resolution::Defer => {
                 // Unreachable: commit() rejects Defer above.

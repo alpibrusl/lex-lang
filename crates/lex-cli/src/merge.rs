@@ -278,8 +278,14 @@ fn cmd_commit(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                 let stage_id = walk_src_for_sig(&store, &src_head, &conflict_id)?;
                 entries.insert(conflict_id, stage_id);
             }
-            lex_vcs::Resolution::Custom { .. } => {
-                bail!("custom resolutions not yet supported by `lex merge commit`");
+            lex_vcs::Resolution::Custom { op } => {
+                let (sig, stage) = op.kind.merge_target()
+                    .ok_or_else(|| anyhow!(
+                        "custom op kind doesn't yield a single sig→stage delta: {:?}", op.kind))?;
+                if sig != conflict_id {
+                    bail!("custom op targets sig `{sig}` but the conflict is on `{conflict_id}`");
+                }
+                entries.insert(conflict_id, stage);
             }
             lex_vcs::Resolution::Defer => {
                 bail!("internal: Defer resolution slipped past commit gate");

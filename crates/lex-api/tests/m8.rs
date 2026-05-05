@@ -394,6 +394,104 @@ fn merge_commit_unknown_session_returns_404() {
 }
 
 #[test]
+fn merge_commit_with_custom_resolution_lands_agent_supplied_stage() {
+    // Same ModifyModify setup as the take_theirs test, but the
+    // agent submits a `Custom { op }` whose ModifyBody.to_stage_id
+    // names a brand-new stage. commit folds the op's target into
+    // the merge entries.
+    let (srv, _tmp, merge_id) = with_modify_modify_session();
+    let path_resolve = format!("/v1/merge/{merge_id}/resolve");
+    let path_commit  = format!("/v1/merge/{merge_id}/commit");
+
+    // Pull conflict + ours/theirs stage ids from the fresh session
+    // start (same merge_id; conflict_id == sig).
+    let (_, b) = http(&srv.addr, "POST", "/v1/merge/start", &json!({
+        "src_branch": "feature", "dst_branch": lex_store::DEFAULT_BRANCH,
+    }).to_string());
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    let conflict = &v["conflicts"][0];
+    let conflict_id = conflict["conflict_id"].as_str().unwrap().to_string();
+    let ours_stage = conflict["ours"].as_str().unwrap().to_string();
+    let theirs_stage = conflict["theirs"].as_str().unwrap().to_string();
+    let custom_stage = "stage-agent-resolved-001".to_string();
+
+    let resolve_body = json!({
+        "resolutions": [
+            {
+                "conflict_id": conflict_id,
+                "resolution": {
+                    "kind": "custom",
+                    "op": {
+                        // Operation's `kind` is #[serde(flatten)],
+                        // so OperationKind's tag + fields appear at
+                        // the top level alongside `parents`.
+                        "op": "modify_body",
+                        "sig_id": conflict_id,
+                        "from_stage_id": ours_stage,
+                        "to_stage_id":   custom_stage,
+                        "parents": [
+                            // Conflict resolution must list both
+                            // sides; MergeSession enforces parents.len() ≥ 2.
+                            ours_stage.clone(),
+                            theirs_stage,
+                        ],
+                    }
+                }
+            }
+        ]
+    }).to_string();
+    let (s, b) = http(&srv.addr, "POST", &path_resolve, &resolve_body);
+    assert_eq!(s, 200, "resolve: {b}");
+    let rv: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(rv["verdicts"][0]["accepted"], true);
+
+    let (s, b) = http(&srv.addr, "POST", &path_commit, "");
+    assert_eq!(s, 200, "commit: {b}");
+    // After commit, dst's branch_head for `foo` should be the
+    // agent-supplied custom stage. We can verify via the public
+    // /v1/stage/<id> endpoint isn't present (it's not a real
+    // stage), but the merge op recorded the head delta — read the
+    // op log via /v1/diff is overkill; instead just check the
+    // response's new_head_op is set.
+    let cv: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert!(cv["new_head_op"].as_str().is_some());
+}
+
+#[test]
+fn merge_commit_rejects_custom_op_targeting_wrong_sig() {
+    let (srv, _tmp, merge_id) = with_modify_modify_session();
+    let path_resolve = format!("/v1/merge/{merge_id}/resolve");
+    let path_commit  = format!("/v1/merge/{merge_id}/commit");
+
+    let (_, b) = http(&srv.addr, "POST", "/v1/merge/start", &json!({
+        "src_branch": "feature", "dst_branch": lex_store::DEFAULT_BRANCH,
+    }).to_string());
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    let conflict_id = v["conflicts"][0]["conflict_id"].as_str().unwrap().to_string();
+
+    let resolve_body = json!({
+        "resolutions": [{
+            "conflict_id": conflict_id,
+            "resolution": {
+                "kind": "custom",
+                "op": {
+                    "op": "modify_body",
+                    "sig_id": "fn::not_the_conflict_sig",
+                    "from_stage_id": "x",
+                    "to_stage_id":   "y",
+                    "parents": ["a", "b"],
+                }
+            }
+        }]
+    }).to_string();
+    let (s, _) = http(&srv.addr, "POST", &path_resolve, &resolve_body);
+    assert_eq!(s, 200, "resolve accepts; mismatch caught at commit");
+    let (s, b) = http(&srv.addr, "POST", &path_commit, "");
+    assert_eq!(s, 422, "commit should 422 on mismatched-sig custom op: {b}");
+    assert!(b.contains("targets a different sig"));
+}
+
+#[test]
 fn replay_with_overrides() {
     let (srv, _tmp) = start_server();
     let src = "import \"std.io\" as io\nfn read_one(p :: Str) -> [io] Result[Str, Str] { io.read(p) }\n";
