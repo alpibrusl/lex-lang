@@ -100,6 +100,17 @@ fn route(
     body: &str,
 ) -> Response<std::io::Cursor<Vec<u8>>> {
     match (method, path) {
+        // ---- lex-tea v1 (HTML browser) ------------------------
+        (Method::Get, "/") => crate::web::index_handler(state),
+        (Method::Get, p) if p.starts_with("/web/branch/") => {
+            let name = &p["/web/branch/".len()..];
+            crate::web::branch_handler(state, name)
+        }
+        (Method::Get, p) if p.starts_with("/web/stage/") => {
+            let id = &p["/web/stage/".len()..];
+            crate::web::stage_html_handler(state, id)
+        }
+        // ---- JSON API -----------------------------------------
         (Method::Get, "/v1/health") => json_response(200, &serde_json::json!({"ok": true})),
         (Method::Post, "/v1/parse") => parse_handler(body),
         (Method::Post, "/v1/check") => check_handler(body),

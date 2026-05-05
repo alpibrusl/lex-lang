@@ -335,6 +335,58 @@ fn merge_resolve_unknown_conflict_is_rejected_per_entry() {
 }
 
 #[test]
+fn web_index_lists_branches_as_html() {
+    let (srv, _tmp) = start_server();
+    // Publish so main has a head_op to display.
+    let src = "fn foo(n :: Int) -> Int { n }\n";
+    let (s, _) = http(&srv.addr, "POST", "/v1/publish", &json!({"source": src, "activate": true}).to_string());
+    assert_eq!(s, 200);
+
+    let (s, b) = http(&srv.addr, "GET", "/", "");
+    assert_eq!(s, 200, "GET /: {b}");
+    assert!(b.contains("<title>") && b.contains("lex-tea"), "html with title expected: {b}");
+    assert!(b.contains("main"), "branch list should mention main: {b}");
+}
+
+#[test]
+fn web_branch_page_lists_fn_with_stage_link() {
+    let (srv, _tmp) = start_server();
+    let src = "fn foo(n :: Int) -> Int { n }\n";
+    let (s, _) = http(&srv.addr, "POST", "/v1/publish", &json!({"source": src, "activate": true}).to_string());
+    assert_eq!(s, 200);
+
+    let (s, b) = http(&srv.addr, "GET", "/web/branch/main", "");
+    assert_eq!(s, 200, "GET /web/branch/main: {b}");
+    assert!(b.contains("foo"), "fn name should appear: {b}");
+    assert!(b.contains("/web/stage/"), "should link to stage page: {b}");
+}
+
+#[test]
+fn web_stage_page_shows_attestations() {
+    let (srv, _tmp) = start_server();
+    let src = "fn foo(n :: Int) -> Int { n }\n";
+    let (s, b) = http(&srv.addr, "POST", "/v1/publish", &json!({"source": src, "activate": true}).to_string());
+    assert_eq!(s, 200);
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    let stage_id = v["ops"][0]["kind"]["stage_id"].as_str().unwrap();
+
+    let (s, b) = http(&srv.addr, "GET", &format!("/web/stage/{stage_id}"), "");
+    assert_eq!(s, 200, "GET /web/stage/<id>: {b}");
+    // The TypeCheck attestation auto-emitted by publish_program
+    // should show up on the page.
+    assert!(b.contains("TypeCheck"), "TypeCheck attestation row expected: {b}");
+    assert!(b.contains("passed"), "passed result expected: {b}");
+    assert!(b.contains("foo"), "fn name in heading expected: {b}");
+}
+
+#[test]
+fn web_unknown_stage_returns_404_html() {
+    let (srv, _tmp) = start_server();
+    let (s, _) = http(&srv.addr, "GET", "/web/stage/no_such_stage", "");
+    assert_eq!(s, 404);
+}
+
+#[test]
 fn merge_resolve_unknown_session_returns_404() {
     let (srv, _tmp) = start_server();
     let body = json!({"resolutions": []}).to_string();

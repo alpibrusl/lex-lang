@@ -18,8 +18,14 @@
 //!   POST /v1/merge/<id>/resolve       { resolutions: [...] } → { verdicts, remaining_conflicts }
 //!   POST /v1/merge/<id>/commit        → { new_head_op, dst_branch } | 422 conflicts remaining
 //!   GET  /v1/health          → { ok: true }
+//!
+//! Web (lex-tea v1, read-only HTML over the JSON API):
+//!   GET  /                      → branch list
+//!   GET  /web/branch/<name>     → fns on a branch
+//!   GET  /web/stage/<id>        → stage info + attestation trail
 
 pub mod handlers;
+mod web;
 
 use std::path::PathBuf;
 use std::sync::Arc;
