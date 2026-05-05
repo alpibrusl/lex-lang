@@ -335,17 +335,70 @@ fn merge_resolve_unknown_conflict_is_rejected_per_entry() {
 }
 
 #[test]
-fn web_index_lists_branches_as_html() {
+fn web_activity_stream_lists_recent_attestations() {
+    // The new home page (lex-tea v2) is an activity stream sourced
+    // from the attestation log. After a publish, there's at least
+    // one TypeCheck::Passed event the page should render.
     let (srv, _tmp) = start_server();
-    // Publish so main has a head_op to display.
     let src = "fn foo(n :: Int) -> Int { n }\n";
     let (s, _) = http(&srv.addr, "POST", "/v1/publish", &json!({"source": src, "activate": true}).to_string());
     assert_eq!(s, 200);
 
     let (s, b) = http(&srv.addr, "GET", "/", "");
     assert_eq!(s, 200, "GET /: {b}");
-    assert!(b.contains("<title>") && b.contains("lex-tea"), "html with title expected: {b}");
+    assert!(b.contains("<title>") && b.contains("lex-tea"), "html title: {b}");
+    assert!(b.contains("activity"), "activity heading expected: {b}");
+    assert!(b.contains("TypeCheck"), "auto-emitted TypeCheck row expected: {b}");
+    assert!(b.contains("/web/stage/"), "should link to stage detail: {b}");
+}
+
+#[test]
+fn web_branches_page_lists_branches() {
+    // The v1 home moved to /web/branches in v2; verify it still
+    // renders the branch list.
+    let (srv, _tmp) = start_server();
+    let src = "fn foo(n :: Int) -> Int { n }\n";
+    let (s, _) = http(&srv.addr, "POST", "/v1/publish", &json!({"source": src, "activate": true}).to_string());
+    assert_eq!(s, 200);
+
+    let (s, b) = http(&srv.addr, "GET", "/web/branches", "");
+    assert_eq!(s, 200, "GET /web/branches: {b}");
     assert!(b.contains("main"), "branch list should mention main: {b}");
+}
+
+#[test]
+fn web_trust_page_groups_by_producer() {
+    // After a publish, the trust page should show a row for the
+    // store-side producer (`lex-store`) since the type-check gate
+    // auto-emitted a TypeCheck attestation under that name.
+    let (srv, _tmp) = start_server();
+    let src = "fn foo(n :: Int) -> Int { n }\n";
+    let (s, _) = http(&srv.addr, "POST", "/v1/publish", &json!({"source": src, "activate": true}).to_string());
+    assert_eq!(s, 200);
+
+    let (s, b) = http(&srv.addr, "GET", "/web/trust", "");
+    assert_eq!(s, 200, "GET /web/trust: {b}");
+    assert!(b.contains("trust"), "trust heading: {b}");
+    assert!(b.contains("lex-store"), "lex-store producer row: {b}");
+}
+
+#[test]
+fn web_attention_empty_when_only_passed_attestations_exist() {
+    // The exceptions table should be empty when every attestation
+    // is Passed — the "clear runway" message renders. Exercises
+    // the attention page's empty-state path so a regression that
+    // accidentally shows passed attestations as exceptions is
+    // caught.
+    let (srv, _tmp) = start_server();
+    let src = "fn foo(n :: Int) -> Int { n }\n";
+    let (s, _) = http(&srv.addr, "POST", "/v1/publish", &json!({"source": src, "activate": true}).to_string());
+    assert_eq!(s, 200);
+
+    let (s, b) = http(&srv.addr, "GET", "/web/attention", "");
+    assert_eq!(s, 200, "GET /web/attention: {b}");
+    assert!(b.contains("attention"), "attention heading: {b}");
+    assert!(b.contains("clear runway") || b.contains("no failed"),
+        "empty-state copy expected: {b}");
 }
 
 #[test]

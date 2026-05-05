@@ -19,10 +19,15 @@
 //!   POST /v1/merge/<id>/commit        → { new_head_op, dst_branch } | 422 conflicts remaining
 //!   GET  /v1/health          → { ok: true }
 //!
-//! Web (lex-tea v1, read-only HTML over the JSON API):
-//!   GET  /                      → branch list
-//!   GET  /web/branch/<name>     → fns on a branch
-//!   GET  /web/stage/<id>        → stage info + attestation trail
+//! Web (lex-tea v2, read-only HTML; human-only audit + triage):
+//!   GET  /                      → activity stream (recent attestations)
+//!   GET  /web/attention         → exceptions queue (Failed / Inconclusive,
+//!                                 stale merge sessions)
+//!   GET  /web/trust             → per-producer rollup (pass rate, latest
+//!                                 failure)
+//!   GET  /web/branches          → branch list
+//!   GET  /web/branch/<name>     → fns on a branch (detail)
+//!   GET  /web/stage/<id>        → stage info + attestation trail (detail)
 
 pub mod handlers;
 mod web;

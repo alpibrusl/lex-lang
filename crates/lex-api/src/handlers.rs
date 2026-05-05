@@ -100,8 +100,11 @@ fn route(
     body: &str,
 ) -> Response<std::io::Cursor<Vec<u8>>> {
     match (method, path) {
-        // ---- lex-tea v1 (HTML browser) ------------------------
-        (Method::Get, "/") => crate::web::index_handler(state),
+        // ---- lex-tea v2 (HTML browser) ------------------------
+        (Method::Get, "/") => crate::web::activity_handler(state),
+        (Method::Get, "/web/branches") => crate::web::branches_handler(state),
+        (Method::Get, "/web/trust") => crate::web::trust_handler(state),
+        (Method::Get, "/web/attention") => crate::web::attention_handler(state),
         (Method::Get, p) if p.starts_with("/web/branch/") => {
             let name = &p["/web/branch/".len()..];
             crate::web::branch_handler(state, name)
