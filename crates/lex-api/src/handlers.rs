@@ -113,6 +113,12 @@ fn route(
             let id = &p["/web/stage/".len()..];
             crate::web::stage_html_handler(state, id)
         }
+        // lex-tea v3a: human override pin (#172). HTML form
+        // posts to /web/stage/<id>/pin with `reason` body.
+        (Method::Post, p) if p.starts_with("/web/stage/") && p.ends_with("/pin") => {
+            let id = &p["/web/stage/".len()..p.len() - "/pin".len()];
+            crate::web::stage_pin_handler(state, id, body)
+        }
         // ---- JSON API -----------------------------------------
         (Method::Get, "/v1/health") => json_response(200, &serde_json::json!({"ok": true})),
         (Method::Post, "/v1/parse") => parse_handler(body),

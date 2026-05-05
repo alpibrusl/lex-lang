@@ -124,6 +124,24 @@ pub enum AttestationKind {
     SandboxRun {
         effects: BTreeSet<String>,
     },
+    /// Human-issued override (lex-tea v3, #172). Records that a
+    /// human took an action that bypassed an automatic verdict
+    /// — e.g. activating a stage despite a `Spec::Failed` or
+    /// `TypeCheck::Failed` attestation. Subject to the same
+    /// trust trail as agent attestations: the audit fact lives
+    /// in the log alongside what it overrode.
+    ///
+    /// `actor` is the human's identifier (today: `LEX_TEA_USER`
+    /// env var or `--actor` flag; v3b adds session auth).
+    /// `target_attestation_id` points at the attestation being
+    /// overridden, when one exists; for unconditional pins
+    /// (e.g. activate-by-default) it can be `None`.
+    Override {
+        actor: String,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_attestation_id: Option<AttestationId>,
+    },
 }
 
 /// Verification method for [`AttestationKind::Spec`]. Mirrors the
