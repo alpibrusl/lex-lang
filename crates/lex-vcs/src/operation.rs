@@ -143,6 +143,38 @@ pub enum OperationKind {
     },
 }
 
+impl OperationKind {
+    /// The `(SigId, Option<StageId>)` an op kind targets, as used by
+    /// `StageTransition::Merge::entries`. Used by the merge-commit
+    /// path (#134) to translate a `Resolution::Custom { op }` into
+    /// the head-map delta the merge op records:
+    ///
+    /// * Adds → `(sig, Some(stage_id))`
+    /// * Modifies → `(sig, Some(to_stage_id))`
+    /// * Removes → `(sig, None)`
+    /// * Renames → `(to_sig, Some(body_stage_id))`
+    /// * `AddImport` / `RemoveImport` / nested `Merge` → `None`
+    ///   (no single sig→stage delta)
+    pub fn merge_target(&self) -> Option<(SigId, Option<StageId>)> {
+        use OperationKind::*;
+        match self {
+            AddFunction { sig_id, stage_id, .. }
+            | AddType { sig_id, stage_id }
+                => Some((sig_id.clone(), Some(stage_id.clone()))),
+            ModifyBody { sig_id, to_stage_id, .. }
+            | ChangeEffectSig { sig_id, to_stage_id, .. }
+            | ModifyType { sig_id, to_stage_id, .. }
+                => Some((sig_id.clone(), Some(to_stage_id.clone()))),
+            RemoveFunction { sig_id, .. }
+            | RemoveType { sig_id, .. }
+                => Some((sig_id.clone(), None)),
+            RenameSymbol { to, body_stage_id, .. }
+                => Some((to.clone(), Some(body_stage_id.clone()))),
+            AddImport { .. } | RemoveImport { .. } | Merge { .. } => None,
+        }
+    }
+}
+
 /// The operation as a whole — its kind and the causal predecessors
 /// it assumes. The `OpId` is computed from this plus a sorted view
 /// of `parents`.

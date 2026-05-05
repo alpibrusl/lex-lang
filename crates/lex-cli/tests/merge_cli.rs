@@ -163,6 +163,59 @@ fn merge_commit_with_unresolved_conflicts_errors() {
 }
 
 #[test]
+fn merge_full_cycle_with_custom_resolution_lands_agent_stage() {
+    let store = tempdir().unwrap();
+    modify_modify_setup(store.path());
+    let v = merge_start(store.path(), "feature", lex_store::DEFAULT_BRANCH);
+    let merge_id = v.pointer("/data/merge_id").unwrap().as_str().unwrap().to_string();
+    let conflict = v.pointer("/data/conflicts/0").unwrap();
+    let conflict_id = conflict["conflict_id"].as_str().unwrap().to_string();
+    let ours = conflict["ours"].as_str().unwrap().to_string();
+    let theirs = conflict["theirs"].as_str().unwrap().to_string();
+
+    let resolutions_path = store.path().join("res.json");
+    // Same shape as the HTTP /resolve body. Operation's `kind` is
+    // serde-flattened so the OperationKind tag lives at the top.
+    let body = serde_json::json!([{
+        "conflict_id": conflict_id,
+        "resolution": {
+            "kind": "custom",
+            "op": {
+                "op": "modify_body",
+                "sig_id": conflict_id,
+                "from_stage_id": ours,
+                "to_stage_id":   "stage-agent-resolved-cli-001",
+                "parents": [ours, theirs],
+            }
+        }
+    }]);
+    std::fs::write(&resolutions_path, serde_json::to_vec(&body).unwrap()).unwrap();
+
+    let out = Command::new(lex_bin())
+        .args([
+            "--output", "json",
+            "merge", "resolve",
+            "--store", store.path().to_str().unwrap(),
+            &merge_id,
+            "--file", resolutions_path.to_str().unwrap(),
+        ])
+        .output().unwrap();
+    assert!(out.status.success(), "resolve: {}", String::from_utf8_lossy(&out.stderr));
+
+    let out = Command::new(lex_bin())
+        .args([
+            "--output", "json",
+            "merge", "commit",
+            "--store", store.path().to_str().unwrap(),
+            &merge_id,
+        ])
+        .output().unwrap();
+    assert!(out.status.success(), "commit: {}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(!v.pointer("/data/new_head_op").unwrap().as_str().unwrap().is_empty());
+}
+
+#[test]
 fn merge_status_unknown_id_errors() {
     let store = tempdir().unwrap();
     let out = Command::new(lex_bin())
