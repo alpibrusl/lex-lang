@@ -1138,6 +1138,55 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             ));
             Some(Ty::Record(fields))
         }
+        "yaml" => {
+            // YAML config parser. Same shape as `std.toml`: parse
+            // is polymorphic, output Value layout matches std.json
+            // (Str/Int/Float/Bool/List/Record). Anchors and tags
+            // are flattened by serde_yaml's deserializer.
+            let mut fields = IndexMap::new();
+            fields.insert("parse".into(), Ty::function(
+                vec![Ty::str()], EffectSet::empty(),
+                Ty::Con("Result".into(), vec![Ty::Var(0), Ty::str()]),
+            ));
+            fields.insert("stringify".into(), Ty::function(
+                vec![Ty::Var(0)], EffectSet::empty(),
+                Ty::Con("Result".into(), vec![Ty::str(), Ty::str()]),
+            ));
+            Some(Ty::Record(fields))
+        }
+        "dotenv" => {
+            // .env-style files. parse :: Str -> Result[Map[Str,Str], Str].
+            // Returns a map (not a polymorphic record) because
+            // dotenv files don't carry shape — every value is a
+            // string and keys aren't statically known.
+            let mut fields = IndexMap::new();
+            fields.insert("parse".into(), Ty::function(
+                vec![Ty::str()], EffectSet::empty(),
+                Ty::Con("Result".into(), vec![
+                    Ty::Con("Map".into(), vec![Ty::str(), Ty::str()]),
+                    Ty::str(),
+                ]),
+            ));
+            Some(Ty::Record(fields))
+        }
+        "csv" => {
+            // CSV rows-as-lists. parse :: Str -> Result[List[List[Str]], Str].
+            // Header awareness is left to the caller — row 0 is
+            // whatever the file has. A `parse_with_headers` that
+            // returns List[Map[Str,Str]] is a natural follow-up.
+            let row_ty = Ty::List(Box::new(Ty::str()));
+            let rows_ty = Ty::List(Box::new(row_ty.clone()));
+            let mut fields = IndexMap::new();
+            fields.insert("parse".into(), Ty::function(
+                vec![Ty::str()], EffectSet::empty(),
+                Ty::Con("Result".into(), vec![rows_ty.clone(), Ty::str()]),
+            ));
+            fields.insert("stringify".into(), Ty::function(
+                vec![rows_ty], EffectSet::empty(),
+                Ty::Con("Result".into(), vec![Ty::str(), Ty::str()]),
+            ));
+            Some(Ty::Record(fields))
+        }
         "toml" => {
             // TOML config parser. Mirrors `std.json`'s shape: parse
             // is polymorphic so callers annotate the expected
@@ -1211,6 +1260,9 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "log" => "log",
         "http" => "http",
         "toml" => "toml",
+        "yaml" => "yaml",
+        "dotenv" => "dotenv",
+        "csv" => "csv",
         _ => return None,
     })
 }
