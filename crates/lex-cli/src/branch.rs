@@ -53,6 +53,7 @@ pub fn cmd_branch(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "current" => current(fmt, &store),
         "log"     => log(fmt, &store, &rest),
         "peek"    => peek(fmt, &store, &rest),
+        "overlay" => overlay(fmt, &store, &rest),
         other     => bail!("unknown `lex branch` subcommand `{other}`"),
     }
 }
@@ -325,6 +326,101 @@ fn peek(fmt: &OutputFormat, store: &Store, args: &[String]) -> Result<()> {
             let id = o["op_id"].as_str().unwrap_or("");
             let kind = o["kind"].as_str().unwrap_or("?");
             println!("  {id:.16}…  {kind}");
+        }
+    });
+    Ok(())
+}
+
+/// `lex branch overlay <other> [--on <branch>]` — show what the
+/// current (or `--on`) branch would look like if `<other>` were
+/// merged in (#133). Pure read: nothing is persisted, no
+/// MergeSession is created.
+///
+/// Runs the same merge engine as `store-merge` but stops after
+/// classifying outcomes, then projects the dst head map forward
+/// over the auto-resolved entries. Conflicts are returned for
+/// inspection but do *not* block the projection — overlay's job
+/// is "what would the clean parts look like, and what would
+/// remain to fight about?".
+///
+/// Output: { this_branch, other_branch, lca, projected_head,
+///           auto_resolved, conflicts }.
+fn overlay(fmt: &OutputFormat, store: &Store, args: &[String]) -> Result<()> {
+    let mut other: Option<String> = None;
+    let mut on: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--on" => { on = args.get(i + 1).cloned(); i += 2; }
+            o if other.is_none() => { other = Some(o.to_string()); i += 1; }
+            o => bail!("unexpected arg `{o}`"),
+        }
+    }
+    let other = other.ok_or_else(|| anyhow!("usage: lex branch overlay <other> [--on <branch>]"))?;
+    let this  = on.unwrap_or_else(|| store.current_branch());
+
+    let this_head_op  = store.get_branch(&this)
+        .map_err(|e| anyhow!("read branch {this}: {e}"))?
+        .and_then(|b| b.head_op);
+    let other_head_op = store.get_branch(&other)
+        .map_err(|e| anyhow!("read branch {other}: {e}"))?
+        .ok_or_else(|| anyhow!("unknown branch `{other}`"))?
+        .head_op;
+
+    let log = lex_vcs::OpLog::open(store.root())
+        .map_err(|e| anyhow!("open op log: {e}"))?;
+    let merge_output = lex_vcs::merge(&log, other_head_op.as_ref(), this_head_op.as_ref())
+        .map_err(|e| anyhow!("merge: {e}"))?;
+
+    // Start with dst (this) branch's head map, apply Src outcomes
+    // to project what overlay would produce. Conflict sigs stay at
+    // their dst head until resolved — they're listed separately.
+    let mut projected = store.branch_head(&this)
+        .map_err(|e| anyhow!("branch_head {this}: {e}"))?;
+
+    let mut auto_resolved: Vec<&lex_vcs::MergeOutcome> = Vec::new();
+    let mut conflicts: Vec<&lex_vcs::MergeOutcome> = Vec::new();
+    for o in &merge_output.outcomes {
+        match o {
+            lex_vcs::MergeOutcome::Src { sig_id, stage_id } => {
+                match stage_id {
+                    Some(s) => { projected.insert(sig_id.clone(), s.clone()); }
+                    None    => { projected.remove(sig_id); }
+                }
+                auto_resolved.push(o);
+            }
+            lex_vcs::MergeOutcome::Both { .. } | lex_vcs::MergeOutcome::Dst { .. } => {
+                auto_resolved.push(o);
+            }
+            lex_vcs::MergeOutcome::Conflict { .. } => {
+                conflicts.push(o);
+            }
+        }
+    }
+
+    let data = serde_json::json!({
+        "this_branch":     &this,
+        "other_branch":    &other,
+        "lca":             merge_output.lca,
+        "projected_head":  serde_json::to_value(&projected)?,
+        "auto_resolved":   serde_json::to_value(&auto_resolved)?,
+        "conflicts":       serde_json::to_value(&conflicts)?,
+    });
+    let projected_for_text = projected.clone();
+    let conflicts_count    = conflicts.len();
+    let auto_count         = auto_resolved.len();
+    let this_for_text      = this.clone();
+    let other_for_text     = other.clone();
+    acli_mod::emit_or_text("branch", data, fmt, move || {
+        println!("overlay {other_for_text} on {this_for_text}: {} auto-resolved, {} conflict(s)",
+            auto_count, conflicts_count);
+        if conflicts_count == 0 {
+            println!("  projection ({} sigs):", projected_for_text.len());
+        } else {
+            println!("  projection (conflicting sigs unchanged from {this_for_text}):");
+        }
+        for (sig, stage) in &projected_for_text {
+            println!("    {sig:.16}…  →  {stage:.16}…");
         }
     });
     Ok(())

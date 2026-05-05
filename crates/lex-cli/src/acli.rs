@@ -485,14 +485,20 @@ fn cmd_branch() -> CommandInfo {
         .add_option("--since-fork", "bool", "limit to ops since the fork from --vs (or `parent`)", None)
         .add_option("--vs", "string", "compare against this branch (default: <name>'s parent)", None)
         .add_option("--store", "string", "store root", None);
+    let overlay = CommandInfo::new("overlay", "preview a merge: project current branch as if <other> were merged in")
+        .idempotent(true)
+        .add_argument("other", "string", "branch whose ops would be merged in", true)
+        .add_option("--on", "string", "destination branch (default: current)", None)
+        .add_option("--store", "string", "store root", None);
     let mut info = CommandInfo::new("branch", "snapshot branches in lex-store (tier-1 agent-native VC)")
         .with_examples(vec![
             ("List branches", "lex branch list"),
             ("Create a feature", "lex branch create feature --from main"),
             ("Peek what feature has done since fork", "lex branch peek feature --since-fork"),
+            ("Preview merging feature into main", "lex branch overlay feature --on main"),
         ])
         .with_see_also(vec!["store-merge", "store", "log", "merge"]);
-    info.subcommands = vec![list, show, create, delete, use_b, current, log, peek];
+    info.subcommands = vec![list, show, create, delete, use_b, current, log, peek, overlay];
     info
 }
 
