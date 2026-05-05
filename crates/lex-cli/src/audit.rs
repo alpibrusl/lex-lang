@@ -40,6 +40,15 @@ struct AuditOpts {
     kinds: Vec<String>,
     json: bool,
     no_summary: bool,
+    /// Store root for `EffectAudit` attestation persistence (#132).
+    /// When set together with `--effect K`, every scanned FnDecl gets
+    /// an attestation against its content-hashed StageId:
+    ///
+    /// * `Passed` if it doesn't touch any of the listed effects
+    /// * `Failed` if it does (detail = which effect(s))
+    ///
+    /// Without `--store`, behavior is unchanged.
+    store_root: Option<PathBuf>,
 }
 
 #[derive(Serialize)]
@@ -66,6 +75,24 @@ pub fn cmd_audit(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     }
     let files = collect_lex_files(&opts.paths)?;
     let mut report = AuditReport { summary: BTreeMap::new(), hits: Vec::new() };
+
+    // #132: when `--store DIR` is combined with `--effect K1,K2,...`,
+    // every scanned FnDecl gets an EffectAudit attestation against
+    // its content-hashed StageId. Without `--effect`, the attestation
+    // would be a vacuous claim — refuse so callers don't accumulate
+    // noise.
+    let att_log = match (&opts.store_root, opts.effects.is_empty()) {
+        (Some(_), true) => {
+            return Err(anyhow!(
+                "`--store DIR` requires `--effect K1,K2,...` to specify the effect set the audit is checking against"));
+        }
+        (Some(root), false) => {
+            let store = lex_store::Store::open(root)
+                .with_context(|| format!("opening store at {}", root.display()))?;
+            Some(store.attestation_log()?)
+        }
+        (None, _) => None,
+    };
 
     for path in &files {
         // Parse + canonicalize. Errors are printed once, then we keep
@@ -98,6 +125,42 @@ pub fn cmd_audit(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                         signature: render_signature(fd),
                         matched: if always { vec!["all".into()] } else { matched },
                     });
+                }
+
+                if let Some(log) = &att_log {
+                    if let Some(stage_id) = lex_ast::stage_id(stage) {
+                        let touched: Vec<&String> = info.effects.iter()
+                            .filter(|e| opts.effects.iter().any(|q| q == *e))
+                            .collect();
+                        let result = if touched.is_empty() {
+                            lex_vcs::AttestationResult::Passed
+                        } else {
+                            let names: Vec<&str> = touched.iter().map(|s| s.as_str()).collect();
+                            lex_vcs::AttestationResult::Failed {
+                                detail: format!("touches forbidden effect(s): {}", names.join(",")),
+                            }
+                        };
+                        let producer = lex_vcs::ProducerDescriptor {
+                            tool: "lex audit".into(),
+                            version: env!("CARGO_PKG_VERSION").into(),
+                            model: None,
+                        };
+                        let attestation = lex_vcs::Attestation::new(
+                            stage_id,
+                            None,
+                            None,
+                            lex_vcs::AttestationKind::EffectAudit,
+                            result,
+                            producer,
+                            None,
+                        );
+                        if let Err(e) = log.put(&attestation) {
+                            eprintln!(
+                                "warning: failed to persist EffectAudit attestation in {}: {e}",
+                                path.display()
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -168,6 +231,11 @@ fn parse_audit_args(args: &[String]) -> Result<AuditOpts> {
             }
             "--json"        => { o.json = true;        i += 1; }
             "--no-summary"  => { o.no_summary = true;  i += 1; }
+            "--store" => {
+                let v = args.get(i + 1).ok_or_else(|| anyhow!("--store needs a path"))?;
+                o.store_root = Some(PathBuf::from(v));
+                i += 2;
+            }
             other => { o.paths.push(PathBuf::from(other)); i += 1; }
         }
     }
