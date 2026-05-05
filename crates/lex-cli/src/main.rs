@@ -799,6 +799,53 @@ fn record_spec_attestation(
     Ok(())
 }
 
+/// Emit an attestation produced by `lex agent-tool` against the
+/// StageId of the agent-emitted `tool` fn. Centralizes the
+/// producer descriptor so every emission site (`--spec`,
+/// `--diff-body`, `--examples`, sandboxed run) tags itself
+/// consistently. The `model` field carries the Claude model name
+/// when the body came from `--request`; `None` for `--body`/
+/// `--body-file` since the model wasn't the proximate producer.
+fn emit_agent_tool_attestation(
+    log: &lex_vcs::AttestationLog,
+    stage_id: &str,
+    kind: lex_vcs::AttestationKind,
+    result: lex_vcs::AttestationResult,
+    model: Option<String>,
+) -> Result<()> {
+    let producer = lex_vcs::ProducerDescriptor {
+        tool: "lex agent-tool".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        model,
+    };
+    let attestation = lex_vcs::Attestation::new(
+        stage_id.to_string(),
+        None,
+        None,
+        kind,
+        result,
+        producer,
+        None,
+    );
+    log.put(&attestation)?;
+    Ok(())
+}
+
+/// Lowercase-hex SHA-256 of `bytes`. Used by `lex agent-tool` to
+/// content-hash example files and diff-body sources for the
+/// `Examples`/`DiffBody` attestation kinds.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    let digest = h.finalize();
+    let mut out = String::with_capacity(64);
+    for b in digest.iter() {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
 fn value_to_json_string(v: &Value) -> String {
     serde_json::to_string(&v.to_json()).unwrap()
 }
@@ -1472,6 +1519,12 @@ struct AgentToolOpts {
     /// Catches model-version regressions when v1's emission and v2's
     /// emission disagree on at least one case the host cares about.
     diff_body_source: Option<BodySource>,
+    /// Store root for attestation persistence (#132). When set,
+    /// every verification step (`--examples`, `--spec`, `--diff-body`,
+    /// and the final sandboxed run) emits an attestation against
+    /// the StageId of the agent-emitted `tool` fn. None ⇒ verifications
+    /// run as before with no persistence.
+    store_root: Option<PathBuf>,
 }
 
 enum BodySource {
@@ -1516,6 +1569,31 @@ fn cmd_agent_tool(args: &[String]) -> Result<()> {
     // effect on `fn tool` and the checker rejects it.
     let prog = load_program_from_str(&src).context("parse agent-generated source")?;
     let stages = canonicalize_program(&prog);
+
+    // #132: every verification step below is an attestation producer
+    // when `--store DIR` is set. Compute the StageId of the agent-
+    // emitted `tool` fn once; open the log once. Subsequent emit
+    // sites are content-addressed against this StageId so a later
+    // `lex stage <id> --attestations` can answer "what evidence
+    // exists for this exact body?".
+    let tool_stage_id: Option<String> = stages.iter()
+        .find_map(|s| match s {
+            Stage::FnDecl(fd) if fd.name == "tool" => stage_id(s),
+            _ => None,
+        });
+    let att_log: Option<lex_vcs::AttestationLog> = match &opts.store_root {
+        Some(root) => {
+            let store = Store::open(root)
+                .with_context(|| format!("opening store at {}", root.display()))?;
+            Some(store.attestation_log()?)
+        }
+        None => None,
+    };
+    let model_for_attestation: Option<String> = match &opts.body_source {
+        BodySource::Request(_) => Some(opts.model.clone()),
+        _ => None,
+    };
+
     if let Err(errs) = lex_types::check_program(&stages) {
         eprintln!("→ TYPE-CHECK REJECTED — tool not run.");
         for e in &errs {
@@ -1557,6 +1635,33 @@ fn cmd_agent_tool(args: &[String]) -> Result<()> {
             eprintln!("→ checking spec `{}`…", spec.name);
         }
         let report = spec_checker::check_spec(&spec, &src, opts.spec_trials);
+
+        // Emit the Spec attestation *before* the match below acts on
+        // the verdict — Counterexample / strict Inconclusive both
+        // exit, so we'd lose evidence on the failure path otherwise.
+        // Failures are evidence too (#132 trust model).
+        if let (Some(log), Some(sid)) = (&att_log, &tool_stage_id) {
+            let result = match &report.status {
+                spec_checker::ProofStatus::Proved => lex_vcs::AttestationResult::Passed,
+                spec_checker::ProofStatus::Counterexample => {
+                    let detail = report.evidence.counterexample.as_ref()
+                        .and_then(|c| serde_json::to_string(c).ok())
+                        .map(|s| format!("counterexample: {s}"))
+                        .unwrap_or_else(|| "counterexample".into());
+                    lex_vcs::AttestationResult::Failed { detail }
+                }
+                spec_checker::ProofStatus::Inconclusive => lex_vcs::AttestationResult::Inconclusive {
+                    detail: report.evidence.note.clone().unwrap_or_else(|| "inconclusive".into()),
+                },
+            };
+            let kind = lex_vcs::AttestationKind::Spec {
+                spec_id: report.spec_id.clone(),
+                method: lex_vcs::SpecMethod::Random,
+                trials: Some(opts.spec_trials as usize),
+            };
+            emit_agent_tool_attestation(log, sid, kind, result, model_for_attestation.clone())?;
+        }
+
         match report.status {
             spec_checker::ProofStatus::Proved => {
                 if opts.show_source {
@@ -1643,6 +1748,27 @@ fn cmd_agent_tool(args: &[String]) -> Result<()> {
                 diverged.push((input.clone(), out_a, out_b));
             }
         }
+        // Emit a DiffBody attestation against the original tool's
+        // StageId. `other_body_hash` is the SHA-256 of the second
+        // body's source so re-running with the same pair dedups.
+        // Failed attestation carries a summary of how many inputs
+        // diverged.
+        if let (Some(log), Some(sid)) = (&att_log, &tool_stage_id) {
+            let other_body_hash = sha256_hex(diff_body_text.as_bytes());
+            let result = if diverged.is_empty() {
+                lex_vcs::AttestationResult::Passed
+            } else {
+                lex_vcs::AttestationResult::Failed {
+                    detail: format!("{}/{} inputs diverged", diverged.len(), inputs.len()),
+                }
+            };
+            let kind = lex_vcs::AttestationKind::DiffBody {
+                other_body_hash,
+                input_count: inputs.len(),
+            };
+            emit_agent_tool_attestation(log, sid, kind, result, model_for_attestation.clone())?;
+        }
+
         if !diverged.is_empty() {
             eprintln!("→ DIFFERENTIAL DIVERGENCE — {} of {} inputs differ.",
                 diverged.len(), inputs.len());
@@ -1659,6 +1785,18 @@ fn cmd_agent_tool(args: &[String]) -> Result<()> {
         // Print body A's output on the first input — single-shot mode.
         let chosen = inputs.first().cloned().unwrap_or_default();
         let out = run_tool_once(&bc, &policy, opts.max_steps, &chosen)?;
+        if let (Some(log), Some(sid)) = (&att_log, &tool_stage_id) {
+            let kind = lex_vcs::AttestationKind::SandboxRun {
+                effects: opts.allowed_effects.iter().cloned().collect(),
+            };
+            emit_agent_tool_attestation(
+                log,
+                sid,
+                kind,
+                lex_vcs::AttestationResult::Passed,
+                model_for_attestation.clone(),
+            )?;
+        }
         println!("{out}");
         return Ok(());
     }
@@ -1668,7 +1806,11 @@ fn cmd_agent_tool(args: &[String]) -> Result<()> {
     // the type system says what code touches; the examples say what it
     // should return. On any mismatch, exit 5 (distinct from 2/3/4).
     if let Some(path) = opts.examples_file.as_ref() {
-        let examples = load_examples(path)?;
+        let raw_examples = fs::read(path)
+            .with_context(|| format!("read examples file {}", path.display()))?;
+        let examples_file_hash = sha256_hex(&raw_examples);
+        let examples: Vec<Example> = serde_json::from_slice(&raw_examples)
+            .with_context(|| format!("parse examples file {}; expected JSON array of {{input, expected}}", path.display()))?;
         if opts.show_source {
             eprintln!("→ checking {} example(s)…", examples.len());
         }
@@ -1679,6 +1821,24 @@ fn cmd_agent_tool(args: &[String]) -> Result<()> {
                 failures.push((idx, ex, out));
             }
         }
+
+        // Emit Examples attestation regardless of pass/fail. Same
+        // "failures are evidence too" rule as Spec.
+        if let (Some(log), Some(sid)) = (&att_log, &tool_stage_id) {
+            let result = if failures.is_empty() {
+                lex_vcs::AttestationResult::Passed
+            } else {
+                lex_vcs::AttestationResult::Failed {
+                    detail: format!("{}/{} examples mismatched", failures.len(), examples.len()),
+                }
+            };
+            let kind = lex_vcs::AttestationKind::Examples {
+                file_hash: examples_file_hash,
+                count: examples.len(),
+            };
+            emit_agent_tool_attestation(log, sid, kind, result, model_for_attestation.clone())?;
+        }
+
         if !failures.is_empty() {
             eprintln!("→ EXAMPLES FAILED — tool not trusted ({} of {} mismatched).",
                 failures.len(), examples.len());
@@ -1697,6 +1857,23 @@ fn cmd_agent_tool(args: &[String]) -> Result<()> {
     // 5b) Single-shot run with the user_input. With --examples this
     // doubles as a sanity invocation; without examples it's the only run.
     let result = run_tool_once(&bc, &policy, opts.max_steps, &opts.user_input)?;
+
+    // Emit a SandboxRun attestation tagging the effects the policy
+    // actually allowed. `Passed` only — a runtime-error path
+    // returns Err above and never reaches this point.
+    if let (Some(log), Some(sid)) = (&att_log, &tool_stage_id) {
+        let kind = lex_vcs::AttestationKind::SandboxRun {
+            effects: opts.allowed_effects.iter().cloned().collect(),
+        };
+        emit_agent_tool_attestation(
+            log,
+            sid,
+            kind,
+            lex_vcs::AttestationResult::Passed,
+            model_for_attestation.clone(),
+        )?;
+    }
+
     println!("{result}");
     Ok(())
 }
@@ -1772,6 +1949,7 @@ fn parse_agent_tool_args(args: &[String]) -> Result<AgentToolOpts> {
     let mut spec_allow_inconclusive = false;
     let mut spec_trials: u32 = 1000;
     let mut diff_body: Option<BodySource> = None;
+    let mut store_root: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1848,6 +2026,11 @@ fn parse_agent_tool_args(args: &[String]) -> Result<AgentToolOpts> {
                     .ok_or_else(|| anyhow!("--diff-body-file needs a path"))?)));
                 i += 2;
             }
+            "--store" => {
+                store_root = Some(PathBuf::from(args.get(i + 1)
+                    .ok_or_else(|| anyhow!("--store needs a path"))?));
+                i += 2;
+            }
             "--quiet" => { show_source = false; i += 1; }
             other => bail!("unknown agent-tool flag: {other}"),
         }
@@ -1868,6 +2051,7 @@ fn parse_agent_tool_args(args: &[String]) -> Result<AgentToolOpts> {
         spec_allow_inconclusive,
         spec_trials,
         diff_body_source: diff_body,
+        store_root,
     })
 }
 
