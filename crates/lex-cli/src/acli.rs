@@ -130,6 +130,7 @@ fn commands() -> Vec<CommandInfo> {
         cmd_ast_merge(),
         cmd_branch(),
         cmd_store_merge(),
+        cmd_merge(),
         cmd_log(),
         cmd_repl(),
         cmd_watch(),
@@ -512,5 +513,36 @@ fn cmd_store_merge() -> CommandInfo {
             ("Preview a merge", "lex store-merge feature main"),
             ("Commit a clean merge", "lex store-merge feature main --commit"),
         ])
-        .with_see_also(vec!["branch", "ast-merge"])
+        .with_see_also(vec!["branch", "ast-merge", "merge"])
+}
+
+fn cmd_merge() -> CommandInfo {
+    let start = CommandInfo::new("start", "open a stateful merge session and surface conflicts")
+        .idempotent(false)
+        .add_option("--src", "string", "source branch (theirs)", None)
+        .add_option("--dst", "string", "destination branch (ours)", None)
+        .add_option("--store", "string", "store root directory", None);
+    let status = CommandInfo::new("status", "print remaining conflicts for a session")
+        .idempotent(true)
+        .add_argument("merge_id", "string", "session id from `lex merge start`", true)
+        .add_option("--store", "string", "store root directory", None);
+    let resolve = CommandInfo::new("resolve", "submit batched per-conflict resolutions")
+        .idempotent(false)
+        .add_argument("merge_id", "string", "session id", true)
+        .add_option("--file", "string", "JSON array of {conflict_id, resolution}", None)
+        .add_option("--store", "string", "store root directory", None);
+    let commit = CommandInfo::new("commit", "finalize the merge and advance dst's head")
+        .idempotent(false)
+        .add_argument("merge_id", "string", "session id", true)
+        .add_option("--store", "string", "store root directory", None);
+    let mut info = CommandInfo::new("merge", "stateful agent-driven merge (CLI mirror of /v1/merge/*)")
+        .with_examples(vec![
+            ("Open a merge",        "lex merge start --src feature --dst main"),
+            ("See remaining work",  "lex merge status merge_..."),
+            ("Submit resolutions",  "lex merge resolve merge_... --file resolutions.json"),
+            ("Land the merge",      "lex merge commit merge_..."),
+        ])
+        .with_see_also(vec!["store-merge", "branch", "log"]);
+    info.subcommands = vec![start, status, resolve, commit];
+    info
 }

@@ -9,7 +9,8 @@ use crate::operation::{OpId, OperationKind, OperationRecord, SigId, StageId};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum MergeOutcome {
     /// Both sides converged on the same op_id for this sig.
     Both { sig_id: SigId, stage_id: Option<StageId> },
