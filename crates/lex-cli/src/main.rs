@@ -77,6 +77,7 @@ fn run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "publish" => cmd_publish(fmt, &args[1..]),
         "store" => cmd_store(fmt, &args[1..]),
         "stage" => cmd_stage(fmt, &args[1..]),
+        "attest" => cmd_attest(fmt, &args[1..]),
         "trace" => cmd_trace(fmt, &args[1..]),
         "replay" => cmd_replay(fmt, &args[1..]),
         "diff" => cmd_diff(fmt, &args[1..]),
@@ -147,6 +148,8 @@ fn print_usage() {
     println!("  store list [--store DIR]           list SigIds in the store");
     println!("  store get [--store DIR] <stage>    print metadata + canonical AST for a StageId");
     println!("  stage <stage> [--attestations]     print stage info, or list its attestations");
+    println!("  attest filter [--kind K] [--result R] [--since T] [--store DIR]");
+    println!("                                     cross-stage attestation queries");
     println!("  trace <run_id>                     print a saved trace tree as JSON");
     println!("  replay <run_id> <file> <fn> [args] [--override NODE=JSON]...");
     println!("                                     re-execute with effect overrides keyed by NodeId");
@@ -1058,6 +1061,147 @@ fn cmd_stage(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&v).unwrap());
     });
     Ok(())
+}
+
+/// `lex attest filter --kind K --result R --since T --store DIR`
+/// — cross-stage attestation query (#132). Walks every primary
+/// attestation file under `<store>/attestations/` and filters by
+/// the supplied criteria. Designed for CI / dashboard queries
+/// that span the whole log rather than a single stage.
+fn cmd_attest(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let sub = args.first().ok_or_else(|| anyhow!("usage: lex attest filter [--kind K] [--result R] [--since T] [--store DIR]"))?;
+    let rest = &args[1..];
+    match sub.as_str() {
+        "filter" => {
+            let mut kind_filter: Option<String> = None;
+            let mut result_filter: Option<String> = None;
+            let mut since: Option<u64> = None;
+            let mut store_root: Option<PathBuf> = None;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--kind" => {
+                        kind_filter = rest.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--result" => {
+                        result_filter = rest.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--since" => {
+                        let raw = rest.get(i + 1).ok_or_else(|| anyhow!("--since needs a value"))?;
+                        since = Some(parse_since(raw)
+                            .ok_or_else(|| anyhow!("--since must be epoch seconds or YYYY-MM-DD, got `{raw}`"))?);
+                        i += 2;
+                    }
+                    "--store" => {
+                        store_root = rest.get(i + 1).map(PathBuf::from);
+                        i += 2;
+                    }
+                    other => bail!("unexpected arg `{other}`"),
+                }
+            }
+            let root = store_root.unwrap_or_else(default_store_root);
+            let store = Store::open(&root)
+                .with_context(|| format!("opening store at {}", root.display()))?;
+            let log = store.attestation_log()?;
+            let all = log.list_all()?;
+
+            let mut filtered: Vec<lex_vcs::Attestation> = all.into_iter()
+                .filter(|a| {
+                    if let Some(k) = &kind_filter {
+                        if attestation_kind_tag(&a.kind) != *k {
+                            return false;
+                        }
+                    }
+                    if let Some(r) = &result_filter {
+                        if attestation_result_tag(&a.result) != *r {
+                            return false;
+                        }
+                    }
+                    if let Some(s) = since {
+                        if a.timestamp < s { return false; }
+                    }
+                    true
+                })
+                .collect();
+            filtered.sort_by_key(|a| std::cmp::Reverse(a.timestamp));
+
+            let data = serde_json::json!({
+                "count": filtered.len(),
+                "attestations": serde_json::to_value(&filtered)?,
+            });
+            let printable = filtered.clone();
+            acli::emit_or_text("attest", data, fmt, move || {
+                if printable.is_empty() {
+                    println!("(no attestations match)");
+                    return;
+                }
+                for a in &printable {
+                    let kind = attestation_kind_tag(&a.kind);
+                    let result = attestation_result_tag(&a.result);
+                    println!(
+                        "{}\t{}\t{}\t{:.16}…\tby={}@{}",
+                        a.timestamp, kind, result, a.stage_id,
+                        a.produced_by.tool, a.produced_by.version,
+                    );
+                }
+            });
+            Ok(())
+        }
+        other => bail!("unknown `lex attest` subcommand: {other}"),
+    }
+}
+
+fn attestation_kind_tag(k: &lex_vcs::AttestationKind) -> &'static str {
+    use lex_vcs::AttestationKind::*;
+    match k {
+        Examples { .. }   => "examples",
+        Spec { .. }       => "spec",
+        DiffBody { .. }   => "diff_body",
+        TypeCheck         => "type_check",
+        EffectAudit       => "effect_audit",
+        SandboxRun { .. } => "sandbox_run",
+    }
+}
+
+fn attestation_result_tag(r: &lex_vcs::AttestationResult) -> &'static str {
+    use lex_vcs::AttestationResult::*;
+    match r {
+        Passed              => "passed",
+        Failed { .. }       => "failed",
+        Inconclusive { .. } => "inconclusive",
+    }
+}
+
+/// Accept either Unix epoch seconds (a u64) or `YYYY-MM-DD`. The
+/// date form resolves to start-of-day UTC. Returns `None` on a
+/// shape we don't recognize so the caller can surface a friendly
+/// usage error.
+fn parse_since(s: &str) -> Option<u64> {
+    if let Ok(secs) = s.parse::<u64>() {
+        return Some(secs);
+    }
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != 3 { return None; }
+    let y: i64 = parts[0].parse().ok()?;
+    let m: u32 = parts[1].parse().ok()?;
+    let d: u32 = parts[2].parse().ok()?;
+    if !(1..=12).contains(&m) || d == 0 { return None; }
+    if y < 1970 { return None; }
+
+    let mut days: i64 = 0;
+    for yr in 1970..y {
+        let yd = if (yr % 4 == 0 && yr % 100 != 0) || yr % 400 == 0 { 366 } else { 365 };
+        days += yd;
+    }
+    let leap_year = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let mdays = [31, if leap_year { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mi = (m - 1) as usize;
+    if d > mdays[mi] as u32 { return None; }
+    days += mdays.iter().take(mi).sum::<i64>();
+    days += (d - 1) as i64;
+    Some((days as u64) * 86_400)
 }
 
 fn cmd_replay(fmt: &OutputFormat, args: &[String]) -> Result<()> {
