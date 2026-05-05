@@ -31,7 +31,7 @@ pub fn is_pure_module(kind: &str) -> bool {
     matches!(kind, "str" | "int" | "float" | "bool" | "list"
         | "option" | "result" | "tuple" | "json" | "bytes" | "flow" | "math"
         | "map" | "set" | "crypto" | "regex" | "deque" | "datetime" | "http"
-        | "toml")
+        | "toml" | "yaml" | "dotenv" | "csv")
 }
 
 fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
@@ -258,6 +258,113 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             match toml::to_string(&json) {
                 Ok(s)  => Ok(ok_v(Value::Str(s))),
                 Err(e) => Ok(err_v(Value::Str(format!("toml.stringify: {e}")))),
+            }
+        }
+
+        // -- yaml -- mirrors std.toml. Wraps serde_yaml so values
+        // map to the same Lex shape as JSON. YAML's Tag/Anchor
+        // features are folded out by serde_yaml's deserialize-to-
+        // Value path; non-representable shapes (e.g. non-string
+        // map keys when stringifying) surface as Result::Err.
+        ("yaml", "parse") => {
+            let s = expect_str(args.first())?;
+            match serde_yaml::from_str::<serde_json::Value>(&s) {
+                Ok(v)  => Ok(ok_v(json_to_value(&v))),
+                Err(e) => Ok(err_v(Value::Str(format!("{e}")))),
+            }
+        }
+        ("yaml", "stringify") => {
+            let v = first_arg(args)?;
+            let json = value_to_json(v);
+            match serde_yaml::to_string(&json) {
+                Ok(s)  => Ok(ok_v(Value::Str(s))),
+                Err(e) => Ok(err_v(Value::Str(format!("yaml.stringify: {e}")))),
+            }
+        }
+
+        // -- dotenv -- KEY=VALUE pair files. Hand-rolled parser
+        // because the dotenvy crate's API is geared at loading
+        // into the process env, not parsing-to-data. The grammar
+        // we accept: blank lines, `# comment` lines, and
+        // `KEY=VALUE` (optional surrounding `"..."` or `'...'`,
+        // unescaped). Simple but covers the .env files in the
+        // wild that aren't trying to be shell.
+        ("dotenv", "parse") => {
+            use std::collections::BTreeMap;
+            use lex_bytecode::MapKey;
+            let s = expect_str(args.first())?;
+            match parse_dotenv(&s) {
+                Ok(map) => {
+                    let mut bt: BTreeMap<MapKey, Value> = BTreeMap::new();
+                    for (k, v) in map {
+                        bt.insert(MapKey::Str(k), Value::Str(v));
+                    }
+                    Ok(ok_v(Value::Map(bt)))
+                }
+                Err(e) => Ok(err_v(Value::Str(e))),
+            }
+        }
+
+        // -- csv -- rows-as-lists; first row is whatever the file
+        // has. The caller decides whether row 0 is a header. We
+        // could ship a `parse_with_headers` later that returns a
+        // List[Map[Str, Str]]; v1 keeps the surface tight.
+        ("csv", "parse") => {
+            let s = expect_str(args.first())?;
+            let mut rdr = csv::ReaderBuilder::new()
+                .has_headers(false)
+                .flexible(true)
+                .from_reader(s.as_bytes());
+            let mut rows: Vec<Value> = Vec::new();
+            for r in rdr.records() {
+                match r {
+                    Ok(rec) => {
+                        let row: Vec<Value> = rec.iter()
+                            .map(|f| Value::Str(f.to_string()))
+                            .collect();
+                        rows.push(Value::List(row));
+                    }
+                    Err(e) => return Ok(err_v(Value::Str(format!("csv.parse: {e}")))),
+                }
+            }
+            Ok(ok_v(Value::List(rows)))
+        }
+        ("csv", "stringify") => {
+            // List[List[Str]] → CSV string. Mixed-type rows are
+            // not allowed (CSV is text-only); non-Str cells get
+            // stringified via to_json since that's already the
+            // convention for `json.stringify` etc.
+            let v = first_arg(args)?;
+            let rows = match v {
+                Value::List(rs) => rs,
+                _ => return Ok(err_v(Value::Str("csv.stringify expects List[List[Str]]".into()))),
+            };
+            let mut out = Vec::new();
+            {
+                let mut wtr = csv::WriterBuilder::new()
+                    .has_headers(false)
+                    .from_writer(&mut out);
+                for row in rows {
+                    let cells = match row {
+                        Value::List(cs) => cs,
+                        _ => return Ok(err_v(Value::Str("csv.stringify row must be List[Str]".into()))),
+                    };
+                    let strs: Vec<String> = cells.iter().map(|c| match c {
+                        Value::Str(s) => s.clone(),
+                        other => serde_json::to_string(&other.to_json())
+                            .unwrap_or_else(|_| String::new()),
+                    }).collect();
+                    if let Err(e) = wtr.write_record(&strs) {
+                        return Ok(err_v(Value::Str(format!("csv.stringify: {e}"))));
+                    }
+                }
+                if let Err(e) = wtr.flush() {
+                    return Ok(err_v(Value::Str(format!("csv.stringify flush: {e}"))));
+                }
+            }
+            match String::from_utf8(out) {
+                Ok(s) => Ok(ok_v(Value::Str(s))),
+                Err(e) => Ok(err_v(Value::Str(format!("csv.stringify utf8: {e}")))),
             }
         }
 
@@ -1216,6 +1323,47 @@ fn unwrap_toml_datetime_markers(v: &mut serde_json::Value) {
 }
 
 fn json_to_value(v: &serde_json::Value) -> Value { Value::from_json(v) }
+
+/// Parse a `.env`-style file into key→value pairs. Accepts:
+///
+/// * Blank lines and `# comment` lines (ignored).
+/// * `KEY=VALUE` with no spaces around `=`. Optional surrounding
+///   `"..."` or `'...'` quotes on the value. No escape sequences,
+///   no shell expansion — by design; we want this to be a *data*
+///   parser, not a shell snippet evaluator.
+///
+/// Errors carry the offending line number (1-indexed) so the
+/// agent's verifier can point a human at the right place.
+fn parse_dotenv(src: &str) -> Result<indexmap::IndexMap<String, String>, String> {
+    let mut out = indexmap::IndexMap::new();
+    for (idx, raw) in src.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Optional `export KEY=VALUE` shell form — accepted for
+        // compat with files that grew out of `set -a` workflows.
+        let after_export = line.strip_prefix("export ").unwrap_or(line);
+        let (k, v) = match after_export.split_once('=') {
+            Some(kv) => kv,
+            None => return Err(format!("dotenv.parse line {}: missing `=`", idx + 1)),
+        };
+        let key = k.trim();
+        if key.is_empty() {
+            return Err(format!("dotenv.parse line {}: empty key", idx + 1));
+        }
+        let v_trim = v.trim();
+        let value = if let Some(q) = v_trim.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+            q.to_string()
+        } else if let Some(q) = v_trim.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+            q.to_string()
+        } else {
+            v_trim.to_string()
+        };
+        out.insert(key.to_string(), value);
+    }
+    Ok(out)
+}
 
 // -- datetime helpers (Instant ↔ chrono::DateTime<Utc>) --
 
