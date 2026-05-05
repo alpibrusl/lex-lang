@@ -111,6 +111,10 @@ fn route(
         }
         (Method::Get, "/v1/diff") => diff_handler(state, query),
         (Method::Post, "/v1/merge/start") => merge_start_handler(state, body),
+        (Method::Post, p) if p.starts_with("/v1/merge/") && p.ends_with("/resolve") => {
+            let id = &p["/v1/merge/".len()..p.len() - "/resolve".len()];
+            merge_resolve_handler(state, id, body)
+        }
         _ => error_response(404, format!("unknown route: {method:?} {path}")),
     }
 }
@@ -538,6 +542,55 @@ fn merge_start_handler(state: &State, body: &str) -> Response<std::io::Cursor<Ve
     drop(conflicts);
     drop(store);
     state.sessions.lock().unwrap().insert(merge_id, session);
+    json_response(200, &body)
+}
+
+#[derive(Deserialize)]
+struct MergeResolveReq {
+    /// Each entry is `(conflict_id, resolution)`. The resolution is
+    /// the same shape as `lex_vcs::Resolution`'s tagged JSON form
+    /// — `{"kind":"take_ours"}`, `{"kind":"take_theirs"}`,
+    /// `{"kind":"defer"}`, or `{"kind":"custom","op":{...}}`.
+    resolutions: Vec<MergeResolveEntry>,
+}
+
+#[derive(Deserialize)]
+struct MergeResolveEntry {
+    conflict_id: String,
+    resolution: lex_vcs::Resolution,
+}
+
+/// `POST /v1/merge/<id>/resolve` (#134) — submit batched
+/// resolutions against the conflicts surfaced by `merge/start`.
+/// Returns one verdict per input: accepted (recorded against the
+/// session) or rejected (with structured reason). The session
+/// stays alive across calls so an agent can iterate.
+///
+/// Errors:
+/// - 404 if `merge_id` doesn't refer to a live session (a typo
+///   or a session GC'd by a server restart).
+/// - 400 on malformed body.
+fn merge_resolve_handler(
+    state: &State,
+    merge_id: &str,
+    body: &str,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    let req: MergeResolveReq = match serde_json::from_str(body) {
+        Ok(r) => r, Err(e) => return error_response(400, format!("bad request: {e}")),
+    };
+    let mut sessions = state.sessions.lock().unwrap();
+    let Some(session) = sessions.get_mut(merge_id) else {
+        return error_response(404, format!("unknown merge_id `{merge_id}`"));
+    };
+    let pairs: Vec<(String, lex_vcs::Resolution)> = req.resolutions.into_iter()
+        .map(|e| (e.conflict_id, e.resolution))
+        .collect();
+    let verdicts = session.resolve(pairs);
+    let remaining: Vec<&lex_vcs::ConflictRecord> = session.remaining_conflicts();
+    let body = serde_json::json!({
+        "verdicts": verdicts,
+        "remaining_conflicts": remaining,
+    });
     json_response(200, &body)
 }
 

@@ -102,7 +102,7 @@ pub enum ResolutionRejection {
     /// The conflict_id doesn't refer to any pending conflict in
     /// the session. Either the agent invented one, or it was
     /// already resolved and the session pruned it.
-    UnknownConflict(ConflictId),
+    UnknownConflict { conflict_id: ConflictId },
     /// The custom op's parents don't include both `ours` and
     /// `theirs`. A custom resolution that doesn't acknowledge
     /// both sides isn't a merge — it's a fork.
@@ -260,7 +260,7 @@ impl MergeSession {
         resolution: &Resolution,
     ) -> Result<(), ResolutionRejection> {
         if !self.conflicts.contains_key(conflict_id) {
-            return Err(ResolutionRejection::UnknownConflict(conflict_id.clone()));
+            return Err(ResolutionRejection::UnknownConflict { conflict_id: conflict_id.clone() });
         }
         if let Resolution::Custom { op } = resolution {
             // Validate that the custom op's parent set acknowledges
@@ -476,7 +476,7 @@ mod tests {
         assert!(!verdicts[0].accepted);
         assert!(matches!(
             verdicts[0].rejection,
-            Some(ResolutionRejection::UnknownConflict(_)),
+            Some(ResolutionRejection::UnknownConflict { .. }),
         ));
     }
 
