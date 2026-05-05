@@ -235,8 +235,21 @@ impl<'a> FnCompiler<'a> {
         match e {
             a::CExpr::Literal { value } => self.compile_lit(value),
             a::CExpr::Var { name } => {
-                let i = *self.locals.get(name).unwrap_or_else(|| panic!("unknown local: {name}"));
-                self.emit(Op::LoadLocal(i));
+                if let Some(slot) = self.locals.get(name) {
+                    self.emit(Op::LoadLocal(*slot));
+                } else if let Some(&fn_id) = self.function_names.get(name) {
+                    // Function name used as a *value* (e.g. as a record-field
+                    // initializer or fold-callback arg) — materialize it as a
+                    // closure with no captures. The runtime already accepts
+                    // `Value::Closure { fn_id, captures: vec![] }` and
+                    // `CallClosure` dispatches it. (#169)
+                    self.emit(Op::MakeClosure { fn_id, capture_count: 0 });
+                } else {
+                    // Should be caught at type-check time; the type checker
+                    // walks every Var. If we land here it's a compiler bug,
+                    // not a user typo.
+                    panic!("unknown var in compiler: {name}");
+                }
             }
             a::CExpr::Let { name, ty: _, value, body } => {
                 self.compile_expr(value, false);
