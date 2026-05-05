@@ -52,6 +52,7 @@ pub fn cmd_branch(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "use"     => use_branch(fmt, &store, &rest, dry_run),
         "current" => current(fmt, &store),
         "log"     => log(fmt, &store, &rest),
+        "peek"    => peek(fmt, &store, &rest),
         other     => bail!("unknown `lex branch` subcommand `{other}`"),
     }
 }
@@ -181,6 +182,149 @@ fn log(fmt: &OutputFormat, store: &Store, args: &[String]) -> Result<()> {
         for m in &entries_for_text {
             println!("  • {} → {name}    {} fns @ {}",
                 m.src, m.merged, format_ts(m.at));
+        }
+    });
+    Ok(())
+}
+
+/// `lex branch peek <name> [--since-fork] [--vs <other>]` — read
+/// another branch's ops without switching to it (#133). Lets agents
+/// answer "what has feature done that main hasn't seen?" as a
+/// query, not a merge.
+///
+/// `--since-fork` walks the op log from the LCA of `<name>` and
+/// either `--vs <other>` or `<name>`'s `parent` field forward to
+/// `<name>`'s head. Without `--since-fork`, walks the full
+/// ancestry (root → head).
+fn peek(fmt: &OutputFormat, store: &Store, args: &[String]) -> Result<()> {
+    let mut name: Option<String> = None;
+    let mut since_fork = false;
+    let mut vs: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--since-fork" => { since_fork = true; i += 1; }
+            "--vs" => {
+                vs = args.get(i + 1).cloned();
+                i += 2;
+            }
+            other if name.is_none() => { name = Some(other.to_string()); i += 1; }
+            other => bail!("unexpected arg `{other}`"),
+        }
+    }
+    let name = name.ok_or_else(|| anyhow!("usage: lex branch peek <name> [--since-fork] [--vs <other>]"))?;
+
+    // The default branch is conceptually always present even if no
+    // branch file exists yet; treat it as an empty (no-head) branch
+    // in that case to match `branch_head`'s shape. Other names that
+    // don't have a branch file are real errors.
+    let branch = match store.get_branch(&name)
+        .map_err(|e| anyhow!("read branch {name}: {e}"))?
+    {
+        Some(b) => b,
+        None if name == DEFAULT_BRANCH => lex_store::Branch {
+            name: name.clone(),
+            parent: None,
+            head_op: None,
+            merges: Vec::new(),
+            created_at: 0,
+        },
+        None => bail!("unknown branch `{name}`"),
+    };
+    let head = match branch.head_op.clone() {
+        Some(h) => h,
+        None => {
+            // Empty branch: nothing to walk.
+            let data = serde_json::json!({
+                "branch": &name,
+                "since_fork": since_fork,
+                "fork_point": serde_json::Value::Null,
+                "ops": [],
+            });
+            acli_mod::emit_or_text("branch", data, fmt, move || {
+                println!("{name}: (no ops)");
+            });
+            return Ok(());
+        }
+    };
+
+    let log = lex_vcs::OpLog::open(store.root())
+        .map_err(|e| anyhow!("open op log: {e}"))?;
+
+    // Determine the optional fork point: the LCA between `name` and
+    // either `--vs <other>` or `name`'s recorded parent. If no
+    // candidate is available the walk degenerates to the full
+    // ancestry, matching the no-`--since-fork` mode.
+    let other_head: Option<lex_vcs::OpId> = if since_fork {
+        let other_name = vs.clone().or_else(|| branch.parent.clone());
+        match other_name.as_deref() {
+            Some(other) => store.get_branch(other)
+                .map_err(|e| anyhow!("read branch {other}: {e}"))?
+                .and_then(|b| b.head_op),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let fork_point: Option<lex_vcs::OpId> = match &other_head {
+        Some(o) => log.lca(&head, o).map_err(|e| anyhow!("lca: {e}"))?,
+        None => None,
+    };
+
+    // Build the exclusion set: every op reachable from `other_head`
+    // (including the LCA itself). With that set, walking back from
+    // `head` and filtering yields exactly the ops on `<name>`'s
+    // side of the fork.
+    let exclude: std::collections::BTreeSet<lex_vcs::OpId> = match &other_head {
+        Some(o) => log.walk_back(o, None)
+            .map_err(|e| anyhow!("walk other head: {e}"))?
+            .into_iter()
+            .map(|r| r.op_id)
+            .collect(),
+        None => std::collections::BTreeSet::new(),
+    };
+
+    let mut records = log.walk_back(&head, None)
+        .map_err(|e| anyhow!("walk_back: {e}"))?;
+    if !exclude.is_empty() {
+        records.retain(|r| !exclude.contains(&r.op_id));
+    }
+    // walk_back is newest-first; flip to oldest-first so the output
+    // reads as a chronological "what happened on this branch."
+    records.reverse();
+
+    let ops: Vec<serde_json::Value> = records.iter().map(|r| {
+        let kind_tag = serde_json::to_value(&r.op.kind).ok()
+            .and_then(|v| v.get("op").cloned())
+            .unwrap_or(serde_json::Value::Null);
+        serde_json::json!({
+            "op_id": r.op_id,
+            "kind": kind_tag,
+            "parents": r.op.parents,
+        })
+    }).collect();
+
+    let data = serde_json::json!({
+        "branch": &name,
+        "head": &head,
+        "since_fork": since_fork,
+        "fork_point": fork_point,
+        "ops": ops,
+    });
+    let ops_for_text = ops.clone();
+    let name_for_text = name.clone();
+    let fork_for_text = fork_point.clone();
+    acli_mod::emit_or_text("branch", data, fmt, move || {
+        let suffix = match &fork_for_text {
+            Some(f) => format!(" since {:.16}…", f),
+            None if since_fork => " (no fork point — walking full ancestry)".to_string(),
+            None => String::new(),
+        };
+        println!("{name_for_text}: {} op(s){suffix}", ops_for_text.len());
+        for o in &ops_for_text {
+            let id = o["op_id"].as_str().unwrap_or("");
+            let kind = o["kind"].as_str().unwrap_or("?");
+            println!("  {id:.16}…  {kind}");
         }
     });
     Ok(())
