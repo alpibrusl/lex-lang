@@ -246,6 +246,102 @@ fn merge_start_returns_session_id_and_no_conflicts_for_disjoint_branches() {
     assert!(v["auto_resolved_count"].as_u64().unwrap() >= 1, "at least one sig auto-resolved");
 }
 
+/// Set up two branches that *both* modify the same fn (`foo`).
+/// Returns the running server, the temp store dir, and the session
+/// `merge_id` produced by `/v1/merge/start`. Used by the resolve
+/// tests to avoid duplicating the divergence setup.
+fn with_modify_modify_session() -> (Server, TempDir, String) {
+    let (srv, tmp) = start_server();
+
+    // 1) Publish initial fn on main.
+    let v0 = "fn foo(n :: Int) -> Int { n }\n";
+    let (s, b) = http(&srv.addr, "POST", "/v1/publish", &json!({"source": v0, "activate": true}).to_string());
+    assert_eq!(s, 200, "publish v0: {b}");
+
+    // 2) Create + switch to feature, modify foo.
+    {
+        let store = lex_store::Store::open(tmp.path()).unwrap();
+        store.create_branch("feature", lex_store::DEFAULT_BRANCH).unwrap();
+        store.set_current_branch("feature").unwrap();
+    }
+    let v_feat = "fn foo(n :: Int) -> Int { n + 1 }\n";
+    let (s, b) = http(&srv.addr, "POST", "/v1/publish", &json!({"source": v_feat, "activate": true}).to_string());
+    assert_eq!(s, 200, "publish feature: {b}");
+
+    // 3) Switch back to main, modify foo differently.
+    {
+        let store = lex_store::Store::open(tmp.path()).unwrap();
+        store.set_current_branch(lex_store::DEFAULT_BRANCH).unwrap();
+    }
+    let v_main = "fn foo(n :: Int) -> Int { n + 2 }\n";
+    let (s, b) = http(&srv.addr, "POST", "/v1/publish", &json!({"source": v_main, "activate": true}).to_string());
+    assert_eq!(s, 200, "publish main: {b}");
+
+    // 4) Start the merge — should produce a ModifyModify conflict on `foo`.
+    let body = json!({"src_branch": "feature", "dst_branch": lex_store::DEFAULT_BRANCH}).to_string();
+    let (s, b) = http(&srv.addr, "POST", "/v1/merge/start", &body);
+    assert_eq!(s, 200, "merge/start: {b}");
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    let merge_id = v["merge_id"].as_str().unwrap().to_string();
+    let conflicts = v["conflicts"].as_array().unwrap();
+    assert_eq!(conflicts.len(), 1, "expected exactly one conflict, got: {conflicts:?}");
+    (srv, tmp, merge_id)
+}
+
+#[test]
+fn merge_resolve_take_ours_clears_the_conflict() {
+    let (srv, _tmp, merge_id) = with_modify_modify_session();
+    let path = format!("/v1/merge/{merge_id}/resolve");
+    // Find the conflict id (same as sig_id of `foo`).
+    let (_, start_body) = http(&srv.addr, "POST", "/v1/merge/start", &json!({
+        "src_branch": "feature", "dst_branch": lex_store::DEFAULT_BRANCH,
+    }).to_string());
+    // Re-run start to pull a fresh conflict list keyed to a *new* merge_id —
+    // but the resolution we're testing is against `merge_id` from the
+    // helper, so the conflict_id is the same (sig).
+    let v: serde_json::Value = serde_json::from_str(&start_body).unwrap();
+    let conflict_id = v["conflicts"][0]["conflict_id"].as_str().unwrap().to_string();
+
+    let body = json!({
+        "resolutions": [
+            {"conflict_id": conflict_id, "resolution": {"kind": "take_ours"}}
+        ]
+    }).to_string();
+    let (s, b) = http(&srv.addr, "POST", &path, &body);
+    assert_eq!(s, 200, "resolve: {b}");
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    let verdicts = v["verdicts"].as_array().unwrap();
+    assert_eq!(verdicts.len(), 1);
+    assert_eq!(verdicts[0]["accepted"], true);
+    let remaining = v["remaining_conflicts"].as_array().unwrap();
+    assert_eq!(remaining.len(), 0, "the take_ours resolution should clear the conflict");
+}
+
+#[test]
+fn merge_resolve_unknown_conflict_is_rejected_per_entry() {
+    let (srv, _tmp, merge_id) = with_modify_modify_session();
+    let path = format!("/v1/merge/{merge_id}/resolve");
+    let body = json!({
+        "resolutions": [
+            {"conflict_id": "definitely-not-a-real-sig", "resolution": {"kind": "take_ours"}}
+        ]
+    }).to_string();
+    let (s, b) = http(&srv.addr, "POST", &path, &body);
+    assert_eq!(s, 200, "resolve should still 200 with per-entry verdicts");
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    let verdicts = v["verdicts"].as_array().unwrap();
+    assert_eq!(verdicts[0]["accepted"], false);
+    assert_eq!(verdicts[0]["rejection"]["kind"], "unknown_conflict");
+}
+
+#[test]
+fn merge_resolve_unknown_session_returns_404() {
+    let (srv, _tmp) = start_server();
+    let body = json!({"resolutions": []}).to_string();
+    let (s, _) = http(&srv.addr, "POST", "/v1/merge/no_such_session/resolve", &body);
+    assert_eq!(s, 404, "unknown merge_id should 404");
+}
+
 #[test]
 fn replay_with_overrides() {
     let (srv, _tmp) = start_server();

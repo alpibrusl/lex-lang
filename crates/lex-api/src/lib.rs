@@ -14,7 +14,8 @@
 //!   GET  /v1/trace/<run_id>  → TraceTree
 //!   POST /v1/replay          { source, fn, args, policy, overrides } → { run_id, output | error }
 //!   GET  /v1/diff?a=&b=      → Divergence | { divergence: null }
-//!   POST /v1/merge/start     { src_branch, dst_branch } → { merge_id, conflicts, ... }
+//!   POST /v1/merge/start              { src_branch, dst_branch } → { merge_id, conflicts, ... }
+//!   POST /v1/merge/<id>/resolve       { resolutions: [...] } → { verdicts, remaining_conflicts }
 //!   GET  /v1/health          → { ok: true }
 
 pub mod handlers;
