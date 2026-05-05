@@ -422,11 +422,18 @@ fn cmd_audit() -> CommandInfo {
         .add_option("--host", "string", "hostname filter (literal)", None)
         .add_option("--kind", "string", "AST node kind filter", None)
         .add_option("--json", "bool", "machine-readable output", None)
+        .add_option(
+            "--store",
+            "string",
+            "with --effect, persist EffectAudit attestations against each scanned stage",
+            None,
+        )
         .with_examples(vec![
             ("Find network calls", "lex audit --effect net examples"),
             ("Find a host as JSON", "lex audit --host api.example.com --json src"),
+            ("Persist effect audits", "lex audit --effect fs_write --store ~/.lex/store src"),
         ])
-        .with_see_also(vec!["ast-diff", "ast-merge"])
+        .with_see_also(vec!["ast-diff", "ast-merge", "attest", "stage"])
 }
 
 fn cmd_ast_diff() -> CommandInfo {
