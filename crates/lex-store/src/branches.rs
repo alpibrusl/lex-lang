@@ -20,9 +20,16 @@ pub struct Branch {
     pub name: String,
     pub parent: Option<String>,
     /// Op DAG head. `None` means the branch has never had an op
-    /// applied (empty branch).
+    /// applied (empty branch) *or* it's a predicate-defined branch
+    /// where the head is computed lazily from `predicate`.
     #[serde(default)]
     pub head_op: Option<OpId>,
+    /// Predicate over the op log (#133). When `Some`, the branch is
+    /// a saved query rather than a snapshot — `head_op` is the
+    /// optional materialization cache. The predicate's JSON shape
+    /// matches `lex_vcs::Predicate::to_value()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicate: Option<serde_json::Value>,
     /// Append-only journal of merges committed *into* this branch.
     #[serde(default)]
     pub merges: Vec<MergeRecord>,
@@ -173,6 +180,38 @@ impl Store {
             name: name.into(),
             parent: Some(from.into()),
             head_op,
+            predicate: None,
+            merges: Vec::new(),
+            created_at: now(),
+        };
+        fs::write(self.branch_path(name), serde_json::to_string_pretty(&b)?)?;
+        Ok(())
+    }
+
+    /// Create a predicate-defined branch (#133). The branch's
+    /// content is the set of ops matching `predicate`; `head_op`
+    /// stays `None` and is materialized lazily by callers when
+    /// they need a single point to apply ops against. Cheap to
+    /// create and discard — it's a saved query, not a snapshot.
+    pub fn create_predicate_branch(
+        &self,
+        name: &str,
+        predicate: serde_json::Value,
+    ) -> Result<(), StoreError> {
+        if name.is_empty() || name.contains('/') || name.contains('\\') {
+            return Err(StoreError::InvalidTransition(
+                format!("branch name `{name}` rejected (empty or path-like)")));
+        }
+        if self.branch_path(name).exists() {
+            return Err(StoreError::InvalidTransition(
+                format!("branch `{name}` already exists")));
+        }
+        fs::create_dir_all(self.branches_dir())?;
+        let b = Branch {
+            name: name.into(),
+            parent: None,
+            head_op: None,
+            predicate: Some(predicate),
             merges: Vec::new(),
             created_at: now(),
         };
@@ -229,6 +268,7 @@ impl Store {
                 name: DEFAULT_BRANCH.into(),
                 parent: None,
                 head_op: None,
+                predicate: None,
                 merges: Vec::new(),
                 created_at: now(),
             },
