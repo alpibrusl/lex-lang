@@ -136,7 +136,7 @@ pub enum CommitError {
 /// `start` and `commit`. Sessions are not thread-safe; the HTTP
 /// wrapper is expected to wrap them in a `Mutex` keyed by
 /// [`MergeSessionId`].
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct MergeSession {
     pub merge_id: MergeSessionId,
     pub src_head: Option<OpId>,

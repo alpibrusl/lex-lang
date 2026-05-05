@@ -15,6 +15,7 @@ mod audit;
 mod diff;
 mod ast_merge;
 mod branch;
+mod merge;
 mod acli;
 mod op;
 mod repl;
@@ -99,6 +100,7 @@ fn run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "ast-merge" => ast_merge::cmd_ast_merge(fmt, &args[1..]),
         "branch" => branch::cmd_branch(fmt, &args[1..]),
         "store-merge" => branch::cmd_store_merge(fmt, &args[1..]),
+        "merge" => merge::cmd_merge(fmt, &args[1..]),
         "log" => branch::cmd_log(fmt, &args[1..]),
         "op" => op::cmd_op(fmt, &args[1..]),
         "repl" => repl::cmd_repl(&args[1..]),
@@ -178,6 +180,9 @@ fn print_usage() {
     println!("  store-merge <src> <dst> [--commit] [--json]  three-way merge between two branches in");
     println!("                                     the store; conflicts as JSON. --commit applies a");
     println!("                                     clean merge; refuses if any conflicts remain.");
+    println!("  merge {{start|status|resolve|commit}}");
+    println!("                                     stateful merge for agent loops (#134); persists");
+    println!("                                     a session under <store>/merges/<merge_id>.json");
     println!();
     println!("policy flags (run, replay):");
     println!("  --allow-effects k1,k2,...   permit these effect kinds");
@@ -860,6 +865,13 @@ fn default_store_root() -> PathBuf {
         return PathBuf::from(home).join(".lex").join("store");
     }
     PathBuf::from(".lex-store")
+}
+
+/// Public re-export for sibling CLI modules. `default_store_root`
+/// itself stays private to keep the binary's surface tight; modules
+/// that need it call this trampoline.
+pub(crate) fn default_store_root_pub() -> PathBuf {
+    default_store_root()
 }
 
 fn parse_store_flag(args: &[String]) -> (PathBuf, Vec<String>, bool, bool) {
