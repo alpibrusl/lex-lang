@@ -34,9 +34,11 @@
 mod ast;
 mod parser;
 mod checker;
+mod gate;
 mod smt;
 
 pub use ast::{Quantifier, Spec, SpecExpr, SpecOp, SpecType};
 pub use checker::{check_spec, CheckResult, Evidence, ProofStatus};
+pub use gate::{evaluate_gate, evaluate_gate_compiled, GateVerdict};
 pub use parser::{parse_spec, SpecParseError};
 pub use smt::to_smtlib;
