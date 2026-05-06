@@ -29,6 +29,12 @@ struct Parser {
     /// `[[[{{{...` that would otherwise blow the stack. Found by
     /// the libFuzzer parser target — see `fuzz/fuzz_targets/parser.rs`.
     depth: u32,
+    /// Counter for `let _ := ...` discard bindings (#200). Each
+    /// discard gets a unique synthetic name so multiple `let _`
+    /// in the same scope shadow rather than collide. The names
+    /// aren't expressible in user syntax (`__lex_discard_N`),
+    /// so user code can't reference them by accident.
+    discard_counter: u32,
 }
 
 /// Maximum nesting depth the parser will accept before refusing
@@ -43,7 +49,7 @@ const MAX_DEPTH: u32 = 96;
 
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, idx: 0, depth: 0 }
+        Self { tokens, idx: 0, depth: 0, discard_counter: 0 }
     }
 
     fn at_eof(&self) -> bool {
@@ -400,7 +406,19 @@ impl Parser {
 
     fn parse_let_statement(&mut self) -> Result<Statement, ParseError> {
         self.expect(&TokenKind::Let, "in let")?;
-        let name = self.expect_ident("after `let`")?;
+        // `let _ := expr` is the discard idiom (#200). The RHS is
+        // still evaluated for its effect, but the result is bound
+        // to a synthetic name nothing else references — so the
+        // type-checker / VM treat it like a normal let, but user
+        // code can't accidentally reach it.
+        let name = if matches!(self.peek_skip_newlines(), Some(TokenKind::Underscore)) {
+            self.skip_newlines();
+            self.bump();
+            self.discard_counter += 1;
+            format!("__lex_discard_{}", self.discard_counter)
+        } else {
+            self.expect_ident("after `let`")?
+        };
         let ty = if self.eat(&TokenKind::ColonColon) {
             Some(self.parse_type_expr()?)
         } else {

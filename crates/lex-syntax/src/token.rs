@@ -69,7 +69,14 @@ pub enum TokenKind {
     #[regex(r#"b"([^"\\]|\\.)*""#, |lex| unescape(&lex.slice()[2..lex.slice().len()-1]).map(|s| s.into_bytes()))]
     Bytes(Vec<u8>),
 
+    // Identifier. Two alternatives so a bare `_` keeps lexing as
+    // the discard token (used by `match _ => ...` and the new
+    // `let _ := ...`) while `_name` is recognized as a real
+    // identifier (#200). Logos picks the longer match: for `_`
+    // alone only Underscore matches (Ident requires ≥2 chars on
+    // the underscore branch); for `_x` the Ident branch wins.
     #[regex(r"[a-zA-Z][a-zA-Z0-9_]*", |lex| lex.slice().to_string())]
+    #[regex(r"_[a-zA-Z0-9_]+", |lex| lex.slice().to_string())]
     Ident(String),
 }
 
