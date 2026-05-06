@@ -66,6 +66,14 @@ jobs:
           # to appear in the registry index before exiting, so
           # we don't need explicit sleeps between crates.
           # `--locked` enforces Cargo.lock consistency.
+          #
+          # Re-run robustness: before each `cargo publish`, check
+          # crates.io for the (crate, version) tuple. If it already
+          # exists, skip — `cargo publish` would error out with
+          # "crate version already uploaded" otherwise. This makes
+          # the workflow safe to re-trigger after partial failures
+          # (rate-limit hits, network blips, single-crate compile
+          # errors).
           for crate in \
             lex-syntax \
             lex-ast \
@@ -79,6 +87,14 @@ jobs:
             spec-checker
           do
             echo "::group::publish $crate"
+            ver=$(cargo metadata --no-deps --format-version 1 \
+              | jq -r ".packages[] | select(.name == \"$crate\") | .version")
+            if [ -z "$DRY_FLAG" ] && curl -sf -o /dev/null \
+                "https://crates.io/api/v1/crates/$crate/$ver"; then
+              echo "$crate $ver already on crates.io — skipping"
+              echo "::endgroup::"
+              continue
+            fi
             cargo publish $DRY_FLAG --locked -p "$crate"
             echo "::endgroup::"
           done
