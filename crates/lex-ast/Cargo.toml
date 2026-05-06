@@ -16,4 +16,4 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 indexmap.workspace = true
-lex-syntax = { path = "../lex-syntax", version = "0.2.1" }
+lex-syntax = { path = "../lex-syntax", version = "0.2.2" }

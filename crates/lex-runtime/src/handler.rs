@@ -51,6 +51,12 @@ pub struct DefaultHandler {
     /// dispatch so `chat.broadcast` / `chat.send` work from inside
     /// a handler invocation.
     pub chat_registry: Option<Arc<crate::ws::ChatRegistry>>,
+    /// LRU cache of `agent.call_mcp` clients keyed by the
+    /// command-line string (#197). Avoids spawn-per-call cost
+    /// when an agent invokes the same MCP server in tight loops.
+    /// Capped — when the cache is full, the least-recently-used
+    /// entry is dropped (its subprocess is reaped on Drop).
+    pub mcp_clients: crate::mcp_client::McpClientCache,
 }
 
 impl DefaultHandler {
@@ -62,6 +68,7 @@ impl DefaultHandler {
             budget_used: RefCell::new(0),
             program: None,
             chat_registry: None,
+            mcp_clients: crate::mcp_client::McpClientCache::with_capacity(16),
         }
     }
 
@@ -662,14 +669,19 @@ impl EffectHandler for DefaultHandler {
                 other => return Err(format!("unsupported agent.{other}")),
             };
             self.ensure_kind_allowed(effect_kind)?;
-            // `call_mcp` is wired to a real stdio MCP client
-            // (#185). The other three effects keep their stub
-            // pending the downstream crates that own their wire
-            // format (`soft-agent` for `llm_*` and `a2a`).
-            if op == "call_mcp" {
-                return Ok(dispatch_call_mcp(args));
-            }
-            return Ok(ok(Value::Str(format!("<{effect_kind} stub>"))));
+            // `call_mcp` runs through the LRU client cache
+            // (#197). `local_complete` / `cloud_complete` hit
+            // Ollama / OpenAI via env-var-driven configuration
+            // (#196); custom backends override at the
+            // EffectHandler layer rather than via a config file.
+            // `send_a2a` keeps its stub — that wire format
+            // lives in downstream `soft-a2a`.
+            return match op {
+                "call_mcp"       => Ok(self.dispatch_call_mcp(args)),
+                "local_complete" => Ok(dispatch_llm_local(args)),
+                "cloud_complete" => Ok(dispatch_llm_cloud(args)),
+                _ => Ok(ok(Value::Str(format!("<{effect_kind} stub>")))),
+            };
         }
         if kind == "http" && matches!(op, "send" | "get" | "post") {
             self.ensure_kind_allowed("net")?;
@@ -1367,40 +1379,71 @@ fn err(v: Value) -> Value {
     Value::Variant { name: "Err".into(), args: vec![v] }
 }
 
-/// Implementation of `agent.call_mcp(server, tool, args_json)`.
-/// Spawn the MCP server, complete `initialize`, send `tools/call`
-/// with the supplied arguments, and return the server's `result`
-/// JSON serialized back to a Lex `Str`. Errors at any stage come
-/// back as `Err(reason)` so callers can `match` on them — no
-/// `Result<_, String>` from the handler itself.
-fn dispatch_call_mcp(args: Vec<Value>) -> Value {
-    let server = match args.first() {
+impl DefaultHandler {
+    /// Implementation of `agent.call_mcp(server, tool, args_json)`.
+    /// Goes through the LRU client cache (#197): the named server
+    /// is spawned on first use and reused on subsequent calls.
+    /// On failure the offending client is dropped so the next
+    /// call respawns rather than silently failing forever.
+    fn dispatch_call_mcp(&mut self, args: Vec<Value>) -> Value {
+        let server = match args.first() {
+            Some(Value::Str(s)) => s.clone(),
+            _ => return err(Value::Str(
+                "agent.call_mcp(server, tool, args_json): server must be Str".into())),
+        };
+        let tool = match args.get(1) {
+            Some(Value::Str(s)) => s.clone(),
+            _ => return err(Value::Str(
+                "agent.call_mcp(server, tool, args_json): tool must be Str".into())),
+        };
+        let args_json = match args.get(2) {
+            Some(Value::Str(s)) => s.clone(),
+            _ => return err(Value::Str(
+                "agent.call_mcp(server, tool, args_json): args_json must be Str".into())),
+        };
+        let parsed: serde_json::Value = match serde_json::from_str(&args_json) {
+            Ok(v) => v,
+            Err(e) => return err(Value::Str(format!(
+                "agent.call_mcp: args_json is not valid JSON: {e}"))),
+        };
+        match self.mcp_clients.call(&server, &tool, parsed) {
+            Ok(result) => ok(Value::Str(
+                serde_json::to_string(&result).unwrap_or_else(|_| "null".into()))),
+            Err(e) => err(Value::Str(e)),
+        }
+    }
+}
+
+/// Implementation of `agent.local_complete(prompt)` (#196).
+/// Hits Ollama (or any compatible HTTP service via `OLLAMA_HOST`)
+/// and returns the completion text. Override at the
+/// `EffectHandler` layer if you need a different transport.
+fn dispatch_llm_local(args: Vec<Value>) -> Value {
+    let prompt = match args.first() {
         Some(Value::Str(s)) => s.clone(),
         _ => return err(Value::Str(
-            "agent.call_mcp(server, tool, args_json): server must be Str".into())),
+            "agent.local_complete(prompt): prompt must be Str".into())),
     };
-    let tool = match args.get(1) {
+    match crate::llm::local_complete(&prompt) {
+        Ok(text) => ok(Value::Str(text)),
+        Err(e) => err(Value::Str(e)),
+    }
+}
+
+/// Implementation of `agent.cloud_complete(prompt)` (#196).
+/// Hits OpenAI's chat-completions API (or any compatible
+/// service via `OPENAI_BASE_URL`) and returns the assistant
+/// message. Requires `OPENAI_API_KEY`. Override at the
+/// `EffectHandler` layer for custom auth, batching, or other
+/// providers.
+fn dispatch_llm_cloud(args: Vec<Value>) -> Value {
+    let prompt = match args.first() {
         Some(Value::Str(s)) => s.clone(),
         _ => return err(Value::Str(
-            "agent.call_mcp(server, tool, args_json): tool must be Str".into())),
+            "agent.cloud_complete(prompt): prompt must be Str".into())),
     };
-    let args_json = match args.get(2) {
-        Some(Value::Str(s)) => s.clone(),
-        _ => return err(Value::Str(
-            "agent.call_mcp(server, tool, args_json): args_json must be Str".into())),
-    };
-    let parsed: serde_json::Value = match serde_json::from_str(&args_json) {
-        Ok(v) => v,
-        Err(e) => return err(Value::Str(format!(
-            "agent.call_mcp: args_json is not valid JSON: {e}"))),
-    };
-    let mut client = match crate::mcp_client::McpClient::spawn(&server) {
-        Ok(c) => c,
-        Err(e) => return err(Value::Str(e)),
-    };
-    match client.call_tool(&tool, parsed) {
-        Ok(result) => ok(Value::Str(
-            serde_json::to_string(&result).unwrap_or_else(|_| "null".into()))),
+    match crate::llm::cloud_complete(&prompt) {
+        Ok(text) => ok(Value::Str(text)),
         Err(e) => err(Value::Str(e)),
     }
 }

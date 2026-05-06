@@ -5,6 +5,54 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [0.2.2] — 2026-05-06
+
+Real wires for the `[llm_local]` and `[llm_cloud]` effects, plus
+a connection cache for `agent.call_mcp`. Stub responses are gone.
+
+### Added
+
+- **`agent.local_complete(prompt)`** (#196) hits Ollama (or any
+  HTTP-compatible service) at `OLLAMA_HOST` (default
+  `http://localhost:11434`), model from `LEX_LLM_LOCAL_MODEL`
+  (default `llama3`), and returns the completion text.
+- **`agent.cloud_complete(prompt)`** (#196) hits any
+  OpenAI-shape chat-completions endpoint. Provider-agnostic by
+  design — point `LEX_LLM_CLOUD_BASE_URL` at OpenAI / Mistral /
+  Groq / Together / DeepSeek / vLLM / etc. API key from
+  `LEX_LLM_CLOUD_API_KEY` (preferred) or `OPENAI_API_KEY`
+  (fallback). Model from `LEX_LLM_CLOUD_MODEL`.
+- **EffectHandler escape hatch** documented (`crates/lex-runtime/src/llm.rs`).
+  Custom auth, batching, alternative providers, or non-HTTP
+  transports go through wrapping `DefaultHandler` and
+  intercepting the dispatch — no upstream change needed.
+- **`McpClientCache`** (#197): LRU-bounded cache of stdio MCP
+  clients keyed by command-line string, default cap 16. Per-
+  `DefaultHandler` instance. Subprocess death is detected
+  lazily — failed `tools/call` drops the client so the next
+  call respawns. Replaces the spawn-per-call pattern from
+  v0.2.0.
+
+### Changed
+
+`agent.local_complete` / `agent.cloud_complete` no longer
+return the `Ok("<llm_local stub>")` / `Ok("<llm_cloud stub>")`
+sentinels. Existing callers must either:
+
+- Set `OLLAMA_HOST` / `OPENAI_API_KEY` (etc.) so the call
+  succeeds, or
+- Wrap `DefaultHandler` and intercept the dispatch with a
+  custom `EffectHandler` impl.
+
+`agent.send_a2a` keeps its stub — that wire format lives in
+the downstream `soft-a2a` crate, not in lex-lang.
+
+### Internal
+
+- Workspace bumped to 0.2.2 (additive surface; the stub
+  behaviour change is API-visible but explicitly documented as
+  a v1 → v2 transition).
+
 ## [0.2.1] — 2026-05-06
 
 Patch release, additive only.
@@ -503,6 +551,7 @@ the changelog itself was started; entries are coarse-grained.
 - `SECURITY.md` threat model with deployment recommendations.
 - `cargo fuzz` CI for parser + type checker (60 s/PR, 5 min nightly).
 
+[0.2.2]: https://github.com/alpibrusl/lex-lang/releases/tag/v0.2.2
 [0.2.1]: https://github.com/alpibrusl/lex-lang/releases/tag/v0.2.1
 [0.2.0]: https://github.com/alpibrusl/lex-lang/releases/tag/v0.2.0
 [0.1.0]: https://github.com/alpibrusl/lex-lang/releases/tag/v0.1.0
