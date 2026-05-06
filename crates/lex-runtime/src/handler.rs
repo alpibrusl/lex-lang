@@ -662,10 +662,13 @@ impl EffectHandler for DefaultHandler {
                 other => return Err(format!("unsupported agent.{other}")),
             };
             self.ensure_kind_allowed(effect_kind)?;
-            // Sentinel response: the wire format ships in
-            // downstream crates. Tests use this to verify the
-            // type-check + policy-gate path without depending on
-            // any LLM/A2A/MCP transport.
+            // `call_mcp` is wired to a real stdio MCP client
+            // (#185). The other three effects keep their stub
+            // pending the downstream crates that own their wire
+            // format (`soft-agent` for `llm_*` and `a2a`).
+            if op == "call_mcp" {
+                return Ok(dispatch_call_mcp(args));
+            }
             return Ok(ok(Value::Str(format!("<{effect_kind} stub>"))));
         }
         if kind == "http" && matches!(op, "send" | "get" | "post") {
@@ -1362,6 +1365,44 @@ fn ok(v: Value) -> Value {
 }
 fn err(v: Value) -> Value {
     Value::Variant { name: "Err".into(), args: vec![v] }
+}
+
+/// Implementation of `agent.call_mcp(server, tool, args_json)`.
+/// Spawn the MCP server, complete `initialize`, send `tools/call`
+/// with the supplied arguments, and return the server's `result`
+/// JSON serialized back to a Lex `Str`. Errors at any stage come
+/// back as `Err(reason)` so callers can `match` on them — no
+/// `Result<_, String>` from the handler itself.
+fn dispatch_call_mcp(args: Vec<Value>) -> Value {
+    let server = match args.first() {
+        Some(Value::Str(s)) => s.clone(),
+        _ => return err(Value::Str(
+            "agent.call_mcp(server, tool, args_json): server must be Str".into())),
+    };
+    let tool = match args.get(1) {
+        Some(Value::Str(s)) => s.clone(),
+        _ => return err(Value::Str(
+            "agent.call_mcp(server, tool, args_json): tool must be Str".into())),
+    };
+    let args_json = match args.get(2) {
+        Some(Value::Str(s)) => s.clone(),
+        _ => return err(Value::Str(
+            "agent.call_mcp(server, tool, args_json): args_json must be Str".into())),
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&args_json) {
+        Ok(v) => v,
+        Err(e) => return err(Value::Str(format!(
+            "agent.call_mcp: args_json is not valid JSON: {e}"))),
+    };
+    let mut client = match crate::mcp_client::McpClient::spawn(&server) {
+        Ok(c) => c,
+        Err(e) => return err(Value::Str(e)),
+    };
+    match client.call_tool(&tool, parsed) {
+        Ok(result) => ok(Value::Str(
+            serde_json::to_string(&result).unwrap_or_else(|_| "null".into()))),
+        Err(e) => err(Value::Str(e)),
+    }
 }
 
 fn some(v: Value) -> Value {
