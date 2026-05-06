@@ -82,9 +82,44 @@ pub fn evaluate_gate_compiled(
     bindings: &IndexMap<String, Value>,
     bc: &lex_bytecode::Program,
 ) -> GateVerdict {
+    evaluate_gate_compiled_inner(specs, bindings, bc, None)
+}
+
+/// Like [`evaluate_gate_compiled`] but additionally threads a
+/// caller-supplied tracer into every Vm the spec body spins up
+/// for [`SpecExpr::Call`] (#199).
+///
+/// `new_tracer` is called once per host-helper invocation and
+/// must produce a fresh `Box<dyn Tracer>` for each new `Vm`.
+/// Multiple tracers can share state — typically by closing over
+/// a [`lex_trace::Handle`] and cloning it inside the closure —
+/// so the resulting trace tree captures the spec body's call
+/// graph (e.g. `under_budget → projected_load + budget_total`)
+/// alongside the rest of the agent's run.
+///
+/// Existing callers of [`evaluate_gate`] / [`evaluate_gate_compiled`]
+/// stay unchanged; this is purely additive.
+pub fn evaluate_gate_compiled_traced<F>(
+    specs: &[Spec],
+    bindings: &IndexMap<String, Value>,
+    bc: &lex_bytecode::Program,
+    new_tracer: F,
+) -> GateVerdict
+where
+    F: Fn() -> Box<dyn lex_bytecode::vm::Tracer>,
+{
+    evaluate_gate_compiled_inner(specs, bindings, bc, Some(&new_tracer))
+}
+
+fn evaluate_gate_compiled_inner(
+    specs: &[Spec],
+    bindings: &IndexMap<String, Value>,
+    bc: &lex_bytecode::Program,
+    new_tracer: Option<&dyn Fn() -> Box<dyn lex_bytecode::vm::Tracer>>,
+) -> GateVerdict {
     let policy = Policy::permissive();
     for spec in specs {
-        match eval_body(&spec.body, bindings, bc, &policy) {
+        match eval_body(&spec.body, bindings, bc, &policy, new_tracer) {
             Ok(Value::Bool(true)) => continue,
             Ok(Value::Bool(false)) => {
                 return GateVerdict::Deny {
@@ -130,11 +165,19 @@ fn short_value(v: &Value) -> String {
 /// Evaluate a `SpecExpr` against caller-supplied `bindings`.
 /// Mirrors `checker::eval` but kept separate so the gate path
 /// doesn't have to thread random-generation state.
+///
+/// `new_tracer`, when present, is invoked once per
+/// `SpecExpr::Call` and the resulting Tracer is attached to
+/// the Vm before running the host helper. The factory shape
+/// (rather than a single `Box<dyn Tracer>`) is what lets
+/// multiple sibling calls all flow into the same caller-side
+/// recorder via cloned `Handle`s.
 fn eval_body(
     e: &SpecExpr,
     bindings: &IndexMap<String, Value>,
     bc: &lex_bytecode::Program,
     policy: &Policy,
+    new_tracer: Option<&dyn Fn() -> Box<dyn lex_bytecode::vm::Tracer>>,
 ) -> Result<Value, String> {
     match e {
         SpecExpr::IntLit { value } => Ok(Value::Int(*value)),
@@ -144,25 +187,28 @@ fn eval_body(
         SpecExpr::Var { name } => bindings.get(name).cloned()
             .ok_or_else(|| format!("unbound spec var `{name}` (provide via gate bindings)")),
         SpecExpr::Let { name, value, body } => {
-            let v = eval_body(value, bindings, bc, policy)?;
+            let v = eval_body(value, bindings, bc, policy, new_tracer)?;
             let mut next = bindings.clone();
             next.insert(name.clone(), v);
-            eval_body(body, &next, bc, policy)
+            eval_body(body, &next, bc, policy, new_tracer)
         }
-        SpecExpr::Not { expr } => match eval_body(expr, bindings, bc, policy)? {
+        SpecExpr::Not { expr } => match eval_body(expr, bindings, bc, policy, new_tracer)? {
             Value::Bool(b) => Ok(Value::Bool(!b)),
             other => Err(format!("not on non-bool: {other:?}")),
         },
         SpecExpr::BinOp { op, lhs, rhs } => {
-            let a = eval_body(lhs, bindings, bc, policy)?;
-            let b = eval_body(rhs, bindings, bc, policy)?;
+            let a = eval_body(lhs, bindings, bc, policy, new_tracer)?;
+            let b = eval_body(rhs, bindings, bc, policy, new_tracer)?;
             apply_binop(*op, a, b)
         }
         SpecExpr::Call { func, args } => {
             let mut argv = Vec::new();
-            for a in args { argv.push(eval_body(a, bindings, bc, policy)?); }
+            for a in args { argv.push(eval_body(a, bindings, bc, policy, new_tracer)?); }
             let handler = DefaultHandler::new(policy.clone());
             let mut vm = Vm::with_handler(bc, Box::new(handler));
+            if let Some(make_tracer) = new_tracer {
+                vm.set_tracer(make_tracer());
+            }
             vm.call(func, argv).map_err(|e| format!("call `{func}`: {e}"))
         }
     }
@@ -349,5 +395,98 @@ mod tests {
         let per_call_us = elapsed.as_micros() / n as u128;
         assert!(per_call_us < 5_000,
             "per-gate verdict should be under 5ms; got {per_call_us}μs");
+    }
+
+    // ---- #199: optional tracer hook -----------------------------
+
+    /// Minimal Tracer that records every enter_call name into a
+    /// shared Vec. Avoids depending on lex-trace; soft-agent's
+    /// real wiring uses `lex_trace::Recorder` + `Handle::clone`.
+    struct CallRecorder {
+        captured: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    impl lex_bytecode::vm::Tracer for CallRecorder {
+        fn enter_call(&mut self, _node_id: &str, name: &str, _args: &[Value]) {
+            self.captured.lock().unwrap().push(name.to_string());
+        }
+        fn enter_effect(&mut self, _: &str, _: &str, _: &str, _: &[Value]) {}
+        fn exit_ok(&mut self, _: &Value) {}
+        fn exit_err(&mut self, _: &str) {}
+        fn exit_call_tail(&mut self) {}
+        fn override_effect(&mut self, _: &str) -> Option<Value> { None }
+    }
+
+    #[test]
+    fn traced_gate_captures_nested_call_events() {
+        // Spec body calls `under_budget`, which itself calls
+        // `projected_load` and `budget_total`. Without the tracer
+        // hook, only the top-level Lex call appears in any
+        // recorder; with it, the nested helpers do too.
+        let host_src = r#"
+            fn projected_load(active :: Int, delta :: Int) -> Int {
+              active + delta
+            }
+            fn budget_total(budget :: Int, headroom :: Int) -> Int {
+              budget + headroom
+            }
+            fn under_budget(active :: Int, delta :: Int, budget :: Int, headroom :: Int) -> Bool {
+              projected_load(active, delta) <= budget_total(budget, headroom)
+            }
+        "#;
+        let prog = parse_source(host_src).unwrap();
+        let stages = lex_ast::canonicalize_program(&prog);
+        let bc = compile_program(&stages);
+
+        let spec = parse_spec(r#"
+            spec gated_budget {
+              forall active :: Int, delta :: Int, budget :: Int, headroom :: Int :
+                under_budget(active, delta, budget, headroom)
+            }
+        "#).unwrap();
+        let bindings = b([
+            ("active", Value::Int(40)),
+            ("delta", Value::Int(15)),
+            ("budget", Value::Int(60)),
+            ("headroom", Value::Int(0)),
+        ]);
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured_for_factory = std::sync::Arc::clone(&captured);
+        let v = evaluate_gate_compiled_traced(
+            std::slice::from_ref(&spec),
+            &bindings,
+            &bc,
+            move || Box::new(CallRecorder {
+                captured: std::sync::Arc::clone(&captured_for_factory),
+            }),
+        );
+        assert_eq!(v, GateVerdict::Allow);
+
+        let calls = captured.lock().unwrap();
+        // The Vm fires `enter_call` for sub-calls executed inside
+        // the entry function's body, not for the host-driven
+        // `Vm::call("under_budget", ...)` itself — that's the
+        // host's contract. The point of the tracer hook is that
+        // these *nested* helpers are visible at all; pre-#199
+        // they were entirely opaque to the gate's recorder.
+        for expected in ["projected_load", "budget_total"] {
+            assert!(calls.iter().any(|c| c == expected),
+                "expected `{expected}` in captured calls; got {:?}", *calls);
+        }
+    }
+
+    #[test]
+    fn untraced_gate_path_unchanged() {
+        // The existing `evaluate_gate_compiled` API stays unaffected
+        // by #199: same signature, same behavior. Pin this so future
+        // refactors of the inner factory threading don't quietly
+        // shift the public contract.
+        let spec = parse_spec("spec ok { forall x :: Int : x + 1 > x }").unwrap();
+        let v = evaluate_gate_compiled(
+            std::slice::from_ref(&spec),
+            &b([("x", Value::Int(5))]),
+            &compile_program(&lex_ast::canonicalize_program(&parse_source("").unwrap())),
+        );
+        assert_eq!(v, GateVerdict::Allow);
     }
 }

@@ -253,76 +253,110 @@ pub(crate) fn json_to_value(v: &serde_json::Value) -> Value {
 
 impl Tracer for Recorder {
     fn enter_call(&mut self, node_id: &str, name: &str, args: &[Value]) {
-        let mut st = self.state.lock().unwrap();
-        st.open.push(OpenFrame {
-            node: TraceNode {
-                node_id: node_id.to_string(),
-                kind: TraceNodeKind::Call,
-                target: name.to_string(),
-                input: values_to_json(args),
-                output: None,
-                error: None,
-                started_at: now_unix(),
-                ended_at: 0,
-                children: Vec::new(),
-            },
-            children: Vec::new(),
-        });
+        push_call_frame(&self.state, node_id, name, args);
     }
-
     fn enter_effect(&mut self, node_id: &str, kind: &str, op: &str, args: &[Value]) {
-        let mut st = self.state.lock().unwrap();
-        st.open.push(OpenFrame {
-            node: TraceNode {
-                node_id: node_id.to_string(),
-                kind: TraceNodeKind::Effect,
-                target: format!("{kind}.{op}"),
-                input: values_to_json(args),
-                output: None,
-                error: None,
-                started_at: now_unix(),
-                ended_at: 0,
-                children: Vec::new(),
-            },
-            children: Vec::new(),
-        });
+        push_effect_frame(&self.state, node_id, kind, op, args);
     }
-
-    fn exit_ok(&mut self, value: &Value) {
-        let mut st = self.state.lock().unwrap();
-        if let Some(mut frame) = st.open.pop() {
-            frame.node.ended_at = now_unix();
-            frame.node.output = Some(value_to_json(value));
-            frame.node.children = frame.children;
-            attach_completed(&mut st, frame.node);
-        }
-    }
-
-    fn exit_err(&mut self, message: &str) {
-        let mut st = self.state.lock().unwrap();
-        if let Some(mut frame) = st.open.pop() {
-            frame.node.ended_at = now_unix();
-            frame.node.error = Some(message.to_string());
-            frame.node.children = frame.children;
-            attach_completed(&mut st, frame.node);
-        }
-    }
-
-    fn exit_call_tail(&mut self) {
-        let mut st = self.state.lock().unwrap();
-        if let Some(mut frame) = st.open.pop() {
-            frame.node.ended_at = now_unix();
-            // Tail call: tag with synthetic output so it shows as completed.
-            frame.node.output = Some(serde_json::Value::Null);
-            frame.node.children = frame.children;
-            attach_completed(&mut st, frame.node);
-        }
-    }
-
+    fn exit_ok(&mut self, value: &Value) { exit_ok_frame(&self.state, value); }
+    fn exit_err(&mut self, message: &str) { exit_err_frame(&self.state, message); }
+    fn exit_call_tail(&mut self) { exit_tail_frame(&self.state); }
     fn override_effect(&mut self, node_id: &str) -> Option<Value> {
-        let st = self.state.lock().unwrap();
-        st.overrides.get(node_id).map(json_to_value)
+        lookup_override(&self.state, node_id)
     }
+}
+
+/// Tracer impl for the recorder's shareable handle (#199). Multiple
+/// `Vm` instances driven against the same `Recorder` — for example,
+/// the spec-checker's per-`SpecExpr::Call` Vms — can each take their
+/// own `Box<dyn Tracer>` cloned from this handle, and the events
+/// will fold into the same trace tree.
+impl Tracer for Handle {
+    fn enter_call(&mut self, node_id: &str, name: &str, args: &[Value]) {
+        push_call_frame(&self.state, node_id, name, args);
+    }
+    fn enter_effect(&mut self, node_id: &str, kind: &str, op: &str, args: &[Value]) {
+        push_effect_frame(&self.state, node_id, kind, op, args);
+    }
+    fn exit_ok(&mut self, value: &Value) { exit_ok_frame(&self.state, value); }
+    fn exit_err(&mut self, message: &str) { exit_err_frame(&self.state, message); }
+    fn exit_call_tail(&mut self) { exit_tail_frame(&self.state); }
+    fn override_effect(&mut self, node_id: &str) -> Option<Value> {
+        lookup_override(&self.state, node_id)
+    }
+}
+
+// ---- Tracer body, factored so Recorder and Handle share it. ------
+
+fn push_call_frame(state: &Mutex<RecorderState>, node_id: &str, name: &str, args: &[Value]) {
+    let mut st = state.lock().unwrap();
+    st.open.push(OpenFrame {
+        node: TraceNode {
+            node_id: node_id.to_string(),
+            kind: TraceNodeKind::Call,
+            target: name.to_string(),
+            input: values_to_json(args),
+            output: None,
+            error: None,
+            started_at: now_unix(),
+            ended_at: 0,
+            children: Vec::new(),
+        },
+        children: Vec::new(),
+    });
+}
+
+fn push_effect_frame(state: &Mutex<RecorderState>, node_id: &str, kind: &str, op: &str, args: &[Value]) {
+    let mut st = state.lock().unwrap();
+    st.open.push(OpenFrame {
+        node: TraceNode {
+            node_id: node_id.to_string(),
+            kind: TraceNodeKind::Effect,
+            target: format!("{kind}.{op}"),
+            input: values_to_json(args),
+            output: None,
+            error: None,
+            started_at: now_unix(),
+            ended_at: 0,
+            children: Vec::new(),
+        },
+        children: Vec::new(),
+    });
+}
+
+fn exit_ok_frame(state: &Mutex<RecorderState>, value: &Value) {
+    let mut st = state.lock().unwrap();
+    if let Some(mut frame) = st.open.pop() {
+        frame.node.ended_at = now_unix();
+        frame.node.output = Some(value_to_json(value));
+        frame.node.children = frame.children;
+        attach_completed(&mut st, frame.node);
+    }
+}
+
+fn exit_err_frame(state: &Mutex<RecorderState>, message: &str) {
+    let mut st = state.lock().unwrap();
+    if let Some(mut frame) = st.open.pop() {
+        frame.node.ended_at = now_unix();
+        frame.node.error = Some(message.to_string());
+        frame.node.children = frame.children;
+        attach_completed(&mut st, frame.node);
+    }
+}
+
+fn exit_tail_frame(state: &Mutex<RecorderState>) {
+    let mut st = state.lock().unwrap();
+    if let Some(mut frame) = st.open.pop() {
+        frame.node.ended_at = now_unix();
+        frame.node.output = Some(serde_json::Value::Null);
+        frame.node.children = frame.children;
+        attach_completed(&mut st, frame.node);
+    }
+}
+
+fn lookup_override(state: &Mutex<RecorderState>, node_id: &str) -> Option<Value> {
+    let st = state.lock().unwrap();
+    st.overrides.get(node_id).map(json_to_value)
 }
 
 fn attach_completed(st: &mut RecorderState, node: TraceNode) {
