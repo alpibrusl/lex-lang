@@ -5,10 +5,89 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
-## [Unreleased]
+## [0.2.0] — 2026-05-06
 
-### Added
+First public release on crates.io. The 10 library crates listed
+in [`crates published`](#crates-published-in-this-release) ship
+at this version; the rest carry `publish = false`.
 
+### Added — agent-runtime primitives (#184–#192)
+
+Driven by the `soft` proposal's request for a typed substrate
+to build agent runtimes on. The four `std.agent` builtins below
+each carry their own effect tag so a function declared
+`[llm_local, a2a]` cannot accidentally reach `[llm_cloud]` or
+`[mcp]`; the type-checker enforces this at compile time.
+
+- **`std.agent` module** with effect-typed builtins (#184):
+  - `agent.local_complete(prompt) :: [llm_local] Result[Str, Str]`
+  - `agent.cloud_complete(prompt) :: [llm_cloud] Result[Str, Str]`
+  - `agent.send_a2a(peer, payload) :: [a2a] Result[Str, Str]`
+  - `agent.call_mcp(server, tool, args_json) :: [mcp] Result[Str, Str]`
+- **Real stdio MCP client** behind `agent.call_mcp` (#185).
+  JSON-RPC 2.0 over a subprocess; spawn-per-call. Connection
+  cache is a v2 follow-up pending downstream benchmarks.
+- **Spec-checker as a runtime gate** (#186). New
+  `evaluate_gate(specs, bindings, lex_source) -> GateVerdict`
+  API: per-action `Allow / Deny / Inconclusive` verdicts in
+  single-digit milliseconds for small spec sets. The randomized
+  property checker stays as the offline tool.
+- **Type-driven `parse[T]` validation** for `std.{json,toml,yaml}`
+  (#168, #188). When the inferred result type is
+  `Result[Record{...}, _]` the type-checker rewrites the call to
+  validate required fields before returning `Ok`.
+- **`docs/design/trace-vs-vcs.md`** (#187) — traces stay out of
+  the op log; cross-store sync uses attestations for metadata
+  plus content-addressed blob copy for the trace JSON. No new
+  resolver needed.
+
+### Crates published in this release
+
+- `lex-syntax` — tokenizer + parser
+- `lex-ast` — canonical AST + content-addressed identity
+- `lex-types` — type system + effect inference
+- `lex-bytecode` — bytecode compiler + VM
+- `lex-runtime` — effect handler runtime + capability policy
+- `lex-trace` — trace tree + replay
+- `lex-vcs` — agent-native VCS (typed op log + attestation graph)
+- `lex-store` — on-disk store (stages, branches, traces)
+- `lex-api` — HTTP/JSON + MCP server surface
+- `spec-checker` — property checker + runtime gate
+
+Internal crates (`core-syntax`, `core-compiler`, `lex-stdlib`,
+`lex-cli`, `conformance`) carry `publish = false`. Install the
+`lex` binary via `cargo install --git
+https://github.com/alpibrusl/lex-lang lex-cli` until a binary
+release flow is in place.
+
+### Added — agent-native VCS, lex-tea v3 (#172, #181)
+
+- **`Override` / `Defer` / `Block` / `Unblock` attestation kinds**
+  (#177, #178). Human triage actions are first-class
+  attestations, queryable via `lex attest filter --kind ...`.
+- **`lex stage pin / defer / block / unblock`** CLI commands;
+  `lex stage pin` consults `lex_vcs::is_stage_blocked` and
+  refuses to activate a blocked stage.
+- **Web UI parity** for triage actions on `/web/stage/<id>`
+  (#179).
+- **`<store>/users.json`** actor-identity gate (#180).
+  `LEX_TEA_USER` env var and `X-Lex-User` header both validated
+  against the file when present; v3a–v3c behaviour preserved
+  when absent.
+- **`lex merge defer <merge_id> <conflict_id>`** per-conflict
+  shortcut (#182). `Resolution::Defer` plumbed through.
+- **`<store>/policy.json`** producer block list (#183). The
+  activity feed renders a `blocked` tag next to attestation
+  rows whose `produced_by.tool` is on the list. Read-time
+  enforcement; the attestation log keeps every record.
+- **`lex policy block-producer / unblock-producer / list`** CLI
+  commands.
+
+### Added — earlier
+
+- **MCP server** (`lex serve --mcp`) exposing the v1 JSON API as
+  MCP tools (#175, #171).
+- **Closures-as-values in record fields** (#176, #169).
 - **Agent-native VCS, tier-2 — full rollout.** Closes #128 (and
   sub-issues #129-#134). The store goes from a snapshot-of-functions
   database to a **typed event log with first-class intent and
@@ -399,5 +478,5 @@ the changelog itself was started; entries are coarse-grained.
 - `SECURITY.md` threat model with deployment recommendations.
 - `cargo fuzz` CI for parser + type checker (60 s/PR, 5 min nightly).
 
-[Unreleased]: https://github.com/alpibrusl/lex-lang/compare/v0.1.0...HEAD
+[0.2.0]: https://github.com/alpibrusl/lex-lang/releases/tag/v0.2.0
 [0.1.0]: https://github.com/alpibrusl/lex-lang/releases/tag/v0.1.0

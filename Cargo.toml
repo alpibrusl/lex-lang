@@ -23,9 +23,14 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "EUPL-1.2"
+repository = "https://github.com/alpibrusl/lex-lang"
+homepage = "https://github.com/alpibrusl/lex-lang"
+authors = ["Alpibrupa <https://github.com/alpibrupa>"]
+keywords = ["lex", "agent", "effects", "language"]
+categories = ["compilers", "development-tools"]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
