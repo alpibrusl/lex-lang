@@ -646,6 +646,28 @@ impl EffectHandler for DefaultHandler {
         // declared signature (`http.get :: Str -> [net] ...`) and
         // keeps `--allow-effects net` doing the obvious thing for
         // both `net.*` and `http.*` callers.
+        // `std.agent` (#184): the four runtime effects added for
+        // agent-style programs (`llm_local`, `llm_cloud`, `a2a`,
+        // `mcp`). The handlers are stubs — they enforce the
+        // declared-effect gate, return a sentinel `Ok` so traces
+        // record the call, and defer the real wire formats to
+        // downstream crates (`soft-agent` for `llm_*` and `a2a`)
+        // and #185 (MCP client wrapper).
+        if kind == "agent" {
+            let effect_kind = match op {
+                "local_complete" => "llm_local",
+                "cloud_complete" => "llm_cloud",
+                "send_a2a"       => "a2a",
+                "call_mcp"       => "mcp",
+                other => return Err(format!("unsupported agent.{other}")),
+            };
+            self.ensure_kind_allowed(effect_kind)?;
+            // Sentinel response: the wire format ships in
+            // downstream crates. Tests use this to verify the
+            // type-check + policy-gate path without depending on
+            // any LLM/A2A/MCP transport.
+            return Ok(ok(Value::Str(format!("<{effect_kind} stub>"))));
+        }
         if kind == "http" && matches!(op, "send" | "get" | "post") {
             self.ensure_kind_allowed("net")?;
             return match op {

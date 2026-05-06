@@ -42,7 +42,12 @@ impl Policy {
 
     pub fn permissive() -> Self {
         let mut s = BTreeSet::new();
-        for k in ["io", "net", "time", "rand", "llm", "proc", "panic", "fs_read", "fs_write", "budget"] {
+        for k in [
+            "io", "net", "time", "rand", "llm", "proc", "panic",
+            "fs_read", "fs_write", "budget",
+            // #184: agent-runtime effects.
+            "llm_local", "llm_cloud", "a2a", "mcp",
+        ] {
             s.insert(k.to_string());
         }
         Self {

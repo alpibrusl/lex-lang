@@ -1273,6 +1273,45 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             ));
             Some(Ty::Record(fields))
         }
+        // `std.agent` (#184) — runtime primitives whose effects
+        // separate (a) which LLM surface (`llm_local` vs
+        // `llm_cloud`), (b) which peer protocol (`a2a`), and
+        // (c) which tool boundary (`mcp`). The wire formats land
+        // in downstream crates (`soft-agent`, `soft-a2a`) and
+        // in #185 for MCP; what's typed here is the boundary
+        // alone — agent code can be type-checked as
+        // `[llm_local, a2a]` and will fail if it tries to reach
+        // `[llm_cloud]` even before the wire layer is finished.
+        "agent" => {
+            let mut fields = IndexMap::new();
+            // local_complete :: Str -> [llm_local] Result[Str, Str]
+            fields.insert("local_complete".into(), Ty::function(
+                vec![Ty::str()],
+                EffectSet::singleton("llm_local"),
+                Ty::Con("Result".into(), vec![Ty::str(), Ty::str()]),
+            ));
+            // cloud_complete :: Str -> [llm_cloud] Result[Str, Str]
+            fields.insert("cloud_complete".into(), Ty::function(
+                vec![Ty::str()],
+                EffectSet::singleton("llm_cloud"),
+                Ty::Con("Result".into(), vec![Ty::str(), Ty::str()]),
+            ));
+            // send_a2a :: (Str, Str) -> [a2a] Result[Str, Str]
+            //              peer payload                   reply
+            fields.insert("send_a2a".into(), Ty::function(
+                vec![Ty::str(), Ty::str()],
+                EffectSet::singleton("a2a"),
+                Ty::Con("Result".into(), vec![Ty::str(), Ty::str()]),
+            ));
+            // call_mcp :: (Str, Str, Str) -> [mcp] Result[Str, Str]
+            //              server tool args_json         result_json
+            fields.insert("call_mcp".into(), Ty::function(
+                vec![Ty::str(), Ty::str(), Ty::str()],
+                EffectSet::singleton("mcp"),
+                Ty::Con("Result".into(), vec![Ty::str(), Ty::str()]),
+            ));
+            Some(Ty::Record(fields))
+        }
         _ => None,
     }
 }
@@ -1315,6 +1354,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "dotenv" => "dotenv",
         "csv" => "csv",
         "test" => "test",
+        "agent" => "agent",
         _ => return None,
     })
 }
