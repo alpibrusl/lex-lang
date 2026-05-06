@@ -21,6 +21,11 @@ use tiny_http::{Header, Method, Request, Response};
 
 pub struct State {
     pub store: Mutex<Store>,
+    /// Filesystem root of the store. Held alongside the `Store`
+    /// itself so handlers that need to read store-level files
+    /// (e.g. `users.json` for actor auth) don't have to round-
+    /// trip through the lock.
+    pub root: PathBuf,
     /// In-memory merge sessions, keyed by MergeSessionId. Sessions
     /// are ephemeral by design (#134 foundation): they live for the
     /// lifetime of the server process and are GC'd on commit. A
@@ -45,7 +50,8 @@ pub struct ApiMergeSession {
 impl State {
     pub fn open(root: PathBuf) -> anyhow::Result<Self> {
         Ok(Self {
-            store: Mutex::new(Store::open(root)?),
+            store: Mutex::new(Store::open(&root)?),
+            root,
             sessions: Mutex::new(HashMap::new()),
         })
     }
@@ -85,10 +91,18 @@ pub fn handle(state: Arc<State>, mut req: Request) -> std::io::Result<()> {
     let path = url.split('?').next().unwrap_or("").to_string();
     let query = url.split_once('?').map(|(_, q)| q.to_string()).unwrap_or_default();
 
+    // `X-Lex-User` is the v3d session identifier — set by humans
+    // operating the web UI through whatever proxy fronts auth, or
+    // by AI agents calling the JSON API. We pluck it once here so
+    // every handler can take it as a borrowed string.
+    let x_lex_user = req.headers().iter()
+        .find(|h| h.field.equiv("x-lex-user"))
+        .map(|h| h.value.as_str().to_string());
+
     let mut body = String::new();
     let _ = req.as_reader().read_to_string(&mut body);
 
-    let resp = route(&state, &method, &path, &query, &body);
+    let resp = route(&state, &method, &path, &query, &body, x_lex_user.as_deref());
     req.respond(resp)
 }
 
@@ -98,6 +112,7 @@ fn route(
     path: &str,
     query: &str,
     body: &str,
+    x_lex_user: Option<&str>,
 ) -> Response<std::io::Cursor<Vec<u8>>> {
     match (method, path) {
         // ---- lex-tea v2 (HTML browser) ------------------------
@@ -132,7 +147,7 @@ fn route(
                 "unblock" => crate::web::WebStageDecision::Unblock,
                 _ => unreachable!("matched in outer guard"),
             };
-            crate::web::stage_decision_handler(state, id, body, decision)
+            crate::web::stage_decision_handler(state, id, body, decision, x_lex_user)
         }
         // ---- JSON API -----------------------------------------
         (Method::Get, "/v1/health") => json_response(200, &serde_json::json!({"ok": true})),

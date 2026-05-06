@@ -686,23 +686,40 @@ impl WebStageDecision {
 }
 
 /// `POST /web/stage/<id>/{pin,defer,block,unblock}` — handles
-/// the human-triage form submissions. Reads `LEX_TEA_USER` from
-/// the server env, records the appropriate attestation, and
-/// (for `pin` only) activates the stage. Redirects back to the
-/// stage page so a refresh doesn't repost the action.
+/// the human-triage form submissions. Picks the actor from the
+/// `X-Lex-User` request header (preferred, set by the proxy or
+/// programmatic client) or falls back to the `LEX_TEA_USER`
+/// server env. If `<store>/users.json` exists the resolved name
+/// must be in it. Records the appropriate attestation, and (for
+/// `pin` only) activates the stage. Redirects back to the stage
+/// page so a refresh doesn't repost the action.
 pub(crate) fn stage_decision_handler(
     state: &State,
     id: &str,
     body: &str,
     decision: WebStageDecision,
+    x_lex_user: Option<&str>,
 ) -> Response<Cursor<Vec<u8>>> {
-    let actor = match std::env::var("LEX_TEA_USER") {
-        Ok(n) if !n.is_empty() => n,
-        _ => return html_response(403, page("forbidden", "",
+    let actor = x_lex_user
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("LEX_TEA_USER").ok())
+        .filter(|s| !s.is_empty());
+    let Some(actor) = actor else {
+        return html_response(403, page("forbidden", "",
             r#"<nav class="crumb"><a href="/">activity</a></nav>
 <h1>forbidden</h1>
-<p>Set <code>LEX_TEA_USER</code> on the server to enable triage actions.</p>"#)),
+<p>No actor identified. Send <code>X-Lex-User</code> on the request, or set <code>LEX_TEA_USER</code> on the server.</p>"#));
     };
+    if let Ok(Some(users)) = lex_store::users::load(&state.root) {
+        if !users.knows(&actor) {
+            return html_response(403, page("forbidden", "",
+                &format!(r#"<nav class="crumb"><a href="/">activity</a></nav>
+<h1>forbidden</h1>
+<p>Actor <code>{}</code> is not listed in <code>users.json</code>.</p>"#,
+                    esc(&actor))));
+        }
+    }
     let reason = body.split('&')
         .find_map(|pair| pair.strip_prefix("reason="))
         .map(percent_decode)

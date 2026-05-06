@@ -1150,6 +1150,34 @@ fn cmd_stage(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Resolve and validate the actor for a triage action.
+/// Combines `--actor` and `LEX_TEA_USER` (in that order), and
+/// when `<root>/users.json` exists requires the resulting name
+/// to be in the file. Returns a printable error mentioning the
+/// command verb so the user can see which surface refused them.
+fn resolve_actor(
+    root: &std::path::Path,
+    supplied: Option<String>,
+    verb: &str,
+) -> Result<String> {
+    let actor = supplied
+        .or_else(|| std::env::var("LEX_TEA_USER").ok())
+        .ok_or_else(|| anyhow!(
+            "lex stage {verb}: actor unknown — pass --actor NAME or set LEX_TEA_USER"
+        ))?;
+    if let Some(users) = lex_store::users::load(root)
+        .with_context(|| format!("reading users.json at {}", root.display()))?
+    {
+        if !users.knows(&actor) {
+            bail!(
+                "lex stage {verb}: actor `{actor}` not listed in {}/users.json",
+                root.display()
+            );
+        }
+    }
+    Ok(actor)
+}
+
 /// `lex stage pin <id> --reason "..." [--actor <name>]` —
 /// human override (#172, lex-tea v3a). Activates the stage and
 /// records an `Override` attestation alongside whatever
@@ -1158,7 +1186,8 @@ fn cmd_stage(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 /// returns every override the human(s) have issued.
 ///
 /// `actor` defaults to `$LEX_TEA_USER`; falling back errors so
-/// a pin can't land anonymously.
+/// a pin can't land anonymously. When `<store>/users.json`
+/// exists, the resolved name must be in the file (v3d, #172).
 fn cmd_stage_pin(
     fmt: &OutputFormat,
     root: &std::path::Path,
@@ -1182,11 +1211,7 @@ fn cmd_stage_pin(
     let reason = reason.ok_or_else(|| anyhow!(
         "lex stage pin: --reason required (overrides need a paper trail)"
     ))?;
-    let actor = actor
-        .or_else(|| std::env::var("LEX_TEA_USER").ok())
-        .ok_or_else(|| anyhow!(
-            "lex stage pin: actor unknown — pass --actor NAME or set LEX_TEA_USER"
-        ))?;
+    let actor = resolve_actor(root, actor, "pin")?;
 
     let store = Store::open(root)
         .with_context(|| format!("opening store at {}", root.display()))?;
@@ -1309,11 +1334,7 @@ fn cmd_stage_decision(
     let reason = reason.ok_or_else(|| anyhow!(
         "lex stage {verb}: --reason required (triage decisions need a paper trail)"
     ))?;
-    let actor = actor
-        .or_else(|| std::env::var("LEX_TEA_USER").ok())
-        .ok_or_else(|| anyhow!(
-            "lex stage {verb}: actor unknown — pass --actor NAME or set LEX_TEA_USER"
-        ))?;
+    let actor = resolve_actor(root, actor, verb)?;
 
     let store = Store::open(root)
         .with_context(|| format!("opening store at {}", root.display()))?;
