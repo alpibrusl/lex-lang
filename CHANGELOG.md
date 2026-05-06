@@ -5,6 +5,31 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [0.2.1] — 2026-05-06
+
+Patch release, additive only.
+
+### Added
+
+- **`spec_checker::evaluate_gate_compiled_traced`** (#199). Opt-in
+  tracer hook on the runtime gate: callers pass a
+  `Fn() -> Box<dyn Tracer>` factory and every Vm the gate spins
+  up for `SpecExpr::Call` is wired to a fresh tracer. Lets a
+  downstream agent runtime (e.g. `soft-agent`) capture the spec
+  body's nested host-helper calls (`under_budget` →
+  `projected_load + budget_total`) into the same trace tree as
+  the rest of the action.
+- **`lex_trace::Handle: Tracer + Clone`** (supports #199).
+  Multiple `Vm` instances can take their own
+  `Box::new(handle.clone())` and the events fold into the same
+  shared `Recorder` state. Existing `impl Tracer for Recorder`
+  unchanged.
+
+### Changed
+
+Nothing breaking. Existing callers of `evaluate_gate*` and
+`Recorder` keep their signatures and semantics.
+
 ## [0.2.0] — 2026-05-06
 
 First public release on crates.io. The 10 library crates listed
@@ -478,5 +503,6 @@ the changelog itself was started; entries are coarse-grained.
 - `SECURITY.md` threat model with deployment recommendations.
 - `cargo fuzz` CI for parser + type checker (60 s/PR, 5 min nightly).
 
+[0.2.1]: https://github.com/alpibrusl/lex-lang/releases/tag/v0.2.1
 [0.2.0]: https://github.com/alpibrusl/lex-lang/releases/tag/v0.2.0
 [0.1.0]: https://github.com/alpibrusl/lex-lang/releases/tag/v0.1.0
