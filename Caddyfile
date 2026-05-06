@@ -1,0 +1,23 @@
+# Caddy reverse proxy for `lex serve` (#self-host).
+#
+# `LEX_HOST` is provided by docker-compose from the `.env` file.
+# Caddy auto-fetches a Let's Encrypt certificate for it on first
+# start and renews automatically.
+
+{$LEX_HOST} {
+    # Forward everything to the lex backend. The `lex` service
+    # name resolves inside the docker-compose network.
+    reverse_proxy lex:4040 {
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+
+    # Caddy logs to stdout by default; docker-compose captures
+    # it. Add a file sink here if you want long-term retention.
+    log {
+        output stdout
+        format console
+    }
+}
