@@ -556,35 +556,66 @@ pub(crate) fn stage_html_handler(state: &State, id: &str) -> Response<Cursor<Vec
         }
     }
 
-    // Override form (lex-tea v3a, #172). Renders only when a
-    // user identifier is set via `LEX_TEA_USER`; without one the
-    // pin handler refuses the action anyway, so showing a button
-    // would be misleading. Single-user-mode for v3a; v3b adds
-    // sessions + `<store>/users.json`.
+    // Triage forms (lex-tea v3a/v3b/v3c, #172). Render only when
+    // a user identifier is set via `LEX_TEA_USER`; without one the
+    // handlers refuse the action anyway, so showing buttons would
+    // be misleading. Single-user-mode for now; users.json-backed
+    // auth is a follow-up.
     let actor = std::env::var("LEX_TEA_USER").ok();
-    let pin_form = match &actor {
+    let triage_form = match &actor {
         Some(name) => format!(
-            r#"<h2>override</h2>
-<p class="muted">Pin this stage to Active and record an Override
-attestation under your name. Auditable: shows up under
-<code>kind=override</code> in <code>lex attest filter</code>.</p>
+            r#"<h2>triage</h2>
+<p class="muted">Record a human decision against this stage.
+All four actions write an auditable attestation under your name
+queryable via <code>lex attest filter --kind &lt;kind&gt;</code>.
+<strong>pin</strong> additionally activates the stage; the others
+just record the decision. <strong>block</strong> prevents future
+pins until <strong>unblock</strong> is recorded.</p>
+<p class="muted">actor: <span class="mono">{actor}</span></p>
 <form method="post" action="/web/stage/{id}/pin">
-  <p><strong>actor:</strong> <span class="mono">{actor}</span></p>
-  <p><label for="reason">reason:</label><br>
-     <input type="text" id="reason" name="reason" required
+  <p><label for="pin-reason">pin reason:</label><br>
+     <input type="text" id="pin-reason" name="reason" required
             placeholder="e.g. spec checker is wrong here, will revisit"
             style="width: 100%; padding: .4rem; font-family: inherit;"></p>
   <p><button type="submit"
        style="padding: .4rem 1rem; background: #b00; color: #fff; border: 0;
               border-radius: 3px; cursor: pointer;">pin to Active</button></p>
+</form>
+<form method="post" action="/web/stage/{id}/defer">
+  <p><label for="defer-reason">defer reason:</label><br>
+     <input type="text" id="defer-reason" name="reason" required
+            placeholder="e.g. low priority, revisit next sprint"
+            style="width: 100%; padding: .4rem; font-family: inherit;"></p>
+  <p><button type="submit"
+       style="padding: .4rem 1rem; background: #555; color: #fff; border: 0;
+              border-radius: 3px; cursor: pointer;">defer</button></p>
+</form>
+<form method="post" action="/web/stage/{id}/block">
+  <p><label for="block-reason">block reason:</label><br>
+     <input type="text" id="block-reason" name="reason" required
+            placeholder="e.g. blocks until external review lands"
+            style="width: 100%; padding: .4rem; font-family: inherit;"></p>
+  <p><button type="submit"
+       style="padding: .4rem 1rem; background: #800; color: #fff; border: 0;
+              border-radius: 3px; cursor: pointer;">block</button></p>
+</form>
+<form method="post" action="/web/stage/{id}/unblock">
+  <p><label for="unblock-reason">unblock reason:</label><br>
+     <input type="text" id="unblock-reason" name="reason" required
+            placeholder="e.g. external review landed"
+            style="width: 100%; padding: .4rem; font-family: inherit;"></p>
+  <p><button type="submit"
+       style="padding: .4rem 1rem; background: #060; color: #fff; border: 0;
+              border-radius: 3px; cursor: pointer;">unblock</button></p>
 </form>"#,
             id = esc(id),
             actor = esc(name),
         ),
-        None => r#"<h2>override</h2>
+        None => r#"<h2>triage</h2>
 <p class="muted">Set <code>LEX_TEA_USER=&lt;name&gt;</code> in the
-server's environment to enable human override actions. The
-attestation log will record the override under that name.</p>"#.into(),
+server's environment to enable human triage actions (pin / defer /
+block / unblock). The attestation log records every decision under
+that name.</p>"#.into(),
     };
 
     let body = format!(
@@ -602,7 +633,7 @@ attestation log will record the override under that name.</p>"#.into(),
   <thead><tr><th>kind</th><th>result</th><th>by</th><th>ts</th></tr></thead>
   <tbody>{att_rows}</tbody>
 </table>
-{pin_form}"#,
+{triage_form}"#,
         id_short = esc(&format!("{id:.16}")),
         name = esc(&meta.name),
         sig = esc(&meta.sig_id),
@@ -614,25 +645,64 @@ attestation log will record the override under that name.</p>"#.into(),
     html_response(200, page(&meta.name, "", &body))
 }
 
-/// `POST /web/stage/<id>/pin` — handles the override form
-/// submission. Reads `LEX_TEA_USER` from the server env (since
-/// v3a is single-user mode), records an `Override` attestation,
-/// activates the stage, redirects back to the stage page so the
-/// reviewer sees the new attestation row.
-pub(crate) fn stage_pin_handler(
+/// Which human-triage action a `POST /web/stage/<id>/<verb>` is
+/// requesting. Drives both the recorded `AttestationKind` and
+/// whether the stage gets activated.
+#[derive(Clone, Copy)]
+pub(crate) enum WebStageDecision {
+    Pin,
+    Defer,
+    Block,
+    Unblock,
+}
+
+impl WebStageDecision {
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Pin => "pin",
+            Self::Defer => "defer",
+            Self::Block => "block",
+            Self::Unblock => "unblock",
+        }
+    }
+    fn tool(self) -> &'static str {
+        match self {
+            Self::Pin => "lex-tea pin",
+            Self::Defer => "lex-tea defer",
+            Self::Block => "lex-tea block",
+            Self::Unblock => "lex-tea unblock",
+        }
+    }
+    fn kind(self, actor: String, reason: String) -> AttestationKind {
+        match self {
+            Self::Pin => AttestationKind::Override {
+                actor, reason, target_attestation_id: None,
+            },
+            Self::Defer => AttestationKind::Defer { actor, reason },
+            Self::Block => AttestationKind::Block { actor, reason },
+            Self::Unblock => AttestationKind::Unblock { actor, reason },
+        }
+    }
+}
+
+/// `POST /web/stage/<id>/{pin,defer,block,unblock}` — handles
+/// the human-triage form submissions. Reads `LEX_TEA_USER` from
+/// the server env, records the appropriate attestation, and
+/// (for `pin` only) activates the stage. Redirects back to the
+/// stage page so a refresh doesn't repost the action.
+pub(crate) fn stage_decision_handler(
     state: &State,
     id: &str,
     body: &str,
+    decision: WebStageDecision,
 ) -> Response<Cursor<Vec<u8>>> {
     let actor = match std::env::var("LEX_TEA_USER") {
         Ok(n) if !n.is_empty() => n,
         _ => return html_response(403, page("forbidden", "",
             r#"<nav class="crumb"><a href="/">activity</a></nav>
 <h1>forbidden</h1>
-<p>Set <code>LEX_TEA_USER</code> on the server to enable overrides.</p>"#)),
+<p>Set <code>LEX_TEA_USER</code> on the server to enable triage actions.</p>"#)),
     };
-    // Decode the form-urlencoded `reason=...` body. Single field
-    // for v3a; multi-field forms get a real parser later.
     let reason = body.split('&')
         .find_map(|pair| pair.strip_prefix("reason="))
         .map(percent_decode)
@@ -641,7 +711,7 @@ pub(crate) fn stage_pin_handler(
         return html_response(400, page("bad request", "",
             r#"<nav class="crumb"><a href="/">activity</a></nav>
 <h1>bad request</h1>
-<p>The override form requires a <code>reason</code>.</p>"#));
+<p>This form requires a <code>reason</code>.</p>"#));
     };
 
     let store = state.store.lock().unwrap();
@@ -650,25 +720,35 @@ pub(crate) fn stage_pin_handler(
             &format!(r#"<nav class="crumb"><a href="/">activity</a></nav><pre>unknown stage `{}`</pre>"#,
                 esc(id))));
     }
-    if let Err(e) = store.activate(id) {
-        return html_response(500, page("error", "",
-            &format!("<pre>activate: {}</pre>", esc(&e.to_string()))));
-    }
     let log = match store.attestation_log() {
         Ok(l) => l,
         Err(e) => return html_response(500, page("error", "",
             &format!("<pre>{}</pre>", esc(&e.to_string())))),
     };
+    if matches!(decision, WebStageDecision::Pin) {
+        // Refuse to pin a blocked stage — same gate as the CLI.
+        // Web users have to record an Unblock first.
+        let existing = log.list_for_stage(&id.to_string()).unwrap_or_default();
+        if lex_vcs::is_stage_blocked(&existing) {
+            return html_response(409, page("blocked", "",
+                &format!(r#"<nav class="crumb"><a href="/">activity</a> /
+<a href="/web/stage/{id}">{id_short}…</a></nav>
+<h1>stage is blocked</h1>
+<p>Record an <strong>unblock</strong> first, then re-try the pin.</p>"#,
+                    id = esc(id),
+                    id_short = esc(&format!("{id:.16}")))));
+        }
+        if let Err(e) = store.activate(id) {
+            return html_response(500, page("error", "",
+                &format!("<pre>activate: {}</pre>", esc(&e.to_string()))));
+        }
+    }
     let attestation = lex_vcs::Attestation::new(
         id.to_string(), None, None,
-        AttestationKind::Override {
-            actor,
-            reason,
-            target_attestation_id: None,
-        },
+        decision.kind(actor, reason),
         AttestationResult::Passed,
         lex_vcs::ProducerDescriptor {
-            tool: "lex-tea pin".into(),
+            tool: decision.tool().into(),
             version: env!("CARGO_PKG_VERSION").into(),
             model: None,
         },
@@ -676,10 +756,9 @@ pub(crate) fn stage_pin_handler(
     );
     if let Err(e) = log.put(&attestation) {
         return html_response(500, page("error", "",
-            &format!("<pre>persist override: {}</pre>", esc(&e.to_string()))));
+            &format!("<pre>persist {}: {}</pre>",
+                decision.verb(), esc(&e.to_string()))));
     }
-    // 303 See Other → redirect the form POST to a GET on the
-    // stage page so a refresh doesn't repost the same override.
     Response::from_data(Vec::new())
         .with_status_code(303)
         .with_header(
