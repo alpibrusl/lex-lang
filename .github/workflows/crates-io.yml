@@ -34,7 +34,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.ref_name || github.event.inputs.tag }}
+          # On tag push, github.ref_name *is* the tag — that's what
+          # we want. On workflow_dispatch, github.ref_name is the
+          # branch the dispatch was started from (truthy), which
+          # would short-circuit the `||` and ignore inputs.tag. Be
+          # explicit so manual dry-runs check out the requested tag.
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
 
       - uses: dtolnay/rust-toolchain@stable
 
