@@ -101,6 +101,7 @@ fn run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "branch" => branch::cmd_branch(fmt, &args[1..]),
         "store-merge" => branch::cmd_store_merge(fmt, &args[1..]),
         "merge" => merge::cmd_merge(fmt, &args[1..]),
+        "policy" => cmd_policy(fmt, &args[1..]),
         "log" => branch::cmd_log(fmt, &args[1..]),
         "op" => op::cmd_op(fmt, &args[1..]),
         "repl" => repl::cmd_repl(&args[1..]),
@@ -183,6 +184,9 @@ fn print_usage() {
     println!("  merge {{start|status|resolve|commit}}");
     println!("                                     stateful merge for agent loops (#134); persists");
     println!("                                     a session under <store>/merges/<merge_id>.json");
+    println!("  policy {{block-producer|unblock-producer|list}}");
+    println!("                                     manage <store>/policy.json — list of producers");
+    println!("                                     whose attestations are tagged `blocked` (#181)");
     println!();
     println!("policy flags (run, replay):");
     println!("  --allow-effects k1,k2,...   permit these effect kinds");
@@ -1486,6 +1490,126 @@ fn attestation_kind_tag(k: &lex_vcs::AttestationKind) -> &'static str {
         Block { .. }      => "block",
         Unblock { .. }    => "unblock",
     }
+}
+
+/// `lex policy {block-producer|unblock-producer|list}` — manage
+/// the local trust policy at `<store>/policy.json` (#181). The
+/// list is consulted at attestation-read time: producers on it
+/// keep their attestations in the log (audit trail intact) but
+/// the activity feed and other consumers tag those rows
+/// `blocked`. Enforcement is local; nothing is mutated in the
+/// attestation log itself.
+fn cmd_policy(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let sub = args.first().ok_or_else(|| anyhow!(
+        "usage: lex policy {{block-producer <name> --reason \"...\" | unblock-producer <name> | list}} [--store DIR]"
+    ))?;
+    let rest = &args[1..];
+    match sub.as_str() {
+        "block-producer"   => cmd_policy_block(fmt, rest),
+        "unblock-producer" => cmd_policy_unblock(fmt, rest),
+        "list"             => cmd_policy_list(fmt, rest),
+        other => bail!("unknown `lex policy` subcommand: {other}"),
+    }
+}
+
+fn cmd_policy_block(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let (root, rest, _, _) = parse_store_flag(args);
+    let mut name: Option<String> = None;
+    let mut reason: Option<String> = None;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--reason" => { reason = rest.get(i + 1).cloned(); i += 2; }
+            other if name.is_none() && !other.starts_with("--") => {
+                name = Some(other.to_string()); i += 1;
+            }
+            other => bail!("unexpected arg `{other}`"),
+        }
+    }
+    let name = name.ok_or_else(|| anyhow!(
+        "usage: lex policy block-producer <name> --reason \"...\""
+    ))?;
+    let reason = reason.ok_or_else(|| anyhow!(
+        "lex policy block-producer: --reason required"
+    ))?;
+    let mut policy = lex_store::policy::load(&root)
+        .with_context(|| format!("reading policy.json at {}", root.display()))?
+        .unwrap_or_default();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let was_already_blocked = policy.is_blocked(&name);
+    policy.block(name.clone(), reason.clone(), now);
+    lex_store::policy::save(&root, &policy)
+        .with_context(|| format!("writing policy.json at {}", root.display()))?;
+
+    let data = serde_json::json!({
+        "tool": &name,
+        "reason": &reason,
+        "blocked_at": now,
+        "newly_blocked": !was_already_blocked,
+    });
+    let name_for_text = name.clone();
+    acli::emit_or_text("policy", data, fmt, move || {
+        if was_already_blocked {
+            println!("(already blocked) {name_for_text}");
+        } else {
+            println!("→ blocked producer `{name_for_text}`");
+        }
+    });
+    Ok(())
+}
+
+fn cmd_policy_unblock(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let (root, rest, _, _) = parse_store_flag(args);
+    let name = rest.iter()
+        .find(|a| !a.starts_with("--"))
+        .ok_or_else(|| anyhow!("usage: lex policy unblock-producer <name>"))?
+        .clone();
+    let mut policy = lex_store::policy::load(&root)
+        .with_context(|| format!("reading policy.json at {}", root.display()))?
+        .unwrap_or_default();
+    let removed = policy.unblock(&name);
+    if removed {
+        lex_store::policy::save(&root, &policy)
+            .with_context(|| format!("writing policy.json at {}", root.display()))?;
+    }
+    let data = serde_json::json!({
+        "tool": &name,
+        "was_blocked": removed,
+    });
+    let name_for_text = name.clone();
+    acli::emit_or_text("policy", data, fmt, move || {
+        if removed {
+            println!("→ unblocked producer `{name_for_text}`");
+        } else {
+            println!("(not blocked) {name_for_text}");
+        }
+    });
+    Ok(())
+}
+
+fn cmd_policy_list(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let (root, _rest, _, _) = parse_store_flag(args);
+    let policy = lex_store::policy::load(&root)
+        .with_context(|| format!("reading policy.json at {}", root.display()))?
+        .unwrap_or_default();
+    let data = serde_json::json!({
+        "blocked_producers": &policy.blocked_producers,
+        "count": policy.blocked_producers.len(),
+    });
+    let entries = policy.blocked_producers.clone();
+    acli::emit_or_text("policy", data, fmt, move || {
+        if entries.is_empty() {
+            println!("(no blocked producers)");
+            return;
+        }
+        for p in &entries {
+            println!("{}\tsince={}\treason={}", p.tool, p.blocked_at, p.reason);
+        }
+    });
+    Ok(())
 }
 
 fn attestation_result_tag(r: &lex_vcs::AttestationResult) -> &'static str {
