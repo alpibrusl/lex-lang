@@ -8,11 +8,21 @@ use crate::types::*;
 use crate::unifier::{UnifyError, Unifier};
 use indexmap::IndexMap;
 use lex_ast as a;
+use std::collections::HashMap;
 
 /// Result of checking a whole program.
 pub struct ProgramTypes {
     pub fn_signatures: IndexMap<String, Scheme>,
     pub type_env: TypeEnv,
+    /// For #168: per-call required-fields map for `module.parse(s)`
+    /// calls whose inferred result type is `Result[Record{...}, _]`.
+    /// Keyed by `&CExpr as *const _ as usize` so callers can do an
+    /// O(1) pointer-equality lookup during a separate AST rewrite
+    /// pass. Empty unless any matching call sites were found.
+    ///
+    /// See [`check_and_rewrite_program`] for the function that
+    /// populates this and applies the rewrite in one step.
+    pub parse_required_fields: HashMap<usize, Vec<String>>,
 }
 
 pub fn check_program(stages: &[a::Stage]) -> Result<ProgramTypes, Vec<TypeError>> {
@@ -32,6 +42,7 @@ pub fn check_program(stages: &[a::Stage]) -> Result<ProgramTypes, Vec<TypeError>
                         eff_vars: collect_eff_vars(&ty),
                         ty,
                     });
+                    tcx.module_aliases.insert(i.alias.clone(), mod_name.to_string());
                 }
             }
         }
@@ -69,10 +80,166 @@ pub fn check_program(stages: &[a::Stage]) -> Result<ProgramTypes, Vec<TypeError>
     }
 
     if errors.is_empty() {
-        Ok(ProgramTypes { fn_signatures: signatures, type_env: tcx.type_env })
+        // #168: walk pending parse-call records and resolve each
+        // call's return type now that all unification has settled.
+        // A call shows up here only if the call site syntactically
+        // looks like `<alias>.parse(s)` for an alias bound to one
+        // of {json, toml, yaml} via the import pass.
+        let mut parse_required_fields = HashMap::new();
+        for (call_ptr, ret_ty) in &tcx.pending_parse_calls {
+            if let Some(fields) = extract_record_fields_from_result(&tcx.u, &tcx.type_env, ret_ty) {
+                parse_required_fields.insert(*call_ptr, fields);
+            }
+        }
+        Ok(ProgramTypes {
+            fn_signatures: signatures,
+            type_env: tcx.type_env,
+            parse_required_fields,
+        })
     } else {
         Err(errors)
     }
+}
+
+/// Type-check `stages` and rewrite every `module.parse(s)` call
+/// where the inferred T is a Record into the equivalent
+/// `module.parse_strict(s, [field_names])` (#168). Existing
+/// [`check_program`] keeps the old immutable signature for tests
+/// and tools that don't want the AST rewritten.
+pub fn check_and_rewrite_program(
+    stages: &mut [a::Stage],
+) -> Result<ProgramTypes, Vec<TypeError>> {
+    // Borrow as immutable for the type-check pass — the side-table
+    // it produces is keyed by `*const CExpr as usize`, and the Vec
+    // backing storage doesn't move between this borrow and the
+    // mutable one below.
+    let pt = check_program(&*stages)?;
+    if !pt.parse_required_fields.is_empty() {
+        rewrite_parse_calls(stages, &pt.parse_required_fields);
+    }
+    Ok(pt)
+}
+
+/// Walk `stages` mutably and, for every `CExpr::Call` whose
+/// pointer (cast to `usize`) is a key in `required`, rewrite it
+/// from `module.parse(s)` into `module.parse_strict(s, [...])`.
+///
+/// Assumptions:
+///
+/// - The `usize` keys come from the same physical AST passed
+///   here. This is true when called from
+///   [`check_and_rewrite_program`].
+/// - Every key corresponds to a call whose callee is
+///   `FieldAccess(_, "parse")`. The type-checker only inserts
+///   keys when this holds, so we panic if the assumption is
+///   violated — that's a checker bug, not a user error.
+fn rewrite_parse_calls(stages: &mut [a::Stage], required: &HashMap<usize, Vec<String>>) {
+    for stage in stages.iter_mut() {
+        if let a::Stage::FnDecl(fd) = stage {
+            rewrite_in_expr(&mut fd.body, required);
+        }
+    }
+}
+
+fn rewrite_in_expr(expr: &mut a::CExpr, required: &HashMap<usize, Vec<String>>) {
+    let ptr = expr as *const a::CExpr as usize;
+    let do_rewrite = required.get(&ptr).cloned();
+    // Recurse into children first; rewriting the call itself
+    // doesn't touch the source-arg, so the order doesn't change
+    // semantics — but processing children up front means a
+    // hypothetical nested parse-of-parse still gets rewritten
+    // correctly.
+    match expr {
+        a::CExpr::Call { callee, args } => {
+            rewrite_in_expr(callee, required);
+            for a in args.iter_mut() { rewrite_in_expr(a, required); }
+        }
+        a::CExpr::Let { value, body, .. } => {
+            rewrite_in_expr(value, required);
+            rewrite_in_expr(body, required);
+        }
+        a::CExpr::Match { scrutinee, arms } => {
+            rewrite_in_expr(scrutinee, required);
+            for arm in arms.iter_mut() { rewrite_in_expr(&mut arm.body, required); }
+        }
+        a::CExpr::Block { statements, result } => {
+            for s in statements.iter_mut() { rewrite_in_expr(s, required); }
+            rewrite_in_expr(result, required);
+        }
+        a::CExpr::Constructor { args, .. } => {
+            for a in args.iter_mut() { rewrite_in_expr(a, required); }
+        }
+        a::CExpr::RecordLit { fields } => {
+            for f in fields.iter_mut() { rewrite_in_expr(&mut f.value, required); }
+        }
+        a::CExpr::TupleLit { items } | a::CExpr::ListLit { items } => {
+            for it in items.iter_mut() { rewrite_in_expr(it, required); }
+        }
+        a::CExpr::FieldAccess { value, .. } => rewrite_in_expr(value, required),
+        a::CExpr::Lambda { body, .. } => rewrite_in_expr(body, required),
+        a::CExpr::BinOp { lhs, rhs, .. } => {
+            rewrite_in_expr(lhs, required);
+            rewrite_in_expr(rhs, required);
+        }
+        a::CExpr::UnaryOp { expr, .. } => rewrite_in_expr(expr, required),
+        a::CExpr::Return { value } => rewrite_in_expr(value, required),
+        a::CExpr::Literal { .. } | a::CExpr::Var { .. } => {}
+    }
+    if let Some(fields) = do_rewrite {
+        match expr {
+            a::CExpr::Call { callee, args } => {
+                if let a::CExpr::FieldAccess { field, .. } = callee.as_mut() {
+                    debug_assert_eq!(field, "parse",
+                        "rewrite_in_expr: only `.parse` calls should be in the table");
+                    *field = "parse_strict".to_string();
+                }
+                args.push(a::CExpr::ListLit {
+                    items: fields.into_iter()
+                        .map(|f| a::CExpr::Literal {
+                            value: a::CLit::Str { value: f },
+                        })
+                        .collect(),
+                });
+            }
+            _ => unreachable!("rewrite table key must point to a Call expression"),
+        }
+    }
+}
+
+/// Given an inferred return type from a `module.parse(s)` call,
+/// resolve through the unifier and any type aliases, then look
+/// for `Result[Record{...}, _]`. Returns the field names if the
+/// shape matches; `None` otherwise.
+fn extract_record_fields_from_result(
+    u: &Unifier,
+    env: &TypeEnv,
+    ty: &Ty,
+) -> Option<Vec<String>> {
+    let resolved = u.resolve(ty);
+    let Ty::Con(ref name, ref args) = resolved else { return None; };
+    if name != "Result" || args.len() != 2 { return None; }
+    let ok_ty = u.resolve(&args[0]);
+    let unfolded = unfold_record_alias_static(env, ok_ty);
+    if let Ty::Record(fields) = unfolded {
+        Some(fields.keys().cloned().collect())
+    } else {
+        None
+    }
+}
+
+/// Standalone version of `Checker::unfold_record_alias` —
+/// resolves a `Ty::Con` whose definition is a record alias to
+/// the underlying record. Module-level helper because we need it
+/// after the `Checker` has been moved/destructured.
+fn unfold_record_alias_static(env: &TypeEnv, ty: Ty) -> Ty {
+    if let Ty::Con(ref n, _) = ty {
+        if let Some(td) = env.types.get(n) {
+            if let TypeDefKind::Alias(inner @ Ty::Record(_)) = &td.kind {
+                return inner.clone();
+            }
+        }
+    }
+    ty
 }
 
 fn collect_vars(t: &Ty) -> Vec<TyVarId> {
@@ -144,6 +311,18 @@ struct Checker {
     u: Unifier,
     type_env: TypeEnv,
     globals: IndexMap<String, Scheme>,
+    /// Imported alias → canonical module name (e.g. `cfg` → `toml`).
+    /// Populated during the import pass; consulted by `check_call`
+    /// to recognise `cfg.parse(...)` as a stdlib parse call.
+    module_aliases: IndexMap<String, String>,
+    /// For #168: every `<alias>.parse(s)` call where alias is in
+    /// `module_aliases` and maps to {json, toml, yaml}, recorded
+    /// here as `(call_pointer_as_usize, return_type_var)`. After
+    /// the whole program type-checks, we walk this and resolve
+    /// each return type through the unifier — at that point any
+    /// `Result[Manifest, _]` constraints from match patterns or
+    /// let-annotations have settled.
+    pending_parse_calls: Vec<(usize, Ty)>,
 }
 
 impl Checker {
@@ -152,6 +331,8 @@ impl Checker {
             u: Unifier::new(),
             type_env: TypeEnv::new_with_builtins(),
             globals: IndexMap::new(),
+            module_aliases: IndexMap::new(),
+            pending_parse_calls: Vec::new(),
         }
     }
 
@@ -167,6 +348,22 @@ impl Checker {
             }
         }
         ty
+    }
+
+    /// Whether `callee` is a `<alias>.parse` field access where
+    /// `<alias>` was imported from one of the stdlib modules whose
+    /// `parse` returns `Result[T, Str]` and whose `parse_strict`
+    /// shape exists for #168 enforcement (json / toml / yaml).
+    fn is_module_parse_call(&self, callee: &a::CExpr) -> bool {
+        if let a::CExpr::FieldAccess { value, field } = callee {
+            if field != "parse" { return false; }
+            if let a::CExpr::Var { name } = value.as_ref() {
+                if let Some(module) = self.module_aliases.get(name) {
+                    return matches!(module.as_str(), "json" | "toml" | "yaml");
+                }
+            }
+        }
+        false
     }
 
     /// Unify two types, asymmetrically coercing an anonymous record
@@ -280,7 +477,7 @@ impl Checker {
                 Err(TypeError::UnknownIdentifier { at_node: node_id.into(), name: name.clone() })
             }
             a::CExpr::Constructor { name, args } => self.check_constructor(name, args, node_id, locals, effs),
-            a::CExpr::Call { callee, args } => self.check_call(callee, args, node_id, locals, effs),
+            a::CExpr::Call { callee, args } => self.check_call(e, callee, args, node_id, locals, effs),
             a::CExpr::Let { name, ty, value, body } => {
                 let v_ty = self.check_expr(value, node_id, locals, effs)?;
                 if let Some(declared) = ty {
@@ -509,12 +706,25 @@ impl Checker {
 
     fn check_call(
         &mut self,
+        call_expr: &a::CExpr,
         callee: &a::CExpr,
         args: &[a::CExpr],
         node_id: &str,
         locals: &mut IndexMap<String, Ty>,
         effs: &mut EffectSet,
     ) -> Result<Ty, TypeError> {
+        // #168: snapshot the call's address before the recursive
+        // descent so we can later rewrite this exact node. Pointer
+        // identity is only meaningful while the AST stays put,
+        // which it does until check_program returns and the AST
+        // is handed back to the caller. `is_module_parse_call`
+        // recognises `<alias>.parse` where alias was bound to one
+        // of {json, toml, yaml} during the import pass.
+        let parse_call_ptr = if self.is_module_parse_call(callee) {
+            Some(call_expr as *const a::CExpr as usize)
+        } else {
+            None
+        };
         let callee_ty = self.check_expr(callee, node_id, locals, effs)?;
         let resolved = self.u.resolve(&callee_ty);
         match resolved {
@@ -538,6 +748,16 @@ impl Checker {
                 // *post-binding* set when propagating to the caller.
                 let resolved_effects = self.u.resolve_effects(&effects);
                 effs.extend(&resolved_effects);
+                // #168: snapshot the post-arg-unification return type
+                // for stdlib parse calls. Resolution to the eventual
+                // `Result[Record{...}, _]` shape happens at the end
+                // of `check_program` once the whole program's
+                // unification has settled — match-pattern annotations
+                // and let-type-annotations may bind T after this
+                // point.
+                if let Some(ptr) = parse_call_ptr {
+                    self.pending_parse_calls.push((ptr, (*ret).clone()));
+                }
                 Ok(*ret)
             }
             Ty::Var(_) => {

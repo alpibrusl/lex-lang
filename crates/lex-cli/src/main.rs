@@ -363,8 +363,10 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             &format!("would call `{func}` in {path}"), actions);
     }
     let prog = read_program(path)?;
-    let stages = canonicalize_program(&prog);
-    if let Err(errs) = lex_types::check_program(&stages) {
+    // #168: rewrite stdlib parse calls during type-check so the
+    // runtime sees the strict (validated) shape.
+    let mut stages = canonicalize_program(&prog);
+    if let Err(errs) = lex_types::check_and_rewrite_program(&mut stages) {
         let arr: Vec<serde_json::Value> = errs.iter()
             .map(|e| serde_json::to_value(e).unwrap()).collect();
         let data = serde_json::json!({ "phase": "type-check", "errors": arr });
@@ -917,8 +919,13 @@ fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "usage: lex publish [--store DIR] [--branch NAME] [--activate] <file>"))?;
 
     let prog = read_program(path)?;
-    let stages = canonicalize_program(&prog);
-    if let Err(errs) = lex_types::check_program(&stages) {
+    // #168: type-check *and* rewrite stdlib parse calls so a
+    // typed `toml.parse[T]` validates required fields before
+    // returning Ok. The mutation lands in the canonical AST so
+    // every downstream consumer (bytecode compile, store
+    // publish) sees the strict shape.
+    let mut stages = canonicalize_program(&prog);
+    if let Err(errs) = lex_types::check_and_rewrite_program(&mut stages) {
         let arr: Vec<serde_json::Value> = errs.iter()
             .map(|e| serde_json::to_value(e).unwrap()).collect();
         let data = serde_json::json!({ "phase": "type-check", "errors": arr });
