@@ -225,8 +225,11 @@ pub(crate) fn publish_handler(state: &State, body: &str) -> Response<std::io::Cu
     let prog = match load_program_from_str(&req.source) {
         Ok(p) => p, Err(e) => return error_response(400, format!("syntax error: {e}")),
     };
-    let stages = canonicalize_program(&prog);
-    if let Err(errs) = lex_types::check_program(&stages) {
+    // #168: rewrite stdlib parse calls to parse_strict so the
+    // bytecode emitted from these stages enforces required-field
+    // checks at runtime.
+    let mut stages = canonicalize_program(&prog);
+    if let Err(errs) = lex_types::check_and_rewrite_program(&mut stages) {
         return error_with_detail(422, "type errors", serde_json::to_value(&errs).unwrap());
     }
 
