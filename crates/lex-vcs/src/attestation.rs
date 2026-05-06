@@ -142,6 +142,60 @@ pub enum AttestationKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target_attestation_id: Option<AttestationId>,
     },
+    /// `lex stage defer` (lex-tea v3b, #172). Records that a human
+    /// looked at the stage and chose to revisit it later. No state
+    /// change — purely an audit/triage signal so dashboards and AI
+    /// reviewers can see "this isn't abandoned, it's snoozed."
+    Defer {
+        actor: String,
+        reason: String,
+    },
+    /// `lex stage block` (lex-tea v3b, #172). Records that a human
+    /// has decided this stage should not activate. `lex stage pin`
+    /// and any other activation path consults the attestation log
+    /// and refuses while a Block is the latest decision for the
+    /// stage. Reversed by [`AttestationKind::Unblock`].
+    Block {
+        actor: String,
+        reason: String,
+    },
+    /// `lex stage unblock` (lex-tea v3b, #172). Counterpart to
+    /// [`AttestationKind::Block`]. The attestation log is append-
+    /// only, so we encode "block lifted" as a separate, later fact
+    /// rather than mutating the original block.
+    Unblock {
+        actor: String,
+        reason: String,
+    },
+}
+
+/// Walk a stage's attestations and return whether the latest
+/// Block/Unblock decision is currently a Block. Used by
+/// activation paths (e.g. `lex stage pin`) to refuse when a
+/// human has signalled the stage shouldn't ship.
+///
+/// "Latest" is defined by `timestamp`, which matches what users
+/// see in `lex stage <id> --attestations`. Ties go to Unblock so
+/// retrying an unblock right after a block (same wall-clock
+/// second) doesn't leave the stage stuck.
+pub fn is_stage_blocked(attestations: &[Attestation]) -> bool {
+    let mut latest: Option<&Attestation> = None;
+    for a in attestations {
+        if !matches!(a.kind, AttestationKind::Block { .. } | AttestationKind::Unblock { .. }) {
+            continue;
+        }
+        match latest {
+            None => latest = Some(a),
+            Some(prev) if a.timestamp > prev.timestamp => latest = Some(a),
+            Some(prev) if a.timestamp == prev.timestamp
+                && matches!(a.kind, AttestationKind::Unblock { .. }) =>
+            {
+                latest = Some(a);
+            }
+            _ => {}
+        }
+    }
+    matches!(latest.map(|a| &a.kind), Some(AttestationKind::Block { .. }))
 }
 
 /// Verification method for [`AttestationKind::Spec`]. Mirrors the
@@ -848,5 +902,104 @@ mod tests {
 
         let listing = log.list_for_stage(&"stage-abc".to_string()).unwrap();
         assert_eq!(listing.len(), 2, "both passing and failing evidence must persist");
+    }
+
+    fn human_decision(kind: AttestationKind, ts: u64) -> Attestation {
+        Attestation::with_timestamp(
+            "stage-abc",
+            None, None,
+            kind,
+            AttestationResult::Passed,
+            ProducerDescriptor {
+                tool: "lex stage".into(),
+                version: "0.1.0".into(),
+                model: None,
+            },
+            None,
+            ts,
+        )
+    }
+
+    #[test]
+    fn is_stage_blocked_empty_log_is_false() {
+        assert!(!is_stage_blocked(&[]));
+    }
+
+    #[test]
+    fn is_stage_blocked_only_unrelated_attestations() {
+        // TypeCheck/Override attestations don't gate activation —
+        // only Block/Unblock do.
+        let attestations = vec![
+            typecheck_passed(),
+            human_decision(
+                AttestationKind::Override {
+                    actor: "alice".into(),
+                    reason: "ship".into(),
+                    target_attestation_id: None,
+                },
+                500,
+            ),
+        ];
+        assert!(!is_stage_blocked(&attestations));
+    }
+
+    #[test]
+    fn is_stage_blocked_block_alone_blocks() {
+        let attestations = vec![human_decision(
+            AttestationKind::Block { actor: "alice".into(), reason: "x".into() },
+            500,
+        )];
+        assert!(is_stage_blocked(&attestations));
+    }
+
+    #[test]
+    fn is_stage_blocked_later_unblock_clears_block() {
+        let attestations = vec![
+            human_decision(
+                AttestationKind::Block { actor: "alice".into(), reason: "x".into() },
+                500,
+            ),
+            human_decision(
+                AttestationKind::Unblock { actor: "alice".into(), reason: "ok".into() },
+                600,
+            ),
+        ];
+        assert!(!is_stage_blocked(&attestations));
+    }
+
+    #[test]
+    fn is_stage_blocked_later_block_re_blocks() {
+        let attestations = vec![
+            human_decision(
+                AttestationKind::Block { actor: "a".into(), reason: "1".into() },
+                500,
+            ),
+            human_decision(
+                AttestationKind::Unblock { actor: "a".into(), reason: "2".into() },
+                600,
+            ),
+            human_decision(
+                AttestationKind::Block { actor: "a".into(), reason: "3".into() },
+                700,
+            ),
+        ];
+        assert!(is_stage_blocked(&attestations));
+    }
+
+    #[test]
+    fn is_stage_blocked_unblock_wins_at_same_timestamp() {
+        // Tie-break favours Unblock so a hasty re-attempt at the
+        // same wall-clock second can't strand the stage.
+        let attestations = vec![
+            human_decision(
+                AttestationKind::Block { actor: "a".into(), reason: "1".into() },
+                500,
+            ),
+            human_decision(
+                AttestationKind::Unblock { actor: "a".into(), reason: "2".into() },
+                500,
+            ),
+        ];
+        assert!(!is_stage_blocked(&attestations));
     }
 }

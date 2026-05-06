@@ -1050,11 +1050,21 @@ fn cmd_store(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 /// `GET /v1/stage/<id>` and `GET /v1/stage/<id>/attestations`.
 fn cmd_stage(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let (root, rest, _, _) = parse_store_flag(args);
-    // `lex stage pin <id> ...` — human override (#172). Detect it
-    // as a leading positional so the existing `lex stage <id>` and
-    // `lex stage <id> --attestations` shapes keep working unchanged.
-    if rest.first().map(String::as_str) == Some("pin") {
-        return cmd_stage_pin(fmt, &root, &rest[1..]);
+    // `lex stage pin|defer|block|unblock <id> ...` — human triage
+    // actions (#172). Detect them as a leading positional so the
+    // existing `lex stage <id>` and `lex stage <id> --attestations`
+    // shapes keep working unchanged.
+    if let Some(action) = rest.first().map(String::as_str) {
+        match action {
+            "pin"     => return cmd_stage_pin(fmt, &root, &rest[1..]),
+            "defer"   => return cmd_stage_decision(
+                fmt, &root, &rest[1..], StageDecision::Defer),
+            "block"   => return cmd_stage_decision(
+                fmt, &root, &rest[1..], StageDecision::Block),
+            "unblock" => return cmd_stage_decision(
+                fmt, &root, &rest[1..], StageDecision::Unblock),
+            _ => {}
+        }
     }
     let attestations_mode = rest.iter().any(|a| a == "--attestations");
     let id = rest
@@ -1100,6 +1110,15 @@ fn cmd_stage(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                     }
                     lex_vcs::AttestationKind::Override { actor, .. } => {
                         format!("Override({actor})")
+                    }
+                    lex_vcs::AttestationKind::Defer { actor, .. } => {
+                        format!("Defer({actor})")
+                    }
+                    lex_vcs::AttestationKind::Block { actor, .. } => {
+                        format!("Block({actor})")
+                    }
+                    lex_vcs::AttestationKind::Unblock { actor, .. } => {
+                        format!("Unblock({actor})")
                     }
                 };
                 let result = match &a.result {
@@ -1177,6 +1196,16 @@ fn cmd_stage_pin(
     let _ = store.get_metadata(&id)
         .with_context(|| format!("unknown stage `{id}`"))?;
 
+    // Refuse to pin a blocked stage. The block is only meaningful
+    // if it actually stops the activation it's supposed to prevent.
+    let log = store.attestation_log()?;
+    let existing = log.list_for_stage(&id)?;
+    if lex_vcs::is_stage_blocked(&existing) {
+        bail!(
+            "lex stage pin: stage `{id}` is blocked — run `lex stage unblock {id} --reason \"...\"` first"
+        );
+    }
+
     // Activate first (the actual override action), then record the
     // audit. Order matters: if activate fails, no audit is written;
     // if audit fails after a successful activate, the user retries
@@ -1216,6 +1245,118 @@ fn cmd_stage_pin(
     let actor_for_text = actor.clone();
     acli::emit_or_text("stage", data, fmt, move || {
         println!("→ pinned `{id_for_text:.16}…` (actor: {actor_for_text})");
+    });
+    Ok(())
+}
+
+/// Triage decisions a human can record on a stage. Mirrors the
+/// `Defer`/`Block`/`Unblock` `AttestationKind` variants.
+#[derive(Clone, Copy)]
+enum StageDecision {
+    Defer,
+    Block,
+    Unblock,
+}
+
+impl StageDecision {
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Defer => "defer",
+            Self::Block => "block",
+            Self::Unblock => "unblock",
+        }
+    }
+
+    fn past(self) -> &'static str {
+        match self {
+            Self::Defer => "deferred",
+            Self::Block => "blocked",
+            Self::Unblock => "unblocked",
+        }
+    }
+}
+
+/// `lex stage <defer|block|unblock> <id> --reason "..." [--actor NAME]`
+/// — human triage actions (#172, lex-tea v3b).
+///
+/// Defer/Block/Unblock all record an attestation against the stage
+/// without changing its status. Block additionally makes future
+/// `lex stage pin` calls refuse until an `unblock` is recorded.
+/// The append-only attestation log makes the full triage history
+/// queryable via `lex attest filter --kind block` etc.
+fn cmd_stage_decision(
+    fmt: &OutputFormat,
+    root: &std::path::Path,
+    args: &[String],
+    decision: StageDecision,
+) -> Result<()> {
+    let mut id: Option<String> = None;
+    let mut reason: Option<String> = None;
+    let mut actor: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--reason" => { reason = args.get(i + 1).cloned(); i += 2; }
+            "--actor"  => { actor  = args.get(i + 1).cloned(); i += 2; }
+            other if id.is_none() => { id = Some(other.to_string()); i += 1; }
+            other => bail!("unexpected arg `{other}`"),
+        }
+    }
+    let verb = decision.verb();
+    let id = id.ok_or_else(|| anyhow!(
+        "usage: lex stage {verb} <stage_id> --reason \"...\" [--actor NAME]"
+    ))?;
+    let reason = reason.ok_or_else(|| anyhow!(
+        "lex stage {verb}: --reason required (triage decisions need a paper trail)"
+    ))?;
+    let actor = actor
+        .or_else(|| std::env::var("LEX_TEA_USER").ok())
+        .ok_or_else(|| anyhow!(
+            "lex stage {verb}: actor unknown — pass --actor NAME or set LEX_TEA_USER"
+        ))?;
+
+    let store = Store::open(root)
+        .with_context(|| format!("opening store at {}", root.display()))?;
+    let _ = store.get_metadata(&id)
+        .with_context(|| format!("unknown stage `{id}`"))?;
+
+    let kind = match decision {
+        StageDecision::Defer => lex_vcs::AttestationKind::Defer {
+            actor: actor.clone(), reason: reason.clone(),
+        },
+        StageDecision::Block => lex_vcs::AttestationKind::Block {
+            actor: actor.clone(), reason: reason.clone(),
+        },
+        StageDecision::Unblock => lex_vcs::AttestationKind::Unblock {
+            actor: actor.clone(), reason: reason.clone(),
+        },
+    };
+    let producer = lex_vcs::ProducerDescriptor {
+        tool: format!("lex stage {verb}"),
+        version: env!("CARGO_PKG_VERSION").into(),
+        model: None,
+    };
+    let attestation = lex_vcs::Attestation::new(
+        id.clone(), None, None,
+        kind,
+        lex_vcs::AttestationResult::Passed,
+        producer, None,
+    );
+    let log = store.attestation_log()?;
+    log.put(&attestation)?;
+
+    let data = serde_json::json!({
+        "stage_id": &id,
+        "decision": verb,
+        "actor": &actor,
+        "reason": &reason,
+        "attestation_id": &attestation.attestation_id,
+    });
+    let id_for_text = id.clone();
+    let actor_for_text = actor.clone();
+    let past = decision.past();
+    acli::emit_or_text("stage", data, fmt, move || {
+        println!("→ {past} `{id_for_text:.16}…` (actor: {actor_for_text})");
     });
     Ok(())
 }
@@ -1320,6 +1461,9 @@ fn attestation_kind_tag(k: &lex_vcs::AttestationKind) -> &'static str {
         EffectAudit       => "effect_audit",
         SandboxRun { .. } => "sandbox_run",
         Override { .. }   => "override",
+        Defer { .. }      => "defer",
+        Block { .. }      => "block",
+        Unblock { .. }    => "unblock",
     }
 }
 
