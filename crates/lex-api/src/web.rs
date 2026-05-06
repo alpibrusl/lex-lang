@@ -55,6 +55,7 @@ th { color: #666; font-weight: 500; background: #fafafa; }
 .tag.fail { background: #fdd; color: #800; }
 .tag.inc { background: #ffd; color: #850; }
 .tag.kind { background: #eef0f3; color: #445; }
+.tag.blocked { background: #444; color: #fff; }
 .empty { color: #aaa; font-style: italic; padding: 1rem; }
 .summary { display: flex; gap: 1.5rem; margin: 1rem 0; }
 .stat { padding: .5rem 1rem; background: #fafafa; border-radius: 4px; min-width: 110px; }
@@ -131,6 +132,12 @@ pub(crate) fn activity_handler(state: &State) -> Response<Cursor<Vec<u8>>> {
     };
     let mut atts = log.list_all().unwrap_or_default();
     atts.sort_by_key(|a| std::cmp::Reverse(a.timestamp));
+    // #181: producers on the local policy block list keep their
+    // attestations in the log (audit trail intact) but every row
+    // gets a `blocked` tag in the feed so reviewers can filter
+    // them out by eye.
+    let policy = lex_store::policy::load(&state.root)
+        .ok().flatten().unwrap_or_default();
 
     // Headline counters: pass / fail / inconclusive in the last 24h.
     // 24h from "now" via wall clock; small enough to be glanceable,
@@ -160,10 +167,15 @@ pub(crate) fn activity_handler(state: &State) -> Response<Cursor<Vec<u8>>> {
                 | AttestationResult::Inconclusive { detail } => esc(detail),
                 AttestationResult::Passed => esc(&a.produced_by.tool),
             };
+            let blocked_tag = if policy.is_blocked(&a.produced_by.tool) {
+                r#" <span class="tag blocked" title="producer is on the policy block list">blocked</span>"#
+            } else {
+                ""
+            };
             rows.push_str(&format!(
                 r#"<tr>
                   <td class="muted mono">{ts}</td>
-                  <td><span class="tag kind">{kind}</span></td>
+                  <td><span class="tag kind">{kind}</span>{blocked_tag}</td>
                   <td><span class="tag {css}">{result}</span> <span class="muted">{summary}</span></td>
                   <td class="mono"><a href="/web/stage/{stage}">{stage:.16}…</a></td>
                 </tr>"#,
