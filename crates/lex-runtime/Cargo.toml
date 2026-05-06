@@ -35,10 +35,10 @@ toml = "0.9"
 serde_yaml = "0.9"
 csv = "1"
 rusqlite = { version = "0.36", features = ["bundled"] }
-lex-bytecode = { path = "../lex-bytecode", version = "0.2.1" }
+lex-bytecode = { path = "../lex-bytecode", version = "0.2.2" }
 
 [dev-dependencies]
-lex-syntax = { path = "../lex-syntax", version = "0.2.1" }
-lex-ast = { path = "../lex-ast", version = "0.2.1" }
-lex-types = { path = "../lex-types", version = "0.2.1" }
+lex-syntax = { path = "../lex-syntax", version = "0.2.2" }
+lex-ast = { path = "../lex-ast", version = "0.2.2" }
+lex-types = { path = "../lex-types", version = "0.2.2" }
 tempfile = "3"

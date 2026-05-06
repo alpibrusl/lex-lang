@@ -131,3 +131,95 @@ impl Drop for McpClient {
         let _ = Duration::from_millis(0);
     }
 }
+
+// ---- LRU connection cache (#197) --------------------------------
+
+/// Bounded cache of `McpClient` instances keyed by the
+/// command-line string. Keeps a Vec of `(key, client)` pairs
+/// in usage order — most-recently-used at the back. On cache
+/// miss past `cap`, the front (oldest) entry is dropped.
+///
+/// Why a Vec rather than a `HashMap` + linked list: cap is
+/// small (16 by default) so linear scan is cheaper than the
+/// pointer chase, and a Vec lets us own the Clients directly
+/// instead of through `RefCell`/`Arc`.
+///
+/// Subprocess death is detected lazily: when `call_tool` fails
+/// the offending entry is dropped. Next call to the same
+/// server respawns. A handler that sits idle long enough for
+/// upstream MCP servers to be killed by ops will see one
+/// `Err` per server before recovering.
+pub struct McpClientCache {
+    entries: Vec<(String, McpClient)>,
+    cap: usize,
+}
+
+impl McpClientCache {
+    pub fn with_capacity(cap: usize) -> Self {
+        Self { entries: Vec::with_capacity(cap), cap }
+    }
+
+    /// Send a `tools/call` to the named server, spawning the
+    /// subprocess on cache miss and reusing it on hit. Returns
+    /// the server's `result` JSON or an error message; on error,
+    /// the offending client is dropped so the next call respawns.
+    pub fn call(
+        &mut self,
+        server: &str,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        // Hit: move the entry to the back (mark MRU) and call.
+        if let Some(idx) = self.entries.iter().position(|(k, _)| k == server) {
+            let (key, mut client) = self.entries.remove(idx);
+            match client.call_tool(tool, args) {
+                Ok(v) => {
+                    self.entries.push((key, client));
+                    Ok(v)
+                }
+                Err(e) => {
+                    // Dropping `client` reaps the subprocess.
+                    Err(e)
+                }
+            }
+        } else {
+            // Miss: spawn, evict if at capacity, push.
+            let mut client = McpClient::spawn(server)?;
+            let result = client.call_tool(tool, args);
+            if result.is_ok() {
+                if self.entries.len() >= self.cap && !self.entries.is_empty() {
+                    self.entries.remove(0);
+                }
+                self.entries.push((server.to_string(), client));
+            }
+            result
+        }
+    }
+
+    /// Number of cached subprocesses. Useful for tests and
+    /// observability; not on the hot path.
+    pub fn len(&self) -> usize { self.entries.len() }
+
+    pub fn is_empty(&self) -> bool { self.entries.is_empty() }
+}
+
+impl Default for McpClientCache {
+    fn default() -> Self { Self::with_capacity(16) }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    /// Smoke test that the cache structure works without
+    /// actually spawning subprocesses (which would require a
+    /// real MCP server). Tests against the real `lex serve --mcp`
+    /// fixture live in `tests/std_agent_mcp_client.rs`.
+    #[test]
+    fn empty_cache_starts_at_zero_with_configured_cap() {
+        let c = McpClientCache::with_capacity(4);
+        assert_eq!(c.len(), 0);
+        assert!(c.is_empty());
+        assert_eq!(c.cap, 4);
+    }
+}
