@@ -17,6 +17,7 @@ pub mod builtins;
 pub mod policy;
 pub mod handler;
 pub mod ws;
+pub mod mcp_client;
 
 pub use builtins::{is_pure_module, try_pure_builtin};
 pub use handler::{CapturedSink, DefaultHandler, IoSink, StdoutSink};
