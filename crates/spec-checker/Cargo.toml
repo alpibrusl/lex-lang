@@ -1,8 +1,14 @@
 [package]
 name = "spec-checker"
+description = "Property-based and runtime-gate checker for Lex specs."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 serde.workspace = true
@@ -10,11 +16,11 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 indexmap.workspace = true
-lex-syntax = { path = "../lex-syntax" }
-lex-ast = { path = "../lex-ast" }
-lex-types = { path = "../lex-types" }
-lex-bytecode = { path = "../lex-bytecode" }
-lex-runtime = { path = "../lex-runtime" }
+lex-syntax = { path = "../lex-syntax", version = "0.2.0" }
+lex-ast = { path = "../lex-ast", version = "0.2.0" }
+lex-types = { path = "../lex-types", version = "0.2.0" }
+lex-bytecode = { path = "../lex-bytecode", version = "0.2.0" }
+lex-runtime = { path = "../lex-runtime", version = "0.2.0" }
 
 [dev-dependencies]
-lex-syntax = { path = "../lex-syntax" }
+lex-syntax = { path = "../lex-syntax", version = "0.2.0" }

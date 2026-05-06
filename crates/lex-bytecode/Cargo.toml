@@ -1,16 +1,22 @@
 [package]
 name = "lex-bytecode"
+description = "Bytecode compiler + VM for Lex."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 indexmap.workspace = true
-lex-ast = { path = "../lex-ast" }
-lex-types = { path = "../lex-types" }
+lex-ast = { path = "../lex-ast", version = "0.2.0" }
+lex-types = { path = "../lex-types", version = "0.2.0" }
 
 [dev-dependencies]
-lex-syntax = { path = "../lex-syntax" }
+lex-syntax = { path = "../lex-syntax", version = "0.2.0" }
