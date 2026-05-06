@@ -62,10 +62,22 @@ jobs:
             DRY_FLAG="--dry-run"
             echo "DRY RUN — no crates will actually be published."
           fi
+          # Derive the version to publish from the workspace
+          # Cargo.toml so the workflow stays in sync with whatever
+          # tag was pushed.
+          WANT_VERSION=$(awk '/^\[workspace\.package\]/{f=1;next} /^\[/{f=0} f && /^version = /{gsub(/"/,"",$3); print $3; exit}' Cargo.toml)
+          echo "Target version: $WANT_VERSION"
           # `cargo publish` since 1.71 waits for the new version
           # to appear in the registry index before exiting, so
           # we don't need explicit sleeps between crates.
           # `--locked` enforces Cargo.lock consistency.
+          #
+          # Idempotency: before each publish, ask crates.io if
+          # the version is already there. If yes, skip — this
+          # turns a partial-success run (e.g. timeout halfway
+          # through) into a fixable retry rather than a wedge
+          # where re-running fails on every crate that already
+          # landed.
           for crate in \
             lex-syntax \
             lex-ast \
@@ -79,6 +91,13 @@ jobs:
             spec-checker
           do
             echo "::group::publish $crate"
-            cargo publish $DRY_FLAG --locked -p "$crate"
+            status=$(curl -fsS -o /dev/null -w "%{http_code}" \
+              "https://crates.io/api/v1/crates/$crate/$WANT_VERSION" \
+              -H "User-Agent: lex-lang-crates-io-workflow" || echo "000")
+            if [ "$status" = "200" ] && [ -z "$DRY_FLAG" ]; then
+              echo "::notice::$crate $WANT_VERSION already on crates.io — skipping"
+            else
+              cargo publish $DRY_FLAG --locked -p "$crate"
+            fi
             echo "::endgroup::"
           done
