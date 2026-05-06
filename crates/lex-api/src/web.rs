@@ -732,6 +732,9 @@ fn kind_short(k: &AttestationKind) -> String {
             format!("SandboxRun([{}])", names.join(","))
         }
         AttestationKind::Override { actor, .. } => format!("Override({actor})"),
+        AttestationKind::Defer { actor, .. } => format!("Defer({actor})"),
+        AttestationKind::Block { actor, .. } => format!("Block({actor})"),
+        AttestationKind::Unblock { actor, .. } => format!("Unblock({actor})"),
     }
 }
 
