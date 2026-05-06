@@ -105,23 +105,26 @@ fn orchestrate(q :: Str, peer :: Str)
 
 #[test]
 fn agent_calls_succeed_under_permissive_policy() {
-    // Permissive policy includes all four new effects, so the
-    // stub handler returns `Ok(<llm_local stub>)` etc. and the
-    // function returns the last call's result.
+    // Permissive policy includes all four new effects. The three
+    // still-stubbed effects (`llm_local`, `llm_cloud`, `a2a`)
+    // return `Ok("<{kind} stub>")`. `call_mcp` is wired to a
+    // real MCP client (#185) and is exercised separately in
+    // `std_agent_mcp_client.rs`; the function below ends with
+    // `send_a2a` so it returns the stub `Ok` regardless of
+    // whether the test environment has an MCP server available.
     let src = r#"
 import "std.agent" as agent
 
-fn run() -> [llm_local, llm_cloud, a2a, mcp] Result[Str, Str] {
+fn run() -> [llm_local, llm_cloud, a2a] Result[Str, Str] {
   let r1 := agent.local_complete("hi")
   let r2 := agent.cloud_complete("hi")
-  let r3 := agent.send_a2a("peer-1", "hi")
-  agent.call_mcp("optimizer", "schedule", "{}")
+  agent.send_a2a("peer-1", "hi")
 }
 "#;
     let v = run_with_policy(src, "run", vec![], Policy::permissive());
     match &v {
         Value::Variant { name, args } if name == "Ok" => match &args[0] {
-            Value::Str(s) => assert!(s.contains("mcp"),
+            Value::Str(s) => assert!(s.contains("a2a"),
                 "stub response should mention the effect kind: {s}"),
             other => panic!("expected Str, got {other:?}"),
         },
