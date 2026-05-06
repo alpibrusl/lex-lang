@@ -98,10 +98,20 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             // TypeEnv::new_with_builtins; refer to it nominally so call
             // sites unify against the user's `:: Matrix` annotations.
             let mat = || Ty::Con("Matrix".into(), Vec::new());
-            // Scalar floats.
-            for name in &["exp", "log", "sqrt", "abs"] {
+            // Scalar floats — single-arg `Float -> Float`.
+            for name in &[
+                "exp", "log", "log2", "log10", "sqrt", "abs",
+                "sin", "cos", "tan", "asin", "acos", "atan",
+                "floor", "ceil", "round", "trunc",
+            ] {
                 fields.insert((*name).into(), Ty::function(
                     vec![Ty::float()], EffectSet::empty(), Ty::float(),
+                ));
+            }
+            // Two-arg `Float, Float -> Float`.
+            for name in &["pow", "atan2", "min", "max"] {
+                fields.insert((*name).into(), Ty::function(
+                    vec![Ty::float(), Ty::float()], EffectSet::empty(), Ty::float(),
                 ));
             }
             // Constructors.

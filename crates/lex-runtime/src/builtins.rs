@@ -494,10 +494,42 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         // type alias `Matrix = { rows :: Int, cols :: Int, data ::
         // List[Float] }`; field access is unsupported, so all
         // introspection happens through these helpers.
-        ("math", "exp")  => Ok(Value::Float(expect_float(args.first())?.exp())),
-        ("math", "log")  => Ok(Value::Float(expect_float(args.first())?.ln())),
-        ("math", "sqrt") => Ok(Value::Float(expect_float(args.first())?.sqrt())),
-        ("math", "abs")  => Ok(Value::Float(expect_float(args.first())?.abs())),
+        ("math", "exp")   => Ok(Value::Float(expect_float(args.first())?.exp())),
+        ("math", "log")   => Ok(Value::Float(expect_float(args.first())?.ln())),
+        ("math", "log2")  => Ok(Value::Float(expect_float(args.first())?.log2())),
+        ("math", "log10") => Ok(Value::Float(expect_float(args.first())?.log10())),
+        ("math", "sqrt")  => Ok(Value::Float(expect_float(args.first())?.sqrt())),
+        ("math", "abs")   => Ok(Value::Float(expect_float(args.first())?.abs())),
+        ("math", "sin")   => Ok(Value::Float(expect_float(args.first())?.sin())),
+        ("math", "cos")   => Ok(Value::Float(expect_float(args.first())?.cos())),
+        ("math", "tan")   => Ok(Value::Float(expect_float(args.first())?.tan())),
+        ("math", "asin")  => Ok(Value::Float(expect_float(args.first())?.asin())),
+        ("math", "acos")  => Ok(Value::Float(expect_float(args.first())?.acos())),
+        ("math", "atan")  => Ok(Value::Float(expect_float(args.first())?.atan())),
+        ("math", "floor") => Ok(Value::Float(expect_float(args.first())?.floor())),
+        ("math", "ceil")  => Ok(Value::Float(expect_float(args.first())?.ceil())),
+        ("math", "round") => Ok(Value::Float(expect_float(args.first())?.round())),
+        ("math", "trunc") => Ok(Value::Float(expect_float(args.first())?.trunc())),
+        ("math", "pow") => {
+            let a = expect_float(args.first())?;
+            let b = expect_float(args.get(1))?;
+            Ok(Value::Float(a.powf(b)))
+        }
+        ("math", "atan2") => {
+            let y = expect_float(args.first())?;
+            let x = expect_float(args.get(1))?;
+            Ok(Value::Float(y.atan2(x)))
+        }
+        ("math", "min") => {
+            let a = expect_float(args.first())?;
+            let b = expect_float(args.get(1))?;
+            Ok(Value::Float(a.min(b)))
+        }
+        ("math", "max") => {
+            let a = expect_float(args.first())?;
+            let b = expect_float(args.get(1))?;
+            Ok(Value::Float(a.max(b)))
+        }
         ("math", "zeros") => {
             let r = expect_int(args.first())?;
             let c = expect_int(args.get(1))?;
