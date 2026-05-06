@@ -227,3 +227,83 @@ fn merge_status_unknown_id_errors() {
         .output().unwrap();
     assert!(!out.status.success());
 }
+
+#[test]
+fn merge_defer_resolves_one_conflict_and_blocks_commit() {
+    // `lex merge defer <merge_id> <conflict_id>` is the per-
+    // conflict shortcut that #181 calls out: same effect as
+    // putting `Resolution::Defer` in a resolutions file but no
+    // tempfile dance for the common "park this for review" path.
+    let store = tempdir().unwrap();
+    modify_modify_setup(store.path());
+    let v = merge_start(store.path(), "feature", lex_store::DEFAULT_BRANCH);
+    let merge_id = v.pointer("/data/merge_id").unwrap().as_str().unwrap().to_string();
+    let conflict_id = v.pointer("/data/conflicts/0/conflict_id").unwrap().as_str().unwrap().to_string();
+
+    let out = Command::new(lex_bin())
+        .args([
+            "--output", "json",
+            "merge", "defer",
+            "--store", store.path().to_str().unwrap(),
+            &merge_id,
+            &conflict_id,
+        ])
+        .output().unwrap();
+    assert!(out.status.success(), "defer: {}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let verdict = v.pointer("/data/verdicts/0").unwrap();
+    assert_eq!(verdict["accepted"], true, "defer should be accepted: {v}");
+    assert_eq!(verdict["conflict_id"], conflict_id);
+
+    // Defer leaves the conflict in remaining_conflicts so commit
+    // refuses — that's the whole point: punt-to-human, not auto-
+    // resolve.
+    let out = Command::new(lex_bin())
+        .args([
+            "merge", "commit",
+            "--store", store.path().to_str().unwrap(),
+            &merge_id,
+        ])
+        .output().unwrap();
+    assert!(!out.status.success(), "commit must refuse a deferred conflict");
+}
+
+#[test]
+fn merge_defer_unknown_conflict_returns_rejection_verdict() {
+    let store = tempdir().unwrap();
+    modify_modify_setup(store.path());
+    let v = merge_start(store.path(), "feature", lex_store::DEFAULT_BRANCH);
+    let merge_id = v.pointer("/data/merge_id").unwrap().as_str().unwrap().to_string();
+
+    let out = Command::new(lex_bin())
+        .args([
+            "--output", "json",
+            "merge", "defer",
+            "--store", store.path().to_str().unwrap(),
+            &merge_id,
+            "no_such_conflict",
+        ])
+        .output().unwrap();
+    // Per-conflict rejection lives in the verdict JSON, not the
+    // process exit — matches `lex merge resolve` shape.
+    assert!(out.status.success(),
+        "defer should print verdict, not exit-fail: {}",
+        String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let verdict = v.pointer("/data/verdicts/0").unwrap();
+    assert_eq!(verdict["accepted"], false, "rejection expected: {v}");
+}
+
+#[test]
+fn merge_defer_requires_both_args() {
+    let store = tempdir().unwrap();
+    let out = Command::new(lex_bin())
+        .args([
+            "merge", "defer",
+            "--store", store.path().to_str().unwrap(),
+        ])
+        .output().unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("usage"), "stderr should have usage: {stderr}");
+}

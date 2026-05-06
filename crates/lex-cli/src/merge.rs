@@ -87,12 +87,13 @@ fn parse_store_arg(args: &[String]) -> (PathBuf, Vec<String>) {
 
 pub fn cmd_merge(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let sub = args.first().ok_or_else(||
-        anyhow!("usage: lex merge {{start|status|resolve|commit}} ..."))?;
+        anyhow!("usage: lex merge {{start|status|resolve|defer|commit}} ..."))?;
     let rest = &args[1..];
     match sub.as_str() {
         "start"   => cmd_start(fmt, rest),
         "status"  => cmd_status(fmt, rest),
         "resolve" => cmd_resolve(fmt, rest),
+        "defer"   => cmd_defer(fmt, rest),
         "commit"  => cmd_commit(fmt, rest),
         other => bail!("unknown `lex merge` subcommand: {other}"),
     }
@@ -238,6 +239,61 @@ fn cmd_resolve(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             println!("  {mark} {}", v.conflict_id);
         }
         println!("remaining: {}", remaining_for_text.len());
+    });
+    Ok(())
+}
+
+/// `lex merge defer <merge_id> <conflict_id> [--store DIR]` —
+/// per-conflict shortcut that submits `Resolution::Defer` against
+/// a single conflict (#181). Equivalent to feeding `lex merge
+/// resolve` a one-line JSON file but ergonomic for the common
+/// "I don't have an opinion on this conflict, leave it for
+/// review" workflow that would otherwise require a tempfile.
+fn cmd_defer(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let (root, rest) = parse_store_arg(args);
+    let mut positional: Vec<String> = Vec::with_capacity(2);
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            other if !other.starts_with("--") && positional.len() < 2 => {
+                positional.push(other.to_string());
+                i += 1;
+            }
+            other => bail!("unexpected arg `{other}`"),
+        }
+    }
+    let merge_id = positional.first().ok_or_else(||
+        anyhow!("usage: lex merge defer <merge_id> <conflict_id>"))?.clone();
+    let conflict_id = positional.get(1).ok_or_else(||
+        anyhow!("usage: lex merge defer <merge_id> <conflict_id>"))?.clone();
+
+    let mut file = load_merge(&root, &merge_id)?;
+    let pairs = vec![(conflict_id.clone(), lex_vcs::Resolution::Defer)];
+    let verdicts = file.session.resolve(pairs);
+    let remaining: Vec<lex_vcs::ConflictRecord> = file.session
+        .remaining_conflicts()
+        .into_iter()
+        .cloned()
+        .collect();
+    save_merge(&root, &file)?;
+
+    let data = serde_json::json!({
+        "verdicts":            verdicts,
+        "remaining_conflicts": remaining,
+    });
+    let conflict_id_for_text = conflict_id.clone();
+    let verdict_for_text = verdicts.first().cloned();
+    acli_mod::emit_or_text("merge", data, fmt, move || {
+        match verdict_for_text {
+            Some(v) if v.accepted => println!("✓ deferred {conflict_id_for_text}"),
+            Some(v) => {
+                let why = v.rejection
+                    .map(|r| format!("{r:?}"))
+                    .unwrap_or_else(|| "rejected".into());
+                println!("✗ {conflict_id_for_text}: {why}");
+            }
+            None => println!("(no verdict returned)"),
+        }
     });
     Ok(())
 }

@@ -180,7 +180,7 @@ fn print_usage() {
     println!("  store-merge <src> <dst> [--commit] [--json]  three-way merge between two branches in");
     println!("                                     the store; conflicts as JSON. --commit applies a");
     println!("                                     clean merge; refuses if any conflicts remain.");
-    println!("  merge {{start|status|resolve|commit}}");
+    println!("  merge {{start|status|resolve|defer|commit}}");
     println!("                                     stateful merge for agent loops (#134); persists");
     println!("                                     a session under <store>/merges/<merge_id>.json");
     println!();
