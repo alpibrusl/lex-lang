@@ -439,6 +439,19 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::open_var(2),
                 Ty::Con("Option".into(), vec![Ty::Var(1)]),
             ));
+            // option.and_then :: Option[T], (T) -> [E] Option[U] -> [E] Option[U]
+            // The compiler entry has been wired since the result/option
+            // variant_map work landed; this signature was missed,
+            // making the call fail to type-check until now.
+            fields.insert("and_then".into(), Ty::function(
+                vec![
+                    Ty::Con("Option".into(), vec![Ty::Var(0)]),
+                    Ty::function(vec![Ty::Var(0)], EffectSet::open_var(3),
+                        Ty::Con("Option".into(), vec![Ty::Var(1)])),
+                ],
+                EffectSet::open_var(3),
+                Ty::Con("Option".into(), vec![Ty::Var(1)]),
+            ));
             fields.insert("unwrap_or".into(), Ty::function(
                 vec![Ty::Con("Option".into(), vec![Ty::Var(0)]), Ty::Var(0)],
                 EffectSet::empty(),
