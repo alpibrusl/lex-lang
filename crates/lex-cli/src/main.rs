@@ -147,6 +147,9 @@ fn print_usage() {
     println!("  parse <file>                       print canonical AST as JSON");
     println!("  check <file>                       type-check; exit 0 or print errors");
     println!("  run [policy] <file> <fn> [args]    execute fn (args parsed as JSON)");
+    println!("  run --from-store STAGE_ID [--require-signed] [--trusted-key HEX] <fn> [args]");
+    println!("                                     run a stage straight out of the store;");
+    println!("                                     verify Ed25519 signature when present.");
     println!("  hash <file>                        print stage canonical hashes");
     println!("  publish [--store DIR] [--branch NAME] [--activate] [--signing-key HEX] <file>");
     println!("                                     publish each stage to the store as Draft;");
@@ -254,6 +257,27 @@ fn load_stages(path: &str, from_canonical: bool) -> Result<Vec<lex_ast::Stage>> 
         let prog = read_program(path)?;
         Ok(canonicalize_program(&prog))
     }
+}
+
+/// Load a single stage out of the default `lex-store` and verify
+/// its signature against the supplied policy. The returned program
+/// is `vec![stage]` — the function being called is expected to be
+/// self-contained inside that stage. Imports / cross-stage refs
+/// would need a richer load path; this slice keeps the surface
+/// minimal.
+fn load_stages_from_store(
+    stage_id: &str,
+    require_signed: bool,
+    trusted_key: Option<&str>,
+) -> Result<Vec<lex_ast::Stage>> {
+    let store = lex_store::Store::open(default_store_root())
+        .with_context(|| "opening default store")?;
+    let meta = store.get_metadata(stage_id)
+        .with_context(|| format!("loading metadata for stage `{stage_id}`"))?;
+    verify_metadata_signature(&meta, require_signed, trusted_key)?;
+    let stage = store.get_ast(stage_id)
+        .with_context(|| format!("loading AST for stage `{stage_id}`"))?;
+    Ok(vec![stage])
 }
 
 fn cmd_parse(fmt: &OutputFormat, args: &[String]) -> Result<()> {
@@ -393,15 +417,31 @@ fn suggest_grants(s: &EffectsSummary) -> String {
 }
 
 fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
-    let (policy, positional, trace, max_steps, dry_run, from_canonical) = parse_run_flags(args)?;
-    let path = positional.first().ok_or_else(|| anyhow!("usage: lex run [policy] [--from-canonical] <file> <fn> [args]"))?;
-    let func = positional.get(1).ok_or_else(|| anyhow!("missing function name"))?;
-    if dry_run {
+    let f = parse_run_flags(args)?;
+    // #227 follow-up: when `--from-store` is set, the first
+    // positional is the function name (no path needed). Otherwise
+    // the legacy shape `lex run <file> <fn> [args]` applies.
+    let (source_label, func, arg_positional_start) = if f.from_store.is_some() {
+        let func = f.positional.first().ok_or_else(|| anyhow!(
+            "usage: lex run --from-store STAGE_ID [--require-signed] [--trusted-key HEX] <fn> [args]"))?;
+        (
+            format!("store:{}", f.from_store.as_deref().unwrap()),
+            func.clone(),
+            1,
+        )
+    } else {
+        let path = f.positional.first().ok_or_else(|| anyhow!(
+            "usage: lex run [policy] [--from-canonical] <file> <fn> [args]"))?;
+        let func = f.positional.get(1).ok_or_else(|| anyhow!("missing function name"))?;
+        (path.clone(), func.clone(), 2)
+    };
+    let policy = &f.policy;
+    if f.dry_run {
         let actions = vec![serde_json::json!({
             "action": "execute",
-            "file": path,
+            "source": &source_label,
             "function": func,
-            "args": &positional[2..],
+            "args": &f.positional[arg_positional_start..],
             "policy": {
                 "allow_effects": policy.allow_effects.iter().collect::<Vec<_>>(),
                 "allow_fs_read": policy.allow_fs_read.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
@@ -409,16 +449,20 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                 "allow_net_host": &policy.allow_net_host,
                 "budget": policy.budget,
             },
-            "trace": trace,
-            "max_steps": max_steps,
+            "trace": f.trace,
+            "max_steps": f.max_steps,
         })];
         acli::emit_dry_run("run", fmt,
-            &format!("would call `{func}` in {path}"), actions);
+            &format!("would call `{func}` in {source_label}"), actions);
     }
-    // #206 slice 3: load via text parser or canonical-AST decoder.
-    // Both paths produce the same Vec<Stage>; the typecheck and
-    // compile pipeline is identical from this point on.
-    let mut stages = load_stages(path, from_canonical)?;
+    // #206 slice 3 (text/canonical paths) or #227 follow-up
+    // (store path). Each produces the same Vec<Stage>; the typecheck
+    // and compile pipeline is identical from this point on.
+    let mut stages = if let Some(stage_id) = &f.from_store {
+        load_stages_from_store(stage_id, f.require_signed, f.trusted_key.as_deref())?
+    } else {
+        load_stages(&source_label, f.from_canonical)?
+    };
     // #168: rewrite stdlib parse calls during type-check so the
     // runtime sees the strict (validated) shape.
     if let Err(errs) = lex_types::check_and_rewrite_program(&mut stages) {
@@ -434,7 +478,7 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     }
     let bc = compile_program(&stages);
 
-    if let Err(violations) = check_policy(&bc, &policy) {
+    if let Err(violations) = check_policy(&bc, policy) {
         let arr: Vec<serde_json::Value> = violations.iter()
             .map(|v| serde_json::to_value(v).unwrap()).collect();
         let data = serde_json::json!({ "phase": "policy", "violations": arr });
@@ -447,14 +491,14 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     }
 
     let bc = std::sync::Arc::new(bc);
-    let handler = DefaultHandler::new(policy).with_program(std::sync::Arc::clone(&bc));
+    let handler = DefaultHandler::new(f.policy.clone()).with_program(std::sync::Arc::clone(&bc));
     let mut vm = Vm::with_handler(&bc, Box::new(handler));
-    if let Some(n) = max_steps { vm.set_step_limit(n); }
+    if let Some(n) = f.max_steps { vm.set_step_limit(n); }
     let recorder = lex_trace::Recorder::new();
     let trace_handle = recorder.handle();
-    if trace { vm.set_tracer(Box::new(recorder)); }
+    if f.trace { vm.set_tracer(Box::new(recorder)); }
 
-    let vargs: Vec<Value> = positional[2..]
+    let vargs: Vec<Value> = f.positional[arg_positional_start..]
         .iter()
         .map(|a| {
             let v: serde_json::Value = serde_json::from_str(a)
@@ -464,11 +508,11 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     let started = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-    let result = vm.call(func, vargs);
+    let result = vm.call(&func, vargs);
     let ended = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     let mut trace_id: Option<String> = None;
-    if trace {
+    if f.trace {
         let store = lex_store::Store::open(default_store_root())?;
         let (root_out, root_err) = match &result {
             Ok(v) => (Some(value_to_json(v)), None),
@@ -490,37 +534,51 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::type_complexity)]
-fn parse_run_flags(args: &[String]) -> Result<(Policy, Vec<String>, bool, Option<u64>, bool, bool)> {
-    let mut policy = Policy::pure();
-    let mut positional = Vec::new();
-    let mut trace = false;
-    let mut max_steps: Option<u64> = None;
-    let mut dry_run = false;
-    let mut from_canonical = false;
+/// Parsed arguments for `lex run`.
+#[derive(Default)]
+struct RunFlags {
+    policy: Policy,
+    positional: Vec<String>,
+    trace: bool,
+    max_steps: Option<u64>,
+    dry_run: bool,
+    from_canonical: bool,
+    /// `--from-store STAGE_ID` (#227 follow-up). Loads the stage's
+    /// canonical AST out of the store instead of reading a file. The
+    /// fn-arg must name a function that exists in the loaded stage.
+    from_store: Option<String>,
+    /// Refuse to run an unsigned stage (only meaningful with
+    /// `--from-store`). Implied by `--trusted-key`.
+    require_signed: bool,
+    /// Hex Ed25519 public key the stage must be signed by.
+    trusted_key: Option<String>,
+}
+
+fn parse_run_flags(args: &[String]) -> Result<RunFlags> {
+    let mut f = RunFlags { policy: Policy::pure(), ..Default::default() };
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
         match a.as_str() {
             "--allow-effects" => {
                 let val = args.get(i + 1).ok_or_else(|| anyhow!("--allow-effects needs a value"))?;
-                policy.allow_effects = val.split(',').filter(|s| !s.is_empty())
+                f.policy.allow_effects = val.split(',').filter(|s| !s.is_empty())
                     .map(|s| s.to_string()).collect::<BTreeSet<_>>();
                 i += 2;
             }
             "--allow-fs-read" => {
                 let val = args.get(i + 1).ok_or_else(|| anyhow!("--allow-fs-read needs a value"))?;
-                policy.allow_fs_read.push(PathBuf::from(val));
+                f.policy.allow_fs_read.push(PathBuf::from(val));
                 i += 2;
             }
             "--allow-fs-write" => {
                 let val = args.get(i + 1).ok_or_else(|| anyhow!("--allow-fs-write needs a value"))?;
-                policy.allow_fs_write.push(PathBuf::from(val));
+                f.policy.allow_fs_write.push(PathBuf::from(val));
                 i += 2;
             }
             "--allow-net-host" => {
                 let val = args.get(i + 1).ok_or_else(|| anyhow!("--allow-net-host needs a value"))?;
-                policy.allow_net_host.push(val.clone());
+                f.policy.allow_net_host.push(val.clone());
                 i += 2;
             }
             "--allow-proc" => {
@@ -528,34 +586,46 @@ fn parse_run_flags(args: &[String]) -> Result<(Policy, Vec<String>, bool, Option
                 // is allowed to spawn. Read SECURITY.md before granting.
                 let val = args.get(i + 1).ok_or_else(|| anyhow!("--allow-proc needs a value"))?;
                 for name in val.split(',').filter(|s| !s.is_empty()) {
-                    policy.allow_proc.push(name.to_string());
+                    f.policy.allow_proc.push(name.to_string());
                 }
                 i += 2;
             }
             "--budget" => {
                 let val = args.get(i + 1).ok_or_else(|| anyhow!("--budget needs a value"))?;
-                policy.budget = Some(val.parse().context("--budget must be an integer")?);
+                f.policy.budget = Some(val.parse().context("--budget must be an integer")?);
                 i += 2;
             }
             "--max-steps" => {
                 let val = args.get(i + 1).ok_or_else(|| anyhow!("--max-steps needs a value"))?;
-                max_steps = Some(val.parse().context("--max-steps must be an integer")?);
+                f.max_steps = Some(val.parse().context("--max-steps must be an integer")?);
                 i += 2;
             }
-            "--trace" => { trace = true; i += 1; }
-            "--dry-run" => { dry_run = true; i += 1; }
+            "--trace" => { f.trace = true; i += 1; }
+            "--dry-run" => { f.dry_run = true; i += 1; }
             "--from-canonical" => {
                 // #206 slice 3: read the program as canonical-AST
                 // bytes instead of `.lex` text. The path argument
                 // points to the bytes file (or `-` for stdin); the
                 // text parser is bypassed entirely on this path.
-                from_canonical = true;
+                f.from_canonical = true;
                 i += 1;
             }
-            _ => { positional.push(a.clone()); i += 1; }
+            "--from-store" => {
+                let val = args.get(i + 1).ok_or_else(|| anyhow!("--from-store needs a stage_id"))?;
+                f.from_store = Some(val.clone());
+                i += 2;
+            }
+            "--require-signed" => { f.require_signed = true; i += 1; }
+            "--trusted-key" => {
+                let val = args.get(i + 1).ok_or_else(|| anyhow!("--trusted-key needs a hex value"))?;
+                f.trusted_key = Some(val.clone());
+                f.require_signed = true;
+                i += 2;
+            }
+            _ => { f.positional.push(a.clone()); i += 1; }
         }
     }
-    Ok((policy, positional, trace, max_steps, dry_run, from_canonical))
+    Ok(f)
 }
 
 fn cmd_trace(fmt: &OutputFormat, args: &[String]) -> Result<()> {
