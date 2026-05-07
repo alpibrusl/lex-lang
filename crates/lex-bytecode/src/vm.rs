@@ -35,6 +35,19 @@ pub trait EffectHandler {
     fn dispatch(&mut self, kind: &str, op: &str, args: Vec<Value>) -> Result<Value, String>;
 }
 
+/// `Vm` exposes itself as a `ClosureCaller` so the parser interpreter
+/// can invoke user-supplied closures during a `parser.run` walk
+/// (#221). The Vm is reentrant for closure invocation: pushing a new
+/// frame onto an active call stack is supported, and the handler
+/// stays in place so any effects the closure body fires dispatch
+/// normally.
+impl<'a> crate::parser_runtime::ClosureCaller for Vm<'a> {
+    fn call_closure(&mut self, closure: Value, args: Vec<Value>) -> Result<Value, String> {
+        self.invoke_closure_value(closure, args)
+            .map_err(|e| format!("{e:?}"))
+    }
+}
+
 /// A handler that fails any effect call. Useful as a default for pure-only runs.
 pub struct DenyAllEffects;
 impl EffectHandler for DenyAllEffects {
@@ -139,6 +152,54 @@ impl<'a> Vm<'a> {
         self.invoke(fn_id, args)
     }
 
+    /// Vm-level handler for `parser.run` (#221). Routed here from
+    /// `Op::EffectCall` rather than through the `EffectHandler` so
+    /// the recursive parser interpreter has reentrant Vm access for
+    /// closure invocation. Returns the wrapped `Result[T, ParseErr]`
+    /// value the language sees.
+    fn run_parser_op(&mut self, args: Vec<Value>) -> Result<Value, String> {
+        let parser = args.first().cloned()
+            .ok_or_else(|| "parser.run: missing parser arg".to_string())?;
+        let input = match args.get(1) {
+            Some(Value::Str(s)) => s.clone(),
+            _ => return Err("parser.run: input must be Str".into()),
+        };
+        match crate::parser_runtime::run_parser(&parser, &input, 0, self) {
+            Ok((value, _pos)) => Ok(Value::Variant {
+                name: "Ok".into(),
+                args: vec![value],
+            }),
+            Err((pos, msg)) => {
+                let mut e = indexmap::IndexMap::new();
+                e.insert("pos".into(), Value::Int(pos as i64));
+                e.insert("message".into(), Value::Str(msg));
+                Ok(Value::Variant {
+                    name: "Err".into(),
+                    args: vec![Value::Record(e)],
+                })
+            }
+        }
+    }
+
+    /// Invoke a `Value::Closure` by combining its captures with the
+    /// supplied call args and dispatching to the underlying function.
+    /// Used by the parser interpreter (#221) to call user-supplied
+    /// `f` arguments inside `parser.map` / `parser.and_then` nodes.
+    pub fn invoke_closure_value(
+        &mut self,
+        closure: Value,
+        args: Vec<Value>,
+    ) -> Result<Value, VmError> {
+        let (fn_id, captures) = match closure {
+            Value::Closure { fn_id, captures, .. } => (fn_id, captures),
+            other => return Err(VmError::TypeMismatch(
+                format!("invoke_closure_value: not a closure: {other:?}"))),
+        };
+        let mut combined = captures;
+        combined.extend(args);
+        self.invoke(fn_id, combined)
+    }
+
     pub fn invoke(&mut self, fn_id: u32, args: Vec<Value>) -> Result<Value, VmError> {
         let f = &self.program.functions[fn_id as usize];
         if args.len() != f.arity as usize {
@@ -146,11 +207,15 @@ impl<'a> Vm<'a> {
         }
         let mut locals = vec![Value::Unit; f.locals_count.max(f.arity) as usize];
         for (i, v) in args.into_iter().enumerate() { locals[i] = v; }
+        // Record the depth before pushing — this is what `run` will
+        // exit at, supporting reentrant invocation from inside the
+        // VM (e.g. the parser interpreter calling closures, #221).
+        let base_depth = self.frames.len();
         self.push_frame(Frame {
             fn_id, pc: 0, locals, stack_base: self.stack.len(),
             trace_kind: FrameKind::Entry,
         })?;
-        self.run()
+        self.run_to(base_depth)
     }
 
     /// All call-frame pushes funnel through here so the depth
@@ -165,7 +230,11 @@ impl<'a> Vm<'a> {
         Ok(())
     }
 
-    fn run(&mut self) -> Result<Value, VmError> {
+    /// Run until the frame stack drops to `base_depth`. Required for
+    /// reentrant invocation: a `Vm::invoke` call from inside an
+    /// already-running `run()` must return when *its* frame returns,
+    /// not when the entire frame stack empties (#221).
+    fn run_to(&mut self, base_depth: usize) -> Result<Value, VmError> {
         loop {
             if self.steps > self.step_limit {
                 return Err(VmError::Panic(format!(
@@ -366,14 +435,17 @@ impl<'a> Vm<'a> {
                     let n = capture_count as usize;
                     let mut captures: Vec<Value> = (0..n).map(|_| Value::Unit).collect();
                     for i in (0..n).rev() { captures[i] = self.pop()?; }
-                    self.stack.push(Value::Closure { fn_id, captures });
+                    // Look up the canonical body hash so the resulting
+                    // `Value::Closure` carries it for equality (#222).
+                    let body_hash = self.program.functions[fn_id as usize].body_hash;
+                    self.stack.push(Value::Closure { fn_id, body_hash, captures });
                 }
                 Op::CallClosure { arity, node_id_idx } => {
                     let mut args: Vec<Value> = (0..arity).map(|_| Value::Unit).collect();
                     for i in (0..arity as usize).rev() { args[i] = self.pop()?; }
                     let closure = self.pop()?;
                     let (fn_id, captures) = match closure {
-                        Value::Closure { fn_id, captures } => (fn_id, captures),
+                        Value::Closure { fn_id, captures, .. } => (fn_id, captures),
                         other => return Err(VmError::TypeMismatch(format!("CallClosure on non-closure: {other:?}"))),
                     };
                     let node_id = const_str(&self.program.constants, node_id_idx);
@@ -436,6 +508,13 @@ impl<'a> Vm<'a> {
                     self.tracer.enter_effect(&node_id, &kind, &op_name, &args);
                     let result = match self.tracer.override_effect(&node_id) {
                         Some(v) => Ok(v),
+                        // VM-level intercept for `parser.run` (#221).
+                        // Routed inline rather than through the handler
+                        // because the parser interpreter needs reentrant
+                        // VM access to invoke `Value::Closure` values
+                        // from `Map` / `AndThen` nodes.
+                        None if (kind.as_str(), op_name.as_str()) == ("parser", "run")
+                            => self.run_parser_op(args.clone()),
                         None => self.handler.dispatch(&kind, &op_name, args.clone()),
                     };
                     match result {
@@ -457,7 +536,11 @@ impl<'a> Vm<'a> {
                     if matches!(frame.trace_kind, FrameKind::Call(_)) {
                         self.tracer.exit_ok(&v);
                     }
-                    if self.frames.is_empty() {
+                    // Exit when we've returned past the depth this
+                    // `run_to` was entered at — supports reentrancy
+                    // (a nested `invoke` returns into its caller, not
+                    // out of the outermost VM run, #221).
+                    if self.frames.len() <= base_depth {
                         return Ok(v);
                     }
                     self.stack.push(v);

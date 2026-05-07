@@ -212,17 +212,20 @@ pub fn diff_to_ops(inputs: DiffInputs<'_>) -> Result<Vec<OperationKind>, DiffMap
 }
 
 /// Project a slice of effects into the canonical `EffectSet` (sorted
-/// kind strings).
+/// label strings).
 ///
-/// Effect args (e.g. `fs_read("/tmp")`) are intentionally dropped —
-/// the OpId models effect *kinds*, not capability scopes. Two
-/// fns differing only in `fs_read` paths will share the same
-/// `EffectSet`. Capability-scope tracking is #130's territory
-/// (the write-time gate has access to per-arg detail; the op log
-/// summarizes only what callers need to discriminate "kind of
-/// effect changed").
+/// Effect args are preserved via the canonical pretty-print form
+/// (e.g. `fs_read("/tmp")`, `net("wttr.in")`) — see
+/// `compute_diff::effect_label`. This makes `[net]` → `[net("wttr.in")]`
+/// a real `ChangeEffectSig` op (the strings differ), satisfying #207's
+/// third acceptance criterion via #223.
+///
+/// **OpId stability**: bare effects still produce just `"net"` (not
+/// `"net()"` or any other suffix), so every pre-#223 op log retains
+/// its existing OpIds. Only ops *introducing* parameterized effects
+/// see new hashes — and those are by definition new ops.
 fn effect_set(effs: &[Effect]) -> EffectSet {
-    effs.iter().map(|e| e.name.clone()).collect()
+    effs.iter().map(crate::compute_diff::effect_label).collect()
 }
 
 #[cfg(test)]
@@ -388,6 +391,125 @@ mod tests {
         match err {
             DiffMappingError::MissingOldSigForName(n) => assert_eq!(n, "ghost"),
             other => panic!("expected MissingOldSigForName, got {other:?}"),
+        }
+    }
+
+    // ----------------------------- #223 acceptance ---------------------
+
+    /// Bare effects must produce identical strings to pre-#223
+    /// behavior — preserves OpId stability for every existing op log.
+    /// Pre-#223 `effect_set` was `effs.iter().map(|e| e.name.clone())`,
+    /// so the canonical form for `[net]` was `"net"`. Confirm that.
+    #[test]
+    fn bare_effect_set_string_is_unchanged_from_pre_223() {
+        let src = "fn f() -> [net] Int { 0 }";
+        let prog = lex_syntax::load_program_from_str(src).unwrap();
+        let stages = lex_ast::canonicalize_program(&prog);
+        let fd = match &stages[0] {
+            Stage::FnDecl(fd) => fd,
+            other => panic!("{other:?}"),
+        };
+        let set = effect_set(&fd.effects);
+        assert_eq!(set, ["net".to_string()].into_iter().collect::<EffectSet>(),
+            "bare [net] must canonicalize to {{\"net\"}} so existing \
+             op logs keep their OpIds across the #223 change");
+    }
+
+    /// Parameterized effects produce a distinct, parens-quoted string
+    /// — `[net("wttr.in")]` becomes `"net(\"wttr.in\")"`. This is the
+    /// fulcrum that makes `[net]` → `[net("wttr.in")]` a real
+    /// `ChangeEffectSig` op rather than a no-op.
+    #[test]
+    fn parameterized_effect_label_is_distinct_from_bare() {
+        let bare_src = "fn f() -> [net] Int { 0 }";
+        let scoped_src = r#"fn f() -> [net("wttr.in")] Int { 0 }"#;
+        for (src, expected) in [
+            (bare_src, vec!["net"]),
+            (scoped_src, vec!["net(\"wttr.in\")"]),
+        ] {
+            let prog = lex_syntax::load_program_from_str(src).unwrap();
+            let stages = lex_ast::canonicalize_program(&prog);
+            let fd = match &stages[0] {
+                Stage::FnDecl(fd) => fd,
+                other => panic!("{other:?}"),
+            };
+            let want: EffectSet = expected.into_iter().map(String::from).collect();
+            assert_eq!(effect_set(&fd.effects), want);
+        }
+    }
+
+    /// End-to-end: when a function's effect declaration changes from
+    /// `[net]` to `[net("wttr.in")]`, `diff_to_ops` must emit a
+    /// `ChangeEffectSig` op carrying the parameterized form in
+    /// `to_effects`. Pre-#223 this was a no-op (both flattened to
+    /// `{"net"}`), defeating #207's reason to exist.
+    #[test]
+    fn changing_bare_to_parameterized_emits_change_effect_sig() {
+        let bare_src   = "fn weather() -> [net] Str { \"\" }";
+        let scoped_src = r#"fn weather() -> [net("wttr.in")] Str { "" }"#;
+
+        let bare_stage = match &lex_ast::canonicalize_program(
+            &lex_syntax::load_program_from_str(bare_src).unwrap())[0] {
+            Stage::FnDecl(fd) => fd.clone(),
+            _ => unreachable!(),
+        };
+        let scoped_stage = match &lex_ast::canonicalize_program(
+            &lex_syntax::load_program_from_str(scoped_src).unwrap())[0] {
+            Stage::FnDecl(fd) => fd.clone(),
+            _ => unreachable!(),
+        };
+
+        let sig = sig_id(&Stage::FnDecl(bare_stage.clone())).unwrap();
+        let from_stage_id = stage_id(&Stage::FnDecl(bare_stage.clone())).unwrap();
+
+        let mut head = BTreeMap::new();
+        head.insert(sig.clone(), from_stage_id.clone());
+        let mut n2s = BTreeMap::new();
+        n2s.insert("weather".to_string(), sig.clone());
+        let mut eff = BTreeMap::new();
+        eff.insert(sig.clone(), effect_set(&bare_stage.effects));
+
+        let mut diff = dr();
+        diff.modified.push(Modified {
+            name: "weather".into(),
+            signature_before: "fn weather() -> [net] Str".into(),
+            signature_after:  "fn weather() -> [net(\"wttr.in\")] Str".into(),
+            signature_changed: true,
+            body_patches: Vec::new(),
+            effect_changes: EffectChanges {
+                before: vec!["net".into()],
+                after: vec!["net(\"wttr.in\")".into()],
+                added: vec!["net(\"wttr.in\")".into()],
+                removed: vec!["net".into()],
+            },
+        });
+
+        let oi = ImportMap::new();
+        let ni = ImportMap::new();
+        let new_stage = Stage::FnDecl(scoped_stage);
+        let ops = diff_to_ops(DiffInputs {
+            old_head: &head,
+            old_name_to_sig: &n2s,
+            old_effects: &eff,
+            old_imports: &oi,
+            new_stages: &[new_stage],
+            new_imports: &ni,
+            diff: &diff,
+        }).expect("diff_to_ops should succeed");
+
+        let change = ops.iter().find(|op| matches!(op, OperationKind::ChangeEffectSig { .. }));
+        let change = change.expect(
+            "expected a ChangeEffectSig op when going [net] → [net(\"wttr.in\")] — \
+             pre-#223 both sides flattened to {\"net\"} and the op was incorrectly \
+             skipped");
+        match change {
+            OperationKind::ChangeEffectSig { from_effects, to_effects, .. } => {
+                let from: Vec<_> = from_effects.iter().cloned().collect();
+                let to:   Vec<_> = to_effects.iter().cloned().collect();
+                assert_eq!(from, vec!["net".to_string()]);
+                assert_eq!(to,   vec!["net(\"wttr.in\")".to_string()]);
+            }
+            _ => unreachable!(),
         }
     }
 }

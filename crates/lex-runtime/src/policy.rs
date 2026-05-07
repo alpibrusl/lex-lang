@@ -47,6 +47,10 @@ impl Policy {
             "fs_read", "fs_write", "budget",
             // #184: agent-runtime effects.
             "llm_local", "llm_cloud", "a2a", "mcp",
+            // #216: env-var access. Per-var scoping (`[env(NAME)]`)
+            // arrives with the per-capability effect parameterization
+            // work (#207); the flat `[env]` is the v1 surface.
+            "env",
         ] {
             s.insert(k.to_string());
         }
@@ -119,9 +123,14 @@ pub fn check_program(program: &Program, policy: &Policy) -> Result<PolicyReport,
         for e in &f.effects {
             declared_effects.entry(f.name.clone()).or_default().push(e.clone());
 
-            // Effect kind allowlist.
-            if !policy.allow_effects.contains(&e.kind) {
-                violations.push(PolicyViolation::effect_not_allowed(&e.kind, &f.name));
+            // Effect-kind allowlist (#207). A grant like `mcp:ocpp`
+            // permits `[mcp("ocpp")]` only; bare `mcp` permits any
+            // `[mcp(...)]`. Subsumption follows the type-system rule
+            // in `lex-types::EffectKind::subsumes`. The CLI wire
+            // format stays plain strings for backward compat.
+            if !is_effect_allowed(&policy.allow_effects, e) {
+                violations.push(PolicyViolation::effect_not_allowed(
+                    &declared_effect_pretty(e), &f.name));
                 continue;
             }
 
@@ -170,4 +179,61 @@ pub struct PolicyReport {
 fn path_under_any(p: &str, list: &[PathBuf]) -> bool {
     let candidate = Path::new(p);
     list.iter().any(|allowed| candidate.starts_with(allowed))
+}
+
+/// Render a `DeclaredEffect` for diagnostic output, matching the
+/// `EffectKind::pretty` form used by the type checker (#207).
+fn declared_effect_pretty(e: &DeclaredEffect) -> String {
+    match &e.arg {
+        None => e.kind.clone(),
+        Some(EffectArg::Str(s)) => format!("{}(\"{}\")", e.kind, s),
+        Some(EffectArg::Int(n)) => format!("{}({})", e.kind, n),
+        Some(EffectArg::Ident(s)) => format!("{}({})", e.kind, s),
+    }
+}
+
+/// Decide whether `e` is permitted by `grants` (#207).
+///
+/// Grant strings come from `--allow-effects` and may be either:
+///   - `name`           (bare wildcard, accepts any arg)
+///   - `name:arg`       (string-arg specific grant — the colon is
+///                       a CLI-friendly separator)
+///   - `name(arg)`      (matches the canonical pretty form for
+///                       grants written by hand or copy-pasted from
+///                       error messages)
+///
+/// Bare absorbs specific; specific matches only an exactly-equal
+/// string arg. Int/Ident args on the declaration side are accepted
+/// only by their bare-name grants (no CLI form for them in v1 —
+/// they're rare in practice and can be added later).
+pub fn is_effect_allowed(grants: &BTreeSet<String>, e: &DeclaredEffect) -> bool {
+    grants.iter().any(|g| grant_subsumes(g, e))
+}
+
+fn grant_subsumes(grant: &str, e: &DeclaredEffect) -> bool {
+    // Accept three forms: "name", "name:arg", "name(arg)".
+    let (g_name, g_arg) = parse_grant(grant);
+    if g_name != e.kind { return false; }
+    match (g_arg, &e.arg) {
+        (None, _) => true,                                 // bare absorbs anything
+        (Some(_), None) => false,                          // specific can't grant bare
+        (Some(g), Some(EffectArg::Str(d))) => g == d,
+        // Int / Ident args have no CLI form in v1; only bare grants
+        // satisfy them (handled by the (None, _) branch above).
+        (Some(_), Some(_)) => false,
+    }
+}
+
+/// Split `"mcp:ocpp"` or `"mcp(ocpp)"` into `("mcp", Some("ocpp"))`.
+/// Plain `"mcp"` returns `("mcp", None)`.
+fn parse_grant(s: &str) -> (&str, Option<&str>) {
+    if let Some((name, rest)) = s.split_once('(') {
+        if let Some(arg) = rest.strip_suffix(')') {
+            return (name, Some(arg.trim_matches('"')));
+        }
+    }
+    if let Some((name, arg)) = s.split_once(':') {
+        return (name, Some(arg));
+    }
+    (s, None)
 }

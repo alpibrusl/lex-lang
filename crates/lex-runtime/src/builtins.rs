@@ -31,7 +31,7 @@ pub fn is_pure_module(kind: &str) -> bool {
     matches!(kind, "str" | "int" | "float" | "bool" | "list"
         | "option" | "result" | "tuple" | "json" | "bytes" | "flow" | "math"
         | "map" | "set" | "crypto" | "regex" | "deque" | "datetime" | "http"
-        | "toml" | "yaml" | "dotenv" | "csv" | "test")
+        | "toml" | "yaml" | "dotenv" | "csv" | "test" | "random" | "parser")
 }
 
 fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
@@ -494,10 +494,42 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         // type alias `Matrix = { rows :: Int, cols :: Int, data ::
         // List[Float] }`; field access is unsupported, so all
         // introspection happens through these helpers.
-        ("math", "exp")  => Ok(Value::Float(expect_float(args.first())?.exp())),
-        ("math", "log")  => Ok(Value::Float(expect_float(args.first())?.ln())),
-        ("math", "sqrt") => Ok(Value::Float(expect_float(args.first())?.sqrt())),
-        ("math", "abs")  => Ok(Value::Float(expect_float(args.first())?.abs())),
+        ("math", "exp")   => Ok(Value::Float(expect_float(args.first())?.exp())),
+        ("math", "log")   => Ok(Value::Float(expect_float(args.first())?.ln())),
+        ("math", "log2")  => Ok(Value::Float(expect_float(args.first())?.log2())),
+        ("math", "log10") => Ok(Value::Float(expect_float(args.first())?.log10())),
+        ("math", "sqrt")  => Ok(Value::Float(expect_float(args.first())?.sqrt())),
+        ("math", "abs")   => Ok(Value::Float(expect_float(args.first())?.abs())),
+        ("math", "sin")   => Ok(Value::Float(expect_float(args.first())?.sin())),
+        ("math", "cos")   => Ok(Value::Float(expect_float(args.first())?.cos())),
+        ("math", "tan")   => Ok(Value::Float(expect_float(args.first())?.tan())),
+        ("math", "asin")  => Ok(Value::Float(expect_float(args.first())?.asin())),
+        ("math", "acos")  => Ok(Value::Float(expect_float(args.first())?.acos())),
+        ("math", "atan")  => Ok(Value::Float(expect_float(args.first())?.atan())),
+        ("math", "floor") => Ok(Value::Float(expect_float(args.first())?.floor())),
+        ("math", "ceil")  => Ok(Value::Float(expect_float(args.first())?.ceil())),
+        ("math", "round") => Ok(Value::Float(expect_float(args.first())?.round())),
+        ("math", "trunc") => Ok(Value::Float(expect_float(args.first())?.trunc())),
+        ("math", "pow") => {
+            let a = expect_float(args.first())?;
+            let b = expect_float(args.get(1))?;
+            Ok(Value::Float(a.powf(b)))
+        }
+        ("math", "atan2") => {
+            let y = expect_float(args.first())?;
+            let x = expect_float(args.get(1))?;
+            Ok(Value::Float(y.atan2(x)))
+        }
+        ("math", "min") => {
+            let a = expect_float(args.first())?;
+            let b = expect_float(args.get(1))?;
+            Ok(Value::Float(a.min(b)))
+        }
+        ("math", "max") => {
+            let a = expect_float(args.first())?;
+            let b = expect_float(args.get(1))?;
+            Ok(Value::Float(a.max(b)))
+        }
         ("math", "zeros") => {
             let r = expect_int(args.first())?;
             let c = expect_int(args.get(1))?;
@@ -918,6 +950,136 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             Ok(Value::Bool(eq))
         }
 
+        // -- random (#219): pure, seeded RNG. Backed by SplitMix64;
+        // state is the u64 mixer state stored as a single i64 in
+        // `Rng = { state :: Int }`. Threading the Rng through the
+        // call site is the user's responsibility — there is no
+        // global RNG and therefore no `[random]` effect tag for
+        // pure-seeded usage. --
+        ("random", "seed") => {
+            let s = args.first().ok_or("random.seed: missing arg")?.as_int();
+            // Hash the user-supplied seed once before installing it.
+            // SplitMix64 is fine when seeded with any u64, but
+            // hashing first protects against pathological seeds
+            // (e.g., 0) that would make the very first draw zero.
+            let mixed = splitmix64(s as u64).0;
+            Ok(rng_value(mixed))
+        }
+        ("random", "int") => {
+            let state = rng_decode(args.first())?;
+            let lo = args.get(1).ok_or("random.int: missing lo")?.as_int();
+            let hi = args.get(2).ok_or("random.int: missing hi")?.as_int();
+            if hi < lo {
+                return Err(format!(
+                    "random.int: hi ({hi}) must be >= lo ({lo})"));
+            }
+            let span = (hi as i128) - (lo as i128) + 1;
+            let (raw, next_state) = splitmix64(state);
+            // Reduce uniformly to [lo, hi]. The bias from a plain
+            // modulo is at most `(u64::MAX % span) / u64::MAX`,
+            // which for any practical span is invisible. Crypto
+            // applications should use `crypto.random` instead.
+            let drawn = lo as i128 + (raw as u128 % span as u128) as i128;
+            Ok(Value::Tuple(vec![
+                Value::Int(drawn as i64),
+                rng_value(next_state),
+            ]))
+        }
+        ("random", "float") => {
+            let state = rng_decode(args.first())?;
+            let (raw, next_state) = splitmix64(state);
+            // Take the top 53 bits and divide by 2^53 to land in
+            // [0.0, 1.0); this is the standard f64 uniform draw.
+            let f = ((raw >> 11) as f64) / ((1u64 << 53) as f64);
+            Ok(Value::Tuple(vec![Value::Float(f), rng_value(next_state)]))
+        }
+        ("random", "choose") => {
+            let state = rng_decode(args.first())?;
+            let xs = match args.get(1) {
+                Some(Value::List(xs)) => xs,
+                _ => return Err("random.choose: expected List".into()),
+            };
+            if xs.is_empty() {
+                return Ok(Value::Variant {
+                    name: "None".into(), args: vec![],
+                });
+            }
+            let (raw, next_state) = splitmix64(state);
+            let idx = (raw as usize) % xs.len();
+            let pick = xs[idx].clone();
+            Ok(Value::Variant {
+                name: "Some".into(),
+                args: vec![Value::Tuple(vec![pick, rng_value(next_state)])],
+            })
+        }
+
+        // -- parser (#217): parser combinators. Parser values are
+        // tagged Records — `{ kind: "Char", ch: "x" }` etc. — so
+        // canonical equality follows from the canonical Record
+        // encoding. The interpreter is `parser_run_impl`. --
+        ("parser", "char") => {
+            let s = expect_str(args.first())?;
+            if s.chars().count() != 1 {
+                return Err(format!(
+                    "parser.char: expected 1-character string, got {s:?}"));
+            }
+            Ok(parser_node("Char", &[("ch", Value::Str(s))]))
+        }
+        ("parser", "string") => {
+            let s = expect_str(args.first())?;
+            Ok(parser_node("String", &[("s", Value::Str(s))]))
+        }
+        ("parser", "digit") => Ok(parser_node("Digit", &[])),
+        ("parser", "alpha") => Ok(parser_node("Alpha", &[])),
+        ("parser", "whitespace") => Ok(parser_node("Whitespace", &[])),
+        ("parser", "eof") => Ok(parser_node("Eof", &[])),
+        ("parser", "seq") => {
+            let a = args.first().cloned()
+                .ok_or_else(|| "parser.seq: missing first parser".to_string())?;
+            let b = args.get(1).cloned()
+                .ok_or_else(|| "parser.seq: missing second parser".to_string())?;
+            Ok(parser_node("Seq", &[("a", a), ("b", b)]))
+        }
+        ("parser", "alt") => {
+            let a = args.first().cloned()
+                .ok_or_else(|| "parser.alt: missing first parser".to_string())?;
+            let b = args.get(1).cloned()
+                .ok_or_else(|| "parser.alt: missing second parser".to_string())?;
+            Ok(parser_node("Alt", &[("a", a), ("b", b)]))
+        }
+        ("parser", "many") => {
+            let p = args.first().cloned()
+                .ok_or_else(|| "parser.many: missing inner parser".to_string())?;
+            Ok(parser_node("Many", &[("p", p)]))
+        }
+        ("parser", "optional") => {
+            let p = args.first().cloned()
+                .ok_or_else(|| "parser.optional: missing inner parser".to_string())?;
+            Ok(parser_node("Optional", &[("p", p)]))
+        }
+        // `parser.map` and `parser.and_then` (#221): closure-bearing
+        // combinators. Constructors only — actual closure invocation
+        // happens at parser.run time via the Vm-level interpreter.
+        ("parser", "map") => {
+            let p = args.first().cloned()
+                .ok_or_else(|| "parser.map: missing parser".to_string())?;
+            let f = args.get(1).cloned()
+                .ok_or_else(|| "parser.map: missing closure".to_string())?;
+            Ok(parser_node("Map", &[("p", p), ("f", f)]))
+        }
+        ("parser", "and_then") => {
+            let p = args.first().cloned()
+                .ok_or_else(|| "parser.and_then: missing parser".to_string())?;
+            let f = args.get(1).cloned()
+                .ok_or_else(|| "parser.and_then: missing closure".to_string())?;
+            Ok(parser_node("AndThen", &[("p", p), ("f", f)]))
+        }
+        // `parser.run` is handled at the Vm level (lex-bytecode's
+        // `Op::EffectCall` intercept) — it needs reentrant Vm access
+        // to invoke the closures inside `Map` / `AndThen` nodes. The
+        // pure-builtin path doesn't have that, so we deliberately do
+        // *not* have a `("parser", "run")` arm here.
+
         // -- regex (the compiled `Regex` is stored as the pattern
         // string; the runtime caches the actual `regex::Regex` so
         // ops don't re-compile on every call) --
@@ -1281,6 +1443,63 @@ fn some(v: Value) -> Value { Value::Variant { name: "Some".into(), args: vec![v]
 fn none() -> Value { Value::Variant { name: "None".into(), args: Vec::new() } }
 fn ok_v(v: Value) -> Value { Value::Variant { name: "Ok".into(), args: vec![v] } }
 fn err_v(v: Value) -> Value { Value::Variant { name: "Err".into(), args: vec![v] } }
+
+// -- std.parser helpers (#217) ----------------------------------------
+
+/// Construct a tagged parser-AST node. The runtime representation is
+/// `{ kind: "Char" | "Seq" | ..., ...children }`; the type system
+/// treats these as opaque `Parser[T]` so user code can't poke at the
+/// fields. Encoding is canonical because `IndexMap` insertion order
+/// is stable and we always insert `kind` first.
+fn parser_node(kind: &str, fields: &[(&str, Value)]) -> Value {
+    let mut r = indexmap::IndexMap::new();
+    r.insert("kind".into(), Value::Str(kind.into()));
+    for (k, v) in fields {
+        r.insert((*k).into(), v.clone());
+    }
+    Value::Record(r)
+}
+
+// `parser.run` interpretation lives in `lex-bytecode::parser_runtime`
+// (#221) — it needs reentrant Vm access to invoke closures inside
+// `Map` / `AndThen` nodes, which the pure-builtin path doesn't have.
+
+// -- std.random helpers (#219) ----------------------------------------
+
+/// SplitMix64 — single-`u64` state PRNG that is byte-identical
+/// across platforms (no float math, no platform-dependent reductions).
+/// Returns `(drawn, next_state)`. Constants are the canonical
+/// SplitMix64 mixer from the original 2014 paper.
+fn splitmix64(state: u64) -> (u64, u64) {
+    let next = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = next;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    let z = z ^ (z >> 31);
+    (z, next)
+}
+
+/// Encode a SplitMix64 state as the user-facing `Rng` value.
+/// `Rng = { state :: Int }`; the type-checker treats `Rng` as
+/// opaque so users can't poke at the field.
+fn rng_value(state: u64) -> Value {
+    let mut fields = indexmap::IndexMap::new();
+    fields.insert("state".into(), Value::Int(state as i64));
+    Value::Record(fields)
+}
+
+/// Pull the SplitMix64 state out of a `Value::Record { state }`.
+fn rng_decode(v: Option<&Value>) -> Result<u64, String> {
+    let rec = match v {
+        Some(Value::Record(r)) => r,
+        Some(other) => return Err(format!("expected Rng, got {other:?}")),
+        None => return Err("missing Rng arg".into()),
+    };
+    match rec.get("state") {
+        Some(Value::Int(n)) => Ok(*n as u64),
+        _ => Err("malformed Rng: missing `state :: Int`".into()),
+    }
+}
 
 // -- helpers for `std.http` builders / decoders --
 

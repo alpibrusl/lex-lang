@@ -108,6 +108,9 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
                         a::EffectArg::Ident { value } => EffectArg::Ident(value.clone()),
                     }),
                 }).collect(),
+                // Filled in at the end of the compile pass, once `code`
+                // and `locals_count` are final. See #222.
+                body_hash: crate::program::ZERO_BODY_HASH,
             });
         }
     }
@@ -187,6 +190,17 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
         drop(fc);
         p.functions[pl.fn_id as usize].code = code;
         p.functions[pl.fn_id as usize].locals_count = peak;
+    }
+
+    // Final pass: stamp every function with its content hash now that
+    // every body is finalized (#222). Trampolines installed via
+    // `install_trampoline` already have it; recomputing is cheap and
+    // makes the invariant easier to read at this top level.
+    for f in p.functions.iter_mut() {
+        if f.body_hash == crate::program::ZERO_BODY_HASH {
+            f.body_hash = crate::program::compute_body_hash(
+                f.arity, f.locals_count, &f.code);
+        }
     }
 
     p.constants = pool.pool;
@@ -550,6 +564,8 @@ impl<'a> FnCompiler<'a> {
             locals_count: 0,
             code: Vec::new(),
             effects: Vec::new(),
+            // See #222: filled in at the end of the compile pass.
+            body_hash: crate::program::ZERO_BODY_HASH,
         });
 
         // Emit code at the lambda site: load each captured local, then MakeClosure.
@@ -582,8 +598,10 @@ impl<'a> FnCompiler<'a> {
             ("result", "map") => self.emit_variant_map(args, "Ok", true),
             ("result", "and_then") => self.emit_variant_map(args, "Ok", false),
             ("result", "map_err") => self.emit_variant_map(args, "Err", true),
+            ("result", "or_else") => self.emit_variant_or_else(args, "Err", 1),
             ("option", "map") => self.emit_variant_map(args, "Some", true),
             ("option", "and_then") => self.emit_variant_map(args, "Some", false),
+            ("option", "or_else") => self.emit_variant_or_else(args, "None", 0),
             ("list", "map") => self.emit_list_map(args),
             ("list", "filter") => self.emit_list_filter(args),
             ("list", "fold") => self.emit_list_fold(args),
@@ -924,6 +942,69 @@ impl<'a> FnCompiler<'a> {
         }
     }
 
+    /// Sibling of `emit_variant_map` for the recovery combinators
+    /// `result.or_else` and `option.or_else`. Differences from
+    /// `emit_variant_map`:
+    ///   - matches on the *negative* variant (`Err` / `None`)
+    ///   - the closure's result becomes the call's result directly,
+    ///     with no wrapping (it is itself a `Result` / `Option`)
+    ///   - `option.or_else`'s closure takes zero args (`None` has no
+    ///     payload to forward)
+    fn emit_variant_or_else(
+        &mut self,
+        args: &[a::CExpr],
+        match_on: &str,
+        closure_arity: u16,
+    ) {
+        let match_idx = self.pool.variant(match_on);
+
+        self.compile_expr(&args[0], false);
+        let val_slot = self.alloc_local("__hoe");
+        self.emit(Op::StoreLocal(val_slot));
+
+        self.compile_expr(&args[1], false);
+        let f_slot = self.alloc_local("__hoe_f");
+        self.emit(Op::StoreLocal(f_slot));
+
+        // Stack discipline mirrors emit_variant_map:
+        //   load val      ⇒ [v]
+        //   dup           ⇒ [v, v]
+        //   test          ⇒ [v, Bool]
+        //   jumpifnot     ⇒ [v]
+        // The unmatched arm leaves [v] (Ok/Some unchanged); the
+        // matched arm pops [v] and pushes the closure's result.
+        self.emit(Op::LoadLocal(val_slot));
+        self.emit(Op::Dup);
+        self.emit(Op::TestVariant(match_idx));
+        let j_skip = self.code.len();
+        self.emit(Op::JumpIfNot(0));
+
+        // Matched arm: pop the duplicate left on the stack,
+        // then call the closure with whatever payload it expects.
+        self.emit(Op::Pop);
+        self.emit(Op::LoadLocal(f_slot));
+        if closure_arity == 1 {
+            self.emit(Op::LoadLocal(val_slot));
+            self.emit(Op::GetVariantArg(0));
+        }
+        let nid = self.pool.node_id("n_hoe");
+        self.emit(Op::CallClosure { arity: closure_arity, node_id_idx: nid });
+
+        let j_end = self.code.len();
+        self.emit(Op::Jump(0));
+
+        // Unmatched arm: stack already holds [v]; nothing to do.
+        let skip_target = self.code.len() as i32;
+        if let Op::JumpIfNot(off) = &mut self.code[j_skip] {
+            *off = skip_target - (j_skip as i32 + 1);
+        }
+
+        let end_target = self.code.len() as i32;
+        if let Op::Jump(off) = &mut self.code[j_end] {
+            *off = end_target - (j_end as i32 + 1);
+        }
+    }
+
     // ---- std.flow trampolines ----------------------------------------
     //
     // Each flow.<op>(c1, c2, ...) call site:
@@ -936,14 +1017,20 @@ impl<'a> FnCompiler<'a> {
     // arg_0, ...]: captures first, the closure's own args after.
 
     /// Allocate a fresh fn_id for a trampoline and install its bytecode.
+    /// Trampolines are the one Function-creation path that already has
+    /// the body in hand at install time (top-level fns and lambdas have
+    /// it filled in later), so we compute `body_hash` immediately. The
+    /// final hash pass at the end of `compile_program` is a no-op here.
     fn install_trampoline(&mut self, name: &str, arity: u16, locals_count: u16, code: Vec<Op>) -> u32 {
         let fn_id = self.next_fn_id.len() as u32;
+        let body_hash = crate::program::compute_body_hash(arity, locals_count, &code);
         self.next_fn_id.push(Function {
             name: name.into(),
             arity,
             locals_count,
             code,
             effects: Vec::new(),
+            body_hash,
         });
         fn_id
     }

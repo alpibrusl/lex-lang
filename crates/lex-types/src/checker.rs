@@ -291,10 +291,20 @@ fn function_scheme(fd: &a::FnDecl) -> Scheme {
     // Collect type-param ids in order; map their names to fresh Var(idx).
     let params: Vec<Ty> = fd.params.iter().map(|p| ty_from_canon(&p.ty, &fd.type_params)).collect();
     let ret = ty_from_canon(&fd.return_type, &fd.type_params);
+    // Plumb effect args (#207). A canonical-AST `EffectDecl` already
+    // carries `Option<EffectArg>`; map it into the type-system kind so
+    // subsumption can honor parameterized effects.
     let effects = EffectSet {
         concrete: {
             let mut s = std::collections::BTreeSet::new();
-            for e in &fd.effects { s.insert(e.name.clone()); }
+            for e in &fd.effects {
+                let arg = e.arg.as_ref().map(|a| match a {
+                    a::EffectArg::Str { value } => crate::types::EffectArg::Str(value.clone()),
+                    a::EffectArg::Int { value } => crate::types::EffectArg::Int(*value),
+                    a::EffectArg::Ident { value } => crate::types::EffectArg::Ident(value.clone()),
+                });
+                s.insert(crate::types::EffectKind { name: e.name.clone(), arg });
+            }
             s
         },
         var: None,
@@ -446,10 +456,10 @@ impl Checker {
         if !inferred_effects.is_subset(&declared_effects) {
             // Pick the first undeclared effect for the error.
             for e in inferred_effects.concrete.iter() {
-                if !declared_effects.concrete.contains(e) {
+                if !declared_effects.concrete.iter().any(|d| d.subsumes(e)) {
                     return Err(vec![TypeError::EffectNotDeclared {
                         at_node: "n_0".into(),
-                        effect: e.clone(),
+                        effect: e.pretty(),
                     }]);
                 }
             }
@@ -581,7 +591,14 @@ impl Checker {
                 let declared = EffectSet {
                     concrete: {
                         let mut s = std::collections::BTreeSet::new();
-                        for e in l_effects { s.insert(e.name.clone()); }
+                        for e in l_effects {
+                            let arg = e.arg.as_ref().map(|a| match a {
+                                a::EffectArg::Str { value } => crate::types::EffectArg::Str(value.clone()),
+                                a::EffectArg::Int { value } => crate::types::EffectArg::Int(*value),
+                                a::EffectArg::Ident { value } => crate::types::EffectArg::Ident(value.clone()),
+                            });
+                            s.insert(crate::types::EffectKind { name: e.name.clone(), arg });
+                        }
                         s
                     },
                     var: None,
@@ -597,10 +614,10 @@ impl Checker {
                 }
                 if !inner_effs.is_subset(&declared) {
                     for e in inner_effs.concrete.iter() {
-                        if !declared.concrete.contains(e) {
+                        if !declared.concrete.iter().any(|d| d.subsumes(e)) {
                             return Err(TypeError::EffectNotDeclared {
                                 at_node: node_id.into(),
-                                effect: e.clone(),
+                                effect: e.pretty(),
                             });
                         }
                     }
@@ -1021,7 +1038,8 @@ fn mismatch_err(node_id: &str, e: UnifyError, u: &Unifier, context: Vec<String>)
             // form, e.g. `[net]` vs `[]`. Avoids inventing a new
             // TypeError variant + wire format right now.
             let render = |e: &EffectSet| -> String {
-                let mut parts: Vec<String> = e.concrete.iter().cloned().collect();
+                let mut parts: Vec<String> = e.concrete.iter()
+                    .map(crate::types::EffectKind::pretty).collect();
                 if let Some(v) = e.var { parts.push(format!("?e{}", v)); }
                 if parts.is_empty() { "[]".into() } else { format!("[{}]", parts.join(", ")) }
             };

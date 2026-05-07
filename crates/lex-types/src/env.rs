@@ -213,10 +213,18 @@ pub fn ty_from_canon(t: &lex_ast::TypeExpr, params: &[String]) -> Ty {
         }
         lex_ast::TypeExpr::Tuple { items } => Ty::Tuple(items.iter().map(|t| ty_from_canon(t, params)).collect()),
         lex_ast::TypeExpr::Function { params: ps, effects, ret } => {
+            // Plumb effect args (#207).
             let effs = EffectSet {
                 concrete: {
                     let mut s = std::collections::BTreeSet::new();
-                    for e in effects { s.insert(e.name.clone()); }
+                    for e in effects {
+                        let arg = e.arg.as_ref().map(|a| match a {
+                            lex_ast::EffectArg::Str { value } => crate::types::EffectArg::Str(value.clone()),
+                            lex_ast::EffectArg::Int { value } => crate::types::EffectArg::Int(*value),
+                            lex_ast::EffectArg::Ident { value } => crate::types::EffectArg::Ident(value.clone()),
+                        });
+                        s.insert(crate::types::EffectKind { name: e.name.clone(), arg });
+                    }
                     s
                 },
                 var: None,

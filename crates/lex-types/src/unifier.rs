@@ -119,7 +119,7 @@ impl Unifier {
                     // the chain to track. Tighter handling possible
                     // later.
                 }
-                let extra: std::collections::BTreeSet<String> =
+                let extra: std::collections::BTreeSet<crate::types::EffectKind> =
                     b.concrete.difference(&a.concrete).cloned().collect();
                 let bound = EffectSet { concrete: extra, var: b.var };
                 self.eff_subst.insert(va, bound);
@@ -129,7 +129,7 @@ impl Unifier {
                 if !b.concrete.is_subset(&a.concrete) {
                     return Err(UnifyError::EffectMismatch { a, b });
                 }
-                let extra: std::collections::BTreeSet<String> =
+                let extra: std::collections::BTreeSet<crate::types::EffectKind> =
                     a.concrete.difference(&b.concrete).cloned().collect();
                 let bound = EffectSet { concrete: extra, var: None };
                 self.eff_subst.insert(vb, bound);

@@ -98,10 +98,20 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             // TypeEnv::new_with_builtins; refer to it nominally so call
             // sites unify against the user's `:: Matrix` annotations.
             let mat = || Ty::Con("Matrix".into(), Vec::new());
-            // Scalar floats.
-            for name in &["exp", "log", "sqrt", "abs"] {
+            // Scalar floats — single-arg `Float -> Float`.
+            for name in &[
+                "exp", "log", "log2", "log10", "sqrt", "abs",
+                "sin", "cos", "tan", "asin", "acos", "atan",
+                "floor", "ceil", "round", "trunc",
+            ] {
                 fields.insert((*name).into(), Ty::function(
                     vec![Ty::float()], EffectSet::empty(), Ty::float(),
+                ));
+            }
+            // Two-arg `Float, Float -> Float`.
+            for name in &["pow", "atan2", "min", "max"] {
+                fields.insert((*name).into(), Ty::function(
+                    vec![Ty::float(), Ty::float()], EffectSet::empty(), Ty::float(),
                 ));
             }
             // Constructors.
@@ -273,6 +283,60 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             ));
             Some(Ty::Record(fields))
         }
+        "random" => {
+            // #219: pure, seeded RNG. The caller threads the `Rng`
+            // value through computations explicitly — there is no
+            // global state and no effect tag, because the seed is
+            // visible in the program's value flow and replay is
+            // therefore deterministic by construction.
+            //
+            // Backed at runtime by SplitMix64 (deterministic across
+            // platforms, single-u64 state). The proposal mentioned
+            // `rand_chacha` for cryptographic-strength bias, but the
+            // acceptance criterion is just "byte-identical sequence
+            // across platforms," and SplitMix64 satisfies that with
+            // a state shape that fits in `Value::Int` cleanly.
+            let rng_t = || Ty::Con("Rng".into(), vec![]);
+            let mut fields = IndexMap::new();
+            // seed :: Int -> Rng
+            fields.insert("seed".into(), Ty::function(
+                vec![Ty::int()], EffectSet::empty(), rng_t()));
+            // int :: Rng, Int, Int -> (Int, Rng)
+            // Uniform in [lo, hi] inclusive at both ends. Returns
+            // the drawn value and the advanced Rng.
+            fields.insert("int".into(), Ty::function(
+                vec![rng_t(), Ty::int(), Ty::int()],
+                EffectSet::empty(),
+                Ty::Tuple(vec![Ty::int(), rng_t()])));
+            // float :: Rng -> (Float, Rng)
+            // Uniform in [0.0, 1.0).
+            fields.insert("float".into(), Ty::function(
+                vec![rng_t()], EffectSet::empty(),
+                Ty::Tuple(vec![Ty::float(), rng_t()])));
+            // choose :: Rng, List[T] -> Option[(T, Rng)]
+            // Returns None if the list is empty.
+            fields.insert("choose".into(), Ty::function(
+                vec![rng_t(), Ty::List(Box::new(Ty::Var(0)))],
+                EffectSet::empty(),
+                Ty::Con("Option".into(), vec![
+                    Ty::Tuple(vec![Ty::Var(0), rng_t()]),
+                ]),
+            ));
+            Some(Ty::Record(fields))
+        }
+        "env" => {
+            // #216: env.get(name) -> [env] Option[Str].
+            // Per-var scoping (`[env(NAME)]`) lands with the
+            // per-capability effect parameterization work (#207); the
+            // flat `[env]` is the v1 surface.
+            let mut fields = IndexMap::new();
+            fields.insert("get".into(), Ty::function(
+                vec![Ty::str()],
+                EffectSet::singleton("env"),
+                Ty::Con("Option".into(), vec![Ty::str()]),
+            ));
+            Some(Ty::Record(fields))
+        }
         "net" => {
             let mut fields = IndexMap::new();
             // get :: Str -> [net] Result[Str, Str]
@@ -403,6 +467,19 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::open_var(5),
                 Ty::Con("Result".into(), vec![Ty::Var(0), Ty::Var(2)]),
             ));
+            // result.or_else :: Result[T, E1], (E1) -> [E] Result[T, E2]
+            //                                    -> [E] Result[T, E2]
+            // Recovery combinator: closure runs only on Err and returns
+            // the next Result (which itself may swap the error type).
+            fields.insert("or_else".into(), Ty::function(
+                vec![
+                    Ty::Con("Result".into(), vec![Ty::Var(0), Ty::Var(1)]),
+                    Ty::function(vec![Ty::Var(1)], EffectSet::open_var(6),
+                        Ty::Con("Result".into(), vec![Ty::Var(0), Ty::Var(2)])),
+                ],
+                EffectSet::open_var(6),
+                Ty::Con("Result".into(), vec![Ty::Var(0), Ty::Var(2)]),
+            ));
             Some(Ty::Record(fields))
         }
         "option" => {
@@ -416,10 +493,34 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::open_var(2),
                 Ty::Con("Option".into(), vec![Ty::Var(1)]),
             ));
+            // option.and_then :: Option[T], (T) -> [E] Option[U] -> [E] Option[U]
+            // The compiler entry has been wired since the result/option
+            // variant_map work landed; this signature was missed,
+            // making the call fail to type-check until now.
+            fields.insert("and_then".into(), Ty::function(
+                vec![
+                    Ty::Con("Option".into(), vec![Ty::Var(0)]),
+                    Ty::function(vec![Ty::Var(0)], EffectSet::open_var(3),
+                        Ty::Con("Option".into(), vec![Ty::Var(1)])),
+                ],
+                EffectSet::open_var(3),
+                Ty::Con("Option".into(), vec![Ty::Var(1)]),
+            ));
             fields.insert("unwrap_or".into(), Ty::function(
                 vec![Ty::Con("Option".into(), vec![Ty::Var(0)]), Ty::Var(0)],
                 EffectSet::empty(),
                 Ty::Var(0),
+            ));
+            // option.or_else :: Option[T], () -> [E] Option[T] -> [E] Option[T]
+            // The closure takes no arguments because None has no payload to pass.
+            fields.insert("or_else".into(), Ty::function(
+                vec![
+                    Ty::Con("Option".into(), vec![Ty::Var(0)]),
+                    Ty::function(vec![], EffectSet::open_var(4),
+                        Ty::Con("Option".into(), vec![Ty::Var(0)])),
+                ],
+                EffectSet::open_var(4),
+                Ty::Con("Option".into(), vec![Ty::Var(0)]),
             ));
             Some(Ty::Record(fields))
         }
@@ -753,7 +854,7 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             fields.insert("set_sink".into(), Ty::function(
                 vec![Ty::str()],
                 EffectSet {
-                    concrete: ["io".to_string(), "fs_write".to_string()].into_iter().collect(),
+                    concrete: [crate::types::EffectKind::bare("io"), crate::types::EffectKind::bare("fs_write")].into_iter().collect(),
                     var: None,
                 },
                 result_str(Ty::Unit)));
@@ -922,7 +1023,7 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             fields.insert("copy".into(), Ty::function(
                 vec![Ty::str(), Ty::str()],
                 EffectSet {
-                    concrete: ["fs_walk".to_string(), "fs_write".to_string()].into_iter().collect(),
+                    concrete: [crate::types::EffectKind::bare("fs_walk"), crate::types::EffectKind::bare("fs_write")].into_iter().collect(),
                     var: None,
                 },
                 result_str(Ty::Unit)));
@@ -937,7 +1038,7 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             fields.insert("open".into(), Ty::function(
                 vec![Ty::str()],
                 EffectSet {
-                    concrete: ["kv".to_string(), "fs_write".to_string()].into_iter().collect(),
+                    concrete: [crate::types::EffectKind::bare("kv"), crate::types::EffectKind::bare("fs_write")].into_iter().collect(),
                     var: None,
                 },
                 Ty::Con("Result".into(), vec![kv_t(), Ty::str()])));
@@ -998,7 +1099,7 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             fields.insert("open".into(), Ty::function(
                 vec![Ty::str()],
                 EffectSet {
-                    concrete: ["sql".to_string(), "fs_write".to_string()].into_iter().collect(),
+                    concrete: [crate::types::EffectKind::bare("sql"), crate::types::EffectKind::bare("fs_write")].into_iter().collect(),
                     var: None,
                 },
                 Ty::Con("Result".into(), vec![db_t(), Ty::str()])));
@@ -1026,6 +1127,104 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                     Ty::List(Box::new(Ty::Var(0))),
                     Ty::str(),
                 ])));
+            Some(Ty::Record(fields))
+        }
+        "parser" => {
+            // #217: structured parser combinators. Parser values are
+            // tagged Records at runtime (`{ kind, ... }`), opaque at
+            // the language level via `Ty::Con("Parser", [T])`.
+            //
+            // Surface:
+            //   - primitives: char, string, digit, alpha, whitespace, eof
+            //   - combinators: seq, alt, many, optional, map, and_then
+            //   - run :: Parser[T], Str -> Result[T, ParseErr]
+            //
+            // `map` and `and_then` were deferred from #217's v1 because
+            // their closure arguments carried call-site identity that
+            // broke the canonical-parsers acceptance criterion. With
+            // closure body-hash equality landed in #222, that concern
+            // is gone, and #221 wires them in. The interpreter for
+            // `parser.run` has been moved to `lex-bytecode::parser_runtime`
+            // so it can invoke closures from `Map` / `AndThen` nodes.
+            let pt = |t: Ty| Ty::Con("Parser".into(), vec![t]);
+            let parse_err = || {
+                let mut fs = IndexMap::new();
+                fs.insert("pos".into(), Ty::int());
+                fs.insert("message".into(), Ty::str());
+                Ty::Record(fs)
+            };
+            let mut fields = IndexMap::new();
+            // char :: Str -> Parser[Str] (single-char Str literal)
+            fields.insert("char".into(), Ty::function(
+                vec![Ty::str()], EffectSet::empty(), pt(Ty::str())));
+            // string :: Str -> Parser[Str]
+            fields.insert("string".into(), Ty::function(
+                vec![Ty::str()], EffectSet::empty(), pt(Ty::str())));
+            // digit :: () -> Parser[Str]
+            fields.insert("digit".into(), Ty::function(
+                vec![], EffectSet::empty(), pt(Ty::str())));
+            // alpha :: () -> Parser[Str]
+            fields.insert("alpha".into(), Ty::function(
+                vec![], EffectSet::empty(), pt(Ty::str())));
+            // whitespace :: () -> Parser[Str]
+            fields.insert("whitespace".into(), Ty::function(
+                vec![], EffectSet::empty(), pt(Ty::str())));
+            // eof :: () -> Parser[Unit]
+            fields.insert("eof".into(), Ty::function(
+                vec![], EffectSet::empty(), pt(Ty::Unit)));
+            // seq :: Parser[A], Parser[B] -> Parser[(A, B)]
+            fields.insert("seq".into(), Ty::function(
+                vec![pt(Ty::Var(0)), pt(Ty::Var(1))],
+                EffectSet::empty(),
+                pt(Ty::Tuple(vec![Ty::Var(0), Ty::Var(1)]))));
+            // alt :: Parser[T], Parser[T] -> Parser[T]
+            // PEG-style ordered choice: the second alternative is
+            // tried only if the first fails.
+            fields.insert("alt".into(), Ty::function(
+                vec![pt(Ty::Var(0)), pt(Ty::Var(0))],
+                EffectSet::empty(),
+                pt(Ty::Var(0))));
+            // many :: Parser[T] -> Parser[List[T]]
+            // Zero-or-more. Stops as soon as the inner parser fails
+            // OR doesn't advance the position (avoids infinite loop
+            // on empty matches).
+            fields.insert("many".into(), Ty::function(
+                vec![pt(Ty::Var(0))],
+                EffectSet::empty(),
+                pt(Ty::List(Box::new(Ty::Var(0))))));
+            // optional :: Parser[T] -> Parser[Option[T]]
+            fields.insert("optional".into(), Ty::function(
+                vec![pt(Ty::Var(0))],
+                EffectSet::empty(),
+                pt(Ty::Con("Option".into(), vec![Ty::Var(0)]))));
+            // map :: Parser[T], (T) -> [E] U -> [E] Parser[U]
+            // The closure runs at parse time when the Parser is run.
+            // Effect-polymorphic on the closure: any effect the
+            // closure declares propagates to the surrounding `run`.
+            fields.insert("map".into(), Ty::function(
+                vec![
+                    pt(Ty::Var(0)),
+                    Ty::function(vec![Ty::Var(0)], EffectSet::open_var(2), Ty::Var(1)),
+                ],
+                EffectSet::open_var(2),
+                pt(Ty::Var(1))));
+            // and_then :: Parser[T], (T) -> [E] Parser[U] -> [E] Parser[U]
+            // Monadic bind: closure inspects the parsed value and
+            // returns the next parser to run.
+            fields.insert("and_then".into(), Ty::function(
+                vec![
+                    pt(Ty::Var(0)),
+                    Ty::function(vec![Ty::Var(0)], EffectSet::open_var(3),
+                        pt(Ty::Var(1))),
+                ],
+                EffectSet::open_var(3),
+                pt(Ty::Var(1))));
+            // run :: Parser[T], Str -> Result[T, ParseErr]
+            // ParseErr = { pos :: Int, message :: Str }
+            fields.insert("run".into(), Ty::function(
+                vec![pt(Ty::Var(0)), Ty::str()],
+                EffectSet::empty(),
+                Ty::Con("Result".into(), vec![Ty::Var(0), parse_err()])));
             Some(Ty::Record(fields))
         }
         "regex" => {
@@ -1332,6 +1531,8 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "tuple" => "tuple",
         "time" => "time",
         "rand" => "rand",
+        "random" => "random",
+        "env" => "env",
         "bytes" => "bytes",
         "net" => "net",
         "chat" => "chat",
@@ -1341,6 +1542,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "proc" => "proc",
         "crypto" => "crypto",
         "regex" => "regex",
+        "parser" => "parser",
         "deque" => "deque",
         "kv" => "kv",
         "sql" => "sql",
