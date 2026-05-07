@@ -1057,20 +1057,28 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                 .ok_or_else(|| "parser.optional: missing inner parser".to_string())?;
             Ok(parser_node("Optional", &[("p", p)]))
         }
-        ("parser", "run") => {
-            let parser = args.first()
-                .ok_or_else(|| "parser.run: missing parser".to_string())?;
-            let input = expect_str(args.get(1))?;
-            match parser_run_impl(parser, &input, 0) {
-                Ok((value, _pos)) => Ok(ok_v(value)),
-                Err((pos, msg)) => {
-                    let mut e = indexmap::IndexMap::new();
-                    e.insert("pos".into(), Value::Int(pos as i64));
-                    e.insert("message".into(), Value::Str(msg));
-                    Ok(err_v(Value::Record(e)))
-                }
-            }
+        // `parser.map` and `parser.and_then` (#221): closure-bearing
+        // combinators. Constructors only — actual closure invocation
+        // happens at parser.run time via the Vm-level interpreter.
+        ("parser", "map") => {
+            let p = args.first().cloned()
+                .ok_or_else(|| "parser.map: missing parser".to_string())?;
+            let f = args.get(1).cloned()
+                .ok_or_else(|| "parser.map: missing closure".to_string())?;
+            Ok(parser_node("Map", &[("p", p), ("f", f)]))
         }
+        ("parser", "and_then") => {
+            let p = args.first().cloned()
+                .ok_or_else(|| "parser.and_then: missing parser".to_string())?;
+            let f = args.get(1).cloned()
+                .ok_or_else(|| "parser.and_then: missing closure".to_string())?;
+            Ok(parser_node("AndThen", &[("p", p), ("f", f)]))
+        }
+        // `parser.run` is handled at the Vm level (lex-bytecode's
+        // `Op::EffectCall` intercept) — it needs reentrant Vm access
+        // to invoke the closures inside `Map` / `AndThen` nodes. The
+        // pure-builtin path doesn't have that, so we deliberately do
+        // *not* have a `("parser", "run")` arm here.
 
         // -- regex (the compiled `Regex` is stored as the pattern
         // string; the runtime caches the actual `regex::Regex` so
@@ -1452,131 +1460,9 @@ fn parser_node(kind: &str, fields: &[(&str, Value)]) -> Value {
     Value::Record(r)
 }
 
-/// Interpret a parser AST against `input` starting at byte `pos`.
-/// Returns either `(value, new_pos)` on success or `(failure_pos,
-/// message)` on failure. Failures carry a position so callers can
-/// report column numbers without a separate scan.
-fn parser_run_impl(
-    node: &Value,
-    input: &str,
-    pos: usize,
-) -> Result<(Value, usize), (usize, String)> {
-    let rec = match node {
-        Value::Record(r) => r,
-        _ => return Err((pos, "parser: expected Parser node".into())),
-    };
-    let kind = match rec.get("kind") {
-        Some(Value::Str(s)) => s.as_str(),
-        _ => return Err((pos, "parser: malformed node (no kind)".into())),
-    };
-    let bytes = input.as_bytes();
-    match kind {
-        "Char" => {
-            let want = match rec.get("ch") {
-                Some(Value::Str(s)) => s,
-                _ => return Err((pos, "char: missing ch".into())),
-            };
-            let want_bytes = want.as_bytes();
-            if pos + want_bytes.len() > bytes.len() {
-                return Err((pos, format!("expected {want:?}, got EOF")));
-            }
-            if &bytes[pos..pos + want_bytes.len()] == want_bytes {
-                Ok((Value::Str(want.clone()), pos + want_bytes.len()))
-            } else {
-                Err((pos, format!("expected {want:?}")))
-            }
-        }
-        "String" => {
-            let want = match rec.get("s") {
-                Some(Value::Str(s)) => s,
-                _ => return Err((pos, "string: missing s".into())),
-            };
-            if input[pos..].starts_with(want.as_str()) {
-                Ok((Value::Str(want.clone()), pos + want.len()))
-            } else {
-                Err((pos, format!("expected {want:?}")))
-            }
-        }
-        "Digit" => {
-            if let Some(&b) = bytes.get(pos) {
-                if b.is_ascii_digit() {
-                    return Ok((Value::Str((b as char).to_string()), pos + 1));
-                }
-            }
-            Err((pos, "expected digit".into()))
-        }
-        "Alpha" => {
-            if let Some(&b) = bytes.get(pos) {
-                if b.is_ascii_alphabetic() {
-                    return Ok((Value::Str((b as char).to_string()), pos + 1));
-                }
-            }
-            Err((pos, "expected alpha".into()))
-        }
-        "Whitespace" => {
-            if let Some(&b) = bytes.get(pos) {
-                if b.is_ascii_whitespace() {
-                    return Ok((Value::Str((b as char).to_string()), pos + 1));
-                }
-            }
-            Err((pos, "expected whitespace".into()))
-        }
-        "Eof" => {
-            if pos == bytes.len() {
-                Ok((Value::Unit, pos))
-            } else {
-                Err((pos, "expected EOF".into()))
-            }
-        }
-        "Seq" => {
-            let a = rec.get("a").ok_or((pos, "seq: missing a".to_string()))?;
-            let b = rec.get("b").ok_or((pos, "seq: missing b".to_string()))?;
-            let (va, p1) = parser_run_impl(a, input, pos)?;
-            let (vb, p2) = parser_run_impl(b, input, p1)?;
-            Ok((Value::Tuple(vec![va, vb]), p2))
-        }
-        "Alt" => {
-            // Ordered choice: bias toward `a`. If `a` fails (at any
-            // position), try `b` from the original `pos`. This is
-            // PEG semantics, not the unrestricted-CFG variant.
-            let a = rec.get("a").ok_or((pos, "alt: missing a".to_string()))?;
-            let b = rec.get("b").ok_or((pos, "alt: missing b".to_string()))?;
-            match parser_run_impl(a, input, pos) {
-                Ok(r) => Ok(r),
-                Err(_) => parser_run_impl(b, input, pos),
-            }
-        }
-        "Many" => {
-            let p = rec.get("p").ok_or((pos, "many: missing p".to_string()))?;
-            let mut cur = pos;
-            let mut out = Vec::new();
-            loop {
-                match parser_run_impl(p, input, cur) {
-                    // Require strict advance to avoid infinite loops
-                    // on inner parsers that match the empty string
-                    // (e.g. `optional(...)`).
-                    Ok((v, np)) if np > cur => { out.push(v); cur = np; }
-                    _ => break,
-                }
-            }
-            Ok((Value::List(out), cur))
-        }
-        "Optional" => {
-            let p = rec.get("p").ok_or((pos, "optional: missing p".to_string()))?;
-            match parser_run_impl(p, input, pos) {
-                Ok((v, np)) => Ok((
-                    Value::Variant { name: "Some".into(), args: vec![v] },
-                    np,
-                )),
-                Err(_) => Ok((
-                    Value::Variant { name: "None".into(), args: vec![] },
-                    pos,
-                )),
-            }
-        }
-        other => Err((pos, format!("unknown parser kind: {other:?}"))),
-    }
-}
+// `parser.run` interpretation lives in `lex-bytecode::parser_runtime`
+// (#221) — it needs reentrant Vm access to invoke closures inside
+// `Map` / `AndThen` nodes, which the pure-builtin path doesn't have.
 
 // -- std.random helpers (#219) ----------------------------------------
 

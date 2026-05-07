@@ -4,6 +4,7 @@ pub mod op;
 pub mod program;
 pub mod value;
 pub mod compiler;
+pub mod parser_runtime;
 pub mod vm;
 
 pub use compiler::compile_program;

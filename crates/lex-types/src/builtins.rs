@@ -1134,18 +1134,18 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             // tagged Records at runtime (`{ kind, ... }`), opaque at
             // the language level via `Ty::Con("Parser", [T])`.
             //
-            // This v1 surface is the structural subset:
+            // Surface:
             //   - primitives: char, string, digit, alpha, whitespace, eof
-            //   - combinators: seq, alt, many, optional
+            //   - combinators: seq, alt, many, optional, map, and_then
             //   - run :: Parser[T], Str -> Result[T, ParseErr]
             //
-            // `map` and `and_then` are deliberately deferred: their
-            // closure captures have call-site identity (fn_id +
-            // captures), which would make two parsers for the same
-            // grammar canonicalize differently — directly at odds with
-            // the proposal's "canonical parsers" acceptance criterion.
-            // See the comment on #217 for the full rationale and the
-            // path forward.
+            // `map` and `and_then` were deferred from #217's v1 because
+            // their closure arguments carried call-site identity that
+            // broke the canonical-parsers acceptance criterion. With
+            // closure body-hash equality landed in #222, that concern
+            // is gone, and #221 wires them in. The interpreter for
+            // `parser.run` has been moved to `lex-bytecode::parser_runtime`
+            // so it can invoke closures from `Map` / `AndThen` nodes.
             let pt = |t: Ty| Ty::Con("Parser".into(), vec![t]);
             let parse_err = || {
                 let mut fs = IndexMap::new();
@@ -1197,6 +1197,28 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 vec![pt(Ty::Var(0))],
                 EffectSet::empty(),
                 pt(Ty::Con("Option".into(), vec![Ty::Var(0)]))));
+            // map :: Parser[T], (T) -> [E] U -> [E] Parser[U]
+            // The closure runs at parse time when the Parser is run.
+            // Effect-polymorphic on the closure: any effect the
+            // closure declares propagates to the surrounding `run`.
+            fields.insert("map".into(), Ty::function(
+                vec![
+                    pt(Ty::Var(0)),
+                    Ty::function(vec![Ty::Var(0)], EffectSet::open_var(2), Ty::Var(1)),
+                ],
+                EffectSet::open_var(2),
+                pt(Ty::Var(1))));
+            // and_then :: Parser[T], (T) -> [E] Parser[U] -> [E] Parser[U]
+            // Monadic bind: closure inspects the parsed value and
+            // returns the next parser to run.
+            fields.insert("and_then".into(), Ty::function(
+                vec![
+                    pt(Ty::Var(0)),
+                    Ty::function(vec![Ty::Var(0)], EffectSet::open_var(3),
+                        pt(Ty::Var(1))),
+                ],
+                EffectSet::open_var(3),
+                pt(Ty::Var(1))));
             // run :: Parser[T], Str -> Result[T, ParseErr]
             // ParseErr = { pos :: Int, message :: Str }
             fields.insert("run".into(), Ty::function(
