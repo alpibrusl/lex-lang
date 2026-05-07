@@ -260,8 +260,7 @@ fn cmd_check(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     // canonical-AST bytes instead of `.lex` text.
     let mut from_canonical = false;
     let mut path: Option<&str> = None;
-    let mut iter = args.iter();
-    while let Some(a) = iter.next() {
+    for a in args {
         match a.as_str() {
             "--from-canonical" => { from_canonical = true; }
             other if !other.starts_with("--") => {
