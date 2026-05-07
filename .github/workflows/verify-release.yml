@@ -1,0 +1,117 @@
+name: verify-release
+
+# Smoke-tests the artifacts produced by `release.yml` after the tag
+# is published (#198). Runs the Linux binaries through their host
+# loader (native for x86_64, qemu-user-static for aarch64) and
+# asserts `lex --version` returns successfully.
+#
+# Intentionally NOT a gate on the release itself — it triggers on
+# `release: published`, so by the time it runs the artifacts are
+# already public. Failures surface as a red CI status on the tag,
+# not a blocked publish. The reasoning: a packaging regression that
+# slips past the build matrix is rare, and decoupling lets us iterate
+# on the verify logic without risking the release pipeline.
+#
+# Coverage:
+#   - x86_64-unknown-linux-gnu (native, free)
+#   - aarch64-unknown-linux-gnu (qemu-user-static, ~free)
+#
+# Out of scope:
+#   - macOS aarch64 / x86_64. Apple's loader isn't redistributable
+#     in CI; verification on those targets needs a real Mac runner
+#     or a downstream check.
+#   - Windows. No qemu equivalent for Windows binaries; would need
+#     a windows runner just to print --version.
+#
+# Manual rehearsal: `workflow_dispatch` with the tag input runs the
+# whole flow against an existing release.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to verify (e.g. v0.2.2)"
+        required: true
+
+jobs:
+  verify-linux:
+    name: verify (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            qemu: false
+          - target: aarch64-unknown-linux-gnu
+            qemu: true
+    steps:
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          T="${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}"
+          if [ -z "$T" ]; then
+            echo "no tag resolved from ref or input"; exit 1
+          fi
+          echo "tag=$T" >> "$GITHUB_OUTPUT"
+
+      - name: Install qemu-user-static
+        if: matrix.qemu
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-user-static
+
+      - name: Download artifact + sha256
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.tag }}"
+          NAME="lex-${TAG}-${{ matrix.target }}"
+          BASE="https://github.com/${{ github.repository }}/releases/download/${TAG}"
+          curl -sSLO --retry 3 "${BASE}/${NAME}.tar.gz"
+          curl -sSLO --retry 3 "${BASE}/${NAME}.tar.gz.sha256"
+          sha256sum -c "${NAME}.tar.gz.sha256"
+          tar -xzf "${NAME}.tar.gz"
+          # Sanity-check the binary's architecture matches the target.
+          file "${NAME}/lex"
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-gnu)
+              file "${NAME}/lex" | grep -q "x86-64"
+              ;;
+            aarch64-unknown-linux-gnu)
+              file "${NAME}/lex" | grep -q "aarch64"
+              ;;
+          esac
+
+      - name: Run --version through host loader (or qemu)
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.tag }}"
+          BIN="lex-${TAG}-${{ matrix.target }}/lex"
+          # binfmt_misc on Ubuntu auto-routes aarch64 ELFs to
+          # qemu-aarch64-static; native x86_64 just runs.
+          OUT="$($BIN --version)"
+          echo "lex --version: $OUT"
+          # Sanity: the version output should mention `lex` and
+          # contain the tag (without the leading `v`).
+          echo "$OUT" | grep -q lex
+          STRIPPED="${TAG#v}"
+          echo "$OUT" | grep -q "$STRIPPED"
+
+      - name: Smoke-test compile + run
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.tag }}"
+          BIN="lex-${TAG}-${{ matrix.target }}/lex"
+          cat > hello.lex <<'LEX'
+          fn add(x :: Int, y :: Int) -> Int { x + y }
+          LEX
+          # `lex check` exercises parser + canonicalize + type-check
+          # on the cross-compiled binary; cheaper than `run` and
+          # doesn't need stdin handling for arg-passing semantics.
+          "$BIN" check hello.lex

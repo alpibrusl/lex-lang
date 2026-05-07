@@ -35,7 +35,7 @@ pub fn to_smtlib(spec: &Spec) -> String {
     write!(out, "(assert (not (forall (").unwrap();
     for (i, q) in spec.quantifiers.iter().enumerate() {
         if i > 0 { write!(out, " ").unwrap(); }
-        write!(out, "({} {})", q.name, smt_type(q.ty)).unwrap();
+        write!(out, "({} {})", q.name, smt_type(&q.ty)).unwrap();
     }
     write!(out, ") ").unwrap();
     // Antecedent: AND of constraints (defaults to true).
@@ -49,12 +49,21 @@ pub fn to_smtlib(spec: &Spec) -> String {
     out
 }
 
-fn smt_type(t: SpecType) -> &'static str {
+fn smt_type(t: &SpecType) -> &'static str {
     match t {
         SpecType::Int => "Int",
         SpecType::Float => "Real",
         SpecType::Bool => "Bool",
         SpecType::Str => "String",
+        // #208: SMT-LIB encoding for record types isn't implemented in
+        // this slice. SMT supports records via the `Record`/datatype
+        // declaration, but mapping `SpecType::Record` into SMT-LIB
+        // datatypes needs name management for nested records and
+        // accessor function generation. Out of scope for v1; the SMT
+        // path stays scalar-only. Specs that use records are still
+        // evaluable via the gate path (`evaluate_gate_compiled`),
+        // which is what soft-agent uses.
+        SpecType::Record { .. } => "<unsupported-Record>",
     }
 }
 
@@ -95,6 +104,12 @@ fn expr_to_smt(e: &SpecExpr) -> String {
         }
         SpecExpr::Let { name, value, body } => {
             format!("(let (({name} {})) {})", expr_to_smt(value), expr_to_smt(body))
+        }
+        // #208: see `smt_type`. Record field access maps to SMT-LIB
+        // datatype accessors which need the datatype declarations
+        // smt_type doesn't currently emit. Out of scope for v1.
+        SpecExpr::FieldAccess { value, field } => {
+            format!("(<unsupported-FieldAccess> {} {})", expr_to_smt(value), field)
         }
     }
 }

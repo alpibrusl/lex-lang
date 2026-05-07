@@ -181,6 +181,17 @@ fn sample(ty: &SpecType, rng: &mut DetRng) -> Value {
             let n = rng.next_u64() % 6;
             Value::Str(("ab".repeat(n as usize)).chars().take(n as usize).collect())
         }
+        // #208: random-input sampling on records recurses field by field.
+        // The gate-evaluation path (which is what soft-agent uses) bypasses
+        // this — agents pass concrete record values via bindings — but the
+        // offline `check_spec` random-input prover needs a sampler too.
+        SpecType::Record { fields } => {
+            let mut out = indexmap::IndexMap::new();
+            for (name, fty) in fields {
+                out.insert(name.clone(), sample(fty, rng));
+            }
+            Value::Record(out)
+        }
     }
 }
 
@@ -220,6 +231,20 @@ fn eval(
             let handler = DefaultHandler::new(policy.clone());
             let mut vm = Vm::with_handler(bc, Box::new(handler));
             vm.call(func, argv).map_err(|e| format!("call `{func}`: {e}"))
+        }
+        SpecExpr::FieldAccess { value, field } => {
+            // #208: random-input prover supports field access on records,
+            // mirroring the gate path. The two evaluators stay in sync —
+            // a spec that holds for a concrete record at runtime should
+            // also hold for randomly-sampled records of the same shape.
+            let v = eval(value, bindings, bc, policy)?;
+            match v {
+                Value::Record(fields) => fields.get(field).cloned().ok_or_else(|| {
+                    let known: Vec<&str> = fields.keys().map(String::as_str).collect();
+                    format!("field `{field}` missing on record (have: {})", known.join(", "))
+                }),
+                other => Err(format!("field access `.{field}` on non-record: {other:?}")),
+            }
         }
     }
 }
