@@ -108,6 +108,9 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
                         a::EffectArg::Ident { value } => EffectArg::Ident(value.clone()),
                     }),
                 }).collect(),
+                // Filled in at the end of the compile pass, once `code`
+                // and `locals_count` are final. See #222.
+                body_hash: crate::program::ZERO_BODY_HASH,
             });
         }
     }
@@ -187,6 +190,17 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
         drop(fc);
         p.functions[pl.fn_id as usize].code = code;
         p.functions[pl.fn_id as usize].locals_count = peak;
+    }
+
+    // Final pass: stamp every function with its content hash now that
+    // every body is finalized (#222). Trampolines installed via
+    // `install_trampoline` already have it; recomputing is cheap and
+    // makes the invariant easier to read at this top level.
+    for f in p.functions.iter_mut() {
+        if f.body_hash == crate::program::ZERO_BODY_HASH {
+            f.body_hash = crate::program::compute_body_hash(
+                f.arity, f.locals_count, &f.code);
+        }
     }
 
     p.constants = pool.pool;
@@ -550,6 +564,8 @@ impl<'a> FnCompiler<'a> {
             locals_count: 0,
             code: Vec::new(),
             effects: Vec::new(),
+            // See #222: filled in at the end of the compile pass.
+            body_hash: crate::program::ZERO_BODY_HASH,
         });
 
         // Emit code at the lambda site: load each captured local, then MakeClosure.
@@ -1001,14 +1017,20 @@ impl<'a> FnCompiler<'a> {
     // arg_0, ...]: captures first, the closure's own args after.
 
     /// Allocate a fresh fn_id for a trampoline and install its bytecode.
+    /// Trampolines are the one Function-creation path that already has
+    /// the body in hand at install time (top-level fns and lambdas have
+    /// it filled in later), so we compute `body_hash` immediately. The
+    /// final hash pass at the end of `compile_program` is a no-op here.
     fn install_trampoline(&mut self, name: &str, arity: u16, locals_count: u16, code: Vec<Op>) -> u32 {
         let fn_id = self.next_fn_id.len() as u32;
+        let body_hash = crate::program::compute_body_hash(arity, locals_count, &code);
         self.next_fn_id.push(Function {
             name: name.into(),
             arity,
             locals_count,
             code,
             effects: Vec::new(),
+            body_hash,
         });
         fn_id
     }

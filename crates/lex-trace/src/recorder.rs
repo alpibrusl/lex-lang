@@ -188,7 +188,15 @@ fn value_to_json(v: &Value) -> serde_json::Value {
             m.insert("args".into(), J::Array(args.iter().map(value_to_json).collect()));
             J::Object(m)
         }
-        Value::Closure { fn_id, .. } => J::String(format!("<closure fn_{fn_id}>")),
+        Value::Closure { body_hash, .. } => {
+            // Render the first 4 bytes (8 hex chars) of the body hash
+            // (#222). Equivalent closures across source locations now
+            // produce the same trace token, so trace replay is stable
+            // when a developer moves a closure literal.
+            let prefix: String = body_hash.iter().take(4)
+                .map(|b| format!("{b:02x}")).collect();
+            J::String(format!("<closure {prefix}>"))
+        }
         Value::F64Array { rows, cols, data } => {
             let mut m = serde_json::Map::new();
             m.insert("$f64_array".into(), J::Bool(true));

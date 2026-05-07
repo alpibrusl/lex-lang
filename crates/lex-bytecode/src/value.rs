@@ -1,9 +1,10 @@
 //! Runtime values.
 
+use crate::program::BodyHash;
 use indexmap::IndexMap;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Value {
     Int(i64),
     Float(f64),
@@ -18,7 +19,14 @@ pub enum Value {
     /// First-class function value (a lambda + its captured locals). The
     /// function's first `captures.len()` params bind to `captures`; the
     /// remaining params are supplied at call time.
-    Closure { fn_id: u32, captures: Vec<Value> },
+    ///
+    /// `fn_id` is a dense compile-time index into `Program::functions`
+    /// for fast dispatch; `body_hash` is the **canonical identity** —
+    /// two closures with identical bytecode bodies compare equal even
+    /// when their `fn_id`s differ (which they will, when the source
+    /// has the same closure literal at two locations). See `PartialEq`
+    /// below and #222 for the rationale.
+    Closure { fn_id: u32, body_hash: BodyHash, captures: Vec<Value> },
     /// Dense row-major `f64` matrix. A "fast lane" representation that
     /// avoids the per-element `Value::Float` boxing of `Value::List`.
     /// Used by Core's native tensor ops (matmul, dot, …) so end-to-end
@@ -41,6 +49,41 @@ pub enum Value {
     /// uses this dedicated variant rather than backing a deque on top
     /// of `Value::List` (which would make `push_front` O(n)).
     Deque(VecDeque<Value>),
+}
+
+/// Manual `PartialEq` for `Value` (#222). Mirrors the auto-derived
+/// implementation for every variant *except* `Closure`, which compares
+/// on `(body_hash, captures)` only — `fn_id` is a dense compile-time
+/// index that is not stable across source-location-equivalent closure
+/// literals, and including it would defeat the canonicality property
+/// the `body_hash` field exists to provide.
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        use Value::*;
+        match (self, other) {
+            (Int(a), Int(b)) => a == b,
+            (Float(a), Float(b)) => a == b,
+            (Bool(a), Bool(b)) => a == b,
+            (Str(a), Str(b)) => a == b,
+            (Bytes(a), Bytes(b)) => a == b,
+            (Unit, Unit) => true,
+            (List(a), List(b)) => a == b,
+            (Tuple(a), Tuple(b)) => a == b,
+            (Record(a), Record(b)) => a == b,
+            (Variant { name: an, args: aa }, Variant { name: bn, args: ba }) =>
+                an == bn && aa == ba,
+            (Closure { body_hash: ah, captures: ac, .. },
+             Closure { body_hash: bh, captures: bc, .. }) =>
+                ah == bh && ac == bc,
+            (F64Array { rows: ar, cols: ac, data: ad },
+             F64Array { rows: br, cols: bc, data: bd }) =>
+                ar == br && ac == bc && ad == bd,
+            (Map(a), Map(b)) => a == b,
+            (Set(a), Set(b)) => a == b,
+            (Deque(a), Deque(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 /// Hashable, ordered key for `Value::Map` / `Value::Set`. v1
@@ -98,7 +141,9 @@ impl Value {
     /// Encoding:
     /// - `Variant { name, args }` → `{"$variant": name, "args": [...]}`
     /// - `F64Array { ... }` → `{"$f64_array": true, rows, cols, data}`
-    /// - `Closure { fn_id, .. }` → `"<closure fn_N>"`
+    /// - `Closure { body_hash, .. }` → `"<closure HEX8>"` (first 8 hex
+    ///   chars of the body hash; equivalent closures across source
+    ///   locations render identically — see #222)
     /// - `Bytes` → `{"$bytes": "deadbeef"}` (lowercase hex). Round-trips
     ///   through `from_json`. Bare hex strings decode as `Str`, so the
     ///   marker is required to disambiguate bytes from a string that
@@ -137,7 +182,15 @@ impl Value {
                 m.insert("args".into(), J::Array(args.iter().map(Value::to_json).collect()));
                 J::Object(m)
             }
-            Value::Closure { fn_id, .. } => J::String(format!("<closure fn_{fn_id}>")),
+            Value::Closure { body_hash, .. } => {
+                // Render the first 4 bytes (8 hex chars) of the body
+                // hash. Trace stability follows: equivalent closures
+                // produced from different source locations get the
+                // same string. See #222.
+                let prefix: String = body_hash.iter().take(4)
+                    .map(|b| format!("{b:02x}")).collect();
+                J::String(format!("<closure {prefix}>"))
+            }
             Value::F64Array { rows, cols, data } => {
                 let mut m = serde_json::Map::new();
                 m.insert("$f64_array".into(), J::Bool(true));

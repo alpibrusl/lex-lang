@@ -366,14 +366,17 @@ impl<'a> Vm<'a> {
                     let n = capture_count as usize;
                     let mut captures: Vec<Value> = (0..n).map(|_| Value::Unit).collect();
                     for i in (0..n).rev() { captures[i] = self.pop()?; }
-                    self.stack.push(Value::Closure { fn_id, captures });
+                    // Look up the canonical body hash so the resulting
+                    // `Value::Closure` carries it for equality (#222).
+                    let body_hash = self.program.functions[fn_id as usize].body_hash;
+                    self.stack.push(Value::Closure { fn_id, body_hash, captures });
                 }
                 Op::CallClosure { arity, node_id_idx } => {
                     let mut args: Vec<Value> = (0..arity).map(|_| Value::Unit).collect();
                     for i in (0..arity as usize).rev() { args[i] = self.pop()?; }
                     let closure = self.pop()?;
                     let (fn_id, captures) = match closure {
-                        Value::Closure { fn_id, captures } => (fn_id, captures),
+                        Value::Closure { fn_id, captures, .. } => (fn_id, captures),
                         other => return Err(VmError::TypeMismatch(format!("CallClosure on non-closure: {other:?}"))),
                     };
                     let node_id = const_str(&self.program.constants, node_id_idx);
