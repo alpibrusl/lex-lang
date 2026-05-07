@@ -15,9 +15,12 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 sha2.workspace = true
+hex.workspace = true
+ureq = { version = "3.3", default-features = false, features = ["rustls", "platform-verifier", "json"] }
 lex-ast = { path = "../lex-ast", version = "0.2.2" }
 lex-store = { path = "../lex-store", version = "0.2.2" }
 
 [dev-dependencies]
 tempfile = "3"
+tiny_http = "0.12"
 lex-syntax = { path = "../lex-syntax", version = "0.2.2" }

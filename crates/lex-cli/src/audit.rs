@@ -513,10 +513,10 @@ fn cmd_audit_semantic(fmt: &OutputFormat, opts: &AuditOpts) -> Result<()> {
 
     let store = lex_store::Store::open(&root)
         .with_context(|| format!("opening store at {}", root.display()))?;
-    let embedder = lex_search::MockEmbedder::new();
-    let idx = lex_search::SearchIndex::build(&store, &embedder)
+    let embedder = crate::build_embedder(&root)?;
+    let idx = lex_search::SearchIndex::build(&store, &*embedder)
         .map_err(|e| anyhow!("building search index: {e}"))?;
-    let mut hits = idx.query(&embedder, query, limit.saturating_mul(4))
+    let mut hits = idx.query(&*embedder, query, limit.saturating_mul(4))
         .map_err(|e| anyhow!("query embedding: {e}"))?;
 
     // Post-filter by --effect on the ranked list. We over-fetch

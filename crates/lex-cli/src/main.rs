@@ -753,6 +753,24 @@ fn cmd_canonical_encode(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 /// The secret key is printed once and never persisted by Lex itself —
 /// the caller is responsible for storing it (env var, secret manager,
 /// hardware token, etc.).
+/// Build the embedder used by `lex store search` / `lex audit
+/// --query`. When `LEX_EMBED_URL` is set we wire up an HTTP backend
+/// (Ollama or OpenAI-compat per `LEX_EMBED_PROVIDER`) wrapped in a
+/// filesystem cache under `<store>/search/embeddings/`. Otherwise
+/// we use the deterministic [`lex_search::MockEmbedder`].
+pub(crate) fn build_embedder(store_root: &std::path::Path) -> Result<Box<dyn lex_search::Embedder>> {
+    if let Some(http) = lex_search::HttpEmbedder::from_env()
+        .map_err(|e| anyhow!("LEX_EMBED_URL configuration: {e}"))?
+    {
+        let fingerprint = format!("{:?}:{}", http.provider(), http.model());
+        let cache_root = lex_search::default_cache_root(store_root);
+        let cached = lex_search::CachingEmbedder::new(http, cache_root, fingerprint);
+        Ok(Box::new(cached))
+    } else {
+        Ok(Box::new(lex_search::MockEmbedder::new()))
+    }
+}
+
 fn cmd_keygen(fmt: &OutputFormat, _args: &[String]) -> Result<()> {
     let kp = lex_vcs::Keypair::generate()
         .map_err(|e| anyhow!("keygen: {e}"))?;
@@ -1482,10 +1500,10 @@ fn cmd_store_search(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 
     let store = Store::open(&root)
         .with_context(|| format!("opening store at {}", root.display()))?;
-    let embedder = lex_search::MockEmbedder::new();
-    let idx = lex_search::SearchIndex::build(&store, &embedder)
+    let embedder = build_embedder(&root)?;
+    let idx = lex_search::SearchIndex::build(&store, &*embedder)
         .map_err(|e| anyhow!("building search index: {e}"))?;
-    let hits = idx.query(&embedder, &query, limit)
+    let hits = idx.query(&*embedder, &query, limit)
         .map_err(|e| anyhow!("query embedding: {e}"))?;
     let v = serde_json::json!({
         "query": &query,
