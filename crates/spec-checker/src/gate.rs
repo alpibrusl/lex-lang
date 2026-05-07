@@ -211,6 +211,22 @@ fn eval_body(
             }
             vm.call(func, argv).map_err(|e| format!("call `{func}`: {e}"))
         }
+        SpecExpr::FieldAccess { value, field } => {
+            // Drill into a record-typed binding (#208). Fails loudly
+            // if the value isn't a record or the field is missing —
+            // both indicate a spec/binding shape mismatch the agent
+            // wants to know about, not silently default.
+            let v = eval_body(value, bindings, bc, policy, new_tracer)?;
+            match v {
+                Value::Record(fields) => fields.get(field).cloned().ok_or_else(|| {
+                    let known: Vec<&str> = fields.keys().map(String::as_str).collect();
+                    format!("field `{field}` missing on record (have: {})", known.join(", "))
+                }),
+                other => Err(format!(
+                    "field access `.{field}` on non-record: {}",
+                    short_value(&other))),
+            }
+        }
     }
 }
 
@@ -488,5 +504,115 @@ mod tests {
             &compile_program(&lex_ast::canonicalize_program(&parse_source("").unwrap())),
         );
         assert_eq!(v, GateVerdict::Allow);
+    }
+
+    // ---- #208: record-typed bindings + field access ------------------
+
+    /// Build a `Value::Record` from `(field, value)` pairs.
+    fn rec(fields: &[(&str, Value)]) -> Value {
+        let mut m = indexmap::IndexMap::new();
+        for (k, v) in fields {
+            m.insert((*k).into(), v.clone());
+        }
+        Value::Record(m)
+    }
+
+    #[test]
+    fn record_quantifier_type_parses() {
+        // The header type uses the new record syntax. The body
+        // doesn't have to use it — confirms the parser accepts the
+        // `{ name :: Ty, ... }` shape independently of how the spec
+        // body references the binding.
+        let spec = parse_spec(r#"
+            spec session_ok {
+              forall s :: { used :: Int, ceiling :: Int } : true
+            }
+        "#).unwrap();
+        let v = evaluate_gate(&[spec], &b([
+            ("s", rec(&[("used", Value::Int(0)), ("ceiling", Value::Int(100))])),
+        ]), "");
+        assert_eq!(v, GateVerdict::Allow);
+    }
+
+    #[test]
+    fn field_access_drills_into_record_value() {
+        // The headline #208 case: spec quantifies a record-shaped
+        // binding *and* references its fields directly. Pre-#208
+        // soft-agent had to flatten this via BindingsFn.
+        let spec = parse_spec(r#"
+            spec budget_ok {
+              forall s :: { used :: Int, ceiling :: Int } :
+                s.used <= s.ceiling
+            }
+        "#).unwrap();
+        let allow = evaluate_gate(std::slice::from_ref(&spec), &b([
+            ("s", rec(&[("used", Value::Int(40)), ("ceiling", Value::Int(100))])),
+        ]), "");
+        assert_eq!(allow, GateVerdict::Allow);
+        let deny = evaluate_gate(&[spec], &b([
+            ("s", rec(&[("used", Value::Int(120)), ("ceiling", Value::Int(100))])),
+        ]), "");
+        assert!(matches!(deny, GateVerdict::Deny { .. }));
+    }
+
+    #[test]
+    fn nested_record_field_access_works() {
+        // `s.charge.power_drawn` — chained field access. Mirrors the
+        // structured-state pattern that motivated the issue (see the
+        // "active sessions, station.power_drawn ≤ station.budget"
+        // example in #208's background).
+        let spec = parse_spec(r#"
+            spec station_ok {
+              forall s :: { charge :: { power_drawn :: Int, budget :: Int } } :
+                s.charge.power_drawn <= s.charge.budget
+            }
+        "#).unwrap();
+        let allow = evaluate_gate(std::slice::from_ref(&spec), &b([
+            ("s", rec(&[("charge", rec(&[
+                ("power_drawn", Value::Int(50)),
+                ("budget", Value::Int(80)),
+            ]))])),
+        ]), "");
+        assert_eq!(allow, GateVerdict::Allow);
+    }
+
+    #[test]
+    fn missing_field_is_inconclusive_not_panic() {
+        // Spec references `s.budget` but the binding has only `s.used`.
+        // This is an agent/spec mismatch; surface as Inconclusive with a
+        // diagnostic listing the available fields.
+        let spec = parse_spec(r#"
+            spec needs_budget {
+              forall s :: { used :: Int, budget :: Int } : s.used <= s.budget
+            }
+        "#).unwrap();
+        let v = evaluate_gate(&[spec], &b([
+            ("s", rec(&[("used", Value::Int(40))])),
+        ]), "");
+        match v {
+            GateVerdict::Inconclusive { reason, .. } => {
+                assert!(reason.contains("field `budget`"),
+                    "reason should name the missing field; got: {reason}");
+            }
+            other => panic!("expected Inconclusive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn field_access_on_non_record_is_inconclusive() {
+        // Catches the "spec author forgot the value was scalar" case.
+        let spec = parse_spec(r#"
+            spec wrong_shape {
+              forall x :: Int : x.used > 0
+            }
+        "#).unwrap();
+        let v = evaluate_gate(&[spec], &b([("x", Value::Int(40))]), "");
+        match v {
+            GateVerdict::Inconclusive { reason, .. } => {
+                assert!(reason.contains("non-record"),
+                    "reason should call out non-record; got: {reason}");
+            }
+            other => panic!("expected Inconclusive, got {other:?}"),
+        }
     }
 }

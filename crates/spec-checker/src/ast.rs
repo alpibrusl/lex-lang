@@ -21,9 +21,21 @@ pub struct Quantifier {
     pub constraint: Option<SpecExpr>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum SpecType { Int, Float, Bool, Str }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SpecType {
+    Int,
+    Float,
+    Bool,
+    Str,
+    /// Record type with named fields (#208). Quantifying over a
+    /// record-shaped binding lets specs reference structured agent
+    /// state without flattening into per-field scalar bindings.
+    /// Fields are stored in declaration order; the gate evaluator
+    /// resolves `expr.field` against `Value::Record`'s `IndexMap`,
+    /// which preserves insertion order.
+    Record { fields: Vec<(String, SpecType)> },
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "node")]
@@ -38,6 +50,10 @@ pub enum SpecExpr {
     Let { name: String, value: Box<SpecExpr>, body: Box<SpecExpr> },
     BinOp { op: SpecOp, lhs: Box<SpecExpr>, rhs: Box<SpecExpr> },
     Not { expr: Box<SpecExpr> },
+    /// Field access on a record-typed expression (#208). Evaluated by
+    /// drilling into `Value::Record`'s field map; fails-loudly if the
+    /// underlying value isn't a record or doesn't contain the field.
+    FieldAccess { value: Box<SpecExpr>, field: String },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

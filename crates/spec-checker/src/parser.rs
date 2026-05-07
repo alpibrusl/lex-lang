@@ -131,15 +131,44 @@ impl Parser {
         if !self.eat(&TokenKind::ColonColon) {
             return Err(self.err("expected `::` after quantifier var"));
         }
-        let ty_name = self.expect_ident("for quantifier type")?;
-        let ty = match ty_name.as_str() {
-            "Int" => SpecType::Int,
-            "Float" => SpecType::Float,
-            "Bool" => SpecType::Bool,
-            "Str" => SpecType::Str,
-            other => return Err(self.err(format!("unknown spec type `{other}`"))),
-        };
+        let ty = self.parse_spec_type()?;
         Ok(Quantifier { name, ty, constraint: None })
+    }
+
+    /// Parse a `SpecType` (#208). Scalar idents (`Int`, `Float`, `Bool`,
+    /// `Str`) plus structured `{ name :: Ty, ... }` for records.
+    /// Records nest, so `{ s :: { used :: Int, ceiling :: Int } }` works.
+    fn parse_spec_type(&mut self) -> Result<SpecType, SpecParseError> {
+        if self.eat(&TokenKind::LBrace) {
+            // Record type: `{ name :: Ty, name :: Ty, ... }`
+            let mut fields: Vec<(String, SpecType)> = Vec::new();
+            self.skip_newlines();
+            if !matches!(self.peek(), Some(TokenKind::RBrace)) {
+                loop {
+                    let field_name = self.expect_ident("for record field name")?;
+                    if !self.eat(&TokenKind::ColonColon) {
+                        return Err(self.err("expected `::` after record field name"));
+                    }
+                    let field_ty = self.parse_spec_type()?;
+                    fields.push((field_name, field_ty));
+                    self.skip_newlines();
+                    if !self.eat(&TokenKind::Comma) { break; }
+                    self.skip_newlines();
+                }
+            }
+            if !self.eat(&TokenKind::RBrace) {
+                return Err(self.err("expected `}` to close record type"));
+            }
+            return Ok(SpecType::Record { fields });
+        }
+        let ty_name = self.expect_ident("for quantifier type")?;
+        match ty_name.as_str() {
+            "Int" => Ok(SpecType::Int),
+            "Float" => Ok(SpecType::Float),
+            "Bool" => Ok(SpecType::Bool),
+            "Str" => Ok(SpecType::Str),
+            other => Err(self.err(format!("unknown spec type `{other}`"))),
+        }
     }
 
     /// The body may be a sequence of `let` bindings followed by a single
@@ -257,22 +286,32 @@ impl Parser {
 
     fn parse_postfix(&mut self) -> Result<SpecExpr, SpecParseError> {
         let mut e = self.parse_primary()?;
-        while matches!(self.peek(), Some(TokenKind::LParen)) {
-            self.bump();
-            let mut args = Vec::new();
-            self.skip_newlines();
-            if !matches!(self.peek(), Some(TokenKind::RParen)) {
-                args.push(self.parse_expr()?);
-                while self.eat(&TokenKind::Comma) { args.push(self.parse_expr()?); }
+        loop {
+            match self.peek() {
+                Some(TokenKind::LParen) => {
+                    self.bump();
+                    let mut args = Vec::new();
+                    self.skip_newlines();
+                    if !matches!(self.peek(), Some(TokenKind::RParen)) {
+                        args.push(self.parse_expr()?);
+                        while self.eat(&TokenKind::Comma) { args.push(self.parse_expr()?); }
+                    }
+                    if !self.eat(&TokenKind::RParen) {
+                        return Err(self.err("expected `)` to close call"));
+                    }
+                    let func = match e {
+                        SpecExpr::Var { name } => name,
+                        other => return Err(self.err(format!("only ident-callable; got {other:?}"))),
+                    };
+                    e = SpecExpr::Call { func, args };
+                }
+                Some(TokenKind::Dot) => {
+                    self.bump();
+                    let field = self.expect_ident("after `.`")?;
+                    e = SpecExpr::FieldAccess { value: Box::new(e), field };
+                }
+                _ => break,
             }
-            if !self.eat(&TokenKind::RParen) {
-                return Err(self.err("expected `)` to close call"));
-            }
-            let func = match e {
-                SpecExpr::Var { name } => name,
-                other => return Err(self.err(format!("only ident-callable; got {other:?}"))),
-            };
-            e = SpecExpr::Call { func, args };
         }
         Ok(e)
     }
