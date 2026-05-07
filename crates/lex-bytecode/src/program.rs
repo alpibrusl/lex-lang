@@ -62,6 +62,27 @@ pub struct Function {
     /// depend on the closure literal's source location (#222).
     #[serde(default = "zero_body_hash")]
     pub body_hash: BodyHash,
+    /// Per-parameter refinement predicates (#209 slice 3). `Some(r)`
+    /// for params declared with `Type{x | predicate}`, `None`
+    /// otherwise. The VM evaluates these at `Op::Call` time before
+    /// pushing the frame; failure raises `VmError::RefinementFailed`
+    /// and the tracer records a verdict event with the same shape
+    /// as a runtime gate's `gate.verdict`.
+    #[serde(default)]
+    pub refinements: Vec<Option<Refinement>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Refinement {
+    /// The bound variable name from `Type{binding | predicate}`.
+    pub binding: String,
+    /// The predicate, stored as a canonical-AST `CExpr`. The VM
+    /// interprets it directly via a small tree-walk evaluator —
+    /// no separate compile pass needed since predicates are pure
+    /// expressions over a single binding plus, eventually, the
+    /// surrounding call-site context (slice 3 supports the
+    /// binding only).
+    pub predicate: lex_ast::CExpr,
 }
 
 fn zero_body_hash() -> BodyHash { ZERO_BODY_HASH }

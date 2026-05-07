@@ -111,6 +111,17 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
                 // Filled in at the end of the compile pass, once `code`
                 // and `locals_count` are final. See #222.
                 body_hash: crate::program::ZERO_BODY_HASH,
+                // Per-param refinement predicates for runtime check
+                // (#209 slice 3). Lifted directly from each param's
+                // `TypeExpr::Refined` if present; `None` otherwise.
+                refinements: fd.params.iter().map(|p| match &p.ty {
+                    a::TypeExpr::Refined { binding, predicate, .. } =>
+                        Some(crate::program::Refinement {
+                            binding: binding.clone(),
+                            predicate: (**predicate).clone(),
+                        }),
+                    _ => None,
+                }).collect(),
             });
         }
     }
@@ -566,6 +577,11 @@ impl<'a> FnCompiler<'a> {
             effects: Vec::new(),
             // See #222: filled in at the end of the compile pass.
             body_hash: crate::program::ZERO_BODY_HASH,
+            // Lambdas don't carry refinements at the surface today
+            // (closure params don't accept `Type{x | ...}` syntax in
+            // the parser). #209 stays focused on top-level fn decls;
+            // closure-param refinements are a follow-up.
+            refinements: Vec::new(),
         });
 
         // Emit code at the lambda site: load each captured local, then MakeClosure.
@@ -1032,6 +1048,9 @@ impl<'a> FnCompiler<'a> {
             code,
             effects: Vec::new(),
             body_hash,
+            // Trampolines (flow.sequential / parallel / etc.) don't
+            // surface refined params at this layer.
+            refinements: Vec::new(),
         });
         fn_id
     }
