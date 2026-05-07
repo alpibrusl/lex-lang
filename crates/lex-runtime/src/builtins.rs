@@ -31,7 +31,7 @@ pub fn is_pure_module(kind: &str) -> bool {
     matches!(kind, "str" | "int" | "float" | "bool" | "list"
         | "option" | "result" | "tuple" | "json" | "bytes" | "flow" | "math"
         | "map" | "set" | "crypto" | "regex" | "deque" | "datetime" | "http"
-        | "toml" | "yaml" | "dotenv" | "csv" | "test" | "random")
+        | "toml" | "yaml" | "dotenv" | "csv" | "test" | "random" | "parser")
 }
 
 fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
@@ -1013,6 +1013,65 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             })
         }
 
+        // -- parser (#217): parser combinators. Parser values are
+        // tagged Records — `{ kind: "Char", ch: "x" }` etc. — so
+        // canonical equality follows from the canonical Record
+        // encoding. The interpreter is `parser_run_impl`. --
+        ("parser", "char") => {
+            let s = expect_str(args.first())?;
+            if s.chars().count() != 1 {
+                return Err(format!(
+                    "parser.char: expected 1-character string, got {s:?}"));
+            }
+            Ok(parser_node("Char", &[("ch", Value::Str(s))]))
+        }
+        ("parser", "string") => {
+            let s = expect_str(args.first())?;
+            Ok(parser_node("String", &[("s", Value::Str(s))]))
+        }
+        ("parser", "digit") => Ok(parser_node("Digit", &[])),
+        ("parser", "alpha") => Ok(parser_node("Alpha", &[])),
+        ("parser", "whitespace") => Ok(parser_node("Whitespace", &[])),
+        ("parser", "eof") => Ok(parser_node("Eof", &[])),
+        ("parser", "seq") => {
+            let a = args.first().cloned()
+                .ok_or_else(|| "parser.seq: missing first parser".to_string())?;
+            let b = args.get(1).cloned()
+                .ok_or_else(|| "parser.seq: missing second parser".to_string())?;
+            Ok(parser_node("Seq", &[("a", a), ("b", b)]))
+        }
+        ("parser", "alt") => {
+            let a = args.first().cloned()
+                .ok_or_else(|| "parser.alt: missing first parser".to_string())?;
+            let b = args.get(1).cloned()
+                .ok_or_else(|| "parser.alt: missing second parser".to_string())?;
+            Ok(parser_node("Alt", &[("a", a), ("b", b)]))
+        }
+        ("parser", "many") => {
+            let p = args.first().cloned()
+                .ok_or_else(|| "parser.many: missing inner parser".to_string())?;
+            Ok(parser_node("Many", &[("p", p)]))
+        }
+        ("parser", "optional") => {
+            let p = args.first().cloned()
+                .ok_or_else(|| "parser.optional: missing inner parser".to_string())?;
+            Ok(parser_node("Optional", &[("p", p)]))
+        }
+        ("parser", "run") => {
+            let parser = args.first()
+                .ok_or_else(|| "parser.run: missing parser".to_string())?;
+            let input = expect_str(args.get(1))?;
+            match parser_run_impl(parser, &input, 0) {
+                Ok((value, _pos)) => Ok(ok_v(value)),
+                Err((pos, msg)) => {
+                    let mut e = indexmap::IndexMap::new();
+                    e.insert("pos".into(), Value::Int(pos as i64));
+                    e.insert("message".into(), Value::Str(msg));
+                    Ok(err_v(Value::Record(e)))
+                }
+            }
+        }
+
         // -- regex (the compiled `Regex` is stored as the pattern
         // string; the runtime caches the actual `regex::Regex` so
         // ops don't re-compile on every call) --
@@ -1376,6 +1435,148 @@ fn some(v: Value) -> Value { Value::Variant { name: "Some".into(), args: vec![v]
 fn none() -> Value { Value::Variant { name: "None".into(), args: Vec::new() } }
 fn ok_v(v: Value) -> Value { Value::Variant { name: "Ok".into(), args: vec![v] } }
 fn err_v(v: Value) -> Value { Value::Variant { name: "Err".into(), args: vec![v] } }
+
+// -- std.parser helpers (#217) ----------------------------------------
+
+/// Construct a tagged parser-AST node. The runtime representation is
+/// `{ kind: "Char" | "Seq" | ..., ...children }`; the type system
+/// treats these as opaque `Parser[T]` so user code can't poke at the
+/// fields. Encoding is canonical because `IndexMap` insertion order
+/// is stable and we always insert `kind` first.
+fn parser_node(kind: &str, fields: &[(&str, Value)]) -> Value {
+    let mut r = indexmap::IndexMap::new();
+    r.insert("kind".into(), Value::Str(kind.into()));
+    for (k, v) in fields {
+        r.insert((*k).into(), v.clone());
+    }
+    Value::Record(r)
+}
+
+/// Interpret a parser AST against `input` starting at byte `pos`.
+/// Returns either `(value, new_pos)` on success or `(failure_pos,
+/// message)` on failure. Failures carry a position so callers can
+/// report column numbers without a separate scan.
+fn parser_run_impl(
+    node: &Value,
+    input: &str,
+    pos: usize,
+) -> Result<(Value, usize), (usize, String)> {
+    let rec = match node {
+        Value::Record(r) => r,
+        _ => return Err((pos, "parser: expected Parser node".into())),
+    };
+    let kind = match rec.get("kind") {
+        Some(Value::Str(s)) => s.as_str(),
+        _ => return Err((pos, "parser: malformed node (no kind)".into())),
+    };
+    let bytes = input.as_bytes();
+    match kind {
+        "Char" => {
+            let want = match rec.get("ch") {
+                Some(Value::Str(s)) => s,
+                _ => return Err((pos, "char: missing ch".into())),
+            };
+            let want_bytes = want.as_bytes();
+            if pos + want_bytes.len() > bytes.len() {
+                return Err((pos, format!("expected {want:?}, got EOF")));
+            }
+            if &bytes[pos..pos + want_bytes.len()] == want_bytes {
+                Ok((Value::Str(want.clone()), pos + want_bytes.len()))
+            } else {
+                Err((pos, format!("expected {want:?}")))
+            }
+        }
+        "String" => {
+            let want = match rec.get("s") {
+                Some(Value::Str(s)) => s,
+                _ => return Err((pos, "string: missing s".into())),
+            };
+            if input[pos..].starts_with(want.as_str()) {
+                Ok((Value::Str(want.clone()), pos + want.len()))
+            } else {
+                Err((pos, format!("expected {want:?}")))
+            }
+        }
+        "Digit" => {
+            if let Some(&b) = bytes.get(pos) {
+                if b.is_ascii_digit() {
+                    return Ok((Value::Str((b as char).to_string()), pos + 1));
+                }
+            }
+            Err((pos, "expected digit".into()))
+        }
+        "Alpha" => {
+            if let Some(&b) = bytes.get(pos) {
+                if b.is_ascii_alphabetic() {
+                    return Ok((Value::Str((b as char).to_string()), pos + 1));
+                }
+            }
+            Err((pos, "expected alpha".into()))
+        }
+        "Whitespace" => {
+            if let Some(&b) = bytes.get(pos) {
+                if b.is_ascii_whitespace() {
+                    return Ok((Value::Str((b as char).to_string()), pos + 1));
+                }
+            }
+            Err((pos, "expected whitespace".into()))
+        }
+        "Eof" => {
+            if pos == bytes.len() {
+                Ok((Value::Unit, pos))
+            } else {
+                Err((pos, "expected EOF".into()))
+            }
+        }
+        "Seq" => {
+            let a = rec.get("a").ok_or((pos, "seq: missing a".to_string()))?;
+            let b = rec.get("b").ok_or((pos, "seq: missing b".to_string()))?;
+            let (va, p1) = parser_run_impl(a, input, pos)?;
+            let (vb, p2) = parser_run_impl(b, input, p1)?;
+            Ok((Value::Tuple(vec![va, vb]), p2))
+        }
+        "Alt" => {
+            // Ordered choice: bias toward `a`. If `a` fails (at any
+            // position), try `b` from the original `pos`. This is
+            // PEG semantics, not the unrestricted-CFG variant.
+            let a = rec.get("a").ok_or((pos, "alt: missing a".to_string()))?;
+            let b = rec.get("b").ok_or((pos, "alt: missing b".to_string()))?;
+            match parser_run_impl(a, input, pos) {
+                Ok(r) => Ok(r),
+                Err(_) => parser_run_impl(b, input, pos),
+            }
+        }
+        "Many" => {
+            let p = rec.get("p").ok_or((pos, "many: missing p".to_string()))?;
+            let mut cur = pos;
+            let mut out = Vec::new();
+            loop {
+                match parser_run_impl(p, input, cur) {
+                    // Require strict advance to avoid infinite loops
+                    // on inner parsers that match the empty string
+                    // (e.g. `optional(...)`).
+                    Ok((v, np)) if np > cur => { out.push(v); cur = np; }
+                    _ => break,
+                }
+            }
+            Ok((Value::List(out), cur))
+        }
+        "Optional" => {
+            let p = rec.get("p").ok_or((pos, "optional: missing p".to_string()))?;
+            match parser_run_impl(p, input, pos) {
+                Ok((v, np)) => Ok((
+                    Value::Variant { name: "Some".into(), args: vec![v] },
+                    np,
+                )),
+                Err(_) => Ok((
+                    Value::Variant { name: "None".into(), args: vec![] },
+                    pos,
+                )),
+            }
+        }
+        other => Err((pos, format!("unknown parser kind: {other:?}"))),
+    }
+}
 
 // -- std.random helpers (#219) ----------------------------------------
 

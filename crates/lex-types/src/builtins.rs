@@ -1129,6 +1129,82 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 ])));
             Some(Ty::Record(fields))
         }
+        "parser" => {
+            // #217: structured parser combinators. Parser values are
+            // tagged Records at runtime (`{ kind, ... }`), opaque at
+            // the language level via `Ty::Con("Parser", [T])`.
+            //
+            // This v1 surface is the structural subset:
+            //   - primitives: char, string, digit, alpha, whitespace, eof
+            //   - combinators: seq, alt, many, optional
+            //   - run :: Parser[T], Str -> Result[T, ParseErr]
+            //
+            // `map` and `and_then` are deliberately deferred: their
+            // closure captures have call-site identity (fn_id +
+            // captures), which would make two parsers for the same
+            // grammar canonicalize differently — directly at odds with
+            // the proposal's "canonical parsers" acceptance criterion.
+            // See the comment on #217 for the full rationale and the
+            // path forward.
+            let pt = |t: Ty| Ty::Con("Parser".into(), vec![t]);
+            let parse_err = || {
+                let mut fs = IndexMap::new();
+                fs.insert("pos".into(), Ty::int());
+                fs.insert("message".into(), Ty::str());
+                Ty::Record(fs)
+            };
+            let mut fields = IndexMap::new();
+            // char :: Str -> Parser[Str] (single-char Str literal)
+            fields.insert("char".into(), Ty::function(
+                vec![Ty::str()], EffectSet::empty(), pt(Ty::str())));
+            // string :: Str -> Parser[Str]
+            fields.insert("string".into(), Ty::function(
+                vec![Ty::str()], EffectSet::empty(), pt(Ty::str())));
+            // digit :: () -> Parser[Str]
+            fields.insert("digit".into(), Ty::function(
+                vec![], EffectSet::empty(), pt(Ty::str())));
+            // alpha :: () -> Parser[Str]
+            fields.insert("alpha".into(), Ty::function(
+                vec![], EffectSet::empty(), pt(Ty::str())));
+            // whitespace :: () -> Parser[Str]
+            fields.insert("whitespace".into(), Ty::function(
+                vec![], EffectSet::empty(), pt(Ty::str())));
+            // eof :: () -> Parser[Unit]
+            fields.insert("eof".into(), Ty::function(
+                vec![], EffectSet::empty(), pt(Ty::Unit)));
+            // seq :: Parser[A], Parser[B] -> Parser[(A, B)]
+            fields.insert("seq".into(), Ty::function(
+                vec![pt(Ty::Var(0)), pt(Ty::Var(1))],
+                EffectSet::empty(),
+                pt(Ty::Tuple(vec![Ty::Var(0), Ty::Var(1)]))));
+            // alt :: Parser[T], Parser[T] -> Parser[T]
+            // PEG-style ordered choice: the second alternative is
+            // tried only if the first fails.
+            fields.insert("alt".into(), Ty::function(
+                vec![pt(Ty::Var(0)), pt(Ty::Var(0))],
+                EffectSet::empty(),
+                pt(Ty::Var(0))));
+            // many :: Parser[T] -> Parser[List[T]]
+            // Zero-or-more. Stops as soon as the inner parser fails
+            // OR doesn't advance the position (avoids infinite loop
+            // on empty matches).
+            fields.insert("many".into(), Ty::function(
+                vec![pt(Ty::Var(0))],
+                EffectSet::empty(),
+                pt(Ty::List(Box::new(Ty::Var(0))))));
+            // optional :: Parser[T] -> Parser[Option[T]]
+            fields.insert("optional".into(), Ty::function(
+                vec![pt(Ty::Var(0))],
+                EffectSet::empty(),
+                pt(Ty::Con("Option".into(), vec![Ty::Var(0)]))));
+            // run :: Parser[T], Str -> Result[T, ParseErr]
+            // ParseErr = { pos :: Int, message :: Str }
+            fields.insert("run".into(), Ty::function(
+                vec![pt(Ty::Var(0)), Ty::str()],
+                EffectSet::empty(),
+                Ty::Con("Result".into(), vec![Ty::Var(0), parse_err()])));
+            Some(Ty::Record(fields))
+        }
         "regex" => {
             // The compiled `Regex` is stored as a `Str` at runtime
             // (the pattern source) plus a process-wide cache of the
@@ -1444,6 +1520,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "proc" => "proc",
         "crypto" => "crypto",
         "regex" => "regex",
+        "parser" => "parser",
         "deque" => "deque",
         "kv" => "kv",
         "sql" => "sql",
