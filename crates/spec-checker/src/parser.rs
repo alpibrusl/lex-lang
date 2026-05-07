@@ -178,6 +178,14 @@ impl Parser {
                 }
                 Ok(SpecType::List { element: Box::new(elem) })
             }
+            // #208 slice 3: any other capitalized ident is treated as
+            // a user-defined ADT name (`Message`, `Order`, …). The
+            // gate path uses the value's runtime variant tag for
+            // discrimination, so no compile-time variant table is
+            // needed; the random-input prover doesn't enumerate these.
+            other if other.chars().next().is_some_and(|c| c.is_ascii_uppercase()) => {
+                Ok(SpecType::Named { name: other.to_string() })
+            }
             other => Err(self.err(format!("unknown spec type `{other}`"))),
         }
     }
@@ -352,6 +360,7 @@ impl Parser {
             },
             Some(TokenKind::True) => { self.bump(); Ok(SpecExpr::BoolLit { value: true }) }
             Some(TokenKind::False) => { self.bump(); Ok(SpecExpr::BoolLit { value: false }) }
+            Some(TokenKind::Match) => self.parse_match(),
             Some(TokenKind::Ident(_)) => {
                 let name = self.expect_ident("")?;
                 Ok(SpecExpr::Var { name })
@@ -366,6 +375,73 @@ impl Parser {
             }
             other => Err(self.err(format!("expected primary expression, got {other:?}"))),
         }
+    }
+
+    /// Parse `match scrutinee { Pattern => body, _ => body, ... }`
+    /// (#208 slice 3). Arms are separated by `,`; trailing comma OK.
+    fn parse_match(&mut self) -> Result<SpecExpr, SpecParseError> {
+        self.bump(); // consume `match`
+        let scrutinee = self.parse_expr()?;
+        if !self.eat(&TokenKind::LBrace) {
+            return Err(self.err("expected `{` after match scrutinee"));
+        }
+        let mut arms: Vec<crate::ast::MatchArm> = Vec::new();
+        self.skip_newlines();
+        while !matches!(self.peek(), Some(TokenKind::RBrace)) {
+            let pattern = self.parse_pattern()?;
+            if !self.eat(&TokenKind::FatArrow) {
+                return Err(self.err("expected `=>` after match pattern"));
+            }
+            let body = self.parse_expr()?;
+            arms.push(crate::ast::MatchArm { pattern, body });
+            self.skip_newlines();
+            if !self.eat(&TokenKind::Comma) { break; }
+            self.skip_newlines();
+        }
+        if !self.eat(&TokenKind::RBrace) {
+            return Err(self.err("expected `}` to close match"));
+        }
+        Ok(SpecExpr::Match {
+            scrutinee: Box::new(scrutinee),
+            arms,
+        })
+    }
+
+    /// Parse a single pattern: `_`, `Variant`, `Variant(a, b, ...)`.
+    fn parse_pattern(&mut self) -> Result<crate::ast::SpecPattern, SpecParseError> {
+        self.skip_newlines();
+        if self.eat(&TokenKind::Underscore) {
+            return Ok(crate::ast::SpecPattern::Wildcard);
+        }
+        let name = self.expect_ident("for variant pattern")?;
+        let bindings = if self.eat(&TokenKind::LParen) {
+            let mut bs = Vec::new();
+            self.skip_newlines();
+            if !matches!(self.peek(), Some(TokenKind::RParen)) {
+                bs.push(self.parse_variant_binding()?);
+                while self.eat(&TokenKind::Comma) {
+                    bs.push(self.parse_variant_binding()?);
+                }
+            }
+            if !self.eat(&TokenKind::RParen) {
+                return Err(self.err("expected `)` to close variant pattern"));
+            }
+            bs
+        } else {
+            Vec::new()
+        };
+        Ok(crate::ast::SpecPattern::Variant { name, bindings })
+    }
+
+    /// Parse a single binding inside a variant pattern: either an
+    /// ident name or `_` for "ignore this positional arg". Internally
+    /// `_` is bound to the literal name `_`; the body never references
+    /// it, so collisions across `_` bindings are inert.
+    fn parse_variant_binding(&mut self) -> Result<String, SpecParseError> {
+        if self.eat(&TokenKind::Underscore) {
+            return Ok("_".to_string());
+        }
+        self.expect_ident("for variant binding")
     }
 
     fn peek_kw(&self, name: &str) -> bool {

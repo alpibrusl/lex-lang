@@ -205,6 +205,18 @@ fn sample(ty: &SpecType, rng: &mut DetRng) -> Value {
             }
             Value::List(out)
         }
+        // #208 slice 3: random sampling over user-defined ADTs needs
+        // a variant table that the spec language doesn't carry. The
+        // gate path doesn't need it (concrete bindings come from the
+        // caller) but the offline prover does. For v1 we surface a
+        // sentinel value; the random-input prover treats this as
+        // "type not sampleable" and skips the spec. Specs that
+        // quantify over `Named` types should be evaluated via the
+        // gate path (`evaluate_gate_compiled`) with concrete inputs.
+        SpecType::Named { name } => Value::Variant {
+            name: format!("__unsampled_{name}"),
+            args: Vec::new(),
+        },
     }
 }
 
@@ -279,6 +291,18 @@ fn eval(
                 return Err(format!("list index {i} out of bounds (length {})", xs.len()));
             }
             Ok(xs[i as usize].clone())
+        }
+        SpecExpr::Match { scrutinee, arms } => {
+            // Mirror of the gate path's match (#208 slice 3).
+            let v = eval(scrutinee, bindings, bc, policy)?;
+            for arm in arms {
+                if let Some(extra) = crate::gate::pattern_match(&arm.pattern, &v) {
+                    let mut next = bindings.clone();
+                    for (k, vv) in extra { next.insert(k, vv); }
+                    return eval(&arm.body, &next, bc, policy);
+                }
+            }
+            Err(format!("non-exhaustive match: no arm matched value {v:?}"))
         }
     }
 }

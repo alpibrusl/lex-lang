@@ -247,6 +247,22 @@ fn eval_body(
             let i = eval_body(index, bindings, bc, policy, new_tracer)?;
             list_index(xs, i)
         }
+        SpecExpr::Match { scrutinee, arms } => {
+            // #208 slice 3: dispatch on `Value::Variant`'s tag.
+            // Wildcard arms always match. Variant arms match by name
+            // and arity, binding positional args by name in the body.
+            let v = eval_body(scrutinee, bindings, bc, policy, new_tracer)?;
+            for arm in arms {
+                if let Some(extra) = pattern_match(&arm.pattern, &v) {
+                    let mut next = bindings.clone();
+                    for (k, vv) in extra { next.insert(k, vv); }
+                    return eval_body(&arm.body, &next, bc, policy, new_tracer);
+                }
+            }
+            Err(format!(
+                "non-exhaustive match: no arm matched value {}",
+                short_value(&v)))
+        }
         SpecExpr::FieldAccess { value, field } => {
             // Drill into a record-typed binding (#208). Fails loudly
             // if the value isn't a record or the field is missing —
@@ -261,6 +277,29 @@ fn eval_body(
                 other => Err(format!(
                     "field access `.{field}` on non-record: {}",
                     short_value(&other))),
+            }
+        }
+    }
+}
+
+/// Try to match a pattern against a value (#208 slice 3). Returns
+/// `Some(bindings)` on success — the bindings to add to the
+/// arm's lexical environment — or `None` if the pattern doesn't
+/// match. The caller falls through to the next arm on `None`.
+pub(crate) fn pattern_match(pat: &crate::ast::SpecPattern, v: &Value)
+    -> Option<Vec<(String, Value)>>
+{
+    use crate::ast::SpecPattern;
+    match pat {
+        SpecPattern::Wildcard => Some(Vec::new()),
+        SpecPattern::Variant { name, bindings } => {
+            match v {
+                Value::Variant { name: vn, args } if vn == name && args.len() == bindings.len() => {
+                    Some(bindings.iter().cloned()
+                        .zip(args.iter().cloned())
+                        .collect())
+                }
+                _ => None,
             }
         }
     }
@@ -864,5 +903,157 @@ mod tests {
             }
             other => panic!("expected Inconclusive, got {other:?}"),
         }
+    }
+
+    // ---- #208 slice 3: ADT pattern matching --------------------------
+
+    /// Build a `Value::Variant` with the given name and positional args.
+    fn variant(name: &str, args: Vec<Value>) -> Value {
+        Value::Variant { name: name.into(), args }
+    }
+
+    #[test]
+    fn named_type_in_quantifier_parses() {
+        let spec = parse_spec(r#"
+            spec ok {
+              forall msg :: Message : true
+            }
+        "#).unwrap();
+        let v = evaluate_gate(&[spec], &b([
+            ("msg", variant("Heartbeat", vec![])),
+        ]), "");
+        assert_eq!(v, GateVerdict::Allow);
+    }
+
+    #[test]
+    fn match_dispatches_on_variant_name() {
+        // Two arms: Charge(amount) returns amount > 0; Telemetry(_)
+        // is unconditionally true. Wildcard catches the rest.
+        let spec = parse_spec(r#"
+            spec valid_msg {
+              forall msg :: Message :
+                match msg {
+                  Charge(amount) => amount > 0,
+                  Telemetry(payload) => true,
+                  _ => false,
+                }
+            }
+        "#).unwrap();
+        let allow_charge = evaluate_gate(std::slice::from_ref(&spec), &b([
+            ("msg", variant("Charge", vec![Value::Int(50)])),
+        ]), "");
+        assert_eq!(allow_charge, GateVerdict::Allow);
+
+        let deny_negative = evaluate_gate(std::slice::from_ref(&spec), &b([
+            ("msg", variant("Charge", vec![Value::Int(-1)])),
+        ]), "");
+        assert!(matches!(deny_negative, GateVerdict::Deny { .. }));
+
+        let allow_telemetry = evaluate_gate(std::slice::from_ref(&spec), &b([
+            ("msg", variant("Telemetry", vec![Value::Str("ok".into())])),
+        ]), "");
+        assert_eq!(allow_telemetry, GateVerdict::Allow);
+
+        let deny_unknown = evaluate_gate(&[spec], &b([
+            ("msg", variant("UnknownTopic", vec![])),
+        ]), "");
+        assert!(matches!(deny_unknown, GateVerdict::Deny { .. }));
+    }
+
+    #[test]
+    fn variant_pattern_binds_positional_args() {
+        // `Charge(amount, station)` binds two args; the body
+        // references both. Confirms multi-arg variant patterns work.
+        let spec = parse_spec(r#"
+            spec budget_match {
+              forall msg :: Message :
+                match msg {
+                  Charge(amount, budget) => amount <= budget,
+                  _ => true,
+                }
+            }
+        "#).unwrap();
+        let allow = evaluate_gate(std::slice::from_ref(&spec), &b([
+            ("msg", variant("Charge", vec![Value::Int(50), Value::Int(100)])),
+        ]), "");
+        assert_eq!(allow, GateVerdict::Allow);
+        let deny = evaluate_gate(&[spec], &b([
+            ("msg", variant("Charge", vec![Value::Int(150), Value::Int(100)])),
+        ]), "");
+        assert!(matches!(deny, GateVerdict::Deny { .. }));
+    }
+
+    #[test]
+    fn variant_arity_mismatch_falls_through_to_next_arm() {
+        // `Charge(x)` (1 arg) doesn't match a `Charge(a, b)` value
+        // (2 args). The wildcard fallback catches it.
+        let spec = parse_spec(r#"
+            spec arity_check {
+              forall msg :: Message :
+                match msg {
+                  Charge(x) => x > 0,
+                  _ => true,
+                }
+            }
+        "#).unwrap();
+        let v = evaluate_gate(&[spec], &b([
+            ("msg", variant("Charge", vec![Value::Int(1), Value::Int(2)])),
+        ]), "");
+        assert_eq!(v, GateVerdict::Allow);
+    }
+
+    #[test]
+    fn non_exhaustive_match_is_inconclusive() {
+        // No wildcard, no matching variant — no arm fires.
+        let spec = parse_spec(r#"
+            spec only_charge {
+              forall msg :: Message :
+                match msg {
+                  Charge(_) => true,
+                }
+            }
+        "#).unwrap();
+        let v = evaluate_gate(&[spec], &b([
+            ("msg", variant("OtherTopic", vec![])),
+        ]), "");
+        match v {
+            GateVerdict::Inconclusive { reason, .. } => {
+                assert!(reason.contains("non-exhaustive"),
+                    "expected non-exhaustive diagnostic; got: {reason}");
+            }
+            other => panic!("expected Inconclusive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_match_drills_into_variant_payload_record() {
+        // `Charge(s)` binds `s`, which is itself a record. The arm
+        // body uses `s.power <= s.budget` — combines slice 1
+        // (FieldAccess) with slice 3 (variant binding). Models the
+        // soft "for every charging session" pattern.
+        let spec = parse_spec(r#"
+            spec station_match {
+              forall msg :: Message :
+                match msg {
+                  Charge(s) => s.power <= s.budget,
+                  _ => true,
+                }
+            }
+        "#).unwrap();
+        let mut session = indexmap::IndexMap::new();
+        session.insert("power".into(), Value::Int(60));
+        session.insert("budget".into(), Value::Int(100));
+        let allow = evaluate_gate(std::slice::from_ref(&spec), &b([
+            ("msg", variant("Charge", vec![Value::Record(session)])),
+        ]), "");
+        assert_eq!(allow, GateVerdict::Allow);
+
+        let mut over = indexmap::IndexMap::new();
+        over.insert("power".into(), Value::Int(160));
+        over.insert("budget".into(), Value::Int(100));
+        let deny = evaluate_gate(&[spec], &b([
+            ("msg", variant("Charge", vec![Value::Record(over)])),
+        ]), "");
+        assert!(matches!(deny, GateVerdict::Deny { .. }));
     }
 }
