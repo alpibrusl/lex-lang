@@ -757,6 +757,20 @@ impl EffectHandler for DefaultHandler {
                 let hi = expect_int(args.get(1))?;
                 Ok(Value::Int((lo + hi) / 2))
             }
+            // `env.get` returns `Option[Str]` — `None` for unset vars.
+            // Per-var scoping (`[env(NAME)]`) arrives with #207's
+            // per-capability effect parameterization; today the flat
+            // `[env]` grants access to the entire process environment.
+            ("env", "get") => {
+                let name = expect_str(args.first())?;
+                Ok(match std::env::var(&name) {
+                    Ok(v) => Value::Variant {
+                        name: "Some".into(),
+                        args: vec![Value::Str(v)],
+                    },
+                    Err(_) => Value::Variant { name: "None".into(), args: Vec::new() },
+                })
+            }
             ("budget", _) => {
                 // Budget calls are nominally tracked here; budget itself is
                 // enforced statically in `policy::check_program`.

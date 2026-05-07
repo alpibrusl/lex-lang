@@ -283,6 +283,19 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             ));
             Some(Ty::Record(fields))
         }
+        "env" => {
+            // #216: env.get(name) -> [env] Option[Str].
+            // Per-var scoping (`[env(NAME)]`) lands with the
+            // per-capability effect parameterization work (#207); the
+            // flat `[env]` is the v1 surface.
+            let mut fields = IndexMap::new();
+            fields.insert("get".into(), Ty::function(
+                vec![Ty::str()],
+                EffectSet::singleton("env"),
+                Ty::Con("Option".into(), vec![Ty::str()]),
+            ));
+            Some(Ty::Record(fields))
+        }
         "net" => {
             let mut fields = IndexMap::new();
             // get :: Str -> [net] Result[Str, Str]
@@ -1342,6 +1355,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "tuple" => "tuple",
         "time" => "time",
         "rand" => "rand",
+        "env" => "env",
         "bytes" => "bytes",
         "net" => "net",
         "chat" => "chat",

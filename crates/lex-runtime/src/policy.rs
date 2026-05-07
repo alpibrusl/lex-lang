@@ -47,6 +47,10 @@ impl Policy {
             "fs_read", "fs_write", "budget",
             // #184: agent-runtime effects.
             "llm_local", "llm_cloud", "a2a", "mcp",
+            // #216: env-var access. Per-var scoping (`[env(NAME)]`)
+            // arrives with the per-capability effect parameterization
+            // work (#207); the flat `[env]` is the v1 surface.
+            "env",
         ] {
             s.insert(k.to_string());
         }
