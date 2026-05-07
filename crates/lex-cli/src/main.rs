@@ -105,6 +105,7 @@ fn run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "log" => branch::cmd_log(fmt, &args[1..]),
         "op" => op::cmd_op(fmt, &args[1..]),
         "canonical" => cmd_canonical(fmt, &args[1..]),
+        "keygen" => cmd_keygen(fmt, &args[1..]),
         "repl" => repl::cmd_repl(&args[1..]),
         "watch" => watch::cmd_watch(&args[1..]),
         "help" | "--help" | "-h" => { print_usage(); Ok(()) }
@@ -147,10 +148,15 @@ fn print_usage() {
     println!("  check <file>                       type-check; exit 0 or print errors");
     println!("  run [policy] <file> <fn> [args]    execute fn (args parsed as JSON)");
     println!("  hash <file>                        print stage canonical hashes");
-    println!("  publish [--store DIR] [--activate] <file>");
-    println!("                                     publish each stage to the store as Draft");
+    println!("  publish [--store DIR] [--branch NAME] [--activate] [--signing-key HEX] <file>");
+    println!("                                     publish each stage to the store as Draft;");
+    println!("                                     --signing-key (or LEX_SIGNING_KEY) attaches an");
+    println!("                                     Ed25519 signature over each StageId.");
+    println!("  keygen                             print a fresh Ed25519 keypair (hex)");
     println!("  store list [--store DIR]           list SigIds in the store");
-    println!("  store get [--store DIR] <stage>    print metadata + canonical AST for a StageId");
+    println!("  store get [--store DIR] [--require-signed] [--trusted-key HEX] <stage>");
+    println!("                                     print stage metadata + canonical AST;");
+    println!("                                     verify Ed25519 signature when present.");
     println!("  stage <stage> [--attestations]     print stage info, or list its attestations");
     println!("  attest filter [--kind K] [--result R] [--since T] [--store DIR]");
     println!("                                     cross-stage attestation queries");
@@ -658,15 +664,96 @@ fn cmd_canonical_encode(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `lex canonical decode <bytes-file>` (#206 slice 2).
+// ---- #227: ed25519 keygen + signing helpers ----------------------
+
+/// `lex keygen` — print a fresh Ed25519 keypair as hex.
 ///
-/// Reads the canonical-AST byte representation from a file, decodes
-/// it, and prints the program back in `.lex` text form via
-/// `lex_ast::print_stages`. The text output is a debugger /
-/// new-developer affordance — round-tripping `text → canonical → text`
-/// produces semantically equivalent (but not necessarily byte-identical)
-/// source, since the canonical form drops insignificant whitespace
-/// and comment placement.
+/// Default text output is two lines:
+///
+///   `public_key  <hex>`
+///   `secret_key  <hex>`
+///
+/// JSON output emits `{ "public_key": "...", "secret_key": "..." }`.
+/// The secret key is printed once and never persisted by Lex itself —
+/// the caller is responsible for storing it (env var, secret manager,
+/// hardware token, etc.).
+fn cmd_keygen(fmt: &OutputFormat, _args: &[String]) -> Result<()> {
+    let kp = lex_vcs::Keypair::generate()
+        .map_err(|e| anyhow!("keygen: {e}"))?;
+    let data = serde_json::json!({
+        "public_key": kp.public_hex(),
+        "secret_key": kp.secret_hex(),
+    });
+    let pk = kp.public_hex();
+    let sk = kp.secret_hex();
+    acli::emit_or_text("keygen", data, fmt, move || {
+        println!("public_key  {pk}");
+        println!("secret_key  {sk}");
+    });
+    Ok(())
+}
+
+/// Resolve a signing key from the CLI flag, then env var, then None.
+/// Returns `Ok(None)` if neither is set so the caller can decide
+/// whether unsigned publish is allowed.
+fn resolve_signing_key(flag_value: Option<&str>) -> Result<Option<lex_vcs::Keypair>> {
+    let hex_str = match flag_value {
+        Some(v) => Some(v.to_string()),
+        None => std::env::var("LEX_SIGNING_KEY").ok(),
+    };
+    match hex_str {
+        Some(s) if !s.is_empty() => {
+            let kp = lex_vcs::Keypair::from_secret_hex(s.trim())
+                .map_err(|e| anyhow!(
+                    "invalid signing key (hex): {e}. \
+                     Expected 64 hex chars from `lex keygen`."))?;
+            Ok(Some(kp))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Apply `--require-signed` / `--trusted-key` policy to a stage's
+/// metadata. Returns `Ok(())` if the policy permits the stage:
+///
+/// * If `require_signed` is true and `metadata.signature` is `None`,
+///   error.
+/// * If `trusted_key` is set, the signature must be present, must
+///   verify, and the public key must match the trusted key.
+/// * If `require_signed` is true and a signature is present, the
+///   signature must verify.
+/// * Otherwise (no flags set, present-but-not-required signature),
+///   we still verify a present signature so that a corrupted record
+///   surfaces clearly rather than silently passing.
+fn verify_metadata_signature(
+    meta: &lex_store::Metadata,
+    require_signed: bool,
+    trusted_key: Option<&str>,
+) -> Result<()> {
+    match &meta.signature {
+        None => {
+            if require_signed {
+                bail!("stage `{}` is not signed (--require-signed/--trusted-key was set)",
+                    meta.stage_id);
+            }
+            Ok(())
+        }
+        Some(sig) => {
+            lex_vcs::verify_stage_id(&meta.stage_id, sig)
+                .map_err(|e| anyhow!(
+                    "signature on stage `{}` failed verification: {e}",
+                    meta.stage_id))?;
+            if let Some(trusted) = trusted_key {
+                if !sig.public_key.eq_ignore_ascii_case(trusted) {
+                    bail!("stage `{}` is signed by `{}`, not by trusted key `{}`",
+                        meta.stage_id, sig.public_key, trusted);
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 fn cmd_canonical_decode(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let path = args.first().ok_or_else(|| anyhow!(
         "usage: lex canonical decode <bytes-file>"))?;
@@ -1105,19 +1192,24 @@ fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     use lex_vcs::ImportMap;
 
     let (root, rest, activate, dry_run) = parse_store_flag(args);
-    // Pull --branch off as well.
+    // Pull --branch and --signing-key off as well.
     let mut branch: Option<String> = None;
+    let mut signing_key_flag: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         if a == "--branch" {
             branch = Some(it.next().ok_or_else(|| anyhow!("--branch needs a value"))?.clone());
+        } else if a == "--signing-key" {
+            signing_key_flag = Some(it.next()
+                .ok_or_else(|| anyhow!("--signing-key needs a hex value"))?.clone());
         } else {
             positional.push(a.clone());
         }
     }
     let path = positional.first().ok_or_else(|| anyhow!(
-        "usage: lex publish [--store DIR] [--branch NAME] [--activate] <file>"))?;
+        "usage: lex publish [--store DIR] [--branch NAME] [--activate] [--signing-key HEX] <file>"))?;
+    let signer = resolve_signing_key(signing_key_flag.as_deref())?;
 
     let prog = read_program(path)?;
     // #168: type-check *and* rewrite stdlib parse calls so a
@@ -1206,10 +1298,13 @@ fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    let outcome = store.publish_program(&branch, &stages, &report, &new_imports, activate)?;
+    let outcome = store.publish_program_signed(
+        &branch, &stages, &report, &new_imports, activate, signer.as_ref())?;
+    let signed = signer.as_ref().map(|kp| kp.public_hex());
     let data = serde_json::json!({
         "ops": outcome.ops,
         "head_op": outcome.head_op,
+        "signed_by": signed,
     });
     acli::emit_or_text("publish", data, fmt, || {});
     Ok(())
@@ -1239,13 +1334,37 @@ fn cmd_store(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "get" => {
             let (root, rest, _, _) = parse_store_flag(rest);
             let store = Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
-            let id = rest.first().ok_or_else(|| anyhow!("usage: lex store get <stage_id>"))?;
+            // #227 verification flags. `--require-signed` rejects an
+            // unsigned stage; `--trusted-key HEX` rejects any stage
+            // whose signature was made by a different key. Both are
+            // independent: `--trusted-key` implies signed.
+            let mut require_signed = false;
+            let mut trusted_key: Option<String> = None;
+            let mut positional: Vec<&String> = Vec::new();
+            let mut it = rest.iter();
+            while let Some(a) = it.next() {
+                if a == "--require-signed" {
+                    require_signed = true;
+                } else if a == "--trusted-key" {
+                    trusted_key = Some(it.next()
+                        .ok_or_else(|| anyhow!("--trusted-key needs a hex value"))?
+                        .clone());
+                    require_signed = true;
+                } else {
+                    positional.push(a);
+                }
+            }
+            let id = positional.first()
+                .ok_or_else(|| anyhow!(
+                    "usage: lex store get [--require-signed] [--trusted-key HEX] <stage_id>"))?;
             let meta = store.get_metadata(id)?;
+            verify_metadata_signature(&meta, require_signed, trusted_key.as_deref())?;
             let ast = store.get_ast(id)?;
             let v = serde_json::json!({
                 "metadata": serde_json::to_value(&meta)?,
                 "status": format!("{:?}", store.get_status(id)?).to_lowercase(),
                 "ast": serde_json::to_value(&ast)?,
+                "signature_verified": meta.signature.is_some(),
             });
             acli::emit_or_text("store", v.clone(), fmt, || {
                 println!("{}", serde_json::to_string_pretty(&v).unwrap());

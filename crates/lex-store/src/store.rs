@@ -105,6 +105,25 @@ impl Store {
     /// Idempotent: republishing the same canonical AST returns the same
     /// StageId without writing duplicates.
     pub fn publish(&self, stage: &Stage) -> Result<String, StoreError> {
+        self.publish_signed(stage, None)
+    }
+
+    /// Like [`Self::publish`] but optionally attaches an Ed25519
+    /// signature over the StageId (#227). When `signer` is `Some`,
+    /// the persisted metadata gets a `signature` field that
+    /// downstream consumers can verify via
+    /// [`lex_vcs::verify_stage_id`].
+    ///
+    /// Idempotency: if a metadata file already exists the signature
+    /// is *not* re-written. This preserves "republishing is a no-op"
+    /// even across different signers — promoting a signed stage
+    /// requires a fresh stage hash anyway, so a metadata overwrite
+    /// would be the wrong primitive.
+    pub fn publish_signed(
+        &self,
+        stage: &Stage,
+        signer: Option<&lex_vcs::Keypair>,
+    ) -> Result<String, StoreError> {
         let sig = sig_id(stage).ok_or(StoreError::CannotPublishImport)?;
         let stage_id = stage_id(stage).ok_or(StoreError::CannotPublishImport)?;
         let name = stage_name(stage).to_string();
@@ -120,12 +139,14 @@ impl Store {
             write_canonical_json(&ast_path, stage)?;
         }
         if !meta_path.exists() {
+            let signature = signer.map(|kp| kp.sign_stage_id(&stage_id));
             let metadata = Metadata {
                 stage_id: stage_id.clone(),
                 sig_id: sig.clone(),
                 name,
                 published_at: Self::now(),
                 note: None,
+                signature,
             };
             write_canonical_json(&meta_path, &metadata)?;
         }
@@ -457,6 +478,22 @@ impl Store {
         new_imports: &lex_vcs::ImportMap,
         activate: bool,
     ) -> Result<PublishOutcome, StoreError> {
+        self.publish_program_signed(branch, stages, diff, new_imports, activate, None)
+    }
+
+    /// Signed variant of [`Self::publish_program`] (#227). Every
+    /// stage written under this batch gets the same signer; per-stage
+    /// keys aren't supported because the agent identity model treats
+    /// a publish as a single authorial act.
+    pub fn publish_program_signed(
+        &self,
+        branch: &str,
+        stages: &[lex_ast::Stage],
+        diff: &lex_vcs::DiffReport,
+        new_imports: &lex_vcs::ImportMap,
+        activate: bool,
+        signer: Option<&lex_vcs::Keypair>,
+    ) -> Result<PublishOutcome, StoreError> {
         use std::collections::{BTreeMap, BTreeSet};
 
         // #130's write-time gate: verify the candidate program
@@ -510,7 +547,7 @@ impl Store {
             // produces or replaces one.
             if let Some(stg) = stage_for_kind(&kind, stages) {
                 if !matches!(stg, lex_ast::Stage::Import(_)) {
-                    self.publish(stg)?;
+                    self.publish_signed(stg, signer)?;
                     if activate {
                         if let Some(stage_id_str) = stage_id(stg) {
                             let _ = self.activate(&stage_id_str);

@@ -40,3 +40,6 @@ thiserror = "2"
 anyhow = "1"
 logos = "0.16"
 indexmap = { version = "2", features = ["serde"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast"] }
+getrandom = "0.2"
+hex = "0.4"
