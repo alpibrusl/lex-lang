@@ -207,6 +207,11 @@ impl Parser {
     }
 
     fn parse_type_expr(&mut self) -> Result<TypeExpr, ParseError> {
+        let base = self.parse_type_expr_base()?;
+        self.maybe_wrap_refinement(base)
+    }
+
+    fn parse_type_expr_base(&mut self) -> Result<TypeExpr, ParseError> {
         self.skip_newlines();
         match self.peek() {
             Some(TokenKind::LBrace) => self.parse_record_type(),
@@ -253,6 +258,35 @@ impl Parser {
             }
             other => Err(self.error(format!("expected type expression, got {other:?}"))),
         }
+    }
+
+    /// Refinement type postfix (#209): `BaseType{binding | predicate}`.
+    ///
+    /// Disambiguates from a function body's opening brace by peeking
+    /// three tokens ahead — refinement requires `{ Ident |`, a body
+    /// begins with `{ <expr-starting-token>`. This means a refinement
+    /// binding name can't start with `|`, but that's fine since
+    /// identifiers don't.
+    fn maybe_wrap_refinement(&mut self, base: TypeExpr) -> Result<TypeExpr, ParseError> {
+        let next0 = self.tokens.get(self.idx).map(|t| &t.kind);
+        let next1 = self.tokens.get(self.idx + 1).map(|t| &t.kind);
+        let next2 = self.tokens.get(self.idx + 2).map(|t| &t.kind);
+        let is_refinement_lookahead = matches!(next0, Some(TokenKind::LBrace))
+            && matches!(next1, Some(TokenKind::Ident(_)))
+            && matches!(next2, Some(TokenKind::Bar));
+        if !is_refinement_lookahead {
+            return Ok(base);
+        }
+        self.bump(); // `{`
+        let binding = self.expect_ident("for refinement binding")?;
+        self.expect(&TokenKind::Bar, "after refinement binding")?;
+        let predicate = self.parse_expr()?;
+        self.expect(&TokenKind::RBrace, "to close refinement")?;
+        Ok(TypeExpr::Refined {
+            base: Box::new(base),
+            binding,
+            predicate: Box::new(predicate),
+        })
     }
 
     fn parse_record_type(&mut self) -> Result<TypeExpr, ParseError> {

@@ -211,5 +211,18 @@ fn walk_type<'a>(t: &'a TypeExpr, parent: &NodeId, out: &mut Vec<(NodeId, NodeRe
                 idx += 1;
             }
         }
+        TypeExpr::Refined { base, predicate, .. } => {
+            // The base type and predicate are children for NodeId
+            // attribution. The binding name is metadata, not a node.
+            let id = parent.child(idx);
+            out.push((id.clone(), NodeRef::TypeExpr(base)));
+            walk_type(base, &id, out);
+            idx += 1;
+            // Walk into the predicate so its sub-expressions get NodeIds
+            // too — same pattern as walking a function body.
+            let pid = parent.child(idx);
+            out.push((pid.clone(), NodeRef::CExpr(predicate)));
+            walk_expr(predicate, &pid, out);
+        }
     }
 }

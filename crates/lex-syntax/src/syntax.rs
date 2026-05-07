@@ -72,6 +72,19 @@ pub enum TypeExpr {
         ret: Box<TypeExpr>,
     },
     Union(Vec<UnionVariant>),
+    /// Refinement type (#209): a base type plus a predicate the
+    /// inhabitant must satisfy. `Int{x | x > 0 and x <= balance}`
+    /// parses with `base = Named { name: "Int", args: [] }`,
+    /// `binding = "x"`, and `predicate = (x > 0) and (x <= balance)`.
+    /// Slice 1 stores the refinement; the type checker treats the
+    /// refined type as its base. Slice 2 wires up static discharge
+    /// via the spec-checker's gate evaluator; slice 3 adds the
+    /// residual runtime check at call boundaries.
+    Refined {
+        base: Box<TypeExpr>,
+        binding: String,
+        predicate: Box<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

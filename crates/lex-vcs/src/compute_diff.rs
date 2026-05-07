@@ -323,5 +323,12 @@ fn render_type(t: &TypeExpr) -> String {
             Some(p) => format!("{}({})", v.name, render_type(p)),
             None => v.name.clone(),
         }).collect::<Vec<_>>().join(" | "),
+        TypeExpr::Refined { base, binding, .. } => {
+            // Render compactly: `Base{x | …}`. The full predicate is
+            // captured in the canonical AST and contributes to
+            // OpId hashing via lex-vcs's content-addressing — this
+            // string is for diagnostics only. (#209 slice 1)
+            format!("{}{{{} | …}}", render_type(base), binding)
+        }
     }
 }

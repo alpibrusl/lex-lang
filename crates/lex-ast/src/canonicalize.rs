@@ -106,6 +106,11 @@ fn canonicalize_type(t: &s::TypeExpr) -> TypeExpr {
             vs.sort_by(|a, b| a.name.cmp(&b.name));
             TypeExpr::Union { variants: vs }
         }
+        s::TypeExpr::Refined { base, binding, predicate } => TypeExpr::Refined {
+            base: Box::new(canonicalize_type(base)),
+            binding: binding.clone(),
+            predicate: Box::new(canonicalize_expr(predicate)),
+        },
     }
 }
 

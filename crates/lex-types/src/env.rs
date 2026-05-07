@@ -239,5 +239,17 @@ pub fn ty_from_canon(t: &lex_ast::TypeExpr, params: &[String]) -> Ty {
             // Unions on the RHS of type-decls; not in arbitrary positions.
             Ty::Unit
         }
+        lex_ast::TypeExpr::Refined { base, .. } => {
+            // #209 slice 1: refinement types unify structurally as
+            // their base type. The predicate is parsed and stored in
+            // the AST (so `lex-vcs` content-addressing picks up
+            // refinement edits), but static discharge and runtime
+            // residual checks land in slices 2 and 3 of #209. The
+            // unification behavior here means a function declaring
+            // `Int{x | x > 0}` interoperates with plain `Int` callers
+            // — the predicate is informational until discharge is
+            // wired up.
+            ty_from_canon(base, params)
+        }
     }
 }

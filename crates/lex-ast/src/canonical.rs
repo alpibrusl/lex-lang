@@ -74,6 +74,17 @@ pub enum TypeExpr {
     Tuple { items: Vec<TypeExpr> },
     Function { params: Vec<TypeExpr>, effects: Vec<Effect>, ret: Box<TypeExpr> },
     Union { variants: Vec<UnionVariant> },
+    /// Refinement type (#209). Carries the predicate as a canonical
+    /// expression so `lex-vcs` content-addressing picks up changes
+    /// to the refinement just like changes to the base type. The
+    /// type checker treats the refined type as its base for
+    /// structural unification (slice 1); slice 2 plumbs static
+    /// discharge through the spec-checker.
+    Refined {
+        base: Box<TypeExpr>,
+        binding: String,
+        predicate: Box<CExpr>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

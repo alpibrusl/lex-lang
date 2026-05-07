@@ -356,6 +356,15 @@ impl<'a> Mangler<'a> {
                     })
                     .collect(),
             ),
+            TypeExpr::Refined { base, binding, predicate } => TypeExpr::Refined {
+                base: Box::new(self.mangle_type_expr(*base)),
+                binding,
+                // The predicate is an expression; its names are
+                // resolved during type-check, not loader-time, so
+                // it passes through unchanged here. Slice 2 wires
+                // up discharge through the spec-checker.
+                predicate,
+            },
         }
     }
 
