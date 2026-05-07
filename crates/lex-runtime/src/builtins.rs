@@ -31,7 +31,7 @@ pub fn is_pure_module(kind: &str) -> bool {
     matches!(kind, "str" | "int" | "float" | "bool" | "list"
         | "option" | "result" | "tuple" | "json" | "bytes" | "flow" | "math"
         | "map" | "set" | "crypto" | "regex" | "deque" | "datetime" | "http"
-        | "toml" | "yaml" | "dotenv" | "csv" | "test")
+        | "toml" | "yaml" | "dotenv" | "csv" | "test" | "random")
 }
 
 fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
@@ -950,6 +950,69 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             Ok(Value::Bool(eq))
         }
 
+        // -- random (#219): pure, seeded RNG. Backed by SplitMix64;
+        // state is the u64 mixer state stored as a single i64 in
+        // `Rng = { state :: Int }`. Threading the Rng through the
+        // call site is the user's responsibility — there is no
+        // global RNG and therefore no `[random]` effect tag for
+        // pure-seeded usage. --
+        ("random", "seed") => {
+            let s = args.first().ok_or("random.seed: missing arg")?.as_int();
+            // Hash the user-supplied seed once before installing it.
+            // SplitMix64 is fine when seeded with any u64, but
+            // hashing first protects against pathological seeds
+            // (e.g., 0) that would make the very first draw zero.
+            let mixed = splitmix64(s as u64).0;
+            Ok(rng_value(mixed))
+        }
+        ("random", "int") => {
+            let state = rng_decode(args.first())?;
+            let lo = args.get(1).ok_or("random.int: missing lo")?.as_int();
+            let hi = args.get(2).ok_or("random.int: missing hi")?.as_int();
+            if hi < lo {
+                return Err(format!(
+                    "random.int: hi ({hi}) must be >= lo ({lo})"));
+            }
+            let span = (hi as i128) - (lo as i128) + 1;
+            let (raw, next_state) = splitmix64(state);
+            // Reduce uniformly to [lo, hi]. The bias from a plain
+            // modulo is at most `(u64::MAX % span) / u64::MAX`,
+            // which for any practical span is invisible. Crypto
+            // applications should use `crypto.random` instead.
+            let drawn = lo as i128 + (raw as u128 % span as u128) as i128;
+            Ok(Value::Tuple(vec![
+                Value::Int(drawn as i64),
+                rng_value(next_state),
+            ]))
+        }
+        ("random", "float") => {
+            let state = rng_decode(args.first())?;
+            let (raw, next_state) = splitmix64(state);
+            // Take the top 53 bits and divide by 2^53 to land in
+            // [0.0, 1.0); this is the standard f64 uniform draw.
+            let f = ((raw >> 11) as f64) / ((1u64 << 53) as f64);
+            Ok(Value::Tuple(vec![Value::Float(f), rng_value(next_state)]))
+        }
+        ("random", "choose") => {
+            let state = rng_decode(args.first())?;
+            let xs = match args.get(1) {
+                Some(Value::List(xs)) => xs,
+                _ => return Err("random.choose: expected List".into()),
+            };
+            if xs.is_empty() {
+                return Ok(Value::Variant {
+                    name: "None".into(), args: vec![],
+                });
+            }
+            let (raw, next_state) = splitmix64(state);
+            let idx = (raw as usize) % xs.len();
+            let pick = xs[idx].clone();
+            Ok(Value::Variant {
+                name: "Some".into(),
+                args: vec![Value::Tuple(vec![pick, rng_value(next_state)])],
+            })
+        }
+
         // -- regex (the compiled `Regex` is stored as the pattern
         // string; the runtime caches the actual `regex::Regex` so
         // ops don't re-compile on every call) --
@@ -1313,6 +1376,43 @@ fn some(v: Value) -> Value { Value::Variant { name: "Some".into(), args: vec![v]
 fn none() -> Value { Value::Variant { name: "None".into(), args: Vec::new() } }
 fn ok_v(v: Value) -> Value { Value::Variant { name: "Ok".into(), args: vec![v] } }
 fn err_v(v: Value) -> Value { Value::Variant { name: "Err".into(), args: vec![v] } }
+
+// -- std.random helpers (#219) ----------------------------------------
+
+/// SplitMix64 — single-`u64` state PRNG that is byte-identical
+/// across platforms (no float math, no platform-dependent reductions).
+/// Returns `(drawn, next_state)`. Constants are the canonical
+/// SplitMix64 mixer from the original 2014 paper.
+fn splitmix64(state: u64) -> (u64, u64) {
+    let next = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = next;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    let z = z ^ (z >> 31);
+    (z, next)
+}
+
+/// Encode a SplitMix64 state as the user-facing `Rng` value.
+/// `Rng = { state :: Int }`; the type-checker treats `Rng` as
+/// opaque so users can't poke at the field.
+fn rng_value(state: u64) -> Value {
+    let mut fields = indexmap::IndexMap::new();
+    fields.insert("state".into(), Value::Int(state as i64));
+    Value::Record(fields)
+}
+
+/// Pull the SplitMix64 state out of a `Value::Record { state }`.
+fn rng_decode(v: Option<&Value>) -> Result<u64, String> {
+    let rec = match v {
+        Some(Value::Record(r)) => r,
+        Some(other) => return Err(format!("expected Rng, got {other:?}")),
+        None => return Err("missing Rng arg".into()),
+    };
+    match rec.get("state") {
+        Some(Value::Int(n)) => Ok(*n as u64),
+        _ => Err("malformed Rng: missing `state :: Int`".into()),
+    }
+}
 
 // -- helpers for `std.http` builders / decoders --
 

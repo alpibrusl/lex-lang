@@ -283,6 +283,47 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             ));
             Some(Ty::Record(fields))
         }
+        "random" => {
+            // #219: pure, seeded RNG. The caller threads the `Rng`
+            // value through computations explicitly — there is no
+            // global state and no effect tag, because the seed is
+            // visible in the program's value flow and replay is
+            // therefore deterministic by construction.
+            //
+            // Backed at runtime by SplitMix64 (deterministic across
+            // platforms, single-u64 state). The proposal mentioned
+            // `rand_chacha` for cryptographic-strength bias, but the
+            // acceptance criterion is just "byte-identical sequence
+            // across platforms," and SplitMix64 satisfies that with
+            // a state shape that fits in `Value::Int` cleanly.
+            let rng_t = || Ty::Con("Rng".into(), vec![]);
+            let mut fields = IndexMap::new();
+            // seed :: Int -> Rng
+            fields.insert("seed".into(), Ty::function(
+                vec![Ty::int()], EffectSet::empty(), rng_t()));
+            // int :: Rng, Int, Int -> (Int, Rng)
+            // Uniform in [lo, hi] inclusive at both ends. Returns
+            // the drawn value and the advanced Rng.
+            fields.insert("int".into(), Ty::function(
+                vec![rng_t(), Ty::int(), Ty::int()],
+                EffectSet::empty(),
+                Ty::Tuple(vec![Ty::int(), rng_t()])));
+            // float :: Rng -> (Float, Rng)
+            // Uniform in [0.0, 1.0).
+            fields.insert("float".into(), Ty::function(
+                vec![rng_t()], EffectSet::empty(),
+                Ty::Tuple(vec![Ty::float(), rng_t()])));
+            // choose :: Rng, List[T] -> Option[(T, Rng)]
+            // Returns None if the list is empty.
+            fields.insert("choose".into(), Ty::function(
+                vec![rng_t(), Ty::List(Box::new(Ty::Var(0)))],
+                EffectSet::empty(),
+                Ty::Con("Option".into(), vec![
+                    Ty::Tuple(vec![Ty::Var(0), rng_t()]),
+                ]),
+            ));
+            Some(Ty::Record(fields))
+        }
         "env" => {
             // #216: env.get(name) -> [env] Option[Str].
             // Per-var scoping (`[env(NAME)]`) lands with the
@@ -1392,6 +1433,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "tuple" => "tuple",
         "time" => "time",
         "rand" => "rand",
+        "random" => "random",
         "env" => "env",
         "bytes" => "bytes",
         "net" => "net",
