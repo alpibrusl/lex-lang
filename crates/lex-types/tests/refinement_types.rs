@@ -57,21 +57,136 @@ fn pay(amount :: Int{x | x > 0 and x <= 100}) -> Int { amount }
 
 #[test]
 fn refined_param_unifies_as_its_base_type_for_now() {
-    // Slice 1: refined types are structurally equal to their base.
-    // A function declaring `Int{x | x > 0}` accepts plain Int callers
-    // and type-checks. Slice 2 will tighten this so static-known
-    // violations are rejected.
+    // Refined types unify structurally as their base, so a non-literal
+    // call (where slice-2 discharge can't decide) type-checks. Use a
+    // local var so the call defers to slice 3's runtime check.
+    let src = r#"
+fn withdraw(amount :: Int{x | x > 0}) -> Int { amount }
+fn caller(input :: Int) -> Int { withdraw(input) }
+"#;
+    let prog = parse_source(src).expect("parse");
+    let stages = canonicalize_program(&prog);
+    // Type-check should pass: refined Int unifies as Int and the
+    // non-literal arg defers to runtime (slice 3 territory).
+    if let Err(errs) = lex_types::check_program(&stages) {
+        panic!("expected type-check pass (non-literal arg defers to \
+                runtime check); got: {errs:#?}");
+    }
+}
+
+// ---- #209 slice 2: static discharge of literal arguments ---------
+
+#[test]
+fn literal_arg_satisfying_predicate_proves_statically() {
+    // The headline acceptance criterion: `withdraw(5)` against
+    // `amount > 0` proves at compile time, no runtime cost.
+    let src = r#"
+fn withdraw(amount :: Int{x | x > 0}) -> Int { amount }
+fn caller() -> Int { withdraw(5) }
+"#;
+    let prog = parse_source(src).expect("parse");
+    let stages = canonicalize_program(&prog);
+    if let Err(errs) = lex_types::check_program(&stages) {
+        panic!("expected static discharge to prove `5 > 0`; \
+                got: {errs:#?}");
+    }
+}
+
+#[test]
+fn literal_arg_violating_predicate_is_refuted_statically() {
+    // Pre-slice-2 this type-checked silently; now `withdraw(-5)`
+    // is rejected at compile time because the type checker can
+    // evaluate the predicate `x > 0` with `x = -5` and see it's
+    // false. The headline correctness win.
     let src = r#"
 fn withdraw(amount :: Int{x | x > 0}) -> Int { amount }
 fn caller() -> Int { withdraw(-5) }
 "#;
     let prog = parse_source(src).expect("parse");
     let stages = canonicalize_program(&prog);
-    // Type-check should pass: refined Int unifies as Int.
-    if let Err(errs) = lex_types::check_program(&stages) {
-        panic!("expected type-check pass (slice 1 unifies refined as \
-                base); got: {errs:#?}");
-    }
+    let errs = match lex_types::check_program(&stages) {
+        Ok(_) => panic!("expected type-check to fail"),
+        Err(e) => e,
+    };
+    let viol = errs.iter().find(|e| matches!(e,
+        lex_types::TypeError::RefinementViolation { .. }));
+    assert!(viol.is_some(),
+        "expected RefinementViolation; got: {errs:#?}");
+}
+
+#[test]
+fn compound_predicate_proves_when_all_clauses_hold() {
+    let src = r#"
+fn pay(amount :: Int{x | x > 0 and x <= 100}) -> Int { amount }
+fn caller() -> Int { pay(50) }
+"#;
+    let prog = parse_source(src).expect("parse");
+    let stages = canonicalize_program(&prog);
+    lex_types::check_program(&stages).expect("50 satisfies (>0 and <=100)");
+}
+
+#[test]
+fn compound_predicate_refutes_on_upper_bound() {
+    let src = r#"
+fn pay(amount :: Int{x | x > 0 and x <= 100}) -> Int { amount }
+fn caller() -> Int { pay(150) }
+"#;
+    let prog = parse_source(src).expect("parse");
+    let stages = canonicalize_program(&prog);
+    let errs = match lex_types::check_program(&stages) {
+        Ok(_) => panic!("expected type-check to fail"),
+        Err(e) => e,
+    };
+    assert!(errs.iter().any(|e| matches!(e,
+        lex_types::TypeError::RefinementViolation { .. })),
+        "expected RefinementViolation for 150 > 100; got: {errs:#?}");
+}
+
+#[test]
+fn predicate_with_external_var_defers_to_runtime() {
+    // The predicate references `balance`, which isn't the binding.
+    // Slice 2's discharge engine doesn't try to resolve external
+    // identifiers; it defers to slice 3's runtime check. The literal
+    // arg by itself doesn't statically violate the part the engine
+    // *can* see, so the call type-checks.
+    //
+    // This intentionally documents a slice-2 limitation: agents that
+    // want richer discharge today should rewrite predicates so all
+    // free variables are the binding (e.g. inline `balance` as a
+    // numeric constant). Slice 3 will plumb call-site context.
+    let src = r#"
+fn withdraw(amount :: Int{x | x > 0 and x <= balance}) -> Int { amount }
+fn caller() -> Int { withdraw(50) }
+"#;
+    let prog = parse_source(src).expect("parse");
+    let stages = canonicalize_program(&prog);
+    lex_types::check_program(&stages).expect(
+        "external `balance` should defer; the bound predicate `x > 0` \
+         alone is satisfied by 50, so no static refutation");
+}
+
+#[test]
+fn refutation_error_names_the_binding_and_reason() {
+    let src = r#"
+fn pos(amount :: Int{x | x > 0}) -> Int { amount }
+fn caller() -> Int { pos(-3) }
+"#;
+    let prog = parse_source(src).expect("parse");
+    let stages = canonicalize_program(&prog);
+    let errs = match lex_types::check_program(&stages) {
+        Ok(_) => panic!("expected type-check to fail"),
+        Err(e) => e,
+    };
+    let v = errs.iter().find_map(|e| match e {
+        lex_types::TypeError::RefinementViolation {
+            fn_name, binding, reason, ..
+        } => Some((fn_name.clone(), binding.clone(), reason.clone())),
+        _ => None,
+    }).expect("expected RefinementViolation");
+    assert_eq!(v.0, "pos");
+    assert_eq!(v.1, "x");
+    assert!(v.2.contains("-3"),
+        "reason should name the failing arg value; got: {}", v.2);
 }
 
 #[test]

@@ -51,6 +51,18 @@ pub enum TypeError {
         at_node: String,
         name: String,
     },
+    /// Refinement-type predicate provably violated at a call site
+    /// (#209 slice 2). The type checker statically discharged the
+    /// refinement and found the literal argument doesn't satisfy the
+    /// predicate. Slice 3 will add residual runtime checks for
+    /// arguments that can't be discharged statically.
+    RefinementViolation {
+        at_node: String,
+        fn_name: String,
+        param_index: usize,
+        binding: String,
+        reason: String,
+    },
 }
 
 impl TypeError {
@@ -66,7 +78,8 @@ impl TypeError {
             | TypeError::EffectNotDeclared { at_node, .. }
             | TypeError::InfiniteType { at_node, .. }
             | TypeError::AmbiguousType { at_node, .. }
-            | TypeError::RecursiveTypeWithoutConstructor { at_node, .. } => at_node,
+            | TypeError::RecursiveTypeWithoutConstructor { at_node, .. }
+            | TypeError::RefinementViolation { at_node, .. } => at_node,
         }
     }
 }
@@ -89,6 +102,9 @@ impl std::fmt::Display for TypeError {
             TypeError::InfiniteType { at_node } => write!(f, "infinite type (occurs check) at {at_node}"),
             TypeError::AmbiguousType { at_node } => write!(f, "ambiguous type at {at_node}"),
             TypeError::RecursiveTypeWithoutConstructor { at_node, name } => write!(f, "recursive type {name} has no constructor at {at_node}"),
+            TypeError::RefinementViolation { at_node, fn_name, param_index, binding, reason } =>
+                write!(f, "refinement violated at {at_node}: argument {} of `{fn_name}` (binding `{binding}`): {reason}",
+                    param_index + 1),
         }
     }
 }
