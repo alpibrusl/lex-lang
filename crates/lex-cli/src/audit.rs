@@ -49,6 +49,13 @@ struct AuditOpts {
     ///
     /// Without `--store`, behavior is unchanged.
     store_root: Option<PathBuf>,
+    /// Semantic-search query (#224). When set, the audit runs against
+    /// the store rather than the file system: every active stage is
+    /// embedded into the three-index, then ranked by fused cosine
+    /// similarity to this query.
+    query: Option<String>,
+    /// Top-K cap for `--query` results.
+    limit: usize,
 }
 
 #[derive(Serialize)]
@@ -70,8 +77,11 @@ struct AuditReport {
 pub fn cmd_audit(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let mut opts = parse_audit_args(args)?;
     if matches!(fmt, OutputFormat::Json) { opts.json = true; }
+    if opts.query.is_some() {
+        return cmd_audit_semantic(fmt, &opts);
+    }
     if opts.paths.is_empty() {
-        return Err(anyhow!("usage: lex audit [paths...] [--effect KIND] [--calls FN] [--uses-host HOST] [--kind NODE] [--json]"));
+        return Err(anyhow!("usage: lex audit [paths...] [--effect KIND] [--calls FN] [--uses-host HOST] [--kind NODE] [--query Q] [--json]"));
     }
     let files = collect_lex_files(&opts.paths)?;
     let mut report = AuditReport { summary: BTreeMap::new(), hits: Vec::new() };
@@ -234,6 +244,16 @@ fn parse_audit_args(args: &[String]) -> Result<AuditOpts> {
             "--store" => {
                 let v = args.get(i + 1).ok_or_else(|| anyhow!("--store needs a path"))?;
                 o.store_root = Some(PathBuf::from(v));
+                i += 2;
+            }
+            "--query" => {
+                let v = args.get(i + 1).ok_or_else(|| anyhow!("--query needs a value"))?;
+                o.query = Some(v.clone());
+                i += 2;
+            }
+            "--limit" => {
+                let v = args.get(i + 1).ok_or_else(|| anyhow!("--limit needs a value"))?;
+                o.limit = v.parse().with_context(|| format!("--limit must be a positive integer (got `{v}`)"))?;
                 i += 2;
             }
             other => { o.paths.push(PathBuf::from(other)); i += 1; }
@@ -478,4 +498,72 @@ fn render_type(t: &TypeExpr) -> String {
             format!("{}{{{} | …}}", render_type(base), binding)
         }
     }
+}
+
+// ---- #224 semantic search ----------------------------------------
+
+/// `lex audit --query "..."` mode. Walks the store, embeds every
+/// active stage, ranks against the query, and applies the structural
+/// filters (`--effect`, etc.) as a post-filter on the ranked list.
+fn cmd_audit_semantic(fmt: &OutputFormat, opts: &AuditOpts) -> Result<()> {
+    let query = opts.query.as_deref().unwrap();
+    let limit = if opts.limit == 0 { 10 } else { opts.limit };
+    let root = opts.store_root.clone()
+        .unwrap_or_else(default_store_root);
+
+    let store = lex_store::Store::open(&root)
+        .with_context(|| format!("opening store at {}", root.display()))?;
+    let embedder = lex_search::MockEmbedder::new();
+    let idx = lex_search::SearchIndex::build(&store, &embedder)
+        .map_err(|e| anyhow!("building search index: {e}"))?;
+    let mut hits = idx.query(&embedder, query, limit.saturating_mul(4))
+        .map_err(|e| anyhow!("query embedding: {e}"))?;
+
+    // Post-filter by --effect on the ranked list. We over-fetch
+    // (4× limit) above so that a filter that matches a few stages
+    // still has enough candidates after pruning.
+    if !opts.effects.is_empty() {
+        hits.retain(|h| {
+            let stg = match store.get_ast(&h.stage_id) {
+                Ok(s) => s,
+                Err(_) => return false,
+            };
+            if let Stage::FnDecl(fd) = stg {
+                fd.effects.iter().any(|e| opts.effects.iter().any(|q| q == &e.name))
+            } else {
+                false
+            }
+        });
+    }
+    hits.truncate(limit);
+
+    let v = serde_json::json!({
+        "query": query,
+        "limit": limit,
+        "indexed": idx.stages.len(),
+        "hits": serde_json::to_value(&hits)?,
+    });
+    if matches!(fmt, OutputFormat::Json) {
+        crate::acli::emit_or_text("audit", v, fmt, || {});
+        return Ok(());
+    }
+    if opts.json {
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
+    println!("{} hit(s) for `{query}`", hits.len());
+    for h in &hits {
+        println!(
+            "  {:>6.3}  {}::{}  {}",
+            h.score.fused, h.stage_id, h.name, h.signature
+        );
+        if let Some(d) = &h.description { println!("          note: {d}"); }
+    }
+    Ok(())
+}
+
+fn default_store_root() -> PathBuf {
+    std::env::var("LEX_STORE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(".lex"))
 }

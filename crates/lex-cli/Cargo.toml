@@ -23,6 +23,7 @@ lex-types = { path = "../lex-types" }
 lex-bytecode = { path = "../lex-bytecode" }
 lex-runtime = { path = "../lex-runtime" }
 lex-store = { path = "../lex-store" }
+lex-search = { path = "../lex-search" }
 lex-vcs = { path = "../lex-vcs" }
 lex-trace = { path = "../lex-trace" }
 lex-api = { path = "../lex-api" }

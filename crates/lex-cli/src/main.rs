@@ -157,6 +157,9 @@ fn print_usage() {
     println!("  store get [--store DIR] [--require-signed] [--trusted-key HEX] <stage>");
     println!("                                     print stage metadata + canonical AST;");
     println!("                                     verify Ed25519 signature when present.");
+    println!("  store search [--store DIR] [--limit N] \"<query>\"");
+    println!("                                     semantic search over active stages,");
+    println!("                                     ranked by description+signature+examples.");
     println!("  stage <stage> [--attestations]     print stage info, or list its attestations");
     println!("  attest filter [--kind K] [--result R] [--since T] [--store DIR]");
     println!("                                     cross-stage attestation queries");
@@ -178,6 +181,9 @@ fn print_usage() {
     println!("                                     and invoke them via /tools/{{id}}/invoke");
     println!("  audit [paths...] [filters]        structural code search by effect / call /");
     println!("                                     hostname / AST kind. --json for machine-readable.");
+    println!("  audit --query \"<text>\" [--limit N] [--effect K]");
+    println!("                                     semantic search over the store; --effect");
+    println!("                                     post-filters the ranked list.");
     println!("  ast-diff <file_a> <file_b>        AST-native diff: added/removed/renamed/modified");
     println!("                                     fns, plus body-level patches per modified body.");
     println!("  ast-merge <base> <ours> <theirs>  three-way structural merge; structured-JSON");
@@ -1371,8 +1377,63 @@ fn cmd_store(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             });
             Ok(())
         }
+        "search" => cmd_store_search(fmt, rest),
         other => bail!("unknown `lex store` subcommand: {other}"),
     }
+}
+
+/// `lex store search "<query>"` (#224). Embeds the query and ranks
+/// every active stage in the store by fused cosine similarity over
+/// description + signature + examples. Slice 1 ships only the
+/// MockEmbedder for offline / deterministic ranking; the network-
+/// backed providers gate on `LEX_EMBED_URL` (slice 2).
+fn cmd_store_search(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let (root, rest, _, _) = parse_store_flag(args);
+    let mut limit: usize = 10;
+    let mut query: Option<String> = None;
+    let mut iter = rest.iter();
+    while let Some(a) = iter.next() {
+        match a.as_str() {
+            "--limit" => {
+                let v = iter.next().ok_or_else(|| anyhow!("--limit needs a value"))?;
+                limit = v.parse().context("--limit must be a positive integer")?;
+            }
+            other if !other.starts_with("--") => {
+                if query.is_some() {
+                    bail!("usage: lex store search [--limit N] \"<query>\"");
+                }
+                query = Some(other.to_string());
+            }
+            other => bail!("unknown flag `{other}` for `lex store search`"),
+        }
+    }
+    let query = query.ok_or_else(|| anyhow!(
+        "usage: lex store search [--limit N] \"<query>\""))?;
+
+    let store = Store::open(&root)
+        .with_context(|| format!("opening store at {}", root.display()))?;
+    let embedder = lex_search::MockEmbedder::new();
+    let idx = lex_search::SearchIndex::build(&store, &embedder)
+        .map_err(|e| anyhow!("building search index: {e}"))?;
+    let hits = idx.query(&embedder, &query, limit)
+        .map_err(|e| anyhow!("query embedding: {e}"))?;
+    let v = serde_json::json!({
+        "query": &query,
+        "limit": limit,
+        "indexed": idx.stages.len(),
+        "hits": serde_json::to_value(&hits)?,
+    });
+    acli::emit_or_text("store-search", v.clone(), fmt, || {
+        println!("{} hit(s) for `{}`", hits.len(), query);
+        for h in &hits {
+            println!(
+                "  {:>6.3}  {}::{}  {}",
+                h.score.fused, h.stage_id, h.name, h.signature,
+            );
+            if let Some(d) = &h.description { println!("          note: {d}"); }
+        }
+    });
+    Ok(())
 }
 
 /// `lex stage <stage_id>` — print metadata + canonical AST + status.

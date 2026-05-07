@@ -1,0 +1,23 @@
+[package]
+name = "lex-search"
+description = "Semantic search over lex-store stages: three-index fusion (description / signature / examples)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+lex-ast = { path = "../lex-ast", version = "0.2.2" }
+lex-store = { path = "../lex-store", version = "0.2.2" }
+
+[dev-dependencies]
+tempfile = "3"
+lex-syntax = { path = "../lex-syntax", version = "0.2.2" }
