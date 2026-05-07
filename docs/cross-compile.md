@@ -137,6 +137,55 @@ server) and aren't useful as a cross-compile smoke test.
   running the model server. The pre-built artifacts are the
   fastest route.
 
+## Local-LLM backend choice (downstream concern)
+
+`lex-lang` ships the `lex` binary and the runtime that intercepts
+`agent.local_complete` / `agent.cloud_complete` calls. **Choosing
+which model server to run alongside it is downstream's job** —
+those decisions live with whoever's deploying the agent (`soft`,
+in the Phase 1 case).
+
+Common pairings on aarch64 hardware:
+
+| Target | Recommended local-LLM backend |
+|---|---|
+| Jetson Orin (`aarch64-linux`) | Ollama, or `llama.cpp` with CUDA when latency matters more than ergonomics. |
+| Mac Studio mini (`aarch64-darwin`) | Ollama (uses Metal automatically). |
+
+Whatever you pick, point `OLLAMA_HOST` (or the equivalent) at the
+right URL before launching `lex run` / `soft-run`. The lex-lang
+runtime treats the LLM endpoint as configurable, not pinned —
+see `crates/lex-runtime/src/llm.rs` for the env-var precedence
+(`LEX_LLM_LOCAL_HOST` → `OLLAMA_HOST` → default
+`http://localhost:11434`). Anthropic-shape `agent.cloud_complete`
+is similar; see `soft-runner`'s `--llm-cloud-provider anthropic`
+path for an example of pointing it at a different endpoint
+without a lex-lang change.
+
+The upstream surface that matters here is `#196` — it tracks the
+LLM config shape (env vars, header layout, retry / timeout) — and
+**not** the choice of which server runs at the other end. That
+distinction has been the working assumption between the two
+projects since v0.2.0; this doc captures it.
+
+## CI verification
+
+Every tag publish triggers `verify-release.yml`, which downloads
+the just-published `lex-${TAG}-x86_64-unknown-linux-gnu.tar.gz` and
+`lex-${TAG}-aarch64-unknown-linux-gnu.tar.gz` archives, verifies
+their `.sha256` sidecars, runs `lex --version`, and smoke-tests
+`lex check` on a tiny file. The aarch64 binary runs through
+`qemu-user-static` so the check works on a stock x86_64 GitHub
+runner.
+
+This catches packaging regressions (a corrupted tarball, a
+binary built for the wrong arch, a missing dynamic library) but
+it doesn't replace on-hardware verification — qemu emulates the
+ISA but not the real Jetson / Mac Studio environment. For
+production-bound deploys, run the manual smoke test in the
+"Pre-built release binaries" section above on the actual target
+device before rolling forward.
+
 ## Troubleshooting
 
 | Symptom | Likely cause |
