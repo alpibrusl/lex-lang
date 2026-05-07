@@ -132,7 +132,7 @@ impl SearchIndex {
             example_embs: vec![vec![0.0; dim]; row.examples.len()],
         }).collect();
 
-        for (kind, vec) in kinds.into_iter().zip(embeddings.into_iter()) {
+        for (kind, vec) in kinds.into_iter().zip(embeddings) {
             let row = &mut indexed[kind.row];
             match kind.slot {
                 Slot::Description => row.description_emb = Some(vec),
