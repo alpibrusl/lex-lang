@@ -149,3 +149,58 @@ fn zero_attempts_returns_unit_value() {
     let v = compile_run(ZERO_ATTEMPTS_SRC, "run", vec![]);
     assert_eq!(v, Value::Unit);
 }
+
+// ---- Effect-row propagation tests (regression for the bug fixed in
+// this PR: EffectSet::empty() on the closure parameter was replaced
+// with open_var(3), allowing effectful closures to be passed) ----
+
+const EFFECTFUL_RETRY_SRC: &str = r#"
+import "std.flow" as flow
+
+# A closure that carries [io]. Before the fix, passing this to
+# retry_with_backoff failed type-check because the parameter was
+# typed as pure (EffectSet::empty()). After the fix the effect row
+# is unified with [io] and the result function is [io, time].
+fn try_io(_x :: Int) -> [io] Result[Int, Str] {
+  Ok(1)
+}
+
+fn run() -> [io, time] Result[Int, Str] {
+  let r := flow.retry_with_backoff(try_io, 3, 1)
+  r(0)
+}
+"#;
+
+#[test]
+fn effectful_closure_typechecks_with_retry_with_backoff() {
+    // This test would panic at "type errors" before the open_var fix.
+    let v = compile_run(EFFECTFUL_RETRY_SRC, "run", vec![]);
+    match v {
+        Value::Variant { ref name, .. } if name == "Ok" => {}
+        other => panic!("expected Ok, got {other:?}"),
+    }
+}
+
+const EFFECTFUL_RETRY_PLAIN_SRC: &str = r#"
+import "std.flow" as flow
+
+fn try_io(_x :: Int) -> [io] Result[Int, Str] {
+  Ok(42)
+}
+
+# flow.retry with an effectful closure. The returned function's
+# effect row should unify to [io] (same as the closure's row).
+fn run() -> [io] Result[Int, Str] {
+  let r := flow.retry(try_io, 2)
+  r(0)
+}
+"#;
+
+#[test]
+fn effectful_closure_typechecks_with_retry() {
+    let v = compile_run(EFFECTFUL_RETRY_PLAIN_SRC, "run", vec![]);
+    match v {
+        Value::Variant { ref name, .. } if name == "Ok" => {}
+        other => panic!("expected Ok, got {other:?}"),
+    }
+}
