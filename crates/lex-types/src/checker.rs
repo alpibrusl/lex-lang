@@ -65,6 +65,10 @@ pub fn check_program(stages: &[a::Stage]) -> Result<ProgramTypes, Vec<TypeError>
         if let a::Stage::FnDecl(fd) = stage {
             let scheme = function_scheme(fd);
             tcx.globals.insert(fd.name.clone(), scheme);
+            // #209 slice 2: keep the original params so call-site
+            // refinement discharge can see the predicate before it
+            // gets stripped to its base type by `ty_from_canon`.
+            tcx.fn_params.insert(fd.name.clone(), fd.params.clone());
         }
     }
 
@@ -333,6 +337,12 @@ struct Checker {
     /// `Result[Manifest, _]` constraints from match patterns or
     /// let-annotations have settled.
     pending_parse_calls: Vec<(usize, Ty)>,
+    /// Per-function param list, retained so call-site discharge can
+    /// see refinement predicates (#209 slice 2). The main `globals`
+    /// scheme strips refinements (`Refined` unifies as its base);
+    /// this side-table keeps the pre-stripped `TypeExpr` available
+    /// for static discharge of literal arguments.
+    fn_params: IndexMap<String, Vec<a::Param>>,
 }
 
 impl Checker {
@@ -343,6 +353,7 @@ impl Checker {
             globals: IndexMap::new(),
             module_aliases: IndexMap::new(),
             pending_parse_calls: Vec::new(),
+            fn_params: IndexMap::new(),
         }
     }
 
@@ -757,6 +768,31 @@ impl Checker {
                     let at = self.check_expr(a, node_id, locals, effs)?;
                     if let Err(err) = self.unify_with_record_coercion(&at, p) {
                         return Err(mismatch_err(node_id, err, &self.u, vec![format!("argument {} of call", i + 1)]));
+                    }
+                }
+                // #209 slice 2: refinement discharge for direct named
+                // calls. Look up the callee's original params (kept
+                // pre-strip in `fn_params`), and for each refined
+                // param attempt static discharge against the call
+                // arg. Refuted = type error; Deferred = pass (slice
+                // 3 will add a runtime residual check).
+                if let a::CExpr::Var { name: callee_name } = callee {
+                    if let Some(callee_params) = self.fn_params.get(callee_name).cloned() {
+                        for (i, (param, arg)) in callee_params.iter().zip(args.iter()).enumerate() {
+                            if let a::TypeExpr::Refined { binding, predicate, .. } = &param.ty {
+                                let outcome = crate::discharge::try_discharge(
+                                    predicate, binding, arg);
+                                if let crate::discharge::DischargeOutcome::Refuted { reason } = outcome {
+                                    return Err(TypeError::RefinementViolation {
+                                        at_node: node_id.into(),
+                                        fn_name: callee_name.clone(),
+                                        param_index: i,
+                                        binding: binding.clone(),
+                                        reason,
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
                 // Re-resolve effects after unifying args: an effect-row

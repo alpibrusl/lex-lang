@@ -55,16 +55,17 @@ fn smt_type(t: &SpecType) -> &'static str {
         SpecType::Float => "Real",
         SpecType::Bool => "Bool",
         SpecType::Str => "String",
-        // #208: SMT-LIB encoding for record / list types isn't
-        // implemented in this slice. SMT supports both via datatype
-        // declarations + sequences, but mapping the spec types into
-        // SMT-LIB needs name management for nested records and
-        // accessor / `seq.nth` generation. Out of scope for v1;
-        // the SMT path stays scalar-only. Specs that use these types
-        // are still evaluable via the gate path
-        // (`evaluate_gate_compiled`), which is what soft-agent uses.
+        // #208: SMT-LIB encoding for record / list / named (ADT)
+        // types isn't implemented. SMT supports all three via
+        // datatype declarations + sequences, but mapping the spec
+        // types into SMT-LIB needs name management and accessor
+        // function generation. Out of scope; the SMT path stays
+        // scalar-only. Specs that use these types are still
+        // evaluable via the gate path (`evaluate_gate_compiled`),
+        // which is what soft-agent uses.
         SpecType::Record { .. } => "<unsupported-Record>",
         SpecType::List { .. } => "<unsupported-List>",
+        SpecType::Named { .. } => "<unsupported-Named>",
     }
 }
 
@@ -116,6 +117,12 @@ fn expr_to_smt(e: &SpecExpr) -> String {
         SpecExpr::Index { list, index } => {
             format!("(<unsupported-Index> {} {})",
                 expr_to_smt(list), expr_to_smt(index))
+        }
+        SpecExpr::Match { scrutinee, arms } => {
+            // SMT-LIB match needs the datatype declared via declare-datatypes;
+            // out of scope for v1 — same rationale as the other variants.
+            let _ = arms;
+            format!("(<unsupported-Match> {})", expr_to_smt(scrutinee))
         }
     }
 }

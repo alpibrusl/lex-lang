@@ -472,5 +472,10 @@ fn render_type(t: &TypeExpr) -> String {
             }).collect();
             parts.join(" | ")
         }
+        TypeExpr::Refined { base, binding, .. } => {
+            // Compact diagnostic form (#209 slice 1). Full predicate
+            // is in the canonical AST and contributes to OpId hashing.
+            format!("{}{{{} | …}}", render_type(base), binding)
+        }
     }
 }

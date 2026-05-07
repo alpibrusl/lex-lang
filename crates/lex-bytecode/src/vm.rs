@@ -19,6 +19,19 @@ pub enum VmError {
     Effect(String),
     #[error("call stack overflow: recursion depth exceeded ({0})")]
     CallStackOverflow(u32),
+    /// Refinement predicate failed at a call boundary (#209 slice 3).
+    /// Surfaced when a function declares `param :: Type{x | predicate}`,
+    /// the call-site arg couldn't be discharged statically (slice 2),
+    /// and the runtime evaluator finds the predicate is `false` for
+    /// the actual argument value. The `verdict` mirrors the shape of
+    /// `gate.verdict`-style records in `lex-trace`.
+    #[error("refinement violated: argument {param_index} of `{fn_name}` (binding `{binding}`): {reason}")]
+    RefinementFailed {
+        fn_name: String,
+        param_index: usize,
+        binding: String,
+        reason: String,
+    },
 }
 
 /// Maximum simultaneous call frames. Defends against unbounded
@@ -174,6 +187,116 @@ fn hash_call_args(args: &[Value]) -> [u8; 16] {
     out
 }
 
+/// Evaluate a refinement predicate at runtime against the actual
+/// argument value (#209 slice 3). Mirrors `lex_types::discharge`'s
+/// static evaluator but operates on `Value` directly.
+///
+/// Returns `Ok(true)` / `Ok(false)` for a clean boolean verdict, or
+/// `Err(reason)` if the predicate references something the runtime
+/// can't resolve (free variable beyond the binding, unsupported AST
+/// node). Callers map `Ok(false)` and `Err` to `VmError::RefinementFailed`.
+fn eval_refinement(
+    predicate: &lex_ast::CExpr,
+    binding: &str,
+    arg: &Value,
+) -> Result<bool, String> {
+    match eval_refinement_inner(predicate, binding, arg) {
+        Ok(Value::Bool(b)) => Ok(b),
+        Ok(other) => Err(format!("predicate didn't reduce to a Bool, got {other:?}")),
+        Err(e) => Err(e),
+    }
+}
+
+fn eval_refinement_inner(
+    e: &lex_ast::CExpr,
+    binding: &str,
+    arg: &Value,
+) -> Result<Value, String> {
+    use lex_ast::{CExpr, CLit};
+    match e {
+        CExpr::Literal { value } => Ok(match value {
+            CLit::Int { value } => Value::Int(*value),
+            CLit::Float { value } => Value::Float(value.parse().unwrap_or(0.0)),
+            CLit::Bool { value } => Value::Bool(*value),
+            CLit::Str { value } => Value::Str(value.clone()),
+            CLit::Bytes { value } => Value::Str(value.clone()), // hex; unusual in predicates
+            CLit::Unit => Value::Unit,
+        }),
+        CExpr::Var { name } if name == binding => Ok(arg.clone()),
+        CExpr::Var { name } => Err(format!(
+            "predicate references free var `{name}`; runtime check \
+             only resolves the binding (slice 4 will plumb call-site \
+             context)")),
+        CExpr::UnaryOp { op, expr } => {
+            let v = eval_refinement_inner(expr, binding, arg)?;
+            match (op.as_str(), v) {
+                ("not", Value::Bool(b)) => Ok(Value::Bool(!b)),
+                ("-", Value::Int(n)) => Ok(Value::Int(-n)),
+                ("-", Value::Float(n)) => Ok(Value::Float(-n)),
+                (o, v) => Err(format!("unsupported unary `{o}` on {v:?}")),
+            }
+        }
+        CExpr::BinOp { op, lhs, rhs } => {
+            // Short-circuit `and` / `or` for the same reasons as the
+            // static evaluator.
+            if op == "and" || op == "or" {
+                let l = eval_refinement_inner(lhs, binding, arg)?;
+                let lb = match l {
+                    Value::Bool(b) => b,
+                    other => return Err(format!("`{op}` on non-bool: {other:?}")),
+                };
+                if op == "and" && !lb { return Ok(Value::Bool(false)); }
+                if op == "or"  &&  lb { return Ok(Value::Bool(true));  }
+                let r = eval_refinement_inner(rhs, binding, arg)?;
+                return match r {
+                    Value::Bool(b) => Ok(Value::Bool(b)),
+                    other => Err(format!("`{op}` on non-bool: {other:?}")),
+                };
+            }
+            let l = eval_refinement_inner(lhs, binding, arg)?;
+            let r = eval_refinement_inner(rhs, binding, arg)?;
+            apply_refinement_binop(op, &l, &r)
+        }
+        // Other AST forms (Call, Let, Match, FieldAccess, Lambda,
+        // Block, Constructors, Records, Tuples, Lists, Return) need
+        // a more general evaluator that can call back into the VM.
+        // Out of scope for slice 3; a future slice may unify this
+        // with the spec-checker's gate evaluator.
+        other => Err(format!("unsupported predicate node: {other:?}")),
+    }
+}
+
+fn apply_refinement_binop(op: &str, l: &Value, r: &Value) -> Result<Value, String> {
+    use Value::*;
+    match (op, l, r) {
+        ("+", Int(a), Int(b)) => Ok(Int(a + b)),
+        ("-", Int(a), Int(b)) => Ok(Int(a - b)),
+        ("*", Int(a), Int(b)) => Ok(Int(a * b)),
+        ("/", Int(a), Int(b)) if *b != 0 => Ok(Int(a / b)),
+        ("%", Int(a), Int(b)) if *b != 0 => Ok(Int(a % b)),
+        ("+", Float(a), Float(b)) => Ok(Float(a + b)),
+        ("-", Float(a), Float(b)) => Ok(Float(a - b)),
+        ("*", Float(a), Float(b)) => Ok(Float(a * b)),
+        ("/", Float(a), Float(b)) => Ok(Float(a / b)),
+
+        ("==", a, b) => Ok(Bool(a == b)),
+        ("!=", a, b) => Ok(Bool(a != b)),
+
+        ("<",  Int(a), Int(b)) => Ok(Bool(a < b)),
+        ("<=", Int(a), Int(b)) => Ok(Bool(a <= b)),
+        (">",  Int(a), Int(b)) => Ok(Bool(a > b)),
+        (">=", Int(a), Int(b)) => Ok(Bool(a >= b)),
+
+        ("<",  Float(a), Float(b)) => Ok(Bool(a < b)),
+        ("<=", Float(a), Float(b)) => Ok(Bool(a <= b)),
+        (">",  Float(a), Float(b)) => Ok(Bool(a > b)),
+        (">=", Float(a), Float(b)) => Ok(Bool(a >= b)),
+
+        (op, a, b) => Err(format!(
+            "unsupported binop `{op}` on {a:?} and {b:?}")),
+    }
+}
+
 fn const_str(constants: &[Const], idx: u32) -> String {
     match constants.get(idx as usize) {
         Some(Const::NodeId(s)) | Some(Const::Str(s)) => s.clone(),
@@ -272,6 +395,34 @@ impl<'a> Vm<'a> {
         if args.len() != f.arity as usize {
             return Err(VmError::Panic(format!("arity mismatch calling {}", f.name)));
         }
+        // Refinement runtime check at the public entry point too
+        // (#209 slice 3). `Op::Call` checks for in-program calls;
+        // this branch covers `vm.call("entry", ...)` from the host
+        // and the reentrant `invoke_closure_value` path. Same
+        // semantics, same error shape.
+        let f_name = f.name.clone();
+        let refinements = f.refinements.clone();
+        for (i, refinement) in refinements.iter().enumerate() {
+            if let Some(r) = refinement {
+                let arg = args.get(i).cloned().unwrap_or(Value::Unit);
+                match eval_refinement(&r.predicate, &r.binding, &arg) {
+                    Ok(true) => {}
+                    Ok(false) => return Err(VmError::RefinementFailed {
+                        fn_name: f_name,
+                        param_index: i,
+                        binding: r.binding.clone(),
+                        reason: format!("predicate failed for {} = {arg:?}", r.binding),
+                    }),
+                    Err(reason) => return Err(VmError::RefinementFailed {
+                        fn_name: f_name,
+                        param_index: i,
+                        binding: r.binding.clone(),
+                        reason,
+                    }),
+                }
+            }
+        }
+        let f = &self.program.functions[fn_id as usize];
         let mut locals = vec![Value::Unit; f.locals_count.max(f.arity) as usize];
         for (i, v) in args.into_iter().enumerate() { locals[i] = v; }
         // Record the depth before pushing — this is what `run` will
@@ -549,6 +700,42 @@ impl<'a> Vm<'a> {
                         self.handler.note_call_budget(budget_cost)
                             .map_err(VmError::Effect)?;
                     }
+                    // Refinement runtime check (#209 slice 3). Each
+                    // param's `Option<Refinement>` is evaluated against
+                    // the actual arg before the frame is pushed. The
+                    // tracer sees the call enter; failure surfaces as
+                    // `VmError::RefinementFailed` *before* the body
+                    // starts, which means an erroring trace shows the
+                    // call as enter+exit_err with the verdict reason
+                    // (same shape as `gate.verdict`).
+                    let refinements = self.program.functions[fn_id as usize]
+                        .refinements.clone();
+                    for (i, refinement) in refinements.iter().enumerate() {
+                        if let Some(r) = refinement {
+                            let arg = args.get(i).cloned().unwrap_or(Value::Unit);
+                            match eval_refinement(&r.predicate, &r.binding, &arg) {
+                                Ok(true) => { /* satisfied, continue */ }
+                                Ok(false) => {
+                                    return Err(VmError::RefinementFailed {
+                                        fn_name: callee_name.clone(),
+                                        param_index: i,
+                                        binding: r.binding.clone(),
+                                        reason: format!(
+                                            "predicate failed for {} = {arg:?}",
+                                            r.binding),
+                                    });
+                                }
+                                Err(reason) => {
+                                    return Err(VmError::RefinementFailed {
+                                        fn_name: callee_name.clone(),
+                                        param_index: i,
+                                        binding: r.binding.clone(),
+                                        reason,
+                                    });
+                                }
+                            }
+                        }
+                    }
                     // Pure-fn memoization (#229): if the callee declares
                     // no effects, hash the args and consult the cache.
                     // On hit, push the cached value, emit synthetic
@@ -588,6 +775,32 @@ impl<'a> Vm<'a> {
                     if budget_cost > 0 {
                         self.handler.note_call_budget(budget_cost)
                             .map_err(VmError::Effect)?;
+                    }
+                    // Refinement runtime check on tail calls too
+                    // (#209 slice 3). Same shape as Op::Call.
+                    let refinements = self.program.functions[fn_id as usize]
+                        .refinements.clone();
+                    for (i, refinement) in refinements.iter().enumerate() {
+                        if let Some(r) = refinement {
+                            let arg = args.get(i).cloned().unwrap_or(Value::Unit);
+                            match eval_refinement(&r.predicate, &r.binding, &arg) {
+                                Ok(true) => {}
+                                Ok(false) => return Err(VmError::RefinementFailed {
+                                    fn_name: callee_name.clone(),
+                                    param_index: i,
+                                    binding: r.binding.clone(),
+                                    reason: format!(
+                                        "predicate failed for {} = {arg:?}",
+                                        r.binding),
+                                }),
+                                Err(reason) => return Err(VmError::RefinementFailed {
+                                    fn_name: callee_name.clone(),
+                                    param_index: i,
+                                    binding: r.binding.clone(),
+                                    reason,
+                                }),
+                            }
+                        }
                     }
                     // A tail call closes the current call's trace frame and
                     // opens a new one in its place — preserves the caller's

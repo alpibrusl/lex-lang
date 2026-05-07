@@ -145,6 +145,12 @@ impl Printer {
                     }
                 }
             }
+            TypeExpr::Refined { base, binding, predicate } => {
+                self.type_expr(base);
+                write!(self.out, "{{{} | ", binding).unwrap();
+                self.expr(predicate);
+                write!(self.out, "}}").unwrap();
+            }
         }
     }
 

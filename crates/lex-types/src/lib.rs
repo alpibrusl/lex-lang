@@ -8,6 +8,7 @@ pub mod env;
 pub mod error;
 pub mod builtins;
 pub mod checker;
+pub mod discharge;
 
 pub use checker::{check_and_rewrite_program, check_program, ProgramTypes};
 pub use error::TypeError;

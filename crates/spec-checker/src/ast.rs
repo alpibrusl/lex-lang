@@ -40,6 +40,14 @@ pub enum SpecType {
     /// active charging sessions, message queues — via `length`,
     /// `head`, `tail`, and indexed access (`xs[i]`).
     List { element: Box<SpecType> },
+    /// Named user type (#208 slice 3). Refers to a user-defined ADT
+    /// from the host program (e.g. `Message`, `Order`). The gate
+    /// evaluator inspects the value's variant tag at match time;
+    /// no compile-time variant table is needed for the gate path.
+    /// The random-input prover (`check_spec`) can't sample arbitrary
+    /// user types and fails out — those tests should provide
+    /// concrete bindings instead.
+    Named { name: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -65,6 +73,32 @@ pub enum SpecExpr {
     /// that want defensive behavior wrap with a `length(xs) > i`
     /// check.
     Index { list: Box<SpecExpr>, index: Box<SpecExpr> },
+    /// Pattern match on a sum-typed expression (#208 slice 3). Arms
+    /// are tried in order; the first matching arm's body is the
+    /// result. A `_` wildcard pattern is exhaustive. Variant
+    /// patterns (`Charge(x)`) bind positional args by name in the
+    /// arm's body. Non-exhaustive matches fall through to
+    /// Inconclusive at evaluation time.
+    Match { scrutinee: Box<SpecExpr>, arms: Vec<MatchArm> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MatchArm {
+    pub pattern: SpecPattern,
+    pub body: SpecExpr,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SpecPattern {
+    /// `_` — matches anything, binds nothing.
+    Wildcard,
+    /// `Variant(x, y)` — matches `Value::Variant { name, args }`
+    /// where `name == self.name` and `args.len() == bindings.len()`.
+    /// Each binding name is bound to the corresponding positional
+    /// arg in the arm's body. `Variant()` (no parens) and `Variant`
+    /// (no args) parse identically; both have `bindings: vec![]`.
+    Variant { name: String, bindings: Vec<String> },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
