@@ -426,6 +426,19 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::open_var(5),
                 Ty::Con("Result".into(), vec![Ty::Var(0), Ty::Var(2)]),
             ));
+            // result.or_else :: Result[T, E1], (E1) -> [E] Result[T, E2]
+            //                                    -> [E] Result[T, E2]
+            // Recovery combinator: closure runs only on Err and returns
+            // the next Result (which itself may swap the error type).
+            fields.insert("or_else".into(), Ty::function(
+                vec![
+                    Ty::Con("Result".into(), vec![Ty::Var(0), Ty::Var(1)]),
+                    Ty::function(vec![Ty::Var(1)], EffectSet::open_var(6),
+                        Ty::Con("Result".into(), vec![Ty::Var(0), Ty::Var(2)])),
+                ],
+                EffectSet::open_var(6),
+                Ty::Con("Result".into(), vec![Ty::Var(0), Ty::Var(2)]),
+            ));
             Some(Ty::Record(fields))
         }
         "option" => {
@@ -456,6 +469,17 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 vec![Ty::Con("Option".into(), vec![Ty::Var(0)]), Ty::Var(0)],
                 EffectSet::empty(),
                 Ty::Var(0),
+            ));
+            // option.or_else :: Option[T], () -> [E] Option[T] -> [E] Option[T]
+            // The closure takes no arguments because None has no payload to pass.
+            fields.insert("or_else".into(), Ty::function(
+                vec![
+                    Ty::Con("Option".into(), vec![Ty::Var(0)]),
+                    Ty::function(vec![], EffectSet::open_var(4),
+                        Ty::Con("Option".into(), vec![Ty::Var(0)])),
+                ],
+                EffectSet::open_var(4),
+                Ty::Con("Option".into(), vec![Ty::Var(0)]),
             ));
             Some(Ty::Record(fields))
         }

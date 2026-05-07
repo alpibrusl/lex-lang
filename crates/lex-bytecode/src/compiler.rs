@@ -582,8 +582,10 @@ impl<'a> FnCompiler<'a> {
             ("result", "map") => self.emit_variant_map(args, "Ok", true),
             ("result", "and_then") => self.emit_variant_map(args, "Ok", false),
             ("result", "map_err") => self.emit_variant_map(args, "Err", true),
+            ("result", "or_else") => self.emit_variant_or_else(args, "Err", 1),
             ("option", "map") => self.emit_variant_map(args, "Some", true),
             ("option", "and_then") => self.emit_variant_map(args, "Some", false),
+            ("option", "or_else") => self.emit_variant_or_else(args, "None", 0),
             ("list", "map") => self.emit_list_map(args),
             ("list", "filter") => self.emit_list_filter(args),
             ("list", "fold") => self.emit_list_fold(args),
@@ -913,6 +915,69 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::Jump(0));
 
         // Skip arm: stack already has [v] from the failed Dup; nothing to do.
+        let skip_target = self.code.len() as i32;
+        if let Op::JumpIfNot(off) = &mut self.code[j_skip] {
+            *off = skip_target - (j_skip as i32 + 1);
+        }
+
+        let end_target = self.code.len() as i32;
+        if let Op::Jump(off) = &mut self.code[j_end] {
+            *off = end_target - (j_end as i32 + 1);
+        }
+    }
+
+    /// Sibling of `emit_variant_map` for the recovery combinators
+    /// `result.or_else` and `option.or_else`. Differences from
+    /// `emit_variant_map`:
+    ///   - matches on the *negative* variant (`Err` / `None`)
+    ///   - the closure's result becomes the call's result directly,
+    ///     with no wrapping (it is itself a `Result` / `Option`)
+    ///   - `option.or_else`'s closure takes zero args (`None` has no
+    ///     payload to forward)
+    fn emit_variant_or_else(
+        &mut self,
+        args: &[a::CExpr],
+        match_on: &str,
+        closure_arity: u16,
+    ) {
+        let match_idx = self.pool.variant(match_on);
+
+        self.compile_expr(&args[0], false);
+        let val_slot = self.alloc_local("__hoe");
+        self.emit(Op::StoreLocal(val_slot));
+
+        self.compile_expr(&args[1], false);
+        let f_slot = self.alloc_local("__hoe_f");
+        self.emit(Op::StoreLocal(f_slot));
+
+        // Stack discipline mirrors emit_variant_map:
+        //   load val      ⇒ [v]
+        //   dup           ⇒ [v, v]
+        //   test          ⇒ [v, Bool]
+        //   jumpifnot     ⇒ [v]
+        // The unmatched arm leaves [v] (Ok/Some unchanged); the
+        // matched arm pops [v] and pushes the closure's result.
+        self.emit(Op::LoadLocal(val_slot));
+        self.emit(Op::Dup);
+        self.emit(Op::TestVariant(match_idx));
+        let j_skip = self.code.len();
+        self.emit(Op::JumpIfNot(0));
+
+        // Matched arm: pop the duplicate left on the stack,
+        // then call the closure with whatever payload it expects.
+        self.emit(Op::Pop);
+        self.emit(Op::LoadLocal(f_slot));
+        if closure_arity == 1 {
+            self.emit(Op::LoadLocal(val_slot));
+            self.emit(Op::GetVariantArg(0));
+        }
+        let nid = self.pool.node_id("n_hoe");
+        self.emit(Op::CallClosure { arity: closure_arity, node_id_idx: nid });
+
+        let j_end = self.code.len();
+        self.emit(Op::Jump(0));
+
+        // Unmatched arm: stack already holds [v]; nothing to do.
         let skip_target = self.code.len() as i32;
         if let Op::JumpIfNot(off) = &mut self.code[j_skip] {
             *off = skip_target - (j_skip as i32 + 1);
