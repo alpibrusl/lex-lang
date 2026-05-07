@@ -157,3 +157,74 @@ fn unknown_subaction_lists_valid_choices() {
     assert!(stderr.contains("encode") && stderr.contains("decode"),
         "stderr should hint at valid subactions; got: {stderr}");
 }
+
+// ---- #206 slice 3: --from-canonical on existing commands ----------
+
+#[test]
+fn check_from_canonical_typechecks_bytes_input() {
+    // Encode a `.lex` source then run `lex check --from-canonical`
+    // against the bytes. The text parser shouldn't run on the
+    // receiver path — that's the slice's whole point.
+    let src = tmp_text("check_canon_in", SOURCE);
+    let canon = tmp_path("check_canon_bytes");
+    let (code, _, _) = run(&[
+        "canonical", "encode", src.to_str().unwrap(),
+        "--out", canon.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0);
+
+    let (code, stdout, stderr) = run(&[
+        "check", "--from-canonical", canon.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let s = String::from_utf8_lossy(&stdout);
+    assert!(s.contains("ok"),
+        "expected 'ok' from check; got: {s}");
+}
+
+#[test]
+fn run_from_canonical_executes_function() {
+    let src = tmp_text("run_canon_in", SOURCE);
+    let canon = tmp_path("run_canon_bytes");
+    let (code, _, _) = run(&[
+        "canonical", "encode", src.to_str().unwrap(),
+        "--out", canon.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0);
+
+    let (code, stdout, stderr) = run(&[
+        "run", "--from-canonical", canon.to_str().unwrap(), "run",
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let s = String::from_utf8_lossy(&stdout);
+    // `run()` returns add(2, 3) = 5.
+    assert!(s.trim().contains('5'),
+        "expected output to contain 5; got: {s:?}");
+}
+
+#[test]
+fn run_from_canonical_rejects_text_input() {
+    // Pointing `--from-canonical` at a `.lex` text file fails the
+    // version-byte check at decode. The CLI surfaces a typed error
+    // rather than a confusing parse failure.
+    let src = tmp_text("run_canon_wrong_kind", SOURCE);
+    let (code, _, stderr) = run(&[
+        "run", "--from-canonical", src.to_str().unwrap(), "run",
+    ]);
+    assert_ne!(code, 0);
+    assert!(stderr.to_lowercase().contains("decode") ||
+            stderr.contains("version"),
+        "stderr should explain the decode failure; got: {stderr}");
+}
+
+#[test]
+fn check_from_canonical_rejects_text_input() {
+    let src = tmp_text("check_canon_wrong_kind", SOURCE);
+    let (code, _, stderr) = run(&[
+        "check", "--from-canonical", src.to_str().unwrap(),
+    ]);
+    assert_ne!(code, 0);
+    assert!(stderr.to_lowercase().contains("decode") ||
+            stderr.contains("version"),
+        "stderr should explain the decode failure; got: {stderr}");
+}
