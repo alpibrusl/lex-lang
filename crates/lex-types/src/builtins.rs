@@ -854,7 +854,7 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             fields.insert("set_sink".into(), Ty::function(
                 vec![Ty::str()],
                 EffectSet {
-                    concrete: ["io".to_string(), "fs_write".to_string()].into_iter().collect(),
+                    concrete: [crate::types::EffectKind::bare("io"), crate::types::EffectKind::bare("fs_write")].into_iter().collect(),
                     var: None,
                 },
                 result_str(Ty::Unit)));
@@ -1023,7 +1023,7 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             fields.insert("copy".into(), Ty::function(
                 vec![Ty::str(), Ty::str()],
                 EffectSet {
-                    concrete: ["fs_walk".to_string(), "fs_write".to_string()].into_iter().collect(),
+                    concrete: [crate::types::EffectKind::bare("fs_walk"), crate::types::EffectKind::bare("fs_write")].into_iter().collect(),
                     var: None,
                 },
                 result_str(Ty::Unit)));
@@ -1038,7 +1038,7 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             fields.insert("open".into(), Ty::function(
                 vec![Ty::str()],
                 EffectSet {
-                    concrete: ["kv".to_string(), "fs_write".to_string()].into_iter().collect(),
+                    concrete: [crate::types::EffectKind::bare("kv"), crate::types::EffectKind::bare("fs_write")].into_iter().collect(),
                     var: None,
                 },
                 Ty::Con("Result".into(), vec![kv_t(), Ty::str()])));
@@ -1099,7 +1099,7 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             fields.insert("open".into(), Ty::function(
                 vec![Ty::str()],
                 EffectSet {
-                    concrete: ["sql".to_string(), "fs_write".to_string()].into_iter().collect(),
+                    concrete: [crate::types::EffectKind::bare("sql"), crate::types::EffectKind::bare("fs_write")].into_iter().collect(),
                     var: None,
                 },
                 Ty::Con("Result".into(), vec![db_t(), Ty::str()])));
