@@ -609,6 +609,7 @@ impl<'a> FnCompiler<'a> {
             ("flow", "sequential") => self.emit_flow_sequential(args),
             ("flow", "branch") => self.emit_flow_branch(args),
             ("flow", "retry") => self.emit_flow_retry(args),
+            ("flow", "retry_with_backoff") => self.emit_flow_retry_with_backoff(args),
             ("flow", "parallel") => self.emit_flow_parallel(args),
             ("flow", "parallel_list") => self.emit_flow_parallel_list(args),
             _ => return false,
@@ -1237,6 +1238,109 @@ impl<'a> FnCompiler<'a> {
 
         let fn_id = self.install_trampoline("__flow_retry", 3, 5, code);
         self.emit(Op::MakeClosure { fn_id, capture_count: 2 });
+    }
+
+    /// `flow.retry_with_backoff(f, attempts, base_ms)` (#226). Variant
+    /// of `flow.retry` that sleeps between attempts. The first
+    /// attempt fires immediately; attempt k > 1 waits `base_ms *
+    /// 2^(k-2)` ms before retrying. Sleeps go through
+    /// `time.sleep_ms`, which is why the resulting closure carries
+    /// `[time]` in its effect row even though the underlying `f` is
+    /// pure.
+    fn emit_flow_retry_with_backoff(&mut self, args: &[a::CExpr]) {
+        // Push captures: f, max, base_ms. The trampoline takes one
+        // call-time arg `x`, so capture_count = 3, arity = 4.
+        self.compile_expr(&args[0], false);
+        self.compile_expr(&args[1], false);
+        self.compile_expr(&args[2], false);
+        let call_nid    = self.pool.node_id("n_flow_retry_backoff");
+        let sleep_nid   = self.pool.node_id("n_flow_retry_backoff_sleep");
+        let kind_idx    = self.pool.str("time");
+        let op_idx      = self.pool.str("sleep_ms");
+        let ok_idx      = self.pool.variant("Ok");
+        let zero_const  = self.pool.int(0);
+        let one_const   = self.pool.int(1);
+        let two_const   = self.pool.int(2);
+        // Locals layout:
+        //   0=f, 1=max, 2=base_ms (captures)
+        //   3=x (arg)
+        //   4=i, 5=last, 6=next_delay (working state)
+        let mut code = vec![
+            // next_delay := base_ms
+            Op::LoadLocal(2),
+            Op::StoreLocal(6),
+            // i := 0
+            Op::PushConst(zero_const),
+            Op::StoreLocal(4),
+        ];
+
+        let loop_top = code.len() as i32;
+        // while i < max
+        code.push(Op::LoadLocal(4));
+        code.push(Op::LoadLocal(1));
+        code.push(Op::NumLt);
+        let j_done = code.len();
+        code.push(Op::JumpIfNot(0)); // patched
+
+        // if i > 0: time.sleep_ms(next_delay); next_delay := next_delay * 2
+        code.push(Op::PushConst(zero_const));
+        code.push(Op::LoadLocal(4));
+        code.push(Op::NumLt);                // 0 < i ?
+        let j_no_sleep = code.len();
+        code.push(Op::JumpIfNot(0));         // patched: skip the sleep block
+        // Sleep
+        code.push(Op::LoadLocal(6));         // arg = next_delay
+        code.push(Op::EffectCall {
+            kind_idx, op_idx, arity: 1, node_id_idx: sleep_nid,
+        });
+        code.push(Op::Pop);                  // discard the Unit result
+        // next_delay := next_delay * 2
+        code.push(Op::LoadLocal(6));
+        code.push(Op::PushConst(two_const));
+        code.push(Op::NumMul);
+        code.push(Op::StoreLocal(6));
+        // patch the no-sleep skip
+        let after_sleep = code.len() as i32;
+        if let Op::JumpIfNot(off) = &mut code[j_no_sleep] {
+            *off = after_sleep - (j_no_sleep as i32 + 1);
+        }
+
+        // last := f(x)
+        code.push(Op::LoadLocal(0));
+        code.push(Op::LoadLocal(3));
+        code.push(Op::CallClosure { arity: 1, node_id_idx: call_nid });
+        code.push(Op::StoreLocal(5));
+
+        // if Ok(last): return last
+        code.push(Op::LoadLocal(5));
+        code.push(Op::TestVariant(ok_idx));
+        let j_was_err = code.len();
+        code.push(Op::JumpIfNot(0)); // patched
+        code.push(Op::LoadLocal(5));
+        code.push(Op::Return);
+
+        // was_err: i := i + 1; jump loop_top
+        let was_err_target = code.len() as i32;
+        if let Op::JumpIfNot(off) = &mut code[j_was_err] {
+            *off = was_err_target - (j_was_err as i32 + 1);
+        }
+        code.push(Op::LoadLocal(4));
+        code.push(Op::PushConst(one_const));
+        code.push(Op::NumAdd);
+        code.push(Op::StoreLocal(4));
+        let pc_after_jump = code.len() as i32 + 1;
+        code.push(Op::Jump(loop_top - pc_after_jump));
+
+        // done: return last (the final Err, or Unit if max=0).
+        let done_target = code.len() as i32;
+        if let Op::JumpIfNot(off) = &mut code[j_done] {
+            *off = done_target - (j_done as i32 + 1);
+        }
+        code.push(Op::LoadLocal(5));
+        code.push(Op::Return);
+
+        let fn_id = self.install_trampoline("__flow_retry_backoff", 4, 7, code);
+        self.emit(Op::MakeClosure { fn_id, capture_count: 3 });
     }
 }
 

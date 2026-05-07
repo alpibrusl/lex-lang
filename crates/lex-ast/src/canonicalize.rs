@@ -15,7 +15,13 @@ use crate::canonical::*;
 use lex_syntax::syntax as s;
 
 pub fn canonicalize_program(program: &s::Program) -> Vec<Stage> {
-    program.items.iter().map(canonicalize_item).collect()
+    let raw: Vec<Stage> = program.items.iter().map(canonicalize_item).collect();
+    // Dead-branch elimination (#228): runs *here*, before type-check
+    // and bytecode emission, so the inferred effect set reflects only
+    // live branches. `if true { ... } else { ... }` is desugared into
+    // a `Match` over a Bool literal upstream; the pass folds that to
+    // the matching arm's body in a single depth-first walk.
+    crate::dead_branch::eliminate_dead_branches_in_stages(raw)
 }
 
 pub fn canonicalize_item(item: &s::Item) -> Stage {

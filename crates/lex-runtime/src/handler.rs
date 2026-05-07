@@ -6,7 +6,6 @@
 
 use lex_bytecode::vm::{EffectHandler, Vm};
 use lex_bytecode::{Program, Value};
-use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -41,8 +40,17 @@ pub struct DefaultHandler {
     /// Optional read root for `io.read` — when set, `io.read("p")` resolves
     /// to `read_root.join(p)`. Lets tests run without touching the real fs.
     pub read_root: Option<PathBuf>,
-    /// Captured budget consumption (post-static-check, observability only).
-    pub budget_used: RefCell<u64>,
+    /// Per-run budget pool (#225). `Arc<AtomicU64>` so parallel
+    /// branches share one counter without locking. Initialized to
+    /// the policy ceiling at handler construction; each call to a
+    /// function with declared `[budget(N)]` deducts N atomically
+    /// via `note_call_budget`. Cloning the handler is intentional
+    /// for net.serve / chat handlers — they share the same pool.
+    pub budget_remaining: Arc<AtomicU64>,
+    /// The original ceiling that `budget_remaining` started at, kept
+    /// for diagnostics so a `BudgetExceeded` error can report
+    /// `(used, ceiling)` rather than just "exceeded by N".
+    pub budget_ceiling: Option<u64>,
     /// Shared reference to the program, needed by `net.serve` so the
     /// handler can spin up fresh VMs to dispatch incoming requests.
     /// `None` if the handler was constructed without a program.
@@ -61,11 +69,17 @@ pub struct DefaultHandler {
 
 impl DefaultHandler {
     pub fn new(policy: Policy) -> Self {
+        // If the caller supplied a ceiling, the pool starts at that
+        // ceiling and counts down. No ceiling = `u64::MAX` so calls
+        // never refuse on budget grounds (existing behavior).
+        let ceiling = policy.budget;
+        let initial = ceiling.unwrap_or(u64::MAX);
         Self {
             policy,
             sink: Box::new(StdoutSink),
             read_root: None,
-            budget_used: RefCell::new(0),
+            budget_remaining: Arc::new(AtomicU64::new(initial)),
+            budget_ceiling: ceiling,
             program: None,
             chat_registry: None,
             mcp_clients: crate::mcp_client::McpClientCache::with_capacity(16),
@@ -579,6 +593,36 @@ fn extract_host(url: &str) -> Option<&str> {
 }
 
 impl EffectHandler for DefaultHandler {
+    /// Per-call budget enforcement (#225). VM calls this before
+    /// invoking any function whose signature declares `[budget(N)]`.
+    /// The cost N is deducted atomically from the shared pool;
+    /// returning `Err` aborts the call before any frame is pushed.
+    fn note_call_budget(&mut self, cost: u64) -> Result<(), String> {
+        // Skip the work entirely when no ceiling is configured —
+        // the pool is `u64::MAX` and would never trip.
+        let Some(ceiling) = self.budget_ceiling else { return Ok(()); };
+        // Compare-and-swap: speculatively subtract; if we'd
+        // underflow, return BudgetExceeded without mutating.
+        // Use SeqCst because parallel branches may race here and
+        // the relative ordering of "used so far" vs. "this call's
+        // cost" needs to be deterministic across threads.
+        loop {
+            let cur = self.budget_remaining.load(Ordering::SeqCst);
+            if cost > cur {
+                let used = ceiling.saturating_sub(cur);
+                return Err(format!(
+                    "budget exceeded: requested {cost}, used so far {used}, ceiling {ceiling}"));
+            }
+            let next = cur - cost;
+            // Conservative accounting: if the CAS races and loses,
+            // re-read and try again. No refund-on-failure path.
+            if self.budget_remaining.compare_exchange(cur, next,
+                Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                return Ok(());
+            }
+        }
+    }
+
     fn dispatch(&mut self, kind: &str, op: &str, args: Vec<Value>) -> Result<Value, String> {
         // Pure stdlib builtins (str, list, json, ...) bypass the policy
         // gate — they have no observable side effects and aren't tracked
@@ -751,6 +795,21 @@ impl EffectHandler for DefaultHandler {
                     .map_err(|e| format!("time: {e}"))?.as_secs();
                 Ok(Value::Int(secs as i64))
             }
+            ("time", "sleep_ms") => {
+                // Block the current thread for `n` ms (#226). Used
+                // by `flow.retry_with_backoff`'s exponential delay.
+                // Negative or zero is a no-op. Bounded at 60s in the
+                // runtime to avoid pathological agent-emitted loops
+                // wedging the host — anything legitimate beyond
+                // that should use process-level scheduling, not a
+                // blocking sleep.
+                let n = expect_int(args.first())?;
+                if n > 0 {
+                    let ms = (n as u64).min(60_000);
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                }
+                Ok(Value::Unit)
+            }
             ("rand", "int_in") => {
                 // Deterministic stub: midpoint of [lo, hi].
                 let lo = expect_int(args.first())?;
@@ -763,7 +822,7 @@ impl EffectHandler for DefaultHandler {
             // `[env]` grants access to the entire process environment.
             ("env", "get") => {
                 let name = expect_str(args.first())?;
-                Ok(match std::env::var(&name) {
+                Ok(match std::env::var(name) {
                     Ok(v) => Value::Variant {
                         name: "Some".into(),
                         args: vec![Value::Str(v)],

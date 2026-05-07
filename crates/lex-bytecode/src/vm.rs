@@ -33,6 +33,16 @@ pub const MAX_CALL_DEPTH: u32 = 1024;
 /// and how arguments map to side effects.
 pub trait EffectHandler {
     fn dispatch(&mut self, kind: &str, op: &str, args: Vec<Value>) -> Result<Value, String>;
+
+    /// Hook called by the VM at every function call so handlers can
+    /// enforce per-call budget consumption (#225). The argument is
+    /// the sum of `[budget(N)]` declared on the callee's signature;
+    /// the handler returns `Err` to refuse the call (the VM converts
+    /// to `VmError::Effect`). Default impl is a no-op so legacy
+    /// handlers and pure-only runs are unaffected.
+    fn note_call_budget(&mut self, _budget_cost: u64) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// `Vm` exposes itself as a `ClosureCaller` so the parser interpreter
@@ -99,6 +109,15 @@ pub struct Vm<'a> {
     /// Soft cap to avoid runaway computations in tests.
     pub step_limit: u64,
     pub steps: u64,
+    /// Per-Vm memoization cache for pure functions (#229). Keyed by
+    /// `(fn_id, sha256(canonical_json(args))[..16])`. Effectful
+    /// functions never enter this map. The cache lives for the
+    /// lifetime of one `Vm::call` chain — calling `Vm::with_handler`
+    /// again starts a fresh cache.
+    pure_memo: std::collections::HashMap<(u32, [u8; 16]), Value>,
+    /// Diagnostic counters for `--trace` observability (#229).
+    pub pure_memo_hits: u64,
+    pub pure_memo_misses: u64,
 }
 
 struct Frame {
@@ -108,6 +127,51 @@ struct Frame {
     /// Stack base when this frame started (for cleanup on return).
     stack_base: usize,
     trace_kind: FrameKind,
+    /// Pure-fn memo key (#229). `Some(key)` if the call was eligible
+    /// for memoization and missed the cache; on Op::Return the key
+    /// is used to write the return value back into the cache.
+    /// `None` means "don't memoize" — either the function isn't pure,
+    /// the call wasn't through Op::Call, or memoization is disabled.
+    memo_key: Option<(u32, [u8; 16])>,
+}
+
+/// Sum of `[budget(N)]` declarations on a function's signature
+/// (#225). Used by Op::Call / Op::TailCall / Op::CallClosure to
+/// notify the EffectHandler of per-call budget cost so the handler
+/// can deduct from a shared pool and refuse calls that would
+/// exceed the policy ceiling. Negative `Int` args are ignored —
+/// the static check (`policy::check_program`) treats budgets as
+/// non-negative.
+fn call_budget_cost(f: &crate::program::Function) -> u64 {
+    let mut total: u64 = 0;
+    for e in &f.effects {
+        if e.kind == "budget" {
+            if let Some(crate::program::EffectArg::Int(n)) = &e.arg {
+                if *n >= 0 {
+                    total = total.saturating_add(*n as u64);
+                }
+            }
+        }
+    }
+    total
+}
+
+/// Hash the argument list for a pure-fn memoization lookup (#229).
+/// Routes through the canonical-JSON path so two semantically-equal
+/// argument lists produce the same hash regardless of how the
+/// containing `Value`s were assembled (Records use IndexMap so field
+/// order is already stable, but canon_json gives the same property
+/// for the inner serde_json shape).
+fn hash_call_args(args: &[Value]) -> [u8; 16] {
+    use sha2::{Digest, Sha256};
+    let json = serde_json::Value::Array(args.iter().map(Value::to_json).collect());
+    let canonical = lex_ast::canon_json::hash_canonical(&json);
+    let mut hasher = Sha256::new();
+    hasher.update(canonical);
+    let full = hasher.finalize();
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&full[..16]);
+    out
 }
 
 fn const_str(constants: &[Const], idx: u32) -> String {
@@ -131,6 +195,9 @@ impl<'a> Vm<'a> {
             stack: Vec::new(),
             step_limit: 10_000_000,
             steps: 0,
+            pure_memo: std::collections::HashMap::new(),
+            pure_memo_hits: 0,
+            pure_memo_misses: 0,
         }
     }
 
@@ -214,6 +281,7 @@ impl<'a> Vm<'a> {
         self.push_frame(Frame {
             fn_id, pc: 0, locals, stack_base: self.stack.len(),
             trace_kind: FrameKind::Entry,
+            memo_key: None,
         })?;
         self.run_to(base_depth)
     }
@@ -450,6 +518,11 @@ impl<'a> Vm<'a> {
                     };
                     let node_id = const_str(&self.program.constants, node_id_idx);
                     let callee_name = self.program.functions[fn_id as usize].name.clone();
+                    let budget_cost = call_budget_cost(&self.program.functions[fn_id as usize]);
+                    if budget_cost > 0 {
+                        self.handler.note_call_budget(budget_cost)
+                            .map_err(VmError::Effect)?;
+                    }
                     let mut combined = captures;
                     combined.extend(args);
                     self.tracer.enter_call(&node_id, &callee_name, &combined);
@@ -459,6 +532,11 @@ impl<'a> Vm<'a> {
                     self.push_frame(Frame {
                         fn_id, pc: 0, locals, stack_base: self.stack.len(),
                         trace_kind: FrameKind::Call(node_id),
+                        // Op::CallClosure intentionally doesn't memoize
+                        // for v1 (#229) — closures over captures need a
+                        // hashing strategy that includes the captures.
+                        // Direct Op::Call is the v1 surface.
+                        memo_key: None,
                     })?;
                 }
                 Op::Call { fn_id, arity, node_id_idx } => {
@@ -466,13 +544,39 @@ impl<'a> Vm<'a> {
                     for i in (0..arity as usize).rev() { args[i] = self.pop()?; }
                     let node_id = const_str(&self.program.constants, node_id_idx);
                     let callee_name = self.program.functions[fn_id as usize].name.clone();
-                    self.tracer.enter_call(&node_id, &callee_name, &args);
+                    let budget_cost = call_budget_cost(&self.program.functions[fn_id as usize]);
+                    if budget_cost > 0 {
+                        self.handler.note_call_budget(budget_cost)
+                            .map_err(VmError::Effect)?;
+                    }
+                    // Pure-fn memoization (#229): if the callee declares
+                    // no effects, hash the args and consult the cache.
+                    // On hit, push the cached value, emit synthetic
+                    // enter+exit trace events (so the trace still shows
+                    // the call), and skip the frame push entirely.
                     let f = &self.program.functions[fn_id as usize];
+                    let memo_key: Option<(u32, [u8; 16])> = if f.effects.is_empty() {
+                        Some((fn_id, hash_call_args(&args)))
+                    } else {
+                        None
+                    };
+                    if let Some(key) = memo_key {
+                        if let Some(cached) = self.pure_memo.get(&key).cloned() {
+                            self.pure_memo_hits += 1;
+                            self.tracer.enter_call(&node_id, &callee_name, &args);
+                            self.tracer.exit_ok(&cached);
+                            self.stack.push(cached);
+                            continue;
+                        }
+                        self.pure_memo_misses += 1;
+                    }
+                    self.tracer.enter_call(&node_id, &callee_name, &args);
                     let mut locals = vec![Value::Unit; f.locals_count.max(f.arity) as usize];
                     for (i, v) in args.into_iter().enumerate() { locals[i] = v; }
                     self.push_frame(Frame {
                         fn_id, pc: 0, locals, stack_base: self.stack.len(),
                         trace_kind: FrameKind::Call(node_id),
+                        memo_key,
                     })?;
                 }
                 Op::TailCall { fn_id, arity, node_id_idx } => {
@@ -480,6 +584,11 @@ impl<'a> Vm<'a> {
                     for i in (0..arity as usize).rev() { args[i] = self.pop()?; }
                     let node_id = const_str(&self.program.constants, node_id_idx);
                     let callee_name = self.program.functions[fn_id as usize].name.clone();
+                    let budget_cost = call_budget_cost(&self.program.functions[fn_id as usize]);
+                    if budget_cost > 0 {
+                        self.handler.note_call_budget(budget_cost)
+                            .map_err(VmError::Effect)?;
+                    }
                     // A tail call closes the current call's trace frame and
                     // opens a new one in its place — preserves the caller's
                     // tree depth in the trace.
@@ -535,6 +644,13 @@ impl<'a> Vm<'a> {
                     self.stack.truncate(frame.stack_base);
                     if matches!(frame.trace_kind, FrameKind::Call(_)) {
                         self.tracer.exit_ok(&v);
+                    }
+                    // Pure-fn memoization (#229): if this frame was a
+                    // memoizable call that missed the cache, write the
+                    // computed return value back so the next call with
+                    // the same args returns it without re-executing.
+                    if let Some(key) = frame.memo_key {
+                        self.pure_memo.insert(key, v.clone());
                     }
                     // Exit when we've returned past the depth this
                     // `run_to` was entered at — supports reentrancy

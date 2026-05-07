@@ -81,7 +81,10 @@ fn detects_unknown_field() {
 
 #[test]
 fn detects_unknown_variant() {
-    let src = "fn bad() -> Int { match 1 { Bogus(x) => x, _ => 0 } }\n";
+    // Use a non-literal scrutinee so the dead-branch elimination pass
+    // (which runs before type-check) doesn't fold away the Bogus arm
+    // before the type-checker sees it.
+    let src = "fn bad(n :: Int) -> Int { match n { Bogus(x) => x, _ => 0 } }\n";
     let errs = check(src).unwrap_err();
     assert!(errs.iter().any(|e| matches!(e, TypeError::UnknownVariant { .. })),
         "got {errs:#?}");

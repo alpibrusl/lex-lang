@@ -270,6 +270,15 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::singleton("time"),
                 Ty::int(),
             ));
+            // sleep_ms :: Int -> [time] Unit (#226).
+            // Used internally by flow.retry_with_backoff for
+            // exponential-backoff delays; also available to user
+            // code under `--allow-effects time`.
+            fields.insert("sleep_ms".into(), Ty::function(
+                vec![Ty::int()],
+                EffectSet::singleton("time"),
+                Ty::Unit,
+            ));
             Some(Ty::Record(fields))
         }
         "rand" => {
@@ -696,15 +705,38 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::empty(),
                 Ty::function(vec![Ty::Var(0)], EffectSet::empty(), Ty::Var(1)),
             ));
-            // retry[T, U, E](f: (T) -> Result[U, E], n: Int) -> (T) -> Result[U, E]
+            // retry[T, U, E, Eff](
+            //   f: (T) -> [Eff] Result[U, E], n: Int
+            // ) -> (T) -> [Eff] Result[U, E]
+            // open_var(3) is the effect row carried by `f`; the
+            // combinator itself is pure, so the outer EffectSet is
+            // empty. The returned closure propagates Eff unchanged.
             let result_ty = Ty::Con("Result".into(), vec![Ty::Var(1), Ty::Var(2)]);
             fields.insert("retry".into(), Ty::function(
                 vec![
-                    Ty::function(vec![Ty::Var(0)], EffectSet::empty(), result_ty.clone()),
+                    Ty::function(vec![Ty::Var(0)], EffectSet::open_var(3), result_ty.clone()),
                     Ty::int(),
                 ],
                 EffectSet::empty(),
-                Ty::function(vec![Ty::Var(0)], EffectSet::empty(), result_ty),
+                Ty::function(vec![Ty::Var(0)], EffectSet::open_var(3), result_ty.clone()),
+            ));
+            // retry_with_backoff[T, U, E, Eff](
+            //   f: (T) -> [Eff] Result[U, E], attempts: Int, base_ms: Int,
+            // ) -> (T) -> [Eff, time] Result[U, E]
+            // Same retry shape as `flow.retry` plus an exponential
+            // backoff between attempts. The result function carries
+            // `[time]` (from `time.sleep_ms`) unioned with the inner
+            // closure's effect row Eff, so e.g. a `[net]` closure
+            // produces a `[net, time]` result function. (#226)
+            fields.insert("retry_with_backoff".into(), Ty::function(
+                vec![
+                    Ty::function(vec![Ty::Var(0)], EffectSet::open_var(3), result_ty.clone()),
+                    Ty::int(),
+                    Ty::int(),
+                ],
+                EffectSet::empty(),
+                Ty::function(vec![Ty::Var(0)],
+                    EffectSet::open_var(3).union(&EffectSet::singleton("time")), result_ty),
             ));
             // parallel[A, B](fa: () -> A, fb: () -> B) -> () -> (A, B)
             // Sequential implementation today; spec §11.2 reserves the
