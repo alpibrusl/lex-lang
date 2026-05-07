@@ -35,6 +35,11 @@ pub enum SpecType {
     /// resolves `expr.field` against `Value::Record`'s `IndexMap`,
     /// which preserves insertion order.
     Record { fields: Vec<(String, SpecType)> },
+    /// List of an element type (#208). Quantifying over a list lets
+    /// specs reason about agent collections — outstanding orders,
+    /// active charging sessions, message queues — via `length`,
+    /// `head`, `tail`, and indexed access (`xs[i]`).
+    List { element: Box<SpecType> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -54,6 +59,12 @@ pub enum SpecExpr {
     /// drilling into `Value::Record`'s field map; fails-loudly if the
     /// underlying value isn't a record or doesn't contain the field.
     FieldAccess { value: Box<SpecExpr>, field: String },
+    /// Indexed access on a list-typed expression (#208). `xs[i]`
+    /// evaluates to the i-th element of the list (zero-based).
+    /// Out-of-bounds indices fail loudly via Inconclusive — agents
+    /// that want defensive behavior wrap with a `length(xs) > i`
+    /// check.
+    Index { list: Box<SpecExpr>, index: Box<SpecExpr> },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

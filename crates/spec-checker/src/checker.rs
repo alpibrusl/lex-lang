@@ -192,6 +192,19 @@ fn sample(ty: &SpecType, rng: &mut DetRng) -> Value {
             }
             Value::Record(out)
         }
+        // List sampling generates a length in [0, 8] and recurses on
+        // each element. The cap matches the small-bounded discipline
+        // the rest of `sample` uses (Int is in [-1000, 1000], Str is
+        // ≤ 5 chars) — the prover's intent is finding counterexamples
+        // quickly, not stress-testing throughput.
+        SpecType::List { element } => {
+            let len = (rng.next_u64() % 9) as usize;
+            let mut out = Vec::with_capacity(len);
+            for _ in 0..len {
+                out.push(sample(element, rng));
+            }
+            Value::List(out)
+        }
     }
 }
 
@@ -227,6 +240,10 @@ fn eval(
             // Materialize args.
             let mut argv = Vec::new();
             for a in args { argv.push(eval(a, bindings, bc, policy)?); }
+            // Spec-builtin list ops (#208) — same intercept as the
+            // gate path so random-input proofs and per-action gates
+            // see consistent semantics.
+            if let Some(v) = crate::gate::list_builtin(func, &argv) { return v; }
             // Run the Lex function with a fresh VM (cheap: program is shared).
             let handler = DefaultHandler::new(policy.clone());
             let mut vm = Vm::with_handler(bc, Box::new(handler));
@@ -245,6 +262,23 @@ fn eval(
                 }),
                 other => Err(format!("field access `.{field}` on non-record: {other:?}")),
             }
+        }
+        SpecExpr::Index { list, index } => {
+            // Mirror of the gate path's list-indexing (#208 slice 2).
+            let xs = eval(list, bindings, bc, policy)?;
+            let i = eval(index, bindings, bc, policy)?;
+            let xs = match xs {
+                Value::List(xs) => xs,
+                other => return Err(format!("index on non-list: {other:?}")),
+            };
+            let i = match i {
+                Value::Int(n) => n,
+                other => return Err(format!("list index must be Int: {other:?}")),
+            };
+            if i < 0 || (i as usize) >= xs.len() {
+                return Err(format!("list index {i} out of bounds (length {})", xs.len()));
+            }
+            Ok(xs[i as usize].clone())
         }
     }
 }

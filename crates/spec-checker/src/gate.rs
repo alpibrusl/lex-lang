@@ -197,6 +197,28 @@ fn eval_body(
             other => Err(format!("not on non-bool: {other:?}")),
         },
         SpecExpr::BinOp { op, lhs, rhs } => {
+            // Short-circuit `and` / `or` so guard expressions like
+            // `length(xs) == 0 or xs[0] > 0` don't evaluate the
+            // second arm when the first already decides the result.
+            // Matches the conventional boolean-operator semantics —
+            // and the gate use case where the second arm may
+            // legitimately error on the values the first arm
+            // exists to filter out (#208 slice 2).
+            if matches!(op, SpecOp::And | SpecOp::Or) {
+                let a = eval_body(lhs, bindings, bc, policy, new_tracer)?;
+                let av = match a {
+                    Value::Bool(b) => b,
+                    other => return Err(format!(
+                        "{} on non-bool lhs: {other:?}", op.as_str())),
+                };
+                if matches!(op, SpecOp::And) && !av { return Ok(Value::Bool(false)); }
+                if matches!(op, SpecOp::Or)  &&  av { return Ok(Value::Bool(true));  }
+                let b = eval_body(rhs, bindings, bc, policy, new_tracer)?;
+                return match b {
+                    Value::Bool(bb) => Ok(Value::Bool(bb)),
+                    other => Err(format!("{} on non-bool rhs: {other:?}", op.as_str())),
+                };
+            }
             let a = eval_body(lhs, bindings, bc, policy, new_tracer)?;
             let b = eval_body(rhs, bindings, bc, policy, new_tracer)?;
             apply_binop(*op, a, b)
@@ -204,12 +226,26 @@ fn eval_body(
         SpecExpr::Call { func, args } => {
             let mut argv = Vec::new();
             for a in args { argv.push(eval_body(a, bindings, bc, policy, new_tracer)?); }
+            // Spec-builtin list operations (#208). `length`, `head`,
+            // and `tail` are intercepted before falling through to a
+            // host VM call so specs can reason about list-shaped
+            // bindings without the host program needing those names.
+            // Identical name-shadowing behavior to lex's stdlib —
+            // user code can still define a function `length` and
+            // reference it from a spec, but a spec call to `length(xs)`
+            // where `xs` is a `Value::List` resolves to the builtin.
+            if let Some(v) = list_builtin(func, &argv) { return v; }
             let handler = DefaultHandler::new(policy.clone());
             let mut vm = Vm::with_handler(bc, Box::new(handler));
             if let Some(make_tracer) = new_tracer {
                 vm.set_tracer(make_tracer());
             }
             vm.call(func, argv).map_err(|e| format!("call `{func}`: {e}"))
+        }
+        SpecExpr::Index { list, index } => {
+            let xs = eval_body(list, bindings, bc, policy, new_tracer)?;
+            let i = eval_body(index, bindings, bc, policy, new_tracer)?;
+            list_index(xs, i)
         }
         SpecExpr::FieldAccess { value, field } => {
             // Drill into a record-typed binding (#208). Fails loudly
@@ -228,6 +264,63 @@ fn eval_body(
             }
         }
     }
+}
+
+/// Spec-builtin list operations (#208). Returns `Some(result)` if
+/// `func` names a builtin (`length`, `head`, `tail`) and the args
+/// shape matches; returns `None` to indicate the call should fall
+/// through to a host VM dispatch.
+pub(crate) fn list_builtin(func: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    match func {
+        "length" => {
+            if args.len() != 1 {
+                return Some(Err(format!("length: expected 1 arg, got {}", args.len())));
+            }
+            match &args[0] {
+                Value::List(xs) => Some(Ok(Value::Int(xs.len() as i64))),
+                // Not a list — fall through to host dispatch in case
+                // the user defined their own `length` function.
+                _ => None,
+            }
+        }
+        "head" => {
+            if args.len() != 1 { return None; }
+            match &args[0] {
+                Value::List(xs) => Some(match xs.first() {
+                    Some(v) => Ok(v.clone()),
+                    None => Err("head: empty list".into()),
+                }),
+                _ => None,
+            }
+        }
+        "tail" => {
+            if args.len() != 1 { return None; }
+            match &args[0] {
+                Value::List(xs) => Some(match xs.split_first() {
+                    Some((_, rest)) => Ok(Value::List(rest.to_vec())),
+                    None => Err("tail: empty list".into()),
+                }),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn list_index(list: Value, index: Value) -> Result<Value, String> {
+    let xs = match list {
+        Value::List(xs) => xs,
+        other => return Err(format!("index `[..]` on non-list: {}", short_value(&other))),
+    };
+    let i = match index {
+        Value::Int(n) => n,
+        other => return Err(format!("list index must be Int, got {}", short_value(&other))),
+    };
+    if i < 0 || (i as usize) >= xs.len() {
+        return Err(format!(
+            "list index {i} out of bounds (length {})", xs.len()));
+    }
+    Ok(xs[i as usize].clone())
 }
 
 fn apply_binop(op: SpecOp, a: Value, b: Value) -> Result<Value, String> {
@@ -611,6 +704,163 @@ mod tests {
             GateVerdict::Inconclusive { reason, .. } => {
                 assert!(reason.contains("non-record"),
                     "reason should call out non-record; got: {reason}");
+            }
+            other => panic!("expected Inconclusive, got {other:?}"),
+        }
+    }
+
+    // ---- #208 slice 2: list-typed bindings ---------------------------
+
+    /// Build a `Value::List` from a slice of values.
+    fn lst(items: &[Value]) -> Value {
+        Value::List(items.to_vec())
+    }
+
+    #[test]
+    fn list_quantifier_type_parses() {
+        let spec = parse_spec(r#"
+            spec ok {
+              forall xs :: List[Int] : true
+            }
+        "#).unwrap();
+        let v = evaluate_gate(&[spec], &b([
+            ("xs", lst(&[Value::Int(1), Value::Int(2)])),
+        ]), "");
+        assert_eq!(v, GateVerdict::Allow);
+    }
+
+    #[test]
+    fn length_builtin_returns_list_length() {
+        let spec = parse_spec(r#"
+            spec at_least_one {
+              forall xs :: List[Int] : length(xs) > 0
+            }
+        "#).unwrap();
+        let allow = evaluate_gate(std::slice::from_ref(&spec), &b([
+            ("xs", lst(&[Value::Int(7)])),
+        ]), "");
+        assert_eq!(allow, GateVerdict::Allow);
+        let deny = evaluate_gate(&[spec], &b([
+            ("xs", lst(&[])),
+        ]), "");
+        assert!(matches!(deny, GateVerdict::Deny { .. }));
+    }
+
+    #[test]
+    fn indexed_access_reads_list_element() {
+        let spec = parse_spec(r#"
+            spec head_positive {
+              forall xs :: List[Int] : xs[0] > 0
+            }
+        "#).unwrap();
+        let allow = evaluate_gate(std::slice::from_ref(&spec), &b([
+            ("xs", lst(&[Value::Int(5), Value::Int(10)])),
+        ]), "");
+        assert_eq!(allow, GateVerdict::Allow);
+        let deny = evaluate_gate(&[spec], &b([
+            ("xs", lst(&[Value::Int(0), Value::Int(10)])),
+        ]), "");
+        assert!(matches!(deny, GateVerdict::Deny { .. }));
+    }
+
+    #[test]
+    fn head_and_tail_builtins_work() {
+        // `head(xs) >= length(tail(xs))` — silly but exercises both
+        // builtins together with a length() over the tail.
+        let spec = parse_spec(r#"
+            spec shape {
+              forall xs :: List[Int] :
+                length(xs) > 0 and head(xs) >= length(tail(xs))
+            }
+        "#).unwrap();
+        // [3, 1, 2]: head=3, tail=[1,2] → length 2; 3 >= 2 ✓
+        let allow = evaluate_gate(std::slice::from_ref(&spec), &b([
+            ("xs", lst(&[Value::Int(3), Value::Int(1), Value::Int(2)])),
+        ]), "");
+        assert_eq!(allow, GateVerdict::Allow);
+        // [1, 1, 2, 3]: head=1, tail=[1,2,3] → length 3; 1 >= 3 ✗
+        let deny = evaluate_gate(&[spec], &b([
+            ("xs", lst(&[Value::Int(1), Value::Int(1),
+                         Value::Int(2), Value::Int(3)])),
+        ]), "");
+        assert!(matches!(deny, GateVerdict::Deny { .. }));
+    }
+
+    #[test]
+    fn list_of_records_lets_specs_quantify_structured_collections() {
+        // The pattern motivated by the issue's "for every charging
+        // session in active_sessions, station.power_drawn ≤ station.budget"
+        // example. The spec checks the *first* session's invariant —
+        // a per-element forall is slice 3's territory; this slice
+        // verifies the structural plumbing (List of Record + indexed
+        // access + field access) composes.
+        let spec = parse_spec(r#"
+            spec first_session_within_budget {
+              forall sessions :: List[{ power :: Int, budget :: Int }] :
+                length(sessions) == 0 or sessions[0].power <= sessions[0].budget
+            }
+        "#).unwrap();
+        let mut session = indexmap::IndexMap::new();
+        session.insert("power".into(), Value::Int(50));
+        session.insert("budget".into(), Value::Int(80));
+        let allow = evaluate_gate(std::slice::from_ref(&spec), &b([
+            ("sessions", Value::List(vec![Value::Record(session.clone())])),
+        ]), "");
+        assert_eq!(allow, GateVerdict::Allow);
+
+        let mut over = indexmap::IndexMap::new();
+        over.insert("power".into(), Value::Int(120));
+        over.insert("budget".into(), Value::Int(80));
+        let deny = evaluate_gate(&[spec], &b([
+            ("sessions", Value::List(vec![Value::Record(over)])),
+        ]), "");
+        assert!(matches!(deny, GateVerdict::Deny { .. }));
+    }
+
+    #[test]
+    fn empty_list_passes_when_predicate_is_vacuous() {
+        // Verifies the `length(xs) == 0 or ...` short-circuit pattern
+        // used to make per-list predicates well-defined on empties.
+        let spec = parse_spec(r#"
+            spec ok_or_empty {
+              forall xs :: List[Int] : length(xs) == 0 or xs[0] > 0
+            }
+        "#).unwrap();
+        let v = evaluate_gate(&[spec], &b([("xs", lst(&[]))]), "");
+        assert_eq!(v, GateVerdict::Allow);
+    }
+
+    #[test]
+    fn out_of_bounds_index_is_inconclusive() {
+        let spec = parse_spec(r#"
+            spec needs_two {
+              forall xs :: List[Int] : xs[1] > 0
+            }
+        "#).unwrap();
+        let v = evaluate_gate(&[spec], &b([
+            ("xs", lst(&[Value::Int(5)])),  // length 1; xs[1] OOB
+        ]), "");
+        match v {
+            GateVerdict::Inconclusive { reason, .. } => {
+                assert!(reason.contains("out of bounds"),
+                    "expected OOB diagnostic; got: {reason}");
+            }
+            other => panic!("expected Inconclusive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn head_of_empty_list_is_inconclusive() {
+        let spec = parse_spec(r#"
+            spec head_pos {
+              forall xs :: List[Int] : head(xs) > 0
+            }
+        "#).unwrap();
+        let v = evaluate_gate(&[spec], &b([("xs", lst(&[]))]), "");
+        match v {
+            GateVerdict::Inconclusive { reason, .. } => {
+                assert!(reason.contains("empty list"),
+                    "expected empty-list diagnostic; got: {reason}");
             }
             other => panic!("expected Inconclusive, got {other:?}"),
         }

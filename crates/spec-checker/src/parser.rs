@@ -167,6 +167,17 @@ impl Parser {
             "Float" => Ok(SpecType::Float),
             "Bool" => Ok(SpecType::Bool),
             "Str" => Ok(SpecType::Str),
+            "List" => {
+                // `List[T]` — element type in brackets.
+                if !self.eat(&TokenKind::LBracket) {
+                    return Err(self.err("expected `[` after `List`"));
+                }
+                let elem = self.parse_spec_type()?;
+                if !self.eat(&TokenKind::RBracket) {
+                    return Err(self.err("expected `]` to close `List[...]`"));
+                }
+                Ok(SpecType::List { element: Box::new(elem) })
+            }
             other => Err(self.err(format!("unknown spec type `{other}`"))),
         }
     }
@@ -309,6 +320,17 @@ impl Parser {
                     self.bump();
                     let field = self.expect_ident("after `.`")?;
                     e = SpecExpr::FieldAccess { value: Box::new(e), field };
+                }
+                Some(TokenKind::LBracket) => {
+                    // `xs[i]` indexed access (#208). The expression
+                    // inside brackets is parsed at full precedence so
+                    // `xs[i + 1]`, `xs[length(xs) - 1]`, etc. work.
+                    self.bump();
+                    let index = self.parse_expr()?;
+                    if !self.eat(&TokenKind::RBracket) {
+                        return Err(self.err("expected `]` to close index"));
+                    }
+                    e = SpecExpr::Index { list: Box::new(e), index: Box::new(index) };
                 }
                 _ => break,
             }

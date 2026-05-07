@@ -55,15 +55,16 @@ fn smt_type(t: &SpecType) -> &'static str {
         SpecType::Float => "Real",
         SpecType::Bool => "Bool",
         SpecType::Str => "String",
-        // #208: SMT-LIB encoding for record types isn't implemented in
-        // this slice. SMT supports records via the `Record`/datatype
-        // declaration, but mapping `SpecType::Record` into SMT-LIB
-        // datatypes needs name management for nested records and
-        // accessor function generation. Out of scope for v1; the SMT
-        // path stays scalar-only. Specs that use records are still
-        // evaluable via the gate path (`evaluate_gate_compiled`),
-        // which is what soft-agent uses.
+        // #208: SMT-LIB encoding for record / list types isn't
+        // implemented in this slice. SMT supports both via datatype
+        // declarations + sequences, but mapping the spec types into
+        // SMT-LIB needs name management for nested records and
+        // accessor / `seq.nth` generation. Out of scope for v1;
+        // the SMT path stays scalar-only. Specs that use these types
+        // are still evaluable via the gate path
+        // (`evaluate_gate_compiled`), which is what soft-agent uses.
         SpecType::Record { .. } => "<unsupported-Record>",
+        SpecType::List { .. } => "<unsupported-List>",
     }
 }
 
@@ -107,9 +108,14 @@ fn expr_to_smt(e: &SpecExpr) -> String {
         }
         // #208: see `smt_type`. Record field access maps to SMT-LIB
         // datatype accessors which need the datatype declarations
-        // smt_type doesn't currently emit. Out of scope for v1.
+        // smt_type doesn't currently emit. List ops likewise map to
+        // `seq.length` / `seq.nth` — same out-of-scope rationale.
         SpecExpr::FieldAccess { value, field } => {
             format!("(<unsupported-FieldAccess> {} {})", expr_to_smt(value), field)
+        }
+        SpecExpr::Index { list, index } => {
+            format!("(<unsupported-Index> {} {})",
+                expr_to_smt(list), expr_to_smt(index))
         }
     }
 }
