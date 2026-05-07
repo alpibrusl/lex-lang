@@ -6,6 +6,7 @@ pub mod canonical;
 pub mod canonicalize;
 pub mod canon_json;
 pub mod canon_print;
+pub mod dead_branch;
 pub mod ids;
 pub mod patch;
 
