@@ -270,6 +270,15 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::singleton("time"),
                 Ty::int(),
             ));
+            // sleep_ms :: Int -> [time] Unit (#226).
+            // Used internally by flow.retry_with_backoff for
+            // exponential-backoff delays; also available to user
+            // code under `--allow-effects time`.
+            fields.insert("sleep_ms".into(), Ty::function(
+                vec![Ty::int()],
+                EffectSet::singleton("time"),
+                Ty::Unit,
+            ));
             Some(Ty::Record(fields))
         }
         "rand" => {
@@ -704,7 +713,24 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                     Ty::int(),
                 ],
                 EffectSet::empty(),
-                Ty::function(vec![Ty::Var(0)], EffectSet::empty(), result_ty),
+                Ty::function(vec![Ty::Var(0)], EffectSet::empty(), result_ty.clone()),
+            ));
+            // retry_with_backoff[T, U, E](
+            //   f: (T) -> Result[U, E], attempts: Int, base_ms: Int,
+            // ) -> (T) -> [time] Result[U, E]
+            // Same retry shape as `flow.retry` plus an exponential
+            // backoff between attempts. The result function carries
+            // `[time]` because the trampoline calls `time.sleep_ms`
+            // internally. (#226)
+            fields.insert("retry_with_backoff".into(), Ty::function(
+                vec![
+                    Ty::function(vec![Ty::Var(0)], EffectSet::empty(), result_ty.clone()),
+                    Ty::int(),
+                    Ty::int(),
+                ],
+                EffectSet::empty(),
+                Ty::function(vec![Ty::Var(0)],
+                    EffectSet::singleton("time"), result_ty),
             ));
             // parallel[A, B](fa: () -> A, fb: () -> B) -> () -> (A, B)
             // Sequential implementation today; spec §11.2 reserves the

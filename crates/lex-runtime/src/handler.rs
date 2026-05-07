@@ -795,6 +795,21 @@ impl EffectHandler for DefaultHandler {
                     .map_err(|e| format!("time: {e}"))?.as_secs();
                 Ok(Value::Int(secs as i64))
             }
+            ("time", "sleep_ms") => {
+                // Block the current thread for `n` ms (#226). Used
+                // by `flow.retry_with_backoff`'s exponential delay.
+                // Negative or zero is a no-op. Bounded at 60s in the
+                // runtime to avoid pathological agent-emitted loops
+                // wedging the host — anything legitimate beyond
+                // that should use process-level scheduling, not a
+                // blocking sleep.
+                let n = expect_int(args.first())?;
+                if n > 0 {
+                    let ms = (n as u64).min(60_000);
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                }
+                Ok(Value::Unit)
+            }
             ("rand", "int_in") => {
                 // Deterministic stub: midpoint of [lo, hi].
                 let lo = expect_int(args.first())?;
