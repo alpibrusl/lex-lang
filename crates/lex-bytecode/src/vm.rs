@@ -33,6 +33,16 @@ pub const MAX_CALL_DEPTH: u32 = 1024;
 /// and how arguments map to side effects.
 pub trait EffectHandler {
     fn dispatch(&mut self, kind: &str, op: &str, args: Vec<Value>) -> Result<Value, String>;
+
+    /// Hook called by the VM at every function call so handlers can
+    /// enforce per-call budget consumption (#225). The argument is
+    /// the sum of `[budget(N)]` declared on the callee's signature;
+    /// the handler returns `Err` to refuse the call (the VM converts
+    /// to `VmError::Effect`). Default impl is a no-op so legacy
+    /// handlers and pure-only runs are unaffected.
+    fn note_call_budget(&mut self, _budget_cost: u64) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// `Vm` exposes itself as a `ClosureCaller` so the parser interpreter
@@ -108,6 +118,27 @@ struct Frame {
     /// Stack base when this frame started (for cleanup on return).
     stack_base: usize,
     trace_kind: FrameKind,
+}
+
+/// Sum of `[budget(N)]` declarations on a function's signature
+/// (#225). Used by Op::Call / Op::TailCall / Op::CallClosure to
+/// notify the EffectHandler of per-call budget cost so the handler
+/// can deduct from a shared pool and refuse calls that would
+/// exceed the policy ceiling. Negative `Int` args are ignored —
+/// the static check (`policy::check_program`) treats budgets as
+/// non-negative.
+fn call_budget_cost(f: &crate::program::Function) -> u64 {
+    let mut total: u64 = 0;
+    for e in &f.effects {
+        if e.kind == "budget" {
+            if let Some(crate::program::EffectArg::Int(n)) = &e.arg {
+                if *n >= 0 {
+                    total = total.saturating_add(*n as u64);
+                }
+            }
+        }
+    }
+    total
 }
 
 fn const_str(constants: &[Const], idx: u32) -> String {
@@ -450,6 +481,11 @@ impl<'a> Vm<'a> {
                     };
                     let node_id = const_str(&self.program.constants, node_id_idx);
                     let callee_name = self.program.functions[fn_id as usize].name.clone();
+                    let budget_cost = call_budget_cost(&self.program.functions[fn_id as usize]);
+                    if budget_cost > 0 {
+                        self.handler.note_call_budget(budget_cost)
+                            .map_err(VmError::Effect)?;
+                    }
                     let mut combined = captures;
                     combined.extend(args);
                     self.tracer.enter_call(&node_id, &callee_name, &combined);
@@ -466,6 +502,11 @@ impl<'a> Vm<'a> {
                     for i in (0..arity as usize).rev() { args[i] = self.pop()?; }
                     let node_id = const_str(&self.program.constants, node_id_idx);
                     let callee_name = self.program.functions[fn_id as usize].name.clone();
+                    let budget_cost = call_budget_cost(&self.program.functions[fn_id as usize]);
+                    if budget_cost > 0 {
+                        self.handler.note_call_budget(budget_cost)
+                            .map_err(VmError::Effect)?;
+                    }
                     self.tracer.enter_call(&node_id, &callee_name, &args);
                     let f = &self.program.functions[fn_id as usize];
                     let mut locals = vec![Value::Unit; f.locals_count.max(f.arity) as usize];
@@ -480,6 +521,11 @@ impl<'a> Vm<'a> {
                     for i in (0..arity as usize).rev() { args[i] = self.pop()?; }
                     let node_id = const_str(&self.program.constants, node_id_idx);
                     let callee_name = self.program.functions[fn_id as usize].name.clone();
+                    let budget_cost = call_budget_cost(&self.program.functions[fn_id as usize]);
+                    if budget_cost > 0 {
+                        self.handler.note_call_budget(budget_cost)
+                            .map_err(VmError::Effect)?;
+                    }
                     // A tail call closes the current call's trace frame and
                     // opens a new one in its place — preserves the caller's
                     // tree depth in the trace.
