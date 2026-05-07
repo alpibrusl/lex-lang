@@ -41,6 +41,7 @@ mod merge_session;
 mod op_log;
 mod operation;
 mod predicate;
+pub mod signing;
 
 pub use apply::{apply, ApplyError, NewHead};
 pub use attestation::{
@@ -58,6 +59,7 @@ pub use merge_session::{
     Resolution, ResolutionRejection,
 };
 pub use predicate::{evaluate, evaluate_with_resolver, IntentResolver, Predicate};
+pub use signing::{verify_stage_id, Keypair, SigningError};
 pub use op_log::OpLog;
 pub use operation::{
     EffectSet, ModuleRef, OpId, Operation, OperationRecord, OperationKind, SigId, StageId,

@@ -66,6 +66,12 @@ pub struct Metadata {
     /// Free-form notes (e.g. "fixes overflow on n>20").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Optional Ed25519 signature over the UTF-8 bytes of `stage_id`
+    /// (#227). Set on publish when the caller provides a signing key;
+    /// consumers verify via [`lex_vcs::verify_stage_id`]. Absence
+    /// means "unsigned" — policy decides whether to accept it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<lex_vcs::Signature>,
 }
 
 /// A test attached to a SigId (spec §4.4).
