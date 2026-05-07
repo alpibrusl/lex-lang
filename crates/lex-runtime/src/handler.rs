@@ -822,7 +822,7 @@ impl EffectHandler for DefaultHandler {
             // `[env]` grants access to the entire process environment.
             ("env", "get") => {
                 let name = expect_str(args.first())?;
-                Ok(match std::env::var(&name) {
+                Ok(match std::env::var(name) {
                     Ok(v) => Value::Variant {
                         name: "Some".into(),
                         args: vec![Value::Str(v)],

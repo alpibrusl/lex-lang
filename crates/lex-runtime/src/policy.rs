@@ -197,10 +197,10 @@ fn declared_effect_pretty(e: &DeclaredEffect) -> String {
 /// Grant strings come from `--allow-effects` and may be either:
 ///   - `name`           (bare wildcard, accepts any arg)
 ///   - `name:arg`       (string-arg specific grant — the colon is
-///                       a CLI-friendly separator)
+///     a CLI-friendly separator)
 ///   - `name(arg)`      (matches the canonical pretty form for
-///                       grants written by hand or copy-pasted from
-///                       error messages)
+///     grants written by hand or copy-pasted from
+///     error messages)
 ///
 /// Bare absorbs specific; specific matches only an exactly-equal
 /// string arg. Int/Ident args on the declaration side are accepted

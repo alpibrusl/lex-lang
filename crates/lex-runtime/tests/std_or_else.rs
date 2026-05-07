@@ -60,7 +60,7 @@ fn run(fn_name: &str, args: Vec<Value>) -> Value {
     vm.call(fn_name, args).unwrap_or_else(|e| panic!("call {fn_name}: {e}"))
 }
 
-fn variant<'v>(v: &'v Value) -> (&'v str, &'v [Value]) {
+fn variant(v: &Value) -> (&str, &[Value]) {
     match v {
         Value::Variant { name, args } => (name.as_str(), args.as_slice()),
         other => panic!("expected Variant, got {other:?}"),
