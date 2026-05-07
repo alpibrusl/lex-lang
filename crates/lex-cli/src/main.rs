@@ -104,6 +104,7 @@ fn run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "policy" => cmd_policy(fmt, &args[1..]),
         "log" => branch::cmd_log(fmt, &args[1..]),
         "op" => op::cmd_op(fmt, &args[1..]),
+        "canonical" => cmd_canonical(fmt, &args[1..]),
         "repl" => repl::cmd_repl(&args[1..]),
         "watch" => watch::cmd_watch(&args[1..]),
         "help" | "--help" | "-h" => { print_usage(); Ok(()) }
@@ -219,6 +220,30 @@ fn read_program(path: &str) -> Result<SynProgram> {
     }
 }
 
+/// Load a program as canonical AST stages, choosing between the
+/// text parser and the canonical-AST decoder by `from_canonical`
+/// (#206 slice 3). Both paths produce the same `Vec<Stage>` shape;
+/// the difference is whether the parse step runs at all. Agents
+/// that build canonical AST directly avoid parser-bug blast radius
+/// and skip a CPU-bound step, which is part of the slice-1
+/// motivation.
+fn load_stages(path: &str, from_canonical: bool) -> Result<Vec<lex_ast::Stage>> {
+    if from_canonical {
+        let bytes = if path == "-" {
+            let mut buf = Vec::new();
+            std::io::stdin().read_to_end(&mut buf).context("reading stdin")?;
+            buf
+        } else {
+            std::fs::read(path).map_err(|e| anyhow!("read {path}: {e}"))?
+        };
+        lex_ast::canonical_format::decode_program(&bytes)
+            .map_err(|e| anyhow!("decode {path}: {e}"))
+    } else {
+        let prog = read_program(path)?;
+        Ok(canonicalize_program(&prog))
+    }
+}
+
 fn cmd_parse(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let path = args.first().ok_or_else(|| anyhow!("usage: lex parse <file>"))?;
     let prog = read_program(path)?;
@@ -231,9 +256,25 @@ fn cmd_parse(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 }
 
 fn cmd_check(fmt: &OutputFormat, args: &[String]) -> Result<()> {
-    let path = args.first().ok_or_else(|| anyhow!("usage: lex check <file>"))?;
-    let prog = read_program(path)?;
-    let stages = canonicalize_program(&prog);
+    // #206 slice 3: `--from-canonical` reads the program as
+    // canonical-AST bytes instead of `.lex` text.
+    let mut from_canonical = false;
+    let mut path: Option<&str> = None;
+    for a in args {
+        match a.as_str() {
+            "--from-canonical" => { from_canonical = true; }
+            other if !other.starts_with("--") => {
+                if path.is_some() {
+                    bail!("usage: lex check [--from-canonical] <file>");
+                }
+                path = Some(other);
+            }
+            other => bail!("unknown flag `{other}` for `lex check`"),
+        }
+    }
+    let path = path.ok_or_else(|| anyhow!(
+        "usage: lex check [--from-canonical] <file>"))?;
+    let stages = load_stages(path, from_canonical)?;
     match lex_types::check_program(&stages) {
         Ok(_) => {
             let summary = effects_summary(&stages);
@@ -340,8 +381,8 @@ fn suggest_grants(s: &EffectsSummary) -> String {
 }
 
 fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
-    let (policy, positional, trace, max_steps, dry_run) = parse_run_flags(args)?;
-    let path = positional.first().ok_or_else(|| anyhow!("usage: lex run [policy] <file> <fn> [args]"))?;
+    let (policy, positional, trace, max_steps, dry_run, from_canonical) = parse_run_flags(args)?;
+    let path = positional.first().ok_or_else(|| anyhow!("usage: lex run [policy] [--from-canonical] <file> <fn> [args]"))?;
     let func = positional.get(1).ok_or_else(|| anyhow!("missing function name"))?;
     if dry_run {
         let actions = vec![serde_json::json!({
@@ -362,10 +403,12 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         acli::emit_dry_run("run", fmt,
             &format!("would call `{func}` in {path}"), actions);
     }
-    let prog = read_program(path)?;
+    // #206 slice 3: load via text parser or canonical-AST decoder.
+    // Both paths produce the same Vec<Stage>; the typecheck and
+    // compile pipeline is identical from this point on.
+    let mut stages = load_stages(path, from_canonical)?;
     // #168: rewrite stdlib parse calls during type-check so the
     // runtime sees the strict (validated) shape.
-    let mut stages = canonicalize_program(&prog);
     if let Err(errs) = lex_types::check_and_rewrite_program(&mut stages) {
         let arr: Vec<serde_json::Value> = errs.iter()
             .map(|e| serde_json::to_value(e).unwrap()).collect();
@@ -436,12 +479,13 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 }
 
 #[allow(clippy::type_complexity)]
-fn parse_run_flags(args: &[String]) -> Result<(Policy, Vec<String>, bool, Option<u64>, bool)> {
+fn parse_run_flags(args: &[String]) -> Result<(Policy, Vec<String>, bool, Option<u64>, bool, bool)> {
     let mut policy = Policy::pure();
     let mut positional = Vec::new();
     let mut trace = false;
     let mut max_steps: Option<u64> = None;
     let mut dry_run = false;
+    let mut from_canonical = false;
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -488,10 +532,18 @@ fn parse_run_flags(args: &[String]) -> Result<(Policy, Vec<String>, bool, Option
             }
             "--trace" => { trace = true; i += 1; }
             "--dry-run" => { dry_run = true; i += 1; }
+            "--from-canonical" => {
+                // #206 slice 3: read the program as canonical-AST
+                // bytes instead of `.lex` text. The path argument
+                // points to the bytes file (or `-` for stdin); the
+                // text parser is bypassed entirely on this path.
+                from_canonical = true;
+                i += 1;
+            }
             _ => { positional.push(a.clone()); i += 1; }
         }
     }
-    Ok((policy, positional, trace, max_steps, dry_run))
+    Ok((policy, positional, trace, max_steps, dry_run, from_canonical))
 }
 
 fn cmd_trace(fmt: &OutputFormat, args: &[String]) -> Result<()> {
@@ -519,6 +571,155 @@ fn cmd_diff(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&data).unwrap());
     });
     Ok(())
+}
+
+/// `lex canonical <encode|decode>` dispatcher (#206 slice 2).
+fn cmd_canonical(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let sub = args.first().ok_or_else(|| anyhow!(
+        "usage: lex canonical <encode|decode> ..."))?;
+    match sub.as_str() {
+        "encode" => cmd_canonical_encode(fmt, &args[1..]),
+        "decode" => cmd_canonical_decode(fmt, &args[1..]),
+        other => bail!("unknown `lex canonical` action `{other}`; \
+                       expected `encode` or `decode`"),
+    }
+}
+
+/// `lex canonical encode <text-file> [--out <bytes-file>]` (#206 slice 2).
+///
+/// Parses a `.lex` source file, canonicalizes it, and emits the
+/// versioned canonical-AST byte representation. Without `--out`,
+/// writes raw bytes to stdout (suitable for piping into another
+/// agent process or `lex canonical decode`); with `--out`, writes
+/// to the named file.
+///
+/// JSON-output mode (`--output json`) emits a structured envelope
+/// instead — `{ "ok": true, "bytes_b64": "..." }` — so agent
+/// harnesses can capture the canonical bytes without dealing with
+/// raw-bytes-on-stdout encoding issues.
+fn cmd_canonical_encode(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let mut path: Option<&str> = None;
+    let mut out_path: Option<&str> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--out" => {
+                out_path = Some(args.get(i + 1).map(|s| s.as_str())
+                    .ok_or_else(|| anyhow!("--out needs a path"))?);
+                i += 2;
+            }
+            s if s.starts_with("--") => bail!("unknown flag `{s}` for `lex canonical encode`"),
+            _ => {
+                if path.is_some() {
+                    bail!("usage: lex canonical encode <text-file> [--out <bytes-file>]");
+                }
+                path = Some(args[i].as_str());
+                i += 1;
+            }
+        }
+    }
+    let path = path.ok_or_else(|| anyhow!(
+        "usage: lex canonical encode <text-file> [--out <bytes-file>]"))?;
+
+    let prog = read_program(path)?;
+    let stages = canonicalize_program(&prog);
+    let bytes = lex_ast::canonical_format::encode_program(&stages);
+
+    if let Some(out) = out_path {
+        std::fs::write(out, &bytes)
+            .map_err(|e| anyhow!("write {out}: {e}"))?;
+        let data = serde_json::json!({
+            "ok": true,
+            "out": out,
+            "bytes": bytes.len(),
+            "stages": stages.len(),
+        });
+        acli::emit_or_text("canonical-encode", data, fmt, || {
+            println!("wrote {} bytes to {out}", bytes.len());
+        });
+    } else {
+        match fmt {
+            OutputFormat::Json => {
+                let b64 = encode_b64(&bytes);
+                let data = serde_json::json!({
+                    "ok": true,
+                    "bytes_b64": b64,
+                    "stages": stages.len(),
+                });
+                acli::emit_or_text("canonical-encode", data, fmt, || {});
+            }
+            _ => {
+                use std::io::Write;
+                std::io::stdout().write_all(&bytes)
+                    .map_err(|e| anyhow!("stdout: {e}"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `lex canonical decode <bytes-file>` (#206 slice 2).
+///
+/// Reads the canonical-AST byte representation from a file, decodes
+/// it, and prints the program back in `.lex` text form via
+/// `lex_ast::print_stages`. The text output is a debugger /
+/// new-developer affordance — round-tripping `text → canonical → text`
+/// produces semantically equivalent (but not necessarily byte-identical)
+/// source, since the canonical form drops insignificant whitespace
+/// and comment placement.
+fn cmd_canonical_decode(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let path = args.first().ok_or_else(|| anyhow!(
+        "usage: lex canonical decode <bytes-file>"))?;
+    let bytes = std::fs::read(path)
+        .map_err(|e| anyhow!("read {path}: {e}"))?;
+    let stages = lex_ast::canonical_format::decode_program(&bytes)
+        .map_err(|e| anyhow!("decode {path}: {e}"))?;
+    let text = lex_ast::print_stages(&stages);
+    let data = serde_json::json!({
+        "ok": true,
+        "stages": stages.len(),
+        "text": &text,
+    });
+    acli::emit_or_text("canonical-decode", data, fmt, || {
+        print!("{text}");
+    });
+    Ok(())
+}
+
+/// Tiny base64 encoder for the JSON envelope output. Avoids adding
+/// a `base64` crate dep just for this CLI surface — standard
+/// alphabet (RFC 4648 §4), padded.
+fn encode_b64(bytes: &[u8]) -> String {
+    const A: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        let b0 = bytes[i] as usize;
+        let b1 = bytes[i + 1] as usize;
+        let b2 = bytes[i + 2] as usize;
+        out.push(A[b0 >> 2] as char);
+        out.push(A[((b0 & 0b11) << 4) | (b1 >> 4)] as char);
+        out.push(A[((b1 & 0b1111) << 2) | (b2 >> 6)] as char);
+        out.push(A[b2 & 0b111111] as char);
+        i += 3;
+    }
+    let rem = bytes.len() - i;
+    if rem == 1 {
+        let b0 = bytes[i] as usize;
+        out.push(A[b0 >> 2] as char);
+        out.push(A[(b0 & 0b11) << 4] as char);
+        out.push('=');
+        out.push('=');
+    } else if rem == 2 {
+        let b0 = bytes[i] as usize;
+        let b1 = bytes[i + 1] as usize;
+        out.push(A[b0 >> 2] as char);
+        out.push(A[((b0 & 0b11) << 4) | (b1 >> 4)] as char);
+        out.push(A[(b1 & 0b1111) << 2] as char);
+        out.push('=');
+    }
+    out
 }
 
 fn cmd_hash(fmt: &OutputFormat, args: &[String]) -> Result<()> {
