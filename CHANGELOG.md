@@ -7,6 +7,33 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added — agent-VCS roadmap (#262)
+
+- **Multi-writer CAS branch advance** (#262). Pre-#262, two writers
+  calling `Store::apply_operation` concurrently on the same branch
+  could lose one another's update — `Branch.head_op` was a
+  read-modify-write under no lock. Now branch advance is a
+  fs2-advisory-locked CAS on `<branches>/<name>.lock`: the
+  retry loop reads the current head, persists the op (idempotent
+  via content addressing), then CAS-advances against the
+  pre-persist parent. CAS mismatch rebuilds the op with the new
+  head and retries up to 32 times before surfacing
+  `StoreError::Contention { branch, attempts }`.
+- **`Store::set_branch_head_op_cas`** + **`CasFailed`** internal
+  primitives. Single-parent ops are rebuildable (the retry loop
+  swaps the parent and re-derives the op_id); merge ops are not
+  (their parents are meaningful), so a CAS mismatch on a merge
+  surfaces immediately as `Contention`.
+- **HTTP API**: `apply_operation`-routing endpoints (`/v1/patch`,
+  `/v1/branches/.../merge/.../commit`, `/v1/programs/publish`)
+  map `Contention` → 503 with a `Retry-After: 1` header and a
+  `{kind: "contention", branch, attempts}` detail envelope.
+- Conformance tests in `crates/lex-store/tests/concurrent_apply.rs`:
+  N-thread races land every writer's signature, the resulting
+  history is a single linear chain, and op records are never lost
+  on retry (orphaned records are intentional under the append-only
+  contract).
+
 ### Added — agent-VCS roadmap (#258)
 
 - **Attestation-cascade migration** (#258). Closes the documented

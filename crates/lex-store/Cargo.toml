@@ -16,6 +16,10 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 indexmap.workspace = true
+# Advisory file locking for #262's CAS branch advance. Already a
+# transitive dep via tempfile; promoting to direct so the lock
+# call sites compile.
+fs2 = "0.4"
 lex-ast = { path = "../lex-ast", version = "0.4.0" }
 lex-trace = { path = "../lex-trace", version = "0.4.0" }
 lex-types = { path = "../lex-types", version = "0.4.0" }

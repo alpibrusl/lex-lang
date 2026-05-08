@@ -13,6 +13,31 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
+/// Why a CAS branch advance failed (#262). Surfaced through the
+/// retry loop in `Store::apply_operation` and friends; callers
+/// either retry (on `Mismatch`, after re-reading the head and
+/// rebuilding the candidate op) or propagate (on `Io` /
+/// `UnknownBranch`).
+#[derive(Debug)]
+pub enum CasFailed {
+    /// Read-time `head_op` didn't match the supplied `expected`.
+    /// Another writer advanced the branch between this caller's
+    /// read and write. `actual` is the head we found instead.
+    /// Public field so callers (e.g. an HTTP layer) can surface
+    /// the actual head in a structured error envelope; today's
+    /// retry loop just discards it and re-reads on the next
+    /// iteration.
+    #[allow(dead_code)] // populated for callers that inspect the variant
+    Mismatch { actual: Option<OpId> },
+    /// Branch doesn't exist (and isn't the default branch).
+    UnknownBranch(String),
+    /// Disk I/O failure (lock acquisition, file read, atomic
+    /// write). Stringified at the boundary because `io::Error`
+    /// isn't `Clone`/`PartialEq` and the variant is consumed by
+    /// the retry loop, not pattern-matched on.
+    Io(String),
+}
+
 pub const DEFAULT_BRANCH: &str = "main";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -307,6 +332,83 @@ impl Store {
         fs::create_dir_all(self.branches_dir())?;
         write_branch_atomic(&self.branch_path(name), &b)?;
         Ok(())
+    }
+
+    /// Atomic compare-and-swap on `branch.head_op` (#262). Holds
+    /// an advisory `flock` on a per-branch lock file across the
+    /// read-compare-write sequence so two concurrent writers can't
+    /// both see the same `head_op`, both decide to advance, and
+    /// both succeed (silently dropping one's lineage).
+    ///
+    /// Returns `Ok(())` when `expected == current head_op` and the
+    /// new value is durably written; `Err(CasFailed { actual })`
+    /// when the actual head doesn't match `expected`. Callers
+    /// should re-read the head, rebuild the candidate op against
+    /// the new parent, and retry. Op records are content-addressed
+    /// and idempotent, so re-persisting under a new parent is safe.
+    ///
+    /// Crash safety: same tempfile + rename + fsync as the
+    /// non-CAS path. The lock is the only addition; on a crashed
+    /// process the OS releases the flock and the next writer can
+    /// proceed.
+    pub(crate) fn set_branch_head_op_cas(
+        &self,
+        name: &str,
+        expected: Option<OpId>,
+        new: OpId,
+    ) -> Result<(), CasFailed> {
+        // Acquire the per-branch advisory lock. Path is
+        // `<branches_dir>/<name>.lock`; the file is created on
+        // first use and reused thereafter. We hold the lock for
+        // the entire RMW sequence.
+        fs::create_dir_all(self.branches_dir())
+            .map_err(|e| CasFailed::Io(e.to_string()))?;
+        let lock_path = self.branches_dir().join(format!("{name}.lock"));
+        let lock_file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| CasFailed::Io(e.to_string()))?;
+        use fs2::FileExt;
+        lock_file.lock_exclusive()
+            .map_err(|e| CasFailed::Io(e.to_string()))?;
+
+        // Critical section: read, compare, write. The lock is
+        // released when `lock_file` drops at end of scope (or on
+        // early return).
+        let result = (|| -> Result<(), CasFailed> {
+            let actual = self.get_branch(name)
+                .map_err(|e| CasFailed::Io(format!("{e}")))?
+                .and_then(|b| b.head_op);
+            if actual != expected {
+                return Err(CasFailed::Mismatch { actual });
+            }
+            let mut b = match self.get_branch(name)
+                .map_err(|e| CasFailed::Io(format!("{e}")))?
+            {
+                Some(b) => b,
+                None if name == DEFAULT_BRANCH => Branch {
+                    name: DEFAULT_BRANCH.into(),
+                    parent: None,
+                    head_op: None,
+                    predicate: None,
+                    merges: Vec::new(),
+                    created_at: now(),
+                    last_gate_checkpoint: None,
+                },
+                None => return Err(CasFailed::UnknownBranch(name.into())),
+            };
+            b.head_op = Some(new.clone());
+            b.last_gate_checkpoint = Some(new);
+            write_branch_atomic(&self.branch_path(name), &b)
+                .map_err(|e| CasFailed::Io(format!("{e}")))?;
+            Ok(())
+        })();
+        // Best-effort unlock; OS releases on file close anyway.
+        let _ = fs2::FileExt::unlock(&lock_file);
+        result
     }
 
     /// Invalidate every branch's `last_gate_checkpoint` (#256). Run
