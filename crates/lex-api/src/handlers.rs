@@ -85,6 +85,31 @@ fn error_with_detail(status: u16, msg: impl Into<String>, detail: serde_json::Va
     }).unwrap())
 }
 
+/// Map a `StoreError` from a write path (`apply_operation` /
+/// `apply_operation_checked`) to an HTTP response. The only special
+/// case today is `Contention` (#262 multi-writer CAS retries
+/// exhausted), which maps to 503 with a `Retry-After` header so
+/// clients back off rather than hammering the same branch tip.
+fn write_error_response(prefix: &str, err: lex_store::StoreError)
+    -> Response<std::io::Cursor<Vec<u8>>>
+{
+    if let lex_store::StoreError::Contention { branch, attempts } = &err {
+        let body = serde_json::to_vec(&ErrorEnvelope {
+            error: format!("{prefix}: branch '{branch}' is contended (attempts={attempts})"),
+            detail: Some(serde_json::json!({
+                "kind": "contention",
+                "branch": branch,
+                "attempts": attempts,
+            })),
+        }).unwrap_or_else(|_| b"{}".to_vec());
+        return Response::from_data(body)
+            .with_status_code(503)
+            .with_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap())
+            .with_header(Header::from_bytes(&b"Retry-After"[..], &b"1"[..]).unwrap());
+    }
+    error_response(500, format!("{prefix}: {err}"))
+}
+
 pub fn handle(state: Arc<State>, mut req: Request) -> std::io::Result<()> {
     let method = req.method().clone();
     let url = req.url().to_string();
@@ -297,7 +322,7 @@ pub(crate) fn publish_handler(state: &State, body: &str) -> Response<std::io::Cu
         Err(lex_store::StoreError::TypeError(errs)) => {
             error_with_detail(422, "type errors", serde_json::to_value(&errs).unwrap())
         }
-        Err(e) => error_response(500, format!("publish_program: {e}")),
+        Err(e) => write_error_response("publish_program", e),
     }
 }
 
@@ -407,7 +432,7 @@ fn patch_handler(state: &State, body: &str) -> Response<std::io::Cursor<Vec<u8>>
     );
     let op_id = match store.apply_operation(&branch, op, transition) {
         Ok(id) => id,
-        Err(e) => return error_response(500, format!("apply_operation: {e}")),
+        Err(e) => return write_error_response("apply_operation", e),
     };
 
     let status = format!("{:?}",
@@ -832,7 +857,7 @@ fn merge_commit_handler(
             "new_head_op": new_head_op,
             "dst_branch": dst_branch,
         })),
-        Err(e) => error_response(500, format!("apply merge op: {e}")),
+        Err(e) => write_error_response("apply merge op", e),
     }
 }
 

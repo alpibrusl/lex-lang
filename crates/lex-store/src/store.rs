@@ -51,6 +51,14 @@ pub enum StoreError {
         .0.op_id, .0.missing.join(", ")
     )]
     BranchAdvanceBlocked(crate::policy::BranchAdvanceBlocked),
+    /// All retry attempts of the CAS branch-head advance failed
+    /// because another writer kept advancing the same branch
+    /// (#262). The op record itself is durable in the op log
+    /// (orphaned), so re-running with backoff would eventually
+    /// land — return `503 Contention { retry_after }` from the
+    /// HTTP API and let the client back off.
+    #[error("branch advance contention on `{branch}`: {attempts} retries exhausted")]
+    Contention { branch: String, attempts: u32 },
     /// The op was persisted but its stage carries an attestation
     /// produced by a retroactively quarantined tool (#248). The
     /// branch head is unchanged. The op record stays in the log
@@ -694,17 +702,20 @@ impl Store {
         if let Err(errors) = lex_types::check_program(candidate) {
             return Err(StoreError::TypeError(errors));
         }
-        // Persist the op without advancing the branch head — we want
-        // the TypeCheck attestation visible *before* the gate runs,
-        // so policies that require TypeCheck pass for newly-typed
-        // ops. Then gate, then advance.
         let attestable = attestable_stage_ids(&transition);
         let op_effects = op_declared_effects(&op.kind);
-        let new_head = self.persist_op_only(branch, op, transition)?;
-        self.record_typecheck_passed(&attestable, &new_head.op_id)?;
-        self.run_required_attestations_gate(branch, &new_head.op_id, &attestable, &op_effects)?;
-        self.set_branch_head_op(branch, new_head.op_id.clone())?;
-        Ok(new_head.op_id)
+        // #262: CAS retry loop. Single-parent ops can be safely
+        // re-persisted under a new parent on contention (the kind
+        // is invariant; only `parents` changes). Merge ops (already
+        // 2-parent) come through the merge engine which has its own
+        // coordination; we don't retry them here — we'll see the
+        // first attempt's CAS fail and surface Contention.
+        self.cas_retry_advance(branch, op, transition, |new_head| {
+            self.record_typecheck_passed(&attestable, &new_head.op_id)?;
+            self.run_required_attestations_gate(
+                branch, &new_head.op_id, &attestable, &op_effects,
+            )
+        })
     }
 
     /// Open the attestation log rooted at this store. The log lives
@@ -763,48 +774,155 @@ impl Store {
     ) -> Result<lex_vcs::OpId, StoreError> {
         let attestable = attestable_stage_ids(&transition);
         let op_effects = op_declared_effects(&op.kind);
-        let new_head = self.persist_op_only(branch, op, transition)?;
-        // The unchecked path doesn't auto-emit TypeCheck, so a
-        // policy requiring TypeCheck (or any other attestation) on
-        // ops with attestable stages will refuse to advance the
-        // branch unless the caller emitted the attestation
-        // separately first. This is the intended behavior — the
-        // unchecked path opts out of the safety net the gate
-        // depends on.
-        self.run_required_attestations_gate(branch, &new_head.op_id, &attestable, &op_effects)?;
-        self.set_branch_head_op(branch, new_head.op_id.clone())?;
-        Ok(new_head.op_id)
+        self.cas_retry_advance(branch, op, transition, |new_head| {
+            self.run_required_attestations_gate(
+                branch, &new_head.op_id, &attestable, &op_effects,
+            )
+        })
     }
 
-    /// Persist an op via [`lex_vcs::apply`] but do NOT advance the
-    /// branch head. Internal to the apply pipeline so
-    /// `apply_operation` and `apply_operation_checked` share the
-    /// pre-check + persist sequence without duplicating the
-    /// validation code. The TypeCheck attestation and the
-    /// `required_attestations` gate slot in between this and the
-    /// final `set_branch_head_op` call.
-    fn persist_op_only(
+    /// CAS retry loop for #262. Single-parent ops are rebuilt on
+    /// each iteration with the current branch head as parent;
+    /// the per-iteration callback runs the gate (and TypeCheck
+    /// emission, for the checked path) between persist and CAS.
+    /// Merge ops (with 2 parents already set) skip the rebuild —
+    /// their parents are caller-supplied and meaningful — and get
+    /// a single attempt; on CAS failure they surface `Contention`.
+    fn cas_retry_advance<F>(
         &self,
         branch: &str,
         op: lex_vcs::Operation,
         transition: lex_vcs::StageTransition,
+        mut between_persist_and_cas: F,
+    ) -> Result<lex_vcs::OpId, StoreError>
+    where
+        F: FnMut(&lex_vcs::NewHead) -> Result<(), StoreError>,
+    {
+        // 32 retries handles up to ~32 concurrent writers racing on
+        // the same branch tip. Beyond that, surfacing `Contention`
+        // is the right signal — clients should back off or batch.
+        const MAX_ATTEMPTS: u32 = 32;
+        // Single-parent ops can be rebuilt on retry; merge ops
+        // can't (their two parents are meaningful, supplied by the
+        // merge engine). For merges, single attempt: if CAS
+        // fails, surface Contention.
+        let is_rebuildable = op.parents.len() <= 1;
+        let kind = op.kind.clone();
+        let intent_id = op.intent_id.clone();
+
+        let mut last_io_err: Option<StoreError> = None;
+        let mut current_op = op;
+        let current_transition = transition;
+        // Only rebuild on retries — attempt 1 honors the caller's
+        // exact op so a user-supplied bogus parent surfaces as
+        // `StaleParent` instead of being silently corrected.
+        let mut rebuilt_already = false;
+        for attempt in 1..=MAX_ATTEMPTS {
+            // Read the current head BEFORE we persist — this is
+            // the value we'll compare against in the CAS.
+            let parent = self
+                .get_branch(branch)?
+                .and_then(|b| b.head_op);
+
+            // Rebuild the op against the current head, but only
+            // on retries (not the caller's first attempt) and
+            // only for single-parent operations. Multi-parent
+            // (merge) ops are passed through unchanged.
+            if is_rebuildable && rebuilt_already {
+                current_op = lex_vcs::Operation {
+                    kind: kind.clone(),
+                    parents: parent.iter().cloned().collect(),
+                    intent_id: intent_id.clone(),
+                };
+            }
+
+            // Persist (idempotent). On `StaleParent` from a retry
+            // attempt (where we already rebuilt), the head changed
+            // between our `get_branch` and this `lex_vcs::apply`
+            // — race; rebuild and continue. On `StaleParent` from
+            // attempt 1 (caller's input), propagate.
+            let new_head = match self.persist_op_only_with_parent(
+                branch,
+                parent.as_ref(),
+                current_op.clone(),
+                current_transition.clone(),
+            ) {
+                Ok(nh) => nh,
+                Err(StoreError::Apply(lex_vcs::ApplyError::StaleParent { .. }))
+                    if is_rebuildable && rebuilt_already =>
+                {
+                    rebuilt_already = true;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+
+            // Run the caller's between-persist-and-cas hook
+            // (TypeCheck emission + gate). If this fails, the op
+            // record is durable but orphaned — same semantics as
+            // pre-#262.
+            between_persist_and_cas(&new_head)?;
+
+            // CAS the branch head. On success: done. On mismatch:
+            // someone advanced in parallel; retry.
+            match self.set_branch_head_op_cas(branch, parent, new_head.op_id.clone()) {
+                Ok(()) => return Ok(new_head.op_id),
+                Err(crate::branches::CasFailed::Mismatch { .. }) if is_rebuildable => {
+                    // Try again with the new head as parent.
+                    rebuilt_already = true;
+                    continue;
+                }
+                Err(crate::branches::CasFailed::Mismatch { .. }) => {
+                    // Merge op: surface immediately — we can't
+                    // rebuild without rerunning the merge engine.
+                    let _ = attempt;
+                    return Err(StoreError::Contention {
+                        branch: branch.into(),
+                        attempts: 1,
+                    });
+                }
+                Err(crate::branches::CasFailed::UnknownBranch(b)) => {
+                    return Err(StoreError::UnknownBranch(b));
+                }
+                Err(crate::branches::CasFailed::Io(e)) => {
+                    last_io_err = Some(StoreError::Io(std::io::Error::other(e)));
+                    continue;
+                }
+            }
+        }
+        // Retries exhausted. Prefer surfacing the most recent IO
+        // error if we hit one; otherwise it's pure CAS contention.
+        match last_io_err {
+            Some(e) => Err(e),
+            None => Err(StoreError::Contention {
+                branch: branch.into(),
+                attempts: MAX_ATTEMPTS,
+            }),
+        }
+    }
+
+    /// Persist an op against an explicitly-supplied parent. Used
+    /// by the CAS retry loop in `cas_retry_advance` so the
+    /// `lex_vcs::apply` parent check matches what we read at the
+    /// top of the loop iteration (avoids a TOCTOU race against
+    /// `persist_op_only`'s second read).
+    fn persist_op_only_with_parent(
+        &self,
+        branch: &str,
+        parent: Option<&lex_vcs::OpId>,
+        op: lex_vcs::Operation,
+        transition: lex_vcs::StageTransition,
     ) -> Result<lex_vcs::NewHead, StoreError> {
-        // Pre-check: refuse to persist any op against a branch that
-        // doesn't exist. Without this, applying against a non-default
-        // ghost branch would write the op record (succeeding via
-        // lex_vcs::apply on a None head) and only fail at
-        // set_branch_head_op below — leaving an orphan op in the log
-        // with no branch pointing at it.
         if branch != DEFAULT_BRANCH && self.get_branch(branch)?.is_none() {
             return Err(StoreError::UnknownBranch(branch.into()));
         }
         let log = lex_vcs::OpLog::open(self.root())?;
-        let head_op = self.get_branch(branch)?.and_then(|b| b.head_op);
-        lex_vcs::apply(&log, head_op.as_ref(), op, transition).map_err(|e| match e {
+        lex_vcs::apply(&log, parent, op, transition).map_err(|e| match e {
             lex_vcs::ApplyError::Persist(io) => StoreError::Io(io),
             other => StoreError::Apply(other),
         })
     }
+
 
     /// Run the `required_attestations` gate (#245) and the
     /// retroactive producer-block gate (#248) over a single op
