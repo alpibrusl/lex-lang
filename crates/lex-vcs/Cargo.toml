@@ -11,8 +11,8 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-lex-ast = { path = "../lex-ast", version = "0.2.2" }
-lex-types = { path = "../lex-types", version = "0.2.2" }
+lex-ast = { path = "../lex-ast", version = "0.3.0" }
+lex-types = { path = "../lex-types", version = "0.3.0" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -24,4 +24,4 @@ hex.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
-lex-syntax = { path = "../lex-syntax", version = "0.2.2" }
+lex-syntax = { path = "../lex-syntax", version = "0.3.0" }

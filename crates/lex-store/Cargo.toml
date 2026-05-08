@@ -16,11 +16,11 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 indexmap.workspace = true
-lex-ast = { path = "../lex-ast", version = "0.2.2" }
-lex-trace = { path = "../lex-trace", version = "0.2.2" }
-lex-types = { path = "../lex-types", version = "0.2.2" }
-lex-vcs = { path = "../lex-vcs", version = "0.2.2" }
+lex-ast = { path = "../lex-ast", version = "0.3.0" }
+lex-trace = { path = "../lex-trace", version = "0.3.0" }
+lex-types = { path = "../lex-types", version = "0.3.0" }
+lex-vcs = { path = "../lex-vcs", version = "0.3.0" }
 
 [dev-dependencies]
-lex-syntax = { path = "../lex-syntax", version = "0.2.2" }
+lex-syntax = { path = "../lex-syntax", version = "0.3.0" }
 tempfile = "3"
