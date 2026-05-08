@@ -191,6 +191,11 @@ fn route(
             let name = &p["/v1/branches/".len()..p.len() - "/head".len()];
             branch_head_handler(state, name)
         }
+        // ---- #260: append-only fetch (inverse of #242 push)
+        // Body is a JSON array of OperationRecords reachable from
+        // `branch.head_op` but not from `after`, oldest-first.
+        (Method::Get, "/v1/ops/since") => ops_since_handler(state, query),
+        (Method::Get, "/v1/attestations/since") => attestations_since_handler(state, query),
         _ => error_response(404, format!("unknown route: {method:?} {path}")),
     }
 }
@@ -1104,5 +1109,168 @@ pub(crate) fn branch_head_handler(state: &State, name: &str)
         "branch": name,
         "head_op": head,
     }))
+}
+
+/// `GET /v1/ops/since?after=<op_id>&branch=<name>&limit=<n>` (#260).
+/// Server endpoint for `lex op pull`.
+///
+/// Returns a JSON array of `OperationRecord`s reachable from
+/// `branch.head_op` but not from `<after>`, sorted **oldest-first**
+/// so the client can apply them in topological order without
+/// re-sorting. Empty array when:
+///
+/// * The branch doesn't exist on the remote.
+/// * The branch's `head_op` is `None`.
+/// * `after == branch.head_op` (caller is already at the remote's head).
+/// * `after` is *ahead of* the remote's head (caller is past the
+///   remote — the symmetric "remote behind" case from #260).
+///
+/// `branch` defaults to `main`. `limit` caps the response — useful
+/// for chunked pulls of large gaps; clients re-issue with the next
+/// `after` once the prefix has landed.
+///
+/// Failure modes:
+///
+/// * `400` if the query string is malformed.
+/// * `200` with `[]` for any of the empty-result cases above. "Caller
+///   is already up to date" is a normal answer, not an error.
+pub(crate) fn ops_since_handler(state: &State, query: &str)
+    -> Response<std::io::Cursor<Vec<u8>>>
+{
+    let mut after: Option<String> = None;
+    let mut branch = String::from("main");
+    let mut limit: Option<usize> = None;
+    for kv in query.split('&') {
+        let Some((k, v)) = kv.split_once('=') else { continue };
+        match k {
+            "after" => after = Some(v.to_string()),
+            "branch" => branch = v.to_string(),
+            "limit" => {
+                limit = Some(match v.parse::<usize>() {
+                    Ok(n) => n,
+                    Err(_) => return error_response(400,
+                        format!("limit must be a positive integer, got `{v}`")),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    let store = state.store.lock().unwrap();
+    let log = match lex_vcs::OpLog::open(store.root()) {
+        Ok(l) => l,
+        Err(e) => return error_response(500, format!("opening op log: {e}")),
+    };
+    let head = match store.get_branch(&branch) {
+        Ok(Some(b)) => b.head_op,
+        Ok(None) => None,
+        Err(e) => return error_response(500, format!("get_branch: {e}")),
+    };
+    let Some(head) = head else {
+        return json_response(200, &serde_json::json!([]));
+    };
+
+    let ops_since = match log.ops_since(&head, after.as_ref()) {
+        Ok(o) => o,
+        Err(e) => return error_response(500, format!("ops_since: {e}")),
+    };
+    // ops_since walks newest-first; reverse so the client receives
+    // oldest-first and can apply them in topological order with
+    // `OpLog::put` straight through.
+    let mut ops = ops_since;
+    ops.reverse();
+    if let Some(n) = limit {
+        ops.truncate(n);
+    }
+
+    json_response(200, &serde_json::to_value(&ops).unwrap_or_default())
+}
+
+/// `GET /v1/attestations/since?after-op=<op_id>&limit=<n>` (#260).
+/// Mirror of `ops_since_handler` for the attestation log.
+///
+/// Returns attestations whose `op_id` field is reachable from
+/// **any** branch's head — not just one — and not in `after_op`'s
+/// ancestry. The cross-branch fan-out matches the push side:
+/// attestations are stage-keyed, not branch-keyed, so a single
+/// "since this op" filter is the right shape.
+///
+/// Attestations with `op_id: None` (e.g. `Override`,
+/// `ProducerBlock`) are always included — the cutoff doesn't apply.
+/// `--limit` caps the response.
+pub(crate) fn attestations_since_handler(state: &State, query: &str)
+    -> Response<std::io::Cursor<Vec<u8>>>
+{
+    let mut after_op: Option<String> = None;
+    let mut limit: Option<usize> = None;
+    for kv in query.split('&') {
+        let Some((k, v)) = kv.split_once('=') else { continue };
+        match k {
+            "after-op" => after_op = Some(v.to_string()),
+            "limit" => {
+                limit = Some(match v.parse::<usize>() {
+                    Ok(n) => n,
+                    Err(_) => return error_response(400,
+                        format!("limit must be a positive integer, got `{v}`")),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    let store = state.store.lock().unwrap();
+    let log = match store.attestation_log() {
+        Ok(l) => l,
+        Err(e) => return error_response(500, format!("opening attestation log: {e}")),
+    };
+
+    // Build the exclude set: every op_id reachable from `after_op`,
+    // inclusive. Attestations whose op_id is in this set were
+    // already known to the caller.
+    let exclude: std::collections::BTreeSet<String> = match &after_op {
+        None => std::collections::BTreeSet::new(),
+        Some(cutoff) => {
+            let op_log = match lex_vcs::OpLog::open(store.root()) {
+                Ok(l) => l,
+                Err(e) => return error_response(500, format!("opening op log: {e}")),
+            };
+            match op_log.walk_back(cutoff, None) {
+                Ok(records) => records.into_iter().map(|r| r.op_id).collect(),
+                Err(_) => {
+                    // Cutoff op doesn't exist on this remote. Treat
+                    // as "no exclude" — caller will get every
+                    // attestation. They may dedup client-side.
+                    std::collections::BTreeSet::new()
+                }
+            }
+        }
+    };
+
+    let all = match log.list_all() {
+        Ok(v) => v,
+        Err(e) => return error_response(500, format!("listing attestations: {e}")),
+    };
+    let mut filtered: Vec<lex_vcs::Attestation> = all
+        .into_iter()
+        .filter(|a| match &a.op_id {
+            Some(op_id) => !exclude.contains(op_id),
+            // No op_id = doesn't participate in the cutoff; always
+            // ship it on the first pull, server-side idempotency
+            // dedupes on the client.
+            None => true,
+        })
+        .collect();
+    // Stable order: oldest-first by `timestamp`, then by
+    // `attestation_id` for ties. Lets the client land them
+    // deterministically.
+    filtered.sort_by(|a, b| {
+        a.timestamp.cmp(&b.timestamp)
+            .then_with(|| a.attestation_id.cmp(&b.attestation_id))
+    });
+    if let Some(n) = limit {
+        filtered.truncate(n);
+    }
+
+    json_response(200, &serde_json::to_value(&filtered).unwrap_or_default())
 }
 

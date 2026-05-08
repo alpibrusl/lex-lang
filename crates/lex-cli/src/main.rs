@@ -2201,6 +2201,9 @@ fn cmd_attest(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     if sub == "push" {
         return cmd_attest_push(fmt, rest);
     }
+    if sub == "pull" {
+        return cmd_attest_pull(fmt, rest);
+    }
     match sub.as_str() {
         "filter" => {
             let mut kind_filter: Option<String> = None;
@@ -2571,6 +2574,146 @@ fn cmd_attest_push(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         println!(
             "pushed {received} attestations to {remote_text}: \
              {added} added, {skipped} skipped (already present)"
+        );
+    });
+    Ok(())
+}
+
+/// `lex attest pull <remote_url> [--since-op OP_ID] [--limit N]
+/// [--dry-run] [--store DIR]` (#260).
+///
+/// Append-only fetch of attestations — the inverse of `lex attest
+/// push`. Asks the remote for attestations whose `op_id` is not in
+/// the ancestry of `--since-op` (or, without the flag, whose
+/// `op_id` we don't already know about), validates each, and
+/// persists.
+///
+/// Idempotency: re-running converges to `added: 0`. Network failure
+/// mid-pull leaves the local with the prefix that landed; the next
+/// run picks up where the failure occurred.
+fn cmd_attest_pull(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let (root, rest, _, _) = parse_store_flag(args);
+    let mut remote: Option<String> = None;
+    let mut since_op: Option<String> = None;
+    let mut limit: Option<usize> = None;
+    let mut dry_run = false;
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--since-op" => {
+                since_op = Some(it.next().ok_or_else(|| anyhow!("--since-op needs an op_id"))?.clone());
+            }
+            "--limit" => {
+                limit = Some(it.next().ok_or_else(|| anyhow!("--limit needs N"))?
+                    .parse().map_err(|e| anyhow!("--limit: {e}"))?);
+            }
+            "--dry-run" => dry_run = true,
+            other if !other.starts_with("--") && remote.is_none() => {
+                remote = Some(other.to_string());
+            }
+            other => bail!("unexpected arg `{other}`"),
+        }
+    }
+    let remote = remote.ok_or_else(|| anyhow!(
+        "usage: lex attest pull <remote_url> [--since-op OP_ID] [--limit N] [--dry-run] [--store DIR]"
+    ))?;
+
+    let mut url = format!(
+        "{}/v1/attestations/since",
+        remote.trim_end_matches('/'),
+    );
+    let mut sep = '?';
+    if let Some(op) = &since_op {
+        url.push_str(&format!("{sep}after-op={op}"));
+        sep = '&';
+    }
+    if let Some(n) = limit {
+        url.push_str(&format!("{sep}limit={n}"));
+    }
+    let resp = ureq::get(&url)
+        .call()
+        .map_err(|e| anyhow!("GET {url}: {e}"))?;
+    let status = resp.status().as_u16();
+    if status >= 400 {
+        let body = resp.into_body().read_to_string()
+            .unwrap_or_else(|_| "(unreadable body)".into());
+        bail!("server returned HTTP {status}: {body}");
+    }
+    let received: Vec<lex_vcs::Attestation> = resp.into_body().read_json()
+        .map_err(|e| anyhow!("decoding response from {url}: {e}"))?;
+
+    if dry_run {
+        let ids: Vec<&String> = received.iter().map(|a| &a.attestation_id).collect();
+        let data = serde_json::json!({
+            "remote": remote,
+            "since_op": since_op,
+            "would_receive": received.len(),
+            "attestation_ids": ids,
+        });
+        let count = received.len();
+        let remote_text = remote.clone();
+        acli::emit_or_text("attest-pull", data, fmt, move || {
+            println!("would pull {count} attestations from {remote_text} (dry-run)");
+        });
+        return Ok(());
+    }
+
+    let store = lex_store::Store::open(&root)
+        .with_context(|| format!("opening store at {}", root.display()))?;
+    let log = store.attestation_log()?;
+    let op_log = lex_vcs::OpLog::open(&root)?;
+
+    let mut added = 0usize;
+    let mut rejected_unknown_op = 0usize;
+    for att in &received {
+        // Validate content-addressing.
+        let expected = lex_vcs::Attestation::with_timestamp(
+            att.stage_id.clone(),
+            att.op_id.clone(),
+            att.intent_id.clone(),
+            att.kind.clone(),
+            att.result.clone(),
+            att.produced_by.clone(),
+            att.cost.clone(),
+            att.timestamp,
+        ).attestation_id;
+        if expected != att.attestation_id {
+            bail!(
+                "remote returned attestation with mismatched id: supplied={}, expected={}",
+                att.attestation_id, expected,
+            );
+        }
+        // If the attestation references an op_id, that op must
+        // already exist locally — otherwise the attestation is
+        // dangling. Skip rather than fail the whole pull; the
+        // caller can re-issue after pulling the missing ops.
+        if let Some(op_id) = &att.op_id {
+            if op_log.get(op_id)?.is_none() {
+                rejected_unknown_op += 1;
+                continue;
+            }
+        }
+        let was_present = log.get(&att.attestation_id)?.is_some();
+        log.put(att)?;
+        if !was_present {
+            added += 1;
+        }
+    }
+
+    let data = serde_json::json!({
+        "remote": remote,
+        "received": received.len(),
+        "added": added,
+        "skipped": received.len() - added - rejected_unknown_op,
+        "rejected_unknown_op": rejected_unknown_op,
+    });
+    let total = received.len();
+    let skipped = received.len() - added - rejected_unknown_op;
+    let remote_text = remote.clone();
+    acli::emit_or_text("attest-pull", data, fmt, move || {
+        println!(
+            "pulled {total} attestations from {remote_text}: \
+             {added} new, {skipped} already present, {rejected_unknown_op} skipped (unknown op_id)"
         );
     });
     Ok(())
