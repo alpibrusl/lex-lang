@@ -34,6 +34,26 @@ pub struct Branch {
     #[serde(default)]
     pub merges: Vec<MergeRecord>,
     pub created_at: u64,
+    /// Last op_id through which the producer-block gate (#248) has
+    /// verified the branch's history (#256). When advancing from
+    /// `head_op` to a new tip, the gate walks ops in
+    /// `(last_gate_checkpoint .. head_op]` and runs the
+    /// producer-block check on each ancestor's attestable stages —
+    /// not just the new op. Once that walk passes, the checkpoint
+    /// advances.
+    ///
+    /// Invalidated (set to `None`) when `lex attest retro-block`
+    /// lands a new `ProducerBlock` attestation, forcing the next
+    /// advance to re-walk from genesis once. Steady-state advances
+    /// are `O(new ops)` because the previous advance already
+    /// covered everything up through `last_gate_checkpoint`.
+    ///
+    /// Pre-#256 branch files have no `last_gate_checkpoint` field;
+    /// serde defaults to `None`, which forces a one-time full walk
+    /// on next advance. Same backward-compat trick `intent_id`
+    /// (#131) used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_gate_checkpoint: Option<OpId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -183,6 +203,7 @@ impl Store {
             predicate: None,
             merges: Vec::new(),
             created_at: now(),
+            last_gate_checkpoint: None,
         };
         fs::write(self.branch_path(name), serde_json::to_string_pretty(&b)?)?;
         Ok(())
@@ -214,6 +235,7 @@ impl Store {
             predicate: Some(predicate),
             merges: Vec::new(),
             created_at: now(),
+            last_gate_checkpoint: None,
         };
         fs::write(self.branch_path(name), serde_json::to_string_pretty(&b)?)?;
         Ok(())
@@ -271,13 +293,52 @@ impl Store {
                 predicate: None,
                 merges: Vec::new(),
                 created_at: now(),
+                last_gate_checkpoint: None,
             },
             None => return Err(StoreError::UnknownBranch(name.into())),
         };
-        b.head_op = Some(head_op);
+        // #256: every successful advance also moves the gate
+        // checkpoint to the new head. The gate that ran before this
+        // call has already verified everything in
+        // `(last_gate_checkpoint .. new_head]`, so the new head is
+        // now the verified frontier.
+        b.head_op = Some(head_op.clone());
+        b.last_gate_checkpoint = Some(head_op);
         fs::create_dir_all(self.branches_dir())?;
         write_branch_atomic(&self.branch_path(name), &b)?;
         Ok(())
+    }
+
+    /// Invalidate every branch's `last_gate_checkpoint` (#256). Run
+    /// when a new `ProducerBlock` attestation lands so the next
+    /// branch advance walks back from genesis once and re-verifies
+    /// the full chain. Returns the number of branches whose
+    /// checkpoint changed.
+    pub fn invalidate_gate_checkpoints(&self) -> Result<usize, StoreError> {
+        let dir = self.branches_dir();
+        if !dir.exists() {
+            return Ok(0);
+        }
+        let mut updated = 0usize;
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().is_none_or(|e| e != "json") { continue; }
+            let bytes = fs::read(&path)?;
+            let mut b: Branch = match serde_json::from_slice(&bytes) {
+                Ok(b) => b,
+                // Corrupt branch file shouldn't take down the
+                // invalidation pass; the next gate run will surface
+                // the parse error on a real call path.
+                Err(_) => continue,
+            };
+            if b.last_gate_checkpoint.is_some() {
+                b.last_gate_checkpoint = None;
+                write_branch_atomic(&path, &b)?;
+                updated += 1;
+            }
+        }
+        Ok(updated)
     }
 }
 

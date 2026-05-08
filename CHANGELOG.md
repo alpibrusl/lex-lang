@@ -7,6 +7,30 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added — agent-VCS roadmap (#256)
+
+- **Walk-back producer-block gate** (#256). Closes the
+  grandfathering window in #248. Previously, a retro-block of a
+  compromised tool only fenced off *new* ops; pre-existing
+  contamination in branch history was grandfathered in. Now the
+  gate walks back from `head_op` to the per-branch
+  `last_gate_checkpoint`, runs `check_producer_block` on every
+  ancestor's attestable stages, and refuses if any contamination
+  is found.
+- **`Branch.last_gate_checkpoint: Option<OpId>`** persisted on
+  disk. Every successful advance moves the checkpoint to the new
+  head; subsequent advances are `O(new ops)` because the walk
+  stops at the checkpoint. Pre-#256 branch files default to
+  `None` (serde default) and trigger a one-time full walk on
+  next advance — same backward-compat trick `intent_id` (#131)
+  used.
+- **`Store::invalidate_gate_checkpoints()`** clears every
+  branch's checkpoint. `lex attest retro-block` and
+  `lex attest retro-unblock` call it after writing the
+  attestation, so the next advance re-walks and surfaces (or
+  clears) any newly contaminated ancestors. Reported as
+  `branches_invalidated: N` in the CLI's JSON envelope.
+
 ### Added — agent-VCS roadmap (#260)
 
 The symmetric inverse of #242. With both push and pull, content-
