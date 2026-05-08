@@ -28,15 +28,51 @@ fn parse_store(args: &[String]) -> (PathBuf, Vec<String>) {
 
 pub fn cmd_op(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let sub = args.first().ok_or_else(|| anyhow!(
-        "usage: lex op {{show|log|push|pull}} [--store DIR] ..."))?;
+        "usage: lex op {{show|log|push|pull|repack}} [--store DIR] ..."))?;
     let rest = &args[1..];
     match sub.as_str() {
-        "show" => cmd_op_show(fmt, rest),
-        "log"  => cmd_op_log(fmt, rest),
-        "push" => cmd_op_push(fmt, rest),
-        "pull" => cmd_op_pull(fmt, rest),
-        other  => bail!("unknown `lex op` subcommand: {other}"),
+        "show"   => cmd_op_show(fmt, rest),
+        "log"    => cmd_op_log(fmt, rest),
+        "push"   => cmd_op_push(fmt, rest),
+        "pull"   => cmd_op_pull(fmt, rest),
+        "repack" => cmd_op_repack(fmt, rest),
+        other    => bail!("unknown `lex op` subcommand: {other}"),
     }
+}
+
+/// `lex op repack [--threshold N] [--store DIR]` (#261 slice 1).
+/// Consolidates loose `<op_id>.json` files into a deterministic,
+/// content-addressed packfile. No-op when loose-file count is
+/// below `--threshold` (default 1000) — small stores stay loose.
+fn cmd_op_repack(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let (root, rest) = parse_store(args);
+    let mut threshold: usize = 1000;
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        if a == "--threshold" {
+            threshold = it.next()
+                .ok_or_else(|| anyhow!("--threshold needs N"))?
+                .parse()
+                .map_err(|e| anyhow!("--threshold: {e}"))?;
+        } else {
+            bail!("unexpected arg `{a}` (usage: lex op repack [--threshold N] [--store DIR])");
+        }
+    }
+    let log = OpLog::open(&root)?;
+    let packed = log.repack(threshold)?;
+    let data = serde_json::json!({
+        "packed": packed,
+        "threshold": threshold,
+        "store": root.display().to_string(),
+    });
+    acli::emit_or_text("op", data, fmt, || {
+        if packed == 0 {
+            println!("no repack: loose count below threshold ({threshold})");
+        } else {
+            println!("packed {packed} loose op(s) into a packfile");
+        }
+    });
+    Ok(())
 }
 
 fn cmd_op_show(fmt: &OutputFormat, args: &[String]) -> Result<()> {

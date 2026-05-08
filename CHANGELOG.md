@@ -7,6 +7,38 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added — agent-VCS roadmap (#261, slice 1)
+
+- **Op-log packfiles** (#261 slice 1). Loose-file storage at
+  `<store>/ops/<op_id>.json` is fine to ~10k ops; past that the
+  filesystem starts to thrash. `OpLog::repack(threshold)` now
+  consolidates loose records into a deterministic, content-
+  addressed packfile pair: `pack-<hash>.pack` (each record framed
+  as `[8-byte BE length][canonical JSON]`, ops sorted by op_id)
+  and `pack-<hash>.idx` (JSON map of op_id → byte offset).
+- **Pack name** is the SHA-256 of the sorted op_ids joined by
+  newlines, so re-running `lex op repack` on the same input
+  always produces the same pack hash — a no-op rather than a
+  rewrite.
+- **`OpLog::get`** falls back from loose → pack on miss; every
+  walk method (`walk_back`, `walk_forward`, `lca`, `ops_since`)
+  works seamlessly across both. `list_all` dedups via op_id, so
+  an interrupted repack (loose + pack both present) still yields
+  exactly one record per op.
+- **`lex op repack [--threshold N] [--store DIR]`** (default
+  threshold 1000). No-op below threshold; emits a JSON envelope
+  reporting `packed: N`.
+- Crash safety: `.pack.tmp` and `.idx.tmp` are fsync'd before
+  rename; loose files are deleted only after both renames
+  succeed. A crash mid-repack leaves both forms on disk; `get`
+  finds the loose copy and a subsequent repack cleans up.
+- Conformance: 1000 loose ops → repack → every `OpLog::get`
+  returns the byte-identical record, plus determinism and
+  no-op-on-already-packed tests.
+
+Slices 2 (predicate-driven GC) and 3 (delta encoding) remain
+follow-up work tracked under #261.
+
 ### Added — agent-VCS roadmap (#257)
 
 - **Ops-during-run trace attestations** (#257). Closes the
