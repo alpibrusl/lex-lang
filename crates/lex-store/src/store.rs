@@ -702,7 +702,7 @@ impl Store {
         let op_effects = op_declared_effects(&op.kind);
         let new_head = self.persist_op_only(branch, op, transition)?;
         self.record_typecheck_passed(&attestable, &new_head.op_id)?;
-        self.run_required_attestations_gate(&new_head.op_id, &attestable, &op_effects)?;
+        self.run_required_attestations_gate(branch, &new_head.op_id, &attestable, &op_effects)?;
         self.set_branch_head_op(branch, new_head.op_id.clone())?;
         Ok(new_head.op_id)
     }
@@ -771,7 +771,7 @@ impl Store {
         // separately first. This is the intended behavior — the
         // unchecked path opts out of the safety net the gate
         // depends on.
-        self.run_required_attestations_gate(&new_head.op_id, &attestable, &op_effects)?;
+        self.run_required_attestations_gate(branch, &new_head.op_id, &attestable, &op_effects)?;
         self.set_branch_head_op(branch, new_head.op_id.clone())?;
         Ok(new_head.op_id)
     }
@@ -826,15 +826,15 @@ impl Store {
     /// (default-permissive — matches pre-#245 stores).
     fn run_required_attestations_gate(
         &self,
+        branch: &str,
         op_id: &lex_vcs::OpId,
         stage_ids: &[String],
         op_effects: &std::collections::BTreeSet<String>,
     ) -> Result<(), StoreError> {
-        // Build the candidate slice once and reuse it for both
-        // gates. Ops with no attestable stage (imports, empty
-        // merges) get a single `None`-stage tuple; both gates skip
-        // those — there's nothing to attest.
-        let candidate: Vec<(lex_vcs::OpId, Option<String>, std::collections::BTreeSet<String>)> =
+        // Build the candidate slice for the new op. Ops with no
+        // attestable stage (imports, empty merges) get a single
+        // `None`-stage tuple; both gates skip those.
+        let new_op_candidate: Vec<(lex_vcs::OpId, Option<String>, std::collections::BTreeSet<String>)> =
             if stage_ids.is_empty() {
                 vec![(op_id.clone(), None, op_effects.clone())]
             } else {
@@ -845,20 +845,78 @@ impl Store {
             };
         let attest_log = self.attestation_log()?;
 
-        // #248: producer-block gate. Always evaluated regardless of
-        // policy.json contents — `ProducerBlock` attestations live
-        // in the attestation log, not policy.json.
-        crate::policy::check_producer_block(&attest_log, &candidate)
+        // #248 + #256: producer-block gate, walk-back style.
+        //
+        // The naive #248 gate only checked the new op's stage. That
+        // missed contamination on ancestors — once `lex attest
+        // retro-block` lands, every previously-gated op stays in
+        // the chain even though its attestations are now from a
+        // quarantined producer.
+        //
+        // #256 fixes this by walking the chain from `head_op` back
+        // to `last_gate_checkpoint` (or genesis when the checkpoint
+        // is invalidated), collecting each ancestor's attestable
+        // stages, and running `check_producer_block` on the
+        // combined set. After a successful advance,
+        // `set_branch_head_op` moves the checkpoint to the new
+        // head (steady-state O(new ops) per advance).
+        let walk_back_candidate = self.collect_ancestor_candidates(branch)?;
+        let mut producer_block_candidate = walk_back_candidate;
+        producer_block_candidate.extend(new_op_candidate.iter().cloned());
+        crate::policy::check_producer_block(&attest_log, &producer_block_candidate)
             .map_err(StoreError::ProducerBlocked)?;
 
-        // #245: required-attestations gate. Only fires when the
-        // policy declares rules.
+        // #245: required-attestations gate. Forward-going only —
+        // only the new op is checked. Walking back makes no sense
+        // here: the policy is "this advance must carry these
+        // attestations," not "every prior op must have."
         let policy = match crate::policy::load(self.root())? {
             Some(p) if !p.required_attestations.is_empty() => p,
             _ => return Ok(()),
         };
-        crate::policy::check_required_attestations(&attest_log, &candidate, &policy)
+        crate::policy::check_required_attestations(&attest_log, &new_op_candidate, &policy)
             .map_err(StoreError::BranchAdvanceBlocked)
+    }
+
+    /// Walk the branch from `head_op` back to `last_gate_checkpoint`
+    /// (exclusive) and return the `(op_id, stage_id, op_effects)`
+    /// tuples for every attestable stage touched by an ancestor
+    /// (#256). Empty when the branch is fresh, when the checkpoint
+    /// equals the head, or when the head is None.
+    fn collect_ancestor_candidates(
+        &self,
+        branch: &str,
+    ) -> Result<Vec<GateCandidate>, StoreError> {
+        let b = match self.get_branch(branch)? {
+            Some(b) => b,
+            None => return Ok(Vec::new()),
+        };
+        let Some(head) = b.head_op else { return Ok(Vec::new()); };
+        if Some(&head) == b.last_gate_checkpoint.as_ref() {
+            // Steady-state common case: previous advance left the
+            // checkpoint at head. Nothing to re-walk.
+            return Ok(Vec::new());
+        }
+
+        let log = lex_vcs::OpLog::open(self.root())?;
+        let walk = log.walk_back(&head, None)?;
+        let stop_at = b.last_gate_checkpoint.clone();
+        let mut out = Vec::new();
+        for rec in walk {
+            if Some(&rec.op_id) == stop_at.as_ref() {
+                break;
+            }
+            let stages = attestable_stage_ids(&rec.produces);
+            let effects = op_declared_effects(&rec.op.kind);
+            if stages.is_empty() {
+                out.push((rec.op_id.clone(), None, effects));
+            } else {
+                for sid in stages {
+                    out.push((rec.op_id.clone(), Some(sid), effects.clone()));
+                }
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -932,6 +990,12 @@ fn typecheck_producer() -> lex_vcs::ProducerDescriptor {
 /// sig resolution of a Merge. Removes and ImportOnly produce no
 /// attestable stage; the program typechecks but no specific stage
 /// is the subject of the claim.
+/// One row of input to the producer-block / required-attestations
+/// gates: `(op_id, stage_id, op_effects)`. The `stage_id` is
+/// `None` for ops that don't touch a stage (imports, empty
+/// merges) — the gate skips those.
+type GateCandidate = (lex_vcs::OpId, Option<String>, std::collections::BTreeSet<String>);
+
 /// Effect set declared *by the operation itself* (#245). Used by
 /// the `required_attestations` gate's `EffectsIntersect` clause.
 ///

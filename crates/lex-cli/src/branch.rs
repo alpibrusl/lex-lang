@@ -230,6 +230,7 @@ fn peek(fmt: &OutputFormat, store: &Store, args: &[String]) -> Result<()> {
             predicate: None,
             merges: Vec::new(),
             created_at: 0,
+            last_gate_checkpoint: None,
         },
         None => bail!("unknown branch `{name}`"),
     };

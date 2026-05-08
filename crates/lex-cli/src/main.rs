@@ -2358,12 +2358,18 @@ fn cmd_attest_retro_block(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         now,
     );
     log.put(&attestation)?;
+    // #256: a fresh ProducerBlock invalidates every branch's
+    // walk-back gate checkpoint, forcing the next advance to
+    // re-walk the chain and discover any contamination.
+    let invalidated = store.invalidate_gate_checkpoints()
+        .with_context(|| "invalidating gate checkpoints after retro-block")?;
 
     let data = serde_json::json!({
         "tool_id": &tool_id,
         "reason": &reason,
         "blocked_at": now,
         "attestation_id": &attestation.attestation_id,
+        "branches_invalidated": invalidated,
     });
     let printable_tool = tool_id.clone();
     acli::emit_or_text("attest", data, fmt, move || {
@@ -2423,12 +2429,18 @@ fn cmd_attest_retro_unblock(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         now,
     );
     log.put(&attestation)?;
+    // #256: an unblock can also unblock previously-refused branch
+    // advances. Invalidate so the next advance re-walks and lets
+    // through anything the unblock cleared.
+    let invalidated = store.invalidate_gate_checkpoints()
+        .with_context(|| "invalidating gate checkpoints after retro-unblock")?;
 
     let data = serde_json::json!({
         "tool_id": &tool_id,
         "reason": &reason,
         "unblocked_at": now,
         "attestation_id": &attestation.attestation_id,
+        "branches_invalidated": invalidated,
     });
     let printable_tool = tool_id.clone();
     acli::emit_or_text("attest", data, fmt, move || {
