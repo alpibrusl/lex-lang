@@ -31,7 +31,8 @@ pub fn is_pure_module(kind: &str) -> bool {
     matches!(kind, "str" | "int" | "float" | "bool" | "list"
         | "option" | "result" | "tuple" | "json" | "bytes" | "flow" | "math"
         | "map" | "set" | "crypto" | "regex" | "deque" | "datetime" | "http"
-        | "toml" | "yaml" | "dotenv" | "csv" | "test" | "random" | "parser")
+        | "toml" | "yaml" | "dotenv" | "csv" | "test" | "random" | "parser"
+        | "cli")
 }
 
 fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
@@ -115,15 +116,24 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             })
         }
         ("str", "slice") => {
-            // Half-open byte-range slice. Out-of-range or non-UTF-8
-            // boundaries error rather than panic, so caller code can
-            // recover via Result. Spec §11.1 doesn't pin a name; this
-            // matches the bytes.slice helper added earlier.
+            // Half-open byte-range slice. `hi` is clamped to `s.len()`
+            // and a negative `lo` / `hi` clamps to `0`, mirroring
+            // Python's `s[lo:hi]` semantics (and matching what
+            // production users expect when slicing fixed sizes off
+            // a possibly-shorter string — e.g. the first 64 chars
+            // of a license header). Reversed ranges (`lo > hi` after
+            // clamping) error since that's a caller logic bug. A
+            // mid-codepoint `lo` after clamping still errors so
+            // silent UTF-8 truncation never sneaks through.
             let s = expect_str(args.first())?;
-            let lo = expect_int(args.get(1))? as usize;
-            let hi = expect_int(args.get(2))? as usize;
-            if lo > hi || hi > s.len() {
-                return Err(format!("str.slice: out of range [{lo}..{hi}] of len {}", s.len()));
+            let lo_i = expect_int(args.get(1))?;
+            let hi_i = expect_int(args.get(2))?;
+            let lo = (lo_i.max(0) as usize).min(s.len());
+            let hi = (hi_i.max(0) as usize).min(s.len());
+            if lo > hi {
+                return Err(format!(
+                    "str.slice: reversed range [{lo}..{hi}] (after clamping to len {})",
+                    s.len()));
             }
             if !s.is_char_boundary(lo) || !s.is_char_boundary(hi) {
                 return Err(format!("str.slice: [{lo}..{hi}] not on char boundaries"));
@@ -1277,9 +1287,84 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             }
         }
 
+        // -- std.cli (Rubric port): argparse-equivalent for end-user
+        // programs. Specs are tagged Json values; the parser walks
+        // argv against the spec and returns a CliParsed Json record.
+        ("cli", "flag") => {
+            let name = expect_str(args.first())?;
+            let short = opt_str(args.get(1));
+            let help = expect_str(args.get(2))?;
+            Ok(value_from_json(crate::cli::flag_spec(&name, short.as_deref(), &help)))
+        }
+        ("cli", "option") => {
+            let name = expect_str(args.first())?;
+            let short = opt_str(args.get(1));
+            let help = expect_str(args.get(2))?;
+            let default = opt_str(args.get(3));
+            Ok(value_from_json(crate::cli::option_spec(&name, short.as_deref(), &help, default.as_deref())))
+        }
+        ("cli", "positional") => {
+            let name = expect_str(args.first())?;
+            let help = expect_str(args.get(1))?;
+            let required = expect_bool(args.get(2))?;
+            Ok(value_from_json(crate::cli::positional_spec(&name, &help, required)))
+        }
+        ("cli", "spec") => {
+            let name = expect_str(args.first())?;
+            let help = expect_str(args.get(1))?;
+            let arg_specs: Vec<serde_json::Value> = expect_list(args.get(2))?
+                .iter().map(value_to_json).collect();
+            let subs: Vec<serde_json::Value> = expect_list(args.get(3))?
+                .iter().map(value_to_json).collect();
+            Ok(value_from_json(crate::cli::build_spec(&name, &help, arg_specs, subs)))
+        }
+        ("cli", "parse") => {
+            let spec = value_to_json(args.first().unwrap_or(&Value::Unit));
+            let argv: Vec<String> = expect_list(args.get(1))?
+                .iter().map(|v| match v {
+                    Value::Str(s) => Ok(s.clone()),
+                    other => Err(format!("cli.parse: argv must be List[Str], got {other:?}")),
+                }).collect::<Result<_, _>>()?;
+            match crate::cli::parse(&spec, &argv) {
+                Ok(parsed) => Ok(ok_v(value_from_json(parsed))),
+                Err(msg) => Ok(err_v(Value::Str(msg))),
+            }
+        }
+        ("cli", "envelope") => {
+            let ok = expect_bool(args.first())?;
+            let cmd = expect_str(args.get(1))?;
+            let data = value_to_json(args.get(2).unwrap_or(&Value::Unit));
+            Ok(value_from_json(crate::cli::envelope(ok, &cmd, data)))
+        }
+        ("cli", "describe") => {
+            let spec = value_to_json(args.first().unwrap_or(&Value::Unit));
+            Ok(value_from_json(crate::cli::describe(&spec)))
+        }
+        ("cli", "help") => {
+            let spec = value_to_json(args.first().unwrap_or(&Value::Unit));
+            Ok(Value::Str(crate::cli::help_text(&spec)))
+        }
+
         _ => Err(format!("unknown pure builtin: {kind}.{op}")),
     }
 }
+
+/// Extract `Option[Str]` arg as `Option<String>`. None and missing
+/// arg both map to `None`. Used by the `cli` builders so callers can
+/// pass `option.none()` or `Some("v")` interchangeably.
+fn opt_str(arg: Option<&Value>) -> Option<String> {
+    match arg {
+        Some(Value::Variant { name, args }) if name == "Some" => {
+            args.first().and_then(|v| match v {
+                Value::Str(s) => Some(s.clone()),
+                _ => None,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn value_from_json(v: serde_json::Value) -> Value { Value::from_json(&v) }
 
 /// Process-wide cache of compiled regexes, keyed by the pattern
 /// string. Compilation is the only cost we want to amortize; matching
@@ -1427,6 +1512,14 @@ fn expect_list(v: Option<&Value>) -> Result<&Vec<Value>, String> {
     match v {
         Some(Value::List(xs)) => Ok(xs),
         Some(other) => Err(format!("expected List, got {other:?}")),
+        None => Err("missing argument".into()),
+    }
+}
+
+fn expect_bool(v: Option<&Value>) -> Result<bool, String> {
+    match v {
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(other) => Err(format!("expected Bool, got {other:?}")),
         None => Err("missing argument".into()),
     }
 }
@@ -1646,16 +1739,26 @@ fn required_field_names(arg: Option<&Value>) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-/// Verify that `value`'s top level is an object containing every
-/// name in `required`. Returns a stable, human-readable error
-/// listing the missing field(s) so the agent's verifier can
-/// surface it directly.
+/// Verify that `value` is an object containing every entry in
+/// `required`. A required entry may be a plain field name (must
+/// exist at the top level) or a dotted path (`"project.license"`)
+/// which descends through nested objects. Returns a stable,
+/// human-readable error listing every missing path so the agent's
+/// verifier can surface it directly.
 ///
-/// Tactical fix for #168 — gives users a way to make
-/// `parse[T]` errors propagate as `Result::Err` instead of as
-/// runtime `GetField` errors at access time. The full
-/// type-driven fix (deriving `required` from `T` at type-check
-/// time so plain `parse[T]` works) tracked in #168.
+/// Tactical fix for #168 — gives users a way to make `parse[T]`
+/// errors propagate as `Result::Err` instead of as runtime
+/// `GetField` errors at access time. The full type-driven fix
+/// (deriving `required` from `T` at type-check time so plain
+/// `parse[T]` works, including auto-wrapping `Option[F]` fields
+/// as not-required) is the cleaner endgame; see #168.
+///
+/// Path semantics:
+/// * `"name"` → top-level `name` must be present (any value).
+/// * `"a.b.c"` → walk `a`, then `b`, then check `c` exists. Each
+///   intermediate value must itself be an object.
+/// * `\\.` is the literal-dot escape (e.g. `"weird\\.key"` for a
+///   field that genuinely contains a dot in its name).
 fn check_required_fields(
     value: &serde_json::Value,
     required: &[String],
@@ -1663,22 +1766,68 @@ fn check_required_fields(
     if required.is_empty() {
         return Ok(());
     }
-    let obj = match value {
-        serde_json::Value::Object(o) => o,
-        _ => return Err(format!(
+    if !matches!(value, serde_json::Value::Object(_)) {
+        return Err(format!(
             "parse_strict: expected top-level object with fields {:?}, got {value}",
             required
-        )),
-    };
-    let missing: Vec<&str> = required.iter()
-        .filter(|n| !obj.contains_key(n.as_str()))
-        .map(String::as_str)
-        .collect();
+        ));
+    }
+    let mut missing: Vec<String> = Vec::new();
+    for path in required {
+        if !path_exists(value, path) {
+            missing.push(path.clone());
+        }
+    }
     if missing.is_empty() {
         Ok(())
     } else {
         Err(format!("missing required field(s): {}", missing.join(", ")))
     }
+}
+
+/// Walk `value` along the dotted `path` and report whether the
+/// terminal segment exists. Intermediate non-object stops surface
+/// as "missing" — a path can't traverse through a string, list, or
+/// scalar.
+fn path_exists(value: &serde_json::Value, path: &str) -> bool {
+    let mut cursor = value;
+    let segments = split_dotted_path(path);
+    for seg in &segments {
+        match cursor {
+            serde_json::Value::Object(o) => match o.get(seg.as_str()) {
+                Some(next) => cursor = next,
+                None => return false,
+            },
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Split `"a.b.c"` into `["a", "b", "c"]`, with `\.` recognised
+/// as a literal-dot escape so legitimate dotted field names
+/// (e.g. `"package\.json"`) don't accidentally start a descent.
+fn split_dotted_path(path: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut iter = path.chars().peekable();
+    while let Some(c) = iter.next() {
+        if c == '\\' {
+            // Backslash at end is preserved; only `\.` is special.
+            if let Some(&'.') = iter.peek() {
+                cur.push('.');
+                iter.next();
+                continue;
+            }
+            cur.push(c);
+        } else if c == '.' {
+            out.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(c);
+        }
+    }
+    out.push(cur);
+    out
 }
 
 /// Parse a `.env`-style file into key→value pairs. Accepts:

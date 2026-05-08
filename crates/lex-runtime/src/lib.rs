@@ -14,6 +14,7 @@
 //!   half of §7.4 and what the §7.6 acceptance tests exercise.
 
 pub mod builtins;
+pub mod cli;
 pub mod policy;
 pub mod handler;
 pub mod ws;
