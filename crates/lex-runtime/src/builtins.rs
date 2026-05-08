@@ -31,7 +31,8 @@ pub fn is_pure_module(kind: &str) -> bool {
     matches!(kind, "str" | "int" | "float" | "bool" | "list"
         | "option" | "result" | "tuple" | "json" | "bytes" | "flow" | "math"
         | "map" | "set" | "crypto" | "regex" | "deque" | "datetime" | "http"
-        | "toml" | "yaml" | "dotenv" | "csv" | "test" | "random" | "parser")
+        | "toml" | "yaml" | "dotenv" | "csv" | "test" | "random" | "parser"
+        | "cli")
 }
 
 fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
@@ -1286,9 +1287,84 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             }
         }
 
+        // -- std.cli (Rubric port): argparse-equivalent for end-user
+        // programs. Specs are tagged Json values; the parser walks
+        // argv against the spec and returns a CliParsed Json record.
+        ("cli", "flag") => {
+            let name = expect_str(args.first())?;
+            let short = opt_str(args.get(1));
+            let help = expect_str(args.get(2))?;
+            Ok(value_from_json(crate::cli::flag_spec(&name, short.as_deref(), &help)))
+        }
+        ("cli", "option") => {
+            let name = expect_str(args.first())?;
+            let short = opt_str(args.get(1));
+            let help = expect_str(args.get(2))?;
+            let default = opt_str(args.get(3));
+            Ok(value_from_json(crate::cli::option_spec(&name, short.as_deref(), &help, default.as_deref())))
+        }
+        ("cli", "positional") => {
+            let name = expect_str(args.first())?;
+            let help = expect_str(args.get(1))?;
+            let required = expect_bool(args.get(2))?;
+            Ok(value_from_json(crate::cli::positional_spec(&name, &help, required)))
+        }
+        ("cli", "spec") => {
+            let name = expect_str(args.first())?;
+            let help = expect_str(args.get(1))?;
+            let arg_specs: Vec<serde_json::Value> = expect_list(args.get(2))?
+                .iter().map(value_to_json).collect();
+            let subs: Vec<serde_json::Value> = expect_list(args.get(3))?
+                .iter().map(value_to_json).collect();
+            Ok(value_from_json(crate::cli::build_spec(&name, &help, arg_specs, subs)))
+        }
+        ("cli", "parse") => {
+            let spec = value_to_json(args.first().unwrap_or(&Value::Unit));
+            let argv: Vec<String> = expect_list(args.get(1))?
+                .iter().map(|v| match v {
+                    Value::Str(s) => Ok(s.clone()),
+                    other => Err(format!("cli.parse: argv must be List[Str], got {other:?}")),
+                }).collect::<Result<_, _>>()?;
+            match crate::cli::parse(&spec, &argv) {
+                Ok(parsed) => Ok(ok_v(value_from_json(parsed))),
+                Err(msg) => Ok(err_v(Value::Str(msg))),
+            }
+        }
+        ("cli", "envelope") => {
+            let ok = expect_bool(args.first())?;
+            let cmd = expect_str(args.get(1))?;
+            let data = value_to_json(args.get(2).unwrap_or(&Value::Unit));
+            Ok(value_from_json(crate::cli::envelope(ok, &cmd, data)))
+        }
+        ("cli", "describe") => {
+            let spec = value_to_json(args.first().unwrap_or(&Value::Unit));
+            Ok(value_from_json(crate::cli::describe(&spec)))
+        }
+        ("cli", "help") => {
+            let spec = value_to_json(args.first().unwrap_or(&Value::Unit));
+            Ok(Value::Str(crate::cli::help_text(&spec)))
+        }
+
         _ => Err(format!("unknown pure builtin: {kind}.{op}")),
     }
 }
+
+/// Extract `Option[Str]` arg as `Option<String>`. None and missing
+/// arg both map to `None`. Used by the `cli` builders so callers can
+/// pass `option.none()` or `Some("v")` interchangeably.
+fn opt_str(arg: Option<&Value>) -> Option<String> {
+    match arg {
+        Some(Value::Variant { name, args }) if name == "Some" => {
+            args.first().and_then(|v| match v {
+                Value::Str(s) => Some(s.clone()),
+                _ => None,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn value_from_json(v: serde_json::Value) -> Value { Value::from_json(&v) }
 
 /// Process-wide cache of compiled regexes, keyed by the pattern
 /// string. Compilation is the only cost we want to amortize; matching
@@ -1436,6 +1512,14 @@ fn expect_list(v: Option<&Value>) -> Result<&Vec<Value>, String> {
     match v {
         Some(Value::List(xs)) => Ok(xs),
         Some(other) => Err(format!("expected List, got {other:?}")),
+        None => Err("missing argument".into()),
+    }
+}
+
+fn expect_bool(v: Option<&Value>) -> Result<bool, String> {
+    match v {
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(other) => Err(format!("expected Bool, got {other:?}")),
         None => Err("missing argument".into()),
     }
 }

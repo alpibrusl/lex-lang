@@ -1259,6 +1259,67 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 Ty::Con("Result".into(), vec![Ty::Var(0), parse_err()])));
             Some(Ty::Record(fields))
         }
+        "cli" => {
+            // #224 Rubric port: argparse-equivalent for end-user
+            // programs. Spec values are tagged `Json` records (opaque
+            // to the language but inspectable). Construction via the
+            // `flag` / `option` / `positional` / `spec` builders;
+            // parse + introspection / help via the remaining ops.
+            let json = || Ty::Con("Json".into(), vec![]);
+            let opt_str = || Ty::Con("Option".into(), vec![Ty::str()]);
+            let mut fields = IndexMap::new();
+            // flag :: Str -> Option[Str] -> Str -> Json
+            //   long_name -> short -> help -> CliArg
+            fields.insert("flag".into(), Ty::function(
+                vec![Ty::str(), opt_str(), Ty::str()],
+                EffectSet::empty(),
+                json()));
+            // option :: Str -> Option[Str] -> Str -> Option[Str] -> Json
+            //   long_name -> short -> help -> default -> CliArg
+            fields.insert("option".into(), Ty::function(
+                vec![Ty::str(), opt_str(), Ty::str(), opt_str()],
+                EffectSet::empty(),
+                json()));
+            // positional :: Str -> Str -> Bool -> Json
+            //   name -> help -> required -> CliArg
+            fields.insert("positional".into(), Ty::function(
+                vec![Ty::str(), Ty::str(), Ty::bool()],
+                EffectSet::empty(),
+                json()));
+            // spec :: Str -> Str -> List[Json] -> List[Json] -> Json
+            //   name -> help -> args -> subcommands -> CliSpec
+            fields.insert("spec".into(), Ty::function(
+                vec![Ty::str(), Ty::str(),
+                     Ty::List(Box::new(json())),
+                     Ty::List(Box::new(json()))],
+                EffectSet::empty(),
+                json()));
+            // parse :: Json -> List[Str] -> Result[Json, Str]
+            //   spec -> argv -> Result[CliParsed, error]
+            fields.insert("parse".into(), Ty::function(
+                vec![json(), Ty::List(Box::new(Ty::str()))],
+                EffectSet::empty(),
+                Ty::Con("Result".into(), vec![json(), Ty::str()])));
+            // envelope :: Bool -> Str -> T -> Json
+            //   ok -> command -> data -> ACLI-shaped envelope.
+            // `data` is polymorphic so callers don't have to round-
+            // trip through `json.parse` for trivial payloads.
+            fields.insert("envelope".into(), Ty::function(
+                vec![Ty::bool(), Ty::str(), Ty::Var(0)],
+                EffectSet::empty(),
+                json()));
+            // describe :: Json -> Json — machine-readable spec dump
+            fields.insert("describe".into(), Ty::function(
+                vec![json()],
+                EffectSet::empty(),
+                json()));
+            // help :: Json -> Str — human-readable help text
+            fields.insert("help".into(), Ty::function(
+                vec![json()],
+                EffectSet::empty(),
+                Ty::str()));
+            Some(Ty::Record(fields))
+        }
         "regex" => {
             // The compiled `Regex` is stored as a `Str` at runtime
             // (the pattern source) plus a process-wide cache of the
@@ -1589,6 +1650,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "csv" => "csv",
         "test" => "test",
         "agent" => "agent",
+        "cli" => "cli",
         _ => return None,
     })
 }
