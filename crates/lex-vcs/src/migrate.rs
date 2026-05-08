@@ -195,6 +195,111 @@ pub fn apply_migration(log: &OpLog, plan: &MigrationPlan) -> io::Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------- attestation cascade (#258)
+
+/// Plan + apply step for one attestation whose `op_id` is in the
+/// op-migration mapping (#258).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttestationMigrationStep {
+    pub old: crate::attestation::Attestation,
+    pub new: crate::attestation::Attestation,
+}
+
+impl AttestationMigrationStep {
+    /// `true` when nothing actually rotated — the new and old
+    /// `attestation_id`s match, so apply is a no-op.
+    pub fn is_no_op(&self) -> bool {
+        self.old.attestation_id == self.new.attestation_id
+    }
+}
+
+/// Plan an attestation migration that follows an op-id rotation.
+/// `op_mapping` is `MigrationPlan::mapping()` — old op_id → new
+/// op_id. For every attestation whose `op_id` is in the mapping
+/// (i.e. the op got rotated), build a new attestation pointing at
+/// the new op_id and re-derive its `attestation_id` from the
+/// canonical form.
+///
+/// Attestations whose `op_id` is `None` (`Override`,
+/// `ProducerBlock`, `Defer`, etc.) are unaffected — they don't
+/// participate in the cascade.
+///
+/// Steps are returned in deterministic order (sorted by old
+/// `attestation_id`), independent of filesystem listing order, so
+/// `--dry-run` output is reproducible.
+pub fn plan_attestation_migration(
+    log: &crate::attestation::AttestationLog,
+    op_mapping: &BTreeMap<OpId, OpId>,
+) -> io::Result<Vec<AttestationMigrationStep>> {
+    if op_mapping.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut all = log.list_all()?;
+    all.sort_by(|a, b| a.attestation_id.cmp(&b.attestation_id));
+    let mut steps = Vec::new();
+    for old in all {
+        let Some(old_op_id) = old.op_id.as_ref() else { continue };
+        let Some(new_op_id) = op_mapping.get(old_op_id) else { continue };
+        if old_op_id == new_op_id {
+            // Mapping recorded but nothing rotated for this op
+            // (e.g. plan.is_no_op()); skip rather than emit a
+            // pointless step.
+            continue;
+        }
+        // Re-derive the attestation under the new op_id. Same
+        // stage_id, intent_id, kind, result, producer, cost,
+        // timestamp — only op_id changes.
+        let new = crate::attestation::Attestation::with_timestamp(
+            old.stage_id.clone(),
+            Some(new_op_id.clone()),
+            old.intent_id.clone(),
+            old.kind.clone(),
+            old.result.clone(),
+            old.produced_by.clone(),
+            old.cost.clone(),
+            old.timestamp,
+        );
+        steps.push(AttestationMigrationStep { old, new });
+    }
+    Ok(steps)
+}
+
+/// Apply an attestation migration plan. Two-phase: write all new
+/// attestations (with their new attestation_ids) first, then
+/// delete the old ones whose ids changed. Mirrors
+/// [`apply_migration`]'s crash-safety story — between phases the
+/// log is double-sized but readable; re-running converges.
+pub fn apply_attestation_migration(
+    log: &crate::attestation::AttestationLog,
+    steps: &[AttestationMigrationStep],
+) -> io::Result<()> {
+    if steps.is_empty() {
+        return Ok(());
+    }
+    // Phase 1: write all new attestations (with new
+    // attestation_ids and their by-stage / by-run index entries).
+    for step in steps {
+        if step.is_no_op() {
+            continue;
+        }
+        log.put(&step.new)?;
+    }
+    // Phase 2: delete the old ones whose ids changed. Collect new
+    // ids first so we never delete a file that's also a new file
+    // (the rare new == old case is filtered by `is_no_op`).
+    let new_ids: BTreeSet<&crate::attestation::AttestationId> =
+        steps.iter().map(|s| &s.new.attestation_id).collect();
+    for step in steps {
+        if step.is_no_op() {
+            continue;
+        }
+        if !new_ids.contains(&step.old.attestation_id) {
+            log.delete(&step.old)?;
+        }
+    }
+    Ok(())
+}
+
 /// Topological sort of the op DAG (parents before children). Stable
 /// across runs because we process nodes in `BTreeMap` iteration
 /// order — sorted by `op_id` — which matches the deterministic
