@@ -201,9 +201,11 @@ fn print_usage() {
     println!("  merge {{start|status|resolve|defer|commit}}");
     println!("                                     stateful merge for agent loops (#134); persists");
     println!("                                     a session under <store>/merges/<merge_id>.json");
-    println!("  policy {{block-producer|unblock-producer|list}}");
-    println!("                                     manage <store>/policy.json — list of producers");
-    println!("                                     whose attestations are tagged `blocked` (#181)");
+    println!("  policy {{block-producer|unblock-producer|require-attestation|");
+    println!("          unrequire-attestation|show}}");
+    println!("                                     manage <store>/policy.json — negative gate on");
+    println!("                                     producers (#181) and positive gate on required");
+    println!("                                     attestations for branch advance (#245)");
     println!();
     println!("policy flags (run, replay):");
     println!("  --allow-effects k1,k2,...   permit these effect kinds");
@@ -2165,13 +2167,19 @@ fn attestation_kind_tag(k: &lex_vcs::AttestationKind) -> &'static str {
 /// attestation log itself.
 fn cmd_policy(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let sub = args.first().ok_or_else(|| anyhow!(
-        "usage: lex policy {{block-producer <name> --reason \"...\" | unblock-producer <name> | list}} [--store DIR]"
+        "usage: lex policy {{block-producer <name> --reason \"...\" | unblock-producer <name> | \
+         require-attestation <kind> [--when-effects e1,e2,...] | unrequire-attestation <kind> | \
+         list | show}} [--store DIR]"
     ))?;
     let rest = &args[1..];
     match sub.as_str() {
-        "block-producer"   => cmd_policy_block(fmt, rest),
-        "unblock-producer" => cmd_policy_unblock(fmt, rest),
-        "list"             => cmd_policy_list(fmt, rest),
+        "block-producer"        => cmd_policy_block(fmt, rest),
+        "unblock-producer"      => cmd_policy_unblock(fmt, rest),
+        "require-attestation"   => cmd_policy_require_attestation(fmt, rest),
+        "unrequire-attestation" => cmd_policy_unrequire_attestation(fmt, rest),
+        // `show` is the new name; `list` is kept as an alias for the
+        // pre-#245 muscle memory.
+        "list" | "show"         => cmd_policy_show(fmt, rest),
         other => bail!("unknown `lex policy` subcommand: {other}"),
     }
 }
@@ -2254,23 +2262,167 @@ fn cmd_policy_unblock(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn cmd_policy_list(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+/// `lex policy show` (formerly `lex policy list`) — render every
+/// active rule in `policy.json`. Covers both the negative
+/// `blocked_producers` gate (#181) and the positive
+/// `required_attestations` gate (#245).
+fn cmd_policy_show(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let (root, _rest, _, _) = parse_store_flag(args);
     let policy = lex_store::policy::load(&root)
         .with_context(|| format!("reading policy.json at {}", root.display()))?
         .unwrap_or_default();
+    let required_json: Vec<serde_json::Value> = policy
+        .required_attestations
+        .iter()
+        .map(|r| match &r.when {
+            lex_store::policy::AttestationCondition::Always => serde_json::json!({
+                "kind": r.kind.tag(),
+                "when": "always",
+            }),
+            lex_store::policy::AttestationCondition::EffectsIntersect(effects) => {
+                serde_json::json!({
+                    "kind": r.kind.tag(),
+                    "when": "effects_intersect",
+                    "effects": effects.iter().collect::<Vec<_>>(),
+                })
+            }
+        })
+        .collect();
     let data = serde_json::json!({
         "blocked_producers": &policy.blocked_producers,
+        // `count` is the pre-#245 key (count of blocked producers).
+        // Kept under that name so external `lex policy list --output
+        // json` consumers don't break; new `blocked_count` /
+        // `required_count` are the explicit, namespaced versions.
         "count": policy.blocked_producers.len(),
+        "blocked_count": policy.blocked_producers.len(),
+        "required_attestations": required_json,
+        "required_count": policy.required_attestations.len(),
     });
-    let entries = policy.blocked_producers.clone();
+    let blocked = policy.blocked_producers.clone();
+    let required = policy.required_attestations.clone();
     acli::emit_or_text("policy", data, fmt, move || {
-        if entries.is_empty() {
-            println!("(no blocked producers)");
-            return;
+        println!("# blocked producers");
+        if blocked.is_empty() {
+            println!("(none)");
+        } else {
+            for p in &blocked {
+                println!("{}\tsince={}\treason={}", p.tool, p.blocked_at, p.reason);
+            }
         }
-        for p in &entries {
-            println!("{}\tsince={}\treason={}", p.tool, p.blocked_at, p.reason);
+        println!("\n# required attestations");
+        if required.is_empty() {
+            println!("(none)");
+        } else {
+            for r in &required {
+                match &r.when {
+                    lex_store::policy::AttestationCondition::Always => {
+                        println!("{}\twhen=always", r.kind.tag());
+                    }
+                    lex_store::policy::AttestationCondition::EffectsIntersect(effects) => {
+                        let list = effects.iter().cloned().collect::<Vec<_>>().join(",");
+                        println!("{}\twhen=effects_intersect({list})", r.kind.tag());
+                    }
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
+/// `lex policy require-attestation <kind> [--when-effects e1,e2,...]`
+/// (#245). Adds a positive gate rule. Without `--when-effects`, the
+/// rule fires on every op (`AttestationCondition::Always`); with it,
+/// the rule only fires when the op's declared effect set intersects
+/// the listed effects.
+fn cmd_policy_require_attestation(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let (root, rest, _, _) = parse_store_flag(args);
+    let mut kind_str: Option<String> = None;
+    let mut effects: Option<std::collections::BTreeSet<String>> = None;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--when-effects" => {
+                let v = rest.get(i + 1)
+                    .ok_or_else(|| anyhow!("--when-effects needs a comma-separated list"))?;
+                effects = Some(v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
+                i += 2;
+            }
+            other if kind_str.is_none() && !other.starts_with("--") => {
+                kind_str = Some(other.to_string());
+                i += 1;
+            }
+            other => bail!("unexpected arg `{other}`"),
+        }
+    }
+    let kind_str = kind_str.ok_or_else(|| anyhow!(
+        "usage: lex policy require-attestation <kind> [--when-effects e1,e2,...]\n\
+         supported kinds: type_check, spec, sandbox_run, examples, diff_body, effect_audit"
+    ))?;
+    let kind = lex_store::policy::RequiredAttestationKind::from_tag(&kind_str)
+        .ok_or_else(|| anyhow!("unknown attestation kind `{kind_str}`"))?;
+    let when = match effects {
+        Some(set) => lex_store::policy::AttestationCondition::EffectsIntersect(set),
+        None => lex_store::policy::AttestationCondition::Always,
+    };
+    let mut policy = lex_store::policy::load(&root)
+        .with_context(|| format!("reading policy.json at {}", root.display()))?
+        .unwrap_or_default();
+    let added = policy.require_attestation(kind, when.clone());
+    lex_store::policy::save(&root, &policy)
+        .with_context(|| format!("writing policy.json at {}", root.display()))?;
+
+    let when_json = match &when {
+        lex_store::policy::AttestationCondition::Always => serde_json::json!({"always": null}),
+        lex_store::policy::AttestationCondition::EffectsIntersect(set) => {
+            serde_json::json!({"effects_intersect": set.iter().collect::<Vec<_>>()})
+        }
+    };
+    let data = serde_json::json!({
+        "kind": kind.tag(),
+        "when": when_json,
+        "newly_added": added,
+    });
+    let kind_tag = kind.tag();
+    acli::emit_or_text("policy", data, fmt, move || {
+        if added {
+            println!("→ require attestation `{kind_tag}`");
+        } else {
+            println!("(already required) {kind_tag}");
+        }
+    });
+    Ok(())
+}
+
+/// `lex policy unrequire-attestation <kind>` (#245). Removes every
+/// rule with the given kind. To narrow a rule (Always → effects),
+/// unrequire then re-require.
+fn cmd_policy_unrequire_attestation(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let (root, rest, _, _) = parse_store_flag(args);
+    let kind_str = rest.iter()
+        .find(|a| !a.starts_with("--"))
+        .ok_or_else(|| anyhow!("usage: lex policy unrequire-attestation <kind>"))?
+        .clone();
+    let kind = lex_store::policy::RequiredAttestationKind::from_tag(&kind_str)
+        .ok_or_else(|| anyhow!("unknown attestation kind `{kind_str}`"))?;
+    let mut policy = lex_store::policy::load(&root)
+        .with_context(|| format!("reading policy.json at {}", root.display()))?
+        .unwrap_or_default();
+    let removed = policy.unrequire_attestation(kind);
+    if removed > 0 {
+        lex_store::policy::save(&root, &policy)
+            .with_context(|| format!("writing policy.json at {}", root.display()))?;
+    }
+    let data = serde_json::json!({
+        "kind": kind.tag(),
+        "removed": removed,
+    });
+    let kind_tag = kind.tag();
+    acli::emit_or_text("policy", data, fmt, move || {
+        if removed > 0 {
+            println!("→ removed {removed} rule(s) for `{kind_tag}`");
+        } else {
+            println!("(no rules) {kind_tag}");
         }
     });
     Ok(())

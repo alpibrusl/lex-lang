@@ -7,6 +7,32 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added — agent-VCS roadmap (#245)
+
+- **Machine-checkable branch advancement gates** (#245). New
+  `policy.required_attestations` rules in `<store>/policy.json`:
+  every op landing on the branch must carry a `Passed` attestation
+  of the listed kinds before `Store::apply_operation` will advance
+  the branch head past it. Conditions: `always` (every op) or
+  `effects_intersect: [io, fs_write, …]` (only when the op's
+  declared effects intersect). Surfaces a structured
+  `BranchAdvanceBlocked { op_id, stage_id, missing }` error;
+  `to_envelope()` renders it as the JSON shape the HTTP API will
+  serve.
+- **TypeCheck attestation now emits before the gate, not after.**
+  `apply_operation_checked` is reordered:
+  typecheck → persist op → emit `TypeCheck` → run gate → advance
+  head. A policy that requires `TypeCheck` is satisfied by the
+  auto-emission for every freshly-checked op, with no caller
+  changes.
+- **`lex policy require-attestation <kind> [--when-effects e1,…]`**
+  and **`lex policy unrequire-attestation <kind>`** CLI commands.
+  Supported kinds: `type_check`, `spec`, `sandbox_run`, `examples`,
+  `diff_body`, `effect_audit`. The pre-#245 `lex policy list`
+  command is renamed `lex policy show` (alias `list` retained) and
+  now renders both `blocked_producers` and `required_attestations`
+  in one view.
+
 ### Added — agent-VCS roadmap (#244)
 
 - **`OperationFormat` enum + version-aware canonical encoder**
