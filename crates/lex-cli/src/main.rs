@@ -1700,9 +1700,8 @@ fn cmd_store_migrate_ops(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             }
             if !changed.is_empty() {
                 println!(
-                    "\nNote: applying with --confirm will also rewrite branch heads. \
-                     Attestations are NOT rewritten by this command — that cascade is a \
-                     known follow-up to #244."
+                    "\nNote: applying with --confirm will also rewrite branch heads \
+                     and cascade-migrate attestations whose `op_id` rotated (#258)."
                 );
             }
         });
@@ -1711,10 +1710,31 @@ fn cmd_store_migrate_ops(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 
     // --confirm path: apply.
     lex_vcs::migrate::apply_migration(&log, &plan)
-        .with_context(|| "applying migration")?;
+        .with_context(|| "applying op-log migration")?;
 
     let branch_updates = rewrite_branch_heads(&root, &mapping)
         .with_context(|| "rewriting branch heads")?;
+
+    // #258: cascade migrate attestations whose `op_id` references
+    // a rotated op. Their `attestation_id` is computed including
+    // op_id, so they all rotate too.
+    let store = lex_store::Store::open(&root)
+        .with_context(|| format!("opening store at {}", root.display()))?;
+    let attest_log = store.attestation_log()
+        .with_context(|| "opening attestation log")?;
+    let att_steps = lex_vcs::migrate::plan_attestation_migration(&attest_log, &mapping)
+        .with_context(|| "planning attestation cascade")?;
+    lex_vcs::migrate::apply_attestation_migration(&attest_log, &att_steps)
+        .with_context(|| "applying attestation cascade")?;
+    let attestations_rotated = att_steps.iter().filter(|s| !s.is_no_op()).count();
+
+    // Invalidate the gate-checkpoint pointers on every branch
+    // (#256). They reference op_ids by content, which the
+    // migration just rotated; without invalidation the next
+    // advance would compare against a stale id and re-walk
+    // unnecessarily (or, worse, treat the new head as "already
+    // verified" because its old name happened to match).
+    let _ = store.invalidate_gate_checkpoints();
 
     let summary = serde_json::json!({
         "target_format": format!("{:?}", target).to_lowercase(),
@@ -1723,22 +1743,19 @@ fn cmd_store_migrate_ops(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "is_no_op": plan.is_no_op(),
         "applied": true,
         "branches_updated": branch_updates,
+        "attestations_rotated": attestations_rotated,
         "mappings": summary["mappings"].clone(),
     });
     acli::emit_or_text("store-migrate-ops", summary, fmt, || {
         println!(
-            "migrated {} ops to {:?}; {} op_ids rotated; {} branch heads rewritten",
+            "migrated {} ops to {:?}; {} op_ids rotated; \
+             {} branch heads rewritten; {} attestations cascade-migrated",
             plan.steps.len(),
             target,
             changed.len(),
             branch_updates,
+            attestations_rotated,
         );
-        if !changed.is_empty() {
-            println!(
-                "\nNote: attestations were NOT rewritten — their `attestation_id` \
-                 cascades from `op_id` and needs its own migration step. See #244."
-            );
-        }
     });
     Ok(())
 }

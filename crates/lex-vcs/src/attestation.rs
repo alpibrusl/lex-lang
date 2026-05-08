@@ -565,6 +565,29 @@ impl AttestationLog {
         Ok(())
     }
 
+    /// Remove an attestation from the log along with both index
+    /// entries (#258). Idempotent on missing files.
+    ///
+    /// **Not** part of the day-to-day API — the attestation log is
+    /// append-only by design (#132). The only legitimate caller is
+    /// the migration tool, which supervises a destructive,
+    /// `--confirm`-gated batch.
+    pub fn delete(&self, attestation: &Attestation) -> io::Result<()> {
+        let primary = self.primary_path(&attestation.attestation_id);
+        match fs::remove_file(&primary) {
+            Ok(()) | Err(_) => {} // best-effort; missing is fine
+        }
+        let stage_idx = self.by_stage
+            .join(&attestation.stage_id)
+            .join(&attestation.attestation_id);
+        let _ = fs::remove_file(&stage_idx);
+        if let AttestationKind::Trace { run_id, .. } = &attestation.kind {
+            let run_idx = self.by_run.join(run_id).join(&attestation.attestation_id);
+            let _ = fs::remove_file(&run_idx);
+        }
+        Ok(())
+    }
+
     pub fn get(&self, id: &AttestationId) -> io::Result<Option<Attestation>> {
         let path = self.primary_path(id);
         if !path.exists() {

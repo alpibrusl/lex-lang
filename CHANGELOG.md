@@ -7,6 +7,27 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added — agent-VCS roadmap (#258)
+
+- **Attestation-cascade migration** (#258). Closes the documented
+  limitation in #244. When an `OperationFormat` rotation
+  invalidates every `OpId`, `lex_vcs::migrate::plan_attestation_migration`
+  + `apply_attestation_migration` re-derive every attestation
+  whose `op_id` references a rotated op. New attestations get a
+  fresh `attestation_id` (content-addressed, including the new
+  op_id) and inherit the `by-stage` and `by-run` indices.
+- **`AttestationLog::delete`** — narrowly-purposed cleanup of
+  primary file + by-stage + by-run index entries, used only by
+  the cascade.
+- **`lex store migrate-ops --confirm`** now invokes the
+  cascade after the op-log migration: rotates op_ids, rewrites
+  branch heads, cascade-migrates attestations, and invalidates
+  every branch's `last_gate_checkpoint` (#256). Reports
+  `attestations_rotated: N` in the JSON envelope.
+- **Idempotency**: re-running the cascade on an already-migrated
+  log is a no-op; the original mapping's keys (old op_ids) no
+  longer exist, so plan returns an empty step list.
+
 ### Added — agent-VCS roadmap (#256)
 
 - **Walk-back producer-block gate** (#256). Closes the
