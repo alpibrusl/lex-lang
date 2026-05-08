@@ -115,15 +115,24 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             })
         }
         ("str", "slice") => {
-            // Half-open byte-range slice. Out-of-range or non-UTF-8
-            // boundaries error rather than panic, so caller code can
-            // recover via Result. Spec §11.1 doesn't pin a name; this
-            // matches the bytes.slice helper added earlier.
+            // Half-open byte-range slice. `hi` is clamped to `s.len()`
+            // and a negative `lo` / `hi` clamps to `0`, mirroring
+            // Python's `s[lo:hi]` semantics (and matching what
+            // production users expect when slicing fixed sizes off
+            // a possibly-shorter string — e.g. the first 64 chars
+            // of a license header). Reversed ranges (`lo > hi` after
+            // clamping) error since that's a caller logic bug. A
+            // mid-codepoint `lo` after clamping still errors so
+            // silent UTF-8 truncation never sneaks through.
             let s = expect_str(args.first())?;
-            let lo = expect_int(args.get(1))? as usize;
-            let hi = expect_int(args.get(2))? as usize;
-            if lo > hi || hi > s.len() {
-                return Err(format!("str.slice: out of range [{lo}..{hi}] of len {}", s.len()));
+            let lo_i = expect_int(args.get(1))?;
+            let hi_i = expect_int(args.get(2))?;
+            let lo = (lo_i.max(0) as usize).min(s.len());
+            let hi = (hi_i.max(0) as usize).min(s.len());
+            if lo > hi {
+                return Err(format!(
+                    "str.slice: reversed range [{lo}..{hi}] (after clamping to len {})",
+                    s.len()));
             }
             if !s.is_char_boundary(lo) || !s.is_char_boundary(hi) {
                 return Err(format!("str.slice: [{lo}..{hi}] not on char boundaries"));
