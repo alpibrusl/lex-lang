@@ -1655,16 +1655,26 @@ fn required_field_names(arg: Option<&Value>) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-/// Verify that `value`'s top level is an object containing every
-/// name in `required`. Returns a stable, human-readable error
-/// listing the missing field(s) so the agent's verifier can
-/// surface it directly.
+/// Verify that `value` is an object containing every entry in
+/// `required`. A required entry may be a plain field name (must
+/// exist at the top level) or a dotted path (`"project.license"`)
+/// which descends through nested objects. Returns a stable,
+/// human-readable error listing every missing path so the agent's
+/// verifier can surface it directly.
 ///
-/// Tactical fix for #168 — gives users a way to make
-/// `parse[T]` errors propagate as `Result::Err` instead of as
-/// runtime `GetField` errors at access time. The full
-/// type-driven fix (deriving `required` from `T` at type-check
-/// time so plain `parse[T]` works) tracked in #168.
+/// Tactical fix for #168 — gives users a way to make `parse[T]`
+/// errors propagate as `Result::Err` instead of as runtime
+/// `GetField` errors at access time. The full type-driven fix
+/// (deriving `required` from `T` at type-check time so plain
+/// `parse[T]` works, including auto-wrapping `Option[F]` fields
+/// as not-required) is the cleaner endgame; see #168.
+///
+/// Path semantics:
+/// * `"name"` → top-level `name` must be present (any value).
+/// * `"a.b.c"` → walk `a`, then `b`, then check `c` exists. Each
+///   intermediate value must itself be an object.
+/// * `\\.` is the literal-dot escape (e.g. `"weird\\.key"` for a
+///   field that genuinely contains a dot in its name).
 fn check_required_fields(
     value: &serde_json::Value,
     required: &[String],
@@ -1672,22 +1682,68 @@ fn check_required_fields(
     if required.is_empty() {
         return Ok(());
     }
-    let obj = match value {
-        serde_json::Value::Object(o) => o,
-        _ => return Err(format!(
+    if !matches!(value, serde_json::Value::Object(_)) {
+        return Err(format!(
             "parse_strict: expected top-level object with fields {:?}, got {value}",
             required
-        )),
-    };
-    let missing: Vec<&str> = required.iter()
-        .filter(|n| !obj.contains_key(n.as_str()))
-        .map(String::as_str)
-        .collect();
+        ));
+    }
+    let mut missing: Vec<String> = Vec::new();
+    for path in required {
+        if !path_exists(value, path) {
+            missing.push(path.clone());
+        }
+    }
     if missing.is_empty() {
         Ok(())
     } else {
         Err(format!("missing required field(s): {}", missing.join(", ")))
     }
+}
+
+/// Walk `value` along the dotted `path` and report whether the
+/// terminal segment exists. Intermediate non-object stops surface
+/// as "missing" — a path can't traverse through a string, list, or
+/// scalar.
+fn path_exists(value: &serde_json::Value, path: &str) -> bool {
+    let mut cursor = value;
+    let segments = split_dotted_path(path);
+    for seg in &segments {
+        match cursor {
+            serde_json::Value::Object(o) => match o.get(seg.as_str()) {
+                Some(next) => cursor = next,
+                None => return false,
+            },
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Split `"a.b.c"` into `["a", "b", "c"]`, with `\.` recognised
+/// as a literal-dot escape so legitimate dotted field names
+/// (e.g. `"package\.json"`) don't accidentally start a descent.
+fn split_dotted_path(path: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut iter = path.chars().peekable();
+    while let Some(c) = iter.next() {
+        if c == '\\' {
+            // Backslash at end is preserved; only `\.` is special.
+            if let Some(&'.') = iter.peek() {
+                cur.push('.');
+                iter.next();
+                continue;
+            }
+            cur.push(c);
+        } else if c == '.' {
+            out.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(c);
+        }
+    }
+    out.push(cur);
+    out
 }
 
 /// Parse a `.env`-style file into key→value pairs. Accepts:
