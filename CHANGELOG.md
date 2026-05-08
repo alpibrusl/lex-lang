@@ -5,6 +5,50 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [Unreleased]
+
+### Added — agent-VCS roadmap (#260)
+
+The symmetric inverse of #242. With both push and pull, content-
+addressed sync is bidirectional: any agent on any machine can
+both publish and consume ops + attestations from a remote.
+
+- **`GET /v1/ops/since?after=<op_id>&branch=<name>&limit=<n>`** —
+  server endpoint accepting a since-cutoff and returning a JSON
+  array of `OperationRecord`s reachable from `branch.head_op` but
+  not from `<after>`, sorted **oldest-first** so the client can
+  apply with the existing idempotent `OpLog::put`. Empty array
+  when caller is at the remote's head, when the branch doesn't
+  exist, or when the remote is behind. `--limit` chunks large
+  gaps.
+- **`GET /v1/attestations/since?after-op=<op_id>&limit=<n>`** —
+  mirror for the attestation log. Excludes attestations whose
+  `op_id` is in the cutoff's ancestry; always ships
+  attestations with `op_id: None` (e.g. `Override`,
+  `ProducerBlock`).
+- **`lex op pull <remote_url> [--branch NAME] [--since OP_ID]
+  [--limit N] [--dry-run]`** CLI command. Probes the remote head,
+  fetches the delta, validates each record (content-addressing +
+  DAG integrity), persists via `OpLog::put`. On clean
+  fast-forward (local head is an ancestor of the new tip) the
+  branch advances; on divergent histories the pull refuses with
+  a `DivergentHistory { local_head, remote_head }` envelope and
+  the local branch is unchanged.
+- **`lex attest pull <remote_url> [--since-op OP_ID] [--limit N]
+  [--dry-run]`** mirrors the same shape for attestations.
+  Attestations whose `op_id` references an op the local doesn't
+  yet have are skipped (with a `rejected_unknown_op` count) so
+  the caller can re-issue after pulling the missing ops.
+
+### Out of scope (called out for follow-up)
+
+- **Bidirectional `lex sync`** that wraps `pull && push` — a CLI
+  veneer, not a new protocol primitive.
+- **`--force-fast-forward`** that overwrites local divergent
+  history. Route through the merge engine (#134) instead.
+- **Capability-scoped pull** (only fetch ops matching effect set
+  X). Symmetric to the same gap on the push side.
+
 ## [0.4.0] — 2026-05-08
 
 The agent-VCS roadmap. Closes the seven gaps from the lex-vcs

@@ -2,7 +2,7 @@
 
 use crate::acli;
 use ::acli::OutputFormat;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use lex_store::Store;
 use lex_vcs::{OpLog, OperationRecord};
 use std::path::PathBuf;
@@ -28,12 +28,13 @@ fn parse_store(args: &[String]) -> (PathBuf, Vec<String>) {
 
 pub fn cmd_op(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let sub = args.first().ok_or_else(|| anyhow!(
-        "usage: lex op {{show|log|push}} [--store DIR] ..."))?;
+        "usage: lex op {{show|log|push|pull}} [--store DIR] ..."))?;
     let rest = &args[1..];
     match sub.as_str() {
         "show" => cmd_op_show(fmt, rest),
         "log"  => cmd_op_log(fmt, rest),
         "push" => cmd_op_push(fmt, rest),
+        "pull" => cmd_op_pull(fmt, rest),
         other  => bail!("unknown `lex op` subcommand: {other}"),
     }
 }
@@ -345,4 +346,257 @@ pub(crate) fn probe_remote_head(remote: &str, branch: &str) -> Result<Option<Str
     Ok(body.get("head_op")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string()))
+}
+
+/// `lex op pull <remote_url> [--branch NAME] [--since OP_ID]
+/// [--limit N] [--dry-run] [--store DIR]` (#260).
+///
+/// Append-only fetch — the inverse of `lex op push`. Asks the
+/// remote for ops reachable from its `branch.head_op` but not from
+/// the local branch's head, validates each, and persists. On
+/// fast-forward (local head is an ancestor of the new remote head)
+/// the local branch's `head_op` advances; on divergent histories
+/// the pull refuses with a structured envelope and the local
+/// branch is unchanged.
+///
+/// `--since` overrides the cutoff explicitly (useful for partial
+/// pulls). `--limit` chunks the response so very large gaps don't
+/// require a single huge round-trip; the client re-issues until
+/// the remote reports an empty response.
+fn cmd_op_pull(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let (root, rest) = parse_store(args);
+    let mut remote: Option<String> = None;
+    let mut branch: Option<String> = None;
+    let mut since: Option<String> = None;
+    let mut limit: Option<usize> = None;
+    let mut dry_run = false;
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--branch" => {
+                branch = Some(it.next().ok_or_else(|| anyhow!("--branch needs a value"))?.clone());
+            }
+            "--since" => {
+                since = Some(it.next().ok_or_else(|| anyhow!("--since needs an op_id"))?.clone());
+            }
+            "--limit" => {
+                limit = Some(it.next().ok_or_else(|| anyhow!("--limit needs N"))?
+                    .parse().map_err(|e| anyhow!("--limit: {e}"))?);
+            }
+            "--dry-run" => dry_run = true,
+            other if !other.starts_with("--") && remote.is_none() => {
+                remote = Some(other.to_string());
+            }
+            other => bail!("unexpected arg `{other}`"),
+        }
+    }
+    let remote = remote.ok_or_else(|| anyhow!(
+        "usage: lex op pull <remote_url> [--branch NAME] [--since OP_ID] [--limit N] [--dry-run] [--store DIR]"
+    ))?;
+    let store = Store::open(&root)?;
+    let branch = branch.unwrap_or_else(|| store.current_branch());
+
+    let local_head = store.get_branch(&branch)?.and_then(|b| b.head_op);
+    let cutoff: Option<String> = since.or_else(|| local_head.clone());
+
+    // Fetch the delta from the remote. Returns oldest-first so we
+    // can apply in topological order with the existing idempotent
+    // OpLog::put.
+    let received = fetch_ops_since(&remote, &branch, cutoff.as_deref(), limit)?;
+
+    if dry_run {
+        let ids: Vec<&String> = received.iter().map(|r| &r.op_id).collect();
+        let data = serde_json::json!({
+            "remote": remote,
+            "branch": branch,
+            "since": cutoff,
+            "would_receive": received.len(),
+            "op_ids": ids,
+        });
+        let count = received.len();
+        let remote_text = remote.clone();
+        let branch_text = branch.clone();
+        acli::emit_or_text("op-pull", data, fmt, move || {
+            println!(
+                "would pull {count} ops from {remote_text} on branch `{branch_text}` (dry-run)"
+            );
+        });
+        return Ok(());
+    }
+
+    if received.is_empty() {
+        let data = serde_json::json!({
+            "remote": remote,
+            "branch": branch,
+            "received": 0,
+            "added": 0,
+            "fast_forwarded_to": serde_json::Value::Null,
+        });
+        acli::emit_or_text("op-pull", data, fmt, || {
+            println!("nothing to pull (local is at or ahead of remote)");
+        });
+        return Ok(());
+    }
+
+    // Validate + persist. The local op log is idempotent, so we
+    // can safely re-apply ops that may already be present.
+    let log = OpLog::open(&root)?;
+    let mut added = 0usize;
+    let mut batch_ids: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    for rec in &received {
+        // Content-addressing: the supplied op_id must equal the
+        // canonical hash of the payload. Otherwise the remote is
+        // serving forged or corrupted records.
+        let expected = rec.op.op_id();
+        if expected != rec.op_id {
+            bail!(
+                "remote returned op with mismatched op_id: supplied={}, expected={}",
+                rec.op_id, expected,
+            );
+        }
+        // DAG integrity: every parent must already be in the local
+        // log OR appear earlier in this batch (which is sorted
+        // oldest-first by the server).
+        for parent in &rec.op.parents {
+            let known = log.get(parent)?.is_some() || batch_ids.contains(parent);
+            if !known {
+                bail!(
+                    "remote returned op {} with unreachable parent {parent}; \
+                     pull aborted to preserve DAG integrity",
+                    rec.op_id,
+                );
+            }
+        }
+        let was_present = log.get(&rec.op_id)?.is_some();
+        log.put(rec)?;
+        if !was_present {
+            added += 1;
+        }
+        batch_ids.insert(rec.op_id.clone());
+    }
+
+    // Divergent-history detection: a clean fast-forward requires
+    // that the local head, if present, is reachable from the
+    // remote tip. Walk the new tip's ancestry; if local_head doesn't
+    // appear, the histories diverged.
+    let new_tip = received.last().expect("checked is_empty above").op_id.clone();
+    let fast_forward_ok = match &local_head {
+        None => true, // empty branch can absorb anything
+        Some(lh) => log.walk_back(&new_tip, None)?
+            .iter()
+            .any(|r| &r.op_id == lh),
+    };
+
+    if !fast_forward_ok {
+        let envelope = serde_json::json!({
+            "error": "DivergentHistory",
+            "local_head": local_head,
+            "remote_head": new_tip,
+            "remark": "local branch head is not an ancestor of the pulled tip; \
+                      use `lex merge` to integrate the divergent histories",
+        });
+        // Print structured envelope; exit non-zero so scripts can
+        // tell the difference from a successful no-op pull.
+        let env_clone = envelope.clone();
+        acli::emit_or_text("op-pull", envelope, fmt, move || {
+            eprintln!("{}", serde_json::to_string_pretty(&env_clone).unwrap());
+        });
+        bail!("divergent histories — branch unchanged");
+    }
+
+    // Fast-forward: advance the branch head to the new tip.
+    // `Store::set_branch_head_op` is `pub(crate)`, so we go through
+    // the JSON file directly. (#262 will replace this with a CAS
+    // path; for now we rely on the single-writer invariant.)
+    fast_forward_branch_head(&root, &branch, &new_tip)
+        .with_context(|| format!("advancing branch head to {new_tip}"))?;
+
+    let data = serde_json::json!({
+        "remote": remote,
+        "branch": branch,
+        "received": received.len(),
+        "added": added,
+        "fast_forwarded_to": new_tip,
+    });
+    let total = received.len();
+    let remote_text = remote.clone();
+    let branch_text = branch.clone();
+    let new_tip_text = new_tip.clone();
+    acli::emit_or_text("op-pull", data, fmt, move || {
+        println!(
+            "pulled {total} ops from {remote_text} on branch `{branch_text}`: \
+             {added} new, branch advanced to {new_tip_text}"
+        );
+    });
+    Ok(())
+}
+
+/// Fetch a delta from `<remote>/v1/ops/since`. Returns the records
+/// in the order the server sent them (oldest-first by contract).
+fn fetch_ops_since(
+    remote: &str,
+    branch: &str,
+    after: Option<&str>,
+    limit: Option<usize>,
+) -> Result<Vec<OperationRecord>> {
+    let mut url = format!(
+        "{}/v1/ops/since?branch={branch}",
+        remote.trim_end_matches('/'),
+    );
+    if let Some(a) = after { url.push_str(&format!("&after={a}")); }
+    if let Some(n) = limit { url.push_str(&format!("&limit={n}")); }
+    let resp = ureq::get(&url)
+        .call()
+        .map_err(|e| anyhow!("GET {url}: {e}"))?;
+    let status = resp.status().as_u16();
+    if status >= 400 {
+        let body = resp.into_body().read_to_string()
+            .unwrap_or_else(|_| "(unreadable body)".into());
+        bail!("server returned HTTP {status}: {body}");
+    }
+    resp.into_body().read_json::<Vec<OperationRecord>>()
+        .map_err(|e| anyhow!("decoding response from {url}: {e}"))
+}
+
+/// Advance `<root>/branches/<name>.json`'s `head_op` to `new`. The
+/// store's `set_branch_head_op` is `pub(crate)`, so we operate on
+/// the JSON file directly. Same temp-file + rename pattern as the
+/// `lex store migrate-ops` branch-head rewriter.
+fn fast_forward_branch_head(
+    root: &std::path::Path,
+    branch: &str,
+    new: &str,
+) -> Result<()> {
+    let path = root.join("branches").join(format!("{branch}.json"));
+    if !path.exists() {
+        // First-time pull on a branch the local doesn't have yet.
+        // Bootstrap a minimal branch file pointing at the new head.
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let value = serde_json::json!({
+            "name": branch,
+            "parent": serde_json::Value::Null,
+            "head_op": new,
+            "merges": [],
+            "created_at": now,
+        });
+        let bytes = serde_json::to_vec_pretty(&value)?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::rename(&tmp, &path)?;
+        return Ok(());
+    }
+    let bytes = std::fs::read(&path)?;
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing {}", path.display()))?;
+    value["head_op"] = serde_json::Value::String(new.to_string());
+    let new_bytes = serde_json::to_vec_pretty(&value)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &new_bytes)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
 }
