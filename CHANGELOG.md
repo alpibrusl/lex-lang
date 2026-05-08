@@ -7,6 +7,31 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added — agent-VCS roadmap (#246)
+
+- **`AttestationKind::Trace { run_id, root_target }`** (#246).
+  Closes the deferred decision in `docs/design/trace-vs-vcs.md`:
+  option B (a dedicated variant) is now in production, replacing
+  the option-A workaround of overloading `SandboxRun` with an
+  empty effect set. `lex attest filter --kind trace` returns
+  *only* trace attestations.
+- **`AttestationLog::list_for_run(run_id)`** + new
+  `<root>/attestations/by-run/<run_id>/` secondary index. Only
+  `Trace` variants are indexed; other kinds skip it. Cost is
+  `O(traces of that run)`, typically 1.
+- **`lex run --trace`** auto-emits a `Trace` attestation linking
+  the trace blob to the entry function's `stage_id` (#246).
+  `result` mirrors the run's success: `Passed` / `Failed`. Skipped
+  silently when the entry function isn't resolvable to a stage in
+  the loaded program.
+- **`lex trace --op <op_id>`** lists every `Trace` attestation
+  whose `op_id` field matches. Today empty unless an
+  ops-committed-during-a-run pipeline populates `op_id`; the
+  surface is in place for that follow-up.
+- **`lex attest filter --run <id>`** uses the new by-run index.
+- `docs/design/trace-vs-vcs.md` updated: option B documented,
+  rationale captured, follow-ups list pruned.
+
 ### Added — agent-VCS roadmap (#244)
 
 - **`OperationFormat` enum + version-aware canonical encoder**

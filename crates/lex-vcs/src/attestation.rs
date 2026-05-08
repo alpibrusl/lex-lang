@@ -167,7 +167,31 @@ pub enum AttestationKind {
         actor: String,
         reason: String,
     },
+    /// `lex run --trace` finalized a [`lex_trace::TraceTree`] (#246).
+    /// Links the trace blob to the stage that was the run's entry
+    /// point. The trace itself stays at
+    /// `<store>/traces/<run_id>/trace.json` (per
+    /// `docs/design/trace-vs-vcs.md`); this attestation is the
+    /// audit-side hook so `lex attest filter --kind trace` and
+    /// cross-store sync can reason about runs without copying the
+    /// trace bytes.
+    ///
+    /// `root_target` is the entry function's `SigId` — the call site
+    /// the user (or agent) typed on the command line. Distinct from
+    /// `Attestation::stage_id`, which records the *content-addressed*
+    /// stage the entry function resolved to; the same `root_target`
+    /// across multiple body edits surfaces as multiple
+    /// `(stage_id, root_target)` rows in the attestation log.
+    Trace {
+        run_id: TraceRunId,
+        root_target: super::operation::SigId,
+    },
 }
+
+/// Stable identifier for a [`lex_trace::TraceTree`]. Mirrors the
+/// `run_id` field on the trace JSON; kept as a `String` so this
+/// crate doesn't pull `lex-trace` in.
+pub type TraceRunId = String;
 
 /// Walk a stage's attestations and return whether the latest
 /// Block/Unblock decision is currently a Block. Used by
@@ -396,20 +420,29 @@ struct CanonicalAttestationView<'a> {
 ///
 /// Mirrors [`crate::OpLog`] / [`crate::IntentLog`] in shape: one
 /// canonical-JSON file per attestation, atomic writes via tempfile +
-/// rename, idempotent on re-puts. Adds a `by-stage/` index so "list
-/// every attestation for stage X" is `O(attestations on X)` rather
-/// than `O(all attestations)`.
+/// rename, idempotent on re-puts. Maintains two secondary indices
+/// for cheap reverse lookups:
+///
+/// * `by-stage/<StageId>/<AttestationId>` — every attestation,
+///   indexed by the stage it records evidence for.
+/// * `by-run/<TraceRunId>/<AttestationId>` (#246) — only
+///   `AttestationKind::Trace` entries are indexed here, so
+///   `list_for_run` is `O(traces of that run)` rather than scanning
+///   the whole log.
 pub struct AttestationLog {
     dir: PathBuf,
     by_stage: PathBuf,
+    by_run: PathBuf,
 }
 
 impl AttestationLog {
     pub fn open(root: &Path) -> io::Result<Self> {
         let dir = root.join("attestations");
         let by_stage = dir.join("by-stage");
+        let by_run = dir.join("by-run");
         fs::create_dir_all(&by_stage)?;
-        Ok(Self { dir, by_stage })
+        fs::create_dir_all(&by_run)?;
+        Ok(Self { dir, by_stage, by_run })
     }
 
     fn primary_path(&self, id: &AttestationId) -> PathBuf {
@@ -439,6 +472,17 @@ impl AttestationLog {
         let idx = stage_dir.join(&attestation.attestation_id);
         if !idx.exists() {
             fs::File::create(&idx)?;
+        }
+        // by-run secondary index for Trace attestations (#246) —
+        // only the variants that carry a `run_id` are indexed; every
+        // other kind skips this directory entirely.
+        if let AttestationKind::Trace { run_id, .. } = &attestation.kind {
+            let run_dir = self.by_run.join(run_id);
+            fs::create_dir_all(&run_dir)?;
+            let idx = run_dir.join(&attestation.attestation_id);
+            if !idx.exists() {
+                fs::File::create(&idx)?;
+            }
         }
         Ok(())
     }
@@ -513,6 +557,29 @@ impl AttestationLog {
         Ok(out)
     }
 
+    /// Enumerate `AttestationKind::Trace` entries for a given
+    /// `run_id` (#246). Walks the `by-run/<run_id>/` directory; cost
+    /// is `O(trace attestations for that run)`, typically 1.
+    /// Returns an empty vec if the run has no Trace attestations.
+    /// Order is not stable.
+    pub fn list_for_run(&self, run_id: &TraceRunId) -> io::Result<Vec<Attestation>> {
+        let run_dir = self.by_run.join(run_id);
+        if !run_dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for entry in fs::read_dir(&run_dir)? {
+            let entry = entry?;
+            let id = match entry.file_name().into_string() {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if let Some(att) = self.get(&id)? {
+                out.push(att);
+            }
+        }
+        Ok(out)
+    }
 }
 
 // ---- Tests --------------------------------------------------------

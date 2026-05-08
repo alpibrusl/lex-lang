@@ -522,6 +522,37 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         let tree = trace_handle.finalize(func.clone(), serde_json::Value::Null,
             root_out, root_err, started, ended);
         let id = store.save_trace(&tree)?;
+        // #246: emit a `Trace` attestation linking the run to the
+        // entry stage. Skipped silently if the entry function isn't
+        // resolvable to a stage in the loaded program — `lex run`
+        // accepts plain `.lex` files that may carry sigs not yet
+        // published to the store, and the audit hook is informational
+        // rather than load-bearing.
+        if let Some(entry_stage_id) = entry_stage_id_for(&stages, &func) {
+            let attestation = lex_vcs::Attestation::new(
+                entry_stage_id,
+                None,
+                None,
+                lex_vcs::AttestationKind::Trace {
+                    run_id: id.clone(),
+                    root_target: func.clone(),
+                },
+                match &result {
+                    Ok(_) => lex_vcs::AttestationResult::Passed,
+                    Err(e) => lex_vcs::AttestationResult::Failed {
+                        detail: format!("{e}"),
+                    },
+                },
+                trace_producer(),
+                None,
+            );
+            // Use the store's attestation log helper so the file
+            // layout is consistent with `lex publish`'s emissions.
+            store.attestation_log()
+                .map_err(|e| anyhow!("opening attestation log: {e}"))?
+                .put(&attestation)
+                .map_err(|e| anyhow!("recording trace attestation: {e}"))?;
+        }
         trace_id = Some(id.clone());
         if !matches!(fmt, OutputFormat::Json) { eprintln!("trace saved: {id}"); }
     }
@@ -629,15 +660,109 @@ fn parse_run_flags(args: &[String]) -> Result<RunFlags> {
     Ok(f)
 }
 
+/// `lex trace <run_id>` — load the trace tree by run id (existing).
+/// `lex trace --op <op_id>` (#246) — list every `AttestationKind::Trace`
+/// attestation whose `op_id` field matches. Today no producer
+/// emits Trace attestations *with* an op_id (the existing emitter
+/// in `cmd_run` sets it to None), so this filter typically returns
+/// empty; it's the surface the next-generation
+/// "ops-committed-during-a-run" pipeline will populate.
 fn cmd_trace(fmt: &OutputFormat, args: &[String]) -> Result<()> {
-    let id = args.first().ok_or_else(|| anyhow!("usage: lex trace <run_id>"))?;
-    let store = lex_store::Store::open(default_store_root())?;
+    // --op flag form first.
+    let mut op_filter: Option<String> = None;
+    let mut store_root: Option<PathBuf> = None;
+    let mut positional: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--op" => {
+                op_filter = Some(args.get(i + 1)
+                    .ok_or_else(|| anyhow!("--op needs an op_id"))?
+                    .clone());
+                i += 2;
+            }
+            "--store" => {
+                store_root = Some(PathBuf::from(args.get(i + 1)
+                    .ok_or_else(|| anyhow!("--store needs a path"))?));
+                i += 2;
+            }
+            other if !other.starts_with("--") => {
+                positional.push(other.to_string());
+                i += 1;
+            }
+            other => bail!("unexpected arg `{other}`"),
+        }
+    }
+    let root = store_root.unwrap_or_else(default_store_root);
+    let store = lex_store::Store::open(&root)
+        .with_context(|| format!("opening store at {}", root.display()))?;
+
+    if let Some(op_id) = op_filter {
+        let log = store.attestation_log()?;
+        let traces: Vec<lex_vcs::Attestation> = log.list_all()?
+            .into_iter()
+            .filter(|a| matches!(a.kind, lex_vcs::AttestationKind::Trace { .. })
+                && a.op_id.as_deref() == Some(op_id.as_str()))
+            .collect();
+        let data = serde_json::json!({
+            "op_id": op_id,
+            "count": traces.len(),
+            "traces": serde_json::to_value(&traces)?,
+        });
+        let listing = traces.clone();
+        acli::emit_or_text("trace", data, fmt, move || {
+            if listing.is_empty() {
+                println!("(no Trace attestations for op {op_id})");
+                return;
+            }
+            for a in &listing {
+                if let lex_vcs::AttestationKind::Trace { run_id, root_target } = &a.kind {
+                    println!("{run_id}\t{root_target}\tat={}", a.timestamp);
+                }
+            }
+        });
+        return Ok(());
+    }
+
+    // Positional path: load and dump the trace tree.
+    let id = positional.first().ok_or_else(|| anyhow!(
+        "usage: lex trace <run_id> | lex trace --op <op_id> [--store DIR]"
+    ))?;
     let tree = store.load_trace(id)?;
     let data = serde_json::to_value(&tree)?;
     acli::emit_or_text("trace", data.clone(), fmt, || {
         println!("{}", serde_json::to_string_pretty(&data).unwrap());
     });
     Ok(())
+}
+
+/// Find the `stage_id` of the entry-point function in a parsed
+/// program. Used by `lex run --trace` (#246) to attach a stage
+/// reference to the emitted [`AttestationKind::Trace`]. Returns
+/// `None` when the function name doesn't match any FnDecl in the
+/// program — typically because the caller passed a stdlib name or
+/// a function the file doesn't actually define.
+fn entry_stage_id_for(stages: &[lex_ast::Stage], func: &str) -> Option<String> {
+    for stage in stages {
+        if let lex_ast::Stage::FnDecl(fd) = stage {
+            if fd.name == func {
+                return lex_ast::stage_id(stage);
+            }
+        }
+    }
+    None
+}
+
+/// Producer for the `Trace` attestation emitted by `lex run --trace`
+/// (#246). Tagged as `lex-cli` (not `lex-store`) because the run
+/// command — not the store gate — is what notices a tracer was
+/// active.
+fn trace_producer() -> lex_vcs::ProducerDescriptor {
+    lex_vcs::ProducerDescriptor {
+        tool: "lex run --trace".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        model: None,
+    }
 }
 
 fn cmd_diff(fmt: &OutputFormat, args: &[String]) -> Result<()> {
@@ -1788,6 +1913,9 @@ fn cmd_stage(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                     lex_vcs::AttestationKind::Unblock { actor, .. } => {
                         format!("Unblock({actor})")
                     }
+                    lex_vcs::AttestationKind::Trace { run_id, root_target } => {
+                        format!("Trace({root_target}@{run_id:.12}…)")
+                    }
                 };
                 let result = match &a.result {
                     lex_vcs::AttestationResult::Passed => "passed".to_string(),
@@ -2064,6 +2192,9 @@ fn cmd_attest(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             let mut result_filter: Option<String> = None;
             let mut since: Option<u64> = None;
             let mut store_root: Option<PathBuf> = None;
+            // #246: `--run <id>` filters to Trace attestations whose
+            // `kind.run_id` matches. Implies `--kind trace`.
+            let mut run_filter: Option<String> = None;
             let mut i = 0;
             while i < rest.len() {
                 match rest[i].as_str() {
@@ -2085,6 +2216,10 @@ fn cmd_attest(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                         store_root = rest.get(i + 1).map(PathBuf::from);
                         i += 2;
                     }
+                    "--run" => {
+                        run_filter = rest.get(i + 1).cloned();
+                        i += 2;
+                    }
                     other => bail!("unexpected arg `{other}`"),
                 }
             }
@@ -2092,7 +2227,13 @@ fn cmd_attest(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             let store = Store::open(&root)
                 .with_context(|| format!("opening store at {}", root.display()))?;
             let log = store.attestation_log()?;
-            let all = log.list_all()?;
+            // `--run` uses the by-run secondary index instead of
+            // walking every attestation; this is `O(traces of that
+            // run)` rather than `O(all attestations)`.
+            let all = match &run_filter {
+                Some(rid) => log.list_for_run(rid)?,
+                None => log.list_all()?,
+            };
 
             let mut filtered: Vec<lex_vcs::Attestation> = all.into_iter()
                 .filter(|a| {
@@ -2153,6 +2294,7 @@ fn attestation_kind_tag(k: &lex_vcs::AttestationKind) -> &'static str {
         Defer { .. }      => "defer",
         Block { .. }      => "block",
         Unblock { .. }    => "unblock",
+        Trace { .. }      => "trace",
     }
 }
 
