@@ -2194,8 +2194,13 @@ fn cmd_stage_decision(
 /// the supplied criteria. Designed for CI / dashboard queries
 /// that span the whole log rather than a single stage.
 fn cmd_attest(fmt: &OutputFormat, args: &[String]) -> Result<()> {
-    let sub = args.first().ok_or_else(|| anyhow!("usage: lex attest filter [--kind K] [--result R] [--since T] [--store DIR]"))?;
+    let sub = args.first().ok_or_else(|| anyhow!(
+        "usage: lex attest {{filter|push}} ..."
+    ))?;
     let rest = &args[1..];
+    if sub == "push" {
+        return cmd_attest_push(fmt, rest);
+    }
     match sub.as_str() {
         "filter" => {
             let mut kind_filter: Option<String> = None;
@@ -2440,6 +2445,135 @@ fn retro_block_producer() -> lex_vcs::ProducerDescriptor {
         version: env!("CARGO_PKG_VERSION").into(),
         model: None,
     }
+}
+
+/// `lex attest push <remote_url> [--since-op OP_ID] [--store DIR]
+/// [--dry-run]` (#242).
+///
+/// Walks the local attestation log, optionally filtering to
+/// attestations whose `op_id` is `>= --since-op` (in DAG order, not
+/// timestamp), and posts them to `<remote_url>/v1/attestations/batch`.
+///
+/// Without `--since-op`, sends every attestation. The server-side
+/// idempotency check (content-addressed `attestation_id`) makes
+/// "push everything" safe; `--since-op` is purely an optimization
+/// for large logs.
+///
+/// Idempotency: re-pushing the same attestations converges to
+/// `added: 0`. Network failure mid-push leaves the remote with the
+/// prefix that landed; re-running picks up where the failure
+/// occurred.
+fn cmd_attest_push(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let (root, rest, _, _) = parse_store_flag(args);
+    let mut remote: Option<String> = None;
+    let mut since_op: Option<String> = None;
+    let mut dry_run = false;
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--since-op" => {
+                since_op = Some(it.next().ok_or_else(|| anyhow!("--since-op needs an op_id"))?.clone());
+            }
+            "--dry-run" => dry_run = true,
+            other if !other.starts_with("--") && remote.is_none() => {
+                remote = Some(other.to_string());
+            }
+            other => bail!("unexpected arg `{other}`"),
+        }
+    }
+    let remote = remote.ok_or_else(|| anyhow!(
+        "usage: lex attest push <remote_url> [--since-op OP_ID] [--dry-run] [--store DIR]"
+    ))?;
+
+    let store = lex_store::Store::open(&root)
+        .with_context(|| format!("opening store at {}", root.display()))?;
+    let log = store.attestation_log()?;
+
+    // Filter by op-id ancestry when --since-op is set: only push
+    // attestations whose op_id is reachable from the local op log
+    // and not in the ancestry of `since_op`. Without --since-op,
+    // send every attestation.
+    let all = log.list_all()?;
+    let to_send: Vec<lex_vcs::Attestation> = match since_op.as_ref() {
+        None => all,
+        Some(cutoff) => {
+            let op_log = lex_vcs::OpLog::open(&root)?;
+            // Set of op_ids we should NOT re-send: every ancestor of
+            // `cutoff`, inclusive.
+            let exclude: std::collections::BTreeSet<String> =
+                op_log.walk_back(cutoff, None)?
+                    .into_iter()
+                    .map(|r| r.op_id)
+                    .collect();
+            all.into_iter()
+                .filter(|a| match &a.op_id {
+                    Some(op_id) => !exclude.contains(op_id),
+                    None => true,
+                })
+                .collect()
+        }
+    };
+
+    if dry_run {
+        let ids: Vec<&String> = to_send.iter().map(|a| &a.attestation_id).collect();
+        let data = serde_json::json!({
+            "remote": remote,
+            "since_op": since_op,
+            "would_send": to_send.len(),
+            "attestation_ids": ids,
+        });
+        let count = to_send.len();
+        let remote_text = remote.clone();
+        acli::emit_or_text("attest-push", data, fmt, move || {
+            println!("would push {count} attestations to {remote_text} (dry-run)");
+        });
+        return Ok(());
+    }
+
+    if to_send.is_empty() {
+        let data = serde_json::json!({
+            "remote": remote,
+            "received": 0,
+            "added": 0,
+            "skipped": 0,
+        });
+        acli::emit_or_text("attest-push", data, fmt, || {
+            println!("nothing to push (no attestations match)");
+        });
+        return Ok(());
+    }
+
+    let url = format!("{}/v1/attestations/batch", remote.trim_end_matches('/'));
+    let body = serde_json::to_string(&to_send)
+        .map_err(|e| anyhow!("serializing batch: {e}"))?;
+    let resp = ureq::post(&url)
+        .header("Content-Type", "application/json")
+        .send(body)
+        .map_err(|e| anyhow!("POST {url}: {e}"))?;
+    let status = resp.status().as_u16();
+    let resp_body: serde_json::Value = resp.into_body().read_json()
+        .map_err(|e| anyhow!("decoding response: {e}"))?;
+    if status >= 400 {
+        bail!("server rejected batch (HTTP {status}): {resp_body}");
+    }
+
+    let received = resp_body.get("received").and_then(|v| v.as_u64()).unwrap_or(0);
+    let added = resp_body.get("added").and_then(|v| v.as_u64()).unwrap_or(0);
+    let skipped = resp_body.get("skipped").and_then(|v| v.as_u64()).unwrap_or(0);
+    let data = serde_json::json!({
+        "remote": remote,
+        "received": received,
+        "added": added,
+        "skipped": skipped,
+    });
+    let remote_text = remote.clone();
+    acli::emit_or_text("attest-push", data, fmt, move || {
+        println!(
+            "pushed {received} attestations to {remote_text}: \
+             {added} added, {skipped} skipped (already present)"
+        );
+    });
+    Ok(())
 }
 
 fn attestation_kind_tag(k: &lex_vcs::AttestationKind) -> &'static str {

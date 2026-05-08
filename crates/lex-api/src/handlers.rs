@@ -181,6 +181,16 @@ fn route(
             let id = &p["/v1/merge/".len()..p.len() - "/commit".len()];
             merge_commit_handler(state, id)
         }
+        // ---- #242: append-only sync of op log + attestation log
+        (Method::Post, "/v1/ops/batch") => ops_batch_handler(state, body),
+        (Method::Post, "/v1/attestations/batch") => attestations_batch_handler(state, body),
+        // Probe endpoint for `lex op push` to discover the remote's
+        // current head before computing a delta. Returns
+        // `{ "head_op": Option<OpId> }`. `<branch>` is URL-encoded.
+        (Method::Get, p) if p.starts_with("/v1/branches/") && p.ends_with("/head") => {
+            let name = &p["/v1/branches/".len()..p.len() - "/head".len()];
+            branch_head_handler(state, name)
+        }
         _ => error_response(404, format!("unknown route: {method:?} {path}")),
     }
 }
@@ -869,5 +879,230 @@ fn mint_merge_id() -> MergeSessionId {
         .unwrap_or(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("merge_{nanos:x}_{n:x}")
+}
+
+// ---- #242: append-only sync ---------------------------------------
+
+/// `POST /v1/ops/batch` (#242). Server endpoint for `lex op push`.
+///
+/// Body: a JSON array of `OperationRecord`s. The handler validates
+/// DAG integrity by checking that every op's `parents` either
+/// already exist on the remote *or* appear earlier in the same
+/// batch. This lets a client send a topologically-ordered slice
+/// without first probing for what's already there.
+///
+/// Response shape:
+///
+/// ```json
+/// { "received": N, "added": M, "skipped": (N-M), "added_ids": [...] }
+/// ```
+///
+/// Failure modes:
+///
+/// * `400` — body isn't a JSON array of op records.
+/// * `422` with `{ "error": "MissingParent", "detail": { "op_id":
+///   ..., "missing_parent": ... } }` if a parent is unreachable.
+///   The whole batch is rejected; nothing is persisted. The client
+///   should backfill the missing op and retry.
+/// * `409` if the supplied `op_id` doesn't match the canonical
+///   hash of the record's payload — content addressing must hold
+///   over the wire.
+///
+/// Idempotency: a record whose `op_id` already exists is silently
+/// skipped (not added, not rejected). Pushing the same payload
+/// twice is `received == N, added == 0` on the second call.
+pub(crate) fn ops_batch_handler(state: &State, body: &str)
+    -> Response<std::io::Cursor<Vec<u8>>>
+{
+    let records: Vec<lex_vcs::OperationRecord> = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(e) => return error_response(400,
+            format!("body must be a JSON array of OperationRecord: {e}")),
+    };
+    let store = state.store.lock().unwrap();
+    let log = match lex_vcs::OpLog::open(store.root()) {
+        Ok(l) => l,
+        Err(e) => return error_response(500, format!("opening op log: {e}")),
+    };
+
+    // Validate every record before persisting any of them.
+    //
+    // 1. Content-addressing: the supplied `op_id` must match the
+    //    canonical hash of `record.op`. Otherwise the client is
+    //    sending a forged or corrupted record.
+    // 2. DAG integrity: every parent must either already exist in
+    //    the local log OR appear earlier in this batch.
+    let mut batch_ids: std::collections::BTreeSet<lex_vcs::OpId> =
+        std::collections::BTreeSet::new();
+    for rec in &records {
+        let expected = rec.op.op_id();
+        if expected != rec.op_id {
+            return error_with_detail(409, "OpIdMismatch", serde_json::json!({
+                "supplied": rec.op_id,
+                "expected": expected,
+            }));
+        }
+        for parent in &rec.op.parents {
+            let known = match log.get(parent) {
+                Ok(Some(_)) => true,
+                Ok(None) => false,
+                Err(e) => return error_response(500, format!("op log read: {e}")),
+            };
+            if !known && !batch_ids.contains(parent) {
+                return error_with_detail(422, "MissingParent", serde_json::json!({
+                    "op_id": rec.op_id,
+                    "missing_parent": parent,
+                }));
+            }
+        }
+        batch_ids.insert(rec.op_id.clone());
+    }
+
+    // Persist. `OpLog::put` is idempotent so a re-push is a no-op
+    // for already-present records.
+    let mut added = 0usize;
+    let mut added_ids: Vec<&lex_vcs::OpId> = Vec::new();
+    for rec in &records {
+        let already_present = matches!(log.get(&rec.op_id), Ok(Some(_)));
+        match log.put(rec) {
+            Ok(()) => {
+                if !already_present {
+                    added += 1;
+                    added_ids.push(&rec.op_id);
+                }
+            }
+            Err(e) => return error_response(500, format!("op log write: {e}")),
+        }
+    }
+
+    json_response(200, &serde_json::json!({
+        "received": records.len(),
+        "added": added,
+        "skipped": records.len() - added,
+        "added_ids": added_ids,
+    }))
+}
+
+/// `POST /v1/attestations/batch` (#242). Server endpoint for `lex
+/// attest push`.
+///
+/// Body: a JSON array of `Attestation`s. Validates that each
+/// attestation's `op_id` (when set) refers to an op that already
+/// exists on the remote — `attestation_id` is then re-derivable
+/// from the canonical form, so cross-store dedup just works.
+///
+/// Response: same shape as `ops_batch_handler` but `added_ids` is
+/// the list of accepted `attestation_id`s.
+///
+/// Failure modes:
+///
+/// * `400` for malformed JSON.
+/// * `422` with `{ "error": "UnknownOp", "detail": { ... } }` if
+///   an attestation's `op_id` references an op the remote doesn't
+///   know about. Whole batch rejected.
+/// * `409` `AttestationIdMismatch` if the supplied id doesn't
+///   match the canonical hash.
+///
+/// Idempotency: same as the ops endpoint — content-addressed dedup.
+pub(crate) fn attestations_batch_handler(state: &State, body: &str)
+    -> Response<std::io::Cursor<Vec<u8>>>
+{
+    let attestations: Vec<lex_vcs::Attestation> = match serde_json::from_str(body) {
+        Ok(a) => a,
+        Err(e) => return error_response(400,
+            format!("body must be a JSON array of Attestation: {e}")),
+    };
+    let store = state.store.lock().unwrap();
+    let log = match store.attestation_log() {
+        Ok(l) => l,
+        Err(e) => return error_response(500, format!("opening attestation log: {e}")),
+    };
+    let op_log = match lex_vcs::OpLog::open(store.root()) {
+        Ok(l) => l,
+        Err(e) => return error_response(500, format!("opening op log: {e}")),
+    };
+
+    // Validate before persisting any record.
+    for att in &attestations {
+        // Content-addressing: re-derive attestation_id from the
+        // payload and reject mismatches.
+        let expected = lex_vcs::Attestation::with_timestamp(
+            att.stage_id.clone(),
+            att.op_id.clone(),
+            att.intent_id.clone(),
+            att.kind.clone(),
+            att.result.clone(),
+            att.produced_by.clone(),
+            att.cost.clone(),
+            att.timestamp,
+        ).attestation_id;
+        if expected != att.attestation_id {
+            return error_with_detail(409, "AttestationIdMismatch", serde_json::json!({
+                "supplied": att.attestation_id,
+                "expected": expected,
+            }));
+        }
+        // The op_id field, if set, must point at an op the remote
+        // knows about. Without this check, attestations would
+        // dangle into a future sync that never lands the op.
+        if let Some(op_id) = &att.op_id {
+            match op_log.get(op_id) {
+                Ok(Some(_)) => {}
+                Ok(None) => return error_with_detail(422, "UnknownOp", serde_json::json!({
+                    "attestation_id": att.attestation_id,
+                    "op_id": op_id,
+                })),
+                Err(e) => return error_response(500, format!("op log read: {e}")),
+            }
+        }
+    }
+
+    // Persist. `AttestationLog::put` is idempotent on
+    // `attestation_id` and the by-stage index is rewritten as a
+    // marker file, also idempotent.
+    let mut added = 0usize;
+    let mut added_ids: Vec<&lex_vcs::AttestationId> = Vec::new();
+    for att in &attestations {
+        let already_present = matches!(log.get(&att.attestation_id), Ok(Some(_)));
+        match log.put(att) {
+            Ok(()) => {
+                if !already_present {
+                    added += 1;
+                    added_ids.push(&att.attestation_id);
+                }
+            }
+            Err(e) => return error_response(500, format!("attestation log write: {e}")),
+        }
+    }
+
+    json_response(200, &serde_json::json!({
+        "received": attestations.len(),
+        "added": added,
+        "skipped": attestations.len() - added,
+        "added_ids": added_ids,
+    }))
+}
+
+/// `GET /v1/branches/<name>/head` (#242 follow-up). Probe endpoint
+/// the `lex op push` client uses to discover the remote head before
+/// computing a delta against `OpLog::ops_since`.
+///
+/// Response: `{ "branch": "main", "head_op": Option<OpId> }`.
+/// Returns 200 even when the branch doesn't exist locally — the
+/// answer in that case is `head_op: null`, which is the right
+/// signal for "send everything you have."
+pub(crate) fn branch_head_handler(state: &State, name: &str)
+    -> Response<std::io::Cursor<Vec<u8>>>
+{
+    let store = state.store.lock().unwrap();
+    let head = match store.get_branch(name) {
+        Ok(Some(b)) => b.head_op,
+        Ok(None) => None,
+        Err(e) => return error_response(500, format!("get_branch: {e}")),
+    };
+    json_response(200, &serde_json::json!({
+        "branch": name,
+        "head_op": head,
+    }))
 }
 

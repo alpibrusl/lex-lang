@@ -127,6 +127,67 @@ bumps may carry breaking changes when justified).
   current cost, and the chain of `(op_id, from, to)` changes.
   JSON envelope under `--output json` for agent consumers.
 
+### Added — agent-VCS roadmap (#242)
+
+The biggest gap from the agent-VCS review: until now, the op log
+was local-only. Two agents on different machines couldn't
+exchange ops without filesystem-level sharing. #242 closes that
+with **append-only sync**: content-addressed identity makes
+replication a set-difference of immutable blobs, not a merge.
+
+- **`POST /v1/ops/batch`** — server endpoint accepting a JSON
+  array of `OperationRecord`s. Validates DAG integrity (every
+  parent must already exist on the remote *or* appear earlier
+  in the same batch — so a topologically-ordered slice from
+  `OpLog::ops_since` lands in one round-trip), and the
+  content-addressing invariant (`op_id` must equal the canonical
+  hash of the supplied payload).
+- **`POST /v1/attestations/batch`** — mirrors the ops endpoint
+  for attestations. Rejects records whose `op_id` field
+  references an op the remote doesn't know about; rejects
+  `attestation_id` mismatches.
+- **`GET /v1/branches/<name>/head`** probe endpoint so the
+  client can compute a delta against the remote's current head
+  before pushing.
+- **`lex op push <remote_url> [--branch NAME] [--since OP_ID]
+  [--dry-run]`** CLI command. Walks `OpLog::ops_since(local_head,
+  remote_head)`, batches, posts in topological order. Reports
+  `received / added / skipped` from the server's response.
+  `--dry-run` previews without network calls.
+- **`lex attest push <remote_url> [--since-op OP_ID]
+  [--dry-run]`** mirrors the same shape for the attestation log.
+
+Failure modes (all return structured envelopes):
+
+- `422 MissingParent { op_id, missing_parent }` — DAG integrity.
+  Whole batch rejected; nothing persisted.
+- `422 UnknownOp { attestation_id, op_id }` — attestation
+  references an op the remote doesn't have.
+- `409 OpIdMismatch { supplied, expected }` /
+  `409 AttestationIdMismatch { supplied, expected }` —
+  content-addressing was forged or corrupted in transit.
+- `400` for malformed JSON.
+
+Idempotency is built in at every layer: `OpLog::put` and
+`AttestationLog::put` are no-ops on existing ids. Pushing the
+same payload twice returns `added: 0` on the second call.
+Network failure mid-push leaves the remote with the prefix that
+landed; re-running picks up cleanly.
+
+### Out of scope (called out for follow-up)
+
+- **Pull / fetch.** Append-only log replication is unidirectional
+  in this slice. The inverse (pulling someone else's ops) is
+  tracked as a separate piece of work.
+- **Capability-scoped sync** (only push ops matching effect set
+  X) — natural follow-up once a use case appears.
+- **Auth.** Plumbed through the existing `lex serve` surface;
+  not redesigned here.
+- **Conflict resolution.** Ops are immutable and content-
+  addressed; there are no conflicts to resolve at the transport
+  layer. The merge engine already handles agreement on shared
+  history.
+
 ### Added — agent-VCS roadmap (#244)
 
 - **`OperationFormat` enum + version-aware canonical encoder**
