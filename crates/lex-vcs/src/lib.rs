@@ -48,7 +48,7 @@ pub use apply::{apply, ApplyError, NewHead};
 pub use attestation::{
     active_producer_block, is_stage_blocked, Attestation, AttestationId, AttestationKind,
     AttestationLog, AttestationResult, ContentHash, Cost, ProducerDescriptor, Signature, SpecId,
-    SpecMethod,
+    SpecMethod, TraceRunId,
 };
 pub use compute_diff::{compute_diff, effect_label, render_signature};
 pub use diff_report::DiffReport;

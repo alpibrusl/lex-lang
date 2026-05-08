@@ -95,20 +95,60 @@ For an edge-plus-cloud setup that wants to audit-replay later:
 
 ### 1. Identify each run with an attestation
 
-When an edge process records a trace, also emit an attestation
-that points at the run. The existing
-`AttestationKind::SandboxRun { effects }` already serves this
-purpose for sandboxed runs. For non-sandboxed runs, either:
+When `lex run --trace` finalizes a `TraceTree`, the CLI also
+emits an `AttestationKind::Trace { run_id, root_target }`
+attestation linking the trace to the entry function's stage
+(#246). This is **option B** in the historical decision below;
+it landed once enough downstream callers needed to distinguish
+"ran under sandbox" from "produced a trace" in
+`lex attest filter`.
 
-- **Option A (recommended for now):** reuse `SandboxRun` with
-  the empty effect set when the run wasn't actually sandboxed.
-  The attestation is a stand-in for "this trace exists" rather
-  than "this run was sandboxed."
-- **Option B (cleaner if usage grows):** add a new
-  `AttestationKind::Trace { run_id, root_target }` variant so
-  the audit channel distinguishes "ran under sandbox" from
-  "produced a trace." File a follow-up issue when you have
-  enough downstream callers to justify the variant.
+```rust
+pub enum AttestationKind {
+    // ...
+    Trace { run_id: TraceRunId, root_target: SigId },
+}
+```
+
+Properties:
+
+- `stage_id` (on the outer `Attestation`) records the
+  *content-addressed* stage the entry function resolved to. The
+  same `root_target` across multiple body edits surfaces as
+  multiple `(stage_id, root_target)` rows.
+- `op_id` is `None` for runs that didn't commit ops. The
+  ops-committed-during-a-run pipeline (a follow-up to #246) will
+  populate it; today's `lex run --trace` doesn't, so
+  `lex trace --op <op_id>` returns empty until that arrives.
+- `result` mirrors the run's success: `Passed` if the entry
+  call returned `Ok`, `Failed { detail }` otherwise.
+- The `AttestationLog` maintains a `by-run/<run_id>/` secondary
+  index, so `log.list_for_run(run_id)` is `O(traces of that
+  run)`. `lex attest filter --run <id>` walks this index.
+
+#### Historical decision (kept for context)
+
+For non-sandboxed runs, the original doc proposed two options:
+
+- **Option A:** reuse `AttestationKind::SandboxRun { effects }`
+  with the empty effect set as a stand-in for "this trace
+  exists."
+- **Option B:** add a dedicated
+  `AttestationKind::Trace { run_id, root_target }` variant.
+
+Option B was chosen and shipped in #246 because:
+
+1. **Filtering legibility.** `lex attest filter --kind trace`
+   returns *only* trace attestations; reusing `SandboxRun`
+   would conflate "ran under sandbox" with "produced a trace,"
+   forcing every consumer to inspect the `effects` field to
+   tell them apart.
+2. **Audit channel separation.** Adding a `Trace` row to the
+   attestation log doesn't claim anything about effect
+   handling; using `SandboxRun` would have implied a sandbox
+   claim that isn't true.
+3. **The cost is small.** One enum variant; one `by-run`
+   index directory; six new lines in the existing CLI.
 
 The attestation goes through the op log on `store-merge`, so
 the cloud store learns about every edge run by virtue of the
@@ -166,9 +206,16 @@ content-addressing makes the trace location-independent.
 
 ## Open follow-ups (file issues if/when you need them)
 
-- `AttestationKind::Trace { run_id, root_target }` variant
+- ~~`AttestationKind::Trace { run_id, root_target }` variant
   (Option B above), once you want to distinguish sandboxed runs
-  from generic trace-produced runs in `lex attest filter`.
+  from generic trace-produced runs in `lex attest filter`.~~
+  **Shipped in #246.**
+- **Ops-committed-during-a-run pipeline.** Today's `Trace`
+  attestation has `op_id: None` because `lex run --trace`
+  doesn't commit ops while a tracer is active. When agent
+  loops drive `lex publish` from inside a run, the emitter
+  should populate `op_id` so `lex trace --op <op_id>`
+  becomes useful.
 - Seed `RunId::new` with agent identity to harden against
   same-clock multi-edge deployments.
 - A `lex trace push <remote> --since T` convenience command
