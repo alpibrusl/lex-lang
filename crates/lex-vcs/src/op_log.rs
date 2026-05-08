@@ -63,6 +63,23 @@ impl OpLog {
         Ok(Some(rec))
     }
 
+    /// Remove a record from the log. Used by [`crate::migrate`] to
+    /// delete the old `<op_id>.json` files after a format migration
+    /// has written their replacements. Idempotent on missing files.
+    ///
+    /// **Not** part of the day-to-day op-log API — the log is
+    /// append-only by design (#129). The only legitimate caller is
+    /// the migration tool, which is supervising a destructive,
+    /// `--confirm`-gated batch.
+    pub fn delete(&self, op_id: &OpId) -> io::Result<()> {
+        let path = self.path(op_id);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Walk parents transitively. Newest-first, BFS, dedup'd by op_id.
     /// Stops at parentless ops or after `limit` records.
     pub fn walk_back(
