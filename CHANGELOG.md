@@ -5,6 +5,161 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [0.3.0] — 2026-05-08
+
+Stage signing, semantic search over the store, a stable binary
+canonical-AST format, refinement types end-to-end, a much larger
+stdlib, and an optimizer-pass track for agent runtimes. Minor
+bump because per-capability effect parameterization changes
+`EffectSet.concrete` and content-addressed closure identity
+changes `Value::Closure` — both API-visible.
+
+### Added — type system & spec-checker
+
+- **Refinement types end-to-end** (#209 slices 1+2+3). `{x: Int |
+  x > 0}` is a first-class type the spec-checker verifies at
+  gate time. Predicates compose, and a function whose return
+  type is refined carries the predicate into call sites.
+- **Spec-checker ADTs** (#208 slice 3). User-defined sum types
+  are consumable in spec bodies. The `Allow / Deny /
+  Inconclusive` verdict surface is unchanged.
+- **Bounded list quantifiers** (#208 slice 2). `forall x in xs,
+  P(x)` and `exists x in xs, P(x)` are evaluated eagerly by the
+  gate.
+- **Per-capability effect parameterization** (#207). Effect rows
+  carry argument lists, so `[net("wttr.in")]` and
+  `[net("api.internal")]` are statically distinguishable. Bare
+  `[name]` absorbs any `[name(...)]` (subsumption);
+  `[name(arg)]` matches only itself. `--allow-effects` accepts
+  bare (`mcp`), CLI-colon (`mcp:ocpp`), or canonical
+  (`mcp(ocpp)`) forms. `lex-vcs::EffectSet` preserves args
+  end-to-end (#223).
+
+### Added — canonical AST + signed stages
+
+- **Stable binary canonical-AST format** (#206 slice 1). New
+  encoder/decoder under `lex-ast`. Round-trip-stable, version-
+  prefixed, identity-preserving against the existing content-
+  addressed `AstId`.
+- **`lex canonical encode` / `lex canonical decode`** (#206
+  slices 2+3) and **`lex run --from-canonical FILE`** for
+  executing a canonical-AST file directly. Closes the loop
+  where an agent fetches an AST from one store and runs it
+  locally without ever materialising source.
+- **ed25519-signed stages** (#227). `lex publish --sign-with
+  KEYFILE` writes a detached signature into stage metadata.
+  **`lex run --from-store STAGE_ID`** with `--require-signed` /
+  `--trusted-key HEX` verifies before the AST is loaded;
+  tampered metadata fails fast even without `--require-signed`.
+  `--trusted-key` implies `--require-signed`.
+
+### Added — semantic search over the store (#224)
+
+New `lex-search` crate. Agents find stages by intent rather
+than by exact name.
+
+- **`lex store search "<query>"`** and **`lex audit --query
+  "<text>"`** rank active stages by fused cosine over
+  description / signature / examples (weights 0.5 / 0.3 / 0.2,
+  redistributed when a field is absent). Examples scoring uses
+  max-pool so one strong example anchors the stage.
+- **`MockEmbedder`** (slice 1) — deterministic SHA-256 bag-of-
+  words, L2-normalised, 64 dims. Keeps the test suite offline
+  and byte-stable.
+- **`HttpEmbedder`** (slice 2) — Ollama (`POST
+  /api/embeddings`, per-text) or OpenAI-compat (`POST
+  /v1/embeddings`, batched). `LEX_EMBED_URL`,
+  `LEX_EMBED_PROVIDER`, `LEX_EMBED_MODEL`, `LEX_EMBED_API_KEY`.
+- **`CachingEmbedder<E>`** — on-disk cache under
+  `<store>/search/embeddings/`, sharded by SHA-256 prefix and
+  fingerprinted by `provider:model` so swapping providers never
+  returns vectors of the wrong shape. Atomic temp+rename
+  writes; corrupt files fall back to a fresh upstream call.
+
+### Added — stdlib
+
+- **`std.cli`** (#240). Argparse-equivalent for end-user
+  programs: flags, options (`--name value` and `--name=value`),
+  positionals, subcommands with their own flag namespace, `--`
+  end-of-options, ACLI-shaped envelope, plus `cli.help` /
+  `cli.describe` introspection.
+- **`std.parser`** (#217). Structural parser combinators with
+  **`parser.map` / `parser.and_then`** (#221).
+- **`std.random`** (#219). Pure, seeded RNG. Same seed, same
+  sequence; no global state.
+- **`std.env`** (#216). Runtime env-var access through the
+  effect system.
+- **`std.math` extensions.** Trig, transcendentals, rounding,
+  and 2-argument forms (`atan2`, `pow`, …).
+- **`result.or_else` / `option.or_else`.** Recovery combinators
+  symmetric with `and_then`. `option.and_then`'s signature is
+  now registered with the type-checker.
+
+### Added — runtime correctness & optimizer (#231)
+
+- **Runtime budget enforcement** (#225). The `[budget(N)]`
+  effect is now enforced at every `Op::Call` / `Op::TailCall` /
+  `Op::CallClosure` via a new
+  `EffectHandler::note_call_budget(cost)` trait method.
+  `DefaultHandler` deducts atomically via CAS against an
+  `Arc<AtomicU64>` pool; a deduction that would underflow
+  returns `"budget exceeded: requested N, used so far M,
+  ceiling C"` *before* mutating the pool. Conservative
+  accounting — failed calls still consume their declared cost.
+  No ceiling = no enforcement, preserved.
+- **Dead-branch elimination on canonical AST** (#228). `match
+  LITERAL { … }` (and the desugared form of `if true { … }`)
+  folds to the live arm before type-checking, so effects that
+  lived only in dead code drop out of the inferred effect set.
+- **Memoization** and **retry+backoff** for retryable effects.
+- **Content-addressed closure identity** (#222). Two closures
+  with the same captured environment and body produce the same
+  `ClosureId` — automatic dedup across the store.
+- **Agents-only track** (#230). Stdlib batch + closure
+  canonicality + per-capability effects threaded through the
+  runtime path agent runtimes use.
+
+### Added — runtime ergonomics (#240)
+
+- **`str.slice` clamping.** Out-of-range bounds clamp to `[0,
+  s.len()]` (Python semantics for the common case);
+  mid-codepoint and `lo > hi` after clamping still error so
+  UTF-8 truncation can't sneak through silently.
+- **`parse_strict` nested required fields.** The required-
+  fields list accepts dotted paths (`"project.license"`, three-
+  level descent works) and `\.` for literal-dot field names.
+  Top-level case unchanged.
+
+### Added — parser & docs
+
+- **`_name` identifiers and `_` discard in `let`** (#200,
+  #205). `let _ = side_effect()` and `let _name = …` for
+  intentionally-unused bindings.
+- **Cross-compile recipes** (#198, #204) for aarch64 Linux and
+  Apple Silicon, plus a **post-publish release smoke test**
+  (#232) that runs the cross-compiled binaries in CI.
+
+### Changed
+
+- **`EffectSet.concrete` shape change** (#207, #223). Effect
+  rows now carry `EffectKind { name, arg: Option<EffectArg> }`
+  instead of bare `String`. `EffectSet::singleton(s)` keeps its
+  old signature (constructs a bare `EffectKind`); the new
+  `EffectSet::singleton_arg(name, arg)` constructs the
+  parameterized form. Downstream code reading raw effect rows
+  will see the new shape.
+- **`Value::Closure` shape change** (#222, #230). Closures now
+  carry a content-addressed identity. Code matching on
+  `Value::Closure` directly will need to update.
+- **Diagnostics name parameterized effects.** Policy violations
+  render `mcp("ocpp")` rather than just the bare kind.
+
+### Internal
+
+- Workspace bumped to 0.3.0; 39 inter-crate `version = "0.2.2"`
+  specifiers across `crates/*/Cargo.toml` updated together with
+  the workspace version.
+
 ## [0.2.2] — 2026-05-06
 
 Real wires for the `[llm_local]` and `[llm_cloud]` effects, plus
