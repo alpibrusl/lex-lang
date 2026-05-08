@@ -167,6 +167,84 @@ pub enum AttestationKind {
         actor: String,
         reason: String,
     },
+    /// Retroactive producer quarantine (#248). Declares "as of
+    /// `blocked_at`, attestations produced by `tool_id` are no
+    /// longer trusted; the branch advance gate must refuse to move
+    /// past any op whose attestations were produced by this tool
+    /// at or after `blocked_at`."
+    ///
+    /// Distinct from `policy.json`'s `blocked_producers` (#181):
+    /// that is a *forward-going* read-time tag for the activity
+    /// feed; this is a write-time gate on branch advance, retro-
+    /// active to a specific timestamp. The two compose cleanly —
+    /// `blocked_producers` filters what reviewers see; `ProducerBlock`
+    /// stops a compromised tool's history from being promoted past
+    /// a known-bad point.
+    ///
+    /// Stored at the attestation log under `stage_id == tool_id`
+    /// so the by-stage index doubles as a by-tool lookup for these
+    /// records — no schema break, no separate index needed.
+    /// `Attestation::stage_id` carries the `tool_id` for these
+    /// records; the variant payload duplicates it for clarity in
+    /// the JSON.
+    ProducerBlock {
+        tool_id: String,
+        reason: String,
+        blocked_at: u64,
+    },
+    /// Counterpart to [`AttestationKind::ProducerBlock`] (#248). The
+    /// attestation log is append-only, so revoking a producer block
+    /// is a separate, later fact rather than a delete. The branch
+    /// advance gate honors the most recent verdict for each
+    /// `tool_id` by timestamp.
+    ProducerUnblock {
+        tool_id: String,
+        reason: String,
+        unblocked_at: u64,
+    },
+}
+
+/// Walk a tool's `ProducerBlock` / `ProducerUnblock` attestations
+/// and return the active block timestamp, if any (#248). The
+/// attestation log is append-only, so a tool's state is whichever
+/// `ProducerBlock` / `ProducerUnblock` record has the latest
+/// `timestamp`. Returns `Some(blocked_at)` when the latest verdict
+/// is a `ProducerBlock` and `None` when the latest is an unblock or
+/// no verdict exists.
+///
+/// Ties: a `ProducerUnblock` at the same wall-clock second as a
+/// `ProducerBlock` wins, so re-running an unblock immediately after
+/// a block leaves the tool unblocked. Mirrors the tie-breaking in
+/// [`is_stage_blocked`].
+pub fn active_producer_block(
+    attestations: &[Attestation],
+    tool_id: &str,
+) -> Option<u64> {
+    let mut latest: Option<&Attestation> = None;
+    for a in attestations {
+        let matches = match &a.kind {
+            AttestationKind::ProducerBlock { tool_id: tid, .. }
+            | AttestationKind::ProducerUnblock { tool_id: tid, .. } => tid == tool_id,
+            _ => false,
+        };
+        if !matches {
+            continue;
+        }
+        match latest {
+            None => latest = Some(a),
+            Some(prev) if a.timestamp > prev.timestamp => latest = Some(a),
+            Some(prev) if a.timestamp == prev.timestamp
+                && matches!(a.kind, AttestationKind::ProducerUnblock { .. }) =>
+            {
+                latest = Some(a);
+            }
+            _ => {}
+        }
+    }
+    match latest.map(|a| &a.kind) {
+        Some(AttestationKind::ProducerBlock { blocked_at, .. }) => Some(*blocked_at),
+        _ => None,
+    }
 }
 
 /// Walk a stage's attestations and return whether the latest
