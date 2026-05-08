@@ -57,6 +57,14 @@ pub enum StageTransition {
     /// changed relative to the merge op's first parent (`dst_head`):
     /// `Some(stage_id)` sets the head; `None` removes the sig.
     /// Sigs unaffected by the merge are not listed.
+    ///
+    /// **Canonical-form contract:** `BTreeMap` is load-bearing —
+    /// iteration is sorted by `SigId`, so on-disk JSON for two
+    /// callers that resolved the same conflicts in different
+    /// orders produces byte-identical output. Switching to
+    /// `HashMap` here would break canonical stability of the
+    /// `OperationRecord` JSON file and is rejected by the
+    /// canonical-form spec in `crate::canonical`.
     Merge {
         entries: BTreeMap<SigId, Option<StageId>>,
     },
@@ -233,6 +241,18 @@ impl Operation {
     /// sorted parents, intent_id)` produces the same `OpId`. The
     /// invariant #129's automatic-dedup behavior relies on.
     pub fn op_id(&self) -> OpId {
+        canonical::hash_bytes(&self.canonical_bytes())
+    }
+
+    /// The byte sequence that gets hashed to produce [`Self::op_id`].
+    ///
+    /// Exposed (not just consumed by `op_id`) so golden tests can pin
+    /// the exact pre-image. **Not** equal to `serde_json::to_vec(&op)`
+    /// in general — the on-disk JSON skips empty `parents` and
+    /// `None` `intent_id`, while the canonical form always emits a
+    /// (sorted, deduped) `parents` array. See `canonical.rs` for the
+    /// full V1 canonical-form spec.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
         // Build a transient hashable view rather than hashing
         // `self` directly so the parent ordering is canonical
         // even if a caller hand-constructs an `Operation` with
@@ -242,7 +262,7 @@ impl Operation {
             parents: self.parents.iter().collect::<IndexSet<_>>().into_iter().collect::<BTreeSet<_>>(),
             intent_id: self.intent_id.as_deref(),
         };
-        canonical::hash(&canonical)
+        serde_json::to_vec(&canonical).expect("canonical serialization")
     }
 }
 
