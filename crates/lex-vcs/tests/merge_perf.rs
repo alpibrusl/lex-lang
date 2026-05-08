@@ -38,6 +38,7 @@ fn resolve_50_conflicts_in_one_batch_is_fast() {
                 sig_id: sig.clone(),
                 stage_id: stage.clone(),
                 effects: BTreeSet::new(),
+                budget_cost: None,
             },
             head.iter().cloned().collect::<Vec<_>>(),
         );
@@ -58,6 +59,8 @@ fn resolve_50_conflicts_in_one_batch_is_fast() {
                 sig_id: sig.clone(),
                 from_stage_id: from.clone(),
                 to_stage_id: to.clone(),
+                from_budget: None,
+            to_budget: None,
             },
             dst_head.iter().cloned().collect::<Vec<_>>(),
         );
@@ -77,6 +80,8 @@ fn resolve_50_conflicts_in_one_batch_is_fast() {
                 sig_id: sig.clone(),
                 from_stage_id: from.clone(),
                 to_stage_id: to.clone(),
+                from_budget: None,
+            to_budget: None,
             },
             src_head.iter().cloned().collect::<Vec<_>>(),
         );

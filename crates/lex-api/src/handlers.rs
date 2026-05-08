@@ -354,18 +354,31 @@ fn patch_handler(state: &State, body: &str) -> Response<std::io::Cursor<Vec<u8>>
         Err(e) => return error_response(500, format!("get_branch: {e}")),
     };
     let kind = if original_effects != patched_effects {
+        // #247: budget delta is part of the canonical payload now.
+        // Patch endpoints don't currently rehydrate the AST to
+        // recompute budgets, so leave them None — clients that
+        // need budget tracking should publish through the diff
+        // pipeline (`lex publish`) where `compute_diff` populates
+        // them.
+        let from_budget = lex_vcs::operation_budget_from_effects(&original_effects);
+        let to_budget = lex_vcs::operation_budget_from_effects(&patched_effects);
         lex_vcs::OperationKind::ChangeEffectSig {
             sig_id: sig.clone(),
             from_stage_id: req.stage_id.clone(),
             to_stage_id: new_id.clone(),
             from_effects: original_effects,
             to_effects: patched_effects,
+            from_budget,
+            to_budget,
         }
     } else {
+        let budget = lex_vcs::operation_budget_from_effects(&original_effects);
         lex_vcs::OperationKind::ModifyBody {
             sig_id: sig.clone(),
             from_stage_id: req.stage_id.clone(),
             to_stage_id: new_id.clone(),
+            from_budget: budget,
+            to_budget: budget,
         }
     };
     let transition = lex_vcs::StageTransition::Replace {

@@ -15,6 +15,7 @@ fn add(s: &Store, branch: &str, sig: &str, stg: &str) -> String {
             sig_id: sig.into(),
             stage_id: stg.into(),
             effects: BTreeSet::new(),
+            budget_cost: None,
         },
         s.get_branch(branch).unwrap().and_then(|b| b.head_op).into_iter().collect::<Vec<_>>(),
     );
@@ -29,6 +30,8 @@ fn modify(s: &Store, branch: &str, sig: &str, from: &str, to: &str) -> String {
             sig_id: sig.into(),
             from_stage_id: from.into(),
             to_stage_id: to.into(),
+            from_budget: None,
+            to_budget: None,
         },
         [parent],
     );

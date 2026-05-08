@@ -122,10 +122,20 @@ pub enum OperationKind {
     /// in the signature; tracked here (not just inside the stage)
     /// so #130's write-time gate has a cheap path to check effect
     /// changes without rehydrating the AST.
+    ///
+    /// `budget_cost` (#247) records the function's declared
+    /// `[budget(N)]` cost. Optional with `skip_serializing_if`, so
+    /// pre-#247 ops without a declared budget continue to hash to
+    /// their original `OpId` (additive serialization, same trick
+    /// `intent_id` uses). `None` means the function declared no
+    /// budget effect; `Some(n)` is the literal `n` from
+    /// `[budget(n)]`.
     AddFunction {
         sig_id: SigId,
         stage_id: StageId,
         effects: EffectSet,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        budget_cost: Option<u64>,
     },
     /// Function removed; `last_stage_id` is the head before the
     /// remove (so blame can walk the predecessor without scanning).
@@ -134,10 +144,21 @@ pub enum OperationKind {
         last_stage_id: StageId,
     },
     /// Function body changed; signature unchanged.
+    ///
+    /// `from_budget` / `to_budget` (#247) record the declared
+    /// `[budget(N)]` on each side. Same `Option` + `skip` discipline
+    /// as `AddFunction.budget_cost` — pre-#247 ops keep their
+    /// `OpId`s. The pair is what `lex op log --budget-drift` reads
+    /// to surface "budget grew/shrank" diffs without rehydrating
+    /// stages.
     ModifyBody {
         sig_id: SigId,
         from_stage_id: StageId,
         to_stage_id: StageId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_budget: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_budget: Option<u64>,
     },
     /// Symbol renamed. The body hash is preserved (`body_stage_id`)
     /// so two renames of the same body collapse to the same OpId
@@ -151,12 +172,21 @@ pub enum OperationKind {
     /// Effect signature changed. Captures both old and new effect
     /// sets so the write-time gate (#130) can verify importers
     /// haven't silently broken.
+    ///
+    /// `from_budget` / `to_budget` (#247) capture the declared
+    /// `[budget(N)]` on each side. ChangeEffectSig usually fires
+    /// because the effect *list* changed; #247 makes budget drift
+    /// visible without forcing a full effect-set diff.
     ChangeEffectSig {
         sig_id: SigId,
         from_stage_id: StageId,
         to_stage_id: StageId,
         from_effects: EffectSet,
         to_effects: EffectSet,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_budget: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_budget: Option<u64>,
     },
     /// Import added to a file. `in_file` is the canonical path
     /// (relative to the repo root, forward-slashes) so two
@@ -221,6 +251,58 @@ impl OperationKind {
             AddImport { .. } | RemoveImport { .. } | Merge { .. } => None,
         }
     }
+
+    /// `(from_budget, to_budget)` for ops that carry a budget delta
+    /// (#247). `(None, None)` for ops where the budget isn't part
+    /// of the canonical payload — `RemoveFunction`, `RenameSymbol`,
+    /// imports, and merges. `AddFunction` reports `(None,
+    /// Some(cost))` for "this is the initial cost." Used by `lex op
+    /// show`, `lex op log --budget-drift`, and `lex audit --budget`.
+    pub fn budget_delta(&self) -> (Option<u64>, Option<u64>) {
+        use OperationKind::*;
+        match self {
+            AddFunction { budget_cost, .. } => (None, *budget_cost),
+            ModifyBody { from_budget, to_budget, .. }
+            | ChangeEffectSig { from_budget, to_budget, .. } => (*from_budget, *to_budget),
+            _ => (None, None),
+        }
+    }
+
+    /// The `SigId` an op touches if it carries a budget — used for
+    /// per-sig audit rollups in `lex audit --budget`. Returns `None`
+    /// for ops without a relevant budget (the same set as the
+    /// `_ => (None, None)` arm of [`Self::budget_delta`]).
+    pub fn budget_sig(&self) -> Option<&SigId> {
+        use OperationKind::*;
+        match self {
+            AddFunction { sig_id, .. }
+            | ModifyBody { sig_id, .. }
+            | ChangeEffectSig { sig_id, .. } => Some(sig_id),
+            _ => None,
+        }
+    }
+}
+
+/// Extract the declared `[budget(N)]` integer from an [`EffectSet`],
+/// if any (#247).
+///
+/// Effect labels in [`EffectSet`] are produced by
+/// [`crate::compute_diff::effect_label`]: a `[budget(50)]`
+/// declaration becomes the literal string `"budget(50)"`. This
+/// helper parses that literal back to the integer; bare `"budget"`
+/// (no arg) returns `None` because the magnitude is unknown. A
+/// stage with multiple budget declarations — which the type-
+/// checker should reject anyway — picks the smallest, conservative
+/// answer for `lex audit --budget`.
+pub fn budget_from_effects(effects: &EffectSet) -> Option<u64> {
+    let mut min_cost: Option<u64> = None;
+    for label in effects {
+        let Some(rest) = label.strip_prefix("budget(") else { continue };
+        let Some(inner) = rest.strip_suffix(')') else { continue };
+        let Ok(n) = inner.parse::<u64>() else { continue };
+        min_cost = Some(min_cost.map(|c| c.min(n)).unwrap_or(n));
+    }
+    min_cost
 }
 
 /// The operation as a whole — its kind and the causal predecessors
@@ -388,6 +470,7 @@ mod tests {
             sig_id: "fac::Int->Int".into(),
             stage_id: "abc123".into(),
             effects: BTreeSet::new(),
+            budget_cost: None,
         }
     }
 
@@ -406,6 +489,7 @@ mod tests {
                 sig_id: "double::Int->Int".into(),
                 stage_id: "abc123".into(),
                 effects: BTreeSet::new(),
+                budget_cost: None,
             },
             [],
         );
@@ -483,6 +567,7 @@ mod tests {
                 sig_id: "parse_int::Str->Int".into(),
                 stage_id: "abc123".into(),
                 effects: BTreeSet::new(),
+                budget_cost: None,
             },
             ["op-parent".into()],
         );
@@ -500,12 +585,14 @@ mod tests {
         let a = Operation::new(
             OperationKind::AddFunction {
                 sig_id: "x".into(), stage_id: "s".into(), effects: a_effects,
+                budget_cost: None,
             },
             [],
         );
         let b = Operation::new(
             OperationKind::AddFunction {
                 sig_id: "x".into(), stage_id: "s".into(), effects: b_effects,
+                budget_cost: None,
             },
             [],
         );
@@ -528,6 +615,8 @@ mod tests {
                 to_stage_id: "new".into(),
                 from_effects: BTreeSet::new(),
                 to_effects: ["io".into()].into_iter().collect(),
+                from_budget: None,
+                to_budget: None,
             },
             ["op-parent".into()],
         );
@@ -603,6 +692,7 @@ mod tests {
                 sig_id: "fac::Int->Int".into(),
                 stage_id: "abc123".into(),
                 effects: BTreeSet::new(),
+                budget_cost: None,
             },
             [],
         );

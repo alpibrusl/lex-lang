@@ -218,6 +218,7 @@ mod tests {
                 sig_id: "fac::Int->Int".into(),
                 stage_id: "abc123".into(),
                 effects: BTreeSet::new(),
+                budget_cost: None,
             },
             [],
         );
@@ -236,6 +237,8 @@ mod tests {
                 sig_id: sig.into(),
                 from_stage_id: from.into(),
                 to_stage_id: to.into(),
+                from_budget: None,
+                to_budget: None,
             },
             [parent.clone()],
         );
@@ -337,6 +340,7 @@ mod tests {
                     sig_id: "double::Int->Int".into(),
                     stage_id: "ddd111".into(),
                     effects: BTreeSet::new(),
+                    budget_cost: None,
                 },
                 [],
             ),
@@ -397,6 +401,8 @@ mod tests {
                     sig_id: "double::Int->Int".into(),
                     from_stage_id: "ddd000".into(),
                     to_stage_id: "c1".into(),
+                    from_budget: None,
+                    to_budget: None,
                 },
                 [a.op_id.clone()],
             ),

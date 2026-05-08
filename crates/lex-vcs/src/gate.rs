@@ -101,6 +101,7 @@ mod tests {
                 sig_id: "fac".into(),
                 stage_id: "s1".into(),
                 effects: BTreeSet::new(),
+                budget_cost: None,
             },
             [],
         );
@@ -188,6 +189,8 @@ mod tests {
                 sig_id: "fac".into(),
                 from_stage_id: "s1".into(),
                 to_stage_id: "s2".into(),
+                from_budget: None,
+                to_budget: None,
             },
             ["someone-else".into()],
         );
