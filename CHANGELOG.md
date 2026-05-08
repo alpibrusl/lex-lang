@@ -5,7 +5,17 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
-## [Unreleased]
+## [0.4.0] — 2026-05-08
+
+The agent-VCS roadmap. Closes the seven gaps from the lex-vcs
+review: a positive attestation-gate on branch advance, retroactive
+producer quarantine, an op-log ↔ trace link, cost accounting on
+ops, append-only sync over HTTP, plus the foundational OpId
+stability spec and operation format versioning that already
+shipped in 0.3.0's tail. Minor bump because every change is
+additive at the data layer (Option fields with
+`skip_serializing_if`, new enum variants, new endpoints) — no
+existing OpId rotates and no on-disk record changes shape.
 
 ### Added — agent-VCS roadmap (#248)
 
