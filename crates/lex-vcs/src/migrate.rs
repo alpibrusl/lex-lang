@@ -280,6 +280,7 @@ mod tests {
                     sig_id: sig.into(),
                     stage_id: stg.into(),
                     effects: BTreeSet::new(),
+                    budget_cost: None,
                 },
                 parents,
             ),

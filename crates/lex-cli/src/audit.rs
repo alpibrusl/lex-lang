@@ -56,6 +56,11 @@ struct AuditOpts {
     query: Option<String>,
     /// Top-K cap for `--query` results.
     limit: usize,
+    /// `--budget` (#247). Walk the op log on the current branch
+    /// and surface per-sig budget history: every change in
+    /// declared `[budget(N)]` cost across the chain. Mutually
+    /// exclusive with `--query`.
+    budget_history: bool,
 }
 
 #[derive(Serialize)]
@@ -77,11 +82,17 @@ struct AuditReport {
 pub fn cmd_audit(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let mut opts = parse_audit_args(args)?;
     if matches!(fmt, OutputFormat::Json) { opts.json = true; }
+    if opts.query.is_some() && opts.budget_history {
+        return Err(anyhow!("--query and --budget are mutually exclusive"));
+    }
+    if opts.budget_history {
+        return cmd_audit_budget(fmt, &opts);
+    }
     if opts.query.is_some() {
         return cmd_audit_semantic(fmt, &opts);
     }
     if opts.paths.is_empty() {
-        return Err(anyhow!("usage: lex audit [paths...] [--effect KIND] [--calls FN] [--uses-host HOST] [--kind NODE] [--query Q] [--json]"));
+        return Err(anyhow!("usage: lex audit [paths...] [--effect KIND] [--calls FN] [--uses-host HOST] [--kind NODE] [--query Q] [--budget] [--json]"));
     }
     let files = collect_lex_files(&opts.paths)?;
     let mut report = AuditReport { summary: BTreeMap::new(), hits: Vec::new() };
@@ -256,6 +267,7 @@ fn parse_audit_args(args: &[String]) -> Result<AuditOpts> {
                 o.limit = v.parse().with_context(|| format!("--limit must be a positive integer (got `{v}`)"))?;
                 i += 2;
             }
+            "--budget" => { o.budget_history = true; i += 1; }
             other => { o.paths.push(PathBuf::from(other)); i += 1; }
         }
     }
@@ -498,6 +510,103 @@ fn render_type(t: &TypeExpr) -> String {
             format!("{}{{{} | …}}", render_type(base), binding)
         }
     }
+}
+
+// ---- #247 budget history ------------------------------------------
+
+/// `lex audit --budget` mode. Walks the op log on the current
+/// branch, groups ops by `SigId`, and reports per-sig budget
+/// history: the chronological list of `[budget(N)]` declarations
+/// derived from `AddFunction.budget_cost`, `ModifyBody`/
+/// `ChangeEffectSig.{from,to}_budget`. Output is one row per sig
+/// with the current cost and the chain of changes; flat JSON
+/// envelope under `--output json` for agent consumers.
+fn cmd_audit_budget(fmt: &OutputFormat, opts: &AuditOpts) -> Result<()> {
+    let root = opts.store_root.clone()
+        .unwrap_or_else(default_store_root);
+    let store = lex_store::Store::open(&root)
+        .with_context(|| format!("opening store at {}", root.display()))?;
+    let branch = store.current_branch();
+    let head = store.get_branch(&branch)?
+        .and_then(|b| b.head_op);
+    let log = lex_vcs::OpLog::open(&root)?;
+    // Walk the chain oldest-first so the per-sig history reads in
+    // the order changes were made.
+    let recs = match head {
+        Some(h) => log.walk_forward(&h, None)?,
+        None => Vec::new(),
+    };
+
+    // Per-sig change list: each entry is `(op_id, from, to)`.
+    type BudgetChange = (String, Option<u64>, Option<u64>);
+    let mut by_sig: BTreeMap<String, Vec<BudgetChange>> = BTreeMap::new();
+    for r in &recs {
+        let Some(sig) = r.op.kind.budget_sig().cloned() else { continue };
+        let (from, to) = r.op.kind.budget_delta();
+        if from.is_none() && to.is_none() {
+            continue;
+        }
+        by_sig.entry(sig).or_default().push((r.op_id.clone(), from, to));
+    }
+
+    let sigs_json: Vec<serde_json::Value> = by_sig
+        .iter()
+        .map(|(sig, history)| {
+            let current = history.last().and_then(|(_, _, to)| *to);
+            let initial = history.first().and_then(|(_, from, to)| from.or(*to));
+            let history_json: Vec<serde_json::Value> = history.iter().map(|(op_id, from, to)| {
+                serde_json::json!({
+                    "op_id": op_id,
+                    "from": from,
+                    "to": to,
+                })
+            }).collect();
+            serde_json::json!({
+                "sig_id": sig,
+                "initial_budget": initial,
+                "current_budget": current,
+                "changes": history_json,
+            })
+        })
+        .collect();
+    let data = serde_json::json!({
+        "branch": branch,
+        "sigs": sigs_json,
+    });
+    let printable = by_sig.clone();
+    acli_mod::emit_or_text("audit", data, fmt, move || {
+        if printable.is_empty() {
+            println!("(no budget-bearing ops on `{branch}`)");
+            return;
+        }
+        for (sig, history) in &printable {
+            let initial = history.first().and_then(|(_, from, to)| from.or(*to));
+            let current = history.last().and_then(|(_, _, to)| *to);
+            println!("{sig}");
+            match (initial, current) {
+                (Some(i), Some(c)) if i == c => println!("    budget: {i} (unchanged)"),
+                (Some(i), Some(c)) => {
+                    let pct = crate::op::budget_pct(i, c);
+                    let sign = if c >= i { "+" } else { "" };
+                    println!("    budget: {i} → {c} ({sign}{pct:.1}%)");
+                }
+                (None, Some(c)) => println!("    budget: → {c}"),
+                _ => println!("    budget: (variable)"),
+            }
+            for (op_id, from, to) in history {
+                let label = match (from, to) {
+                    (None, Some(t)) => format!("→ {t}"),
+                    (Some(f), Some(t)) if f == t => format!("{f} (unchanged)"),
+                    (Some(f), Some(t)) => format!("{f} → {t}"),
+                    (Some(f), None) => format!("{f} → (unset)"),
+                    (None, None) => "?".into(),
+                };
+                println!("      {op_id:.16}…  {label}");
+            }
+            println!();
+        }
+    });
+    Ok(())
 }
 
 // ---- #224 semantic search ----------------------------------------

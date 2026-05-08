@@ -42,6 +42,7 @@ fn add_function() -> Operation {
             sig_id: "fac::Int->Int".into(),
             stage_id: "abc123".into(),
             effects: empty_effects(),
+            budget_cost: None,
         },
         [],
     )
@@ -63,6 +64,8 @@ fn modify_body() -> Operation {
             sig_id: "fac::Int->Int".into(),
             from_stage_id: "abc123".into(),
             to_stage_id: "def456".into(),
+            from_budget: None,
+            to_budget: None,
         },
         ["op-parent".into()],
     )
@@ -89,6 +92,8 @@ fn change_effect_sig() -> Operation {
             to_stage_id: "new".into(),
             from_effects: from,
             to_effects: to,
+            from_budget: None,
+            to_budget: None,
         },
         ["op-parent".into()],
     )
@@ -127,6 +132,7 @@ fn add_function_with_intent() -> Operation {
             sig_id: "fac::Int->Int".into(),
             stage_id: "abc123".into(),
             effects: empty_effects(),
+            budget_cost: None,
         },
         [],
     )
@@ -146,6 +152,7 @@ fn add_function_parameterized_effect() -> Operation {
             sig_id: "fetch_weather::Str->Str".into(),
             stage_id: "stage-w-1".into(),
             effects,
+            budget_cost: None,
         },
         ["op-parent".into()],
     )

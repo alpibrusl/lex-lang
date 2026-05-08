@@ -50,6 +50,7 @@ fn corpus() -> Vec<OperationKind> {
                     sig_id: sig.into(),
                     stage_id: stage.into(),
                     effects: eff.clone(),
+                    budget_cost: None,
                 });
             }
             out.push(OperationKind::RemoveFunction {
@@ -60,6 +61,8 @@ fn corpus() -> Vec<OperationKind> {
                 sig_id: sig.into(),
                 from_stage_id: stage.into(),
                 to_stage_id: format!("{stage}-next"),
+                from_budget: None,
+                to_budget: None,
             });
             out.push(OperationKind::AddType {
                 sig_id: sig.into(),
@@ -100,6 +103,8 @@ fn corpus() -> Vec<OperationKind> {
                     to_stage_id: "s-new".into(),
                     from_effects: from_eff.clone(),
                     to_effects: to_eff.clone(),
+                    from_budget: None,
+            to_budget: None,
                 });
             }
         }
@@ -234,6 +239,7 @@ fn op_id_is_independent_of_effect_insertion_order() {
                 sig_id: "f".into(),
                 stage_id: "s".into(),
                 effects,
+                budget_cost: None,
             },
             ["op-parent".into()],
         )

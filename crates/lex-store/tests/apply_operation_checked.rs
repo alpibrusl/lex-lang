@@ -27,6 +27,7 @@ fn add_fac_op() -> (Operation, StageTransition) {
             sig_id: "fac".into(),
             stage_id: "stg-1".into(),
             effects: BTreeSet::new(),
+            budget_cost: None,
         },
         [],
     );
@@ -106,6 +107,8 @@ fn apply_operation_checked_does_not_advance_head_after_rejection() {
             sig_id: "fac".into(),
             from_stage_id: "stg-1".into(),
             to_stage_id: "stg-2".into(),
+            from_budget: None,
+            to_budget: None,
         },
         [head1.clone()],
     );
@@ -246,6 +249,8 @@ fn apply_operation_checked_propagates_apply_errors() {
             sig_id: "fac".into(),
             from_stage_id: "stg-1".into(),
             to_stage_id: "stg-2".into(),
+            from_budget: None,
+            to_budget: None,
         },
         ["someone-else".into()],
     );
