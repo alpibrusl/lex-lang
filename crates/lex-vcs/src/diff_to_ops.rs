@@ -130,8 +130,13 @@ pub fn diff_to_ops(inputs: DiffInputs<'_>) -> Result<Vec<OperationKind>, DiffMap
         match stage {
             Stage::FnDecl(fd) => {
                 let effects = effect_set(&fd.effects);
+                // #247: extract the function's declared `[budget(N)]`
+                // from its effect set so the op log carries the
+                // initial cost without rehydrating the stage at
+                // query time.
+                let budget_cost = crate::operation::budget_from_effects(&effects);
                 out.push(OperationKind::AddFunction {
-                    sig_id: sig, stage_id: stg, effects,
+                    sig_id: sig, stage_id: stg, effects, budget_cost,
                 });
             }
             Stage::TypeDecl(_) => {
@@ -182,19 +187,35 @@ pub fn diff_to_ops(inputs: DiffInputs<'_>) -> Result<Vec<OperationKind>, DiffMap
             Stage::FnDecl(fd) if effects_changed => {
                 let from_effects = inputs.old_effects.get(sig).cloned().unwrap_or_default();
                 let to_effects = effect_set(&fd.effects);
+                // #247: the budget delta. ChangeEffectSig fires
+                // because the effect set changed, which often
+                // includes the `[budget(N)]` declaration itself.
+                let from_budget = crate::operation::budget_from_effects(&from_effects);
+                let to_budget = crate::operation::budget_from_effects(&to_effects);
                 out.push(OperationKind::ChangeEffectSig {
                     sig_id: sig.clone(),
                     from_stage_id: from_id.clone(),
                     to_stage_id: to_id,
                     from_effects,
                     to_effects,
+                    from_budget,
+                    to_budget,
                 });
             }
-            Stage::FnDecl(_) => {
+            Stage::FnDecl(fd) => {
+                // #247: ModifyBody fires when only the body changed
+                // — effects (including budget) are unchanged. Pull
+                // the budget from the new stage's effect set; the
+                // old effect set in `old_effects[sig]` would yield
+                // the same value.
+                let to_effects = effect_set(&fd.effects);
+                let budget = crate::operation::budget_from_effects(&to_effects);
                 out.push(OperationKind::ModifyBody {
                     sig_id: sig.clone(),
                     from_stage_id: from_id.clone(),
                     to_stage_id: to_id,
+                    from_budget: budget,
+                    to_budget: budget,
                 });
             }
             Stage::TypeDecl(_) => {
@@ -337,7 +358,7 @@ mod tests {
         }).expect("ok");
         assert_eq!(ops.len(), 1);
         match &ops[0] {
-            OperationKind::ModifyBody { sig_id: s, from_stage_id, to_stage_id } => {
+            OperationKind::ModifyBody { sig_id: s, from_stage_id, to_stage_id, .. } => {
                 assert_eq!(s, &sig);
                 assert_eq!(from_stage_id, "old-stage-id");
                 assert_eq!(to_stage_id, &new_stg);

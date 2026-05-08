@@ -7,6 +7,39 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added — agent-VCS roadmap (#247)
+
+- **Cost accounting on ops** (#247). Three `OperationKind`
+  variants gain optional budget fields:
+  - `AddFunction { …, budget_cost: Option<u64> }`
+  - `ModifyBody { …, from_budget: Option<u64>, to_budget:
+    Option<u64> }`
+  - `ChangeEffectSig { …, from_budget: Option<u64>, to_budget:
+    Option<u64> }`
+
+  All use `#[serde(default, skip_serializing_if =
+  "Option::is_none")]` — same trick that `intent_id` (#131) used —
+  so pre-#247 ops without a declared budget keep byte-identical
+  canonical bytes and their existing `OpId`s. The golden test
+  from #243 still passes against the unchanged hash.
+- **`budget_from_effects(effect_set)`** parser. Pulls the literal
+  `n` out of `"budget(n)"` labels in an `EffectSet`. `compute_diff`
+  uses it to populate the new fields end-to-end so the op log
+  records the budget the type-checker saw, without rehydrating
+  stages at query time.
+- **`lex op show`** renders a `cost: 50 → 100 (+100%)` line for
+  ops that carry a budget delta. `from → to (signed-pct%)`,
+  `→ N` for an Add, `N → (unset)` when the budget disappears,
+  `N → N (no change)` for ModifyBody where only the body moved.
+- **`lex op log --budget-drift [PCT]`** filters the log to ops
+  whose declared `[budget]` cost grew or shrank by at least
+  `PCT` percent (default 10%). Each kept row carries a
+  `budget_drift_pct` field in the JSON output.
+- **`lex audit --budget`** walks the op DAG on the current
+  branch and reports per-`SigId` budget history: initial cost,
+  current cost, and the chain of `(op_id, from, to)` changes.
+  JSON envelope under `--output json` for agent consumers.
+
 ### Added — agent-VCS roadmap (#244)
 
 - **`OperationFormat` enum + version-aware canonical encoder**

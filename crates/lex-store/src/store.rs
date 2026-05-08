@@ -788,7 +788,7 @@ fn transition_for_kind(kind: &lex_vcs::OperationKind) -> lex_vcs::StageTransitio
         | RemoveType { sig_id, last_stage_id } => StageTransition::Remove {
             sig_id: sig_id.clone(), last: last_stage_id.clone(),
         },
-        ModifyBody { sig_id, from_stage_id, to_stage_id }
+        ModifyBody { sig_id, from_stage_id, to_stage_id, .. }
         | ChangeEffectSig { sig_id, from_stage_id, to_stage_id, .. }
         | ModifyType { sig_id, from_stage_id, to_stage_id } => StageTransition::Replace {
             sig_id: sig_id.clone(),

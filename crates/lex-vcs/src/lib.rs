@@ -63,6 +63,6 @@ pub use predicate::{evaluate, evaluate_with_resolver, IntentResolver, Predicate}
 pub use signing::{verify_stage_id, Keypair, SigningError};
 pub use op_log::OpLog;
 pub use operation::{
-    EffectSet, ModuleRef, OpId, Operation, OperationFormat, OperationKind, OperationRecord, SigId,
-    StageId, StageTransition,
+    budget_from_effects as operation_budget_from_effects, EffectSet, ModuleRef, OpId, Operation,
+    OperationFormat, OperationKind, OperationRecord, SigId, StageId, StageTransition,
 };

@@ -18,6 +18,7 @@ fn apply_operation_advances_head_on_main() {
             sig_id: "fac".into(),
             stage_id: "stg-1".into(),
             effects: BTreeSet::new(),
+            budget_cost: None,
         },
         [],
     );
@@ -42,6 +43,7 @@ fn apply_operation_chains_against_existing_head() {
             sig_id: "fac".into(),
             stage_id: "stg-1".into(),
             effects: BTreeSet::new(),
+            budget_cost: None,
         },
         [],
     );
@@ -53,6 +55,8 @@ fn apply_operation_chains_against_existing_head() {
             sig_id: "fac".into(),
             from_stage_id: "stg-1".into(),
             to_stage_id: "stg-2".into(),
+            from_budget: None,
+            to_budget: None,
         },
         [op_id1.clone()],
     );
@@ -72,6 +76,7 @@ fn apply_operation_with_stale_parent_errors() {
             sig_id: "fac".into(),
             stage_id: "stg-1".into(),
             effects: BTreeSet::new(),
+            budget_cost: None,
         },
         [],
     );
@@ -84,6 +89,8 @@ fn apply_operation_with_stale_parent_errors() {
             sig_id: "fac".into(),
             from_stage_id: "stg-1".into(),
             to_stage_id: "stg-2".into(),
+            from_budget: None,
+            to_budget: None,
         },
         ["someone-else".into()],
     );
@@ -104,6 +111,7 @@ fn apply_operation_against_unknown_branch_does_not_persist() {
             sig_id: "fac".into(),
             stage_id: "stg-1".into(),
             effects: BTreeSet::new(),
+            budget_cost: None,
         },
         [],
     );

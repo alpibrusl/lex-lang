@@ -246,6 +246,7 @@ mod tests {
                 sig_id: sig.into(),
                 stage_id: stg.into(),
                 effects: BTreeSet::new(),
+                budget_cost: None,
             },
             parent.cloned().into_iter().collect::<Vec<_>>(),
         );
@@ -259,6 +260,8 @@ mod tests {
                 sig_id: sig.into(),
                 from_stage_id: from.into(),
                 to_stage_id: to.into(),
+                from_budget: None,
+                to_budget: None,
             },
             [parent.clone()],
         );

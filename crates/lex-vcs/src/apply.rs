@@ -88,6 +88,7 @@ mod tests {
                 sig_id: "fac".into(),
                 stage_id: "s1".into(),
                 effects: BTreeSet::new(),
+                budget_cost: None,
             },
             [],
         );
@@ -135,6 +136,8 @@ mod tests {
                 sig_id: "fac".into(),
                 from_stage_id: "s1".into(),
                 to_stage_id: "s2".into(),
+                from_budget: None,
+                to_budget: None,
             },
             [head1.op_id.clone()],
         );
@@ -158,6 +161,8 @@ mod tests {
                 sig_id: "fac".into(),
                 from_stage_id: "s1".into(),
                 to_stage_id: "s2".into(),
+                from_budget: None,
+                to_budget: None,
             },
             ["someone-else".into()],
         );
@@ -187,6 +192,7 @@ mod tests {
                 sig_id: "double".into(),
                 stage_id: "d1".into(),
                 effects: BTreeSet::new(),
+                budget_cost: None,
             },
             [],
         );
@@ -241,6 +247,8 @@ mod tests {
                 sig_id: "fac".into(),
                 from_stage_id: "s1".into(),
                 to_stage_id: "s2".into(),
+                from_budget: None,
+                to_budget: None,
             },
             [head_a.op_id.clone(), "p2".into(), "p3".into()],
         );
@@ -261,6 +269,8 @@ mod tests {
                 sig_id: "fac".into(),
                 from_stage_id: "s1".into(),
                 to_stage_id: "s2".into(),
+                from_budget: None,
+                to_budget: None,
             },
             ["claimed-parent".into()],
         );
