@@ -40,6 +40,17 @@ pub enum StoreError {
     /// type-broken publish leaves no footprint.
     #[error("type errors in published program: {} error(s)", .0.len())]
     TypeError(Vec<lex_types::TypeError>),
+    /// The op was persisted but a `required_attestations` rule in
+    /// `policy.json` (#245) refused to advance the branch head past
+    /// it. The op record is durable — re-running with the missing
+    /// attestations recorded will succeed without re-persisting —
+    /// but the branch is unchanged. Surfaced as a structured JSON
+    /// envelope on the HTTP API.
+    #[error(
+        "branch advance blocked: op {} missing attestations: {}",
+        .0.op_id, .0.missing.join(", ")
+    )]
+    BranchAdvanceBlocked(crate::policy::BranchAdvanceBlocked),
 }
 
 /// The outcome returned by [`Store::publish_program`].
@@ -671,10 +682,17 @@ impl Store {
         if let Err(errors) = lex_types::check_program(candidate) {
             return Err(StoreError::TypeError(errors));
         }
+        // Persist the op without advancing the branch head — we want
+        // the TypeCheck attestation visible *before* the gate runs,
+        // so policies that require TypeCheck pass for newly-typed
+        // ops. Then gate, then advance.
         let attestable = attestable_stage_ids(&transition);
-        let op_id = self.apply_operation(branch, op, transition)?;
-        self.record_typecheck_passed(&attestable, &op_id)?;
-        Ok(op_id)
+        let op_effects = op_declared_effects(&op.kind);
+        let new_head = self.persist_op_only(branch, op, transition)?;
+        self.record_typecheck_passed(&attestable, &new_head.op_id)?;
+        self.run_required_attestations_gate(&new_head.op_id, &attestable, &op_effects)?;
+        self.set_branch_head_op(branch, new_head.op_id.clone())?;
+        Ok(new_head.op_id)
     }
 
     /// Open the attestation log rooted at this store. The log lives
@@ -731,6 +749,34 @@ impl Store {
         op: lex_vcs::Operation,
         transition: lex_vcs::StageTransition,
     ) -> Result<lex_vcs::OpId, StoreError> {
+        let attestable = attestable_stage_ids(&transition);
+        let op_effects = op_declared_effects(&op.kind);
+        let new_head = self.persist_op_only(branch, op, transition)?;
+        // The unchecked path doesn't auto-emit TypeCheck, so a
+        // policy requiring TypeCheck (or any other attestation) on
+        // ops with attestable stages will refuse to advance the
+        // branch unless the caller emitted the attestation
+        // separately first. This is the intended behavior — the
+        // unchecked path opts out of the safety net the gate
+        // depends on.
+        self.run_required_attestations_gate(&new_head.op_id, &attestable, &op_effects)?;
+        self.set_branch_head_op(branch, new_head.op_id.clone())?;
+        Ok(new_head.op_id)
+    }
+
+    /// Persist an op via [`lex_vcs::apply`] but do NOT advance the
+    /// branch head. Internal to the apply pipeline so
+    /// `apply_operation` and `apply_operation_checked` share the
+    /// pre-check + persist sequence without duplicating the
+    /// validation code. The TypeCheck attestation and the
+    /// `required_attestations` gate slot in between this and the
+    /// final `set_branch_head_op` call.
+    fn persist_op_only(
+        &self,
+        branch: &str,
+        op: lex_vcs::Operation,
+        transition: lex_vcs::StageTransition,
+    ) -> Result<lex_vcs::NewHead, StoreError> {
         // Pre-check: refuse to persist any op against a branch that
         // doesn't exist. Without this, applying against a non-default
         // ghost branch would write the op record (succeeding via
@@ -742,13 +788,48 @@ impl Store {
         }
         let log = lex_vcs::OpLog::open(self.root())?;
         let head_op = self.get_branch(branch)?.and_then(|b| b.head_op);
-        let new_head = lex_vcs::apply(&log, head_op.as_ref(), op, transition)
-            .map_err(|e| match e {
-                lex_vcs::ApplyError::Persist(io) => StoreError::Io(io),
-                other => StoreError::Apply(other),
-            })?;
-        self.set_branch_head_op(branch, new_head.op_id.clone())?;
-        Ok(new_head.op_id)
+        lex_vcs::apply(&log, head_op.as_ref(), op, transition).map_err(|e| match e {
+            lex_vcs::ApplyError::Persist(io) => StoreError::Io(io),
+            other => StoreError::Apply(other),
+        })
+    }
+
+    /// Run the `required_attestations` gate (#245) over a single op
+    /// against the store's `policy.json`. Surfaces a
+    /// `BranchAdvanceBlocked` error if any required attestation is
+    /// missing for any of the op's attestable stages. Loads the
+    /// policy and the attestation log lazily; if no policy file
+    /// exists, the gate is a no-op (default-permissive behavior
+    /// matches pre-#245 stores).
+    fn run_required_attestations_gate(
+        &self,
+        op_id: &lex_vcs::OpId,
+        stage_ids: &[String],
+        op_effects: &std::collections::BTreeSet<String>,
+    ) -> Result<(), StoreError> {
+        let policy = match crate::policy::load(self.root())? {
+            Some(p) if !p.required_attestations.is_empty() => p,
+            // No file or no rules — gate is a no-op, return
+            // immediately. Avoids opening the attestation log when
+            // there's nothing to check.
+            _ => return Ok(()),
+        };
+        let attest_log = self.attestation_log()?;
+        // One tuple per stage the op touches. Ops with no
+        // attestable stage (imports, empty merges) get a single
+        // `None`-stage tuple, and the gate skips those — there's
+        // nothing to attest.
+        let candidate: Vec<(lex_vcs::OpId, Option<String>, std::collections::BTreeSet<String>)> =
+            if stage_ids.is_empty() {
+                vec![(op_id.clone(), None, op_effects.clone())]
+            } else {
+                stage_ids
+                    .iter()
+                    .map(|sid| (op_id.clone(), Some(sid.clone()), op_effects.clone()))
+                    .collect()
+            };
+        crate::policy::check_required_attestations(&attest_log, &candidate, &policy)
+            .map_err(StoreError::BranchAdvanceBlocked)
     }
 }
 
@@ -822,6 +903,25 @@ fn typecheck_producer() -> lex_vcs::ProducerDescriptor {
 /// sig resolution of a Merge. Removes and ImportOnly produce no
 /// attestable stage; the program typechecks but no specific stage
 /// is the subject of the claim.
+/// Effect set declared *by the operation itself* (#245). Used by
+/// the `required_attestations` gate's `EffectsIntersect` clause.
+///
+/// Only `AddFunction` and `ChangeEffectSig` carry an effect set in
+/// their op payload; for everything else this returns the empty
+/// set, which means `EffectsIntersect` rules don't fire on those
+/// ops. `Always` rules continue to fire regardless. A future
+/// improvement is to extract effects from the candidate `Stage`
+/// for `ModifyBody` ops, but the typed-effects-on-ops path (#247)
+/// is the cleaner solution and lands separately.
+fn op_declared_effects(kind: &lex_vcs::OperationKind) -> std::collections::BTreeSet<String> {
+    use lex_vcs::OperationKind::*;
+    match kind {
+        AddFunction { effects, .. } => effects.clone(),
+        ChangeEffectSig { to_effects, .. } => to_effects.clone(),
+        _ => std::collections::BTreeSet::new(),
+    }
+}
+
 fn attestable_stage_ids(transition: &lex_vcs::StageTransition) -> Vec<String> {
     use lex_vcs::StageTransition::*;
     match transition {
