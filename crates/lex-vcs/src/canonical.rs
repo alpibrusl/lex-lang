@@ -1,39 +1,70 @@
-//! Canonical JSON serialization for hashing.
+//! Canonical JSON serialization for hashing — the V1 canonical form
+//! that every existing `OpId` was computed under.
 //!
-//! The contract is narrow: given any `Serialize` value, produce a byte
-//! sequence such that two values that *should* hash equal produce
-//! identical bytes. We get there by:
+//! # The V1 canonical form (authoritative spec)
 //!
-//! 1. **Field order from the struct/enum declaration.** `serde_json`
-//!    emits struct fields in the order they appear in the type. Since
-//!    we control the operation enum, this gives us a stable layout
-//!    without sorting at serialize time. The risk is that *changing*
-//!    the type's field order silently rewrites every `OpId`; the
-//!    operation tests below pin a few golden hashes so a refactor
-//!    that breaks identity surfaces as a test failure.
+//! These are the rules every contributor to an `OpId` must follow.
+//! Violating any of them silently rewrites every `OpId` in every
+//! existing store. Issue #244 covers versioning the form so future
+//! evolutions are explicit; until then, treat each rule as
+//! load-bearing.
 //!
-//! 2. **`BTreeSet` / `BTreeMap` for unordered collections.** Effect
-//!    sets are `BTreeSet<String>` so iteration is sorted. If we ever
-//!    add a map-shaped field (e.g. for variant payloads), it should
-//!    use `BTreeMap` for the same reason.
+//! 1. **Compact JSON** (`serde_json::to_vec`). No pretty-printing,
+//!    no trailing whitespace. The compact form has no formatting
+//!    choices, so two independent serializers produce the same
+//!    bytes.
+//! 2. **Field order from the struct/enum declaration.** `serde_json`
+//!    emits struct fields in declaration order. Reordering an
+//!    `OperationKind` variant's fields (or the `CanonicalView`
+//!    struct's fields) rotates every `OpId`.
+//! 3. **`BTreeSet` for unordered string sets.** [`crate::EffectSet`]
+//!    is a `BTreeSet<String>` so iteration is sorted by string
+//!    order. Any new set-shaped field must use `BTreeSet`; a
+//!    `HashSet` is not acceptable.
+//! 4. **`BTreeMap` for unordered key-value collections.**
+//!    `StageTransition::Merge { entries }` is a
+//!    `BTreeMap<SigId, Option<StageId>>`. Iteration is sorted by
+//!    `SigId`, so insertion order is irrelevant. Any new map-shaped
+//!    field must use `BTreeMap`.
+//! 5. **`Vec<OpId>` parents are sorted and deduped before
+//!    hashing.** [`crate::Operation::new`] does this at construction
+//!    time; [`crate::Operation::canonical_bytes`] re-sorts via a
+//!    transient `BTreeSet<&OpId>` so a hand-constructed
+//!    `Operation { parents: vec![...] }` still hashes canonically.
+//! 6. **Empty `parents` arrays are emitted in the canonical form.**
+//!    This differs from the on-disk JSON shape (which skips empty
+//!    `parents`) — see [`crate::Operation::canonical_bytes`] for the
+//!    exact pre-image fed to SHA-256.
+//! 7. **Optional fields use `skip_serializing_if = "Option::is_none"`
+//!    so `None` is omitted entirely.** Adding a `Some(...)` value
+//!    where `None` was rotates the `OpId`; that's intentional (see
+//!    `Operation::with_intent`). Switching from `Option<T>` to a
+//!    `T` with a default value is a canonical-form break.
+//! 8. **SHA-256 to lowercase hex.** 64 ASCII chars; uppercase or
+//!    truncation is a canonical-form break.
 //!
-//! 3. **`serde_json` compact emit.** No pretty-printing, no trailing
-//!    whitespace. The compact form is canonical because it has no
-//!    formatting choices.
-//!
-//! The only thing we explicitly *don't* do here is recursive key
-//! sorting on arbitrary `serde_json::Value` trees. We don't need it:
-//! every type that contributes to an [`OpId`] is concrete and uses
-//! one of the three patterns above. If you find yourself wanting to
-//! hash a `serde_json::Value` directly, route it through a typed
-//! struct first.
+//! The only thing this module deliberately *does not* do is
+//! recursive key sorting on arbitrary `serde_json::Value` trees.
+//! That's not necessary because every type that contributes to an
+//! [`crate::OpId`] is concrete and uses one of the patterns above.
+//! If you find yourself wanting to hash a `serde_json::Value`
+//! directly, route it through a typed struct first.
 
 use sha2::{Digest, Sha256};
 
 /// Hash a serializable value to a 64-char lowercase hex digest.
+///
+/// Internal helper for places that hash typed structs directly.
+/// New callers should prefer [`crate::Operation::canonical_bytes`]
+/// + [`hash_bytes`] so the pre-image stays inspectable.
 pub(crate) fn hash<T: serde::Serialize>(value: &T) -> String {
     let bytes = serde_json::to_vec(value).expect("canonical serialization");
-    let digest = Sha256::digest(&bytes);
+    hash_bytes(&bytes)
+}
+
+/// Hash an already-canonicalized byte sequence to lowercase hex.
+pub(crate) fn hash_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(digest.len() * 2);
     for b in digest.iter() {
         out.push_str(&format!("{b:02x}"));

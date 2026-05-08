@@ -5,6 +5,49 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [Unreleased]
+
+### Added — agent-VCS roadmap (#244)
+
+- **`OperationFormat` enum + version-aware canonical encoder**
+  (#244). `Operation::canonical_bytes_in(format)` and
+  `Operation::op_id_in(format)` route through a per-format encoder.
+  Today only `OperationFormat::V1` is in production; the
+  infrastructure exists so a future `OperationKind` schema change
+  is an explicit, migrate-able event rather than a silent
+  invalidation of every existing `OpId`.
+- **`OperationRecord.format_version`** persisted in the on-disk
+  JSON. Pre-#244 records (no field) deserialize to `V1` (serde
+  default); V1 records continue to omit the field on write
+  (`skip_serializing_if = is_implicit`), so adding it doesn't
+  rotate any existing `OpId` or change any on-disk byte.
+- **`lex_vcs::migrate`** module with `plan_migration` /
+  `apply_migration`. Two-phase rewrite: write all new
+  `<new_op_id>.json` files, then delete old ones. Crash mid-
+  migration leaves both old and new files coexisting, each
+  internally consistent. Topological order ensures parents are
+  remapped before any child references them.
+- **`lex store migrate-ops --to <format> [--dry-run | --confirm]`**
+  CLI command. Required `--dry-run` or `--confirm` because the
+  `--confirm` path is destructive (deletes old op-log files,
+  rewrites every `<root>/branches/*.json` head_op through the
+  mapping). Reports the old→new op_id mapping for every op.
+
+### Internal
+
+- **V1→V2 migration rewrites every `OpId`.** When a future
+  `OperationFormat::V2` lands, the canonical pre-image bytes will
+  change for every op, so every `OpId` rotates. The migration tool
+  is the only safe path; manual surgery on `<root>/ops/` will
+  break parent-chain integrity. The `--dry-run` mode is mandatory
+  reading before committing.
+- **Attestation cascade is a known follow-up.** `AttestationId` is
+  computed including `op_id`, so rotating op_ids leaves
+  attestations dangling (their stored `op_id` field points to
+  deleted records, and their own ids are now stale). The
+  `migrate-ops` command warns about this; an attestation-log
+  migration is a separate piece of work tracked alongside #244.
+
 ## [0.3.0] — 2026-05-08
 
 Stage signing, semantic search over the store, a stable binary

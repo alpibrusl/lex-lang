@@ -161,6 +161,7 @@ fn print_usage() {
     println!("                                     print stage metadata + canonical AST;");
     println!("                                     verify Ed25519 signature when present.");
     println!("  store search [--store DIR] [--limit N] \"<query>\"");
+    println!("  store migrate-ops [--store DIR] --to v1 [--dry-run | --confirm]");
     println!("                                     semantic search over active stages,");
     println!("                                     ranked by description+signature+examples.");
     println!("  stage <stage> [--attestations]     print stage info, or list its attestations");
@@ -1466,8 +1467,195 @@ fn cmd_store(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             Ok(())
         }
         "search" => cmd_store_search(fmt, rest),
+        "migrate-ops" => cmd_store_migrate_ops(fmt, rest),
         other => bail!("unknown `lex store` subcommand: {other}"),
     }
+}
+
+/// `lex store migrate-ops` (#244). Re-canonicalize every op in the
+/// store under a target [`OperationFormat`]. Today only V1 exists,
+/// so the production migration is always a no-op; the command
+/// surfaces the plan/apply mechanism that future format bumps will
+/// rely on.
+///
+/// Flags:
+/// * `--to v1` (required) — the target format. Future variants will
+///   accept their own tags.
+/// * `--dry-run` — print the old→new mapping without rewriting any
+///   files. Mutually exclusive with `--confirm`.
+/// * `--confirm` — apply the migration. **Destructive**: deletes
+///   the old `<root>/ops/<old_op_id>.json` files and rewrites
+///   `<root>/branches/*.json` so `head_op` references the new ids.
+///   Attestations are *not* rewritten in this slice — see #244 and
+///   the attestation cascade follow-up.
+fn cmd_store_migrate_ops(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    // `parse_store_flag` already consumes `--dry-run` and returns it
+    // as the 4th tuple element; we honor that, not a re-parse from
+    // the remainder.
+    let (root, rest, _activate, dry_run) = parse_store_flag(args);
+    let mut target_str: Option<String> = None;
+    let mut confirm = false;
+    let mut iter = rest.iter();
+    while let Some(a) = iter.next() {
+        match a.as_str() {
+            "--to" => {
+                target_str = Some(iter.next()
+                    .ok_or_else(|| anyhow!("--to needs a format tag (today: v1)"))?
+                    .clone());
+            }
+            "--confirm" => confirm = true,
+            other => bail!("unknown flag `{other}` for `lex store migrate-ops`"),
+        }
+    }
+    if dry_run && confirm {
+        bail!("--dry-run and --confirm are mutually exclusive");
+    }
+    if !dry_run && !confirm {
+        bail!(
+            "lex store migrate-ops is destructive — pass --dry-run to preview, \
+             --confirm to apply"
+        );
+    }
+    let target_str = target_str
+        .ok_or_else(|| anyhow!("--to <format> is required (today: v1)"))?;
+    let target: lex_vcs::OperationFormat = match target_str.as_str() {
+        "v1" | "V1" => lex_vcs::OperationFormat::V1,
+        other => bail!("unknown operation format `{other}` — supported: v1"),
+    };
+
+    let log = lex_vcs::OpLog::open(&root)
+        .with_context(|| format!("opening op log at {}", root.display()))?;
+    let plan = lex_vcs::migrate::plan_migration(&log, target)
+        .with_context(|| "planning migration")?;
+
+    let mapping = plan.mapping();
+    let changed: Vec<&lex_vcs::migrate::MigrationStep> = plan
+        .steps
+        .iter()
+        .filter(|s| s.old_op_id != s.new_op_id)
+        .collect();
+
+    let mappings_json: Vec<serde_json::Value> = plan
+        .steps
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "old": s.old_op_id,
+                "new": s.new_op_id,
+                "changed": s.old_op_id != s.new_op_id,
+            })
+        })
+        .collect();
+
+    let summary = serde_json::json!({
+        "target_format": format!("{:?}", target).to_lowercase(),
+        "total_ops": plan.steps.len(),
+        "rotated_op_ids": changed.len(),
+        "is_no_op": plan.is_no_op(),
+        "applied": false,
+        "mappings": mappings_json,
+    });
+
+    if dry_run {
+        acli::emit_or_text("store-migrate-ops", summary.clone(), fmt, || {
+            println!(
+                "would migrate {} ops to {:?}; {} op_ids would rotate (dry-run, no files written)",
+                plan.steps.len(),
+                target,
+                changed.len(),
+            );
+            for s in &plan.steps {
+                if s.old_op_id != s.new_op_id {
+                    println!("  {} → {}", s.old_op_id, s.new_op_id);
+                }
+            }
+            if !changed.is_empty() {
+                println!(
+                    "\nNote: applying with --confirm will also rewrite branch heads. \
+                     Attestations are NOT rewritten by this command — that cascade is a \
+                     known follow-up to #244."
+                );
+            }
+        });
+        return Ok(());
+    }
+
+    // --confirm path: apply.
+    lex_vcs::migrate::apply_migration(&log, &plan)
+        .with_context(|| "applying migration")?;
+
+    let branch_updates = rewrite_branch_heads(&root, &mapping)
+        .with_context(|| "rewriting branch heads")?;
+
+    let summary = serde_json::json!({
+        "target_format": format!("{:?}", target).to_lowercase(),
+        "total_ops": plan.steps.len(),
+        "rotated_op_ids": changed.len(),
+        "is_no_op": plan.is_no_op(),
+        "applied": true,
+        "branches_updated": branch_updates,
+        "mappings": summary["mappings"].clone(),
+    });
+    acli::emit_or_text("store-migrate-ops", summary, fmt, || {
+        println!(
+            "migrated {} ops to {:?}; {} op_ids rotated; {} branch heads rewritten",
+            plan.steps.len(),
+            target,
+            changed.len(),
+            branch_updates,
+        );
+        if !changed.is_empty() {
+            println!(
+                "\nNote: attestations were NOT rewritten — their `attestation_id` \
+                 cascades from `op_id` and needs its own migration step. See #244."
+            );
+        }
+    });
+    Ok(())
+}
+
+/// Walk `<root>/branches/*.json`, parse each, and rewrite `head_op`
+/// in place if the current value appears in `mapping`. Returns the
+/// number of branch files that changed.
+///
+/// Bypasses `lex-store`'s `set_branch_head_op` (which is `pub(crate)`)
+/// because this is a one-shot supervised rewrite invoked by the
+/// `migrate-ops` command — not a normal write path.
+fn rewrite_branch_heads(
+    root: &std::path::Path,
+    mapping: &std::collections::BTreeMap<String, String>,
+) -> Result<usize> {
+    let dir = root.join("branches");
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let mut updated = 0usize;
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let bytes = std::fs::read(&path)?;
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing {}", path.display()))?;
+        let mut changed = false;
+        if let Some(head) = value.get("head_op").and_then(|v| v.as_str()) {
+            if let Some(new) = mapping.get(head) {
+                value["head_op"] = serde_json::Value::String(new.clone());
+                changed = true;
+            }
+        }
+        if changed {
+            let new_bytes = serde_json::to_vec_pretty(&value)
+                .with_context(|| format!("serializing {}", path.display()))?;
+            let tmp = path.with_extension("json.tmp");
+            std::fs::write(&tmp, &new_bytes)?;
+            std::fs::rename(&tmp, &path)?;
+            updated += 1;
+        }
+    }
+    Ok(updated)
 }
 
 /// `lex store search "<query>"` (#224). Embeds the query and ranks

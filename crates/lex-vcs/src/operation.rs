@@ -36,6 +36,46 @@ pub type EffectSet = BTreeSet<String>;
 /// this crate doesn't pull in `lex-syntax`'s parser.
 pub type ModuleRef = String;
 
+/// Version tag for the operation canonical form (#244).
+///
+/// The pre-image bytes hashed to derive an `OpId` are not stable
+/// across schema evolutions: adding a field to `OperationKind` or
+/// changing its serde representation rotates every existing `OpId`.
+/// This enum tags the encoding used so a long-lived store can detect
+/// mismatches and migrate explicitly via [`crate::migrate`].
+///
+/// **Today only [`Self::V1`] is in production.** Adding a future
+/// variant requires:
+///
+/// 1. A new arm in [`Operation::canonical_bytes_in`].
+/// 2. An update to the canonical-form spec in [`crate::canonical`].
+/// 3. A `CHANGELOG.md` entry under `### Internal` calling out the
+///    `OpId` rotation.
+/// 4. A migration recipe via [`crate::migrate::plan_migration`] —
+///    the mechanism is encoder-agnostic, but each new variant needs
+///    its own `canonical_bytes_in` arm.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum OperationFormat {
+    #[default]
+    V1,
+}
+
+impl OperationFormat {
+    /// The format every newly-emitted op uses today.
+    pub const CURRENT: OperationFormat = OperationFormat::V1;
+
+    /// `true` for the implicit format (V1). Used by the
+    /// `skip_serializing_if` hook on [`OperationRecord::format_version`]
+    /// so existing V1 stores keep byte-identical on-disk JSON —
+    /// adding the version field doesn't itself rotate any `OpId`.
+    pub fn is_implicit(&self) -> bool {
+        matches!(self, OperationFormat::V1)
+    }
+}
+
 /// Effect of applying an operation on a stage's content-addressed
 /// identity. Used as the `produces` field of an [`OperationRecord`]
 /// so consumers can answer "after this op, what's the head stage
@@ -57,6 +97,14 @@ pub enum StageTransition {
     /// changed relative to the merge op's first parent (`dst_head`):
     /// `Some(stage_id)` sets the head; `None` removes the sig.
     /// Sigs unaffected by the merge are not listed.
+    ///
+    /// **Canonical-form contract:** `BTreeMap` is load-bearing —
+    /// iteration is sorted by `SigId`, so on-disk JSON for two
+    /// callers that resolved the same conflicts in different
+    /// orders produces byte-identical output. Switching to
+    /// `HashMap` here would break canonical stability of the
+    /// `OperationRecord` JSON file and is rejected by the
+    /// canonical-form spec in `crate::canonical`.
     Merge {
         entries: BTreeMap<SigId, Option<StageId>>,
     },
@@ -227,12 +275,52 @@ impl Operation {
         self
     }
 
-    /// Compute this operation's content-addressed identity.
+    /// Compute this operation's content-addressed identity under the
+    /// current production canonical form ([`OperationFormat::CURRENT`]).
     ///
     /// Stable across runs and machines: same `(kind, payload,
     /// sorted parents, intent_id)` produces the same `OpId`. The
     /// invariant #129's automatic-dedup behavior relies on.
     pub fn op_id(&self) -> OpId {
+        self.op_id_in(OperationFormat::CURRENT)
+    }
+
+    /// Compute the `OpId` under a specific canonical-form version.
+    ///
+    /// Used by [`crate::migrate`] to derive new `OpId`s when porting
+    /// a store across format versions. Production code should call
+    /// [`Self::op_id`].
+    pub fn op_id_in(&self, format: OperationFormat) -> OpId {
+        canonical::hash_bytes(&self.canonical_bytes_in(format))
+    }
+
+    /// The byte sequence that gets hashed to produce [`Self::op_id`]
+    /// under the current canonical form. Equivalent to
+    /// `self.canonical_bytes_in(OperationFormat::CURRENT)`.
+    ///
+    /// Exposed (not just consumed by `op_id`) so golden tests can pin
+    /// the exact pre-image. **Not** equal to `serde_json::to_vec(&op)`
+    /// in general — the on-disk JSON skips empty `parents` and
+    /// `None` `intent_id`, while the canonical form always emits a
+    /// (sorted, deduped) `parents` array. See `canonical.rs` for the
+    /// full V1 canonical-form spec.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        self.canonical_bytes_in(OperationFormat::CURRENT)
+    }
+
+    /// The pre-image hashed under a specific canonical-form version.
+    ///
+    /// Today every `OperationFormat` variant routes to V1's encoder
+    /// (only V1 exists in production). When V2 lands, this match
+    /// gains an arm and the migration tool's encoder closure routes
+    /// here.
+    pub fn canonical_bytes_in(&self, format: OperationFormat) -> Vec<u8> {
+        match format {
+            OperationFormat::V1 => self.canonical_bytes_v1(),
+        }
+    }
+
+    fn canonical_bytes_v1(&self) -> Vec<u8> {
         // Build a transient hashable view rather than hashing
         // `self` directly so the parent ordering is canonical
         // even if a caller hand-constructs an `Operation` with
@@ -242,7 +330,7 @@ impl Operation {
             parents: self.parents.iter().collect::<IndexSet<_>>().into_iter().collect::<BTreeSet<_>>(),
             intent_id: self.intent_id.as_deref(),
         };
-        canonical::hash(&canonical)
+        serde_json::to_vec(&canonical).expect("canonical serialization")
     }
 }
 
@@ -264,11 +352,21 @@ struct CanonicalView<'a> {
 
 /// An operation paired with its computed `OpId` and the resulting
 /// stage transition. This is what gets persisted under
-/// `<root>/ops/<OpId>.json` once `apply.rs` (next slice of #129)
-/// lands.
+/// `<root>/ops/<OpId>.json`.
+///
+/// `format_version` records the canonical form the `op_id` was
+/// computed under. Pre-#244 stores didn't emit this field; reading
+/// such records deserializes to [`OperationFormat::V1`] (the
+/// implicit pre-versioning format), and writing V1 records continues
+/// to omit it (`skip_serializing_if = is_implicit`) so adding the
+/// field doesn't rotate any existing `OpId` or change any on-disk
+/// byte. Records written under a future format will explicitly
+/// carry their version tag.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationRecord {
     pub op_id: OpId,
+    #[serde(default, skip_serializing_if = "OperationFormat::is_implicit")]
+    pub format_version: OperationFormat,
     #[serde(flatten)]
     pub op: Operation,
     pub produces: StageTransition,
@@ -277,7 +375,7 @@ pub struct OperationRecord {
 impl OperationRecord {
     pub fn new(op: Operation, produces: StageTransition) -> Self {
         let op_id = op.op_id();
-        Self { op_id, op, produces }
+        Self { op_id, format_version: OperationFormat::CURRENT, op, produces }
     }
 }
 
