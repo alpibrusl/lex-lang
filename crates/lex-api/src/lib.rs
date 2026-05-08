@@ -17,6 +17,9 @@
 //!   POST /v1/merge/start              { src_branch, dst_branch } → { merge_id, conflicts, ... }
 //!   POST /v1/merge/<id>/resolve       { resolutions: [...] } → { verdicts, remaining_conflicts }
 //!   POST /v1/merge/<id>/commit        → { new_head_op, dst_branch } | 422 conflicts remaining
+//!   POST /v1/ops/batch                [OperationRecord] → { received, added, skipped, added_ids }
+//!   POST /v1/attestations/batch       [Attestation] → { received, added, skipped, added_ids }
+//!   GET  /v1/branches/<name>/head     → { branch, head_op } (probe for `lex op push`)
 //!   GET  /v1/health          → { ok: true }
 //!
 //! Web (lex-tea v2, read-only HTML; human-only audit + triage):

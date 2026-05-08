@@ -28,11 +28,12 @@ fn parse_store(args: &[String]) -> (PathBuf, Vec<String>) {
 
 pub fn cmd_op(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let sub = args.first().ok_or_else(|| anyhow!(
-        "usage: lex op {{show|log}} [--store DIR] ..."))?;
+        "usage: lex op {{show|log|push}} [--store DIR] ..."))?;
     let rest = &args[1..];
     match sub.as_str() {
         "show" => cmd_op_show(fmt, rest),
         "log"  => cmd_op_log(fmt, rest),
+        "push" => cmd_op_push(fmt, rest),
         other  => bail!("unknown `lex op` subcommand: {other}"),
     }
 }
@@ -186,4 +187,162 @@ pub(crate) fn budget_drift_pct(kind: &lex_vcs::OperationKind) -> Option<f64> {
         (Some(f), Some(t)) => Some(budget_pct(f, t)),
         _ => None,
     }
+}
+
+/// `lex op push <remote_url> [--branch NAME] [--since OP_ID]
+/// [--dry-run] [--store DIR]` (#242).
+///
+/// Walks the local op log on `<branch>` (default: current
+/// branch), computes the set of ops not yet on the remote, and
+/// posts them to `<remote_url>/v1/ops/batch`.
+///
+/// Discovery: when `--since` is absent, the client probes
+/// `<remote_url>/v1/branches/<branch>/head` for the remote's
+/// current head_op and uses `OpLog::ops_since(local_head,
+/// remote_head)` to compute the delta. With `--since OP_ID`, the
+/// caller supplies the cutoff directly — useful when the remote
+/// is offline or when pushing to a branch the remote doesn't
+/// have yet (`--since` set to the genesis means "send all").
+///
+/// Idempotency: server-side `OpLog::put` is idempotent on
+/// `op_id`, so re-pushing the same delta is safe and converges to
+/// `added: 0`.
+fn cmd_op_push(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let (root, rest) = parse_store(args);
+    let mut remote: Option<String> = None;
+    let mut branch: Option<String> = None;
+    let mut since: Option<String> = None;
+    let mut dry_run = false;
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--branch" => {
+                branch = Some(it.next().ok_or_else(|| anyhow!("--branch needs a value"))?.clone());
+            }
+            "--since" => {
+                since = Some(it.next().ok_or_else(|| anyhow!("--since needs an op_id"))?.clone());
+            }
+            "--dry-run" => dry_run = true,
+            other if !other.starts_with("--") && remote.is_none() => {
+                remote = Some(other.to_string());
+            }
+            other => bail!("unexpected arg `{other}`"),
+        }
+    }
+    let remote = remote.ok_or_else(|| anyhow!(
+        "usage: lex op push <remote_url> [--branch NAME] [--since OP_ID] [--dry-run] [--store DIR]"
+    ))?;
+    let store = Store::open(&root)?;
+    let branch = branch.unwrap_or_else(|| store.current_branch());
+
+    let local_head = store.get_branch(&branch)?.and_then(|b| b.head_op);
+    let log = OpLog::open(&root)?;
+
+    // Resolve `--since`: explicit > probe > local.
+    let cutoff: Option<String> = match since {
+        Some(s) => Some(s),
+        None => probe_remote_head(&remote, &branch).unwrap_or(None),
+    };
+
+    let to_send: Vec<OperationRecord> = match local_head.as_ref() {
+        Some(head) => {
+            // ops_since walks newest-first and excludes everything
+            // reachable from `cutoff`. Reverse so the batch is sent
+            // oldest-first — the server's DAG-integrity check
+            // requires every op's parents to either already exist
+            // or appear earlier in the same batch.
+            let mut ops = log.ops_since(head, cutoff.as_ref())?;
+            ops.reverse();
+            ops
+        }
+        None => Vec::new(),
+    };
+
+    if dry_run {
+        let ids: Vec<&String> = to_send.iter().map(|r| &r.op_id).collect();
+        let data = serde_json::json!({
+            "remote": remote,
+            "branch": branch,
+            "since": cutoff,
+            "would_send": to_send.len(),
+            "op_ids": ids,
+        });
+        let count = to_send.len();
+        let remote_text = remote.clone();
+        let branch_text = branch.clone();
+        acli::emit_or_text("op-push", data, fmt, move || {
+            println!(
+                "would push {count} ops to {remote_text} on branch `{branch_text}` (dry-run)"
+            );
+        });
+        return Ok(());
+    }
+
+    if to_send.is_empty() {
+        let data = serde_json::json!({
+            "remote": remote,
+            "branch": branch,
+            "received": 0,
+            "added": 0,
+            "skipped": 0,
+        });
+        acli::emit_or_text("op-push", data, fmt, || {
+            println!("nothing to push (branch is at or behind the remote)");
+        });
+        return Ok(());
+    }
+
+    // Post the batch.
+    let url = format!("{}/v1/ops/batch", remote.trim_end_matches('/'));
+    let body = serde_json::to_string(&to_send)
+        .map_err(|e| anyhow!("serializing batch: {e}"))?;
+    let resp = ureq::post(&url)
+        .header("Content-Type", "application/json")
+        .send(body)
+        .map_err(|e| anyhow!("POST {url}: {e}"))?;
+    let status = resp.status().as_u16();
+    let resp_body: serde_json::Value = resp.into_body().read_json()
+        .map_err(|e| anyhow!("decoding response: {e}"))?;
+    if status >= 400 {
+        bail!("server rejected batch (HTTP {status}): {resp_body}");
+    }
+
+    let received = resp_body.get("received").and_then(|v| v.as_u64()).unwrap_or(0);
+    let added = resp_body.get("added").and_then(|v| v.as_u64()).unwrap_or(0);
+    let skipped = resp_body.get("skipped").and_then(|v| v.as_u64()).unwrap_or(0);
+    let data = serde_json::json!({
+        "remote": remote,
+        "branch": branch,
+        "received": received,
+        "added": added,
+        "skipped": skipped,
+    });
+    let remote_text = remote.clone();
+    let branch_text = branch.clone();
+    acli::emit_or_text("op-push", data, fmt, move || {
+        println!(
+            "pushed {received} ops to {remote_text} on branch `{branch_text}`: \
+             {added} added, {skipped} skipped (already present)"
+        );
+    });
+    Ok(())
+}
+
+/// Probe the remote's head_op for `branch`. Returns Ok(Some(id))
+/// when the remote knows the branch, Ok(None) when it doesn't,
+/// Err(_) on transport failure. The caller treats Err as "fall
+/// back to sending everything we have."
+pub(crate) fn probe_remote_head(remote: &str, branch: &str) -> Result<Option<String>> {
+    let url = format!(
+        "{}/v1/branches/{branch}/head",
+        remote.trim_end_matches('/'),
+    );
+    let resp = ureq::get(&url)
+        .call()
+        .map_err(|e| anyhow!("GET {url}: {e}"))?;
+    let body: serde_json::Value = resp.into_body().read_json()
+        .map_err(|e| anyhow!("decoding response: {e}"))?;
+    Ok(body.get("head_op")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string()))
 }
