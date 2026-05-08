@@ -843,6 +843,12 @@ fn kind_short(k: &AttestationKind) -> String {
         AttestationKind::Defer { actor, .. } => format!("Defer({actor})"),
         AttestationKind::Block { actor, .. } => format!("Block({actor})"),
         AttestationKind::Unblock { actor, .. } => format!("Unblock({actor})"),
+        AttestationKind::ProducerBlock { tool_id, .. } => {
+            format!("ProducerBlock({tool_id})")
+        }
+        AttestationKind::ProducerUnblock { tool_id, .. } => {
+            format!("ProducerUnblock({tool_id})")
+        }
     }
 }
 

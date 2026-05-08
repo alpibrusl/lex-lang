@@ -166,6 +166,8 @@ fn print_usage() {
     println!("                                     ranked by description+signature+examples.");
     println!("  stage <stage> [--attestations]     print stage info, or list its attestations");
     println!("  attest filter [--kind K] [--result R] [--since T] [--store DIR]");
+    println!("  attest retro-block --producer TOOL_ID --reason \"...\" [--store DIR]");
+    println!("  attest retro-unblock --producer TOOL_ID --reason \"...\" [--store DIR]");
     println!("                                     cross-stage attestation queries");
     println!("  trace <run_id>                     print a saved trace tree as JSON");
     println!("  replay <run_id> <file> <fn> [args] [--override NODE=JSON]...");
@@ -1790,6 +1792,12 @@ fn cmd_stage(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                     lex_vcs::AttestationKind::Unblock { actor, .. } => {
                         format!("Unblock({actor})")
                     }
+                    lex_vcs::AttestationKind::ProducerBlock { tool_id, .. } => {
+                        format!("ProducerBlock({tool_id})")
+                    }
+                    lex_vcs::AttestationKind::ProducerUnblock { tool_id, .. } => {
+                        format!("ProducerUnblock({tool_id})")
+                    }
                 };
                 let result = match &a.result {
                     lex_vcs::AttestationResult::Passed => "passed".to_string(),
@@ -2138,23 +2146,176 @@ fn cmd_attest(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             });
             Ok(())
         }
+        "retro-block" => cmd_attest_retro_block(fmt, rest),
+        "retro-unblock" => cmd_attest_retro_unblock(fmt, rest),
         other => bail!("unknown `lex attest` subcommand: {other}"),
+    }
+}
+
+/// `lex attest retro-block --producer <tool_id> --reason "..."` (#248).
+/// Emits an `AttestationKind::ProducerBlock` attestation under
+/// `stage_id == tool_id`. The branch advance gate consults the
+/// resulting record on every subsequent apply and refuses to
+/// advance over an op whose stage carries an attestation produced
+/// by `tool_id` at or after this block's timestamp.
+fn cmd_attest_retro_block(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let (root, rest, _, _) = parse_store_flag(args);
+    let mut producer: Option<String> = None;
+    let mut reason: Option<String> = None;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--producer" => {
+                producer = rest.get(i + 1).cloned();
+                i += 2;
+            }
+            "--reason" => {
+                reason = rest.get(i + 1).cloned();
+                i += 2;
+            }
+            other => bail!("unexpected arg `{other}`"),
+        }
+    }
+    let tool_id = producer.ok_or_else(|| anyhow!(
+        "usage: lex attest retro-block --producer <tool_id> --reason \"...\""
+    ))?;
+    let reason = reason.ok_or_else(|| anyhow!(
+        "lex attest retro-block: --reason required"
+    ))?;
+
+    let store = Store::open(&root)
+        .with_context(|| format!("opening store at {}", root.display()))?;
+    let log = store.attestation_log()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let attestation = lex_vcs::Attestation::with_timestamp(
+        tool_id.clone(),
+        None,
+        None,
+        lex_vcs::AttestationKind::ProducerBlock {
+            tool_id: tool_id.clone(),
+            reason: reason.clone(),
+            blocked_at: now,
+        },
+        // The verdict on the *block itself* is always Passed —
+        // it's a declaration, not the result of a verification.
+        // Failure to land the attestation surfaces as an io error,
+        // not as `Failed { detail }`.
+        lex_vcs::AttestationResult::Passed,
+        retro_block_producer(),
+        None,
+        now,
+    );
+    log.put(&attestation)?;
+
+    let data = serde_json::json!({
+        "tool_id": &tool_id,
+        "reason": &reason,
+        "blocked_at": now,
+        "attestation_id": &attestation.attestation_id,
+    });
+    let printable_tool = tool_id.clone();
+    acli::emit_or_text("attest", data, fmt, move || {
+        println!("→ retroactively blocked producer `{printable_tool}` at {now}");
+    });
+    Ok(())
+}
+
+/// `lex attest retro-unblock --producer <tool_id> --reason "..."` (#248).
+/// Counterpart to `retro-block`. Emits an
+/// `AttestationKind::ProducerUnblock` so the gate honors the most
+/// recent verdict per `tool_id` by timestamp.
+fn cmd_attest_retro_unblock(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let (root, rest, _, _) = parse_store_flag(args);
+    let mut producer: Option<String> = None;
+    let mut reason: Option<String> = None;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--producer" => {
+                producer = rest.get(i + 1).cloned();
+                i += 2;
+            }
+            "--reason" => {
+                reason = rest.get(i + 1).cloned();
+                i += 2;
+            }
+            other => bail!("unexpected arg `{other}`"),
+        }
+    }
+    let tool_id = producer.ok_or_else(|| anyhow!(
+        "usage: lex attest retro-unblock --producer <tool_id> --reason \"...\""
+    ))?;
+    let reason = reason.ok_or_else(|| anyhow!(
+        "lex attest retro-unblock: --reason required"
+    ))?;
+
+    let store = Store::open(&root)
+        .with_context(|| format!("opening store at {}", root.display()))?;
+    let log = store.attestation_log()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let attestation = lex_vcs::Attestation::with_timestamp(
+        tool_id.clone(),
+        None,
+        None,
+        lex_vcs::AttestationKind::ProducerUnblock {
+            tool_id: tool_id.clone(),
+            reason: reason.clone(),
+            unblocked_at: now,
+        },
+        lex_vcs::AttestationResult::Passed,
+        retro_block_producer(),
+        None,
+        now,
+    );
+    log.put(&attestation)?;
+
+    let data = serde_json::json!({
+        "tool_id": &tool_id,
+        "reason": &reason,
+        "unblocked_at": now,
+        "attestation_id": &attestation.attestation_id,
+    });
+    let printable_tool = tool_id.clone();
+    acli::emit_or_text("attest", data, fmt, move || {
+        println!("→ retroactively unblocked producer `{printable_tool}` at {now}");
+    });
+    Ok(())
+}
+
+/// Producer descriptor for the synthetic `ProducerBlock` /
+/// `ProducerUnblock` attestations written by the `lex attest
+/// retro-{block,unblock}` commands. Tagged distinctly from
+/// `lex run --trace`'s `trace_producer` so the activity feed can
+/// tell the two apart.
+fn retro_block_producer() -> lex_vcs::ProducerDescriptor {
+    lex_vcs::ProducerDescriptor {
+        tool: "lex attest retro-block".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        model: None,
     }
 }
 
 fn attestation_kind_tag(k: &lex_vcs::AttestationKind) -> &'static str {
     use lex_vcs::AttestationKind::*;
     match k {
-        Examples { .. }   => "examples",
-        Spec { .. }       => "spec",
-        DiffBody { .. }   => "diff_body",
-        TypeCheck         => "type_check",
-        EffectAudit       => "effect_audit",
-        SandboxRun { .. } => "sandbox_run",
-        Override { .. }   => "override",
-        Defer { .. }      => "defer",
-        Block { .. }      => "block",
-        Unblock { .. }    => "unblock",
+        Examples { .. }         => "examples",
+        Spec { .. }             => "spec",
+        DiffBody { .. }         => "diff_body",
+        TypeCheck               => "type_check",
+        EffectAudit             => "effect_audit",
+        SandboxRun { .. }       => "sandbox_run",
+        Override { .. }         => "override",
+        Defer { .. }            => "defer",
+        Block { .. }            => "block",
+        Unblock { .. }          => "unblock",
+        ProducerBlock { .. }    => "producer_block",
+        ProducerUnblock { .. }  => "producer_unblock",
     }
 }
 

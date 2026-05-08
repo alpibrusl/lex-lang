@@ -7,6 +7,42 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added — agent-VCS roadmap (#248)
+
+- **Retroactive producer quarantine** (#248). Two new
+  `AttestationKind` variants — `ProducerBlock { tool_id, reason,
+  blocked_at }` and `ProducerUnblock { tool_id, reason,
+  unblocked_at }` — let an admin declare "as of T, attestations
+  produced by tool X are no longer trusted." The branch advance
+  gate consults the latest verdict per `tool_id` (by timestamp;
+  ties go to `ProducerUnblock`) and refuses to advance over an op
+  whose stage carries an attestation produced by a quarantined
+  tool at or after the cutoff. Distinct from `policy.json`'s
+  `blocked_producers` (#181), which is a forward-going read-time
+  tag for the activity feed; this is a write-time gate.
+- **`StoreError::ProducerBlocked`** with a structured
+  `ProducerBlocked` envelope (`error: "ProducerBlocked"`,
+  `op_id`, `stage_id`, `tool_id`, `blocked_at`, `attestation_at`,
+  `attestation_id`). Distinct error code from #245's
+  `BranchAdvanceBlocked` so the HTTP API can route the security
+  failure separately from the missing-evidence failure.
+- **`lex attest retro-block --producer <tool_id> --reason "..."`**
+  and **`lex attest retro-unblock --producer <tool_id> --reason
+  "..."`** CLI commands. Emit attestations under
+  `stage_id == tool_id` so the existing by-stage index doubles as
+  a by-tool lookup — no schema break, no separate index needed.
+- **Ops are not deleted.** The attestation log carries the
+  tombstone; the op log stays append-only. Branch advance is
+  refused, but the audit trail is intact.
+
+#### Limitation (called out for follow-up)
+
+- **Walk-back gate is not implemented.** Today's gate only checks
+  the *new* op being advanced past, not its ancestors. Pre-
+  existing contamination in a branch's history is grandfathered
+  in at the moment of the retro-block. A future "walk back to the
+  last successful gate run" pass would close this gap.
+
 ### Added — agent-VCS roadmap (#245)
 
 - **Machine-checkable branch advancement gates** (#245). New
