@@ -51,6 +51,18 @@ pub enum StoreError {
         .0.op_id, .0.missing.join(", ")
     )]
     BranchAdvanceBlocked(crate::policy::BranchAdvanceBlocked),
+    /// The op was persisted but its stage carries an attestation
+    /// produced by a retroactively quarantined tool (#248). The
+    /// branch head is unchanged. The op record stays in the log
+    /// (audit trail intact); re-running with the producer
+    /// unblocked, or with un-contaminated attestations, succeeds
+    /// without re-persisting the op.
+    #[error(
+        "branch advance blocked: op {} touches stage {} with an attestation from \
+         quarantined producer `{}` (blocked at {}, attestation at {})",
+        .0.op_id, .0.stage_id, .0.tool_id, .0.blocked_at, .0.attestation_at
+    )]
+    ProducerBlocked(crate::policy::ProducerBlocked),
 }
 
 /// The outcome returned by [`Store::publish_program`].
@@ -794,31 +806,34 @@ impl Store {
         })
     }
 
-    /// Run the `required_attestations` gate (#245) over a single op
-    /// against the store's `policy.json`. Surfaces a
-    /// `BranchAdvanceBlocked` error if any required attestation is
-    /// missing for any of the op's attestable stages. Loads the
-    /// policy and the attestation log lazily; if no policy file
-    /// exists, the gate is a no-op (default-permissive behavior
-    /// matches pre-#245 stores).
+    /// Run the `required_attestations` gate (#245) and the
+    /// retroactive producer-block gate (#248) over a single op
+    /// against the store's `policy.json` and attestation log.
+    ///
+    /// Failure modes (in order):
+    ///
+    /// 1. Producer-block first: if any attestation on the op's
+    ///    stage is from a quarantined tool, refuse with
+    ///    `ProducerBlocked` (#248). Surfaces *before* the
+    ///    required-attestations gate so a clearly-malicious record
+    ///    isn't masked by a missing-Spec error.
+    /// 2. Required-attestations next: if any required attestation
+    ///    kind is missing, refuse with `BranchAdvanceBlocked`
+    ///    (#245).
+    ///
+    /// Loads the policy / attestation log lazily; with no policy
+    /// file and no `ProducerBlock` attestations the gate is a no-op
+    /// (default-permissive — matches pre-#245 stores).
     fn run_required_attestations_gate(
         &self,
         op_id: &lex_vcs::OpId,
         stage_ids: &[String],
         op_effects: &std::collections::BTreeSet<String>,
     ) -> Result<(), StoreError> {
-        let policy = match crate::policy::load(self.root())? {
-            Some(p) if !p.required_attestations.is_empty() => p,
-            // No file or no rules — gate is a no-op, return
-            // immediately. Avoids opening the attestation log when
-            // there's nothing to check.
-            _ => return Ok(()),
-        };
-        let attest_log = self.attestation_log()?;
-        // One tuple per stage the op touches. Ops with no
-        // attestable stage (imports, empty merges) get a single
-        // `None`-stage tuple, and the gate skips those — there's
-        // nothing to attest.
+        // Build the candidate slice once and reuse it for both
+        // gates. Ops with no attestable stage (imports, empty
+        // merges) get a single `None`-stage tuple; both gates skip
+        // those — there's nothing to attest.
         let candidate: Vec<(lex_vcs::OpId, Option<String>, std::collections::BTreeSet<String>)> =
             if stage_ids.is_empty() {
                 vec![(op_id.clone(), None, op_effects.clone())]
@@ -828,6 +843,20 @@ impl Store {
                     .map(|sid| (op_id.clone(), Some(sid.clone()), op_effects.clone()))
                     .collect()
             };
+        let attest_log = self.attestation_log()?;
+
+        // #248: producer-block gate. Always evaluated regardless of
+        // policy.json contents — `ProducerBlock` attestations live
+        // in the attestation log, not policy.json.
+        crate::policy::check_producer_block(&attest_log, &candidate)
+            .map_err(StoreError::ProducerBlocked)?;
+
+        // #245: required-attestations gate. Only fires when the
+        // policy declares rules.
+        let policy = match crate::policy::load(self.root())? {
+            Some(p) if !p.required_attestations.is_empty() => p,
+            _ => return Ok(()),
+        };
         crate::policy::check_required_attestations(&attest_log, &candidate, &policy)
             .map_err(StoreError::BranchAdvanceBlocked)
     }

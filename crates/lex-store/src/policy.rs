@@ -359,6 +359,153 @@ fn passed(r: &AttestationResult) -> bool {
 #[allow(dead_code)]
 fn _force_use(_: Attestation) {} // keep unused-import warning quiet across feature flips
 
+// ----------------------------------------------- producer-block gate (#248)
+
+/// Why a branch advance was refused by the
+/// [`check_producer_block`] gate. Surfaced as
+/// `StoreError::ProducerBlocked` and as a distinct
+/// `ProducerBlocked` envelope on the HTTP API.
+///
+/// Distinct from [`BranchAdvanceBlocked`] (#245's positive
+/// attestation gate) because the response shape is different:
+/// the operator needs to know *which producer* was blocked and
+/// *which attestation* tripped the gate, not just "an
+/// attestation was missing."
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProducerBlocked {
+    pub op_id: OpId,
+    /// Stage the offending attestation was about. Always set —
+    /// `ProducerBlock` only fires when a candidate op has at
+    /// least one stage with attestations.
+    pub stage_id: String,
+    /// Tool that's been retroactively quarantined.
+    pub tool_id: String,
+    /// Cutoff from the most recent `AttestationKind::ProducerBlock`
+    /// for this tool.
+    pub blocked_at: u64,
+    /// Wall-clock timestamp of the offending attestation. Always
+    /// `>= blocked_at`; otherwise the gate wouldn't have fired.
+    pub attestation_at: u64,
+    /// `attestation_id` of the offending attestation, so the
+    /// operator can drill in via `lex attest filter`.
+    pub attestation_id: String,
+}
+
+impl ProducerBlocked {
+    /// Render as a structured JSON envelope. Distinct `error`
+    /// discriminator (`ProducerBlocked`) so the HTTP layer can
+    /// route it to a different status code or recovery path
+    /// from `BranchAdvanceBlocked`.
+    pub fn to_envelope(&self) -> serde_json::Value {
+        serde_json::json!({
+            "error": "ProducerBlocked",
+            "op_id": self.op_id,
+            "stage_id": self.stage_id,
+            "tool_id": self.tool_id,
+            "blocked_at": self.blocked_at,
+            "attestation_at": self.attestation_at,
+            "attestation_id": self.attestation_id,
+        })
+    }
+}
+
+/// Verify that the candidate ops are not contaminated by
+/// attestations from a retroactively quarantined producer (#248).
+///
+/// Algorithm:
+///
+/// 1. Walk the entire attestation log to collect every
+///    `ProducerBlock` / `ProducerUnblock` record. Build a map
+///    `tool_id → Some(blocked_at)` reflecting the latest verdict
+///    per tool.
+/// 2. For each candidate op, list attestations on its
+///    `stage_id`. For every attestation produced by a currently-
+///    blocked tool with `attestation.timestamp >= block.blocked_at`,
+///    refuse the advance with the offending row's details.
+///
+/// Cost is `O(total attestations)` for step 1 — fine for small
+/// stores; a `by-tool` index becomes worthwhile if the producer
+/// list grows past dozens. Step 2 is `O(attestations on the
+/// candidate stage)` per op, dominated by step 1 for the common
+/// case of a single-op advance.
+pub fn check_producer_block(
+    log: &AttestationLog,
+    candidate: &[(OpId, Option<String>, BTreeSet<String>)],
+) -> Result<(), ProducerBlocked> {
+    // Step 1: build the active-block map.
+    let all = match log.list_all() {
+        Ok(v) => v,
+        // Empty log = nothing to check.
+        Err(_) => return Ok(()),
+    };
+    use std::collections::HashMap;
+    let mut active: HashMap<String, u64> = HashMap::new();
+    // Process in timestamp order so the latest verdict per tool
+    // wins. Ties go to ProducerUnblock (matches the spirit of
+    // is_stage_blocked).
+    let mut ordered: Vec<&Attestation> = all.iter().collect();
+    ordered.sort_by(|a, b| {
+        a.timestamp.cmp(&b.timestamp).then_with(|| {
+            // Same timestamp: ProducerUnblock sorts after
+            // ProducerBlock so it wins the "latest" check.
+            let a_unblock = matches!(a.kind, AttestationKind::ProducerUnblock { .. });
+            let b_unblock = matches!(b.kind, AttestationKind::ProducerUnblock { .. });
+            a_unblock.cmp(&b_unblock)
+        })
+    });
+    for a in ordered {
+        match &a.kind {
+            AttestationKind::ProducerBlock { tool_id, blocked_at, .. } => {
+                active.insert(tool_id.clone(), *blocked_at);
+            }
+            AttestationKind::ProducerUnblock { tool_id, .. } => {
+                active.remove(tool_id);
+            }
+            _ => {}
+        }
+    }
+    if active.is_empty() {
+        return Ok(());
+    }
+
+    // Step 2: per-op attestation walk.
+    for (op_id, stage_id_opt, _) in candidate {
+        let stage_id = match stage_id_opt {
+            Some(s) => s,
+            None => continue,
+        };
+        let attestations = match log.list_for_stage(stage_id) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        for a in attestations {
+            // Self-references (a producer's own ProducerBlock /
+            // Unblock attestations are stored at stage_id ==
+            // tool_id) shouldn't be flagged as contamination.
+            if matches!(
+                a.kind,
+                AttestationKind::ProducerBlock { .. }
+                    | AttestationKind::ProducerUnblock { .. }
+            ) {
+                continue;
+            }
+            if let Some(&blocked_at) = active.get(&a.produced_by.tool) {
+                if a.timestamp >= blocked_at {
+                    return Err(ProducerBlocked {
+                        op_id: op_id.clone(),
+                        stage_id: stage_id.clone(),
+                        tool_id: a.produced_by.tool.clone(),
+                        blocked_at,
+                        attestation_at: a.timestamp,
+                        attestation_id: a.attestation_id.clone(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
