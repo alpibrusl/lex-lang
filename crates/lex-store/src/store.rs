@@ -31,6 +31,8 @@ pub enum StoreError {
     InvalidTransition(String),
     #[error("unknown branch `{0}`")]
     UnknownBranch(String),
+    #[error("unknown op_id `{0}`")]
+    UnknownOp(lex_vcs::OpId),
     #[error(transparent)]
     Apply(#[from] lex_vcs::ApplyError),
     /// The candidate program — i.e. the source the caller is
@@ -762,6 +764,99 @@ impl Store {
             log.put(&attestation)?;
         }
         Ok(())
+    }
+
+    /// Emit `Trace` attestations linking an already-committed `op`
+    /// to the run that produced it (#257). One attestation per
+    /// produced stage (matching the `TypeCheck` emission contract
+    /// — see [`Self::apply_operation_checked`]) with
+    /// `op_id: Some(op_id)` set, so `lex trace --op <op_id>`
+    /// surfaces the run.
+    ///
+    /// Returns the number of attestations emitted (zero for ops
+    /// that produce no attestable stage, e.g. `Remove` /
+    /// `ImportOnly`).
+    ///
+    /// Idempotent: re-emitting for the same
+    /// `(run_id, root_target, op_id, stage_id, producer, result)`
+    /// tuple dedups via content addressing.
+    ///
+    /// `op_id` must already exist in the op log — an unknown op
+    /// surfaces as `StoreError::UnknownOp`.
+    pub fn record_op_trace(
+        &self,
+        run_id: &str,
+        root_target: &str,
+        op_id: &lex_vcs::OpId,
+        result: lex_vcs::AttestationResult,
+        producer: lex_vcs::ProducerDescriptor,
+    ) -> Result<usize, StoreError> {
+        let log = lex_vcs::OpLog::open(self.root())?;
+        let rec = log.get(op_id)?
+            .ok_or_else(|| StoreError::UnknownOp(op_id.clone()))?;
+        let stage_ids = attestable_stage_ids(&rec.produces);
+        if stage_ids.is_empty() {
+            return Ok(0);
+        }
+        let attlog = self.attestation_log()?;
+        let mut emitted = 0;
+        for stage_id in stage_ids {
+            let attestation = lex_vcs::Attestation::new(
+                stage_id,
+                Some(op_id.clone()),
+                None,
+                lex_vcs::AttestationKind::Trace {
+                    run_id: run_id.into(),
+                    root_target: root_target.into(),
+                },
+                result.clone(),
+                producer.clone(),
+                None,
+            );
+            attlog.put(&attestation)?;
+            emitted += 1;
+        }
+        Ok(emitted)
+    }
+
+    /// Walk `ops_since(branch_head, base)` and emit per-stage
+    /// `Trace` attestations for each new op, linking them to the
+    /// run that produced them (#257). Used by `lex run --trace`
+    /// after the VM exits: snapshot `base = branch_head` before
+    /// the run, then call this with the post-run head.
+    ///
+    /// `base = None` means "every op currently reachable from the
+    /// branch head" — generally not what you want for a single
+    /// run; pass the pre-run head.
+    ///
+    /// Returns the total number of attestations emitted across
+    /// every new op. Zero is the common case (the run committed no
+    /// ops).
+    ///
+    /// Idempotent on the per-op level via [`Self::record_op_trace`].
+    pub fn record_run_committed_ops_since(
+        &self,
+        run_id: &str,
+        root_target: &str,
+        branch: &str,
+        base: Option<&lex_vcs::OpId>,
+        result: lex_vcs::AttestationResult,
+        producer: lex_vcs::ProducerDescriptor,
+    ) -> Result<usize, StoreError> {
+        let head = match self.get_branch(branch)?.and_then(|b| b.head_op) {
+            Some(h) => h,
+            None => return Ok(0),
+        };
+        let log = lex_vcs::OpLog::open(self.root())?;
+        let new_ops = log.ops_since(&head, base)?;
+        let mut total = 0;
+        for rec in new_ops {
+            total += self.record_op_trace(
+                run_id, root_target, &rec.op_id,
+                result.clone(), producer.clone(),
+            )?;
+        }
+        Ok(total)
     }
 
     /// `set_branch_head_op` for the durability story on the branch

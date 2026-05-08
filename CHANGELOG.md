@@ -7,6 +7,26 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added — agent-VCS roadmap (#257)
+
+- **Ops-during-run trace attestations** (#257). Closes the
+  follow-up #246 documented: `Trace` attestations gained an
+  `op_id` field but no producer set it. Now `Store::record_op_trace`
+  emits per-stage Trace attestations with `op_id: Some(...)`
+  linking a committed op to the run that produced it, and
+  `Store::record_run_committed_ops_since` walks the
+  `ops_since(branch_head, base)` diff and emits Trace
+  attestations for each new op.
+- **`lex run --trace`** snapshots the default branch's `head_op`
+  before the VM exits and calls `record_run_committed_ops_since`
+  after, so any ops committed during the run get linked to the
+  run automatically. Common case (no ops committed) is a single
+  no-op call returning 0.
+- **`lex trace --op <op_id>`** is now populated by this pipeline
+  — the filter the surface added in #246 finally returns hits.
+- **`StoreError::UnknownOp`** for `record_op_trace` against an
+  op_id that isn't in the log.
+
 ### Added — agent-VCS roadmap (#262)
 
 - **Multi-writer CAS branch advance** (#262). Pre-#262, two writers

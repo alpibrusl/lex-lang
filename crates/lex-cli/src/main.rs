@@ -502,6 +502,20 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let recorder = lex_trace::Recorder::new();
     let trace_handle = recorder.handle();
     if f.trace { vm.set_tracer(Box::new(recorder)); }
+    // #257: snapshot the default branch's head before the run so we
+    // can attribute any ops committed during the run back to the
+    // run's `run_id` via Trace attestations. `pre_run_head` is
+    // `None` for a fresh store; that's fine — `record_run_committed_ops_since`
+    // treats `None` as "every reachable op is post-run", which is
+    // the right behavior on an empty pre-run history.
+    let pre_run_head = if f.trace {
+        let store = lex_store::Store::open(default_store_root())?;
+        store.get_branch(lex_store::DEFAULT_BRANCH)
+            .map_err(|e| anyhow!("reading branch: {e}"))?
+            .and_then(|b| b.head_op)
+    } else {
+        None
+    };
 
     let vargs: Vec<Value> = f.positional[arg_positional_start..]
         .iter()
@@ -556,6 +570,28 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                 .map_err(|e| anyhow!("opening attestation log: {e}"))?
                 .put(&attestation)
                 .map_err(|e| anyhow!("recording trace attestation: {e}"))?;
+        }
+        // #257: emit `Trace` attestations with `op_id` set for any
+        // op committed during the run. Walks `ops_since(post_head,
+        // pre_run_head)` on the default branch — the only branch
+        // `lex run` interacts with today. Empty for the common case
+        // where the program doesn't commit ops.
+        let att_result = match &result {
+            Ok(_) => lex_vcs::AttestationResult::Passed,
+            Err(e) => lex_vcs::AttestationResult::Failed {
+                detail: format!("{e}"),
+            },
+        };
+        let n_op_traces = store.record_run_committed_ops_since(
+            &id,
+            &func,
+            lex_store::DEFAULT_BRANCH,
+            pre_run_head.as_ref(),
+            att_result,
+            trace_producer(),
+        ).map_err(|e| anyhow!("recording op traces: {e}"))?;
+        if n_op_traces > 0 && !matches!(fmt, OutputFormat::Json) {
+            eprintln!("trace attestations: {n_op_traces} op(s) linked to run");
         }
         trace_id = Some(id.clone());
         if !matches!(fmt, OutputFormat::Json) { eprintln!("trace saved: {id}"); }
@@ -666,11 +702,12 @@ fn parse_run_flags(args: &[String]) -> Result<RunFlags> {
 
 /// `lex trace <run_id>` — load the trace tree by run id (existing).
 /// `lex trace --op <op_id>` (#246) — list every `AttestationKind::Trace`
-/// attestation whose `op_id` field matches. Today no producer
-/// emits Trace attestations *with* an op_id (the existing emitter
-/// in `cmd_run` sets it to None), so this filter typically returns
-/// empty; it's the surface the next-generation
-/// "ops-committed-during-a-run" pipeline will populate.
+/// attestation whose `op_id` field matches. Populated by the
+/// ops-during-run pipeline (#257): when `lex run --trace` finds
+/// any op committed during the run, it emits per-stage Trace
+/// attestations with `op_id: Some(...)` set, which this filter
+/// surfaces. The entry-point Trace attestation (no op_id) is not
+/// returned — it's not associated with a single committed op.
 fn cmd_trace(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     // --op flag form first.
     let mut op_filter: Option<String> = None;
