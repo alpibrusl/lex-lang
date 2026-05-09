@@ -28,10 +28,12 @@
 mod store;
 mod model;
 mod branches;
+mod delta;
 mod gc;
 pub mod users;
 pub mod policy;
 
+pub use delta::{StageDelta, DELTA_CHAIN_CAP, DELTA_RATIO_THRESHOLD};
 pub use gc::{GcPlan, RetentionReason};
 
 pub use lex_vcs::{OpId, Operation, OperationKind, OperationRecord, StageTransition};

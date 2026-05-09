@@ -7,6 +7,39 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added — agent-VCS roadmap (#261, slice 3)
+
+- **Delta-encoded stage bytes** (#261 slice 3). When
+  `Store::publish` lands a stage and the byte diff against the
+  most-recent prior stage in the same SigId's lifecycle is below
+  `DELTA_RATIO_THRESHOLD` (50%), the stage is persisted as
+  `<stage_id>.delta.json` instead of the full
+  `<stage_id>.ast.json`. The format is a content-stable splice:
+  `(base_stage_id, common_prefix_len, common_suffix_len,
+  middle_hex)` — applying it produces `base[..prefix] + middle +
+  base[tail..]`.
+- **`Store::get_ast`** transparently walks the delta chain to
+  reconstruct canonical bytes, then parses. Callers see no
+  difference between full-snapshot and delta-encoded stages.
+- **Chain-length cap** (`DELTA_CHAIN_CAP = 32`). Every delta
+  records its chain length; when the next publish would exceed
+  the cap, the publish path falls back to a full snapshot. Keeps
+  worst-case `get_ast` cost bounded.
+- **Determinism**: the splice picks the largest common prefix,
+  then the largest non-overlapping suffix, so a given
+  `(base_bytes, new_bytes)` pair always produces the same
+  `.delta.json`.
+- 6 unit tests in `delta.rs` (splice/apply round-trips, pure
+  insertion, pure deletion, threshold/cap gating, overflow guard)
+  and 7 conformance tests in `delta_conformance.rs` (first stage
+  is a full snapshot, close stages delta-encode, transparent
+  reconstruction, lifecycle round-trip, idempotent republish,
+  deep-chain snapshot materialization, dissimilar fallback).
+
+This closes the slice-3 acceptance criteria from #261. With
+slices 1, 2, and 3 all merged, the op-log performance roadmap
+on #261 is fully shipped.
+
 ### Added — agent-VCS roadmap (#261, slice 2)
 
 - **Predicate-driven op-log GC** (#261 slice 2). New
