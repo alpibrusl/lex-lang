@@ -28,7 +28,7 @@ fn parse_store(args: &[String]) -> (PathBuf, Vec<String>) {
 
 pub fn cmd_op(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let sub = args.first().ok_or_else(|| anyhow!(
-        "usage: lex op {{show|log|push|pull|repack}} [--store DIR] ..."))?;
+        "usage: lex op {{show|log|push|pull|repack|gc}} [--store DIR] ..."))?;
     let rest = &args[1..];
     match sub.as_str() {
         "show"   => cmd_op_show(fmt, rest),
@@ -36,8 +36,71 @@ pub fn cmd_op(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "push"   => cmd_op_push(fmt, rest),
         "pull"   => cmd_op_pull(fmt, rest),
         "repack" => cmd_op_repack(fmt, rest),
+        "gc"     => cmd_op_gc(fmt, rest),
         other    => bail!("unknown `lex op` subcommand: {other}"),
     }
+}
+
+/// `lex op gc {--dry-run|--confirm} [--retain JSON ...] [--store DIR]`
+/// (#261 slice 2). Plans (or applies) a predicate-driven garbage
+/// collection of the op log.
+///
+/// Retention rules combine: every op reachable from any branch
+/// head is always kept; ops matching `--retain` predicates or
+/// policy.json's `gc_retention.retain` entries are kept; every
+/// parent of a retained op is kept transitively (DAG integrity).
+fn cmd_op_gc(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let (root, rest) = parse_store(args);
+    let mut dry_run = false;
+    let mut confirm = false;
+    let mut cli_retain: Vec<lex_vcs::Predicate> = Vec::new();
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--dry-run" => dry_run = true,
+            "--confirm" => confirm = true,
+            "--retain" => {
+                let raw = it.next()
+                    .ok_or_else(|| anyhow!("--retain needs a JSON predicate"))?;
+                let v: serde_json::Value = serde_json::from_str(raw)
+                    .with_context(|| format!("parsing --retain JSON: {raw}"))?;
+                let p = lex_vcs::Predicate::from_value(&v)
+                    .map_err(|e| anyhow!("--retain predicate: {e}"))?;
+                cli_retain.push(p);
+            }
+            other => bail!("unexpected arg `{other}` (usage: lex op gc \
+                [--dry-run|--confirm] [--retain JSON]... [--store DIR])"),
+        }
+    }
+    if !dry_run && !confirm {
+        bail!("`lex op gc` requires either --dry-run or --confirm");
+    }
+    if dry_run && confirm {
+        bail!("--dry-run and --confirm are mutually exclusive");
+    }
+    let store = Store::open(&root)?;
+    let plan = store.plan_gc(&cli_retain)?;
+    let removed = if confirm { store.apply_gc(&plan)? } else { 0 };
+    let data = serde_json::json!({
+        "store": root.display().to_string(),
+        "dry_run": dry_run,
+        "to_delete": &plan.to_delete,
+        "retained_count": plan.retained.len(),
+        "removed": removed,
+    });
+    acli::emit_or_text("op", data, fmt, || {
+        let n = plan.to_delete.len();
+        if dry_run {
+            println!("plan: would delete {n} op(s); retain {} op(s)",
+                plan.retained.len());
+        } else if removed == 0 {
+            println!("nothing to do (already at the retention boundary)");
+        } else {
+            println!("removed {removed} op(s); retained {} op(s)",
+                plan.retained.len());
+        }
+    });
+    Ok(())
 }
 
 /// `lex op repack [--threshold N] [--store DIR]` (#261 slice 1).

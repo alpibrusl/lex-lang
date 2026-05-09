@@ -57,6 +57,37 @@ pub struct PolicyFile {
     /// requirements" — same behavior as before this field existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_attestations: Vec<RequiredAttestation>,
+    /// Retention rules for `lex op gc` (#261 slice 2). Default
+    /// (empty) means "every op is GC-eligible unless it's reachable
+    /// from a branch head" — branch reachability is always honored.
+    #[serde(default, skip_serializing_if = "GcRetention::is_empty")]
+    pub gc_retention: GcRetention,
+}
+
+/// Retention policy for the predicate-driven op-log GC (#261 slice
+/// 2). Ops matching any retain predicate are kept; ops reachable
+/// from any branch head are *also* always kept regardless of this
+/// policy. The "parent of a retained op is retained too" invariant
+/// is a closure rule applied by [`crate::Store::plan_gc`], not a
+/// schema field.
+///
+/// The retain predicates are stored as `serde_json::Value` rather
+/// than typed `Predicate`s so the policy file is forward-compatible
+/// with future predicate variants — the GC engine parses them at
+/// load time and surfaces a clear error if the schema doesn't match.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GcRetention {
+    /// Each entry is the JSON form produced by `Predicate::to_value`
+    /// (`{"predicate": "intent", "intent_id": "..."}` etc.). Ops
+    /// matching *any* predicate are retained.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retain: Vec<serde_json::Value>,
+}
+
+impl GcRetention {
+    pub fn is_empty(&self) -> bool {
+        self.retain.is_empty()
+    }
 }
 
 /// One required-attestation rule. Says: "every op advancing the

@@ -198,6 +198,109 @@ impl OpLog {
         Ok(count)
     }
 
+    /// Remove every op_id in `victims` from the log, across both
+    /// loose files and packfiles (#261 slice 2). Used by
+    /// `lex op gc` after a retention plan identifies which ops to
+    /// drop. Idempotent — calling twice with the same set is a
+    /// no-op on the second pass.
+    ///
+    /// Pack handling: any pack containing one or more victims is
+    /// rewritten to a new content-addressed pack with only the
+    /// surviving ops; the old pack and its index file are deleted.
+    /// A pack whose every op is a victim is deleted outright.
+    ///
+    /// Returns the count of ops actually removed (loose files
+    /// deleted + packed ops dropped). Pre-existing absences don't
+    /// contribute.
+    pub fn evict(&self, victims: &BTreeSet<OpId>) -> io::Result<usize> {
+        if victims.is_empty() {
+            return Ok(0);
+        }
+        let mut removed = 0;
+        // Loose files: just delete the matching `<op_id>.json`.
+        for (op_id, path) in self.list_loose_files()? {
+            if victims.contains(&op_id) {
+                match fs::remove_file(&path) {
+                    Ok(()) => removed += 1,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        // Packs: rewrite each affected pack with only surviving ops.
+        for pack_idx in self.list_pack_indices()? {
+            let idx = PackIndex::load(&pack_idx)?;
+            let pack_path = pack_idx.with_extension("pack");
+            let touched = idx.ops.keys().any(|op_id| victims.contains(op_id));
+            if !touched {
+                continue;
+            }
+            // Read every surviving op out, then drop the old pack.
+            let mut survivors: Vec<(OpId, Vec<u8>)> = Vec::new();
+            for (op_id, &offset) in &idx.ops {
+                if victims.contains(op_id) {
+                    removed += 1;
+                    continue;
+                }
+                let rec = read_packed_op(&pack_path, offset)?;
+                let bytes = serde_json::to_vec(&rec)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                survivors.push((op_id.clone(), bytes));
+            }
+            // Delete old pack + idx first; we re-emit a fresh
+            // (different-hash) pack from the survivors below.
+            let _ = fs::remove_file(&pack_path);
+            let _ = fs::remove_file(&pack_idx);
+            if survivors.is_empty() {
+                continue;
+            }
+            self.write_pack_from_survivors(survivors)?;
+        }
+        Ok(removed)
+    }
+
+    /// Helper: write a new content-addressed pack from
+    /// already-serialized op bytes. Same shape as
+    /// [`Self::repack`]'s output path; factored out so
+    /// [`Self::evict`] can reuse it.
+    fn write_pack_from_survivors(
+        &self,
+        mut ops: Vec<(OpId, Vec<u8>)>,
+    ) -> io::Result<()> {
+        ops.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut name_input = Vec::new();
+        for (id, _) in &ops {
+            name_input.extend_from_slice(id.as_bytes());
+            name_input.push(b'\n');
+        }
+        let pack_hash = hash_bytes(&name_input);
+        let pack_path = self.dir.join(format!("pack-{pack_hash}.pack"));
+        let idx_path = self.dir.join(format!("pack-{pack_hash}.idx"));
+        if pack_path.exists() && idx_path.exists() {
+            return Ok(());
+        }
+        let pack_tmp = pack_path.with_extension("pack.tmp");
+        let idx_tmp = idx_path.with_extension("idx.tmp");
+        let mut offsets: BTreeMap<OpId, u64> = BTreeMap::new();
+        {
+            let mut f = fs::File::create(&pack_tmp)?;
+            let mut cursor: u64 = 0;
+            for (op_id, bytes) in &ops {
+                offsets.insert(op_id.clone(), cursor);
+                let len = bytes.len() as u64;
+                f.write_all(&len.to_be_bytes())?;
+                f.write_all(bytes)?;
+                cursor += 8 + len;
+            }
+            f.sync_all()?;
+        }
+        let idx = PackIndex { version: 1, ops: offsets };
+        idx.save(&idx_tmp)?;
+        fs::rename(&pack_tmp, &pack_path)?;
+        fs::rename(&idx_tmp, &idx_path)?;
+        Ok(())
+    }
+
     /// Enumerate every loose `<op_id>.json` in the ops directory.
     /// Used by [`Self::repack`] and [`Self::list_all`].
     fn list_loose_files(&self) -> io::Result<Vec<(OpId, PathBuf)>> {

@@ -28,8 +28,11 @@
 mod store;
 mod model;
 mod branches;
+mod gc;
 pub mod users;
 pub mod policy;
+
+pub use gc::{GcPlan, RetentionReason};
 
 pub use lex_vcs::{OpId, Operation, OperationKind, OperationRecord, StageTransition};
 pub use model::{Lifecycle, Metadata, Spec, StageStatus, Test, Transition};
