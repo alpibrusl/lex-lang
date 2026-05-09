@@ -74,7 +74,7 @@ impl Keypair {
     /// (test vectors, KAT) should use [`Keypair::from_secret_hex`].
     pub fn generate() -> Result<Self, SigningError> {
         let mut seed = [0u8; SECRET_KEY_LENGTH];
-        getrandom::getrandom(&mut seed)
+        getrandom::fill(&mut seed)
             .map_err(|e| SigningError::Entropy(e.to_string()))?;
         Ok(Self::from_seed(&seed))
     }

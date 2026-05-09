@@ -113,7 +113,7 @@ jobs:
         run: ls -la dist/
 
       - name: Create / update Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name || github.event.inputs.tag }}
           generate_release_notes: true
