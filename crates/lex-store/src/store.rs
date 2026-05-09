@@ -166,10 +166,17 @@ impl Store {
         fs::create_dir_all(self.specs_dir(&sig))?;
 
         let ast_path = self.impl_dir(&sig).join(format!("{}.ast.json", stage_id));
+        let delta_path = self.impl_dir(&sig).join(format!("{}.delta.json", stage_id));
         let meta_path = self.impl_dir(&sig).join(format!("{}.metadata.json", stage_id));
 
-        if !ast_path.exists() {
-            write_canonical_json(&ast_path, stage)?;
+        // #261 slice 3: try delta encoding against the most recent
+        // prior stage in this sig's lifecycle. Falls back to a full
+        // snapshot when (a) no prior stage exists, (b) the diff
+        // ratio is over the threshold, or (c) the delta chain is
+        // already at its cap. The decision is internal — callers
+        // see the same `Stage` object on `get_ast` regardless.
+        if !ast_path.exists() && !delta_path.exists() {
+            self.persist_stage_bytes(&sig, &stage_id, stage, &ast_path, &delta_path)?;
         }
         if !meta_path.exists() {
             let signature = signer.map(|kp| kp.sign_stage_id(&stage_id));
@@ -317,9 +324,124 @@ impl Store {
 
     pub fn get_ast(&self, stage_id: &str) -> Result<Stage, StoreError> {
         let (sig, _) = self.lookup_lifecycle(stage_id)?;
-        let path = self.impl_dir(&sig).join(format!("{}.ast.json", stage_id));
-        let bytes = fs::read(&path)?;
+        let bytes = self.read_stage_canonical_bytes(&sig, stage_id)?;
         Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    /// Read the canonical bytes of a stage, walking back through
+    /// any delta chain (#261 slice 3). The recursion ends at a
+    /// `<stage_id>.ast.json` file (a full snapshot) or, in the
+    /// degenerate case of a missing chain, with `UnknownStage`.
+    fn read_stage_canonical_bytes(
+        &self,
+        sig: &str,
+        stage_id: &str,
+    ) -> Result<Vec<u8>, StoreError> {
+        let ast_path = self.impl_dir(sig).join(format!("{}.ast.json", stage_id));
+        if ast_path.exists() {
+            return Ok(fs::read(&ast_path)?);
+        }
+        let delta_path = self.impl_dir(sig).join(format!("{}.delta.json", stage_id));
+        if !delta_path.exists() {
+            return Err(StoreError::UnknownStage(stage_id.into()));
+        }
+        let delta_bytes = fs::read(&delta_path)?;
+        let delta: crate::delta::StageDelta = serde_json::from_slice(&delta_bytes)?;
+        let base_bytes = self.read_stage_canonical_bytes(sig, &delta.base_stage_id)?;
+        crate::delta::apply(&base_bytes, &delta)
+            .map_err(|e| StoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("applying delta for {stage_id}: {e}"),
+            )))
+    }
+
+    /// Persist a freshly-published stage's canonical bytes (#261
+    /// slice 3). Tries delta encoding against the most recent
+    /// prior stage in the sig's lifecycle; falls back to a full
+    /// snapshot when no base exists, the diff ratio is too high,
+    /// or the delta chain is already at its cap.
+    fn persist_stage_bytes(
+        &self,
+        sig: &str,
+        stage_id: &str,
+        stage: &Stage,
+        ast_path: &Path,
+        delta_path: &Path,
+    ) -> Result<(), StoreError> {
+        let new_bytes = canonical_bytes(stage)?;
+        if let Some((base_stage_id, base_chain_length)) =
+            self.pick_delta_base(sig, stage_id)?
+        {
+            let base_bytes = self.read_stage_canonical_bytes(sig, &base_stage_id)?;
+            let (prefix, suffix, middle) = crate::delta::splice(&base_bytes, &new_bytes);
+            let chain_length = base_chain_length + 1;
+            if crate::delta::is_worth_encoding(middle.len(), new_bytes.len(), chain_length) {
+                let delta = crate::delta::StageDelta {
+                    base_stage_id,
+                    chain_length,
+                    common_prefix: prefix,
+                    common_suffix: suffix,
+                    middle_hex: hex::encode(&middle),
+                };
+                write_canonical_json(delta_path, &delta)?;
+                return Ok(());
+            }
+        }
+        // Fall through: full snapshot.
+        if let Some(parent) = ast_path.parent() { fs::create_dir_all(parent)?; }
+        fs::write(ast_path, &new_bytes)?;
+        Ok(())
+    }
+
+    /// Pick a base stage for delta encoding from the given sig's
+    /// lifecycle. Returns `(base_stage_id, base_chain_length)` for
+    /// the most-recent non-tombstoned prior stage, or `None` when
+    /// there is no candidate. The chain length is read off the
+    /// base's `.delta.json` (if any) to enforce the cap.
+    fn pick_delta_base(
+        &self,
+        sig: &str,
+        new_stage_id: &str,
+    ) -> Result<Option<(String, usize)>, StoreError> {
+        let life = self.read_lifecycle(sig).ok();
+        let Some(life) = life else { return Ok(None); };
+        // Walk transitions newest-first; pick the first prior
+        // stage that isn't this one and isn't tombstoned.
+        let mut latest_per_stage: indexmap::IndexMap<&str, StageStatus> = indexmap::IndexMap::new();
+        for t in &life.transitions {
+            latest_per_stage.insert(&t.stage_id, t.to);
+        }
+        let mut candidates: Vec<&str> = latest_per_stage
+            .iter()
+            .filter(|(id, status)| {
+                **id != new_stage_id && **status != StageStatus::Tombstone
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        // Reverse to get newest-first (transitions are append-only,
+        // so latest_per_stage's iteration order matches insertion
+        // order, oldest-first).
+        candidates.reverse();
+        let Some(&base) = candidates.first() else { return Ok(None); };
+        let base_chain_length = self.delta_chain_length(sig, base)?;
+        Ok(Some((base.to_string(), base_chain_length)))
+    }
+
+    /// Length of the delta chain ending at `stage_id`. Zero when
+    /// the stage is a full snapshot (`.ast.json` present); the
+    /// stored `chain_length` from `.delta.json` otherwise.
+    fn delta_chain_length(&self, sig: &str, stage_id: &str) -> Result<usize, StoreError> {
+        let ast_path = self.impl_dir(sig).join(format!("{}.ast.json", stage_id));
+        if ast_path.exists() {
+            return Ok(0);
+        }
+        let delta_path = self.impl_dir(sig).join(format!("{}.delta.json", stage_id));
+        if !delta_path.exists() {
+            return Ok(0);
+        }
+        let bytes = fs::read(&delta_path)?;
+        let delta: crate::delta::StageDelta = serde_json::from_slice(&bytes)?;
+        Ok(delta.chain_length)
     }
 
     pub fn get_metadata(&self, stage_id: &str) -> Result<Metadata, StoreError> {
@@ -1248,6 +1370,15 @@ fn write_canonical_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Stor
     if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
     fs::write(path, s)?;
     Ok(())
+}
+
+/// Serialize a stage to its canonical-JSON byte form. Used by
+/// `publish_signed` for delta encoding (#261 slice 3) — both the
+/// "compute the diff" path and the "write a full snapshot"
+/// fallback need exactly the same bytes.
+fn canonical_bytes(stage: &Stage) -> Result<Vec<u8>, StoreError> {
+    let v = serde_json::to_value(stage)?;
+    Ok(lex_ast::canon_json::to_canonical_string(&v).into_bytes())
 }
 
 #[allow(dead_code)]
