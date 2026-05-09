@@ -686,9 +686,9 @@ impl EffectHandler for DefaultHandler {
             if !(0..=1_048_576).contains(&n) {
                 return Err("crypto.random: n must be in 0..=1048576".into());
             }
-            use rand::{rngs::OsRng, TryRngCore};
+            use rand::{rngs::SysRng, TryRng};
             let mut buf = vec![0u8; n as usize];
-            OsRng.try_fill_bytes(&mut buf)
+            SysRng.try_fill_bytes(&mut buf)
                 .map_err(|e| format!("crypto.random: OS RNG: {e}"))?;
             return Ok(Value::Bytes(buf));
         }
