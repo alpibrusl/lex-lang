@@ -7,6 +7,27 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-05-09
+
+The op-log performance roadmap and the post-0.4.0 limitation
+follow-ups. #261 ships in three slices (packfiles, predicate-driven
+GC, delta-encoded stages) so the on-disk layout scales past the
+~10k-op cap that 0.4.0's loose-file model implied. Alongside, the
+limitation issues filed against 0.4.0 are now closed (#256
+walk-back gate, #257 ops-during-run trace attestations, #258
+attestation-cascade migration), the multi-writer concurrency story
+is real (#262 CAS branch advance), and `lex op pull` (#260)
+completes the symmetric inverse of #242's push.
+
+Minor bump because every data-layer change is additive — packfiles
+and `.delta.json` are new file shapes alongside the existing loose
+forms; loose-file readers ignore them. The one breaking surface is
+the dep update: `rand 0.10` and `getrandom 0.4` rotated their
+trait imports (`OsRng` → `SysRng`, `TryRngCore` → `TryRng`,
+`getrandom::getrandom` → `getrandom::fill`), so callers of
+`lex_vcs::Keypair::generate` or the `crypto.random` runtime
+handler that took out their own RNG will need to adjust imports.
+
 ### Added — agent-VCS roadmap (#261, slice 3)
 
 - **Delta-encoded stage bytes** (#261 slice 3). When
