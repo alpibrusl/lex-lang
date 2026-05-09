@@ -7,6 +7,34 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added — agent-VCS roadmap (#261, slice 2)
+
+- **Predicate-driven op-log GC** (#261 slice 2). New
+  `Store::plan_gc(cli_retain) -> GcPlan` and
+  `Store::apply_gc(plan)`. Three retention rules combine to form
+  the surviving set: (1) every op reachable from any branch head
+  is always kept, (2) ops matching any retain predicate (CLI args
+  + `policy.gc_retention.retain` entries) are kept, (3) every
+  parent of a retained op is kept transitively (DAG integrity —
+  honors the "refuse to delete an op that's still a parent of a
+  retained op" criterion). Each retained op carries a
+  `RetentionReason` for the plan envelope.
+- **`policy.json` `gc_retention.retain`** schema — opaque
+  `serde_json::Value` predicates so the policy file is forward-
+  compatible with future `Predicate` variants. Empty (default)
+  means "no extra retention; branch-reachable ops only."
+- **`OpLog::evict(victims)`** removes op_ids across both loose
+  files and packfiles. Pack handling: any pack containing a
+  victim is rewritten to a new content-addressed pack with only
+  the survivors (or deleted outright when no survivors remain).
+- **`lex op gc {--dry-run|--confirm} [--retain JSON ...] [--store DIR]`**
+  CLI command. `--dry-run` reports the plan without touching
+  disk; `--confirm` applies. Idempotent — re-running on a
+  GC'd store finds no new orphans.
+- 7 conformance tests in `crates/lex-store/tests/gc_conformance.rs`
+  covering reachability, predicate match, parent closure, pack
+  rewriting, idempotence, and policy.json wiring.
+
 ### Added — agent-VCS roadmap (#261, slice 1)
 
 - **Op-log packfiles** (#261 slice 1). Loose-file storage at
