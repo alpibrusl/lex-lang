@@ -7,6 +7,25 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added — agent-discovery (#283)
+
+- **`lex store search reindex`** warms the embedding cache eagerly
+  by walking every active stage through the configured embedder
+  (#283). With `LEX_EMBED_URL` set, hits Ollama (`/api/embeddings`)
+  or OpenAI-compat (`/v1/embeddings`) per `LEX_EMBED_PROVIDER`;
+  without it, falls back to `MockEmbedder`. Reports
+  `{ indexed, dim, elapsed_ms, store }` as the JSON envelope.
+- **Updated lib-level docs** in `lex-search` to reflect what's
+  actually shipped: the slice-2-deferred items (HTTP embedder
+  backends, on-disk cache) are in fact present (`HttpEmbedder`
+  with both Ollama and OpenAI wire formats, `CachingEmbedder`
+  with SHA-256-keyed disk cache). HNSW and cross-store cache sync
+  are the genuinely-deferred items.
+- 2 conformance tests in `crates/lex-cli/tests/search_reindex.rs`:
+  reindex on an empty store reports zero, and only `Active`
+  stages count (drafts are skipped — fixes the "every publish
+  inflates the index with stale candidates" failure mode).
+
 ### Added — agent-onboarding (#282)
 
 - **`lex docs --for-agent`** emits a single structured JSON

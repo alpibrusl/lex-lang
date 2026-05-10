@@ -1849,6 +1849,13 @@ fn rewrite_branch_heads(
 /// MockEmbedder for offline / deterministic ranking; the network-
 /// backed providers gate on `LEX_EMBED_URL` (slice 2).
 fn cmd_store_search(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    // `lex store search reindex` warms the embedding cache by
+    // walking every active stage through `SearchIndex::build`
+    // (#283). Falls through to query mode for any non-reindex
+    // positional.
+    if matches!(args.first().map(String::as_str), Some("reindex")) {
+        return cmd_store_search_reindex(fmt, &args[1..]);
+    }
     let (root, rest, _, _) = parse_store_flag(args);
     let mut limit: usize = 10;
     let mut query: Option<String> = None;
@@ -1893,6 +1900,39 @@ fn cmd_store_search(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             );
             if let Some(d) = &h.description { println!("          note: {d}"); }
         }
+    });
+    Ok(())
+}
+
+/// `lex store search reindex [--store DIR]` (#283). Walks every
+/// active stage through the configured embedder, populating the
+/// on-disk cache so subsequent `lex store search <query>` calls
+/// don't pay the embedding cost on the cold path.
+///
+/// With `LEX_EMBED_URL` set, this calls the HTTP backend (Ollama or
+/// OpenAI-compat per `LEX_EMBED_PROVIDER`); without it, falls back
+/// to [`lex_search::MockEmbedder`] (fast but semantically random —
+/// useful for warming a deterministic test fixture).
+///
+/// Emits `{ indexed, dim, embedder, store }` as the JSON envelope.
+fn cmd_store_search_reindex(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let (root, _rest, _, _) = parse_store_flag(args);
+    let store = Store::open(&root)
+        .with_context(|| format!("opening store at {}", root.display()))?;
+    let embedder = build_embedder(&root)?;
+    let started = std::time::Instant::now();
+    let idx = lex_search::SearchIndex::build(&store, &*embedder)
+        .map_err(|e| anyhow!("building search index: {e}"))?;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let v = serde_json::json!({
+        "indexed": idx.stages.len(),
+        "dim": embedder.dim(),
+        "elapsed_ms": elapsed_ms,
+        "store": root.display().to_string(),
+    });
+    acli::emit_or_text("store-search-reindex", v.clone(), fmt, || {
+        println!("indexed {} stage(s) ({}-dim embeddings, {} ms)",
+            idx.stages.len(), embedder.dim(), elapsed_ms);
     });
     Ok(())
 }
