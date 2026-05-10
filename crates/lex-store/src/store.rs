@@ -1084,6 +1084,73 @@ impl Store {
         self.apply_operation_checked(branch, op, transition, &candidate)
     }
 
+    /// Apply a typed `RenameLocal` transform (#280) — rename a
+    /// `let`-bound local within a fn body and emit a matching
+    /// `OperationKind::RenameLocal`. Same end-to-end shape as
+    /// [`Self::apply_replace_match_arm`]; see that method for the
+    /// failure-mode taxonomy.
+    pub fn apply_rename_local(
+        &self,
+        branch: &str,
+        from_stage_id: &str,
+        let_node: &lex_ast::NodeId,
+        new_name: &str,
+    ) -> Result<lex_vcs::OpId, StoreError> {
+        let from_stage = self.get_ast(from_stage_id)?;
+        // Read the old name before running the transform, so the
+        // op log records the rename target rather than just the
+        // new value.
+        let old_name = read_let_name(&from_stage, let_node)
+            .map_err(StoreError::TransformError)?;
+        let new_stage = lex_ast::rename_local(&from_stage, let_node, new_name)
+            .map_err(StoreError::TransformError)?;
+        let sig = lex_ast::sig_id(&from_stage)
+            .ok_or(StoreError::CannotPublishImport)?;
+        let to_stage_id = self.publish(&new_stage)?;
+        if to_stage_id == from_stage_id {
+            return Err(StoreError::InvalidTransition(format!(
+                "rename_local produced the same stage_id `{from_stage_id}`"
+            )));
+        }
+        let head = self.branch_head(branch)?;
+        let mut candidate: Vec<lex_ast::Stage> = Vec::with_capacity(head.len());
+        for (other_sig, other_stage_id) in &head {
+            if other_sig == &sig {
+                candidate.push(new_stage.clone());
+            } else {
+                candidate.push(self.get_ast(other_stage_id)?);
+            }
+        }
+        if !head.contains_key(&sig) {
+            return Err(StoreError::InvalidTransition(format!(
+                "sig `{sig}` not on branch `{branch}`'s head"
+            )));
+        }
+        let from_budget = budget_of_stage(&from_stage);
+        let to_budget = budget_of_stage(&new_stage);
+        let head_now = self.get_branch(branch)?.and_then(|b| b.head_op);
+        let kind = lex_vcs::OperationKind::RenameLocal {
+            sig_id: sig.clone(),
+            from_stage_id: from_stage_id.to_string(),
+            to_stage_id: to_stage_id.clone(),
+            let_node: let_node.as_str().to_string(),
+            old_name,
+            new_name: new_name.to_string(),
+            from_budget,
+            to_budget,
+        };
+        let transition = lex_vcs::StageTransition::Replace {
+            sig_id: sig.clone(),
+            from: from_stage_id.to_string(),
+            to: to_stage_id.clone(),
+        };
+        let op = lex_vcs::Operation::new(
+            kind,
+            head_now.into_iter().collect::<Vec<_>>(),
+        );
+        self.apply_operation_checked(branch, op, transition, &candidate)
+    }
+
     /// `set_branch_head_op` for the durability story on the branch
     /// file itself.
     pub fn apply_operation(
@@ -1397,7 +1464,8 @@ fn transition_for_kind(kind: &lex_vcs::OperationKind) -> lex_vcs::StageTransitio
         ModifyBody { sig_id, from_stage_id, to_stage_id, .. }
         | ChangeEffectSig { sig_id, from_stage_id, to_stage_id, .. }
         | ModifyType { sig_id, from_stage_id, to_stage_id }
-        | ReplaceMatchArm { sig_id, from_stage_id, to_stage_id, .. } => StageTransition::Replace {
+        | ReplaceMatchArm { sig_id, from_stage_id, to_stage_id, .. }
+        | RenameLocal { sig_id, from_stage_id, to_stage_id, .. } => StageTransition::Replace {
             sig_id: sig_id.clone(),
             from: from_stage_id.clone(),
             to:   to_stage_id.clone(),
@@ -1474,6 +1542,142 @@ fn write_canonical_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Stor
     if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
     fs::write(path, s)?;
     Ok(())
+}
+
+/// Read the `name` of the `Let` expression at `let_node` inside
+/// `stage`'s body. Used by [`Store::apply_rename_local`] to record
+/// the rename source. Returns the same `TransformError` shapes as
+/// the transformer itself so callers see a consistent error
+/// vocabulary.
+fn read_let_name(
+    stage: &Stage,
+    let_node: &lex_ast::NodeId,
+) -> Result<String, lex_ast::TransformError> {
+    // The transformer is itself a pure function; ask it to perform
+    // a rename to a sentinel value and read the resulting let's
+    // original name from the output. Cheaper than duplicating the
+    // node-walk here, and stays correct as the transform evolves.
+    //
+    // We use a sentinel that's invalid as a Lex identifier so even
+    // if the rename somehow lands, downstream parsing would
+    // surface it loudly. (The transform path discards the renamed
+    // value — we only need the *original* name.)
+    let probed = lex_ast::rename_local(stage, let_node, "__lex_rename_probe__")?;
+    let Stage::FnDecl(fd) = probed else {
+        return Err(lex_ast::TransformError::NonFnTarget { stage_kind: "non-FnDecl" });
+    };
+    // Walk back to the probed let to read its old name from the
+    // *original* stage — the probed stage's let has already been
+    // renamed.
+    let Stage::FnDecl(orig_fd) = stage else {
+        return Err(lex_ast::TransformError::NonFnTarget { stage_kind: "non-FnDecl" });
+    };
+    // Path-based lookup matches the transformer's navigation.
+    let path = parse_let_node_path(let_node.as_str())?;
+    if path.is_empty() {
+        return Err(lex_ast::TransformError::NotALet {
+            at: let_node.as_str().into(),
+            found_kind: "stage_root",
+        });
+    }
+    if path[0] != orig_fd.params.len() + 1 {
+        return Err(lex_ast::TransformError::UnknownNode {
+            at: let_node.as_str().into(),
+        });
+    }
+    let inner = &path[1..];
+    let target = navigate_to_let(&orig_fd.body, inner, let_node.as_str())?;
+    let _ = fd; // probed stage discarded
+    Ok(target.to_string())
+}
+
+fn parse_let_node_path(id: &str) -> Result<Vec<usize>, lex_ast::TransformError> {
+    let s = id.strip_prefix("n_")
+        .ok_or_else(|| lex_ast::TransformError::BadNodeId(id.into()))?;
+    let mut parts = s.split('.');
+    let head = parts.next()
+        .ok_or_else(|| lex_ast::TransformError::BadNodeId(id.into()))?;
+    if head != "0" { return Err(lex_ast::TransformError::BadNodeId(id.into())); }
+    let mut out = Vec::new();
+    for p in parts {
+        out.push(p.parse::<usize>()
+            .map_err(|_| lex_ast::TransformError::BadNodeId(id.into()))?);
+    }
+    Ok(out)
+}
+
+fn navigate_to_let<'a>(
+    root: &'a lex_ast::CExpr,
+    path: &[usize],
+    at: &str,
+) -> Result<&'a str, lex_ast::TransformError> {
+    use lex_ast::CExpr::*;
+    let mut current = root;
+    for &idx in path {
+        current = match current {
+            Call { callee, args } => {
+                if idx == 0 { callee } else { args.get(idx - 1)
+                    .ok_or_else(|| lex_ast::TransformError::UnknownNode { at: at.into() })? }
+            }
+            Let { value, body, .. } => match idx {
+                0 => value, 1 => body,
+                _ => return Err(lex_ast::TransformError::UnknownNode { at: at.into() }),
+            },
+            Match { scrutinee, arms } => {
+                if idx == 0 { scrutinee } else {
+                    let arm_off = idx - 1;
+                    if arm_off % 2 != 1 {
+                        return Err(lex_ast::TransformError::UnknownNode { at: at.into() });
+                    }
+                    let arm_index = arm_off / 2;
+                    &arms.get(arm_index)
+                        .ok_or_else(|| lex_ast::TransformError::UnknownNode { at: at.into() })?
+                        .body
+                }
+            }
+            Block { statements, result } => {
+                if idx < statements.len() { &statements[idx] }
+                else if idx == statements.len() { result }
+                else { return Err(lex_ast::TransformError::UnknownNode { at: at.into() }); }
+            }
+            Constructor { args, .. } | TupleLit { items: args, .. }
+            | ListLit { items: args, .. } => args.get(idx)
+                .ok_or_else(|| lex_ast::TransformError::UnknownNode { at: at.into() })?,
+            RecordLit { fields } => &fields.get(idx)
+                .ok_or_else(|| lex_ast::TransformError::UnknownNode { at: at.into() })?
+                .value,
+            FieldAccess { value, .. } if idx == 0 => value,
+            Lambda { body, .. } if idx == 0 => body,
+            BinOp { lhs, rhs, .. } => match idx {
+                0 => lhs, 1 => rhs,
+                _ => return Err(lex_ast::TransformError::UnknownNode { at: at.into() }),
+            },
+            UnaryOp { expr, .. } if idx == 0 => expr,
+            Return { value } if idx == 0 => value,
+            _ => return Err(lex_ast::TransformError::UnknownNode { at: at.into() }),
+        };
+    }
+    let Let { name, .. } = current else {
+        return Err(lex_ast::TransformError::NotALet {
+            at: at.into(),
+            found_kind: lex_cexpr_kind(current),
+        });
+    };
+    Ok(name)
+}
+
+fn lex_cexpr_kind(e: &lex_ast::CExpr) -> &'static str {
+    use lex_ast::CExpr::*;
+    match e {
+        Literal { .. } => "Literal", Var { .. } => "Var",
+        Call { .. } => "Call", Let { .. } => "Let",
+        Match { .. } => "Match", Block { .. } => "Block",
+        Constructor { .. } => "Constructor", RecordLit { .. } => "RecordLit",
+        TupleLit { .. } => "TupleLit", ListLit { .. } => "ListLit",
+        FieldAccess { .. } => "FieldAccess", Lambda { .. } => "Lambda",
+        BinOp { .. } => "BinOp", UnaryOp { .. } => "UnaryOp",
+        Return { .. } => "Return",
+    }
 }
 
 /// Extract the declared `[budget(N)]` integer from a stage's

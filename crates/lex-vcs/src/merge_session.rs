@@ -77,6 +77,12 @@ pub struct ConflictRecord {
 }
 
 /// Choice for a single conflict.
+// `Operation` is the only payload-carrying variant and grew with
+// #280's typed transforms. Clippy flags the size disparity, but
+// boxing the field would churn callers (HTTP handler, CLI, tests)
+// for a heuristic warning — the heap allocation cost vs. the
+// occasional empty variant is not actually a hot path here.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Resolution {

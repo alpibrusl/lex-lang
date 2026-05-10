@@ -219,6 +219,24 @@ pub enum OperationKind {
     Merge {
         resolved: usize,
     },
+    /// Typed transform: renamed a `let`-bound local within a fn
+    /// body (#280). Records the old/new identifiers and the position
+    /// of the let-binding in the AST. Body-shape-stable: the renamed
+    /// stage typically hashes near the original.
+    RenameLocal {
+        sig_id: SigId,
+        from_stage_id: StageId,
+        to_stage_id: StageId,
+        /// Path-style NodeId of the `Let` expression at the time of
+        /// the transform.
+        let_node: String,
+        old_name: String,
+        new_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_budget: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_budget: Option<u64>,
+    },
     /// Typed transform: replaced one arm's body in a `Match`
     /// expression (#280). Semantically a `ModifyBody`, but the op
     /// records *which* arm changed and *where* in the AST — so the
@@ -272,6 +290,7 @@ impl OperationKind {
             | ChangeEffectSig { sig_id, to_stage_id, .. }
             | ModifyType { sig_id, to_stage_id, .. }
             | ReplaceMatchArm { sig_id, to_stage_id, .. }
+            | RenameLocal { sig_id, to_stage_id, .. }
                 => Some((sig_id.clone(), Some(to_stage_id.clone()))),
             RemoveFunction { sig_id, .. }
             | RemoveType { sig_id, .. }
@@ -294,7 +313,8 @@ impl OperationKind {
             AddFunction { budget_cost, .. } => (None, *budget_cost),
             ModifyBody { from_budget, to_budget, .. }
             | ChangeEffectSig { from_budget, to_budget, .. }
-            | ReplaceMatchArm { from_budget, to_budget, .. } => (*from_budget, *to_budget),
+            | ReplaceMatchArm { from_budget, to_budget, .. }
+            | RenameLocal { from_budget, to_budget, .. } => (*from_budget, *to_budget),
             _ => (None, None),
         }
     }
@@ -309,7 +329,8 @@ impl OperationKind {
             AddFunction { sig_id, .. }
             | ModifyBody { sig_id, .. }
             | ChangeEffectSig { sig_id, .. }
-            | ReplaceMatchArm { sig_id, .. } => Some(sig_id),
+            | ReplaceMatchArm { sig_id, .. }
+            | RenameLocal { sig_id, .. } => Some(sig_id),
             _ => None,
         }
     }
