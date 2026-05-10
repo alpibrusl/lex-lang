@@ -17,15 +17,16 @@
 //! produces an ill-typed AST surfaces as `StoreError::TypeError`
 //! rather than failing inside the transformer.
 //!
-//! # Slice 1 (#280)
+//! # Shipped transforms
 //!
-//! [`replace_match_arm`] — replaces the body of one arm in a match
-//! expression. Pattern is preserved; the new body must be a valid
-//! `CExpr`. This is the simplest position-targeted transform and
-//! establishes the pattern for the rest (`RenameLocal`,
-//! `InlineLet`, `ExtractFunction` — separate slices).
+//! - [`replace_match_arm`] — replaces the body of one arm in a
+//!   match expression. Pattern is preserved.
+//! - [`rename_local`] — renames a `let`-bound local. Walks the
+//!   binding's body scope and rewrites every unshadowed reference.
+//!
+//! Future slices: `inline_let`, `extract_function`.
 
-use crate::canonical::{CExpr, Stage};
+use crate::canonical::{CExpr, Pattern, Stage};
 use crate::ids::NodeId;
 
 #[derive(Debug, Clone, thiserror::Error, serde::Serialize, serde::Deserialize)]
@@ -35,12 +36,16 @@ pub enum TransformError {
     UnknownNode { at: String },
     #[error("expected a Match expression at `{at}` but found `{found_kind}`")]
     NotAMatch { at: String, found_kind: &'static str },
+    #[error("expected a Let expression at `{at}` but found `{found_kind}`")]
+    NotALet { at: String, found_kind: &'static str },
     #[error("arm index {requested} out of range (arm count = {arm_count}) at `{at}`")]
     ArmIndexOutOfRange { at: String, arm_count: usize, requested: usize },
     #[error("malformed NodeId `{0}`")]
     BadNodeId(String),
     #[error("cannot transform inside `{stage_kind}` — only FnDecl bodies are transformable")]
     NonFnTarget { stage_kind: &'static str },
+    #[error("rename is a no-op: old and new name are both `{name}`")]
+    RenameNoOp { name: String },
 }
 
 /// Replace `match_node`'s arm at `arm_index` with a new body,
@@ -96,6 +101,132 @@ pub fn replace_match_arm(
     }
     arms[arm_index].body = new_body;
     Ok(out)
+}
+
+/// Rename a `let`-bound local variable. Walks the binding's body
+/// scope and rewrites every unshadowed reference to the old name.
+/// Pure function — produces a new `Stage` with the rename applied.
+///
+/// Scope semantics:
+/// - The let's `value` is evaluated in the outer scope; references
+///   to the old name there belong to whatever bound it before.
+///   We rewrite the `value` only if a renamed outer binding would
+///   reach it — which it can't, since `let` in Lex is
+///   non-recursive. So we leave `value` untouched.
+/// - The let's `body` sees the renamed binding. Shadowing in `body`
+///   (a nested `Let` / `Lambda` param / `Match` pattern that
+///   re-binds the *old* name) cuts off renaming inside the
+///   shadowed sub-tree.
+///
+/// Refuses when `old_name == new_name`. Doesn't otherwise check for
+/// name clashes — if the new name is already bound in scope, the
+/// downstream type-checker surfaces it as a `TypeError`.
+pub fn rename_local(
+    stage: &Stage,
+    let_node: &NodeId,
+    new_name: &str,
+) -> Result<Stage, TransformError> {
+    let mut out = stage.clone();
+    let (body, n_params) = match &mut out {
+        Stage::FnDecl(fd) => {
+            let n = fd.params.len();
+            (&mut fd.body, n)
+        }
+        Stage::TypeDecl(_) => return Err(TransformError::NonFnTarget { stage_kind: "TypeDecl" }),
+        Stage::Import(_) => return Err(TransformError::NonFnTarget { stage_kind: "Import" }),
+    };
+    let path = parse_node_id(let_node.as_str())?;
+    if path.is_empty() {
+        return Err(TransformError::NotALet {
+            at: let_node.as_str().into(),
+            found_kind: "stage_root",
+        });
+    }
+    if path[0] != n_params + 1 {
+        return Err(TransformError::UnknownNode { at: let_node.as_str().into() });
+    }
+    let inner = &path[1..];
+    let target = navigate_to_expr(body, inner, let_node.as_str())?;
+    let CExpr::Let { name, body: let_body, .. } = target else {
+        return Err(TransformError::NotALet {
+            at: let_node.as_str().into(),
+            found_kind: cexpr_kind(target),
+        });
+    };
+    if name == new_name {
+        return Err(TransformError::RenameNoOp { name: name.clone() });
+    }
+    let old_name = std::mem::replace(name, new_name.to_string());
+    // Walk the body scope. Stop renaming at shadow points.
+    rewrite_var_in_expr(let_body, &old_name, new_name);
+    Ok(out)
+}
+
+fn rewrite_var_in_expr(e: &mut CExpr, old: &str, new: &str) {
+    match e {
+        CExpr::Var { name } => {
+            if name == old { *name = new.into(); }
+        }
+        CExpr::Literal { .. } => {}
+        CExpr::Call { callee, args } => {
+            rewrite_var_in_expr(callee, old, new);
+            for a in args { rewrite_var_in_expr(a, old, new); }
+        }
+        CExpr::Let { name, value, body, .. } => {
+            // `value` is evaluated in the outer scope — rewrite
+            // there.
+            rewrite_var_in_expr(value, old, new);
+            // `body` sees the new binding. If THIS let re-binds
+            // `old`, it shadows the rename target; stop descending.
+            if name != old {
+                rewrite_var_in_expr(body, old, new);
+            }
+        }
+        CExpr::Match { scrutinee, arms } => {
+            rewrite_var_in_expr(scrutinee, old, new);
+            for arm in arms {
+                if !pattern_binds(&arm.pattern, old) {
+                    rewrite_var_in_expr(&mut arm.body, old, new);
+                }
+            }
+        }
+        CExpr::Block { statements, result } => {
+            for s in statements { rewrite_var_in_expr(s, old, new); }
+            rewrite_var_in_expr(result, old, new);
+        }
+        CExpr::Constructor { args, .. } => {
+            for a in args { rewrite_var_in_expr(a, old, new); }
+        }
+        CExpr::RecordLit { fields } => {
+            for f in fields { rewrite_var_in_expr(&mut f.value, old, new); }
+        }
+        CExpr::TupleLit { items } | CExpr::ListLit { items } => {
+            for i in items { rewrite_var_in_expr(i, old, new); }
+        }
+        CExpr::FieldAccess { value, .. } => rewrite_var_in_expr(value, old, new),
+        CExpr::Lambda { params, body, .. } => {
+            // Lambda params shadow the outer binding.
+            if !params.iter().any(|p| p.name == old) {
+                rewrite_var_in_expr(body, old, new);
+            }
+        }
+        CExpr::BinOp { lhs, rhs, .. } => {
+            rewrite_var_in_expr(lhs, old, new);
+            rewrite_var_in_expr(rhs, old, new);
+        }
+        CExpr::UnaryOp { expr, .. } => rewrite_var_in_expr(expr, old, new),
+        CExpr::Return { value } => rewrite_var_in_expr(value, old, new),
+    }
+}
+
+fn pattern_binds(p: &Pattern, name: &str) -> bool {
+    match p {
+        Pattern::PVar { name: n } => n == name,
+        Pattern::PLiteral { .. } | Pattern::PWild => false,
+        Pattern::PConstructor { args, .. } => args.iter().any(|p| pattern_binds(p, name)),
+        Pattern::PRecord { fields } => fields.iter().any(|f| pattern_binds(&f.pattern, name)),
+        Pattern::PTuple { items } => items.iter().any(|p| pattern_binds(p, name)),
+    }
 }
 
 fn parse_node_id(id: &str) -> Result<Vec<usize>, TransformError> {
@@ -206,6 +337,193 @@ fn cexpr_kind(e: &CExpr) -> &'static str {
 mod tests {
     use super::*;
     use crate::canonical::{Arm, CLit, FnDecl, Param, Pattern, TypeExpr};
+
+    // ---- rename_local fixtures + tests -----------------------------
+
+    /// `fn outer(n :: Int) -> Int { let x := n + 1; x + 2 }`
+    fn let_stage() -> Stage {
+        let body = CExpr::Let {
+            name: "x".into(),
+            ty: None,
+            value: Box::new(CExpr::BinOp {
+                op: "+".into(),
+                lhs: Box::new(CExpr::Var { name: "n".into() }),
+                rhs: Box::new(CExpr::Literal { value: CLit::Int { value: 1 } }),
+            }),
+            body: Box::new(CExpr::BinOp {
+                op: "+".into(),
+                lhs: Box::new(CExpr::Var { name: "x".into() }),
+                rhs: Box::new(CExpr::Literal { value: CLit::Int { value: 2 } }),
+            }),
+        };
+        Stage::FnDecl(FnDecl {
+            name: "outer".into(),
+            type_params: Vec::new(),
+            params: vec![Param {
+                name: "n".into(),
+                ty: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
+            }],
+            effects: Vec::new(),
+            return_type: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
+            body,
+        })
+    }
+
+    fn let_node_id() -> NodeId { NodeId("n_0.2".into()) }
+
+    #[test]
+    fn rename_local_renames_binding_and_body_reference() {
+        let stage = let_stage();
+        let out = rename_local(&stage, &let_node_id(), "y").unwrap();
+        let Stage::FnDecl(fd) = out else { panic!() };
+        let CExpr::Let { name, value, body, .. } = fd.body else { panic!() };
+        assert_eq!(name, "y", "binding renamed");
+        // value untouched (no `x` ref in `n + 1`).
+        let CExpr::BinOp { lhs, .. } = *value else { panic!() };
+        assert!(matches!(*lhs, CExpr::Var { name: ref n } if n == "n"));
+        // Body's `x` ref renamed to `y`.
+        let CExpr::BinOp { lhs, .. } = *body else { panic!() };
+        assert!(matches!(*lhs, CExpr::Var { name: ref n } if n == "y"));
+    }
+
+    #[test]
+    fn rename_local_refuses_no_op() {
+        let stage = let_stage();
+        let err = rename_local(&stage, &let_node_id(), "x").unwrap_err();
+        assert!(matches!(err, TransformError::RenameNoOp { .. }));
+    }
+
+    #[test]
+    fn rename_local_respects_inner_let_shadowing() {
+        // `fn f() -> Int { let x := 1; let x := 2; x }`
+        // Renaming the OUTER `x` to `y` should leave both inner
+        // references unchanged because the inner let shadows.
+        let inner = CExpr::Let {
+            name: "x".into(),
+            ty: None,
+            value: Box::new(CExpr::Literal { value: CLit::Int { value: 2 } }),
+            body: Box::new(CExpr::Var { name: "x".into() }),
+        };
+        let body = CExpr::Let {
+            name: "x".into(),
+            ty: None,
+            value: Box::new(CExpr::Literal { value: CLit::Int { value: 1 } }),
+            body: Box::new(inner),
+        };
+        let stage = Stage::FnDecl(FnDecl {
+            name: "f".into(),
+            type_params: Vec::new(),
+            params: Vec::new(),
+            effects: Vec::new(),
+            return_type: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
+            body,
+        });
+        let out = rename_local(&stage, &NodeId("n_0.1".into()), "y").unwrap();
+        let Stage::FnDecl(fd) = out else { panic!() };
+        let CExpr::Let { name: outer_name, body: outer_body, .. } = fd.body else { panic!() };
+        assert_eq!(outer_name, "y", "outer let renamed");
+        let CExpr::Let { name: inner_name, body: inner_body, .. } = *outer_body else { panic!() };
+        // Inner let shadows — its name stays "x".
+        assert_eq!(inner_name, "x");
+        // Inner body's `x` is the inner binding, not renamed.
+        assert!(matches!(*inner_body, CExpr::Var { name: ref n } if n == "x"));
+    }
+
+    #[test]
+    fn rename_local_respects_lambda_param_shadowing() {
+        // Body: `let x := 1; (\x. x)`. Lambda param shadows.
+        let lambda = CExpr::Lambda {
+            params: vec![Param {
+                name: "x".into(),
+                ty: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
+            }],
+            return_type: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
+            effects: Vec::new(),
+            body: Box::new(CExpr::Var { name: "x".into() }),
+        };
+        let body = CExpr::Let {
+            name: "x".into(),
+            ty: None,
+            value: Box::new(CExpr::Literal { value: CLit::Int { value: 1 } }),
+            body: Box::new(lambda),
+        };
+        let stage = Stage::FnDecl(FnDecl {
+            name: "f".into(),
+            type_params: Vec::new(),
+            params: Vec::new(),
+            effects: Vec::new(),
+            return_type: TypeExpr::Function {
+                params: vec![TypeExpr::Named { name: "Int".into(), args: Vec::new() }],
+                effects: Vec::new(),
+                ret: Box::new(TypeExpr::Named { name: "Int".into(), args: Vec::new() }),
+            },
+            body,
+        });
+        let out = rename_local(&stage, &NodeId("n_0.1".into()), "y").unwrap();
+        let Stage::FnDecl(fd) = out else { panic!() };
+        let CExpr::Let { name, body: outer_body, .. } = fd.body else { panic!() };
+        assert_eq!(name, "y");
+        let CExpr::Lambda { body: lam_body, .. } = *outer_body else { panic!() };
+        // Lambda body's `x` is the param, not renamed.
+        assert!(matches!(*lam_body, CExpr::Var { name: ref n } if n == "x"));
+    }
+
+    #[test]
+    fn rename_local_respects_match_pattern_shadowing() {
+        // Body: `let x := 1; match foo { x => x, _ => x }`
+        // The first arm's pattern is `PVar { x }` — it binds x,
+        // shadowing the let; that arm's body's `x` is the pattern
+        // binding, not the let binding. Should not be renamed.
+        // The `_` wildcard does NOT shadow; its body's `x` is the
+        // let binding, should be renamed.
+        let match_expr = CExpr::Match {
+            scrutinee: Box::new(CExpr::Var { name: "foo".into() }),
+            arms: vec![
+                Arm {
+                    pattern: Pattern::PVar { name: "x".into() },
+                    body: CExpr::Var { name: "x".into() },
+                },
+                Arm {
+                    pattern: Pattern::PWild,
+                    body: CExpr::Var { name: "x".into() },
+                },
+            ],
+        };
+        let body = CExpr::Let {
+            name: "x".into(),
+            ty: None,
+            value: Box::new(CExpr::Literal { value: CLit::Int { value: 1 } }),
+            body: Box::new(match_expr),
+        };
+        let stage = Stage::FnDecl(FnDecl {
+            name: "f".into(),
+            type_params: Vec::new(),
+            params: Vec::new(),
+            effects: Vec::new(),
+            return_type: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
+            body,
+        });
+        let out = rename_local(&stage, &NodeId("n_0.1".into()), "y").unwrap();
+        let Stage::FnDecl(fd) = out else { panic!() };
+        let CExpr::Let { body: outer_body, .. } = fd.body else { panic!() };
+        let CExpr::Match { arms, .. } = *outer_body else { panic!() };
+        // Arm 0 pattern binds x; arm body's `x` is the pattern, NOT renamed.
+        assert!(matches!(arms[0].body, CExpr::Var { name: ref n } if n == "x"));
+        // Arm 1 has wildcard; body's `x` is the let, renamed to `y`.
+        assert!(matches!(arms[1].body, CExpr::Var { name: ref n } if n == "y"));
+    }
+
+    #[test]
+    fn rename_local_not_a_let_errors() {
+        // Stage with a plain Match body (no Let). Targeting `n_0.2`
+        // should error with NotALet.
+        let stage = match_stage_with_two_arms();
+        let err = rename_local(&stage, &NodeId("n_0.2".into()), "y").unwrap_err();
+        assert!(matches!(err, TransformError::NotALet { found_kind: "Match", .. }),
+            "got {err:?}");
+    }
+
+    // ---- replace_match_arm fixtures + tests ------------------------
 
     fn match_stage_with_two_arms() -> Stage {
         // fn pick(n :: Int) -> Int { match n { 0 => 1, _ => 2 } }

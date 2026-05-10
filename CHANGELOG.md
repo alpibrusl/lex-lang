@@ -7,6 +7,36 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added — agent-VCS roadmap (#280, slice 2)
+
+- **Typed `RenameLocal` transform** (#280 slice 2). Second of the
+  typed refactoring operations from the 0.5.0 review. New
+  `lex_ast::rename_local(stage, let_node, new_name)` walks the
+  binding's body scope and rewrites every unshadowed reference to
+  the old name. Pure function — same shape as
+  `lex_ast::replace_match_arm`.
+- **Scope-aware**: shadowing by inner `Let`, `Lambda` params, or
+  `Match` pattern bindings cuts off the rewrite. `value`-side
+  references are left untouched because Lex `let` is
+  non-recursive.
+- **`OperationKind::RenameLocal { sig_id, from_stage_id,
+  to_stage_id, let_node, old_name, new_name, from_budget,
+  to_budget }`** records the rename in the op log; same
+  `skip_if_none` budget discipline as the rest of #280's variants.
+- **`Store::apply_rename_local`** end-to-end: load AST → transform
+  → publish new stage → re-typecheck → emit op. Failure modes
+  match `apply_replace_match_arm`: `TransformError` for malformed
+  targets, `TypeError` for ill-typed results, `InvalidTransition`
+  for no-op renames.
+- 6 unit tests in `lex_ast::transforms` (rename + body refs;
+  no-op refusal; inner-`Let` shadow; `Lambda` param shadow;
+  `Match` pattern shadow; not-a-Let target). 5 conformance tests
+  in `crates/lex-store/tests/rename_local.rs` (lands typed op,
+  `get_ast` reconstruction, no-op refusal, TypeCheck attestation,
+  transform-error surface for wrong node).
+
+Slices for `InlineLet` and `ExtractFunction` remain follow-ups.
+
 ### Added — agent-discovery (#283)
 
 - **`lex store search reindex`** warms the embedding cache eagerly
