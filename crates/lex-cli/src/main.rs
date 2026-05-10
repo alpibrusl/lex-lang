@@ -17,6 +17,7 @@ mod ast_merge;
 mod branch;
 mod merge;
 mod acli;
+mod docs;
 mod op;
 mod repl;
 mod watch;
@@ -104,6 +105,7 @@ fn run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "policy" => cmd_policy(fmt, &args[1..]),
         "log" => branch::cmd_log(fmt, &args[1..]),
         "op" => op::cmd_op(fmt, &args[1..]),
+        "docs" => docs::cmd_docs(fmt, &args[1..]),
         "canonical" => cmd_canonical(fmt, &args[1..]),
         "keygen" => cmd_keygen(fmt, &args[1..]),
         "repl" => repl::cmd_repl(&args[1..]),
