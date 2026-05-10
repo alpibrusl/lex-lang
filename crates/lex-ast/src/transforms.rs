@@ -27,10 +27,15 @@
 //!   substituting `v` for every unshadowed `x` in `body`. The let
 //!   value is restricted to capture-free, side-effect-free
 //!   expressions (literals, vars, field access, binops on those).
-//!
-//! Future slices: `extract_function`.
+//! - [`extract_function`] — extracts a sub-expression from a fn
+//!   body into a new top-level function, replacing the original
+//!   site with a call. The agent provides the new fn's signature
+//!   (params, return type, effects); the transform verifies free
+//!   variables match the params.
 
-use crate::canonical::{CExpr, Pattern, Stage};
+use crate::canonical::{
+    CExpr, Effect, FnDecl, Param, Pattern, Stage, TypeExpr,
+};
 use crate::ids::NodeId;
 
 #[derive(Debug, Clone, thiserror::Error, serde::Serialize, serde::Deserialize)]
@@ -52,6 +57,23 @@ pub enum TransformError {
     RenameNoOp { name: String },
     #[error("inline_let refused: `{reason}`")]
     InlineLetRefused { reason: String },
+    #[error("extract_function refused: `{reason}`")]
+    ExtractFnRefused { reason: String },
+}
+
+/// Specification of the new function that [`extract_function`]
+/// produces. The agent provides this — slice 4 doesn't infer
+/// types or effects from the surrounding context. The transform
+/// verifies the param set matches the extracted expression's free
+/// variables; the type-checker (downstream) catches mismatches in
+/// types, effects, and return type.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtractFnSpec {
+    pub name: String,
+    pub type_params: Vec<String>,
+    pub params: Vec<Param>,
+    pub return_type: TypeExpr,
+    pub effects: Vec<Effect>,
 }
 
 /// Replace `match_node`'s arm at `arm_index` with a new body,
@@ -545,6 +567,92 @@ fn pattern_binds(p: &Pattern, name: &str) -> bool {
     }
 }
 
+/// Extract a sub-expression from a fn body into a new top-level
+/// function (#280 slice 4). Returns `(modified_source, new_fn)`:
+/// the original stage with the extracted expression replaced by a
+/// call to the new fn, and the new fn itself as a fresh `Stage`.
+///
+/// `expr_node` is the [`NodeId`] of the expression to extract.
+/// `spec` describes the new fn's full signature; the transform
+/// verifies that `spec.params` covers exactly the free variables
+/// of the extracted expression — names must match. Type checking
+/// of the extracted body against the spec happens *after* the
+/// transform, in the apply path's re-typecheck.
+///
+/// The replacement call site uses the parameter order from
+/// `spec.params`: `f(a, b, c)` for `params = [a, b, c]`.
+pub fn extract_function(
+    stage: &Stage,
+    expr_node: &NodeId,
+    spec: ExtractFnSpec,
+) -> Result<(Stage, Stage), TransformError> {
+    // Locate + clone the expression to extract from a fresh stage
+    // copy; we need a separate mutable clone for the modification.
+    let mut modified = stage.clone();
+    let (body, n_params) = match &mut modified {
+        Stage::FnDecl(fd) => {
+            let n = fd.params.len();
+            (&mut fd.body, n)
+        }
+        Stage::TypeDecl(_) => return Err(TransformError::NonFnTarget { stage_kind: "TypeDecl" }),
+        Stage::Import(_) => return Err(TransformError::NonFnTarget { stage_kind: "Import" }),
+    };
+    let path = parse_node_id(expr_node.as_str())?;
+    if path.is_empty() {
+        return Err(TransformError::UnknownNode { at: expr_node.as_str().into() });
+    }
+    if path[0] != n_params + 1 {
+        return Err(TransformError::UnknownNode { at: expr_node.as_str().into() });
+    }
+    let inner = &path[1..];
+    let target = navigate_to_expr(body, inner, expr_node.as_str())?;
+
+    // Snapshot the expression we're about to extract. We need a
+    // value, not a reference, because we'll move it into the new
+    // fn's body.
+    let extracted_expr = target.clone();
+
+    // Free vars of the extracted expr must exactly match the
+    // declared param names. If the agent passed extra params or
+    // missed any, refuse — the agent did the analysis wrong.
+    let free = free_vars(&extracted_expr);
+    let declared: std::collections::BTreeSet<String> =
+        spec.params.iter().map(|p| p.name.clone()).collect();
+    if free != declared {
+        let only_in_free: Vec<&String> = free.difference(&declared).collect();
+        let only_in_declared: Vec<&String> = declared.difference(&free).collect();
+        return Err(TransformError::ExtractFnRefused {
+            reason: format!(
+                "free vars {free:?} differ from declared params {declared:?}: \
+                 missing {only_in_free:?}, extra {only_in_declared:?}"
+            ),
+        });
+    }
+
+    // Replace the extracted expr with a call to the new fn. Args
+    // are `Var { name }` for each declared param, in the spec's
+    // declared order.
+    let call = CExpr::Call {
+        callee: Box::new(CExpr::Var { name: spec.name.clone() }),
+        args: spec.params.iter()
+            .map(|p| CExpr::Var { name: p.name.clone() })
+            .collect(),
+    };
+    *target = call;
+
+    // Build the new fn stage from the extracted body + spec.
+    let new_fn = Stage::FnDecl(FnDecl {
+        name: spec.name,
+        type_params: spec.type_params,
+        params: spec.params,
+        effects: spec.effects,
+        return_type: spec.return_type,
+        body: extracted_expr,
+    });
+
+    Ok((modified, new_fn))
+}
+
 fn parse_node_id(id: &str) -> Result<Vec<usize>, TransformError> {
     let s = id.strip_prefix("n_").ok_or_else(|| TransformError::BadNodeId(id.into()))?;
     let mut parts = s.split('.');
@@ -981,6 +1089,159 @@ mod tests {
         let stage = match_stage_with_two_arms();
         let err = inline_let(&stage, &NodeId("n_0.2".into())).unwrap_err();
         assert!(matches!(err, TransformError::NotALet { found_kind: "Match", .. }));
+    }
+
+    // ---- extract_function tests ------------------------------------
+
+    /// `fn caller(n :: Int, m :: Int) -> Int { (n * 2) + m }`
+    /// We'll extract the `n * 2` sub-expression into a new fn.
+    fn extract_stage() -> Stage {
+        let body = CExpr::BinOp {
+            op: "+".into(),
+            lhs: Box::new(CExpr::BinOp {
+                op: "*".into(),
+                lhs: Box::new(CExpr::Var { name: "n".into() }),
+                rhs: Box::new(CExpr::Literal { value: CLit::Int { value: 2 } }),
+            }),
+            rhs: Box::new(CExpr::Var { name: "m".into() }),
+        };
+        Stage::FnDecl(FnDecl {
+            name: "caller".into(),
+            type_params: Vec::new(),
+            params: vec![
+                Param {
+                    name: "n".into(),
+                    ty: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
+                },
+                Param {
+                    name: "m".into(),
+                    ty: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
+                },
+            ],
+            effects: Vec::new(),
+            return_type: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
+            body,
+        })
+    }
+
+    fn double_n_spec() -> ExtractFnSpec {
+        ExtractFnSpec {
+            name: "double_n".into(),
+            type_params: Vec::new(),
+            params: vec![Param {
+                name: "n".into(),
+                ty: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
+            }],
+            effects: Vec::new(),
+            return_type: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
+        }
+    }
+
+    #[test]
+    fn extract_function_replaces_subexpression_with_call() {
+        // 2 params + return + body slot → body is at child 3.
+        // The body is a BinOp; lhs (the `n * 2` sub-expr) is at
+        // child 0 of the body. So target NodeId = `n_0.3.0`.
+        let stage = extract_stage();
+        let (modified, new_fn) = extract_function(
+            &stage,
+            &NodeId("n_0.3.0".into()),
+            double_n_spec(),
+        ).unwrap();
+
+        // Modified source: lhs is now `Call { Var(double_n), [Var(n)] }`.
+        let Stage::FnDecl(fd) = modified else { panic!() };
+        let CExpr::BinOp { lhs, .. } = fd.body else { panic!() };
+        let CExpr::Call { callee, args } = *lhs else { panic!() };
+        assert!(matches!(*callee, CExpr::Var { name: ref n } if n == "double_n"));
+        assert_eq!(args.len(), 1);
+        assert!(matches!(args[0], CExpr::Var { name: ref n } if n == "n"));
+
+        // New fn: name + params + body all match.
+        let Stage::FnDecl(new_fd) = new_fn else { panic!() };
+        assert_eq!(new_fd.name, "double_n");
+        assert_eq!(new_fd.params.len(), 1);
+        assert_eq!(new_fd.params[0].name, "n");
+        // Body is the original `n * 2`.
+        let CExpr::BinOp { op, lhs, rhs, .. } = new_fd.body else { panic!() };
+        assert_eq!(op, "*");
+        assert!(matches!(*lhs, CExpr::Var { name: ref n } if n == "n"));
+        assert!(matches!(*rhs, CExpr::Literal { value: CLit::Int { value: 2 } }));
+    }
+
+    #[test]
+    fn extract_function_refuses_extra_params() {
+        // Spec declares an extra param `z` not free in `n * 2`.
+        let stage = extract_stage();
+        let mut spec = double_n_spec();
+        spec.params.push(Param {
+            name: "z".into(),
+            ty: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
+        });
+        let err = extract_function(&stage, &NodeId("n_0.3.0".into()), spec).unwrap_err();
+        assert!(matches!(err, TransformError::ExtractFnRefused { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn extract_function_refuses_missing_params() {
+        // Spec omits `n`, which IS free in `n * 2`.
+        let stage = extract_stage();
+        let spec = ExtractFnSpec {
+            name: "no_args".into(),
+            type_params: Vec::new(),
+            params: Vec::new(),
+            effects: Vec::new(),
+            return_type: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
+        };
+        let err = extract_function(&stage, &NodeId("n_0.3.0".into()), spec).unwrap_err();
+        assert!(matches!(err, TransformError::ExtractFnRefused { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn extract_function_handles_zero_free_vars() {
+        // Body: `1 + 2`. Extract the LHS literal `1`. No free vars.
+        let body = CExpr::BinOp {
+            op: "+".into(),
+            lhs: Box::new(CExpr::Literal { value: CLit::Int { value: 1 } }),
+            rhs: Box::new(CExpr::Literal { value: CLit::Int { value: 2 } }),
+        };
+        let stage = Stage::FnDecl(FnDecl {
+            name: "caller".into(),
+            type_params: Vec::new(),
+            params: Vec::new(),
+            effects: Vec::new(),
+            return_type: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
+            body,
+        });
+        let spec = ExtractFnSpec {
+            name: "one".into(),
+            type_params: Vec::new(),
+            params: Vec::new(),
+            effects: Vec::new(),
+            return_type: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
+        };
+        // 0 params + return + body = body at child 1; lhs at 1.0.
+        let (modified, new_fn) = extract_function(
+            &stage, &NodeId("n_0.1.0".into()), spec,
+        ).unwrap();
+        let Stage::FnDecl(fd) = modified else { panic!() };
+        let CExpr::BinOp { lhs, .. } = fd.body else { panic!() };
+        let CExpr::Call { args, .. } = *lhs else { panic!() };
+        assert_eq!(args.len(), 0, "no args for zero-free-var extract");
+        let Stage::FnDecl(new_fd) = new_fn else { panic!() };
+        assert!(matches!(new_fd.body, CExpr::Literal { value: CLit::Int { value: 1 } }));
+    }
+
+    #[test]
+    fn extract_function_typedecl_target_errors() {
+        let stage = Stage::TypeDecl(crate::canonical::TypeDecl {
+            name: "T".into(),
+            params: Vec::new(),
+            definition: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
+        });
+        let err = extract_function(&stage, &NodeId("n_0.0".into()), double_n_spec())
+            .unwrap_err();
+        assert!(matches!(err, TransformError::NonFnTarget { stage_kind: "TypeDecl" }));
     }
 
     // ---- replace_match_arm fixtures + tests ------------------------

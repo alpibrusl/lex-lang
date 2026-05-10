@@ -1213,6 +1213,150 @@ impl Store {
         self.apply_operation_checked(branch, op, transition, &candidate)
     }
 
+    /// Apply a typed `ExtractFunction` transform (#280 slice 4) —
+    /// extract a sub-expression of `from_stage_id`'s body into a
+    /// new top-level fn defined by `spec`, and emit two ops tied
+    /// together by a shared synthetic Intent so `lex op log
+    /// --intent <id>` groups them.
+    ///
+    /// The two ops:
+    ///   1. `AddFunction { sig_id: <new_fn_sig>, stage_id: <new_fn_stage> }`
+    ///   2. `ModifyBody { sig_id: <source_sig>, from_stage_id, to_stage_id: <modified> }`
+    ///
+    /// The shared Intent's prompt is structured (`extract_function:
+    /// <new_fn_name>` plus the source identity) so downstream
+    /// tooling can recover the typed-transform shape from the
+    /// op-log + intent-log join.
+    ///
+    /// Returns `(add_fn_op_id, modify_body_op_id)`.
+    pub fn apply_extract_function(
+        &self,
+        branch: &str,
+        from_stage_id: &str,
+        expr_node: &lex_ast::NodeId,
+        spec: lex_ast::ExtractFnSpec,
+    ) -> Result<(lex_vcs::OpId, lex_vcs::OpId), StoreError> {
+        let from_stage = self.get_ast(from_stage_id)?;
+        let new_fn_name = spec.name.clone();
+        let (modified_stage, new_fn_stage) =
+            lex_ast::extract_function(&from_stage, expr_node, spec)
+                .map_err(StoreError::TransformError)?;
+
+        let source_sig = lex_ast::sig_id(&from_stage)
+            .ok_or(StoreError::CannotPublishImport)?;
+        let new_fn_sig = lex_ast::sig_id(&new_fn_stage)
+            .ok_or(StoreError::CannotPublishImport)?;
+        if source_sig == new_fn_sig {
+            return Err(StoreError::InvalidTransition(format!(
+                "extract_function produced a sig matching the source `{source_sig}`"
+            )));
+        }
+        let new_fn_stage_id = self.publish(&new_fn_stage)?;
+        let modified_stage_id = self.publish(&modified_stage)?;
+        if modified_stage_id == from_stage_id {
+            return Err(StoreError::InvalidTransition(format!(
+                "extract_function produced the same stage_id `{from_stage_id}` for the source"
+            )));
+        }
+
+        let head = self.branch_head(branch)?;
+        if !head.contains_key(&source_sig) {
+            return Err(StoreError::InvalidTransition(format!(
+                "sig `{source_sig}` not on branch `{branch}`'s head"
+            )));
+        }
+
+        // Synthesize an Intent linking the two ops. The session_id
+        // / model fields here are not load-bearing — they exist to
+        // make the IntentId content-addressed; downstream tooling
+        // reads `prompt` to reconstruct the typed-transform shape.
+        let intent = lex_vcs::Intent::new(
+            format!(
+                "[lex.transform.extract_function]\nnew_fn={new_fn_name}\nsource_sig={source_sig}\nfrom_stage={from_stage_id}\nexpr_node={node}",
+                node = expr_node.as_str(),
+            ),
+            "lex-store::apply_extract_function",
+            lex_vcs::ModelDescriptor {
+                provider: "lex-store".into(),
+                name: env!("CARGO_PKG_VERSION").into(),
+                version: None,
+            },
+            None,
+        );
+        let intent_id = intent.intent_id.clone();
+        lex_vcs::IntentLog::open(self.root())?.put(&intent)?;
+
+        // Step 1 — emit the AddFunction op for the new fn. Build
+        // the candidate program by appending the new fn to every
+        // stage on the current branch head.
+        let new_fn_effects: std::collections::BTreeSet<String> = match &new_fn_stage {
+            lex_ast::Stage::FnDecl(fd) => fd.effects.iter()
+                .map(|e| e.name.clone()).collect(),
+            _ => Default::default(),
+        };
+        let new_fn_budget = budget_of_stage(&new_fn_stage);
+        let mut candidate_with_new_fn: Vec<lex_ast::Stage> =
+            Vec::with_capacity(head.len() + 1);
+        for stage_id in head.values() {
+            candidate_with_new_fn.push(self.get_ast(stage_id)?);
+        }
+        candidate_with_new_fn.push(new_fn_stage.clone());
+        let head_now = self.get_branch(branch)?.and_then(|b| b.head_op);
+        let add_op = lex_vcs::Operation::new(
+            lex_vcs::OperationKind::AddFunction {
+                sig_id: new_fn_sig.clone(),
+                stage_id: new_fn_stage_id.clone(),
+                effects: new_fn_effects,
+                budget_cost: new_fn_budget,
+            },
+            head_now.into_iter().collect::<Vec<_>>(),
+        ).with_intent(intent_id.clone());
+        let add_transition = lex_vcs::StageTransition::Create {
+            sig_id: new_fn_sig.clone(),
+            stage_id: new_fn_stage_id.clone(),
+        };
+        let add_op_id = self.apply_operation_checked(
+            branch, add_op, add_transition, &candidate_with_new_fn,
+        )?;
+
+        // Step 2 — emit the ModifyBody op for the source. Build
+        // the candidate program by replacing the source's stage
+        // with `modified_stage` and keeping the new fn alongside.
+        let from_budget = budget_of_stage(&from_stage);
+        let to_budget = budget_of_stage(&modified_stage);
+        let mut candidate_with_modified: Vec<lex_ast::Stage> =
+            Vec::with_capacity(head.len() + 1);
+        for (other_sig, other_stage_id) in &head {
+            if other_sig == &source_sig {
+                candidate_with_modified.push(modified_stage.clone());
+            } else {
+                candidate_with_modified.push(self.get_ast(other_stage_id)?);
+            }
+        }
+        candidate_with_modified.push(new_fn_stage.clone());
+        let head_now = self.get_branch(branch)?.and_then(|b| b.head_op);
+        let modify_op = lex_vcs::Operation::new(
+            lex_vcs::OperationKind::ModifyBody {
+                sig_id: source_sig.clone(),
+                from_stage_id: from_stage_id.to_string(),
+                to_stage_id: modified_stage_id.clone(),
+                from_budget,
+                to_budget,
+            },
+            head_now.into_iter().collect::<Vec<_>>(),
+        ).with_intent(intent_id);
+        let modify_transition = lex_vcs::StageTransition::Replace {
+            sig_id: source_sig,
+            from: from_stage_id.to_string(),
+            to: modified_stage_id,
+        };
+        let modify_op_id = self.apply_operation_checked(
+            branch, modify_op, modify_transition, &candidate_with_modified,
+        )?;
+
+        Ok((add_op_id, modify_op_id))
+    }
+
     /// `set_branch_head_op` for the durability story on the branch
     /// file itself.
     pub fn apply_operation(

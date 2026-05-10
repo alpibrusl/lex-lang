@@ -7,6 +7,40 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added — agent-VCS roadmap (#280, slice 4)
+
+- **Typed `ExtractFunction` transform** (#280 slice 4). Closes the
+  last of the four typed refactoring operations from the 0.5.0
+  review. New `lex_ast::extract_function(stage, expr_node, spec)`
+  produces `(modified_source, new_fn)`: the original stage with
+  the extracted sub-expression replaced by a call, and the new
+  top-level fn carrying the extracted body.
+- **`ExtractFnSpec`** carries the agent-provided signature
+  (name, type_params, params, return_type, effects). The
+  transform verifies that `spec.params` covers exactly the free
+  variables of the extracted expression — names must match; extra
+  params or missing free vars are refused with
+  `TransformError::ExtractFnRefused`. Type checking against the
+  spec happens *after* the transform in the apply path.
+- **`Store::apply_extract_function`** emits two ops linked by a
+  shared synthetic `Intent`: an `AddFunction` for the new fn and
+  a `ModifyBody` for the source's call-site rewrite. The intent's
+  prompt is structured (`[lex.transform.extract_function]\nnew_fn=...`)
+  so `lex op log --intent <id>` recovers the typed-transform
+  shape from the op-log + intent-log join. No new
+  `OperationKind` variant — the typed view comes from the intent
+  linkage.
+- 5 unit tests in `lex_ast::transforms` (replacement, extra-param
+  refusal, missing-param refusal, zero-free-var case, TypeDecl
+  rejection) and 5 conformance tests in
+  `crates/lex-store/tests/extract_function.rs` (two linked ops,
+  structured intent, branch-state consistency, transform-error
+  surface, param-mismatch surface).
+
+**#280 is now complete** — all four typed refactoring transforms
+(`ReplaceMatchArm`, `RenameLocal`, `InlineLet`, `ExtractFunction`)
+are shipped with end-to-end conformance.
+
 ### Added — agent-VCS roadmap (#280, slice 3)
 
 - **Typed `InlineLet` transform** (#280 slice 3). Eliminates a
