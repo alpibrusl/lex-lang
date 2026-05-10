@@ -1151,6 +1151,68 @@ impl Store {
         self.apply_operation_checked(branch, op, transition, &candidate)
     }
 
+    /// Apply a typed `InlineLet` transform (#280) — eliminate a
+    /// `let x := v; body` by substituting `v` for every unshadowed
+    /// `x` in `body`, then replacing the `Let` node with the
+    /// substituted body. Same end-to-end shape as
+    /// [`Self::apply_replace_match_arm`].
+    pub fn apply_inline_let(
+        &self,
+        branch: &str,
+        from_stage_id: &str,
+        let_node: &lex_ast::NodeId,
+    ) -> Result<lex_vcs::OpId, StoreError> {
+        let from_stage = self.get_ast(from_stage_id)?;
+        let binding_name = read_let_name(&from_stage, let_node)
+            .map_err(StoreError::TransformError)?;
+        let new_stage = lex_ast::inline_let(&from_stage, let_node)
+            .map_err(StoreError::TransformError)?;
+        let sig = lex_ast::sig_id(&from_stage)
+            .ok_or(StoreError::CannotPublishImport)?;
+        let to_stage_id = self.publish(&new_stage)?;
+        if to_stage_id == from_stage_id {
+            return Err(StoreError::InvalidTransition(format!(
+                "inline_let produced the same stage_id `{from_stage_id}`"
+            )));
+        }
+        let head = self.branch_head(branch)?;
+        let mut candidate: Vec<lex_ast::Stage> = Vec::with_capacity(head.len());
+        for (other_sig, other_stage_id) in &head {
+            if other_sig == &sig {
+                candidate.push(new_stage.clone());
+            } else {
+                candidate.push(self.get_ast(other_stage_id)?);
+            }
+        }
+        if !head.contains_key(&sig) {
+            return Err(StoreError::InvalidTransition(format!(
+                "sig `{sig}` not on branch `{branch}`'s head"
+            )));
+        }
+        let from_budget = budget_of_stage(&from_stage);
+        let to_budget = budget_of_stage(&new_stage);
+        let head_now = self.get_branch(branch)?.and_then(|b| b.head_op);
+        let kind = lex_vcs::OperationKind::InlineLet {
+            sig_id: sig.clone(),
+            from_stage_id: from_stage_id.to_string(),
+            to_stage_id: to_stage_id.clone(),
+            let_node: let_node.as_str().to_string(),
+            binding_name,
+            from_budget,
+            to_budget,
+        };
+        let transition = lex_vcs::StageTransition::Replace {
+            sig_id: sig.clone(),
+            from: from_stage_id.to_string(),
+            to: to_stage_id.clone(),
+        };
+        let op = lex_vcs::Operation::new(
+            kind,
+            head_now.into_iter().collect::<Vec<_>>(),
+        );
+        self.apply_operation_checked(branch, op, transition, &candidate)
+    }
+
     /// `set_branch_head_op` for the durability story on the branch
     /// file itself.
     pub fn apply_operation(
@@ -1465,7 +1527,8 @@ fn transition_for_kind(kind: &lex_vcs::OperationKind) -> lex_vcs::StageTransitio
         | ChangeEffectSig { sig_id, from_stage_id, to_stage_id, .. }
         | ModifyType { sig_id, from_stage_id, to_stage_id }
         | ReplaceMatchArm { sig_id, from_stage_id, to_stage_id, .. }
-        | RenameLocal { sig_id, from_stage_id, to_stage_id, .. } => StageTransition::Replace {
+        | RenameLocal { sig_id, from_stage_id, to_stage_id, .. }
+        | InlineLet { sig_id, from_stage_id, to_stage_id, .. } => StageTransition::Replace {
             sig_id: sig_id.clone(),
             from: from_stage_id.clone(),
             to:   to_stage_id.clone(),

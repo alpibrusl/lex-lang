@@ -138,7 +138,8 @@ fn touched_sigs(k: &OperationKind) -> Vec<SigId> {
         | OperationKind::RemoveType { sig_id, .. }
         | OperationKind::ModifyType { sig_id, .. }
         | OperationKind::ReplaceMatchArm { sig_id, .. }
-        | OperationKind::RenameLocal { sig_id, .. } => vec![sig_id.clone()],
+        | OperationKind::RenameLocal { sig_id, .. }
+        | OperationKind::InlineLet { sig_id, .. } => vec![sig_id.clone()],
         // A rename touches both sides — concurrent modifies on `from`
         // must surface as a conflict, not as a disjoint set.
         OperationKind::RenameSymbol { from, to, .. } => vec![from.clone(), to.clone()],

@@ -7,6 +7,35 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added — agent-VCS roadmap (#280, slice 3)
+
+- **Typed `InlineLet` transform** (#280 slice 3). Eliminates a
+  `let x := v; body` by substituting `v` for every unshadowed `x`
+  in `body`, then replacing the `Let` node with the substituted
+  body. New `lex_ast::inline_let(stage, let_node)` runs the
+  transform deterministically.
+- **Safety restrictions**: `v` must be capture-free and
+  side-effect-free — only `Literal`, `Var`, `FieldAccess`, and
+  `BinOp`/`UnaryOp`/`TupleLit`/`ListLit` trees over those leaves
+  are accepted. Calls, lambdas, blocks, lets, matches in `v` are
+  refused with `TransformError::InlineLetRefused` so a future
+  slice can lift the restriction without changing the error
+  contract. Free-variable capture (a free var of `v` is re-bound
+  in `body`) is detected and refused too.
+- **`OperationKind::InlineLet { sig_id, from_stage_id,
+  to_stage_id, let_node, binding_name, from_budget, to_budget }`**
+  records the inlined name + position. Same `skip_if_none` budget
+  discipline as the other transform variants.
+- **`Store::apply_inline_let`** wraps the end-to-end flow.
+- 5 unit tests (substitution, call refusal, capture refusal,
+  shadowing, not-a-Let target). 4 conformance tests
+  (`crates/lex-store/tests/inline_let.rs`) covering op landing,
+  AST reconstruction, attestation emission, transform-error
+  surface.
+
+The fourth and final slice (`ExtractFunction`) remains a
+follow-up on #280.
+
 ### Added — agent-VCS roadmap (#280, slice 2)
 
 - **Typed `RenameLocal` transform** (#280 slice 2). Second of the
