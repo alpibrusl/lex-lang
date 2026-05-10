@@ -61,6 +61,13 @@ struct AuditOpts {
     /// declared `[budget(N)]` cost across the chain. Mutually
     /// exclusive with `--query`.
     budget_history: bool,
+    /// `--budget --by-session` (#292 slice 1). Roll up monotonic
+    /// budget spend across every distinct session that produced
+    /// budget-bearing ops. Only meaningful with `--budget`.
+    budget_by_session: bool,
+    /// `--budget --session <id>` (#292 slice 1). Restrict the
+    /// rollup to a single session.
+    budget_session: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -84,6 +91,16 @@ pub fn cmd_audit(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     if matches!(fmt, OutputFormat::Json) { opts.json = true; }
     if opts.query.is_some() && opts.budget_history {
         return Err(anyhow!("--query and --budget are mutually exclusive"));
+    }
+    if (opts.budget_by_session || opts.budget_session.is_some())
+        && !opts.budget_history
+    {
+        return Err(anyhow!(
+            "--by-session / --session require --budget"
+        ));
+    }
+    if opts.budget_history && (opts.budget_by_session || opts.budget_session.is_some()) {
+        return cmd_audit_budget_by_session(fmt, &opts);
     }
     if opts.budget_history {
         return cmd_audit_budget(fmt, &opts);
@@ -268,6 +285,13 @@ fn parse_audit_args(args: &[String]) -> Result<AuditOpts> {
                 i += 2;
             }
             "--budget" => { o.budget_history = true; i += 1; }
+            "--by-session" => { o.budget_by_session = true; i += 1; }
+            "--session" => {
+                let v = args.get(i + 1)
+                    .ok_or_else(|| anyhow!("--session needs a session_id"))?;
+                o.budget_session = Some(v.clone());
+                i += 2;
+            }
             other => { o.paths.push(PathBuf::from(other)); i += 1; }
         }
     }
@@ -604,6 +628,72 @@ fn cmd_audit_budget(fmt: &OutputFormat, opts: &AuditOpts) -> Result<()> {
                 println!("      {op_id:.16}…  {label}");
             }
             println!();
+        }
+    });
+    Ok(())
+}
+
+/// `lex audit --budget --by-session [--session <id>]` (#292 slice 1).
+/// Walks every branch's op log, joins through the IntentLog to
+/// resolve `session_id` per op, and sums monotonic budget spend
+/// per session.
+fn cmd_audit_budget_by_session(
+    fmt: &OutputFormat,
+    opts: &AuditOpts,
+) -> Result<()> {
+    let root = opts.store_root.clone().unwrap_or_else(default_store_root);
+    let store = lex_store::Store::open(&root)
+        .with_context(|| format!("opening store at {}", root.display()))?;
+
+    let mut rollups = store.all_session_budgets()
+        .map_err(|e| anyhow!("computing session budgets: {e}"))?;
+    if let Some(filter) = &opts.budget_session {
+        rollups.retain(|b| &b.session_id == filter);
+        // Pad with a zero entry if the session wasn't found so the
+        // envelope's shape stays predictable for tooling.
+        if rollups.is_empty() {
+            rollups.push(lex_store::SessionBudget {
+                session_id: filter.clone(),
+                spent: 0,
+                op_count: 0,
+            });
+        }
+    }
+
+    let sessions_json: Vec<serde_json::Value> = rollups.iter().map(|b| {
+        serde_json::json!({
+            "session_id": b.session_id,
+            "spent": b.spent,
+            "op_count": b.op_count,
+        })
+    }).collect();
+    let total_spent: u64 = rollups.iter().map(|b| b.spent).sum();
+    let data = serde_json::json!({
+        "sessions": sessions_json,
+        "total_spent": total_spent,
+    });
+    let printable = rollups.clone();
+    let single = opts.budget_session.clone();
+    acli_mod::emit_or_text("audit", data, fmt, move || {
+        if printable.is_empty() {
+            println!("(no budget-bearing ops attributed to any session)");
+            return;
+        }
+        match &single {
+            Some(sid) => {
+                let b = &printable[0];
+                println!("session `{sid}`");
+                println!("    spent:   {}", b.spent);
+                println!("    op_count: {}", b.op_count);
+            }
+            None => {
+                println!("budget spend across {} session(s):", printable.len());
+                for b in &printable {
+                    println!("    {} → {} ({} ops)",
+                        b.session_id, b.spent, b.op_count);
+                }
+                println!("    total: {total_spent}");
+            }
         }
     });
     Ok(())

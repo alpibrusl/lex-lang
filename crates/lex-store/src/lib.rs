@@ -25,6 +25,7 @@
 //! produces identical results regardless of cache state — the obvious way
 //! to honor that is to keep the cache trivially derivable.
 
+mod budget;
 mod store;
 mod model;
 mod branches;
@@ -33,6 +34,7 @@ mod gc;
 pub mod users;
 pub mod policy;
 
+pub use budget::SessionBudget;
 pub use delta::{StageDelta, DELTA_CHAIN_CAP, DELTA_RATIO_THRESHOLD};
 pub use gc::{GcPlan, RetentionReason};
 
