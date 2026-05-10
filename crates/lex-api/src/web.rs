@@ -852,6 +852,12 @@ fn kind_short(k: &AttestationKind) -> String {
         AttestationKind::ProducerUnblock { tool_id, .. } => {
             format!("ProducerUnblock({tool_id})")
         }
+        AttestationKind::RepairHint { failed_op_id, .. } => {
+            format!("RepairHint({failed_op_id:.12}…)")
+        }
+        AttestationKind::RepairAttempt { hint_id, outcome, .. } => {
+            format!("RepairAttempt({outcome}, {hint_id:.12}…)")
+        }
     }
 }
 

@@ -221,6 +221,36 @@ pub enum AttestationKind {
         reason: String,
         unblocked_at: u64,
     },
+    /// Auto-emitted by `Store::apply_operation_checked` when an op
+    /// is rejected for `TypeError` (#281). Records the failed op's
+    /// id, the structured type-error envelope, and an optional
+    /// suggested-transform payload (left empty by the gate; the
+    /// `lex repair --apply` flow populates it via LLM call). The
+    /// hint is attached to the candidate stage that didn't
+    /// typecheck, so `lex_vcs::AttestationLog::list_for_stage`
+    /// surfaces it on the next read.
+    ///
+    /// Schema: `errors` and `suggested_transform` are
+    /// `serde_json::Value` to keep this crate independent of
+    /// `lex-types::TypeError` (which lives downstream) and to let
+    /// the slice-2 LLM integration ship without a schema bump.
+    RepairHint {
+        failed_op_id: super::operation::OpId,
+        errors: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        suggested_transform: Option<serde_json::Value>,
+    },
+    /// Records one iteration of `lex repair --apply` (#281). The
+    /// repair loop emits a chain of `RepairAttempt`s — one per
+    /// applied transform — so the audit trail walks the agent's
+    /// fix progression.
+    RepairAttempt {
+        hint_id: super::operation::OpId,
+        /// Outcome tag: `passed` / `failed` / `skipped`.
+        outcome: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        applied_op_id: Option<super::operation::OpId>,
+    },
 }
 
 /// Walk a tool's `ProducerBlock` / `ProducerUnblock` attestations

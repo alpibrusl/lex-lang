@@ -106,6 +106,7 @@ fn run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "log" => branch::cmd_log(fmt, &args[1..]),
         "op" => op::cmd_op(fmt, &args[1..]),
         "docs" => docs::cmd_docs(fmt, &args[1..]),
+        "repair" => cmd_repair(fmt, &args[1..]),
         "canonical" => cmd_canonical(fmt, &args[1..]),
         "keygen" => cmd_keygen(fmt, &args[1..]),
         "repl" => repl::cmd_repl(&args[1..]),
@@ -938,6 +939,107 @@ pub(crate) fn build_embedder(store_root: &std::path::Path) -> Result<Box<dyn lex
     } else {
         Ok(Box::new(lex_search::MockEmbedder::new()))
     }
+}
+
+/// `lex repair <op_id> [--store DIR]` (#281). Walks the latest
+/// `RepairHint` attestation referencing the given failed op_id
+/// and emits its structured contents (errors + suggested
+/// transform, if any) so an agent can read the rejection cause
+/// without re-running the type-checker.
+///
+/// The `--apply` mode (LLM-assisted automatic fix) is deferred to
+/// a follow-up slice; today the command is read-only.
+fn cmd_repair(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let mut op_id: Option<String> = None;
+    let mut root: Option<PathBuf> = None;
+    let mut apply = false;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--store" => {
+                root = Some(PathBuf::from(it.next()
+                    .ok_or_else(|| anyhow!("--store needs a path"))?));
+            }
+            "--apply" => apply = true,
+            other if !other.starts_with("--") => {
+                if op_id.is_some() {
+                    bail!("usage: lex repair <op_id> [--apply] [--store DIR]");
+                }
+                op_id = Some(other.to_string());
+            }
+            other => bail!("unexpected arg `{other}`"),
+        }
+    }
+    let op_id = op_id.ok_or_else(|| anyhow!(
+        "usage: lex repair <op_id> [--apply] [--store DIR]"))?;
+    if apply {
+        // Slice 1 ships the read-only path; the LLM-assisted apply
+        // mode is the next slice — see #281's "Out of scope" note.
+        bail!("`lex repair --apply` is not yet implemented; ships in a follow-up slice");
+    }
+    let root = root.unwrap_or_else(|| {
+        let home = std::env::var("HOME").map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("."));
+        home.join(".lex/store")
+    });
+    let store = Store::open(&root)?;
+    let attlog = store.attestation_log()
+        .map_err(|e| anyhow!("opening attestation log: {e}"))?;
+
+    // Scan every attestation; pick the most-recent RepairHint
+    // whose `failed_op_id` matches. Cheaper than maintaining a
+    // by-failed-op index — the scan stays O(n) and n is bounded
+    // because RepairHints land only on TypeError-rejected ops.
+    let mut hits: Vec<lex_vcs::Attestation> = attlog.list_all()
+        .map_err(|e| anyhow!("listing attestations: {e}"))?
+        .into_iter()
+        .filter(|a| matches!(&a.kind,
+            lex_vcs::AttestationKind::RepairHint { failed_op_id, .. }
+                if failed_op_id == &op_id))
+        .collect();
+    hits.sort_by_key(|a| a.timestamp);
+    let latest = hits.last().cloned();
+    let envelope = match latest {
+        Some(a) => {
+            let lex_vcs::AttestationKind::RepairHint {
+                failed_op_id,
+                errors,
+                suggested_transform,
+            } = &a.kind else { unreachable!() };
+            serde_json::json!({
+                "found": true,
+                "failed_op_id": failed_op_id,
+                "stage_id": a.stage_id,
+                "attestation_id": a.attestation_id,
+                "timestamp": a.timestamp,
+                "errors": errors,
+                "suggested_transform": suggested_transform,
+            })
+        }
+        None => serde_json::json!({
+            "found": false,
+            "failed_op_id": op_id,
+        }),
+    };
+    acli::emit_or_text("repair", envelope.clone(), fmt, || {
+        if envelope["found"] == false {
+            println!("no RepairHint found for op_id `{op_id}`");
+        } else {
+            let n = envelope["errors"].as_array()
+                .map(|a| a.len()).unwrap_or(0);
+            let stage = envelope["stage_id"].as_str().unwrap_or("?");
+            println!("RepairHint for op_id `{op_id}`:");
+            println!("  stage:  {stage}");
+            println!("  errors: {n}");
+            println!("  suggested_transform: {}",
+                if envelope["suggested_transform"].is_null() {
+                    "(none — populated by future --apply slice)".to_string()
+                } else {
+                    envelope["suggested_transform"].to_string()
+                });
+        }
+    });
+    Ok(())
 }
 
 fn cmd_keygen(fmt: &OutputFormat, _args: &[String]) -> Result<()> {
@@ -2022,6 +2124,12 @@ fn cmd_stage(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                     lex_vcs::AttestationKind::ProducerUnblock { tool_id, .. } => {
                         format!("ProducerUnblock({tool_id})")
                     }
+                    lex_vcs::AttestationKind::RepairHint { failed_op_id, .. } => {
+                        format!("RepairHint({failed_op_id:.12}…)")
+                    }
+                    lex_vcs::AttestationKind::RepairAttempt { hint_id, outcome, .. } => {
+                        format!("RepairAttempt({outcome}, {hint_id:.12}…)")
+                    }
                 };
                 let result = match &a.result {
                     lex_vcs::AttestationResult::Passed => "passed".to_string(),
@@ -2843,6 +2951,8 @@ fn attestation_kind_tag(k: &lex_vcs::AttestationKind) -> &'static str {
         Trace { .. }            => "trace",
         ProducerBlock { .. }    => "producer_block",
         ProducerUnblock { .. }  => "producer_unblock",
+        RepairHint { .. }       => "repair_hint",
+        RepairAttempt { .. }    => "repair_attempt",
     }
 }
 
