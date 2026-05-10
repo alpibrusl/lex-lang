@@ -7,6 +7,34 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added — agent-safety (#292, slice 1)
+
+- **`Store::session_budget(session_id)`** and
+  **`Store::all_session_budgets()`** — read-only ledger of how
+  much budget each agent session has spent across every op
+  attributed to it via `intent_id → session_id`. New
+  `SessionBudget { session_id, spent, op_count }` public type.
+- **Spend model**: monotonic. `AddFunction` contributes its full
+  `budget_cost`; `ModifyBody` / `ChangeEffectSig` / the typed
+  transform variants contribute `max(0, to - from)` (decreases
+  don't refund). Ops without `intent_id` or with a dangling
+  intent are silently skipped — the ledger degrades gracefully
+  rather than failing the read.
+- **`lex audit --budget --by-session [--session <id>]`** rolls up
+  the ledger and emits per-session spend. Without `--by-session`,
+  `--budget` keeps its existing per-sig history shape (#247).
+- 8 conformance tests in `crates/lex-store/tests/session_budget.rs`
+  (zero on empty / unknown; AddFunction attribution; ops without
+  intent skipped; multiple sessions kept separate; ModifyBody
+  increase contributes delta only; decrease doesn't refund;
+  dangling intent skipped gracefully). 3 CLI tests in
+  `crates/lex-cli/tests/audit_session_budget.rs` (empty store;
+  filter-by-missing-session zero-pads; `--by-session` requires
+  `--budget`).
+
+Slice 1 is **read-only**; slices 2 (`policy.json` `session_budgets`
+schema) and 3 (apply-path gate that refuses ops over cap) follow.
+
 ### Added — agent-feedback (#281, slice 2a)
 
 - **`lex repair <op_id> --apply --transform '<json>'`** executes a
