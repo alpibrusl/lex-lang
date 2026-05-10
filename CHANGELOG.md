@@ -7,6 +7,27 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added — agent-onboarding (#282)
+
+- **`lex docs --for-agent`** emits a single structured JSON
+  envelope with the six sections an agent needs to make sensible
+  writes against a Lex repo: `workspace` (lex version, branches,
+  current/default), `stdlib` (every active sig on the branch with
+  rendered type signature, effects, optional budget),
+  `recent_activity` (last N ops with op_id, kind tag, sig_id,
+  intent_id), `open_intents` (intents referenced by recent ops,
+  resolved against `IntentLog`), `policy` (required_attestations,
+  blocked_producers, gc_retention from `policy.json`), and
+  `attention` (stages with active `Block` attestations).
+- `--branch B`, `--limit-recent N` (default 50), `--store DIR`
+  flags. Schema versioned via `lex_docs_version` so future agents
+  can detect breakage.
+- Pure derivation from existing on-disk state — no new
+  persistence, no LLM calls, no costs beyond the per-section
+  walks.
+- 7 conformance tests in `crates/lex-cli/tests/docs_for_agent.rs`
+  driving the CLI as a subprocess.
+
 ### Added — agent-VCS roadmap (#280, slice 1)
 
 - **Typed `ReplaceMatchArm` transform** (#280 slice 1). First of
