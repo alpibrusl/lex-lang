@@ -7,6 +7,31 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added — agent-feedback (#281, slice 2a)
+
+- **`lex repair <op_id> --apply --transform '<json>'`** executes a
+  typed transform against the branch and emits a `RepairAttempt`
+  attestation tied to the original `RepairHint` (#281). Supports
+  all four #280 transform kinds (`replace_match_arm`,
+  `rename_local`, `inline_let`, `extract_function`) via JSON
+  payload. The CLI exits 0 regardless of the apply outcome —
+  success/failure lives in the envelope's `outcome` field and in
+  the attestation log, not in the exit code.
+- **`--branch B`** flag selects which branch the transform
+  targets (defaults to the current branch).
+- Requires a matching `RepairHint` to exist for the failed op_id;
+  bare apply against an unknown op errors with "no RepairHint
+  exists."
+- The LLM-driven `--apply` mode (no `--transform` flag) ships in
+  slice 2b — when supplied without `--transform`, the command
+  errors with a "requires `--transform`" message pointing at the
+  follow-up slice.
+- 3 end-to-end tests in `crates/lex-cli/tests/repair_apply.rs`
+  (well-typed transform lands op + records RepairAttempt;
+  ill-typed transform records a "failed" RepairAttempt; unknown
+  kind surfaces a structured error). Existing flag-validation
+  tests in `repair_cli.rs` updated.
+
 ## [0.6.0] — 2026-05-10
 
 The agent-onboarding + agent-feedback wave from the post-0.5.0

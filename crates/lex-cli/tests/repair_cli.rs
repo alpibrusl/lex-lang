@@ -24,16 +24,48 @@ fn repair_with_no_hint_reports_not_found() {
 }
 
 #[test]
-fn repair_apply_is_unsupported_today() {
+fn repair_apply_without_transform_errors() {
+    // Slice 2a: `--apply` requires `--transform '<json>'`. The
+    // LLM-driven path (no `--transform`) ships in slice 2b.
     let tmp = tempfile::tempdir().unwrap();
     let out = Command::new(lex_bin())
         .args(["repair", "fake-op-id", "--apply",
             "--store", tmp.path().to_str().unwrap()])
         .output().unwrap();
-    assert!(!out.status.success(), "--apply should fail today");
+    assert!(!out.status.success(),
+        "--apply without --transform should fail");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("not yet implemented"),
-        "expected 'not yet implemented' message, got: {stderr}");
+    assert!(stderr.contains("requires `--transform"),
+        "expected '--apply requires --transform' message, got: {stderr}");
+}
+
+#[test]
+fn repair_transform_without_apply_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = Command::new(lex_bin())
+        .args(["repair", "fake-op-id", "--transform", "{}",
+            "--store", tmp.path().to_str().unwrap()])
+        .output().unwrap();
+    assert!(!out.status.success(),
+        "--transform without --apply should fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--transform` requires `--apply"),
+        "expected message, got: {stderr}");
+}
+
+#[test]
+fn repair_apply_without_hint_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = Command::new(lex_bin())
+        .args(["repair", "fake-op-id", "--apply",
+            "--transform", r#"{"kind":"inline_let","from_stage_id":"x","let_node":"n_0.1"}"#,
+            "--store", tmp.path().to_str().unwrap()])
+        .output().unwrap();
+    assert!(!out.status.success(),
+        "applying without a matching RepairHint should fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no RepairHint exists"),
+        "expected hint-required message, got: {stderr}");
 }
 
 #[test]
