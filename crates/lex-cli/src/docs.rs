@@ -258,6 +258,7 @@ fn op_kind_tag(k: &lex_vcs::OperationKind) -> &'static str {
         Merge { .. }           => "merge",
         ReplaceMatchArm { .. } => "replace_match_arm",
         RenameLocal { .. }     => "rename_local",
+        InlineLet { .. }       => "inline_let",
     }
 }
 

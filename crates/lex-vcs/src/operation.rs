@@ -219,6 +219,23 @@ pub enum OperationKind {
     Merge {
         resolved: usize,
     },
+    /// Typed transform: inlined a `let x := v; body` by
+    /// substituting `v` for every unshadowed `x` in `body`, then
+    /// replacing the entire `Let` node with the substituted body
+    /// (#280). The op records the let-binding's position and the
+    /// inlined name; the actual substituted value lives in the
+    /// content-addressed `to_stage_id` so the op_id stays compact.
+    InlineLet {
+        sig_id: SigId,
+        from_stage_id: StageId,
+        to_stage_id: StageId,
+        let_node: String,
+        binding_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_budget: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_budget: Option<u64>,
+    },
     /// Typed transform: renamed a `let`-bound local within a fn
     /// body (#280). Records the old/new identifiers and the position
     /// of the let-binding in the AST. Body-shape-stable: the renamed
@@ -291,6 +308,7 @@ impl OperationKind {
             | ModifyType { sig_id, to_stage_id, .. }
             | ReplaceMatchArm { sig_id, to_stage_id, .. }
             | RenameLocal { sig_id, to_stage_id, .. }
+            | InlineLet { sig_id, to_stage_id, .. }
                 => Some((sig_id.clone(), Some(to_stage_id.clone()))),
             RemoveFunction { sig_id, .. }
             | RemoveType { sig_id, .. }
@@ -314,7 +332,8 @@ impl OperationKind {
             ModifyBody { from_budget, to_budget, .. }
             | ChangeEffectSig { from_budget, to_budget, .. }
             | ReplaceMatchArm { from_budget, to_budget, .. }
-            | RenameLocal { from_budget, to_budget, .. } => (*from_budget, *to_budget),
+            | RenameLocal { from_budget, to_budget, .. }
+            | InlineLet { from_budget, to_budget, .. } => (*from_budget, *to_budget),
             _ => (None, None),
         }
     }
@@ -330,7 +349,8 @@ impl OperationKind {
             | ModifyBody { sig_id, .. }
             | ChangeEffectSig { sig_id, .. }
             | ReplaceMatchArm { sig_id, .. }
-            | RenameLocal { sig_id, .. } => Some(sig_id),
+            | RenameLocal { sig_id, .. }
+            | InlineLet { sig_id, .. } => Some(sig_id),
             _ => None,
         }
     }

@@ -23,8 +23,12 @@
 //!   match expression. Pattern is preserved.
 //! - [`rename_local`] — renames a `let`-bound local. Walks the
 //!   binding's body scope and rewrites every unshadowed reference.
+//! - [`inline_let`] — eliminates a `let x := v; body` by
+//!   substituting `v` for every unshadowed `x` in `body`. The let
+//!   value is restricted to capture-free, side-effect-free
+//!   expressions (literals, vars, field access, binops on those).
 //!
-//! Future slices: `inline_let`, `extract_function`.
+//! Future slices: `extract_function`.
 
 use crate::canonical::{CExpr, Pattern, Stage};
 use crate::ids::NodeId;
@@ -46,6 +50,8 @@ pub enum TransformError {
     NonFnTarget { stage_kind: &'static str },
     #[error("rename is a no-op: old and new name are both `{name}`")]
     RenameNoOp { name: String },
+    #[error("inline_let refused: `{reason}`")]
+    InlineLetRefused { reason: String },
 }
 
 /// Replace `match_node`'s arm at `arm_index` with a new body,
@@ -160,6 +166,316 @@ pub fn rename_local(
     // Walk the body scope. Stop renaming at shadow points.
     rewrite_var_in_expr(let_body, &old_name, new_name);
     Ok(out)
+}
+
+/// Inline a `let x := v; body` by substituting `v` for every
+/// unshadowed occurrence of `x` in `body`, then replacing the
+/// entire `Let` node with the substituted `body`.
+///
+/// Restrictions (slice 3):
+/// - `v` must be capture-free, side-effect-free, and cheap to
+///   duplicate: only `Literal`, `Var`, `FieldAccess`, and `BinOp`/
+///   `UnaryOp` trees over those primitives are accepted. Calls,
+///   lambdas, blocks, lets, matches in `v` are refused with
+///   `InlineLetRefused` so a future slice can lift the restriction
+///   without changing the error contract.
+/// - None of `v`'s free variables may be re-bound (shadowed)
+///   anywhere in `body`. Inlining `let x := y; let y := …; x` is
+///   refused because the inner `let y` would capture the inlined
+///   `y` and silently change semantics.
+///
+/// Refuses no-ops at the API boundary: a `let x := v; x` body
+/// (single direct reference) is fine; a `let x := v; { }` body
+/// with zero references is *not* refused — the let is still
+/// eliminated, which is the user-visible point of inlining.
+pub fn inline_let(
+    stage: &Stage,
+    let_node: &NodeId,
+) -> Result<Stage, TransformError> {
+    let mut out = stage.clone();
+    let (body, n_params) = match &mut out {
+        Stage::FnDecl(fd) => {
+            let n = fd.params.len();
+            (&mut fd.body, n)
+        }
+        Stage::TypeDecl(_) => return Err(TransformError::NonFnTarget { stage_kind: "TypeDecl" }),
+        Stage::Import(_) => return Err(TransformError::NonFnTarget { stage_kind: "Import" }),
+    };
+    let path = parse_node_id(let_node.as_str())?;
+    if path.is_empty() {
+        return Err(TransformError::NotALet {
+            at: let_node.as_str().into(),
+            found_kind: "stage_root",
+        });
+    }
+    if path[0] != n_params + 1 {
+        return Err(TransformError::UnknownNode { at: let_node.as_str().into() });
+    }
+    let inner = &path[1..];
+    // Special case: when the path is `n_<n+1>` exactly (no further
+    // descent), the target is the FnDecl's body root. We swap it
+    // for the inlined body wholesale.
+    if inner.is_empty() {
+        let CExpr::Let { name, value, body: let_body, .. } = body.clone() else {
+            return Err(TransformError::NotALet {
+                at: let_node.as_str().into(),
+                found_kind: cexpr_kind(body),
+            });
+        };
+        check_inlinable(&value)?;
+        let captures = free_vars(&value);
+        check_no_capture(&let_body, &captures)?;
+        let mut replaced = *let_body;
+        substitute_in_expr(&mut replaced, &name, &value);
+        *body = replaced;
+        return Ok(out);
+    }
+    // Otherwise descend to the parent of the let node, capture the
+    // let's owned contents, and splice the inlined body into its
+    // slot. We re-use `navigate_to_expr` to reach the let, clone
+    // its parts, then mutate the slot in place.
+    let target = navigate_to_expr(body, inner, let_node.as_str())?;
+    let CExpr::Let { name, value, body: let_body, .. } = target.clone() else {
+        return Err(TransformError::NotALet {
+            at: let_node.as_str().into(),
+            found_kind: cexpr_kind(target),
+        });
+    };
+    check_inlinable(&value)?;
+    let captures = free_vars(&value);
+    check_no_capture(&let_body, &captures)?;
+    let mut replaced = *let_body;
+    substitute_in_expr(&mut replaced, &name, &value);
+    *target = replaced;
+    Ok(out)
+}
+
+/// True when `v` is restricted to the slice-3 inline-safe shape:
+/// literals, vars, field accesses, binops/unaryops on those. No
+/// calls, lambdas, blocks, lets, matches, constructors, record
+/// literals, or returns.
+fn check_inlinable(v: &CExpr) -> Result<(), TransformError> {
+    match v {
+        CExpr::Literal { .. } | CExpr::Var { .. } => Ok(()),
+        CExpr::FieldAccess { value, .. } => check_inlinable(value),
+        CExpr::BinOp { lhs, rhs, .. } => {
+            check_inlinable(lhs)?;
+            check_inlinable(rhs)
+        }
+        CExpr::UnaryOp { expr, .. } => check_inlinable(expr),
+        CExpr::TupleLit { items } | CExpr::ListLit { items } => {
+            for it in items { check_inlinable(it)?; }
+            Ok(())
+        }
+        other => Err(TransformError::InlineLetRefused {
+            reason: format!(
+                "let value contains a `{}` expression; slice 3 only inlines literal/var/field/binop/unaryop/tuple/list trees",
+                cexpr_kind(other)
+            ),
+        }),
+    }
+}
+
+/// Collect the set of variable names that appear free in `v`.
+/// Order-independent (`BTreeSet` for determinism in tests).
+fn free_vars(v: &CExpr) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    collect_free_vars(v, &mut out);
+    out
+}
+
+fn collect_free_vars(e: &CExpr, out: &mut std::collections::BTreeSet<String>) {
+    match e {
+        CExpr::Var { name } => { out.insert(name.clone()); }
+        CExpr::Literal { .. } => {}
+        CExpr::Call { callee, args } => {
+            collect_free_vars(callee, out);
+            for a in args { collect_free_vars(a, out); }
+        }
+        CExpr::Let { value, body, name, .. } => {
+            collect_free_vars(value, out);
+            // Body sees the let binding. We approximate: collect
+            // body's free vars, then remove the let's name.
+            let mut inner = std::collections::BTreeSet::new();
+            collect_free_vars(body, &mut inner);
+            inner.remove(name);
+            out.extend(inner);
+        }
+        CExpr::Match { scrutinee, arms } => {
+            collect_free_vars(scrutinee, out);
+            for arm in arms {
+                let mut inner = std::collections::BTreeSet::new();
+                collect_free_vars(&arm.body, &mut inner);
+                let bound = pattern_bindings(&arm.pattern);
+                for b in bound { inner.remove(&b); }
+                out.extend(inner);
+            }
+        }
+        CExpr::Block { statements, result } => {
+            for s in statements { collect_free_vars(s, out); }
+            collect_free_vars(result, out);
+        }
+        CExpr::Constructor { args, .. } => {
+            for a in args { collect_free_vars(a, out); }
+        }
+        CExpr::RecordLit { fields } => {
+            for f in fields { collect_free_vars(&f.value, out); }
+        }
+        CExpr::TupleLit { items } | CExpr::ListLit { items } => {
+            for i in items { collect_free_vars(i, out); }
+        }
+        CExpr::FieldAccess { value, .. } => collect_free_vars(value, out),
+        CExpr::Lambda { params, body, .. } => {
+            let mut inner = std::collections::BTreeSet::new();
+            collect_free_vars(body, &mut inner);
+            for p in params { inner.remove(&p.name); }
+            out.extend(inner);
+        }
+        CExpr::BinOp { lhs, rhs, .. } => {
+            collect_free_vars(lhs, out);
+            collect_free_vars(rhs, out);
+        }
+        CExpr::UnaryOp { expr, .. } => collect_free_vars(expr, out),
+        CExpr::Return { value } => collect_free_vars(value, out),
+    }
+}
+
+fn pattern_bindings(p: &Pattern) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_pattern_bindings(p, &mut out);
+    out
+}
+
+fn collect_pattern_bindings(p: &Pattern, out: &mut Vec<String>) {
+    match p {
+        Pattern::PVar { name } => out.push(name.clone()),
+        Pattern::PLiteral { .. } | Pattern::PWild => {}
+        Pattern::PConstructor { args, .. } => for p in args { collect_pattern_bindings(p, out); }
+        Pattern::PRecord { fields } => for f in fields { collect_pattern_bindings(&f.pattern, out); }
+        Pattern::PTuple { items } => for p in items { collect_pattern_bindings(p, out); }
+    }
+}
+
+/// Walk `body`; if any sub-tree introduces a binder whose name is
+/// in `captures`, refuse the inline. We don't need to track scope
+/// here — any shadow at any depth is a problem, because once we
+/// inline, that shadow would capture a name in the substituted
+/// value.
+fn check_no_capture(
+    body: &CExpr,
+    captures: &std::collections::BTreeSet<String>,
+) -> Result<(), TransformError> {
+    let mut conflict: Option<String> = None;
+    walk_binders(body, &mut |name| {
+        if captures.contains(name) && conflict.is_none() {
+            conflict = Some(name.to_string());
+        }
+    });
+    if let Some(name) = conflict {
+        return Err(TransformError::InlineLetRefused {
+            reason: format!(
+                "value's free var `{name}` is re-bound in the body; inlining would capture"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn walk_binders(e: &CExpr, on_binder: &mut dyn FnMut(&str)) {
+    match e {
+        CExpr::Let { name, value, body, .. } => {
+            on_binder(name);
+            walk_binders(value, on_binder);
+            walk_binders(body, on_binder);
+        }
+        CExpr::Lambda { params, body, .. } => {
+            for p in params { on_binder(&p.name); }
+            walk_binders(body, on_binder);
+        }
+        CExpr::Match { scrutinee, arms } => {
+            walk_binders(scrutinee, on_binder);
+            for arm in arms {
+                for b in pattern_bindings(&arm.pattern) { on_binder(&b); }
+                walk_binders(&arm.body, on_binder);
+            }
+        }
+        CExpr::Call { callee, args } => {
+            walk_binders(callee, on_binder);
+            for a in args { walk_binders(a, on_binder); }
+        }
+        CExpr::Block { statements, result } => {
+            for s in statements { walk_binders(s, on_binder); }
+            walk_binders(result, on_binder);
+        }
+        CExpr::Constructor { args, .. } => for a in args { walk_binders(a, on_binder); }
+        CExpr::RecordLit { fields } => for f in fields { walk_binders(&f.value, on_binder); }
+        CExpr::TupleLit { items } | CExpr::ListLit { items } => {
+            for i in items { walk_binders(i, on_binder); }
+        }
+        CExpr::FieldAccess { value, .. } => walk_binders(value, on_binder),
+        CExpr::BinOp { lhs, rhs, .. } => {
+            walk_binders(lhs, on_binder); walk_binders(rhs, on_binder);
+        }
+        CExpr::UnaryOp { expr, .. } => walk_binders(expr, on_binder),
+        CExpr::Return { value } => walk_binders(value, on_binder),
+        CExpr::Var { .. } | CExpr::Literal { .. } => {}
+    }
+}
+
+/// Substitute every unshadowed reference to `name` in `e` with a
+/// clone of `replacement`. Shadowing rules match `rewrite_var_in_expr`:
+/// inner `Let` / `Lambda param` / `Match pattern` that re-binds
+/// `name` cuts off descent.
+fn substitute_in_expr(e: &mut CExpr, name: &str, replacement: &CExpr) {
+    match e {
+        CExpr::Var { name: n } if n == name => {
+            *e = replacement.clone();
+        }
+        CExpr::Var { .. } | CExpr::Literal { .. } => {}
+        CExpr::Call { callee, args } => {
+            substitute_in_expr(callee, name, replacement);
+            for a in args { substitute_in_expr(a, name, replacement); }
+        }
+        CExpr::Let { name: binder, value, body, .. } => {
+            substitute_in_expr(value, name, replacement);
+            if binder != name {
+                substitute_in_expr(body, name, replacement);
+            }
+        }
+        CExpr::Match { scrutinee, arms } => {
+            substitute_in_expr(scrutinee, name, replacement);
+            for arm in arms {
+                if !pattern_binds(&arm.pattern, name) {
+                    substitute_in_expr(&mut arm.body, name, replacement);
+                }
+            }
+        }
+        CExpr::Block { statements, result } => {
+            for s in statements { substitute_in_expr(s, name, replacement); }
+            substitute_in_expr(result, name, replacement);
+        }
+        CExpr::Constructor { args, .. } => {
+            for a in args { substitute_in_expr(a, name, replacement); }
+        }
+        CExpr::RecordLit { fields } => {
+            for f in fields { substitute_in_expr(&mut f.value, name, replacement); }
+        }
+        CExpr::TupleLit { items } | CExpr::ListLit { items } => {
+            for i in items { substitute_in_expr(i, name, replacement); }
+        }
+        CExpr::FieldAccess { value, .. } => substitute_in_expr(value, name, replacement),
+        CExpr::Lambda { params, body, .. } => {
+            if !params.iter().any(|p| p.name == name) {
+                substitute_in_expr(body, name, replacement);
+            }
+        }
+        CExpr::BinOp { lhs, rhs, .. } => {
+            substitute_in_expr(lhs, name, replacement);
+            substitute_in_expr(rhs, name, replacement);
+        }
+        CExpr::UnaryOp { expr, .. } => substitute_in_expr(expr, name, replacement),
+        CExpr::Return { value } => substitute_in_expr(value, name, replacement),
+    }
 }
 
 fn rewrite_var_in_expr(e: &mut CExpr, old: &str, new: &str) {
@@ -521,6 +837,150 @@ mod tests {
         let err = rename_local(&stage, &NodeId("n_0.2".into()), "y").unwrap_err();
         assert!(matches!(err, TransformError::NotALet { found_kind: "Match", .. }),
             "got {err:?}");
+    }
+
+    // ---- inline_let fixtures + tests -------------------------------
+
+    /// `fn f(n :: Int) -> Int { let x := 5; x + n }`
+    fn inlinable_stage() -> Stage {
+        let body = CExpr::Let {
+            name: "x".into(),
+            ty: None,
+            value: Box::new(CExpr::Literal { value: CLit::Int { value: 5 } }),
+            body: Box::new(CExpr::BinOp {
+                op: "+".into(),
+                lhs: Box::new(CExpr::Var { name: "x".into() }),
+                rhs: Box::new(CExpr::Var { name: "n".into() }),
+            }),
+        };
+        Stage::FnDecl(FnDecl {
+            name: "f".into(),
+            type_params: Vec::new(),
+            params: vec![Param {
+                name: "n".into(),
+                ty: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
+            }],
+            effects: Vec::new(),
+            return_type: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
+            body,
+        })
+    }
+
+    #[test]
+    fn inline_let_substitutes_literal_value() {
+        let stage = inlinable_stage();
+        let out = inline_let(&stage, &NodeId("n_0.2".into())).unwrap();
+        let Stage::FnDecl(fd) = out else { panic!() };
+        // The Let is gone; body root is now `5 + n`.
+        let CExpr::BinOp { lhs, .. } = fd.body else { panic!() };
+        assert!(matches!(*lhs, CExpr::Literal { value: CLit::Int { value: 5 } }));
+    }
+
+    #[test]
+    fn inline_let_refuses_call_in_value() {
+        // `let x := f(); x`  →  refused, `f()` may have effects.
+        let body = CExpr::Let {
+            name: "x".into(),
+            ty: None,
+            value: Box::new(CExpr::Call {
+                callee: Box::new(CExpr::Var { name: "f".into() }),
+                args: Vec::new(),
+            }),
+            body: Box::new(CExpr::Var { name: "x".into() }),
+        };
+        let stage = Stage::FnDecl(FnDecl {
+            name: "g".into(),
+            type_params: Vec::new(),
+            params: Vec::new(),
+            effects: Vec::new(),
+            return_type: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
+            body,
+        });
+        let err = inline_let(&stage, &NodeId("n_0.1".into())).unwrap_err();
+        assert!(matches!(err, TransformError::InlineLetRefused { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn inline_let_refuses_capture() {
+        // `let x := y; let y := 7; x + y`
+        // Inlining `x` would capture `y`. Must refuse.
+        let inner = CExpr::Let {
+            name: "y".into(),
+            ty: None,
+            value: Box::new(CExpr::Literal { value: CLit::Int { value: 7 } }),
+            body: Box::new(CExpr::BinOp {
+                op: "+".into(),
+                lhs: Box::new(CExpr::Var { name: "x".into() }),
+                rhs: Box::new(CExpr::Var { name: "y".into() }),
+            }),
+        };
+        let body = CExpr::Let {
+            name: "x".into(),
+            ty: None,
+            value: Box::new(CExpr::Var { name: "y".into() }),
+            body: Box::new(inner),
+        };
+        let stage = Stage::FnDecl(FnDecl {
+            name: "g".into(),
+            type_params: Vec::new(),
+            params: vec![Param {
+                name: "y".into(),
+                ty: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
+            }],
+            effects: Vec::new(),
+            return_type: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
+            body,
+        });
+        // Let `x` is at child index 2 (1 param + return + body slot).
+        let err = inline_let(&stage, &NodeId("n_0.2".into())).unwrap_err();
+        assert!(matches!(err, TransformError::InlineLetRefused { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn inline_let_substitutes_under_shadowing() {
+        // `let x := 5; let x := n; x + 1`
+        // Inner let SHADOWS the outer `x`. Inlining the OUTER `x`
+        // should affect nothing because the inner shadow cuts off
+        // descent. The outer let is still eliminated.
+        let inner = CExpr::Let {
+            name: "x".into(),
+            ty: None,
+            value: Box::new(CExpr::Var { name: "n".into() }),
+            body: Box::new(CExpr::BinOp {
+                op: "+".into(),
+                lhs: Box::new(CExpr::Var { name: "x".into() }),
+                rhs: Box::new(CExpr::Literal { value: CLit::Int { value: 1 } }),
+            }),
+        };
+        let body = CExpr::Let {
+            name: "x".into(),
+            ty: None,
+            value: Box::new(CExpr::Literal { value: CLit::Int { value: 5 } }),
+            body: Box::new(inner),
+        };
+        let stage = Stage::FnDecl(FnDecl {
+            name: "g".into(),
+            type_params: Vec::new(),
+            params: vec![Param {
+                name: "n".into(),
+                ty: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
+            }],
+            effects: Vec::new(),
+            return_type: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
+            body,
+        });
+        let out = inline_let(&stage, &NodeId("n_0.2".into())).unwrap();
+        let Stage::FnDecl(fd) = out else { panic!() };
+        // Outer let removed; body is the inner Let.
+        let CExpr::Let { name, .. } = fd.body else { panic!() };
+        assert_eq!(name, "x", "inner let preserved");
+    }
+
+    #[test]
+    fn inline_let_not_a_let_target_errors() {
+        let stage = match_stage_with_two_arms();
+        let err = inline_let(&stage, &NodeId("n_0.2".into())).unwrap_err();
+        assert!(matches!(err, TransformError::NotALet { found_kind: "Match", .. }));
     }
 
     // ---- replace_match_arm fixtures + tests ------------------------

@@ -17,7 +17,7 @@ pub use canonicalize::{canonicalize_program, canonicalize_item};
 pub use canon_print::print_stages;
 pub use ids::{collect_ids, expr_ids, NodeId, NodeRef};
 pub use patch::{apply_patch, Patch, PatchError};
-pub use transforms::{rename_local, replace_match_arm, TransformError};
+pub use transforms::{inline_let, rename_local, replace_match_arm, TransformError};
 
 /// SHA-256 over the canonical-JSON encoding of a stage. Excludes NodeIds
 /// (the canonical AST data does not carry IDs; they're derived).
