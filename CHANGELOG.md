@@ -7,6 +7,38 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-05-10
+
+The agent-onboarding + agent-feedback wave from the post-0.5.0
+strategic review. Four issues land in one release:
+
+- **#280 typed refactoring operations** — four AST transforms
+  (`ReplaceMatchArm`, `RenameLocal`, `InlineLet`, `ExtractFunction`)
+  that let agents express edits as typed deltas rather than as
+  raw byte rewrites. The op log finally reads as a semantic edit
+  history.
+- **#281 closed repair loop, slice 1** — `RepairHint` attestation
+  auto-emitted by `apply_operation_checked` on `TypeError`, plus
+  `lex repair <op_id>` to read it. The LLM-assisted `--apply`
+  path follows in slice 2.
+- **#282 `lex docs --for-agent`** — single structured JSON
+  envelope giving an agent everything it needs to make sensible
+  writes against a Lex repo (workspace, stdlib, recent activity,
+  open intents, policy, attention queue).
+- **#283 search reindex** — `lex store search reindex` warms the
+  embedding cache eagerly. (The HTTP embedder backends and on-
+  disk cache turned out to already be shipped under #224 — the
+  PR also corrects the stale "deferred to slice 2" note in
+  `lex-search`'s lib.rs.)
+
+Minor bump because every data-layer change is additive: new
+`OperationKind` variants (`ReplaceMatchArm`, `RenameLocal`,
+`InlineLet`) follow the established `skip_if_none` discipline so
+pre-0.6.0 OpIds stay stable; new `AttestationKind` variants
+(`RepairHint`, `RepairAttempt`) are append-only enum extensions;
+new `lex` subcommands (`docs`, `repair`, `op gc`, `search reindex`)
+add surface without changing existing CLIs.
+
 ### Added — agent-feedback (#281)
 
 - **`AttestationKind::RepairHint { failed_op_id, errors,
