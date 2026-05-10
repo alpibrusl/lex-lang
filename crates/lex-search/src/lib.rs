@@ -20,23 +20,28 @@
 //! `parse_csv :: String -> List[Record]` even if the literal token
 //! "csv" never appears in the description.
 //!
-//! ## What's in vs out for slice 1
+//! ## What's shipped
 //!
-//! In:
 //!   - [`Embedder`] trait + [`MockEmbedder`] (deterministic hash-
-//!     based); enough to give CLI tests semantic ordering without
-//!     calling out to a real model.
+//!     based; used in tests and when `LEX_EMBED_URL` is unset).
+//!   - [`HttpEmbedder`] for Ollama (`/api/embeddings`) and OpenAI-
+//!     compatible (`/v1/embeddings`) wire formats. Configured via
+//!     `LEX_EMBED_URL`, `LEX_EMBED_PROVIDER`, `LEX_EMBED_MODEL`,
+//!     `LEX_EMBED_API_KEY` (the last for OpenAI-shape providers).
+//!   - [`CachingEmbedder`] wraps any backend with an on-disk
+//!     SHA-256-keyed cache so repeated queries don't re-embed.
 //!   - [`SearchIndex`] over a `lex_store::Store`.
-//!   - [`fuse_scores`] / [`cosine_similarity`] as standalone
-//!     primitives so the CLI can format breakdowns.
+//!   - `lex store search [--limit N] "<query>"` for one-shot queries
+//!     and `lex store search reindex` to warm the cache eagerly
+//!     (#283).
 //!
-//! Deferred:
-//!   - HTTP embedder backends (Ollama, OpenAI-compat) — Slice 2,
-//!     gated on `LEX_EMBED_URL` env var.
-//!   - On-disk index cache to avoid re-embedding on every query
-//!     once a real backend is wired.
-//!   - HNSW for stores past ~500 stages. Brute force is sub-ms
+//! ## Still deferred
+//!
+//!   - HNSW for stores past ~10k stages. Brute force is sub-ms
 //!     well past that.
+//!   - Cross-store sync of the embedding cache. It's local-derivable
+//!     from the on-disk stages, so syncing is redundant — downstream
+//!     stores reindex against their own provider config.
 
 use serde::{Deserialize, Serialize};
 
