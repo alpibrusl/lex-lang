@@ -7,6 +7,34 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added — agent-feedback (#281)
+
+- **`AttestationKind::RepairHint { failed_op_id, errors,
+  suggested_transform }`** — auto-emitted by
+  `Store::apply_operation_checked` when an op is rejected for a
+  `TypeError`. Attached to each candidate stage in the rejected
+  transition. The hint records the *would-be* op_id (deterministic,
+  content-addressed even though the op record is never persisted)
+  and the structured errors. `suggested_transform` is left `None`;
+  a future slice (`lex repair --apply`) will populate it via LLM.
+- **`AttestationKind::RepairAttempt { hint_id, outcome,
+  applied_op_id }`** — variant for recording repair iterations.
+  Schema-only in this slice; producers land with the LLM path.
+- **`lex repair <op_id> [--store DIR]`** — read-only walk of the
+  attestation log surfacing the latest matching `RepairHint`.
+  Emits `{ found, failed_op_id, stage_id, attestation_id,
+  timestamp, errors, suggested_transform }` JSON. The
+  LLM-assisted `--apply` mode is deferred to a follow-up slice
+  and explicitly errors with "not yet implemented" today.
+- 3 conformance tests in `crates/lex-store/tests/repair_hint.rs`
+  (TypeError emits hint, success emits no hint, deterministic
+  failed_op_id across retries) plus 3 CLI tests in
+  `crates/lex-cli/tests/repair_cli.rs` (no-hint reporting,
+  --apply rejection, text rendering). Existing
+  `apply_operation_checked_emits_no_attestation_on_rejection` is
+  renamed to `..._does_not_emit_typecheck_attestation_on_rejection`
+  and now asserts the RepairHint is the sole attestation written.
+
 ### Added — agent-VCS roadmap (#280, slice 4)
 
 - **Typed `ExtractFunction` transform** (#280 slice 4). Closes the

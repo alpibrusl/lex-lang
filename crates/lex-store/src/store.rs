@@ -832,6 +832,17 @@ impl Store {
         candidate: &[lex_ast::Stage],
     ) -> Result<lex_vcs::OpId, StoreError> {
         if let Err(errors) = lex_types::check_program(candidate) {
+            // #281: emit a `RepairHint` attestation against each
+            // candidate stage the transition was about to produce.
+            // The op record itself isn't persisted (the gate is
+            // pre-persistence), but the candidate stage IS — the
+            // transform-flow methods publish before this call.
+            // The attached hint lets `lex repair <op_id>` and
+            // future LLM-assisted apply paths read the structured
+            // errors without re-running the typecheck.
+            let attestable = attestable_stage_ids(&transition);
+            let failed_op_id = op.op_id();
+            let _ = self.record_repair_hint(&attestable, &failed_op_id, &errors);
             return Err(StoreError::TypeError(errors));
         }
         let attestable = attestable_stage_ids(&transition);
@@ -889,6 +900,52 @@ impl Store {
                 lex_vcs::AttestationKind::TypeCheck,
                 lex_vcs::AttestationResult::Passed,
                 typecheck_producer(),
+                None,
+            );
+            log.put(&attestation)?;
+        }
+        Ok(())
+    }
+
+    /// Emit `RepairHint` attestations for a TypeError-rejected op
+    /// (#281). One per candidate stage in the transition. The hint
+    /// records the *would-be* op_id (deterministic, content-
+    /// addressed even though the op record was never persisted)
+    /// and the structured errors. `suggested_transform` is left
+    /// `None`; the slice-2 LLM-assisted path will populate it.
+    ///
+    /// Best-effort: a write failure here is swallowed by the
+    /// caller (the original `TypeError` is the load-bearing
+    /// signal; missing the hint is recoverable on a retry).
+    fn record_repair_hint(
+        &self,
+        stage_ids: &[String],
+        failed_op_id: &lex_vcs::OpId,
+        errors: &[lex_types::TypeError],
+    ) -> Result<(), StoreError> {
+        if stage_ids.is_empty() {
+            return Ok(());
+        }
+        let errors_json = serde_json::to_value(errors)
+            .map_err(StoreError::Serde)?;
+        let log = self.attestation_log()?;
+        for stage_id in stage_ids {
+            let attestation = lex_vcs::Attestation::new(
+                stage_id.clone(),
+                None,  // the failed op was never persisted; not the
+                       // attestation's op_id (which is for a
+                       // *successful* op).
+                None,
+                lex_vcs::AttestationKind::RepairHint {
+                    failed_op_id: failed_op_id.clone(),
+                    errors: errors_json.clone(),
+                    suggested_transform: None,
+                },
+                lex_vcs::AttestationResult::Failed {
+                    detail: format!("op {} rejected: {} type error(s)",
+                        failed_op_id, errors.len()),
+                },
+                repair_hint_producer(),
                 None,
             );
             log.put(&attestation)?;
@@ -1693,6 +1750,18 @@ fn transition_for_kind(kind: &lex_vcs::OperationKind) -> lex_vcs::StageTransitio
 fn typecheck_producer() -> lex_vcs::ProducerDescriptor {
     lex_vcs::ProducerDescriptor {
         tool: "lex-store".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        model: None,
+    }
+}
+
+/// Producer identity for `RepairHint` attestations emitted by
+/// `apply_operation_checked` on TypeError (#281). Distinct tool
+/// name from `typecheck_producer` so consumers can filter the
+/// activity feed for repair hints without scanning kinds.
+fn repair_hint_producer() -> lex_vcs::ProducerDescriptor {
+    lex_vcs::ProducerDescriptor {
+        tool: "lex-store::repair_hint".into(),
         version: env!("CARGO_PKG_VERSION").into(),
         model: None,
     }

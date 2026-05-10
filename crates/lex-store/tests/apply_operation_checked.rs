@@ -157,10 +157,11 @@ fn apply_operation_checked_emits_typecheck_attestation_for_created_stage() {
 }
 
 #[test]
-fn apply_operation_checked_emits_no_attestation_on_rejection() {
-    // Type-broken candidate: no op landed, no attestation written.
-    // The TypeCheck attestation is *evidence the gate passed*, so
-    // it must not appear when the gate rejected.
+fn apply_operation_checked_does_not_emit_typecheck_attestation_on_rejection() {
+    // Type-broken candidate: no op landed, no `TypeCheck` attestation.
+    // Post-#281, the gate auto-emits a `RepairHint` attestation to
+    // give consumers a structured record of the failure — that's
+    // the only attestation that should appear here.
     let (s, _tmp) = fresh();
     let candidate = parse("fn broken(x :: Int) -> Int { not_defined(x) }\n");
     let (op, t) = add_fac_op();
@@ -168,20 +169,17 @@ fn apply_operation_checked_emits_no_attestation_on_rejection() {
         .apply_operation_checked(DEFAULT_BRANCH, op, t, &candidate)
         .expect_err("expected TypeError");
 
-    let attestations_dir = s.root().join("attestations");
-    if attestations_dir.exists() {
-        // The dir may exist from a prior log open elsewhere; what
-        // matters is that no primary attestation file was written.
-        let primary_count = std::fs::read_dir(&attestations_dir)
-            .unwrap()
-            .filter(|e| {
-                e.as_ref()
-                    .map(|e| e.path().extension().is_some_and(|x| x == "json"))
-                    .unwrap_or(false)
-            })
-            .count();
-        assert_eq!(primary_count, 0, "no attestation should be written on rejection");
-    }
+    let attlog = s.attestation_log().unwrap();
+    let all = attlog.list_all().unwrap();
+    let n_typecheck = all.iter()
+        .filter(|a| matches!(a.kind, lex_vcs::AttestationKind::TypeCheck))
+        .count();
+    assert_eq!(n_typecheck, 0,
+        "no TypeCheck attestation should be written on rejection");
+    let n_hint = all.iter()
+        .filter(|a| matches!(a.kind, lex_vcs::AttestationKind::RepairHint { .. }))
+        .count();
+    assert_eq!(n_hint, 1, "exactly one RepairHint should land (#281)");
 }
 
 #[test]
