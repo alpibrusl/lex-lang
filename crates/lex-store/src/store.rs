@@ -33,6 +33,14 @@ pub enum StoreError {
     UnknownBranch(String),
     #[error("unknown op_id `{0}`")]
     UnknownOp(lex_vcs::OpId),
+    /// A typed AST transform (#280) — e.g. `ReplaceMatchArm` — was
+    /// asked to operate on a node it couldn't address (wrong kind,
+    /// out-of-range arm index, unknown NodeId, etc.). Distinct from
+    /// `TypeError` (which means the transform succeeded but its
+    /// output didn't typecheck) so callers can render the right
+    /// error message.
+    #[error("transform failed: {0}")]
+    TransformError(lex_ast::TransformError),
     #[error(transparent)]
     Apply(#[from] lex_vcs::ApplyError),
     /// The candidate program — i.e. the source the caller is
@@ -981,6 +989,101 @@ impl Store {
         Ok(total)
     }
 
+    /// Apply a typed `ReplaceMatchArm` transform (#280) and emit a
+    /// `OperationKind::ReplaceMatchArm` op that records the
+    /// semantic shape of the edit, not just the byte effect.
+    ///
+    /// Steps:
+    ///   1. Load the source stage's canonical bytes (delta-aware).
+    ///   2. Run [`lex_ast::replace_match_arm`] to produce the new
+    ///      `Stage`. Pure function, no I/O.
+    ///   3. Publish the new stage. Idempotent on the
+    ///      content-addressed `to_stage_id`.
+    ///   4. Assemble the candidate program (every active stage on
+    ///      the branch, with the rewritten one swapped in) and call
+    ///      [`Self::apply_operation_checked`] — re-typechecks and
+    ///      runs every existing gate (TypeCheck attestation,
+    ///      required_attestations, producer-block walk-back).
+    ///
+    /// Failure modes:
+    ///   * [`StoreError::TransformError`] — transform didn't apply.
+    ///     The branch is unchanged; no stage published.
+    ///   * [`StoreError::TypeError`] — transform produced an
+    ///     ill-typed program. The new stage is on disk (idempotent
+    ///     on its content hash) but the branch is unchanged. Same
+    ///     "publish without advance" semantics as #245.
+    ///   * Everything else from `apply_operation_checked`.
+    pub fn apply_replace_match_arm(
+        &self,
+        branch: &str,
+        from_stage_id: &str,
+        match_node: &lex_ast::NodeId,
+        arm_index: usize,
+        new_body: lex_ast::CExpr,
+    ) -> Result<lex_vcs::OpId, StoreError> {
+        let from_stage = self.get_ast(from_stage_id)?;
+        let new_stage = lex_ast::replace_match_arm(
+            &from_stage, match_node, arm_index, new_body,
+        ).map_err(StoreError::TransformError)?;
+        let sig = lex_ast::sig_id(&from_stage)
+            .ok_or(StoreError::CannotPublishImport)?;
+        let to_stage_id = self.publish(&new_stage)?;
+        if to_stage_id == from_stage_id {
+            // No-op transform — the new body was structurally
+            // identical to the old. Refuse rather than advancing
+            // the branch with an empty edit.
+            return Err(StoreError::InvalidTransition(format!(
+                "replace_match_arm produced the same stage_id `{from_stage_id}`"
+            )));
+        }
+
+        // Assemble the candidate program: every active stage on
+        // the branch, with `from_stage_id` swapped for `new_stage`.
+        let head = self.branch_head(branch)?;
+        let mut candidate: Vec<lex_ast::Stage> = Vec::with_capacity(head.len());
+        for (other_sig, other_stage_id) in &head {
+            if other_sig == &sig {
+                candidate.push(new_stage.clone());
+            } else {
+                candidate.push(self.get_ast(other_stage_id)?);
+            }
+        }
+        // If the source sig isn't on the current branch head, the
+        // transform is operating on a stage that hasn't been added
+        // yet — refuse rather than risking a candidate program
+        // that doesn't reflect the branch's actual state.
+        if !head.contains_key(&sig) {
+            return Err(StoreError::InvalidTransition(format!(
+                "sig `{sig}` not on branch `{branch}`'s head"
+            )));
+        }
+
+        // #247: budget delta captured for `lex op log --budget-drift`.
+        let from_budget = budget_of_stage(&from_stage);
+        let to_budget = budget_of_stage(&new_stage);
+
+        let head_now = self.get_branch(branch)?.and_then(|b| b.head_op);
+        let kind = lex_vcs::OperationKind::ReplaceMatchArm {
+            sig_id: sig.clone(),
+            from_stage_id: from_stage_id.to_string(),
+            to_stage_id: to_stage_id.clone(),
+            match_node: match_node.as_str().to_string(),
+            arm_index,
+            from_budget,
+            to_budget,
+        };
+        let transition = lex_vcs::StageTransition::Replace {
+            sig_id: sig.clone(),
+            from: from_stage_id.to_string(),
+            to: to_stage_id.clone(),
+        };
+        let op = lex_vcs::Operation::new(
+            kind,
+            head_now.into_iter().collect::<Vec<_>>(),
+        );
+        self.apply_operation_checked(branch, op, transition, &candidate)
+    }
+
     /// `set_branch_head_op` for the durability story on the branch
     /// file itself.
     pub fn apply_operation(
@@ -1293,7 +1396,8 @@ fn transition_for_kind(kind: &lex_vcs::OperationKind) -> lex_vcs::StageTransitio
         },
         ModifyBody { sig_id, from_stage_id, to_stage_id, .. }
         | ChangeEffectSig { sig_id, from_stage_id, to_stage_id, .. }
-        | ModifyType { sig_id, from_stage_id, to_stage_id } => StageTransition::Replace {
+        | ModifyType { sig_id, from_stage_id, to_stage_id }
+        | ReplaceMatchArm { sig_id, from_stage_id, to_stage_id, .. } => StageTransition::Replace {
             sig_id: sig_id.clone(),
             from: from_stage_id.clone(),
             to:   to_stage_id.clone(),
@@ -1370,6 +1474,26 @@ fn write_canonical_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Stor
     if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
     fs::write(path, s)?;
     Ok(())
+}
+
+/// Extract the declared `[budget(N)]` integer from a stage's
+/// effect set, if any (#280 + #247). Returns `None` for stages
+/// that aren't `FnDecl` or don't carry a budget effect — same
+/// shape as `lex_vcs::budget_from_effects`.
+fn budget_of_stage(stage: &Stage) -> Option<u64> {
+    let fd = match stage {
+        Stage::FnDecl(fd) => fd,
+        _ => return None,
+    };
+    let mut min_cost: Option<u64> = None;
+    for eff in &fd.effects {
+        if eff.name != "budget" { continue }
+        if let Some(lex_ast::EffectArg::Int { value }) = &eff.arg {
+            let n = *value as u64;
+            min_cost = Some(min_cost.map(|c| c.min(n)).unwrap_or(n));
+        }
+    }
+    min_cost
 }
 
 /// Serialize a stage to its canonical-JSON byte form. Used by

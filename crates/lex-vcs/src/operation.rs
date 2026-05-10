@@ -219,6 +219,35 @@ pub enum OperationKind {
     Merge {
         resolved: usize,
     },
+    /// Typed transform: replaced one arm's body in a `Match`
+    /// expression (#280). Semantically a `ModifyBody`, but the op
+    /// records *which* arm changed and *where* in the AST — so the
+    /// op log reads as a semantic edit history rather than as
+    /// opaque hash-to-hash bytes.
+    ///
+    /// `match_node` is the [`lex_ast::ids::NodeId`] of the Match
+    /// expression at the time of the transform. NodeIds aren't
+    /// stable across structural edits — they're audit-trail metadata,
+    /// not re-derivation keys. The authoritative record of the new
+    /// stage is `to_stage_id` (content-addressed).
+    ///
+    /// `from_budget`/`to_budget` follow the same `skip_if_none`
+    /// discipline as [`Self::ModifyBody`]: pre-#280 ops continue
+    /// hashing to their original `OpId`s.
+    ReplaceMatchArm {
+        sig_id: SigId,
+        from_stage_id: StageId,
+        to_stage_id: StageId,
+        /// Path-style NodeId of the Match expression that was
+        /// modified, captured at transform time. See
+        /// [`lex_ast::ids::NodeId`] for the format.
+        match_node: String,
+        arm_index: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_budget: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_budget: Option<u64>,
+    },
 }
 
 impl OperationKind {
@@ -242,6 +271,7 @@ impl OperationKind {
             ModifyBody { sig_id, to_stage_id, .. }
             | ChangeEffectSig { sig_id, to_stage_id, .. }
             | ModifyType { sig_id, to_stage_id, .. }
+            | ReplaceMatchArm { sig_id, to_stage_id, .. }
                 => Some((sig_id.clone(), Some(to_stage_id.clone()))),
             RemoveFunction { sig_id, .. }
             | RemoveType { sig_id, .. }
@@ -263,7 +293,8 @@ impl OperationKind {
         match self {
             AddFunction { budget_cost, .. } => (None, *budget_cost),
             ModifyBody { from_budget, to_budget, .. }
-            | ChangeEffectSig { from_budget, to_budget, .. } => (*from_budget, *to_budget),
+            | ChangeEffectSig { from_budget, to_budget, .. }
+            | ReplaceMatchArm { from_budget, to_budget, .. } => (*from_budget, *to_budget),
             _ => (None, None),
         }
     }
@@ -277,7 +308,8 @@ impl OperationKind {
         match self {
             AddFunction { sig_id, .. }
             | ModifyBody { sig_id, .. }
-            | ChangeEffectSig { sig_id, .. } => Some(sig_id),
+            | ChangeEffectSig { sig_id, .. }
+            | ReplaceMatchArm { sig_id, .. } => Some(sig_id),
             _ => None,
         }
     }

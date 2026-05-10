@@ -332,5 +332,6 @@ fn variant_tag(k: &OperationKind) -> &'static str {
         OperationKind::RemoveType { .. } => "remove_type",
         OperationKind::ModifyType { .. } => "modify_type",
         OperationKind::Merge { .. } => "merge",
+        OperationKind::ReplaceMatchArm { .. } => "replace_match_arm",
     }
 }

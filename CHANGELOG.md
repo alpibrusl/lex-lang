@@ -7,6 +7,39 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added — agent-VCS roadmap (#280, slice 1)
+
+- **Typed `ReplaceMatchArm` transform** (#280 slice 1). First of
+  the typed refactoring operations identified as the load-bearing
+  primitive for "agents write Lex by typed delta, not by raw
+  bytes." A new `lex_ast::replace_match_arm(stage, match_node,
+  arm_index, new_body)` produces a `Stage` with one arm's body
+  replaced; pattern preserved.
+- **`OperationKind::ReplaceMatchArm { sig_id, from_stage_id,
+  to_stage_id, match_node, arm_index, from_budget, to_budget }`**
+  records the transform's intent in the op log. Semantically a
+  `ModifyBody`, but the op carries *what* changed and *where* in
+  the AST — so the log reads as a semantic edit history rather
+  than as opaque hash-to-hash bytes. Same `skip_if_none` budget
+  discipline as #247's existing variants — pre-#280 OpIds stay
+  stable.
+- **`Store::apply_replace_match_arm`** end-to-end: loads source
+  AST → runs transform → publishes the new stage → re-typechecks
+  the candidate program → emits the typed op. Failure modes:
+  `StoreError::TransformError` (transform didn't apply),
+  `StoreError::TypeError` (transform succeeded but result is
+  ill-typed, branch unchanged), or `InvalidTransition` for no-op
+  edits.
+- 6 unit tests in `lex_ast::transforms` (splice/apply primitives,
+  arm bounds, kind mismatch, error surfaces) and 6 conformance
+  tests in `crates/lex-store/tests/replace_match_arm.rs` (lands
+  typed op, reconstruction via `get_ast`, TypeCheck attestation
+  emission, ill-typed rejection with unchanged branch, transform-
+  error surfacing, no-op rejection).
+
+Slices for `RenameLocal`, `InlineLet`, `ExtractFunction` (the
+other three transforms in #280) will land separately.
+
 ## [0.5.0] — 2026-05-09
 
 The op-log performance roadmap and the post-0.4.0 limitation
