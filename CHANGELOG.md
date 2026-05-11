@@ -9,6 +9,26 @@ bumps may carry breaking changes when justified).
 
 ### Added
 
+- **#305 slice 2: per-thread effect handler split for
+  `list.par_map`.** Slice 1 ran each worker with `DenyAllEffects`,
+  so effectful closures (MCP calls, LLM invocations, io.print)
+  failed at runtime — the actual agent use case for par_map was
+  blocked. Slice 2 adds `EffectHandler::spawn_for_worker(&self) ->
+  Option<Box<dyn EffectHandler + Send>>` (default `None` keeps
+  slice-1 behavior). `DefaultHandler` implements it by yielding a
+  fresh `DefaultHandler` per worker that **shares the parent's
+  budget pool** via `Arc<AtomicU64>` (so parallel work can't escape
+  the run-wide ceiling) while keeping `mcp_clients` and `sink`
+  per-worker to avoid mutex-serializing the dispatch path.
+  `chat_registry` and `program` (both `Arc`) are cloned across
+  workers. The `ParallelMap` op now consults the parent's
+  `spawn_for_worker` and pre-builds one handler per worker on the
+  main thread before `std::thread::scope`, so the worker owns its
+  handler outright with no shared mutable state. Two new
+  conformance tests pin the contract: an effectful par_map under
+  `DefaultHandler` now succeeds; a par_map whose total budget
+  cost exceeds the parent ceiling is rejected by the shared pool.
+
 - **#305 slice 1: `list.par_map` with OS-thread parallelism.**
   Lex's runtime was fully synchronous; multiple concurrent effect
   calls or CPU-bound work from a single program had no way to be

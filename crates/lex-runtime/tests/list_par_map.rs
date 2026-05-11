@@ -184,10 +184,19 @@ fn run_(xs :: List[Int]) -> List[Int] {
 }
 
 #[test]
-fn par_map_effectful_closure_is_refused() {
-    // Slice 1: effectful closures get DenyAllEffects in the worker.
-    // The closure compiles and type-checks; it fails at runtime when
-    // it attempts to dispatch an effect.
+fn par_map_effectful_closure_works_with_default_handler() {
+    // #305 slice 2: DefaultHandler implements `spawn_for_worker`,
+    // so each parallel worker gets its own DefaultHandler sharing
+    // the parent's budget pool. Effectful closures (io, mcp, llm,
+    // …) now succeed in par_map bodies.
+    use std::sync::{Arc, Mutex};
+    struct SharedSink(Arc<Mutex<Vec<String>>>);
+    impl lex_runtime::IoSink for SharedSink {
+        fn print_line(&mut self, s: &str) {
+            self.0.lock().unwrap().push(s.into());
+        }
+    }
+
     let src = r#"
 import "std.list" as list
 import "std.io" as io
@@ -201,14 +210,68 @@ fn echo_par(xs :: List[Str]) -> [io] List[Unit] {
     let mut policy = Policy::pure();
     policy.allow_effects.insert("io".into());
     check_program(&bc, &policy).expect("type-checks under io policy");
+    // Note: each per-worker handler gets its own StdoutSink (slice-2
+    // contract). The captured-sink injected here only sees output
+    // from the PARENT vm, not from the workers. We assert success
+    // here (no panic); ordered output capture is not part of slice 2.
+    let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let handler = DefaultHandler::new(policy)
+        .with_sink(Box::new(SharedSink(Arc::clone(&captured))));
+    let mut vm = Vm::with_handler(&bc, Box::new(handler));
+    let r = vm
+        .call(
+            "echo_par",
+            vec![Value::List(vec![
+                Value::Str("a".into()),
+                Value::Str("b".into()),
+                Value::Str("c".into()),
+            ])],
+        )
+        .expect("effectful par_map runs under DefaultHandler");
+    // Result is a list of three Unit values — one per worker call.
+    assert_eq!(
+        r,
+        Value::List(vec![Value::Unit, Value::Unit, Value::Unit]),
+        "result list shape: one Unit per input"
+    );
+}
+
+#[test]
+fn par_map_workers_share_budget_pool() {
+    // #305 slice 2: per-worker DefaultHandlers share the parent's
+    // budget pool. A par_map across N items, each costing K budget,
+    // exceeds a ceiling of N*K-1 — and the failure must surface
+    // through the worker's effect path, not be hidden by parallelism.
+    let src = r#"
+import "std.list" as list
+fn step() -> [budget(10)] Int { 1 }
+fn par_steps(xs :: List[Int]) -> List[Int] {
+    list.par_map(xs, fn(x :: Int) -> Int { step() })
+}
+"#;
+    let prog = parse_source(src).unwrap();
+    let stages = canonicalize_program(&prog);
+    let bc = lex_bytecode::compile_program(&stages);
+    let mut policy = Policy::pure();
+    policy.allow_effects.insert("budget".into());
+    check_program(&bc, &policy).expect("pure-with-budget policy accepts the program");
+    // Ceiling = 25 forces a budget exceedance when 4 calls × 10 each
+    // = 40 land. The exact worker that trips the ceiling depends on
+    // scheduling; we just assert the run as a whole errors.
+    policy.budget = Some(25);
     let handler = DefaultHandler::new(policy);
     let mut vm = Vm::with_handler(&bc, Box::new(handler));
-    let err = vm
-        .call("echo_par", vec![Value::List(vec![Value::Str("hi".into())])])
-        .expect_err("slice 1 must reject effectful par_map closures");
-    let msg = format!("{err:?}");
+    let r = vm.call(
+        "par_steps",
+        vec![Value::List(vec![Value::Int(0); 4])],
+    );
     assert!(
-        msg.contains("effect") || msg.contains("Effect"),
-        "expected an effect-refusal error, got: {msg}"
+        r.is_err(),
+        "shared budget pool must reject the over-ceiling par_map: {r:?}"
+    );
+    let msg = format!("{:?}", r.unwrap_err());
+    assert!(
+        msg.contains("budget"),
+        "expected a budget-exceeded error, got: {msg}"
     );
 }
