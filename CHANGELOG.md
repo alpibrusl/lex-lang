@@ -7,6 +7,11 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-05-11
+
+Patch release containing a single bug fix that surfaced in CI
+after 0.7.0 tagged.
+
 ### Fixed
 
 - **CAS retry race in `apply_operation` for empty-parents ops**
