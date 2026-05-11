@@ -685,7 +685,27 @@ impl Checker {
         let lt = self.check_expr(lhs, node_id, locals, effs)?;
         let rt = self.check_expr(rhs, node_id, locals, effs)?;
         match op {
-            "+" | "-" | "*" | "/" | "%" => {
+            "+" => {
+                // #308: `+` is overloaded over Int, Float, and Str.
+                // Str concatenation dispatches at the VM layer
+                // (Op::NumAdd in bytecode handles all three).
+                self.u.unify(&lt, &rt).map_err(|e| mismatch_err(node_id, e, &self.u, vec![format!("operator `{op}`")]))?;
+                let r = self.u.resolve(&lt);
+                match r {
+                    Ty::Prim(Prim::Int) | Ty::Prim(Prim::Float) | Ty::Prim(Prim::Str) => Ok(lt),
+                    Ty::Var(_) => {
+                        self.u.unify(&lt, &Ty::int()).map_err(|e| mismatch_err(node_id, e, &self.u, vec![format!("operator `{op}`")]))?;
+                        Ok(Ty::int())
+                    }
+                    other => Err(TypeError::TypeMismatch {
+                        at_node: node_id.into(),
+                        expected: "Int, Float, or Str".into(),
+                        got: other.pretty(),
+                        context: vec![format!("operator `{op}`")],
+                    }),
+                }
+            }
+            "-" | "*" | "/" | "%" => {
                 self.u.unify(&lt, &rt).map_err(|e| mismatch_err(node_id, e, &self.u, vec![format!("operator `{op}`")]))?;
                 let r = self.u.resolve(&lt);
                 match r {
