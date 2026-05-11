@@ -990,12 +990,14 @@ fn cmd_repair(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let store = Store::open(&root)?;
 
     if apply {
-        let transform_json = transform_json.ok_or_else(|| anyhow!(
-            "`lex repair --apply` requires `--transform '<json>'` in slice 2a; \
-             LLM-driven generation ships in slice 2b"
-        ))?;
         let branch = branch.unwrap_or_else(|| store.current_branch());
-        return cmd_repair_apply(fmt, &store, &op_id, &branch, &transform_json);
+        // With `--transform`: slice-2a behavior — execute exactly
+        // what the agent provided. Without it: slice-2b — call
+        // the LLM (or fixture) to generate the transform.
+        return match transform_json {
+            Some(t) => cmd_repair_apply(fmt, &store, &op_id, &branch, &t),
+            None => cmd_repair_apply_llm(fmt, &store, &op_id, &branch),
+        };
     }
     if transform_json.is_some() {
         bail!("`--transform` requires `--apply`");
@@ -1165,6 +1167,220 @@ fn repair_attempt_producer() -> lex_vcs::ProducerDescriptor {
         version: env!("CARGO_PKG_VERSION").into(),
         model: None,
     }
+}
+
+/// `lex repair <op_id> --apply` (no `--transform`) — slice 2b.
+///
+/// Reads the latest `RepairHint` for the failed op_id, builds a
+/// structured prompt describing the four typed transforms +
+/// the failure context, asks the configured LLM for a single
+/// transform JSON, then hands the response off to
+/// [`cmd_repair_apply`]'s machinery.
+///
+/// # Test infrastructure
+///
+/// Tests can short-circuit the LLM call by setting the
+/// `LEX_REPAIR_LLM_FIXTURE` env var to a path. The contents of
+/// that file replace the live LLM response. This lets the
+/// subprocess-based CLI tests assert end-to-end behavior without
+/// any network dependency.
+fn cmd_repair_apply_llm(
+    fmt: &OutputFormat,
+    store: &Store,
+    failed_op_id: &str,
+    branch: &str,
+) -> Result<()> {
+    let attlog = store.attestation_log()
+        .map_err(|e| anyhow!("opening attestation log: {e}"))?;
+    let hint = attlog.list_all()
+        .map_err(|e| anyhow!("listing attestations: {e}"))?
+        .into_iter()
+        .filter(|a| matches!(&a.kind,
+            lex_vcs::AttestationKind::RepairHint { failed_op_id: f, .. }
+                if f == failed_op_id))
+        .max_by_key(|a| a.timestamp)
+        .ok_or_else(|| anyhow!(
+            "no RepairHint exists for op_id `{failed_op_id}` — \
+             a hint is required to apply a repair"
+        ))?;
+    let lex_vcs::AttestationKind::RepairHint { errors, .. } = &hint.kind
+        else { unreachable!() };
+
+    let candidate_stage_id = &hint.stage_id;
+    let candidate_stage = store.get_ast(candidate_stage_id)
+        .map_err(|e| anyhow!("loading candidate stage `{candidate_stage_id}`: {e}"))?;
+    let sig = lex_ast::sig_id(&candidate_stage)
+        .ok_or_else(|| anyhow!("candidate stage has no sig_id"))?;
+    let head = store.branch_head(branch)
+        .map_err(|e| anyhow!("reading branch head: {e}"))?;
+    let from_stage_id = head.get(&sig).cloned();
+    let from_stage = match &from_stage_id {
+        Some(id) => Some(store.get_ast(id)
+            .map_err(|e| anyhow!("loading branch-head stage `{id}`: {e}"))?),
+        None => None,
+    };
+
+    let prompt = build_repair_prompt(
+        candidate_stage_id,
+        &candidate_stage,
+        from_stage_id.as_deref(),
+        from_stage.as_ref(),
+        errors,
+    );
+    let response = call_repair_llm(&prompt)?;
+    let transform_json = response.trim().to_string();
+
+    // Pre-validate that the response is at least parseable JSON
+    // and has a `kind` field. A malformed response is recorded
+    // as a `RepairAttempt` failure rather than propagated as
+    // exit-non-zero — the LLM gave a bad answer; the command
+    // itself processed correctly.
+    let parse_err: Option<String> = match serde_json::from_str::<serde_json::Value>(&transform_json) {
+        Ok(v) => {
+            if v.get("kind").and_then(|x| x.as_str()).is_none() {
+                Some("LLM response missing `kind` field".into())
+            } else {
+                None
+            }
+        }
+        Err(e) => Some(format!("LLM response is not valid JSON: {e}")),
+    };
+    if let Some(reason) = parse_err {
+        let attlog = store.attestation_log()
+            .map_err(|e| anyhow!("opening attestation log: {e}"))?;
+        let attempt = lex_vcs::Attestation::new(
+            hint.stage_id.clone(),
+            None,
+            None,
+            lex_vcs::AttestationKind::RepairAttempt {
+                hint_id: hint.attestation_id.clone(),
+                outcome: "failed".into(),
+                applied_op_id: None,
+            },
+            lex_vcs::AttestationResult::Failed { detail: reason.clone() },
+            repair_attempt_producer(),
+            None,
+        );
+        attlog.put(&attempt)
+            .map_err(|e| anyhow!("recording RepairAttempt: {e}"))?;
+        let env = serde_json::json!({
+            "outcome": "failed",
+            "hint_id": hint.attestation_id,
+            "applied_op_id": serde_json::Value::Null,
+            "error": reason,
+        });
+        let env_for_text = env.clone();
+        acli::emit_or_text("repair-apply", env, fmt, move || {
+            println!("repair failed: {}", env_for_text["error"].as_str().unwrap_or("?"));
+        });
+        return Ok(());
+    }
+
+    cmd_repair_apply(fmt, store, failed_op_id, branch, &transform_json)
+}
+
+/// Build the prompt for the LLM repair call. Inlines the JSON
+/// schemas for the four typed transforms so the model can choose
+/// one without a separate spec fetch. Includes the candidate
+/// stage (the one that didn't typecheck), the branch-head stage
+/// (the one transforms should operate against), and the type
+/// errors.
+fn build_repair_prompt(
+    candidate_stage_id: &str,
+    candidate_stage: &lex_ast::Stage,
+    from_stage_id: Option<&str>,
+    from_stage: Option<&lex_ast::Stage>,
+    errors: &serde_json::Value,
+) -> String {
+    let candidate_json = serde_json::to_string_pretty(candidate_stage)
+        .unwrap_or_default();
+    let from_json = from_stage
+        .map(|s| serde_json::to_string_pretty(s).unwrap_or_default())
+        .unwrap_or_else(|| "(no current branch-head stage for this sig)".into());
+    let from_id_render = from_stage_id.unwrap_or("(none)");
+    let errors_json = serde_json::to_string_pretty(errors)
+        .unwrap_or_default();
+
+    format!(r#"You are a Lex type-error repair assistant. The user attempted a
+typed transform; the resulting stage didn't typecheck. Suggest
+exactly one typed AST transform that would fix the type errors.
+
+# Available transforms (return JSON for ONE of these)
+
+1) replace_match_arm — replace the body of one Match arm.
+{{
+  "kind": "replace_match_arm",
+  "from_stage_id": "<branch-head stage_id>",
+  "match_node": "<NodeId of the Match>",
+  "arm_index": <0-based>,
+  "new_body": <CExpr JSON>
+}}
+
+2) rename_local — rename a let-bound local (scope-aware).
+{{
+  "kind": "rename_local",
+  "from_stage_id": "<branch-head stage_id>",
+  "let_node": "<NodeId of the Let>",
+  "new_name": "<identifier>"
+}}
+
+3) inline_let — eliminate `let x := v; body` by substituting v.
+   v must be a literal/var/field-access/binop tree (no calls,
+   no side effects).
+{{
+  "kind": "inline_let",
+  "from_stage_id": "<branch-head stage_id>",
+  "let_node": "<NodeId of the Let>"
+}}
+
+4) extract_function — extract a sub-expression into a new fn.
+{{
+  "kind": "extract_function",
+  "from_stage_id": "<branch-head stage_id>",
+  "expr_node": "<NodeId of the expr>",
+  "spec": {{
+    "name": "<new fn name>",
+    "type_params": [],
+    "params": [{{"name": "n", "type": {{"node": "Named", "name": "Int", "args": []}}}}],
+    "return_type": {{"node": "Named", "name": "Int", "args": []}},
+    "effects": []
+  }}
+}}
+
+# Failure context
+
+Branch-head stage_id (use this as `from_stage_id`):
+{from_id_render}
+
+Branch-head stage AST (the one the transform should operate on):
+{from_json}
+
+Candidate stage_id (the one that didn't typecheck): {candidate_stage_id}
+
+Candidate stage AST (what the agent tried; informative only):
+{candidate_json}
+
+Type errors:
+{errors_json}
+
+# Response format
+
+Output ONLY the JSON object for your chosen transform. No prose,
+no markdown fences, no surrounding commentary.
+"#)
+}
+
+/// Call the configured LLM. Test escape hatch: when
+/// `LEX_REPAIR_LLM_FIXTURE` is set, read the response from that
+/// file instead of calling the live model. Lets the subprocess-
+/// based CLI tests assert end-to-end behavior without network.
+fn call_repair_llm(prompt: &str) -> Result<String> {
+    if let Ok(path) = std::env::var("LEX_REPAIR_LLM_FIXTURE") {
+        return std::fs::read_to_string(&path)
+            .with_context(|| format!("reading LEX_REPAIR_LLM_FIXTURE at `{path}`"));
+    }
+    lex_runtime::llm::cloud_complete(prompt)
+        .map_err(|e| anyhow!("LLM cloud_complete: {e}"))
 }
 
 /// Dispatch a `--transform` payload to the matching

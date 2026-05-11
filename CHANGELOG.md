@@ -7,6 +7,43 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added — agent-feedback (#281, slice 2b)
+
+- **`lex repair <op_id> --apply`** (no `--transform`) now invokes
+  the configured LLM to generate a typed transform from the
+  failed-op context, then dispatches via slice-2a's apply path.
+  Closes the full agent feedback loop: an ill-typed op produces
+  a structured `RepairHint`; `lex repair --apply` reads the hint,
+  asks the LLM for a single typed transform across the four #280
+  variants, and lands it (or records the failed attempt).
+- **Structured prompt** with inlined JSON schemas for each
+  transform, the branch-head stage AST (the one transforms
+  operate against), the candidate stage that didn't typecheck
+  (informative), and the type errors. The model is instructed
+  to respond with ONLY the transform JSON — no prose, no
+  markdown fences.
+- **Test infrastructure**: `LEX_REPAIR_LLM_FIXTURE=<path>` env
+  var short-circuits the live LLM call by reading the response
+  from that file. Lets the CLI subprocess tests assert
+  end-to-end behavior without any network dependency. Production
+  callers (env var unset) hit `lex_runtime::llm::cloud_complete`.
+- **Graceful degradation**: a malformed LLM response (not JSON,
+  or missing `kind`) is recorded as a `RepairAttempt` failure
+  rather than propagated as exit-non-zero. The command itself
+  always exits 0; outcome lives in the envelope and the
+  attestation log. Same shape as slice 2a's ill-typed-transform
+  path.
+- 4 conformance tests in `crates/lex-cli/tests/repair_llm.rs`
+  driving the fixture path (well-typed lands; malformed JSON
+  records failure; unknown kind records failure; ill-typed
+  transform records failure).
+- The slice-2a "requires `--transform`" error is gone — the LLM
+  path is now the default behavior of `--apply`.
+
+With slices 1 + 2a + 2b shipped, **#281 is complete** modulo the
+explicitly-out-of-scope `--max-iters` looping (single-shot
+today).
+
 ### Added — agent-safety (#292, slices 2 + 3)
 
 - **`policy.session_budgets` schema** with `default_cap` and
