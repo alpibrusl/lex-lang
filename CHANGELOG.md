@@ -7,6 +7,53 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-05-11
+
+The post-0.6.0 strategic-amplifier wave. Five issues land in
+one release — the four amplifiers identified in the 0.5.0
+review plus the closure of #281's LLM-driven repair path:
+
+- **#281 closed repair loop, slices 2a + 2b** — `lex repair
+  --apply --transform '<json>'` for typed-transform execution
+  with a `RepairAttempt` audit trail, and `lex repair --apply`
+  (no `--transform`) for LLM-driven transform generation. The
+  `LEX_REPAIR_LLM_FIXTURE` env var short-circuits the LLM call
+  for tests; production calls `lex_runtime::llm::cloud_complete`.
+- **#292 per-session budget enforcement** — `Store::session_budget`
+  ledger (slice 1, shipped in 0.6.0 mid-cycle), `policy.session_budgets`
+  schema with `default_cap` + per-session `overrides` (slice 2),
+  and an `apply_operation_checked` budget gate with
+  `StoreError::BudgetExceeded` mapped to HTTP 503 + `Retry-After: 0`
+  (slice 3).
+- **#293 positive `ProducerTrust`** — `AttestationKind::ProducerTrust
+  { tool_id, score_thousandths, ... }` complementing #248's
+  `ProducerBlock`; `policy.required_attestations[].skip_if_producer_trust_thousandths_above`
+  waiver hook; `TrustWaived` audit attestation;
+  `lex producer-trust recompute` CLI. Hard-vetoes blocked producers.
+- **#294 multi-agent Candidate/Promote ops** —
+  `OperationKind::Candidate` proposes a stage without advancing the
+  branch (no CAS contention between concurrent agents);
+  `OperationKind::Promote` picks a winner and lists every other
+  live candidate in `supersedes`. `lex stage candidates <sig_id>`
+  and `lex stage promote-candidate <op_id>` CLI.
+
+Minor bump because every data-layer change is additive: new
+`OperationKind` variants (`Candidate`, `Promote`) and new
+`AttestationKind` variants (`ProducerTrust`, `TrustWaived`)
+are append-only enum extensions; new `policy.json` fields
+(`session_budgets`, `skip_if_producer_trust_thousandths_above`)
+all use `skip_if_none` so pre-0.7.0 policy files load
+unchanged; new CLI subcommands add surface without changing
+existing commands.
+
+One behavior change worth calling out: `apply_operation_checked`
+now consults the per-session budget cap after typecheck passes
+and may surface `StoreError::BudgetExceeded`. Callers that
+weren't pattern-matching on `StoreError` exhaustively (i.e.
+used a wildcard arm) are unaffected. Stores with no
+`policy.session_budgets` (the pre-0.7.0 shape) keep their
+current behavior — the gate is no-op when no cap is set.
+
 ### Added — agent-coordination (#294)
 
 - **`OperationKind::Candidate { sig_id, stage_id }`** — proposes
