@@ -1782,8 +1782,17 @@ impl Store {
         let mut current_op = op;
         let current_transition = transition;
         // Only rebuild on retries — attempt 1 honors the caller's
-        // exact op so a user-supplied bogus parent surfaces as
-        // `StaleParent` instead of being silently corrected.
+        // exact op so a user-supplied bogus parent (parents =
+        // ["someone-else"]) surfaces as `StaleParent` instead of
+        // being silently corrected.
+        //
+        // Exception (#262 follow-up): an op with `parents = []`
+        // means "I don't care; chain off whatever the current
+        // head is." Under concurrent apply, attempt 1 can read
+        // `head_op = Some(opA)` after a sibling writer landed,
+        // and the persist's parent check fails StaleParent
+        // unprompted. Rebuild attempt 1 for the empty-parents
+        // case so the legitimate-race path retries cleanly.
         let mut rebuilt_already = false;
         for attempt in 1..=MAX_ATTEMPTS {
             // Read the current head BEFORE we persist — this is
@@ -1796,7 +1805,14 @@ impl Store {
             // on retries (not the caller's first attempt) and
             // only for single-parent operations. Multi-parent
             // (merge) ops are passed through unchanged.
-            if is_rebuildable && rebuilt_already {
+            //
+            // Empty-parents ops also rebuild on attempt 1 (see
+            // the exception note above) so concurrent apply
+            // doesn't false-positive on StaleParent.
+            let should_rebuild = is_rebuildable
+                && (rebuilt_already
+                    || (current_op.parents.is_empty() && parent.is_some()));
+            if should_rebuild {
                 current_op = lex_vcs::Operation {
                     kind: kind.clone(),
                     parents: parent.iter().cloned().collect(),

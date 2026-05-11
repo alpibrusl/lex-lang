@@ -7,6 +7,24 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Fixed
+
+- **CAS retry race in `apply_operation` for empty-parents ops**
+  (#262 follow-up). `cas_retry_advance`'s attempt-1
+  "honor caller's exact op" semantics surfaced `StaleParent`
+  on a legitimate race: when a sibling writer landed between
+  the read of `head_op` and the local persist, the caller's
+  `parents = []` op was rejected by `lex_vcs::apply` instead of
+  retrying. CI hit this on the multi-writer stress test. Fix:
+  on attempt 1, rebuild the op against the just-read head when
+  the caller's `parents` is empty — that's the "I don't care,
+  chain off whatever the current head is" intent. Non-empty
+  parents on attempt 1 still surface `StaleParent` so the
+  explicit-bogus-parent test (`apply_operation_with_stale_parent_errors`)
+  keeps its contract. New regression test
+  `empty_parents_op_chains_off_existing_head` covers the path
+  single-threaded so the race is deterministically reproducible.
+
 ## [0.7.0] — 2026-05-11
 
 The post-0.6.0 strategic-amplifier wave. Five issues land in

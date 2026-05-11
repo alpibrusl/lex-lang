@@ -172,3 +172,52 @@ fn concurrent_writers_do_not_lose_op_records() {
         n_ops
     );
 }
+
+#[test]
+fn empty_parents_op_chains_off_existing_head() {
+    // Deterministic regression for the cas_retry_advance race that
+    // surfaced in CI for #262: a caller submitting an op with
+    // `parents = []` against a branch that already has a head
+    // should chain off the existing head rather than fail
+    // StaleParent. This is the single-threaded analogue of the
+    // sibling-writer race in `n_concurrent_writers_all_land`.
+    let tmp = tempfile::tempdir().unwrap();
+    let s = Store::open(tmp.path()).unwrap();
+    fn add(sig: &str, stage: &str) -> (Operation, StageTransition) {
+        let op = Operation::new(
+            OperationKind::AddFunction {
+                sig_id: sig.into(),
+                stage_id: stage.into(),
+                effects: BTreeSet::new(),
+                budget_cost: None,
+            },
+            [],
+        );
+        let t = StageTransition::Create {
+            sig_id: sig.into(),
+            stage_id: stage.into(),
+        };
+        (op, t)
+    }
+
+    // First op lands cleanly.
+    let (op1, t1) = add("first", "stg-first");
+    let head1 = s.apply_operation(DEFAULT_BRANCH, op1, t1).unwrap();
+
+    // Second op is built with parents = [] (same shape as the
+    // concurrent-writer test). Pre-fix this would have failed
+    // StaleParent because attempt 1 doesn't rebuild.
+    let (op2, t2) = add("second", "stg-second");
+    assert!(op2.parents.is_empty(), "op2 must have empty parents to exercise the race");
+    let head2 = s.apply_operation(DEFAULT_BRANCH, op2, t2).unwrap();
+    assert_ne!(head1, head2, "second op should produce a fresh op_id");
+
+    // History walks back from head2 → head1, confirming the
+    // empty-parents op was rebuilt with head1 as parent.
+    let log = lex_vcs::OpLog::open(s.root()).unwrap();
+    let walked = log.walk_back(&head2, None).unwrap();
+    assert_eq!(walked.len(), 2);
+    assert_eq!(walked[0].op_id, head2);
+    assert_eq!(walked[1].op_id, head1);
+    assert_eq!(walked[0].op.parents, vec![head1.clone()]);
+}
