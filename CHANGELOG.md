@@ -9,6 +9,25 @@ bumps may carry breaking changes when justified).
 
 ### Added
 
+- **#306 slice 3: auto-populated `suggested_transform` on
+  `RepairHint`.** Closes #306. When
+  `Store::apply_operation_checked` rejects an op for a `TypeError`,
+  the gate now consults a static (rule_tag → likely_transform)
+  table and pre-populates the `RepairHint` attestation's
+  `suggested_transform` payload. Seven rule_tags ship with a
+  static hint: `type-mismatch` → `ReplaceMatchArm`,
+  `unknown-identifier` → `RenameLocal`, `non-exhaustive-match` →
+  `ReplaceMatchArm`, `effect-not-declared` → `ChangeEffectSig`,
+  `arity-mismatch` → `ModifyBody`, `unknown-field` →
+  `ModifyBody`, `ambiguous-type` → `ModifyBody`. Each suggestion
+  includes a one-sentence `summary` and longer `details` prose
+  suitable for an LLM repair prompt. The LLM-driven `lex repair
+  --apply` path still works for rules without a static suggestion
+  and can overwrite a static suggestion with a higher-quality
+  one. New `lex_types::suggested_transform_for(rule_tag)` is
+  available for any tooling that wants to render the same hint
+  inline (LSP code-actions, repair-flow prompts).
+
 - **#306 slice 2: rule-tagged type errors + `lex docs --rules`.**
   Every `TypeError` variant gains a stable `rule_tag(&self) -> &'static str`
   (kebab-case identifier: `"type-mismatch"`, `"unknown-identifier"`,
