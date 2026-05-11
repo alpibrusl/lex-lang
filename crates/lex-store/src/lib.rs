@@ -26,6 +26,7 @@
 //! to honor that is to keep the cache trivially derivable.
 
 mod budget;
+mod planner;
 mod store;
 mod model;
 mod branches;
@@ -35,6 +36,7 @@ pub mod users;
 pub mod policy;
 
 pub use budget::SessionBudget;
+pub use planner::{Plan, PlanPath};
 pub use delta::{StageDelta, DELTA_CHAIN_CAP, DELTA_RATIO_THRESHOLD};
 pub use gc::{GcPlan, RetentionReason};
 
