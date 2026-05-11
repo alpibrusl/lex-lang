@@ -7,6 +7,43 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added — agent-coordination (#294)
+
+- **`OperationKind::Candidate { sig_id, stage_id }`** — proposes
+  a stage for `sig_id` without advancing the branch head. Produces
+  `StageTransition::ImportOnly`. Multiple agents can land
+  Candidates on the same sig concurrently with no contention.
+  The `Operation`'s `intent_id` distinguishes proposals by
+  author.
+- **`OperationKind::Promote { sig_id, winner_candidate,
+  winner_stage_id, supersedes, from_stage_id, from_budget,
+  to_budget }`** — promotes one `Candidate` as the new branch
+  head for its sig. Lists every other live `Candidate` in
+  `supersedes` so the op log explicitly records the bake-off
+  shape. Produces `Replace` (or `Create` when `from_stage_id`
+  is `None`) and runs through `apply_operation_checked` so the
+  re-typecheck and existing gates apply.
+- **`Store::propose_candidate(branch, new_stage, intent_id)`** —
+  publishes the stage, emits a `Candidate` op tagged with the
+  intent. Doesn't run the gate.
+- **`Store::list_candidates(sig_id)`** — returns every live
+  `Candidate` (not yet referenced as winner or in `supersedes`
+  by any `Promote`). Sorted by op_id for deterministic output.
+- **`Store::promote_candidate(branch, candidate_op_id)`** —
+  emits a `Promote` op advancing the head. Refuses non-
+  Candidate ops with `StoreError::InvalidTransition`. Re-
+  typechecks the candidate program through
+  `apply_operation_checked` so ill-composed promotions surface
+  as `TypeError`.
+- **`lex stage candidates <sig_id>`** and **`lex stage
+  promote-candidate <op_id> [--branch B]`** CLI surfaces.
+- **`CandidateInfo`** public type re-exported from `lex-store`
+  for `lex stage candidates` JSON envelope.
+- 7 conformance tests covering: propose doesn't advance head;
+  list returns every proposal; promote advances + supersedes
+  others; typecheck on promote; unknown op errors;
+  non-Candidate op rejected; cross-sig candidates isolated.
+
 ### Added — agent-trust (#293)
 
 - **`AttestationKind::ProducerTrust { tool_id,

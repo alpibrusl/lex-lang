@@ -335,5 +335,7 @@ fn variant_tag(k: &OperationKind) -> &'static str {
         OperationKind::ReplaceMatchArm { .. } => "replace_match_arm",
         OperationKind::RenameLocal { .. } => "rename_local",
         OperationKind::InlineLet { .. } => "inline_let",
+        OperationKind::Candidate { .. } => "candidate",
+        OperationKind::Promote { .. } => "promote",
     }
 }

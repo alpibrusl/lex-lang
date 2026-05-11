@@ -128,6 +128,18 @@ pub struct StageHistoryEntry {
     pub published_at: Option<u64>,
 }
 
+/// Per-candidate metadata surfaced by [`Store::list_candidates`]
+/// (#294). Returned sorted by `op_id` for deterministic output.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct CandidateInfo {
+    pub op_id: lex_vcs::OpId,
+    pub stage_id: lex_vcs::StageId,
+    /// Author intent. Always set for `Candidate` ops emitted via
+    /// [`Store::propose_candidate`]; `None` only if a
+    /// hand-written raw op skipped the intent tag.
+    pub intent_id: Option<lex_vcs::IntentId>,
+}
+
 pub struct Store {
     root: PathBuf,
 }
@@ -1556,6 +1568,170 @@ impl Store {
         Ok((add_op_id, modify_op_id))
     }
 
+    /// Propose a stage for `sig_id` without advancing the branch
+    /// head (#294). Multiple agents can call this concurrently
+    /// for the same sig — every call lands a fresh `Candidate`
+    /// op chained off the current head_op. The branch head stays
+    /// where it was; a later [`Self::promote_candidate`] picks
+    /// the winner.
+    ///
+    /// The caller is responsible for typechecking `new_stage`
+    /// against whatever program context they consider valid —
+    /// `propose_candidate` doesn't run the gate. Type errors
+    /// surface at promotion time, where the candidate is
+    /// composed back into a candidate program via the standard
+    /// `apply_operation_checked` path.
+    ///
+    /// The stage is published (idempotent on content hash). The
+    /// `intent_id` is required so downstream consumers can
+    /// distinguish proposals by author.
+    pub fn propose_candidate(
+        &self,
+        branch: &str,
+        new_stage: &lex_ast::Stage,
+        intent_id: &lex_vcs::IntentId,
+    ) -> Result<lex_vcs::OpId, StoreError> {
+        let sig = lex_ast::sig_id(new_stage)
+            .ok_or(StoreError::CannotPublishImport)?;
+        let stage_id = self.publish(new_stage)?;
+        let head_now = self.get_branch(branch)?.and_then(|b| b.head_op);
+        let op = lex_vcs::Operation::new(
+            lex_vcs::OperationKind::Candidate {
+                sig_id: sig,
+                stage_id,
+            },
+            head_now.into_iter().collect::<Vec<_>>(),
+        ).with_intent(intent_id.clone());
+        let transition = lex_vcs::StageTransition::ImportOnly;
+        self.apply_operation(branch, op, transition)
+    }
+
+    /// List every live `Candidate` op for `sig_id` — i.e. those
+    /// not yet referenced by any `Promote` op (either as the
+    /// winner or in the `supersedes` set). Used by `lex stage
+    /// candidates`. Results are sorted by op_id for
+    /// reproducibility.
+    pub fn list_candidates(&self, sig_id: &str) -> Result<Vec<CandidateInfo>, StoreError> {
+        let log = lex_vcs::OpLog::open(self.root())?;
+        let all = log.list_all()?;
+        // Collect the set of candidate op_ids referenced by any
+        // Promote for this sig. Those candidates are no longer
+        // live.
+        let mut referenced: std::collections::BTreeSet<lex_vcs::OpId> = Default::default();
+        for rec in &all {
+            if let lex_vcs::OperationKind::Promote { sig_id: s, winner_candidate, supersedes, .. } = &rec.op.kind {
+                if s != sig_id { continue; }
+                referenced.insert(winner_candidate.clone());
+                for sup in supersedes { referenced.insert(sup.clone()); }
+            }
+        }
+        let mut out: Vec<CandidateInfo> = Vec::new();
+        for rec in all {
+            let lex_vcs::OperationKind::Candidate { sig_id: s, stage_id } = &rec.op.kind
+                else { continue };
+            if s != sig_id { continue; }
+            if referenced.contains(&rec.op_id) { continue; }
+            out.push(CandidateInfo {
+                op_id: rec.op_id.clone(),
+                stage_id: stage_id.clone(),
+                intent_id: rec.op.intent_id.clone(),
+            });
+        }
+        out.sort_by(|a, b| a.op_id.cmp(&b.op_id));
+        Ok(out)
+    }
+
+    /// Promote a previously-landed `Candidate` op as the new
+    /// branch head for its sig (#294). Emits a `Promote` op
+    /// listing every other live `Candidate` for the same sig
+    /// in its `supersedes` field. After this lands,
+    /// [`Self::list_candidates`] returns an empty set for the
+    /// sig.
+    ///
+    /// Re-typechecks the candidate program (winner stage + the
+    /// rest of the branch) through `apply_operation_checked`, so
+    /// a candidate that doesn't compose with the current branch
+    /// state surfaces as `StoreError::TypeError`.
+    pub fn promote_candidate(
+        &self,
+        branch: &str,
+        candidate_op_id: &lex_vcs::OpId,
+    ) -> Result<lex_vcs::OpId, StoreError> {
+        let log = lex_vcs::OpLog::open(self.root())?;
+        let candidate_rec = log.get(candidate_op_id)?
+            .ok_or_else(|| StoreError::UnknownOp(candidate_op_id.clone()))?;
+        let (sig, winner_stage_id) = match &candidate_rec.op.kind {
+            lex_vcs::OperationKind::Candidate { sig_id, stage_id } =>
+                (sig_id.clone(), stage_id.clone()),
+            other => return Err(StoreError::InvalidTransition(format!(
+                "op `{candidate_op_id}` is a `{:?}`, not a Candidate", other
+            ))),
+        };
+
+        // Gather every OTHER live candidate for this sig — the
+        // ones this Promote will supersede.
+        let live = self.list_candidates(&sig)?;
+        let mut supersedes: Vec<lex_vcs::OpId> = live.iter()
+            .filter(|c| &c.op_id != candidate_op_id)
+            .map(|c| c.op_id.clone())
+            .collect();
+        supersedes.sort();
+
+        // Assemble candidate program: winner stage in place of
+        // the sig's current head (if any), plus every other sig
+        // unchanged.
+        let head = self.branch_head(branch)?;
+        let winner_stage = self.get_ast(&winner_stage_id)?;
+        let mut candidate_program: Vec<lex_ast::Stage> = Vec::with_capacity(head.len() + 1);
+        let mut found = false;
+        for (other_sig, other_stage_id) in &head {
+            if other_sig == &sig {
+                candidate_program.push(winner_stage.clone());
+                found = true;
+            } else {
+                candidate_program.push(self.get_ast(other_stage_id)?);
+            }
+        }
+        if !found {
+            // Sig doesn't have a head yet — append the winner
+            // stage to make it a Create.
+            candidate_program.push(winner_stage.clone());
+        }
+        let from_stage_id = head.get(&sig).cloned();
+        // Budget delta from old head to winner — same shape as
+        // ModifyBody.
+        let from_budget = from_stage_id.as_deref()
+            .and_then(|s| self.get_ast(s).ok())
+            .and_then(|s| budget_of_stage(&s));
+        let to_budget = budget_of_stage(&winner_stage);
+
+        let head_now = self.get_branch(branch)?.and_then(|b| b.head_op);
+        let op = lex_vcs::Operation::new(
+            lex_vcs::OperationKind::Promote {
+                sig_id: sig.clone(),
+                winner_candidate: candidate_op_id.clone(),
+                winner_stage_id: winner_stage_id.clone(),
+                supersedes,
+                from_stage_id: from_stage_id.clone(),
+                from_budget,
+                to_budget,
+            },
+            head_now.into_iter().collect::<Vec<_>>(),
+        );
+        let transition = match &from_stage_id {
+            Some(from) => lex_vcs::StageTransition::Replace {
+                sig_id: sig,
+                from: from.clone(),
+                to: winner_stage_id,
+            },
+            None => lex_vcs::StageTransition::Create {
+                sig_id: sig,
+                stage_id: winner_stage_id,
+            },
+        };
+        self.apply_operation_checked(branch, op, transition, &candidate_program)
+    }
+
     /// `set_branch_head_op` for the durability story on the branch
     /// file itself.
     pub fn apply_operation(
@@ -1905,6 +2081,25 @@ fn transition_for_kind(kind: &lex_vcs::OperationKind) -> lex_vcs::StageTransitio
         },
         AddImport { .. } | RemoveImport { .. } => StageTransition::ImportOnly,
         Merge { .. } => StageTransition::Merge { entries: Default::default() },
+        // #294: a Candidate proposes a stage without advancing
+        // the branch. ImportOnly keeps the branch head untouched
+        // — the stage IS published on disk (Store::propose_candidate
+        // calls publish before apply), but no head delta lands.
+        Candidate { .. } => StageTransition::ImportOnly,
+        // A Promote advances the head exactly like ModifyBody
+        // (or Create when the sig had no head). The winner
+        // stage is the new branch state for that sig.
+        Promote { sig_id, winner_stage_id, from_stage_id, .. } => match from_stage_id {
+            Some(from) => StageTransition::Replace {
+                sig_id: sig_id.clone(),
+                from: from.clone(),
+                to: winner_stage_id.clone(),
+            },
+            None => StageTransition::Create {
+                sig_id: sig_id.clone(),
+                stage_id: winner_stage_id.clone(),
+            },
+        },
     }
 }
 
