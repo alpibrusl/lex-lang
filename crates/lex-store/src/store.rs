@@ -81,6 +81,19 @@ pub enum StoreError {
         .0.op_id, .0.stage_id, .0.tool_id, .0.blocked_at, .0.attestation_at
     )]
     ProducerBlocked(crate::policy::ProducerBlocked),
+    /// The op would push its session's monotonic budget over the
+    /// cap configured in `policy.session_budgets` (#292 slice 3).
+    /// The op is *not* persisted; the branch head is unchanged.
+    /// The caller should either start a new session, raise the
+    /// cap, or refactor to fit the budget. HTTP API maps to 503.
+    #[error(
+        "session `{session_id}` budget exceeded: spent_after={spent_after} > cap={cap}"
+    )]
+    BudgetExceeded {
+        session_id: String,
+        cap: u64,
+        spent_after: u64,
+    },
 }
 
 /// The outcome returned by [`Store::publish_program`].
@@ -845,6 +858,12 @@ impl Store {
             let _ = self.record_repair_hint(&attestable, &failed_op_id, &errors);
             return Err(StoreError::TypeError(errors));
         }
+        // #292 slice 3: per-session budget gate. After typecheck
+        // passes, refuse the op if it would push its session's
+        // monotonic spend over the configured cap. Sessions
+        // without an intent_id, or with an intent whose session
+        // has no cap configured, sail through.
+        self.check_session_budget(&op)?;
         let attestable = attestable_stage_ids(&transition);
         let op_effects = op_declared_effects(&op.kind);
         // #262: CAS retry loop. Single-parent ops can be safely
@@ -903,6 +922,46 @@ impl Store {
                 None,
             );
             log.put(&attestation)?;
+        }
+        Ok(())
+    }
+
+    /// Consult `policy.session_budgets` for the op's session
+    /// (resolved via `op.intent_id → Intent.session_id`) and
+    /// refuse if applying would push the session's monotonic spend
+    /// over the configured cap (#292 slice 3).
+    ///
+    /// Ops without an `intent_id`, or whose intent has no
+    /// configured cap, return Ok without any disk read.
+    fn check_session_budget(
+        &self,
+        op: &lex_vcs::Operation,
+    ) -> Result<(), StoreError> {
+        let Some(intent_id) = op.intent_id.as_deref() else { return Ok(()); };
+        let intent_log = lex_vcs::IntentLog::open(self.root())?;
+        let Some(intent) = intent_log.get(&intent_id.to_string())? else {
+            // Dangling intent — treat as "no session" and let it
+            // sail through. Slice 1's ledger already documents
+            // this as graceful-degradation semantics.
+            return Ok(());
+        };
+        let policy = crate::policy::load(self.root())?.unwrap_or_default();
+        let Some(cap) = policy.session_budgets.cap_for(&intent.session_id) else {
+            return Ok(());
+        };
+        // Recompute the session's current spend + the contribution
+        // from this op. Re-running the ledger walk on every gated
+        // op is O(branch history); see #292 slice 1's note about
+        // a future on-disk cache.
+        let current = self.session_budget(&intent.session_id)?;
+        let increment = crate::budget::monotonic_spend_of(&op.kind);
+        let spent_after = current.spent.saturating_add(increment);
+        if spent_after > cap {
+            return Err(StoreError::BudgetExceeded {
+                session_id: intent.session_id,
+                cap,
+                spent_after,
+            });
         }
         Ok(())
     }

@@ -7,6 +7,37 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added — agent-safety (#292, slices 2 + 3)
+
+- **`policy.session_budgets` schema** with `default_cap` and
+  per-session `overrides` (#292 slice 2). An override entry of
+  `Some(n)` sets a session-specific cap; an entry with explicit
+  `null` means unbounded for that session (escape hatch for human
+  interventions). Absent `session_budgets` keeps slice-1 behavior
+  (descriptive ledger only, no enforcement).
+- **`Store::session_budget_cap(session_id)`** resolves the
+  effective cap (per-session override → default_cap → None).
+- **`SessionBudget` envelope** extended with optional `cap` and
+  `remaining` fields. JSON shape stays backward-compatible via
+  `skip_serializing_if = "Option::is_none"`.
+- **`Store::apply_operation_checked` budget gate** (#292 slice 3).
+  After typecheck passes, refuses ops that would push the
+  session's monotonic spend over the configured cap. New
+  `StoreError::BudgetExceeded { session_id, cap, spent_after }`
+  variant. Ops without an `intent_id`, with a dangling intent, or
+  whose session has no cap configured sail through.
+- **HTTP API** maps `BudgetExceeded` to **503 with `Retry-After:
+  0`** and a `{kind: "budget_exceeded", session_id, cap,
+  spent_after}` detail envelope. Unlike Contention (where retry
+  might land later), there's no point retrying as-is — the caller
+  needs to raise the cap, switch sessions, or refactor.
+- **`lex policy session-budget {set-default <N> | set <id> <N> |
+  unbounded <id> | clear <id> | clear-default}`** CLI manages
+  the policy file. Writes are atomic (tempfile + rename).
+- 14 new tests (9 store-gate + 5 CLI-policy).
+
+With slices 1 + 2 + 3 all shipped, **#292 is complete**.
+
 ### Added — agent-safety (#292, slice 1)
 
 - **`Store::session_budget(session_id)`** and

@@ -62,6 +62,50 @@ pub struct PolicyFile {
     /// from a branch head" — branch reachability is always honored.
     #[serde(default, skip_serializing_if = "GcRetention::is_empty")]
     pub gc_retention: GcRetention,
+    /// Per-session budget caps (#292 slices 2 + 3). Absence /
+    /// empty value means "no enforcement; ledger stays
+    /// descriptive (slice 1)." See [`SessionBudgetPolicy`].
+    #[serde(default, skip_serializing_if = "SessionBudgetPolicy::is_empty")]
+    pub session_budgets: SessionBudgetPolicy,
+}
+
+/// Per-session budget caps for the apply-path gate (#292 slices 2
+/// and 3). The `default_cap` field applies to every session not
+/// listed in `overrides`. Within the overrides map, a value of
+/// `Some(n)` sets that session's cap to `n`, and an explicit
+/// `null` means the session is unbounded — the escape hatch for
+/// ops outside the budget envelope, e.g. one-shot human
+/// interventions.
+///
+/// Absence of `session_budgets` keeps current (#292 slice 1)
+/// behavior: spending is recorded but never refused.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionBudgetPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_cap: Option<u64>,
+    /// Per-session overrides. Outer `Option`: presence in the
+    /// map. Inner `Option`: `Some(n)` is a cap of `n`; `None` is
+    /// the explicit "unbounded for this session."
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub overrides: std::collections::BTreeMap<String, Option<u64>>,
+}
+
+impl SessionBudgetPolicy {
+    pub fn is_empty(&self) -> bool {
+        self.default_cap.is_none() && self.overrides.is_empty()
+    }
+
+    /// Resolve the cap for a given session. The lookup is:
+    ///   1. If `overrides` has the session_id, use that entry's
+    ///      value (which itself may be `None` meaning unbounded).
+    ///   2. Otherwise fall back to `default_cap`.
+    ///   3. Return `None` for "no cap; don't enforce."
+    pub fn cap_for(&self, session_id: &str) -> Option<u64> {
+        match self.overrides.get(session_id) {
+            Some(explicit) => *explicit,
+            None => self.default_cap,
+        }
+    }
 }
 
 /// Retention policy for the predicate-driven op-log GC (#261 slice
