@@ -905,7 +905,23 @@ impl<'a> Vm<'a> {
                 Op::FloatEq => self.bin_float(|a, b| Value::Bool(a == b))?,
                 Op::FloatLt => self.bin_float(|a, b| Value::Bool(a < b))?,
                 Op::FloatLe => self.bin_float(|a, b| Value::Bool(a <= b))?,
-                Op::NumAdd => self.bin_num(|a, b| Value::Int(a + b), |a, b| Value::Float(a + b))?,
+                Op::NumAdd => {
+                    // #308: `+` is overloaded — Str+Str concatenates,
+                    // numerics add. Other arithmetic ops (-, *, /, %)
+                    // still reject Str at the type-checker layer.
+                    let b = self.pop()?;
+                    let a = self.pop()?;
+                    match (a, b) {
+                        (Value::Int(x), Value::Int(y)) => self.stack.push(Value::Int(x + y)),
+                        (Value::Float(x), Value::Float(y)) => self.stack.push(Value::Float(x + y)),
+                        (Value::Str(x), Value::Str(y)) => {
+                            let mut s = x;
+                            s.push_str(&y);
+                            self.stack.push(Value::Str(s));
+                        }
+                        (a, b) => return Err(VmError::TypeMismatch(format!("Num op: {a:?} {b:?}"))),
+                    }
+                }
                 Op::NumSub => self.bin_num(|a, b| Value::Int(a - b), |a, b| Value::Float(a - b))?,
                 Op::NumMul => self.bin_num(|a, b| Value::Int(a * b), |a, b| Value::Float(a * b))?,
                 Op::NumDiv => self.bin_num(|a, b| Value::Int(a / b), |a, b| Value::Float(a / b))?,

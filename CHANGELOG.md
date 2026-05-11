@@ -7,6 +7,20 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added
+
+- **#308: `+` operator overloaded for `Str` operands.** Lex already
+  shipped `std.str.concat` and the `Op::StrConcat` bytecode, but
+  the surface-language `+` only accepted `Int | Float`, forcing
+  agents to reach for stdlib calls for the most common operation
+  in code-generation paths. Now `a + b` works uniformly across
+  `Int + Int`, `Float + Float`, and `Str + Str`; the type checker
+  admits all three for `+` while keeping `-/*/%` numeric-only, and
+  the VM dispatches `Op::NumAdd` to string concatenation when both
+  operands resolve to `Str`. No coercion: `Str + Int` still errors
+  with a clear `TypeMismatch` diagnostic. Closes the first of the
+  five agent-UX gaps filed as #304–#308.
+
 ## [0.7.1] — 2026-05-11
 
 Patch release containing a single bug fix that surfaced in CI
