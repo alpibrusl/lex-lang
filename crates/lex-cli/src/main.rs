@@ -320,7 +320,34 @@ fn cmd_check(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let path = path.ok_or_else(|| anyhow!(
         "usage: lex check [--from-canonical] <file>"))?;
     let stages = load_stages(path, from_canonical)?;
-    match lex_types::check_program(&stages) {
+
+    // #306 slice 1: when checking a `.lex` source file (not a
+    // pre-built canonical AST), collect each `fn` declaration's
+    // source position so type errors can be reported as
+    // `file:line:col` instead of bare NodeIds. Skipped under
+    // `--from-canonical` since canonical bytes carry no source span.
+    let positions: Option<std::collections::BTreeMap<String, lex_types::Position>> =
+        if !from_canonical && path != "-" {
+            std::fs::read_to_string(path).ok().and_then(|src| {
+                lex_syntax::parse_source_with_positions(&src).ok().map(|(_, fn_pos)| {
+                    fn_pos.into_iter().map(|(name, byte)| {
+                        let (line, col) = lex_types::byte_to_line_col(&src, byte);
+                        (name, lex_types::Position::new(Some(path.to_string()), line, col))
+                    }).collect()
+                })
+            })
+        } else {
+            None
+        };
+
+    let check_result = match &positions {
+        Some(pos) => lex_types::check_program_with_positions(&stages, pos)
+            .map_err(|errs| errs.into_iter().collect::<Vec<_>>()),
+        None => lex_types::check_program(&stages)
+            .map_err(|errs| errs.into_iter().map(lex_types::PositionedError::from).collect()),
+    };
+
+    match check_result {
         Ok(_) => {
             let summary = effects_summary(&stages);
             let data = serde_json::json!({

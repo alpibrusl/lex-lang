@@ -9,6 +9,25 @@ bumps may carry breaking changes when justified).
 
 ### Added
 
+- **#306 slice 1: position-aware type errors.** LLM repair flows
+  measurably need `file:line:col` on type errors, not bare NodeIds.
+  The `lex_types` crate gains a `Position { file, line, col }`
+  struct, a `PositionedError` wrapper that carries
+  `TypeError + Option<Position>`, and a new
+  `check_program_with_positions(stages, &BTreeMap<fn_name, Position>)`
+  entry point. The parser side gains
+  `parse_source_with_positions` which yields each `fn`
+  declaration's byte-offset start position; the `byte_to_line_col`
+  helper translates that to a 1-based `(line, col)`. The `lex
+  check` CLI wires the two together and now emits `position` on
+  every type error in its JSON envelope. Granularity is function-
+  level for this slice — every error from a given `fn` is stamped
+  with that `fn`'s position; slice 1.5 will plumb per-expression
+  spans through canonicalize so deep-body errors point at the
+  exact sub-expression. The bare `check_program` API keeps its
+  old `Vec<TypeError>` shape so existing callers and tests are
+  unaffected.
+
 - **#308: `+` operator overloaded for `Str` operands.** Lex already
   shipped `std.str.concat` and the `Op::StrConcat` bytecode, but
   the surface-language `+` only accepted `Int | Float`, forcing
