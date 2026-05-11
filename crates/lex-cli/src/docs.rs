@@ -24,12 +24,35 @@ const LEX_DOCS_VERSION: u32 = 1;
 
 pub fn cmd_docs(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let sub = args.first().ok_or_else(|| anyhow!(
-        "usage: lex docs --for-agent [--branch B] [--limit-recent N] [--store DIR]"))?;
+        "usage: lex docs --for-agent [--branch B] [--limit-recent N] [--store DIR]\n\
+         usage: lex docs --rules"))?;
+    if sub == "--rules" {
+        // #306 slice 2: enumerate every type-error rule with its
+        // explanation. Stable kebab-case `rule_tag`s let LLM repair
+        // flows cross-reference rules across runs.
+        let rules: Vec<serde_json::Value> = lex_types::all_rules()
+            .iter()
+            .map(|r| serde_json::json!({
+                "rule_tag": r.tag,
+                "rule_explanation": r.explanation,
+            }))
+            .collect();
+        let data = serde_json::json!({ "rules": rules });
+        acli::emit_or_text("docs", data, fmt, || {
+            println!("Lex type-error rules ({} total):", lex_types::all_rules().len());
+            for r in lex_types::all_rules() {
+                println!();
+                println!("  {}", r.tag);
+                println!("    {}", r.explanation);
+            }
+        });
+        return Ok(());
+    }
     if sub != "--for-agent" {
         // Future subcommands (`lex docs serve`, `lex docs sig X`, …)
         // can land here. For 0.5.0's slice, only `--for-agent`.
         anyhow::bail!(
-            "unknown `lex docs` subcommand `{sub}`. only `--for-agent` is supported today"
+            "unknown `lex docs` subcommand `{sub}`. only `--for-agent` and `--rules` are supported today"
         );
     }
     let mut branch: Option<String> = None;
