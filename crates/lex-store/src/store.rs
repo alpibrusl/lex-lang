@@ -1065,8 +1065,13 @@ impl Store {
     /// (#281). One per candidate stage in the transition. The hint
     /// records the *would-be* op_id (deterministic, content-
     /// addressed even though the op record was never persisted)
-    /// and the structured errors. `suggested_transform` is left
-    /// `None`; the slice-2 LLM-assisted path will populate it.
+    /// and the structured errors.
+    ///
+    /// #306 slice 3: `suggested_transform` is populated from the
+    /// static (rule_tag → likely_transform) table for the *first*
+    /// error in the batch. The LLM-driven `lex repair --apply`
+    /// flow can still overwrite this with a higher-quality
+    /// suggestion; the static value is the floor, not the ceiling.
     ///
     /// Best-effort: a write failure here is swallowed by the
     /// caller (the original `TypeError` is the load-bearing
@@ -1082,6 +1087,14 @@ impl Store {
         }
         let errors_json = serde_json::to_value(errors)
             .map_err(StoreError::Serde)?;
+        // #306 slice 3: look up the static suggested_transform for
+        // the first error's rule_tag. Multiple errors per op are
+        // possible — when they fire in lockstep (e.g. one bad let
+        // binding propagates to several use sites), the first
+        // error's rule_tag is usually the load-bearing one to fix.
+        let suggested_transform = errors
+            .first()
+            .and_then(|e| lex_types::suggested_transform_for(e.rule_tag()));
         let log = self.attestation_log()?;
         for stage_id in stage_ids {
             let attestation = lex_vcs::Attestation::new(
@@ -1093,7 +1106,7 @@ impl Store {
                 lex_vcs::AttestationKind::RepairHint {
                     failed_op_id: failed_op_id.clone(),
                     errors: errors_json.clone(),
-                    suggested_transform: None,
+                    suggested_transform: suggested_transform.clone(),
                 },
                 lex_vcs::AttestationResult::Failed {
                     detail: format!("op {} rejected: {} type error(s)",

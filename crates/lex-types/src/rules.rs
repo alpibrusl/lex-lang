@@ -107,6 +107,87 @@ pub fn all_rules() -> &'static [RuleInfo] {
     ]
 }
 
+/// Static (rule_tag → suggested_transform) table for #306 slice 3.
+///
+/// When `Store::apply_operation_checked` rejects an op for a
+/// `TypeError`, the gate consults this table and pre-populates the
+/// `RepairHint` attestation's `suggested_transform` payload so the
+/// LLM repair flow (or a human reading `lex repair <op>`) has a
+/// concrete starting point. `None` means no static suggestion
+/// exists for this rule; the LLM-driven `lex repair --apply` path
+/// still works.
+///
+/// The returned shape is a JSON object with:
+/// - `kind_hint`: name of the typed transform most likely to fix it
+///   (`"ReplaceMatchArm"`, `"RenameLocal"`, `"InlineLet"`,
+///   `"ChangeEffectSig"`, `"ModifyBody"`).
+/// - `rule_tag`: echo of the rule that fired (for downstream
+///   correlation).
+/// - `summary`: one-sentence direction.
+/// - `details`: longer prose suitable for an LLM repair prompt.
+pub fn suggested_transform_for(rule_tag: &str) -> Option<serde_json::Value> {
+    let (kind_hint, summary, details) = match rule_tag {
+        "type-mismatch" => (
+            "ReplaceMatchArm",
+            "Replace the offending match arm (or expression) so its body produces the expected type.",
+            "When a function body's inferred type doesn't match its signature, the easiest \
+typed-transform fix is `ReplaceMatchArm` — rebuild whichever arm produces the wrong type so it \
+returns the expected one. For non-match expressions, the LLM-driven `lex repair --apply` flow \
+can rewrite the body via `ModifyBody`.",
+        ),
+        "unknown-identifier" => (
+            "RenameLocal",
+            "If the name is a typo, rename a similarly-spelled in-scope binding to match.",
+            "An `unknown-identifier` error is most often a typo. Search the function's lexical \
+scope for a binding whose name is a single edit away and apply `RenameLocal` to switch references. \
+If no nearby name exists, the missing binding probably needs a `let` or an `import` — fall back to \
+LLM-driven repair.",
+        ),
+        "non-exhaustive-match" => (
+            "ReplaceMatchArm",
+            "Add the missing match arms (or a `_` wildcard) covering the unhandled variants.",
+            "Use `ReplaceMatchArm` to append arms for the variants listed in the error's \
+`missing` field. If catching the remainder is intended, a single `_` wildcard arm suffices; \
+otherwise add one explicit arm per missing variant so the audit trail records the new semantics.",
+        ),
+        "effect-not-declared" => (
+            "ChangeEffectSig",
+            "Add the inferred effect to the function's `[effects]` declaration.",
+            "The function body invokes an effect that the signature doesn't declare. Either add \
+the effect to the signature via `ChangeEffectSig` (preferred — the effect is genuinely needed) or \
+remove the call that produces it via `ModifyBody` (preferred when the effect was unintentional).",
+        ),
+        "arity-mismatch" => (
+            "ModifyBody",
+            "Match the call site's argument count to the function's declared arity.",
+            "The number of arguments at the call site doesn't match the declared signature. \
+Add the missing arguments or remove the extras. No typed transform directly applies — \
+use the LLM-driven `lex repair --apply` flow with `ModifyBody` to rewrite the call site.",
+        ),
+        "unknown-field" => (
+            "ModifyBody",
+            "Verify the field spelling and the record type's declaration; rewrite the access.",
+            "The field name isn't part of the record type. Either correct the spelling or add \
+the missing field to the type declaration. Use the LLM-driven `lex repair --apply` flow with \
+`ModifyBody` to rewrite the field access once the correct name is known.",
+        ),
+        "ambiguous-type" => (
+            "ModifyBody",
+            "Add a type annotation at the ambiguous expression to disambiguate inference.",
+            "Inference couldn't pick a single concrete type. Add an explicit type annotation on \
+the offending `let` binding, function parameter, or function return type via `ModifyBody`. The \
+LLM-driven `lex repair --apply` flow can synthesize the annotation from the surrounding context.",
+        ),
+        _ => return None,
+    };
+    Some(serde_json::json!({
+        "kind_hint": kind_hint,
+        "rule_tag": rule_tag,
+        "summary": summary,
+        "details": details,
+    }))
+}
+
 // Constants keyed off the tag so `all_rules` and
 // `explanation_for_tag` produce identical strings without
 // duplicating the prose.
@@ -211,5 +292,47 @@ mod tests {
             let expl = catalog.get(tag).unwrap_or_else(|| panic!("tag `{tag}` not in catalog"));
             assert_eq!(e.rule_explanation(), *expl, "tag/explanation mismatch on {tag}");
         }
+    }
+
+    #[test]
+    fn suggested_transform_covers_at_least_five_rules() {
+        // #306 slice 3 AC: ≥5 rule_tags have a non-None
+        // suggested_transform. Catches accidental removal.
+        let mut covered = 0;
+        for rule in all_rules() {
+            if suggested_transform_for(rule.tag).is_some() {
+                covered += 1;
+            }
+        }
+        assert!(
+            covered >= 5,
+            "suggested_transform must cover ≥5 rule_tags; got {covered}"
+        );
+    }
+
+    #[test]
+    fn suggested_transform_shape_is_consistent() {
+        // Every non-None suggestion must carry the four fields
+        // documented in `suggested_transform_for`.
+        for rule in all_rules() {
+            let Some(s) = suggested_transform_for(rule.tag) else { continue };
+            for field in ["kind_hint", "rule_tag", "summary", "details"] {
+                assert!(
+                    s.get(field).and_then(|v| v.as_str()).is_some_and(|v| !v.is_empty()),
+                    "rule `{}` suggestion missing/empty `{field}`: {s}",
+                    rule.tag
+                );
+            }
+            assert_eq!(
+                s.get("rule_tag").and_then(|v| v.as_str()),
+                Some(rule.tag),
+                "suggestion's rule_tag must echo the input tag"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_rule_tag_returns_none() {
+        assert!(suggested_transform_for("does-not-exist").is_none());
     }
 }

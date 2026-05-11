@@ -76,8 +76,21 @@ fn type_error_emits_repair_hint_attestation() {
     } = &hint.kind else { unreachable!() };
     assert!(!failed_op_id.is_empty(),
         "failed_op_id is the would-be op_id");
-    assert!(suggested_transform.is_none(),
-        "slice 1 leaves the suggestion empty");
+    // #306 slice 3: the static (rule_tag → likely_transform) table
+    // now auto-populates `suggested_transform`. A type-mismatch
+    // error maps to a `ReplaceMatchArm` hint.
+    let s = suggested_transform.as_ref()
+        .expect("slice 3 must auto-populate a suggested_transform");
+    assert_eq!(
+        s.get("rule_tag").and_then(|v| v.as_str()),
+        Some("type-mismatch"),
+        "suggestion echoes the rule_tag: {s}"
+    );
+    assert_eq!(
+        s.get("kind_hint").and_then(|v| v.as_str()),
+        Some("ReplaceMatchArm"),
+        "type-mismatch maps to ReplaceMatchArm: {s}"
+    );
     let arr = errors.as_array().expect("errors is an array");
     assert!(!arr.is_empty(), "TypeError carries at least one entry");
 }
@@ -102,6 +115,51 @@ fn successful_apply_does_not_emit_a_repair_hint() {
         .filter(|a| matches!(a.kind, lex_vcs::AttestationKind::RepairHint { .. }))
         .count();
     assert_eq!(n_hints, 0, "no RepairHint on successful apply");
+}
+
+#[test]
+fn unknown_identifier_yields_rename_local_suggestion() {
+    // #306 slice 3: a different rule_tag must yield a different
+    // suggested_transform. The static table maps
+    // `unknown-identifier` → `RenameLocal` because the most common
+    // cause is a typo on a sibling binding.
+    let (store, _tmp) = fresh();
+    let (_sig, from_stage_id) = publish_initial_pick(&store);
+
+    // Replace arm 0's body with a reference to an undeclared name.
+    let undeclared = CExpr::Var { name: "definitely_not_in_scope".into() };
+    let err = store
+        .apply_replace_match_arm(
+            DEFAULT_BRANCH, &from_stage_id, &NodeId("n_0.2".into()),
+            0, undeclared,
+        )
+        .unwrap_err();
+    assert!(matches!(err, lex_store::StoreError::TypeError(_)));
+
+    let attlog = store.attestation_log().unwrap();
+    let hint = attlog.list_all().unwrap()
+        .into_iter()
+        .find(|a| matches!(a.kind, lex_vcs::AttestationKind::RepairHint { .. }))
+        .expect("at least one RepairHint emitted");
+    let lex_vcs::AttestationKind::RepairHint { suggested_transform, .. } = &hint.kind
+        else { unreachable!() };
+    let s = suggested_transform.as_ref()
+        .expect("suggested_transform auto-populated");
+    assert_eq!(
+        s.get("rule_tag").and_then(|v| v.as_str()),
+        Some("unknown-identifier"),
+        "expected unknown-identifier rule, got: {s}"
+    );
+    assert_eq!(
+        s.get("kind_hint").and_then(|v| v.as_str()),
+        Some("RenameLocal"),
+        "unknown-identifier maps to RenameLocal: {s}"
+    );
+    let details = s.get("details").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        details.len() > 40,
+        "details must be non-trivial prose: {details}"
+    );
 }
 
 #[test]
