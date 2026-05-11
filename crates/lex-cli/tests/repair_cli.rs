@@ -24,19 +24,22 @@ fn repair_with_no_hint_reports_not_found() {
 }
 
 #[test]
-fn repair_apply_without_transform_errors() {
-    // Slice 2a: `--apply` requires `--transform '<json>'`. The
-    // LLM-driven path (no `--transform`) ships in slice 2b.
+fn repair_apply_without_transform_calls_llm_path_and_needs_hint() {
+    // Slice 2b: `--apply` without `--transform` invokes the
+    // LLM path, which still requires a matching RepairHint to
+    // exist. Without a hint, the command errors as in slice 2a
+    // — the LLM call never happens because there's nothing to
+    // repair.
     let tmp = tempfile::tempdir().unwrap();
     let out = Command::new(lex_bin())
         .args(["repair", "fake-op-id", "--apply",
             "--store", tmp.path().to_str().unwrap()])
         .output().unwrap();
     assert!(!out.status.success(),
-        "--apply without --transform should fail");
+        "--apply without a hint should fail");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("requires `--transform"),
-        "expected '--apply requires --transform' message, got: {stderr}");
+    assert!(stderr.contains("no RepairHint exists"),
+        "expected hint-required message, got: {stderr}");
 }
 
 #[test]
