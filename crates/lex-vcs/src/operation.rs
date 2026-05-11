@@ -283,6 +283,53 @@ pub enum OperationKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to_budget: Option<u64>,
     },
+    /// Multi-agent coordination: a stage proposed for a sig
+    /// without advancing the branch (#294). Multiple agents can
+    /// land `Candidate` ops on the same sig concurrently without
+    /// contention — they all chain off the current head and don't
+    /// move it. Used together with [`Self::Promote`] to model
+    /// bake-offs: several agents propose, one is promoted.
+    ///
+    /// The `Operation`'s `intent_id` is expected to be set so
+    /// downstream consumers can distinguish proposals by author.
+    /// (The schema doesn't enforce this; the gate does.)
+    Candidate {
+        sig_id: SigId,
+        stage_id: StageId,
+    },
+    /// Multi-agent coordination: promotes a previously-landed
+    /// [`Self::Candidate`] op as the new head for its sig (#294).
+    /// Carries the list of *other* candidates this Promote
+    /// supersedes so the op log explicitly records the bake-off
+    /// shape.
+    ///
+    /// Acts as a `ModifyBody` (or `AddFunction` when the sig has
+    /// no head) for branch-head purposes — `transition_for_kind`
+    /// returns the appropriate `StageTransition`.
+    Promote {
+        sig_id: SigId,
+        /// Op id of the [`Self::Candidate`] being promoted.
+        winner_candidate: OpId,
+        /// Stage id of the winner (duplicates the candidate's
+        /// `stage_id` for fast lookup; saves a log round-trip
+        /// for `lex op show`).
+        winner_stage_id: StageId,
+        /// Every other live `Candidate` for `sig_id` at the time
+        /// of promotion. Sorted by op_id for canonical-form
+        /// stability. After this `Promote` lands, none of these
+        /// op_ids appear in [`Store::list_candidates`].
+        supersedes: Vec<OpId>,
+        /// Current branch head stage for `sig_id`, or `None` if
+        /// the sig had no head (the Promote is creating it).
+        /// `None` is serialized as missing for canonical stability
+        /// across "first promote on a sig" vs "later promote".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_stage_id: Option<StageId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_budget: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_budget: Option<u64>,
+    },
 }
 
 impl OperationKind {
@@ -310,12 +357,18 @@ impl OperationKind {
             | RenameLocal { sig_id, to_stage_id, .. }
             | InlineLet { sig_id, to_stage_id, .. }
                 => Some((sig_id.clone(), Some(to_stage_id.clone()))),
+            Promote { sig_id, winner_stage_id, .. }
+                => Some((sig_id.clone(), Some(winner_stage_id.clone()))),
             RemoveFunction { sig_id, .. }
             | RemoveType { sig_id, .. }
                 => Some((sig_id.clone(), None)),
             RenameSymbol { to, body_stage_id, .. }
                 => Some((to.clone(), Some(body_stage_id.clone()))),
             AddImport { .. } | RemoveImport { .. } | Merge { .. } => None,
+            // Candidate ops don't advance the branch head; they
+            // don't fit the (sig, Option<stage_id>) head-delta
+            // shape that `merge_target` describes.
+            Candidate { .. } => None,
         }
     }
 
@@ -333,7 +386,8 @@ impl OperationKind {
             | ChangeEffectSig { from_budget, to_budget, .. }
             | ReplaceMatchArm { from_budget, to_budget, .. }
             | RenameLocal { from_budget, to_budget, .. }
-            | InlineLet { from_budget, to_budget, .. } => (*from_budget, *to_budget),
+            | InlineLet { from_budget, to_budget, .. }
+            | Promote { from_budget, to_budget, .. } => (*from_budget, *to_budget),
             _ => (None, None),
         }
     }
@@ -350,7 +404,8 @@ impl OperationKind {
             | ChangeEffectSig { sig_id, .. }
             | ReplaceMatchArm { sig_id, .. }
             | RenameLocal { sig_id, .. }
-            | InlineLet { sig_id, .. } => Some(sig_id),
+            | InlineLet { sig_id, .. }
+            | Promote { sig_id, .. } => Some(sig_id),
             _ => None,
         }
     }

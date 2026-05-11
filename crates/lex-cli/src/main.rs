@@ -2578,6 +2578,9 @@ fn cmd_stage(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                 fmt, &root, &rest[1..], StageDecision::Block),
             "unblock" => return cmd_stage_decision(
                 fmt, &root, &rest[1..], StageDecision::Unblock),
+            // #294: multi-agent coordination.
+            "candidates" => return cmd_stage_candidates(fmt, &root, &rest[1..]),
+            "promote-candidate" => return cmd_stage_promote_candidate(fmt, &root, &rest[1..]),
             _ => {}
         }
     }
@@ -2722,6 +2725,89 @@ fn resolve_actor(
 /// returns every override the human(s) have issued.
 ///
 /// `actor` defaults to `$LEX_TEA_USER`; falling back errors so
+/// `lex stage candidates <sig_id> [--store DIR]` (#294). Lists
+/// every live `Candidate` op for the sig — those not yet
+/// referenced as winner or in `supersedes` by any `Promote`.
+/// Sorted by op_id for reproducibility.
+fn cmd_stage_candidates(
+    fmt: &OutputFormat,
+    root: &std::path::Path,
+    rest: &[String],
+) -> Result<()> {
+    let sig_id = rest.first().ok_or_else(|| anyhow!(
+        "usage: lex stage candidates <sig_id> [--store DIR]"))?;
+    let store = Store::open(root)?;
+    let candidates = store.list_candidates(sig_id)?;
+    let data = serde_json::json!({
+        "sig_id": sig_id,
+        "candidates": &candidates,
+        "count": candidates.len(),
+    });
+    let sig_for_text = sig_id.clone();
+    let printable = candidates.clone();
+    acli::emit_or_text("stage-candidates", data, fmt, move || {
+        if printable.is_empty() {
+            println!("(no live candidates for `{sig_for_text}`)");
+            return;
+        }
+        println!("{} candidate(s) for `{sig_for_text}`:", printable.len());
+        for c in &printable {
+            let intent = c.intent_id.as_deref().unwrap_or("(none)");
+            println!("  op_id={:.16}…  stage_id={:.16}…  intent={:.16}…",
+                c.op_id, c.stage_id, intent);
+        }
+    });
+    Ok(())
+}
+
+/// `lex stage promote-candidate <candidate_op_id> [--branch B]
+/// [--store DIR]` (#294). Emits a `Promote` op advancing the
+/// branch head with the candidate's stage. Every other live
+/// candidate for the same sig is listed in `supersedes` so the
+/// op log explicitly records the bake-off.
+fn cmd_stage_promote_candidate(
+    fmt: &OutputFormat,
+    root: &std::path::Path,
+    rest: &[String],
+) -> Result<()> {
+    let mut op_id: Option<String> = None;
+    let mut branch: Option<String> = None;
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--branch" => {
+                branch = Some(it.next()
+                    .ok_or_else(|| anyhow!("--branch needs a name"))?.clone());
+            }
+            other if !other.starts_with("--") => {
+                if op_id.is_some() {
+                    bail!("usage: lex stage promote-candidate <op_id> [--branch B]");
+                }
+                op_id = Some(other.to_string());
+            }
+            other => bail!("unexpected arg `{other}`"),
+        }
+    }
+    let op_id = op_id.ok_or_else(|| anyhow!(
+        "usage: lex stage promote-candidate <op_id> [--branch B] [--store DIR]"))?;
+    let store = Store::open(root)?;
+    let branch = branch.unwrap_or_else(|| store.current_branch());
+    let new_op_id = store.promote_candidate(&branch, &op_id)?;
+    let data = serde_json::json!({
+        "promoted_candidate": op_id,
+        "new_op_id": new_op_id,
+        "branch": branch,
+    });
+    let candidate_for_text = op_id.clone();
+    let new_id_for_text = new_op_id.clone();
+    let branch_for_text = branch.clone();
+    acli::emit_or_text("stage-promote-candidate", data, fmt, move || {
+        println!("promoted candidate `{candidate_for_text}` on `{branch_for_text}`");
+        println!("  new op_id: {new_id_for_text}");
+    });
+    Ok(())
+}
+
 /// a pin can't land anonymously. When `<store>/users.json`
 /// exists, the resolved name must be in the file (v3d, #172).
 fn cmd_stage_pin(
