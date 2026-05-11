@@ -65,6 +65,17 @@ pub enum Op {
     MakeClosure { fn_id: u32, capture_count: u16 },
     /// Call a closure: pop `arity` args + 1 closure (top of stack), invoke.
     CallClosure { arity: u16, node_id_idx: u32 },
+    /// Parallel map (#305 slice 1). Stack: `[xs, f]` (xs underneath).
+    /// Pops the closure `f` and the list `xs`, applies `f` to each
+    /// element in parallel via OS threads, pushes the result list
+    /// in input order. `node_id_idx` is the originating NodeId for
+    /// trace keying. The pool size is capped by
+    /// `LEX_PAR_MAX_CONCURRENCY` (default = available CPU cores).
+    ///
+    /// Slice 1 limitation: closures invoking effects fail at
+    /// runtime with `VmError::Effect`. The per-thread effect handler
+    /// split is queued as slice 2.
+    ParallelMap { node_id_idx: u32 },
     /// EFFECT_CALL `<effect_kind_const_idx>` `<op_name_const_idx>` `<arity>`.
     /// Pops `arity` args, dispatches to a host effect handler, pushes result.
     /// `node_id_idx` points to a `Const::NodeId` for trace keying.

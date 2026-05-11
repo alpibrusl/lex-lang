@@ -619,6 +619,7 @@ impl<'a> FnCompiler<'a> {
             ("option", "and_then") => self.emit_variant_map(args, "Some", false),
             ("option", "or_else") => self.emit_variant_or_else(args, "None", 0),
             ("list", "map") => self.emit_list_map(args),
+            ("list", "par_map") => self.emit_list_par_map(args),
             ("list", "filter") => self.emit_list_filter(args),
             ("list", "fold") => self.emit_list_fold(args),
             ("map", "fold") => self.emit_map_fold(args, node_id_idx),
@@ -693,6 +694,18 @@ impl<'a> FnCompiler<'a> {
             *off = exit_target - (j_exit as i32 + 1);
         }
         self.emit(Op::LoadLocal(out));
+    }
+
+    /// `list.par_map(xs, f)` (#305 slice 1). Pushes `xs` and `f`,
+    /// then emits a single `Op::ParallelMap` — the VM applies `f`
+    /// to each element on OS-thread tasks, capped by
+    /// `LEX_PAR_MAX_CONCURRENCY`. Returns the result list in input
+    /// order.
+    fn emit_list_par_map(&mut self, args: &[a::CExpr]) {
+        self.compile_expr(&args[0], false);
+        self.compile_expr(&args[1], false);
+        let nid = self.pool.node_id("n_list_par_map");
+        self.emit(Op::ParallelMap { node_id_idx: nid });
     }
 
     /// `list.filter(xs, pred)` — keep elements where pred returns true.

@@ -9,6 +9,33 @@ bumps may carry breaking changes when justified).
 
 ### Added
 
+- **#305 slice 1: `list.par_map` with OS-thread parallelism.**
+  Lex's runtime was fully synchronous; multiple concurrent effect
+  calls or CPU-bound work from a single program had no way to be
+  expressed in parallel. This slice ships `list.par_map(xs, f)` —
+  the bytecode compiler intercepts the call (mirroring `list.map`'s
+  inline emission) and emits a new `Op::ParallelMap`. At runtime
+  the VM partitions `xs` into round-robin buckets across N worker
+  threads (capped by `LEX_PAR_MAX_CONCURRENCY`; default = available
+  CPU cores, max 64), spawns each on `std::thread::scope`, and
+  reassembles results in input order. The type signature mirrors
+  `list.map`'s effect-polymorphic shape so closures with declared
+  effects still type-check.
+
+  Slice 1 limitation: worker threads run with `DenyAllEffects`, so
+  effectful closures fail at runtime with `VmError::Effect`. The
+  per-thread effect-handler split (so closures can call MCP tools
+  / LLMs in parallel) is queued as slice 2. Slice 3 ships
+  streaming primitives (`Stream[T]` + `llm.cloud_stream`).
+
+  Coverage: 5 conformance tests in
+  `crates/lex-runtime/tests/list_par_map.rs` (input-order
+  preservation, empty-list, cap=1, cap < N, effectful-closure
+  rejection). A 6th wall-clock-speedup test is `#[ignore]` because
+  sandboxed CI runners commonly serialize OS threads even when
+  `available_parallelism()` reports multiple cores; run it under
+  real multi-core CI with `--ignored --test-threads=1`.
+
 - **#306 slice 3: auto-populated `suggested_transform` on
   `RepairHint`.** Closes #306. When
   `Store::apply_operation_checked` rejects an op for a `TypeError`,
