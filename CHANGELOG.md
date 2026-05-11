@@ -9,6 +9,20 @@ bumps may carry breaking changes when justified).
 
 ### Added
 
+- **#306 slice 2: rule-tagged type errors + `lex docs --rules`.**
+  Every `TypeError` variant gains a stable `rule_tag(&self) -> &'static str`
+  (kebab-case identifier: `"type-mismatch"`, `"unknown-identifier"`,
+  `"effect-not-declared"`, …) and a `rule_explanation(&self) -> &'static str`
+  (plain-language description of what the rule enforces, suitable to
+  inline in an LLM repair prompt). LLM repair flows that reference the
+  `rule_tag` get measurably better repair attempts because the model can
+  cross-reference the rule across many prior examples. The `PositionedError`
+  JSON envelope now carries both fields alongside the existing `kind` and
+  `position`. New `lex docs --rules` subcommand enumerates the full
+  catalog (12 rules for 0.7.x); the JSON envelope is keyed by
+  `rules: [{ rule_tag, rule_explanation }]` so LSP servers and other
+  agent tooling can ingest it directly.
+
 - **#306 slice 1: position-aware type errors.** LLM repair flows
   measurably need `file:line:col` on type errors, not bare NodeIds.
   The `lex_types` crate gains a `Position { file, line, col }`

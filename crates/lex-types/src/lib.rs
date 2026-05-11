@@ -7,6 +7,7 @@ pub mod unifier;
 pub mod env;
 pub mod error;
 pub mod position;
+pub mod rules;
 pub mod builtins;
 pub mod checker;
 pub mod discharge;
@@ -16,4 +17,5 @@ pub use checker::{
 };
 pub use error::{PositionedError, TypeError};
 pub use position::{byte_to_line_col, Position};
+pub use rules::{all_rules, RuleInfo};
 pub use types::{EffectSet, Prim, Scheme, Ty, TyVarId};
