@@ -107,6 +107,31 @@ fn write_error_response(prefix: &str, err: lex_store::StoreError)
             .with_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap())
             .with_header(Header::from_bytes(&b"Retry-After"[..], &b"1"[..]).unwrap());
     }
+    // #292 slice 3: budget overflow → 503 with `Retry-After: 0`.
+    // Unlike Contention (where a retry might land after another
+    // writer finishes), there's no point retrying a budget-
+    // exceeded op — the caller needs to raise the cap, switch
+    // sessions, or refactor the work. The `Retry-After: 0`
+    // signals "don't bother retrying as-is" while still using
+    // the canonical "service refused" status code.
+    if let lex_store::StoreError::BudgetExceeded { session_id, cap, spent_after } = &err {
+        let body = serde_json::to_vec(&ErrorEnvelope {
+            error: format!(
+                "{prefix}: session `{session_id}` budget exceeded \
+                 (spent_after={spent_after}, cap={cap})"
+            ),
+            detail: Some(serde_json::json!({
+                "kind": "budget_exceeded",
+                "session_id": session_id,
+                "cap": cap,
+                "spent_after": spent_after,
+            })),
+        }).unwrap_or_else(|_| b"{}".to_vec());
+        return Response::from_data(body)
+            .with_status_code(503)
+            .with_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap())
+            .with_header(Header::from_bytes(&b"Retry-After"[..], &b"0"[..]).unwrap());
+    }
     error_response(500, format!("{prefix}: {err}"))
 }
 

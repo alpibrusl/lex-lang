@@ -34,6 +34,11 @@ use std::collections::BTreeMap;
 use crate::store::{Store, StoreError};
 
 /// Rollup of a single session's budget spend.
+///
+/// `cap` and `remaining` are populated from `policy.json`'s
+/// `session_budgets` (#292 slices 2 + 3). When no cap is set
+/// either by per-session override or by `default_cap`, both
+/// fields are `None`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionBudget {
     pub session_id: String,
@@ -42,21 +47,46 @@ pub struct SessionBudget {
     /// How many ops were attributed to this session (only those
     /// that contributed a non-zero increment count).
     pub op_count: usize,
+    /// Resolved cap from `policy.session_budgets`. `None` means
+    /// no enforcement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap: Option<u64>,
+    /// `cap - spent` when `cap` is set. Negative when over.
+    /// `None` when uncapped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining: Option<i64>,
 }
 
 impl Store {
     /// Compute the budget spent by the given `session_id` across
     /// every op currently reachable from any branch head. Returns
-    /// `(spent: 0, op_count: 0)` for unknown sessions.
+    /// `(spent: 0, op_count: 0)` for unknown sessions, with cap
+    /// populated from `policy.session_budgets`.
     pub fn session_budget(&self, session_id: &str) -> Result<SessionBudget, StoreError> {
         let all = self.all_session_budgets()?;
-        Ok(all.into_iter()
-            .find(|b| b.session_id == session_id)
-            .unwrap_or(SessionBudget {
-                session_id: session_id.into(),
-                spent: 0,
-                op_count: 0,
-            }))
+        if let Some(b) = all.into_iter().find(|b| b.session_id == session_id) {
+            return Ok(b);
+        }
+        // Unknown session: zero spend, but the cap (if any) still
+        // applies. Useful for "show me what budget this brand-new
+        // session has" queries.
+        let cap = self.session_budget_cap(session_id)?;
+        let remaining = cap.map(|c| c as i64);
+        Ok(SessionBudget {
+            session_id: session_id.into(),
+            spent: 0,
+            op_count: 0,
+            cap,
+            remaining,
+        })
+    }
+
+    /// Resolve the budget cap configured for `session_id` from
+    /// `policy.json`'s `session_budgets` (#292 slice 2). Returns
+    /// `None` when no enforcement is configured.
+    pub fn session_budget_cap(&self, session_id: &str) -> Result<Option<u64>, StoreError> {
+        let policy = crate::policy::load(self.root())?.unwrap_or_default();
+        Ok(policy.session_budgets.cap_for(session_id))
     }
 
     /// Compute per-session budget rollups across every branch.
@@ -107,12 +137,13 @@ impl Store {
             entry.1 += 1;
         }
 
+        let policy = crate::policy::load(self.root())?.unwrap_or_default();
         let out: Vec<SessionBudget> = buckets
             .into_iter()
-            .map(|(session_id, (spent, op_count))| SessionBudget {
-                session_id,
-                spent,
-                op_count,
+            .map(|(session_id, (spent, op_count))| {
+                let cap = policy.session_budgets.cap_for(&session_id);
+                let remaining = cap.map(|c| (c as i64) - (spent as i64));
+                SessionBudget { session_id, spent, op_count, cap, remaining }
             })
             .collect();
         Ok(out)
@@ -123,6 +154,14 @@ impl Store {
 /// `AddFunction` contributes its full `budget_cost`; modify-shape
 /// ops contribute the delta only when budget *increased*.
 fn monotonic_spend(kind: &lex_vcs::OperationKind) -> u64 {
+    monotonic_spend_of(kind)
+}
+
+/// Crate-public form used by [`crate::Store::apply_operation_checked`]'s
+/// budget gate (#292 slice 3). Same semantics as the private
+/// helper; exposed under a separate name so the test-only
+/// `monotonic_spend` keeps its `#[cfg(test)]`-friendly shape.
+pub(crate) fn monotonic_spend_of(kind: &lex_vcs::OperationKind) -> u64 {
     let (from, to) = kind.budget_delta();
     match (from, to) {
         (None, Some(n)) => n,

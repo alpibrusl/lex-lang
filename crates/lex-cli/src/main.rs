@@ -3191,6 +3191,7 @@ fn cmd_policy(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let sub = args.first().ok_or_else(|| anyhow!(
         "usage: lex policy {{block-producer <name> --reason \"...\" | unblock-producer <name> | \
          require-attestation <kind> [--when-effects e1,e2,...] | unrequire-attestation <kind> | \
+         session-budget {{set-default <N> | set <id> <N> | unbounded <id> | clear <id> | clear-default}} | \
          list | show}} [--store DIR]"
     ))?;
     let rest = &args[1..];
@@ -3199,11 +3200,74 @@ fn cmd_policy(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "unblock-producer"      => cmd_policy_unblock(fmt, rest),
         "require-attestation"   => cmd_policy_require_attestation(fmt, rest),
         "unrequire-attestation" => cmd_policy_unrequire_attestation(fmt, rest),
+        "session-budget"        => cmd_policy_session_budget(fmt, rest),
         // `show` is the new name; `list` is kept as an alias for the
         // pre-#245 muscle memory.
         "list" | "show"         => cmd_policy_show(fmt, rest),
         other => bail!("unknown `lex policy` subcommand: {other}"),
     }
+}
+
+/// `lex policy session-budget <subcmd>` — manage
+/// `policy.session_budgets` (#292 slices 2 + 3).
+fn cmd_policy_session_budget(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let sub = args.first().ok_or_else(|| anyhow!(
+        "usage: lex policy session-budget {{set-default <N> | set <id> <N> | \
+         unbounded <id> | clear <id> | clear-default}} [--store DIR]"
+    ))?;
+    let (root, rest, _, _) = parse_store_flag(&args[1..]);
+    let mut policy = lex_store::policy::load(&root)
+        .map_err(|e| anyhow!("loading policy.json: {e}"))?
+        .unwrap_or_default();
+    let action;
+    match sub.as_str() {
+        "set-default" => {
+            let n: u64 = rest.first().ok_or_else(|| anyhow!(
+                "usage: lex policy session-budget set-default <N>"))?
+                .parse().map_err(|e| anyhow!("invalid N: {e}"))?;
+            policy.session_budgets.default_cap = Some(n);
+            action = format!("set default_cap to {n}");
+        }
+        "set" => {
+            let id = rest.first().ok_or_else(|| anyhow!(
+                "usage: lex policy session-budget set <session_id> <N>"))?
+                .clone();
+            let n: u64 = rest.get(1).ok_or_else(|| anyhow!(
+                "usage: lex policy session-budget set <session_id> <N>"))?
+                .parse().map_err(|e| anyhow!("invalid N: {e}"))?;
+            policy.session_budgets.overrides.insert(id.clone(), Some(n));
+            action = format!("set override `{id}` to {n}");
+        }
+        "unbounded" => {
+            let id = rest.first().ok_or_else(|| anyhow!(
+                "usage: lex policy session-budget unbounded <session_id>"))?
+                .clone();
+            policy.session_budgets.overrides.insert(id.clone(), None);
+            action = format!("set override `{id}` to unbounded");
+        }
+        "clear" => {
+            let id = rest.first().ok_or_else(|| anyhow!(
+                "usage: lex policy session-budget clear <session_id>"))?;
+            policy.session_budgets.overrides.remove(id);
+            action = format!("cleared override `{id}`");
+        }
+        "clear-default" => {
+            policy.session_budgets.default_cap = None;
+            action = "cleared default_cap".into();
+        }
+        other => bail!("unknown `session-budget` subcommand: {other}"),
+    }
+    lex_store::policy::save(&root, &policy)
+        .map_err(|e| anyhow!("writing policy.json: {e}"))?;
+    let action_for_text = action.clone();
+    let data = serde_json::json!({
+        "action": action,
+        "session_budgets": serde_json::to_value(&policy.session_budgets)?,
+    });
+    acli::emit_or_text("policy", data, fmt, move || {
+        println!("policy.session_budgets: {action_for_text}");
+    });
+    Ok(())
 }
 
 fn cmd_policy_block(fmt: &OutputFormat, args: &[String]) -> Result<()> {

@@ -652,10 +652,18 @@ fn cmd_audit_budget_by_session(
         // Pad with a zero entry if the session wasn't found so the
         // envelope's shape stays predictable for tooling.
         if rollups.is_empty() {
+            // Pad with a zero entry; resolve any configured cap so
+            // the envelope shows the budget envelope this session
+            // would be subject to once it lands its first op.
+            let cap = store.session_budget_cap(filter)
+                .map_err(|e| anyhow!("reading session-budget cap: {e}"))?;
+            let remaining = cap.map(|c| c as i64);
             rollups.push(lex_store::SessionBudget {
                 session_id: filter.clone(),
                 spent: 0,
                 op_count: 0,
+                cap,
+                remaining,
             });
         }
     }
@@ -665,6 +673,8 @@ fn cmd_audit_budget_by_session(
             "session_id": b.session_id,
             "spent": b.spent,
             "op_count": b.op_count,
+            "cap": b.cap,
+            "remaining": b.remaining,
         })
     }).collect();
     let total_spent: u64 = rollups.iter().map(|b| b.spent).sum();
