@@ -304,6 +304,80 @@ fn const_str(constants: &[Const], idx: u32) -> String {
     }
 }
 
+/// Read `LEX_PAR_MAX_CONCURRENCY` (default = available CPU cores,
+/// fallback 4). Capped at 64 so a malformed env var can't spawn an
+/// unreasonable number of OS threads.
+fn par_max_concurrency() -> usize {
+    let from_env = std::env::var("LEX_PAR_MAX_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0);
+    let default = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    from_env.unwrap_or(default).min(64)
+}
+
+/// `list.par_map`'s runtime: spawn OS threads (capped by
+/// `LEX_PAR_MAX_CONCURRENCY`), apply `closure` to each item, return
+/// results in input order. Each worker runs a fresh `Vm` with
+/// [`DenyAllEffects`] for #305 slice 1 — effectful closures fail
+/// with `VmError::Effect`. Slice 2 will plumb a per-thread effect
+/// handler split.
+fn par_map_run<'a>(
+    program: &'a Program,
+    closure: Value,
+    items: Vec<Value>,
+) -> Result<Vec<Value>, VmError> {
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    let max = par_max_concurrency().max(1);
+    // Carve items into `max` round-robin buckets so each worker
+    // processes (indices, items) pairs and we can reassemble in
+    // input order.
+    let n_workers = max.min(items.len());
+    let mut buckets: Vec<Vec<(usize, Value)>> = (0..n_workers).map(|_| Vec::new()).collect();
+    for (i, v) in items.into_iter().enumerate() {
+        buckets[i % n_workers].push((i, v));
+    }
+    let n_total: usize = buckets.iter().map(|b| b.len()).sum();
+    let results: std::sync::Mutex<Vec<Option<Result<Value, String>>>> =
+        std::sync::Mutex::new((0..n_total).map(|_| None).collect());
+
+    std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(buckets.len());
+        for bucket in buckets {
+            let closure = closure.clone();
+            let results = &results;
+            handles.push(s.spawn(move || {
+                let handler: Box<dyn EffectHandler + 'a> = Box::new(DenyAllEffects);
+                let mut vm = Vm::with_handler(program, handler);
+                for (idx, item) in bucket {
+                    let r = vm
+                        .invoke_closure_value(closure.clone(), vec![item])
+                        .map_err(|e| format!("{e:?}"));
+                    results.lock().unwrap()[idx] = Some(r);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().map_err(|_| ()).ok();
+        }
+    });
+
+    let mut out = Vec::with_capacity(n_total);
+    let inner = results.into_inner().unwrap();
+    for r in inner {
+        match r {
+            Some(Ok(v)) => out.push(v),
+            Some(Err(e)) => return Err(VmError::Effect(format!("par_map worker: {e}"))),
+            None => return Err(VmError::Panic("par_map worker did not produce a result".into())),
+        }
+    }
+    Ok(out)
+}
+
 impl<'a> Vm<'a> {
     pub fn new(program: &'a Program) -> Self {
         Self::with_handler(program, Box::new(DenyAllEffects))
@@ -689,6 +763,27 @@ impl<'a> Vm<'a> {
                         // Direct Op::Call is the v1 surface.
                         memo_key: None,
                     })?;
+                }
+                Op::ParallelMap { node_id_idx: _ } => {
+                    // #305 slice 1: pop (xs, f) and apply f to each
+                    // element across OS threads. Slice 1 limitation:
+                    // closures invoking effects get DenyAllEffects in
+                    // the worker, so an effectful body fails with
+                    // VmError::Effect. Effectful par_map is queued as
+                    // slice 2 (per-thread effect-handler split).
+                    let f = self.pop()?;
+                    let xs = self.pop()?;
+                    let items = match xs {
+                        Value::List(v) => v,
+                        other => return Err(VmError::TypeMismatch(
+                            format!("ParallelMap requires a List, got: {other:?}"))),
+                    };
+                    if !matches!(f, Value::Closure { .. }) {
+                        return Err(VmError::TypeMismatch(
+                            format!("ParallelMap requires a closure, got: {f:?}")));
+                    }
+                    let results = par_map_run(self.program, f, items)?;
+                    self.stack.push(Value::List(results));
                 }
                 Op::Call { fn_id, arity, node_id_idx } => {
                     let mut args: Vec<Value> = (0..arity).map(|_| Value::Unit).collect();

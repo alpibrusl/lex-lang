@@ -185,6 +185,21 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::open_var(2),
                 Ty::List(Box::new(Ty::Var(1))),
             ));
+            // #305 slice 1: parallel map. Same signature shape as
+            // `map`; the runtime spawns OS threads (capped by
+            // LEX_PAR_MAX_CONCURRENCY) to apply the closure
+            // concurrently. Effect row stays open so a closure with
+            // declared effects still type-checks against
+            // par_map — though slice 1's runtime currently refuses
+            // effectful closures at execution (queued as slice 2).
+            fields.insert("par_map".into(), Ty::function(
+                vec![
+                    Ty::List(Box::new(Ty::Var(0))),
+                    Ty::function(vec![Ty::Var(0)], EffectSet::open_var(7), Ty::Var(1)),
+                ],
+                EffectSet::open_var(7),
+                Ty::List(Box::new(Ty::Var(1))),
+            ));
             fields.insert("filter".into(), Ty::function(
                 vec![
                     Ty::List(Box::new(Ty::Var(0))),
