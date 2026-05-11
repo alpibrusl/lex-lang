@@ -858,6 +858,12 @@ fn kind_short(k: &AttestationKind) -> String {
         AttestationKind::RepairAttempt { hint_id, outcome, .. } => {
             format!("RepairAttempt({outcome}, {hint_id:.12}…)")
         }
+        AttestationKind::ProducerTrust { tool_id, score_thousandths, .. } => {
+            format!("ProducerTrust({tool_id}, {:.3})", *score_thousandths as f64 / 1000.0)
+        }
+        AttestationKind::TrustWaived { producer, kind_tag, .. } => {
+            format!("TrustWaived({producer}/{kind_tag})")
+        }
     }
 }
 

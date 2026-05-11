@@ -7,6 +7,38 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added — agent-trust (#293)
+
+- **`AttestationKind::ProducerTrust { tool_id,
+  score_thousandths, evidence, granted_by }`** — positive trust
+  signal complementing #248's `ProducerBlock`. Score is stored as
+  `u32` thousandths (`0..=1000`, representing 0.0..1.0) because
+  `AttestationKind` derives `Eq` for content-addressed hashing,
+  which `f64` doesn't implement. Derivation method: `passed /
+  (passed + failed + inconclusive)` over the producer's most-
+  recent `window` attestations.
+- **`AttestationKind::TrustWaived { producer, score_thousandths,
+  threshold_thousandths, kind_tag }`** — audit signal recording
+  that the `required_attestations` gate skipped a rule because a
+  trusted producer's score exceeded the rule's threshold.
+- **`policy.required_attestations[].skip_if_producer_trust_thousandths_above`**
+  (`Option<u32>`, default `None`). When set, the gate consults
+  the maximum live trust score across all non-blocked producers;
+  if it exceeds the threshold, the rule is waived and a
+  `TrustWaived` attestation lands for the audit trail.
+- **`Store::recompute_producer_trust(tool_id, window, granted_by)`**
+  walks the attestation log filtered by `produced_by.tool`,
+  scores `passed/total` over the last `window` records, and
+  emits a fresh `ProducerTrust` attestation. Refuses to grant
+  trust to a tool with an active `ProducerBlock` (hard veto).
+  Self-referential trust attestations are excluded from the
+  evidence corpus so re-running the recompute is stable.
+- **`lex producer-trust recompute --tool <id> [--window N]
+  [--granted-by ACTOR] [--store DIR]`** CLI runs the recompute
+  and emits the resulting attestation_id. JSON envelope reports
+  `{tool, window, granted_by, attestation_id, ok}`.
+- 11 conformance tests (8 store-gate + 3 CLI).
+
 ### Added — agent-feedback (#281, slice 2b)
 
 - **`lex repair <op_id> --apply`** (no `--transform`) now invokes
