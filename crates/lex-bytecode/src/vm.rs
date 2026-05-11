@@ -56,6 +56,25 @@ pub trait EffectHandler {
     fn note_call_budget(&mut self, _budget_cost: u64) -> Result<(), String> {
         Ok(())
     }
+
+    /// `list.par_map` worker-handler factory (#305 slice 2).
+    ///
+    /// Each parallel worker thread runs its own `Vm` and therefore
+    /// needs its own effect handler. The parent handler may opt in
+    /// to per-worker dispatch by returning `Some(handler)` here;
+    /// returning `None` (the default) keeps slice-1 behavior: the
+    /// worker runs `DenyAllEffects` and any effect call inside the
+    /// closure fails with `VmError::Effect`.
+    ///
+    /// The returned handler must be `Send` so the worker can take
+    /// ownership across a thread boundary. Shared state (budget
+    /// pool, chat registry, etc.) is wired up by the implementer.
+    /// Per-worker independence (MCP client cache, output sink)
+    /// is intentional — the alternative is mutex-serialization of
+    /// the whole effect dispatch, which would defeat the parallelism.
+    fn spawn_for_worker(&self) -> Option<Box<dyn EffectHandler + Send>> {
+        None
+    }
 }
 
 /// `Vm` exposes itself as a `ClosureCaller` so the parser interpreter
@@ -328,15 +347,15 @@ fn par_map_run<'a>(
     program: &'a Program,
     closure: Value,
     items: Vec<Value>,
+    worker_handlers: Vec<Box<dyn EffectHandler + Send>>,
 ) -> Result<Vec<Value>, VmError> {
     if items.is_empty() {
         return Ok(Vec::new());
     }
-    let max = par_max_concurrency().max(1);
-    // Carve items into `max` round-robin buckets so each worker
-    // processes (indices, items) pairs and we can reassemble in
-    // input order.
-    let n_workers = max.min(items.len());
+    let n_workers = worker_handlers.len().min(items.len()).max(1);
+    // Carve items into `n_workers` round-robin buckets so each
+    // worker processes (indices, items) pairs and we can reassemble
+    // in input order.
     let mut buckets: Vec<Vec<(usize, Value)>> = (0..n_workers).map(|_| Vec::new()).collect();
     for (i, v) in items.into_iter().enumerate() {
         buckets[i % n_workers].push((i, v));
@@ -345,14 +364,26 @@ fn par_map_run<'a>(
     let results: std::sync::Mutex<Vec<Option<Result<Value, String>>>> =
         std::sync::Mutex::new((0..n_total).map(|_| None).collect());
 
+    // Pair each bucket with its pre-built handler so workers own
+    // their handler outright — no shared mutable state across
+    // worker threads.
+    let mut worker_handlers = worker_handlers;
+    worker_handlers.truncate(n_workers);
+    type Pair = (Vec<(usize, Value)>, Box<dyn EffectHandler + Send>);
+    let pairs: Vec<Pair> = buckets.into_iter().zip(worker_handlers).collect();
+
     std::thread::scope(|s| {
-        let mut handles = Vec::with_capacity(buckets.len());
-        for bucket in buckets {
+        let mut handles = Vec::with_capacity(pairs.len());
+        for (bucket, handler) in pairs {
             let closure = closure.clone();
             let results = &results;
             handles.push(s.spawn(move || {
-                let handler: Box<dyn EffectHandler + 'a> = Box::new(DenyAllEffects);
-                let mut vm = Vm::with_handler(program, handler);
+                // `Box<dyn EffectHandler + Send>` has implicit
+                // `+ 'static`; that coerces to `+ 'a` because
+                // `'static` outlives any `'a`. The `Send` bound is
+                // auto-erased on the unsize coercion.
+                let handler_for_vm: Box<dyn EffectHandler + 'a> = handler;
+                let mut vm = Vm::with_handler(program, handler_for_vm);
                 for (idx, item) in bucket {
                     let r = vm
                         .invoke_closure_value(closure.clone(), vec![item])
@@ -766,11 +797,15 @@ impl<'a> Vm<'a> {
                 }
                 Op::ParallelMap { node_id_idx: _ } => {
                     // #305 slice 1: pop (xs, f) and apply f to each
-                    // element across OS threads. Slice 1 limitation:
-                    // closures invoking effects get DenyAllEffects in
-                    // the worker, so an effectful body fails with
-                    // VmError::Effect. Effectful par_map is queued as
-                    // slice 2 (per-thread effect-handler split).
+                    // element across OS threads.
+                    //
+                    // #305 slice 2: each worker now asks the parent
+                    // handler for a thread-safe per-worker handler via
+                    // `EffectHandler::spawn_for_worker`. Handlers that
+                    // opt in (e.g. `DefaultHandler`) yield a fresh
+                    // instance sharing the budget pool; handlers that
+                    // don't fall back to the slice-1 behavior of
+                    // `DenyAllEffects` in the worker.
                     let f = self.pop()?;
                     let xs = self.pop()?;
                     let items = match xs {
@@ -782,7 +817,23 @@ impl<'a> Vm<'a> {
                         return Err(VmError::TypeMismatch(
                             format!("ParallelMap requires a closure, got: {f:?}")));
                     }
-                    let results = par_map_run(self.program, f, items)?;
+                    // Pre-build one handler per worker on the main
+                    // thread so the worker just owns its handler with
+                    // no shared borrowing. The actual worker count is
+                    // capped by `LEX_PAR_MAX_CONCURRENCY` (resolved
+                    // inside par_map_run); cap ≤ items.len() so we
+                    // never over-allocate handlers.
+                    let n_workers = par_max_concurrency().max(1).min(items.len().max(1));
+                    let mut worker_handlers: Vec<Box<dyn EffectHandler + Send>> =
+                        Vec::with_capacity(n_workers);
+                    for _ in 0..n_workers {
+                        worker_handlers.push(
+                            self.handler
+                                .spawn_for_worker()
+                                .unwrap_or_else(|| Box::new(DenyAllEffects)),
+                        );
+                    }
+                    let results = par_map_run(self.program, f, items, worker_handlers)?;
                     self.stack.push(Value::List(results));
                 }
                 Op::Call { fn_id, arity, node_id_idx } => {

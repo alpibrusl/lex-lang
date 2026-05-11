@@ -1110,6 +1110,40 @@ impl EffectHandler for DefaultHandler {
             other => Err(format!("unsupported effect {}.{}", other.0, other.1)),
         }
     }
+
+    /// `list.par_map` worker-handler factory (#305 slice 2).
+    ///
+    /// Builds a fresh `DefaultHandler` per worker that shares the
+    /// budget pool with the parent (`Arc<AtomicU64>`) so a parallel
+    /// batch can't escape the run-wide budget ceiling. Other state
+    /// is intentionally split per-worker:
+    ///
+    /// - `sink`: a `StdoutSink` per worker. Tests that capture
+    ///   output via a `SharedSink` wrapped in `Arc<Mutex<…>>` see
+    ///   each worker as a fresh handler. Print interleaving on
+    ///   stdout is acceptable; tests that need ordered capture run
+    ///   workloads serially anyway.
+    /// - `mcp_clients`: a fresh per-worker LRU cache. The parent's
+    ///   subprocess handles can't be shared across threads without
+    ///   mutex-serialising every MCP call, which would defeat the
+    ///   parallelism. Cache hit rate is sub-optimal across the
+    ///   first call per worker; warmed caches still amortise within
+    ///   a worker.
+    /// - `chat_registry`: cloned `Arc<ChatRegistry>` so all workers
+    ///   route into the same chat dispatch layer.
+    /// - `program`: cloned `Arc<Program>` so `net.serve` (if a
+    ///   worker invokes it) sees the same compiled program.
+    fn spawn_for_worker(&self) -> Option<Box<dyn lex_bytecode::vm::EffectHandler + Send>> {
+        let mut fresh = DefaultHandler::new(self.policy.clone());
+        // Share the budget pool atomically — slice 2's correctness
+        // contract: parallel work counts against the same ceiling.
+        fresh.budget_remaining = std::sync::Arc::clone(&self.budget_remaining);
+        fresh.budget_ceiling = self.budget_ceiling;
+        fresh.read_root = self.read_root.clone();
+        fresh.program = self.program.clone();
+        fresh.chat_registry = self.chat_registry.clone();
+        Some(Box::new(fresh))
+    }
 }
 
 /// Blocks the calling thread, accepts incoming HTTP requests on
