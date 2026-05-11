@@ -1,5 +1,6 @@
 //! Structured type errors per spec §6.7.
 
+use crate::position::Position;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,3 +111,51 @@ impl std::fmt::Display for TypeError {
 }
 
 impl std::error::Error for TypeError {}
+
+/// `TypeError` enriched with an optional source `Position` (#306
+/// slice 1). `lex_types::check_program_with_positions` returns a
+/// `Vec<PositionedError>`; the bare `check_program` keeps the old
+/// `Vec<TypeError>` shape for backwards compatibility.
+///
+/// Serializes as a flat JSON object: the wrapped error's fields
+/// (`kind`, `at_node`, `expected`, …) plus a `position` field
+/// when one was attached. Consumers can downcast via the `error`
+/// field or pattern-match on the `kind` tag in the JSON.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PositionedError {
+    #[serde(flatten)]
+    pub error: TypeError,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub position: Option<Position>,
+}
+
+impl PositionedError {
+    pub fn new(error: TypeError, position: Option<Position>) -> Self {
+        Self { error, position }
+    }
+
+    pub fn without_position(error: TypeError) -> Self {
+        Self { error, position: None }
+    }
+
+    pub fn node(&self) -> &str {
+        self.error.node()
+    }
+}
+
+impl std::fmt::Display for PositionedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match &self.position {
+            Some(p) => write!(f, "[{}] {}", p.render(), self.error),
+            None => self.error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for PositionedError {}
+
+impl From<TypeError> for PositionedError {
+    fn from(e: TypeError) -> Self {
+        Self::without_position(e)
+    }
+}

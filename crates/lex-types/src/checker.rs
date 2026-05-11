@@ -3,12 +3,13 @@
 
 use crate::builtins::{module_for_import, module_scope};
 use crate::env::{TypeDefKind, TypeEnv, ty_from_canon};
-use crate::error::TypeError;
+use crate::error::{PositionedError, TypeError};
+use crate::position::Position;
 use crate::types::*;
 use crate::unifier::{UnifyError, Unifier};
 use indexmap::IndexMap;
 use lex_ast as a;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Result of checking a whole program.
 pub struct ProgramTypes {
@@ -25,9 +26,43 @@ pub struct ProgramTypes {
     pub parse_required_fields: HashMap<usize, Vec<String>>,
 }
 
+/// Variant of [`check_program`] that stamps a source [`Position`]
+/// onto every emitted error (#306 slice 1).
+///
+/// `positions` is keyed by function name and supplies the position
+/// of each `fn` declaration in the source. Errors from a given
+/// function are tagged with that function's position; errors that
+/// don't map to a single function (e.g. type-decl-level errors)
+/// keep `position = None`.
+///
+/// Slice 1 ships function-level granularity. Slice 1.5 will plumb
+/// per-expression spans through canonicalize so deep-body errors
+/// land on the offending sub-expression rather than its enclosing
+/// function.
+pub fn check_program_with_positions(
+    stages: &[a::Stage],
+    positions: &BTreeMap<String, Position>,
+) -> Result<ProgramTypes, Vec<PositionedError>> {
+    check_program_inner(stages, Some(positions))
+        .map_err(|errs| errs.into_iter().map(|(e, fn_name)| {
+            let pos = fn_name.as_deref().and_then(|n| positions.get(n)).cloned();
+            PositionedError::new(e, pos)
+        }).collect())
+}
+
 pub fn check_program(stages: &[a::Stage]) -> Result<ProgramTypes, Vec<TypeError>> {
+    check_program_inner(stages, None)
+        .map_err(|errs| errs.into_iter().map(|(e, _)| e).collect())
+}
+
+fn check_program_inner(
+    stages: &[a::Stage],
+    _positions: Option<&BTreeMap<String, Position>>,
+) -> Result<ProgramTypes, Vec<(TypeError, Option<String>)>> {
     let mut tcx = Checker::new();
-    let mut errors = Vec::new();
+    // Each entry is (error, optional fn name the error came from)
+    // so callers can resolve the error to a source position.
+    let mut errors: Vec<(TypeError, Option<String>)> = Vec::new();
 
     // Pass 1: gather imports → bring module values into scope.
     for stage in stages {
@@ -52,10 +87,10 @@ pub fn check_program(stages: &[a::Stage]) -> Result<ProgramTypes, Vec<TypeError>
     for stage in stages {
         if let a::Stage::TypeDecl(td) = stage {
             if let Err(e) = tcx.type_env.add_user_type(&td.name, td.clone()) {
-                errors.push(TypeError::RecursiveTypeWithoutConstructor {
+                errors.push((TypeError::RecursiveTypeWithoutConstructor {
                     at_node: "n_0".into(),
                     name: e,
-                });
+                }, None));
             }
         }
     }
@@ -72,13 +107,18 @@ pub fn check_program(stages: &[a::Stage]) -> Result<ProgramTypes, Vec<TypeError>
         }
     }
 
-    // Pass 4: check each fn body.
+    // Pass 4: check each fn body. With #306 slice 1, every emitted
+    // error is paired with the source fn it came from so the public
+    // [`check_program_with_positions`] wrapper can stamp the
+    // function's source position onto a [`PositionedError`].
     let mut signatures = IndexMap::new();
     for stage in stages {
         if let a::Stage::FnDecl(fd) = stage {
             match tcx.check_fn(fd) {
                 Ok(scheme) => { signatures.insert(fd.name.clone(), scheme); }
-                Err(es) => errors.extend(es),
+                Err(es) => {
+                    errors.extend(es.into_iter().map(|e| (e, Some(fd.name.clone()))));
+                }
             }
         }
     }
