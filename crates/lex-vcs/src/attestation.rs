@@ -251,6 +251,50 @@ pub enum AttestationKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         applied_op_id: Option<super::operation::OpId>,
     },
+    /// Positive trust signal for a producer (#293). Complement to
+    /// [`Self::ProducerBlock`]. Computed from a producer's recent
+    /// history of (passed, failed, inconclusive) attestations;
+    /// not manually set. `score_thousandths` is in `[0, 1000]`
+    /// (representing `0.0 .. 1.0`); fixed-point because
+    /// `AttestationKind` is `Eq` for content-addressed hashing,
+    /// which `f64` doesn't implement. Consumers (the
+    /// `required_attestations` gate) may waive a requirement
+    /// when the latest score for a tool exceeds a configured
+    /// threshold in `policy.required_attestations[].skip_if_producer_trust_thousandths_above`.
+    ///
+    /// Refuses to grant trust to a tool with an active
+    /// `ProducerBlock` (the hard veto wins).
+    ///
+    /// Stored under `stage_id == tool_id` so the by-stage index
+    /// doubles as a per-tool lookup — same trick `ProducerBlock`
+    /// uses.
+    ProducerTrust {
+        tool_id: String,
+        /// Score × 1000, clamped to `[0, 1000]`. Derived from
+        /// `passed / (passed + failed + inconclusive)` over the
+        /// last `window` attestations from this tool.
+        score_thousandths: u32,
+        /// Free-form reference to the evidence corpus the score
+        /// was derived from — e.g. "window=1000 as of <head_op>".
+        evidence: String,
+        granted_by: String,
+    },
+    /// Records that the `required_attestations` gate waived a
+    /// requirement because the producer's `ProducerTrust` score
+    /// exceeded the configured threshold (#293). Audit signal —
+    /// not load-bearing for gate decisions, but ensures every
+    /// skip is recoverable from the attestation log.
+    TrustWaived {
+        /// Tool whose trust score caused the waiver.
+        producer: String,
+        /// Latest score (× 1000) consulted at gate time.
+        score_thousandths: u32,
+        /// Threshold (× 1000) from the policy rule.
+        threshold_thousandths: u32,
+        /// Which required-attestation kind tag was skipped
+        /// (e.g. `spec`, `type_check`).
+        kind_tag: String,
+    },
 }
 
 /// Walk a tool's `ProducerBlock` / `ProducerUnblock` attestations

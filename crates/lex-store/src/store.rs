@@ -886,6 +886,89 @@ impl Store {
     /// blame --with-evidence`, `GET /v1/stage/<id>/attestations` —
     /// can read what the store gate emitted without round-tripping
     /// through this crate's API surface.
+    /// Recompute a producer's trust score from its recent
+    /// attestation history and emit a fresh `ProducerTrust`
+    /// attestation (#293). Score = `passed / (passed + failed
+    /// + inconclusive)` over the last `window` attestations
+    /// produced by `tool_id`, expressed in thousandths
+    /// (`0..=1000`).
+    ///
+    /// Refuses to grant trust when the tool has an active
+    /// `ProducerBlock` — the block wins as a hard veto. Returns
+    /// `Ok(None)` for "no attestations to score" (a brand-new
+    /// producer); the caller can choose how to handle it
+    /// (typically: skip the publish until evidence accrues).
+    ///
+    /// `granted_by` is the identity of the actor running the
+    /// recompute (typically the human admin, or "lex-ci-bot"
+    /// for an automated nightly).
+    pub fn recompute_producer_trust(
+        &self,
+        tool_id: &str,
+        window: usize,
+        granted_by: &str,
+    ) -> Result<Option<lex_vcs::AttestationId>, StoreError> {
+        let log = self.attestation_log()?;
+        let all = log.list_all()?;
+        // Hard veto: don't grant trust to a blocked tool.
+        if lex_vcs::active_producer_block(&all, tool_id).is_some() {
+            return Err(StoreError::InvalidTransition(format!(
+                "cannot recompute trust for `{tool_id}` — \
+                 producer is currently blocked"
+            )));
+        }
+        // Filter to attestations from this tool, newest-first by
+        // timestamp, then take the window.
+        let mut from_tool: Vec<&lex_vcs::Attestation> = all.iter()
+            .filter(|a| a.produced_by.tool == tool_id)
+            // Ignore self-referential trust attestations (we're
+            // scoring evidence, not previous trust statements).
+            .filter(|a| !matches!(a.kind,
+                lex_vcs::AttestationKind::ProducerTrust { .. }
+                | lex_vcs::AttestationKind::TrustWaived { .. }))
+            .collect();
+        from_tool.sort_by_key(|a| std::cmp::Reverse(a.timestamp));
+        from_tool.truncate(window);
+        if from_tool.is_empty() {
+            return Ok(None);
+        }
+        let (mut passed, mut total) = (0u64, 0u64);
+        for a in &from_tool {
+            total += 1;
+            if matches!(a.result, lex_vcs::AttestationResult::Passed) {
+                passed += 1;
+            }
+        }
+        let score = if total == 0 {
+            0
+        } else {
+            let raw = (passed as f64) * 1000.0 / (total as f64);
+            raw.round().clamp(0.0, 1000.0) as u32
+        };
+        let head_op = self.list_branches()?
+            .into_iter()
+            .find_map(|b| self.get_branch(&b).ok().flatten().and_then(|x| x.head_op))
+            .unwrap_or_else(|| "fresh".into());
+        let evidence = format!("window={window}, sample={}, head_op={head_op:.16}", from_tool.len());
+        let attestation = lex_vcs::Attestation::new(
+            tool_id.to_string(),
+            None,
+            None,
+            lex_vcs::AttestationKind::ProducerTrust {
+                tool_id: tool_id.into(),
+                score_thousandths: score,
+                evidence,
+                granted_by: granted_by.into(),
+            },
+            lex_vcs::AttestationResult::Passed,
+            producer_trust_producer(),
+            None,
+        );
+        let id = attestation.attestation_id.clone();
+        log.put(&attestation)?;
+        Ok(Some(id))
+    }
+
     pub fn attestation_log(&self) -> Result<lex_vcs::AttestationLog, StoreError> {
         Ok(lex_vcs::AttestationLog::open(self.root())?)
     }
@@ -1701,8 +1784,31 @@ impl Store {
             Some(p) if !p.required_attestations.is_empty() => p,
             _ => return Ok(()),
         };
-        crate::policy::check_required_attestations(&attest_log, &new_op_candidate, &policy)
-            .map_err(StoreError::BranchAdvanceBlocked)
+        let waivers = crate::policy::check_required_attestations(
+            &attest_log, &new_op_candidate, &policy,
+        ).map_err(StoreError::BranchAdvanceBlocked)?;
+        // #293: emit one `TrustWaived` attestation per waiver so
+        // the audit trail records every skip. Idempotent on
+        // attestation_id (content-addressed dedup) — re-running
+        // the gate with the same state writes the same files.
+        for w in waivers {
+            let att = lex_vcs::Attestation::new(
+                w.stage_id,
+                Some(op_id.clone()),
+                None,
+                lex_vcs::AttestationKind::TrustWaived {
+                    producer: w.producer,
+                    score_thousandths: w.score_thousandths,
+                    threshold_thousandths: w.threshold_thousandths,
+                    kind_tag: w.kind_tag,
+                },
+                lex_vcs::AttestationResult::Passed,
+                trust_waived_producer(),
+                None,
+            );
+            attest_log.put(&att)?;
+        }
+        Ok(())
     }
 
     /// Walk the branch from `head_op` back to `last_gate_checkpoint`
@@ -1821,6 +1927,31 @@ fn typecheck_producer() -> lex_vcs::ProducerDescriptor {
 fn repair_hint_producer() -> lex_vcs::ProducerDescriptor {
     lex_vcs::ProducerDescriptor {
         tool: "lex-store::repair_hint".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        model: None,
+    }
+}
+
+/// Producer identity for `TrustWaived` attestations emitted by
+/// the `required_attestations` gate on a trust-driven waiver
+/// (#293). Distinct from `typecheck_producer` and `repair_hint`
+/// so the audit trail clearly shows "the gate let this advance
+/// through because trust > threshold."
+fn trust_waived_producer() -> lex_vcs::ProducerDescriptor {
+    lex_vcs::ProducerDescriptor {
+        tool: "lex-store::trust_waived".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        model: None,
+    }
+}
+
+/// Producer identity for `ProducerTrust` attestations emitted by
+/// [`Store::recompute_producer_trust`]. The score-derivation
+/// recompute is its own machine-emittable kind, distinct from
+/// the gate-side `TrustWaived` emit (#293).
+fn producer_trust_producer() -> lex_vcs::ProducerDescriptor {
+    lex_vcs::ProducerDescriptor {
+        tool: "lex-store::producer_trust".into(),
         version: env!("CARGO_PKG_VERSION").into(),
         model: None,
     }

@@ -107,6 +107,7 @@ fn run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "op" => op::cmd_op(fmt, &args[1..]),
         "docs" => docs::cmd_docs(fmt, &args[1..]),
         "repair" => cmd_repair(fmt, &args[1..]),
+        "producer-trust" => cmd_producer_trust(fmt, &args[1..]),
         "canonical" => cmd_canonical(fmt, &args[1..]),
         "keygen" => cmd_keygen(fmt, &args[1..]),
         "repl" => repl::cmd_repl(&args[1..]),
@@ -1159,6 +1160,85 @@ fn cmd_repair_apply(
     // success/failure. Exiting non-zero would have stdout emit
     // a second wrapper envelope, which we don't want.
     Ok(())
+}
+
+/// `lex producer-trust recompute --tool <id> [--window N] [--granted-by ACTOR] [--store DIR]`
+/// (#293). Walks the attestation log filtered by `produced_by.tool
+/// == <id>`, computes `passed/total` over the last `window`
+/// records, and emits a fresh `ProducerTrust` attestation. The
+/// `required_attestations` gate consults the latest score per
+/// tool to apply trust-based waivers.
+fn cmd_producer_trust(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let sub = args.first().ok_or_else(|| anyhow!(
+        "usage: lex producer-trust recompute --tool <id> [--window N] \
+         [--granted-by ACTOR] [--store DIR]"))?;
+    if sub != "recompute" {
+        bail!("unknown `lex producer-trust` subcommand: {sub}");
+    }
+    let (root, rest, _, _) = parse_store_flag(&args[1..]);
+    let mut tool: Option<String> = None;
+    let mut window: usize = 1000;
+    let mut granted_by: String = whoami_id();
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--tool" => {
+                tool = Some(it.next()
+                    .ok_or_else(|| anyhow!("--tool needs an id"))?.clone());
+            }
+            "--window" => {
+                window = it.next()
+                    .ok_or_else(|| anyhow!("--window needs N"))?
+                    .parse().map_err(|e| anyhow!("--window: {e}"))?;
+            }
+            "--granted-by" => {
+                granted_by = it.next()
+                    .ok_or_else(|| anyhow!("--granted-by needs an actor"))?.clone();
+            }
+            other => bail!("unexpected arg `{other}`"),
+        }
+    }
+    let tool = tool.ok_or_else(|| anyhow!(
+        "usage: lex producer-trust recompute --tool <id> ..."))?;
+
+    let store = Store::open(&root)?;
+    let result = store.recompute_producer_trust(&tool, window, &granted_by)?;
+    let env = match &result {
+        Some(att_id) => serde_json::json!({
+            "tool": &tool,
+            "window": window,
+            "granted_by": &granted_by,
+            "attestation_id": att_id,
+            "ok": true,
+        }),
+        None => serde_json::json!({
+            "tool": &tool,
+            "window": window,
+            "granted_by": &granted_by,
+            "ok": false,
+            "reason": "no attestations from this tool to score",
+        }),
+    };
+    let env_for_text = env.clone();
+    let tool_for_text = tool.clone();
+    acli::emit_or_text("producer-trust", env, fmt, move || {
+        if env_for_text["ok"] == true {
+            println!("recomputed trust for `{tool_for_text}` → attestation_id={}",
+                env_for_text["attestation_id"].as_str().unwrap_or("?"));
+        } else {
+            println!("no trust recompute: {}",
+                env_for_text["reason"].as_str().unwrap_or("?"));
+        }
+    });
+    Ok(())
+}
+
+/// Best-effort identity for `--granted-by`. Reads `$USER`
+/// (set on Unix login shells) or falls back to `"unknown"`.
+fn whoami_id() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LEX_TEA_USER"))
+        .unwrap_or_else(|_| "unknown".into())
 }
 
 fn repair_attempt_producer() -> lex_vcs::ProducerDescriptor {
@@ -2570,6 +2650,12 @@ fn cmd_stage(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                     lex_vcs::AttestationKind::RepairAttempt { hint_id, outcome, .. } => {
                         format!("RepairAttempt({outcome}, {hint_id:.12}…)")
                     }
+                    lex_vcs::AttestationKind::ProducerTrust { tool_id, score_thousandths, .. } => {
+                        format!("ProducerTrust({tool_id}, {:.3})", *score_thousandths as f64 / 1000.0)
+                    }
+                    lex_vcs::AttestationKind::TrustWaived { producer, kind_tag, .. } => {
+                        format!("TrustWaived({producer}/{kind_tag})")
+                    }
                 };
                 let result = match &a.result {
                     lex_vcs::AttestationResult::Passed => "passed".to_string(),
@@ -3393,6 +3479,8 @@ fn attestation_kind_tag(k: &lex_vcs::AttestationKind) -> &'static str {
         ProducerUnblock { .. }  => "producer_unblock",
         RepairHint { .. }       => "repair_hint",
         RepairAttempt { .. }    => "repair_attempt",
+        ProducerTrust { .. }    => "producer_trust",
+        TrustWaived { .. }      => "trust_waived",
     }
 }
 

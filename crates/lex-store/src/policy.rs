@@ -32,7 +32,9 @@
 //! Existing `policy.json` files keep working — `required_attestations`
 //! defaults to empty (no gate).
 
-use lex_vcs::{Attestation, AttestationKind, AttestationLog, AttestationResult, OpId};
+use lex_vcs::{
+    active_producer_block, Attestation, AttestationKind, AttestationLog, AttestationResult, OpId,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs;
@@ -145,6 +147,18 @@ pub struct RequiredAttestation {
     /// op" rule.
     #[serde(default)]
     pub when: AttestationCondition,
+    /// Trust-based waiver threshold (#293). When set, the gate
+    /// waives this rule if the maximum live
+    /// [`AttestationKind::ProducerTrust`] `score_thousandths`
+    /// across all tools (excluding those with an active
+    /// [`AttestationKind::ProducerBlock`]) exceeds this
+    /// threshold. A `TrustWaived` attestation lands per waiver
+    /// so the audit trail records the skip.
+    ///
+    /// `None` (default) means no waiver — the rule fires
+    /// unconditionally when `when` applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_if_producer_trust_thousandths_above: Option<u32>,
 }
 
 /// Which `AttestationKind` is required. Mirrors the variants the
@@ -312,7 +326,11 @@ impl PolicyFile {
         kind: RequiredAttestationKind,
         when: AttestationCondition,
     ) -> bool {
-        let new = RequiredAttestation { kind, when };
+        let new = RequiredAttestation {
+            kind,
+            when,
+            skip_if_producer_trust_thousandths_above: None,
+        };
         if self.required_attestations.contains(&new) {
             return false;
         }
@@ -379,10 +397,21 @@ pub fn check_required_attestations(
     log: &AttestationLog,
     candidate: &[(OpId, Option<String>, BTreeSet<String>)],
     policy: &PolicyFile,
-) -> Result<(), BranchAdvanceBlocked> {
+) -> Result<Vec<TrustWaiver>, BranchAdvanceBlocked> {
     if policy.required_attestations.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
+    // Compute the live trust ceiling once for the whole gate run.
+    // None if no `ProducerTrust` attestations exist or if every
+    // such tool is also blocked. Otherwise `Some((tool, score))`
+    // for the producer with the highest current score.
+    let trust_ceiling = max_live_producer_trust(log).map_err(|e| BranchAdvanceBlocked {
+        op_id: candidate.first().map(|(o, _, _)| o.clone()).unwrap_or_default(),
+        stage_id: None,
+        missing: vec![format!("io:{e}")],
+    })?;
+    let mut waivers: Vec<TrustWaiver> = Vec::new();
+
     for (op_id, stage_id_opt, op_effects) in candidate {
         let stage_id = match stage_id_opt {
             Some(s) => s,
@@ -401,6 +430,23 @@ pub fn check_required_attestations(
         for rule in &policy.required_attestations {
             if !rule.when.applies(op_effects) {
                 continue;
+            }
+            // #293 trust waiver: if the rule has a threshold AND
+            // a live trusted producer exceeds it, skip the rule
+            // and record a waiver for emission.
+            if let Some(threshold) = rule.skip_if_producer_trust_thousandths_above {
+                if let Some((producer, score)) = &trust_ceiling {
+                    if *score > threshold {
+                        waivers.push(TrustWaiver {
+                            stage_id: stage_id.clone(),
+                            producer: producer.clone(),
+                            score_thousandths: *score,
+                            threshold_thousandths: threshold,
+                            kind_tag: rule.kind.tag().into(),
+                        });
+                        continue;
+                    }
+                }
             }
             let satisfied = attestations.iter().any(|a| {
                 a.op_id.as_deref() == Some(op_id.as_str())
@@ -424,7 +470,58 @@ pub fn check_required_attestations(
             });
         }
     }
-    Ok(())
+    Ok(waivers)
+}
+
+/// Record of a single trust-based waiver from
+/// [`check_required_attestations`] (#293). The store emits a
+/// `TrustWaived` attestation per waiver after the gate succeeds
+/// so the audit trail captures every skip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustWaiver {
+    pub stage_id: String,
+    pub producer: String,
+    pub score_thousandths: u32,
+    pub threshold_thousandths: u32,
+    pub kind_tag: String,
+}
+
+/// Scan the attestation log for the highest live
+/// `ProducerTrust` score (#293). "Live" means the trusted tool
+/// does not have an active [`AttestationKind::ProducerBlock`] —
+/// the block wins as a hard veto over trust.
+///
+/// Returns `Some((tool_id, score_thousandths))` for the highest
+/// live trust, or `None` if no tool currently has trust.
+fn max_live_producer_trust(
+    log: &AttestationLog,
+) -> std::io::Result<Option<(String, u32)>> {
+    let all = log.list_all()?;
+    // For each tool with a `ProducerTrust`, take the highest
+    // recorded score across that tool's history. Multiple
+    // recompute runs append; the latest by timestamp wins.
+    use std::collections::BTreeMap;
+    let mut latest: BTreeMap<String, (u64, u32)> = BTreeMap::new();
+    for a in &all {
+        let AttestationKind::ProducerTrust { tool_id, score_thousandths, .. } = &a.kind else { continue };
+        let entry = latest.entry(tool_id.clone()).or_insert((0, 0));
+        if a.timestamp >= entry.0 {
+            *entry = (a.timestamp, *score_thousandths);
+        }
+    }
+    let mut best: Option<(String, u32)> = None;
+    for (tool, (_, score)) in latest {
+        if active_producer_block(&all, &tool).is_some() {
+            // Blocked — ignore even if score is high.
+            continue;
+        }
+        match &best {
+            None => best = Some((tool, score)),
+            Some((_, b)) if score > *b => best = Some((tool, score)),
+            _ => {}
+        }
+    }
+    Ok(best)
 }
 
 fn passed(r: &AttestationResult) -> bool {
