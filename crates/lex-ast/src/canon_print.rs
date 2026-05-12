@@ -57,6 +57,31 @@ impl Printer {
         write!(self.out, ") -> ").unwrap();
         self.effects(&fd.effects);
         self.ty(&fd.return_type);
+        if !fd.examples.is_empty() {
+            self.nl();
+            self.pad();
+            write!(self.out, "examples {{").unwrap();
+            self.indent += 1;
+            for (i, ex) in fd.examples.iter().enumerate() {
+                self.nl();
+                self.pad();
+                // Render as `name(args...) => expected`. Since canonical
+                // form doesn't carry the call expression, we synthesize
+                // a Call(Var name, args) for the printer.
+                write!(self.out, "{}(", fd.name).unwrap();
+                for (j, a) in ex.args.iter().enumerate() {
+                    if j > 0 { write!(self.out, ", ").unwrap(); }
+                    self.expr(a);
+                }
+                write!(self.out, ") => ").unwrap();
+                self.expr(&ex.expected);
+                if i + 1 < fd.examples.len() { write!(self.out, ",").unwrap(); }
+            }
+            self.indent -= 1;
+            self.nl();
+            self.pad();
+            write!(self.out, "}}").unwrap();
+        }
         write!(self.out, " ").unwrap();
         self.expr_as_block(&fd.body);
         self.nl();

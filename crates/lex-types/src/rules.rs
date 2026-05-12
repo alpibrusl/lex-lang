@@ -39,6 +39,8 @@ impl TypeError {
             TypeError::AmbiguousType { .. } => "ambiguous-type",
             TypeError::RecursiveTypeWithoutConstructor { .. } => "recursive-type-without-constructor",
             TypeError::RefinementViolation { .. } => "refinement-violation",
+            TypeError::ExamplesOnEffectfulFn { .. } => "examples-on-effectful-fn",
+            TypeError::ExampleArityMismatch { .. } => "example-arity-mismatch",
         }
     }
 
@@ -83,6 +85,13 @@ between, so no value of the type can ever be built. Make the recursive position 
         "refinement-violation" => "A literal argument provably violates a refinement-type predicate \
 (#209). Adjust the argument to satisfy the predicate, or relax the predicate at the function \
 signature.",
+        "examples-on-effectful-fn" => "A function with an `examples { ... }` block (#369) also \
+declares effects. Signature-level examples are pure-only in v1 — they must be deterministic so the \
+contract is reproducible. Either remove the effects from the signature, or remove the examples block \
+and rely on external tests.",
+        "example-arity-mismatch" => "A case inside an `examples { ... }` block (#369) supplies a \
+different number of arguments than the function declares. Match the call's argument count to the \
+function's parameter count.",
         _ => "Unknown rule. The rule_tag may have been introduced after this Lex release.",
     }
 }
@@ -104,6 +113,8 @@ pub fn all_rules() -> &'static [RuleInfo] {
         RuleInfo { tag: "ambiguous-type", explanation: AMBIGUOUS_TYPE },
         RuleInfo { tag: "recursive-type-without-constructor", explanation: RECURSIVE_NO_CTOR },
         RuleInfo { tag: "refinement-violation", explanation: REFINEMENT_VIOLATION },
+        RuleInfo { tag: "examples-on-effectful-fn", explanation: EXAMPLES_ON_EFFECTFUL_FN },
+        RuleInfo { tag: "example-arity-mismatch", explanation: EXAMPLE_ARITY_MISMATCH },
     ]
 }
 
@@ -222,6 +233,13 @@ between, so no value of the type can ever be built. Make the recursive position 
 const REFINEMENT_VIOLATION: &str = "A literal argument provably violates a refinement-type predicate \
 (#209). Adjust the argument to satisfy the predicate, or relax the predicate at the function \
 signature.";
+const EXAMPLES_ON_EFFECTFUL_FN: &str = "A function with an `examples { ... }` block (#369) also \
+declares effects. Signature-level examples are pure-only in v1 — they must be deterministic so the \
+contract is reproducible. Either remove the effects from the signature, or remove the examples block \
+and rely on external tests.";
+const EXAMPLE_ARITY_MISMATCH: &str = "A case inside an `examples { ... }` block (#369) supplies a \
+different number of arguments than the function declares. Match the call's argument count to the \
+function's parameter count.";
 
 #[cfg(test)]
 mod tests {
@@ -282,6 +300,17 @@ mod tests {
                 param_index: 0,
                 binding: "x".into(),
                 reason: "x > 0".into(),
+            },
+            TypeError::ExamplesOnEffectfulFn {
+                at_node: "n_0".into(),
+                fn_name: "f".into(),
+            },
+            TypeError::ExampleArityMismatch {
+                at_node: "n_0".into(),
+                fn_name: "f".into(),
+                case_index: 0,
+                expected: 2,
+                got: 1,
             },
         ];
         let catalog: std::collections::BTreeMap<&str, &str> =

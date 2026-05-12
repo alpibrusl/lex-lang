@@ -38,6 +38,22 @@ pub struct FnDecl {
     pub effects: Vec<Effect>,
     pub return_type: TypeExpr,
     pub body: Block,
+    /// Optional `examples { call(a, b) => expected, ... }` block (#369).
+    /// Each case binds the function on literal-or-pure arguments and
+    /// declares the value the body is expected to produce. Pure-only in
+    /// v1: a function carrying examples must declare no effects.
+    /// Serialized as an empty `Vec` so the JSON shape stays compatible
+    /// with pre-#369 signatures when the block is absent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub examples: Vec<Example>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Example {
+    /// Arguments passed to the function, in declaration order.
+    pub args: Vec<Expr>,
+    /// Value the body is expected to produce.
+    pub expected: Expr,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
