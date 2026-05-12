@@ -465,8 +465,15 @@ impl<'a> FnCompiler<'a> {
 
             let fail_target = self.code.len() as i32;
             for j in fail_jumps {
-                if let Op::JumpIfNot(off) = &mut self.code[j] {
-                    *off = fail_target - (j as i32 + 1);
+                // #337: PConstructor patterns now register an
+                // unconditional `Op::Jump` for the failure path
+                // (alongside the existing `Op::JumpIfNot` from
+                // PLiteral / nested constructor tests). Patch
+                // either shape.
+                match &mut self.code[j] {
+                    Op::JumpIfNot(off) => *off = fail_target - (j as i32 + 1),
+                    Op::Jump(off)      => *off = fail_target - (j as i32 + 1),
+                    _ => {}
                 }
             }
             self.next_local = arm_start_locals;
@@ -505,11 +512,32 @@ impl<'a> FnCompiler<'a> {
             }
             a::Pattern::PConstructor { name, args } => {
                 let name_idx = self.pool.variant(name);
-                self.emit(Op::Dup);
-                self.emit(Op::TestVariant(name_idx));
-                let j = self.code.len();
-                self.emit(Op::JumpIfNot(0));
-                fails.push(j);
+                // #337: the failure path must drop the duplicated
+                // scrutinee so subsequent match arms see a clean
+                // stack. The previous shape
+                //   Dup; TestVariant; JumpIfNot(fail);
+                // left `[scrut]` on the stack at the fail target,
+                // poisoning later arms — e.g. a wildcard `_` arm
+                // whose body referenced an unrelated value would
+                // pop the leaked scrutinee instead of its own value.
+                //
+                // New shape: branch on success, fall through to a
+                // failure cleanup that pops the dup'd scrutinee
+                // before jumping. The registered fail-jump is an
+                // unconditional `Op::Jump`; `compile_match`'s patch
+                // loop accepts both `JumpIfNot` and `Jump`.
+                self.emit(Op::Dup);                   // [scrut, scrut]
+                self.emit(Op::TestVariant(name_idx)); // [scrut, Bool]
+                let j_success = self.code.len();
+                self.emit(Op::JumpIf(0));             // pop Bool. success → [scrut]
+                self.emit(Op::Pop);                   // failure cleanup: [scrut] → []
+                let j_fail = self.code.len();
+                self.emit(Op::Jump(0));               // → fail target with []
+                fails.push(j_fail);
+                let success_target = self.code.len() as i32;
+                if let Op::JumpIf(off) = &mut self.code[j_success] {
+                    *off = success_target - (j_success as i32 + 1);
+                }
                 if args.is_empty() {
                     self.emit(Op::Pop);
                 } else if args.len() == 1 {
