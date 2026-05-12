@@ -204,3 +204,195 @@ fn build_ws_event(conn_id: u64, room: &str, body: &str) -> Value {
     rec.insert("room".into(), Value::Str(room.to_string()));
     Value::Record(rec)
 }
+
+// ── Closure-based WebSocket server (#359) ────────────────────────────────────
+
+/// Build a `WsConn` record value for the typed closure-based handler.
+fn build_ws_conn(conn_id: u64, path: &str, subprotocol: &str) -> Value {
+    let mut rec = IndexMap::new();
+    rec.insert("id".into(), Value::Str(conn_id.to_string()));
+    rec.insert("path".into(), Value::Str(path.to_string()));
+    rec.insert("subprotocol".into(), Value::Str(subprotocol.to_string()));
+    Value::Record(rec)
+}
+
+/// Build a `WsMessage` variant value.
+fn build_ws_message_text(body: &str) -> Value {
+    Value::Variant { name: "WsText".into(), args: vec![Value::Str(body.to_string())] }
+}
+
+fn build_ws_message_close() -> Value {
+    Value::Variant { name: "WsClose".into(), args: vec![] }
+}
+
+fn build_ws_message_ping() -> Value {
+    Value::Variant { name: "WsPing".into(), args: vec![] }
+}
+
+/// Interpret a `WsAction` variant and send the appropriate frame.
+fn apply_ws_action(
+    action: &Value,
+    ws: &mut tungstenite::WebSocket<std::net::TcpStream>,
+) -> Result<(), String> {
+    use tungstenite::Message;
+    match action {
+        Value::Variant { name, args } if name == "WsSend" => {
+            let text = match args.first() {
+                Some(Value::Str(s)) => s.clone(),
+                _ => return Err("WsSend payload must be Str".into()),
+            };
+            ws.send(Message::Text(text.into()))
+                .map_err(|e| format!("ws send: {e}"))
+        }
+        Value::Variant { name, args } if name == "WsSendBinary" => {
+            let bytes: Vec<u8> = match args.first() {
+                Some(Value::List(elems)) => elems
+                    .iter()
+                    .map(|v| match v {
+                        Value::Int(n) => Ok(*n as u8),
+                        _ => Err("WsSendBinary payload must be List[Int]".into()),
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+                _ => return Err("WsSendBinary payload must be List[Int]".into()),
+            };
+            ws.send(Message::Binary(bytes.into()))
+                .map_err(|e| format!("ws send binary: {e}"))
+        }
+        Value::Variant { name, .. } if name == "WsNoOp" => Ok(()),
+        other => Err(format!("unexpected WsAction: {other:?}")),
+    }
+}
+
+/// Closure-based WebSocket server. Accepts a `Value::Closure` as the handler.
+pub fn serve_ws_fn(
+    port: u16,
+    subprotocol: String,
+    closure: Value,
+    program: Arc<Program>,
+    policy: Policy,
+    registry: Arc<ChatRegistry>,
+) -> Result<Value, String> {
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .map_err(|e| format!("net.serve_ws_fn bind {port}: {e}"))?;
+    eprintln!("net.serve_ws_fn: listening on ws://127.0.0.1:{port}");
+    for stream in listener.incoming() {
+        let stream = match stream {
+            Ok(s) => s,
+            Err(e) => { eprintln!("net.serve_ws_fn accept: {e}"); continue; }
+        };
+        let program = Arc::clone(&program);
+        let policy = policy.clone();
+        let closure = closure.clone();
+        let subprotocol = subprotocol.clone();
+        let registry = Arc::clone(&registry);
+        thread::spawn(move || {
+            if let Err(e) = handle_connection_fn(
+                stream, program, policy, closure, subprotocol, registry,
+            ) {
+                eprintln!("net.serve_ws_fn connection error: {e}");
+            }
+        });
+    }
+    Ok(Value::Unit)
+}
+
+fn handle_connection_fn(
+    stream: std::net::TcpStream,
+    program: Arc<Program>,
+    policy: Policy,
+    closure: Value,
+    subprotocol: String,
+    registry: Arc<ChatRegistry>,
+) -> Result<(), String> {
+    use tungstenite::{accept_hdr, handshake::server::{Request, Response}};
+
+    let mut path = String::new();
+    let path_ref = &mut path;
+    let mut ws = accept_hdr(stream, |req: &Request, resp: Response| {
+        *path_ref = req.uri().path().to_string();
+        Ok(resp)
+    }).map_err(|e| format!("ws handshake: {e}"))?;
+
+    let (tx, rx) = mpsc::channel::<String>();
+    let conn_id = registry.register(path.trim_start_matches('/').to_string(), tx);
+    let _ = ws.get_mut().set_read_timeout(Some(Duration::from_millis(50)));
+
+    let result = run_loop_fn(
+        &mut ws, &rx, conn_id, &path, &subprotocol,
+        &program, &policy, &closure, &registry,
+    );
+    registry.unregister(conn_id);
+    let _ = ws.close(None);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_loop_fn(
+    ws: &mut tungstenite::WebSocket<std::net::TcpStream>,
+    rx: &mpsc::Receiver<String>,
+    conn_id: u64,
+    path: &str,
+    subprotocol: &str,
+    program: &Arc<Program>,
+    policy: &Policy,
+    closure: &Value,
+    registry: &Arc<ChatRegistry>,
+) -> Result<(), String> {
+    use tungstenite::Message;
+    use std::io::ErrorKind;
+
+    let ws_conn = build_ws_conn(conn_id, path, subprotocol);
+
+    loop {
+        let ws_msg = match ws.read() {
+            Ok(Message::Text(body)) => Some(build_ws_message_text(&body)),
+            Ok(Message::Binary(_)) => None,
+            Ok(Message::Ping(_)) => Some(build_ws_message_ping()),
+            Ok(Message::Close(_)) | Err(tungstenite::Error::ConnectionClosed) => {
+                // Notify handler then exit.
+                let handler = crate::handler::DefaultHandler::new(policy.clone())
+                    .with_program(Arc::clone(program))
+                    .with_chat_registry(Arc::clone(registry));
+                let mut vm = Vm::with_handler(program, Box::new(handler));
+                let _ = vm.invoke_closure_value(
+                    closure.clone(),
+                    vec![ws_conn.clone(), build_ws_message_close()],
+                );
+                break;
+            }
+            Ok(_) => None, // pong / frame
+            Err(tungstenite::Error::Io(ref e))
+                if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => None,
+            Err(e) => return Err(format!("ws read: {e}")),
+        };
+
+        if let Some(msg) = ws_msg {
+            let handler = crate::handler::DefaultHandler::new(policy.clone())
+                .with_program(Arc::clone(program))
+                .with_chat_registry(Arc::clone(registry));
+            let mut vm = Vm::with_handler(program, Box::new(handler));
+            match vm.invoke_closure_value(closure.clone(), vec![ws_conn.clone(), msg]) {
+                Ok(action) => {
+                    if let Err(e) = apply_ws_action(&action, ws) {
+                        eprintln!("ws action {conn_id}: {e}");
+                    }
+                }
+                Err(e) => eprintln!("ws handler {conn_id}: {e}"),
+            }
+        }
+
+        // Drain broadcast/send outbound channel.
+        loop {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    if let Err(e) = ws.send(Message::Text(msg.into())) {
+                        return Err(format!("ws send: {e}"));
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
+            }
+        }
+    }
+    Ok(())
+}

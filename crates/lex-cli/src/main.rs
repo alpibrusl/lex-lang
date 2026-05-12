@@ -20,6 +20,7 @@ mod acli;
 mod docs;
 mod op;
 mod repl;
+mod lint;
 mod test_runner;
 mod watch;
 
@@ -152,7 +153,7 @@ fn print_usage() {
     println!("lex — Lex toolchain\n");
     println!("commands:");
     println!("  parse <file>                       print canonical AST as JSON");
-    println!("  check <file>                       type-check; exit 0 or print errors");
+    println!("  check [--strict] <file>            type-check; --strict adds lint warnings");
     println!("  run [policy] <file> <fn> [args]    execute fn (args parsed as JSON)");
     println!("  run --from-store STAGE_ID [--require-signed] [--trusted-key HEX] <fn> [args]");
     println!("                                     run a stage straight out of the store;");
@@ -309,13 +310,15 @@ fn cmd_check(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     // #206 slice 3: `--from-canonical` reads the program as
     // canonical-AST bytes instead of `.lex` text.
     let mut from_canonical = false;
+    let mut strict = false;
     let mut path: Option<&str> = None;
     for a in args {
         match a.as_str() {
             "--from-canonical" => { from_canonical = true; }
+            "--strict" => { strict = true; }
             other if !other.starts_with("--") => {
                 if path.is_some() {
-                    bail!("usage: lex check [--from-canonical] <file>");
+                    bail!("usage: lex check [--from-canonical] [--strict] <file>");
                 }
                 path = Some(other);
             }
@@ -323,7 +326,7 @@ fn cmd_check(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         }
     }
     let path = path.ok_or_else(|| anyhow!(
-        "usage: lex check [--from-canonical] <file>"))?;
+        "usage: lex check [--from-canonical] [--strict] <file>"))?;
     let stages = load_stages(path, from_canonical)?;
 
     // #306 slice 1: when checking a `.lex` source file (not a
@@ -354,17 +357,35 @@ fn cmd_check(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 
     match check_result {
         Ok(_) => {
+            // --strict: run AST lint passes after the type check succeeds (#347 A2).
+            // Warnings are non-fatal but exit 1 so CI can enforce them.
+            let lint_warnings = if strict && !from_canonical && path != "-" {
+                std::fs::read_to_string(path).ok()
+                    .and_then(|src| lex_syntax::parse_source(&src).ok())
+                    .map(|prog| lint::lint_program(&prog))
+                    .unwrap_or_default()
+            } else {
+                vec![]
+            };
+
             let summary = effects_summary(&stages);
             let data = serde_json::json!({
-                "ok": true,
+                "ok": lint_warnings.is_empty(),
                 "stages": stages.len(),
                 "required_effects": summary.kinds,
                 "required_fs_read": summary.fs_read,
                 "required_fs_write": summary.fs_write,
                 "required_net_host": summary.net_host,
+                "warnings": lint_warnings,
             });
             acli::emit_or_text("check", data, fmt, || {
-                println!("ok");
+                if lint_warnings.is_empty() {
+                    println!("ok");
+                } else {
+                    for w in &lint_warnings {
+                        println!("[{}] {} ({})", w.code, w.message, w.location);
+                    }
+                }
                 if !summary.kinds.is_empty() {
                     println!("required effects: {}", summary.kinds.join(", "));
                     if !summary.fs_read.is_empty() {
@@ -379,6 +400,9 @@ fn cmd_check(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                     println!("hint: lex run {} {path} <fn> [args]", suggest_grants(&summary));
                 }
             });
+            if !lint_warnings.is_empty() {
+                std::process::exit(1);
+            }
             Ok(())
         }
         Err(errs) => {

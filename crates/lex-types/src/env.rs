@@ -177,6 +177,47 @@ impl TypeEnv {
             kind: TypeDefKind::Alias(Ty::Record(net_resp_fields)),
         });
 
+        // WsConn = { id :: Str, path :: Str, subprotocol :: Str }
+        // Passed to every net.serve_ws_fn message handler.
+        let mut ws_conn_fields = IndexMap::new();
+        ws_conn_fields.insert("id".into(), Ty::str());
+        ws_conn_fields.insert("path".into(), Ty::str());
+        ws_conn_fields.insert("subprotocol".into(), Ty::str());
+        e.types.insert("WsConn".into(), TypeDef {
+            params: vec![],
+            kind: TypeDefKind::Alias(Ty::Record(ws_conn_fields)),
+        });
+
+        // WsMessage = WsText(Str) | WsBinary(List[Int]) | WsPing | WsClose
+        let mut ws_msg_variants = IndexMap::new();
+        ws_msg_variants.insert("WsText".into(), Some(Ty::str()));
+        ws_msg_variants.insert("WsBinary".into(), Some(Ty::List(Box::new(Ty::int()))));
+        ws_msg_variants.insert("WsPing".into(), None);
+        ws_msg_variants.insert("WsClose".into(), None);
+        e.types.insert("WsMessage".into(), TypeDef {
+            params: vec![],
+            kind: TypeDefKind::Union(ws_msg_variants),
+        });
+        for ctor in &["WsText", "WsBinary", "WsPing", "WsClose"] {
+            e.ctor_to_type.insert((*ctor).into(), "WsMessage".into());
+        }
+
+        // WsAction = WsSend(Str) | WsSendBinary(List[Int]) | WsNoOp
+        // Handlers return this to tell the runtime what to send back.
+        // Connection close is handled automatically when the runtime receives
+        // an incoming WsClose frame; handlers do not need to emit a close action.
+        let mut ws_act_variants = IndexMap::new();
+        ws_act_variants.insert("WsSend".into(), Some(Ty::str()));
+        ws_act_variants.insert("WsSendBinary".into(), Some(Ty::List(Box::new(Ty::int()))));
+        ws_act_variants.insert("WsNoOp".into(), None);
+        e.types.insert("WsAction".into(), TypeDef {
+            params: vec![],
+            kind: TypeDefKind::Union(ws_act_variants),
+        });
+        for ctor in &["WsSend", "WsSendBinary", "WsNoOp"] {
+            e.ctor_to_type.insert((*ctor).into(), "WsAction".into());
+        }
+
         e
     }
 
