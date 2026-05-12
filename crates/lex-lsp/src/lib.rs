@@ -460,6 +460,103 @@ pub fn code_actions_for_diagnostics(diagnostics: &[lsp_types::Diagnostic]) -> Ve
     out
 }
 
+// ---------------------------------------------------------------
+// #304 phase 3b: refactor actions that apply real WorkspaceEdits
+// ---------------------------------------------------------------
+
+/// Refactor action surfaced when the cursor is on (or close to) a
+/// function whose body is a top-level `let` binding. Selecting
+/// the action replaces the file with the inlined-and-re-printed
+/// canonical source.
+///
+/// Phase 3b ships **`InlineLet`** for top-level let-bound fn
+/// bodies as the first applying refactor. The other three #280
+/// transforms (`RenameLocal`, `ReplaceMatchArm`, `ExtractFunction`)
+/// need cursor-to-NodeId mapping that this slice doesn't have
+/// yet — top-level let is the one case where the target NodeId
+/// is derivable from fn structure alone (`n_0.{n_params + 1}`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineLetAction {
+    /// `fn` whose body is a top-level let.
+    pub fn_name: String,
+    /// Binding name in the let — used to render the action title.
+    pub let_name: String,
+    /// New full-file source after applying `inline_let`. The
+    /// server wraps this in a `WorkspaceEdit` that replaces the
+    /// whole document.
+    pub new_text: String,
+}
+
+/// Find every applicable `InlineLet` refactor in `src`, scoped to
+/// fns whose declaration line falls inside the requesting LSP
+/// `range`. Returns `Vec` so multi-fn files surface multiple
+/// actions when a range spans them.
+///
+/// Phase 3b heuristic: the cursor is "on" a fn when the fn's
+/// declaration line is `<= range.end.line` and the next fn's
+/// declaration line is `> range.end.line` (or there is no next
+/// fn). This is coarse but correct for the dominant single-line-
+/// cursor case the lightbulb is built around.
+pub fn inline_let_actions(src: &str, range: &Range) -> Vec<InlineLetAction> {
+    let (program, fn_positions) = match lex_syntax::parse_source_with_positions(src) {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
+    let stages = lex_ast::canonicalize_program(&program);
+    let n_stages = stages.len();
+    let mut out: Vec<InlineLetAction> = Vec::new();
+
+    // Precompute each fn's declaration line so we can answer
+    // "is the cursor in this fn?" without re-tokenising.
+    let mut fn_lines: std::collections::BTreeMap<String, u32> = Default::default();
+    for (name, byte) in &fn_positions {
+        let (line, _col) = lex_types::byte_to_line_col(src, *byte);
+        fn_lines.insert(name.clone(), line.saturating_sub(1));
+    }
+
+    for (idx, stage) in stages.iter().enumerate() {
+        let lex_ast::Stage::FnDecl(fd) = stage else { continue };
+        // Bail when the fn body isn't a top-level `Let`.
+        let lex_ast::CExpr::Let { name: let_name, .. } = &fd.body else { continue };
+        let let_name = let_name.clone();
+
+        // Range scoping: cursor must fall on or past this fn's
+        // declaration line and before the next fn's.
+        let Some(&this_line) = fn_lines.get(&fd.name) else { continue };
+        let next_line = fn_lines
+            .values()
+            .filter(|&&l| l > this_line)
+            .min()
+            .copied();
+        let cursor = range.end.line;
+        if cursor < this_line {
+            continue;
+        }
+        if let Some(n) = next_line {
+            if cursor >= n { continue; }
+        }
+
+        // Apply the transform. NodeId for the body root is
+        // `n_0.{params + 1}`.
+        let node_id = lex_ast::NodeId(format!("n_0.{}", fd.params.len() + 1));
+        let new_stage = match lex_ast::inline_let(stage, &node_id) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        // Splice the new stage back in and re-print.
+        let mut new_stages: Vec<lex_ast::Stage> = stages.clone();
+        new_stages[idx] = new_stage;
+        let _ = n_stages; // tracking handle for diagnostics
+        let new_text = lex_ast::print_stages(&new_stages);
+        out.push(InlineLetAction {
+            fn_name: fd.name.clone(),
+            let_name,
+            new_text,
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -641,6 +738,82 @@ fn bar() -> Int { 2 }
         };
         let actions = code_actions_for_diagnostics(&[d]);
         assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn inline_let_action_round_trips() {
+        // Top-level let in the fn body is the slice-3b target.
+        // The action's `new_text` re-prints the canonical AST,
+        // which folds the let into the body.
+        let src = "\
+fn one() -> Int {
+    let x := 1
+    x + x
+}
+";
+        let cursor = Range {
+            start: Position { line: 1, character: 0 },
+            end: Position { line: 1, character: 0 },
+        };
+        let actions = inline_let_actions(src, &cursor);
+        assert_eq!(actions.len(), 1, "one inline-let action: {actions:?}");
+        let a = &actions[0];
+        assert_eq!(a.fn_name, "one");
+        assert_eq!(a.let_name, "x");
+        // The let is gone, replaced by the substituted body.
+        assert!(!a.new_text.contains("let x"), "let removed: {}", a.new_text);
+        assert!(
+            a.new_text.contains("1 + 1") || a.new_text.contains("1+1"),
+            "substituted body present: {}",
+            a.new_text
+        );
+    }
+
+    #[test]
+    fn inline_let_action_skips_fns_outside_cursor_range() {
+        // Two top-level lets in two separate fns. Cursor on the
+        // first fn should yield only the first action.
+        let src = "\
+fn first() -> Int {
+    let a := 10
+    a
+}
+
+fn second() -> Int {
+    let b := 20
+    b
+}
+";
+        let cursor = Range {
+            start: Position { line: 1, character: 0 },
+            end: Position { line: 1, character: 0 },
+        };
+        let actions = inline_let_actions(src, &cursor);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].fn_name, "first");
+    }
+
+    #[test]
+    fn inline_let_action_skips_fn_without_top_level_let() {
+        // No top-level let -> no action surfaced.
+        let src = "fn plain(x :: Int) -> Int { x + 1 }\n";
+        let cursor = Range {
+            start: Position { line: 0, character: 5 },
+            end: Position { line: 0, character: 5 },
+        };
+        assert!(inline_let_actions(src, &cursor).is_empty());
+    }
+
+    #[test]
+    fn inline_let_action_handles_unparseable_source() {
+        // Parse failure must degrade silently (the diagnostics
+        // path already surfaces the parse error).
+        let src = "fn bad( :: Int { 1 }\n";
+        let cursor = Range {
+            start: Position { line: 0, character: 0 },
+            end: Position { line: 0, character: 0 },
+        };
+        assert!(inline_let_actions(src, &cursor).is_empty());
     }
 
     #[test]

@@ -8,7 +8,7 @@
 
 use lex_lsp::{
     analyze_source, code_actions_for_diagnostics, completions, definition_at,
-    diagnostics_for_source, hover_at, Documents,
+    diagnostics_for_source, hover_at, inline_let_actions, Documents,
 };
 use lsp_server::{Connection, Message, Notification, Request, Response};
 use lsp_types::notification::{
@@ -25,8 +25,9 @@ use lsp_types::{
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
     GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
     HoverProviderCapability, InitializeParams, InitializeResult, Location, MarkupContent,
-    MarkupKind, OneOf, PublishDiagnosticsParams, Range, ServerCapabilities, ServerInfo,
-    TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
+    MarkupKind, OneOf, Position, PublishDiagnosticsParams, Range, ServerCapabilities, ServerInfo,
+    TextDocumentEdit, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri,
+    OptionalVersionedTextDocumentIdentifier, WorkspaceEdit,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -171,30 +172,52 @@ fn handle_request(
         }
         m if m == CodeActionRequest::METHOD => {
             let params: CodeActionParams = serde_json::from_value(req.params)?;
-            // Phase 3a: every diagnostic in the request whose
+            let mut actions: Vec<CodeActionOrCommand> = Vec::new();
+
+            // Phase 3a: every diagnostic whose
             // `data.suggested_transform` is populated becomes one
-            // code-action stub. Selecting it (in slice 3b) will
-            // produce a `WorkspaceEdit`; for now the action carries
-            // the suggestion JSON in `data` for client extensions.
-            let actions: Vec<CodeActionOrCommand> =
-                code_actions_for_diagnostics(&params.context.diagnostics)
-                    .into_iter()
-                    .map(|stub| {
-                        CodeActionOrCommand::CodeAction(CodeAction {
-                            title: format!(
-                                "Lex: {} ({})",
-                                stub.title, stub.kind_hint
-                            ),
-                            kind: Some(CodeActionKind::QUICKFIX),
-                            diagnostics: Some(vec![stub.diagnostic]),
-                            edit: None,
-                            command: None,
-                            is_preferred: Some(true),
-                            disabled: None,
-                            data: Some(stub.data),
-                        })
-                    })
-                    .collect();
+            // QuickFix stub. The action carries the suggestion in
+            // `data` for client extensions that pipe to
+            // `lex repair --apply --transform '<json>'`.
+            for stub in code_actions_for_diagnostics(&params.context.diagnostics) {
+                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title: format!("Lex: {} ({})", stub.title, stub.kind_hint),
+                    kind: Some(CodeActionKind::QUICKFIX),
+                    diagnostics: Some(vec![stub.diagnostic]),
+                    edit: None,
+                    command: None,
+                    is_preferred: Some(true),
+                    disabled: None,
+                    data: Some(stub.data),
+                }));
+            }
+
+            // Phase 3b: applying refactor — Inline let. For every
+            // fn whose body is a top-level `let` and whose
+            // declaration is in the requested range, emit a
+            // Refactor.Inline action carrying a real
+            // `WorkspaceEdit` that replaces the whole document
+            // with the canonical re-print after the transform.
+            let uri = params.text_document.uri.clone();
+            if let Some(src) = docs.get(&uri.to_string()) {
+                for action in inline_let_actions(src, &params.range) {
+                    let edit = full_document_replace(src, &uri, &action.new_text);
+                    actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                        title: format!(
+                            "Lex: inline let `{}` in `{}`",
+                            action.let_name, action.fn_name
+                        ),
+                        kind: Some(CodeActionKind::REFACTOR_INLINE),
+                        diagnostics: None,
+                        edit: Some(edit),
+                        command: None,
+                        is_preferred: None,
+                        disabled: None,
+                        data: None,
+                    }));
+                }
+            }
+
             Response {
                 id: req.id,
                 result: Some(serde_json::to_value(CodeActionResponse::from(actions))?),
@@ -306,4 +329,34 @@ where
 fn uri_to_path(uri: &Uri) -> Option<String> {
     let s = uri.to_string();
     s.strip_prefix("file://").map(|p| p.to_string())
+}
+
+/// Build a `WorkspaceEdit` that replaces the entirety of `uri`'s
+/// content with `new_text`. The end-of-document position is
+/// derived from the old `src` so the range covers every existing
+/// character — editors collapse the range to a single-edit
+/// replacement.
+fn full_document_replace(src: &str, uri: &Uri, new_text: &str) -> WorkspaceEdit {
+    let n_lines = src.lines().count() as u32;
+    let last_line_idx = n_lines.saturating_sub(1);
+    let last_line_chars = src
+        .lines()
+        .nth(last_line_idx as usize)
+        .map(|l| l.chars().count() as u32)
+        .unwrap_or(0);
+    let range = Range {
+        start: Position { line: 0, character: 0 },
+        end: Position { line: last_line_idx, character: last_line_chars },
+    };
+    let edit = TextDocumentEdit {
+        text_document: OptionalVersionedTextDocumentIdentifier {
+            uri: uri.clone(),
+            version: None,
+        },
+        edits: vec![OneOf::Left(TextEdit { range, new_text: new_text.to_string() })],
+    };
+    WorkspaceEdit {
+        document_changes: Some(lsp_types::DocumentChanges::Edits(vec![edit])),
+        ..Default::default()
+    }
 }

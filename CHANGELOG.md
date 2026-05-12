@@ -9,6 +9,24 @@ bumps may carry breaking changes when justified).
 
 ### Added
 
+- **#304 phase 3b: applying `Inline let` refactor in `lex-lsp`.**
+  First typed-transform (`InlineLet` from #280) that lands a real
+  `WorkspaceEdit` instead of just a hint. The `textDocument/codeAction`
+  handler walks the file's canonical AST; for every fn whose body
+  is a top-level `let` and whose declaration falls inside the
+  requesting range, it emits a `Refactor.Inline` code action whose
+  `edit` is a full-document `TextEdit` replacing the source with
+  the canonical re-print after `inline_let`. Selecting the
+  lightbulb applies the refactor inline, no CLI round-trip. The
+  other three #280 transforms (`RenameLocal`, `ReplaceMatchArm`,
+  `ExtractFunction`) still need cursor-to-NodeId mapping that's
+  queued for a follow-up — top-level let is the case where the
+  target NodeId derives from fn structure alone
+  (`n_0.{params + 1}`). Coverage: 4 lib unit tests on
+  `inline_let_actions` + 2 e2e tests round-tripping the protocol
+  (action surfaces with a real `documentChanges` `edit`;
+  no-top-level-let → no action).
+
 - **#304 phase 3a: code-action surface in `lex-lsp`.** Editors
   now show a lightbulb on every type-error diagnostic that has a
   static `suggested_transform` (#306 slice 3): the action title is
