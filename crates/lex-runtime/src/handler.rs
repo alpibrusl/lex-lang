@@ -34,6 +34,11 @@ impl IoSink for CapturedSink {
     fn print_line(&mut self, s: &str) { self.lines.push(s.to_string()); }
 }
 
+/// `agent.cloud_stream` registry: per-handle producer iterators
+/// keyed by opaque handle id (#305 slice 3).
+pub type StreamRegistry =
+    std::collections::HashMap<String, Box<dyn Iterator<Item = String> + Send>>;
+
 pub struct DefaultHandler {
     policy: Policy,
     pub sink: Box<dyn IoSink>,
@@ -65,6 +70,15 @@ pub struct DefaultHandler {
     /// Capped — when the cache is full, the least-recently-used
     /// entry is dropped (its subprocess is reaped on Drop).
     pub mcp_clients: crate::mcp_client::McpClientCache,
+    /// Stream registry for `agent.cloud_stream` / `stream.next` /
+    /// `stream.collect` (#305 slice 3). Keyed by an opaque handle
+    /// id; values are the producer iterators. Wrapped in
+    /// `Arc<Mutex<…>>` so par_map workers can share the same
+    /// stream pool (when slice-2's per-worker handler split chains
+    /// the registry through).
+    pub streams: Arc<std::sync::Mutex<StreamRegistry>>,
+    /// Monotonic counter for handing out fresh stream handle ids.
+    pub next_stream_id: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl DefaultHandler {
@@ -83,6 +97,8 @@ impl DefaultHandler {
             program: None,
             chat_registry: None,
             mcp_clients: crate::mcp_client::McpClientCache::with_capacity(16),
+            streams: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            next_stream_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -708,6 +724,7 @@ impl EffectHandler for DefaultHandler {
             let effect_kind = match op {
                 "local_complete" => "llm_local",
                 "cloud_complete" => "llm_cloud",
+                "cloud_stream"   => "llm_cloud",
                 "send_a2a"       => "a2a",
                 "call_mcp"       => "mcp",
                 other => return Err(format!("unsupported agent.{other}")),
@@ -724,7 +741,22 @@ impl EffectHandler for DefaultHandler {
                 "call_mcp"       => Ok(self.dispatch_call_mcp(args)),
                 "local_complete" => Ok(dispatch_llm_local(args)),
                 "cloud_complete" => Ok(dispatch_llm_cloud(args)),
+                "cloud_stream"   => Ok(self.dispatch_cloud_stream(args)),
                 _ => Ok(ok(Value::Str(format!("<{effect_kind} stub>")))),
+            };
+        }
+        if kind == "stream" {
+            // #305 slice 3: consumer-side stream operations. Each
+            // op resolves the opaque handle in the parent handler's
+            // stream registry and pulls one or all items. The
+            // `stream` effect must be granted by policy; default
+            // policies for agent runs grant it alongside the
+            // producer effect (e.g. `llm_cloud`).
+            self.ensure_kind_allowed("stream")?;
+            return match op {
+                "next"    => Ok(self.dispatch_stream_next(args)),
+                "collect" => Ok(self.dispatch_stream_collect(args)),
+                other => Err(format!("unsupported stream.{other}")),
             };
         }
         if kind == "http" && matches!(op, "send" | "get" | "post") {
@@ -1142,6 +1174,12 @@ impl EffectHandler for DefaultHandler {
         fresh.read_root = self.read_root.clone();
         fresh.program = self.program.clone();
         fresh.chat_registry = self.chat_registry.clone();
+        // #305 slice 3: share the stream registry across workers so
+        // a stream produced on one thread (or the parent) is
+        // consumable on any other. The registry is already
+        // `Arc<Mutex<…>>` so concurrent access is safe.
+        fresh.streams = std::sync::Arc::clone(&self.streams);
+        fresh.next_stream_id = std::sync::Arc::clone(&self.next_stream_id);
         Some(Box::new(fresh))
     }
 }
@@ -1518,6 +1556,117 @@ impl DefaultHandler {
                 serde_json::to_string(&result).unwrap_or_else(|_| "null".into()))),
             Err(e) => err(Value::Str(e)),
         }
+    }
+
+    /// Implementation of `agent.cloud_stream(prompt) -> Result[Stream[Str], Str]`
+    /// (#305 slice 3). The fixture path (`LEX_LLM_STREAM_FIXTURE`)
+    /// splits the env-var value on `|` and yields each segment as
+    /// one chunk; it's the load-bearing test hook. Live HTTP
+    /// chunked-response support is deferred to a follow-up slice.
+    fn dispatch_cloud_stream(&mut self, args: Vec<Value>) -> Value {
+        let _prompt = match args.first() {
+            Some(Value::Str(s)) => s.clone(),
+            _ => return err(Value::Str(
+                "agent.cloud_stream(prompt): prompt must be Str".into())),
+        };
+        let chunks: Vec<String> = match std::env::var("LEX_LLM_STREAM_FIXTURE") {
+            Ok(v) => v.split('|').map(|s| s.to_string()).collect(),
+            Err(_) => return err(Value::Str(
+                "agent.cloud_stream: live streaming not yet implemented; \
+                 set LEX_LLM_STREAM_FIXTURE='chunk1|chunk2|…' for tests".into())),
+        };
+        let handle = self.register_stream(chunks.into_iter());
+        ok(stream_handle_value(handle))
+    }
+
+    /// Implementation of `stream.next(s) -> Option[T]` (#305 slice 3).
+    /// Returns `Some(chunk)` for each producer yield and `None` once
+    /// the producer is exhausted. Unknown handle ids return `None`
+    /// rather than erroring so streams can be safely consumed past
+    /// the end (matches the semantics of `Iterator::next`).
+    fn dispatch_stream_next(&mut self, args: Vec<Value>) -> Value {
+        let handle = match args.first().and_then(stream_handle_id) {
+            Some(h) => h,
+            None => return Value::Variant { name: "None".into(), args: vec![] },
+        };
+        let mut streams = match self.streams.lock() {
+            Ok(g) => g,
+            Err(_) => return Value::Variant { name: "None".into(), args: vec![] },
+        };
+        match streams.get_mut(&handle).and_then(|it| it.next()) {
+            Some(chunk) => some(Value::Str(chunk)),
+            None => {
+                streams.remove(&handle);
+                Value::Variant { name: "None".into(), args: vec![] }
+            }
+        }
+    }
+
+    /// Implementation of `stream.collect(s) -> List[T]` (#305 slice 3).
+    /// Drains the producer eagerly. Unknown handles drain to an
+    /// empty list so the contract is `collect ∘ collect = []`
+    /// (idempotent on a closed stream).
+    fn dispatch_stream_collect(&mut self, args: Vec<Value>) -> Value {
+        let handle = match args.first().and_then(stream_handle_id) {
+            Some(h) => h,
+            None => return Value::List(Vec::new()),
+        };
+        let mut iter = {
+            let mut streams = match self.streams.lock() {
+                Ok(g) => g,
+                Err(_) => return Value::List(Vec::new()),
+            };
+            match streams.remove(&handle) {
+                Some(it) => it,
+                None => return Value::List(Vec::new()),
+            }
+        };
+        let mut out: Vec<Value> = Vec::new();
+        for chunk in iter.by_ref() {
+            out.push(Value::Str(chunk));
+        }
+        Value::List(out)
+    }
+
+    /// Register a producer iterator and return its handle id. The
+    /// handle is monotonic-counter-based so two streams created in
+    /// quick succession get distinct ids.
+    fn register_stream<I>(&self, iter: I) -> String
+    where
+        I: Iterator<Item = String> + Send + 'static,
+    {
+        let id = self
+            .next_stream_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let handle = format!("stream_{id}");
+        if let Ok(mut streams) = self.streams.lock() {
+            streams.insert(handle.clone(), Box::new(iter));
+        }
+        handle
+    }
+}
+
+/// Build the runtime representation of a `Stream[T]` value:
+/// `Variant("__StreamHandle", [Str(handle_id)])`. The opaque tag is
+/// prefixed with `__` so it can't collide with a user-declared
+/// variant.
+fn stream_handle_value(handle: String) -> Value {
+    Value::Variant {
+        name: "__StreamHandle".into(),
+        args: vec![Value::Str(handle)],
+    }
+}
+
+/// Inverse of [`stream_handle_value`] — extract the handle id from
+/// a Stream value, or `None` if the input doesn't have the
+/// expected shape.
+fn stream_handle_id(v: &Value) -> Option<String> {
+    match v {
+        Value::Variant { name, args } if name == "__StreamHandle" => match args.first() {
+            Some(Value::Str(h)) => Some(h.clone()),
+            _ => None,
+        },
+        _ => None,
     }
 }
 

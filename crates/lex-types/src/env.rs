@@ -62,6 +62,14 @@ impl TypeEnv {
         e.types.insert("Map".into(), TypeDef { params: vec!["K".into(), "V".into()], kind: TypeDefKind::Opaque });
         e.types.insert("Set".into(), TypeDef { params: vec!["T".into()], kind: TypeDefKind::Opaque });
 
+        // Stream[T]: opaque streaming iterator (#305 slice 3).
+        // Built and consumed exclusively through the `stream.*` and
+        // `agent.cloud_stream` effect builtins; the runtime
+        // represents a Stream value as an opaque variant carrying a
+        // handle id. Registered as Opaque so type-checking knows
+        // `Stream[Str]` parses but doesn't unwrap it structurally.
+        e.types.insert("Stream".into(), TypeDef { params: vec!["T".into()], kind: TypeDefKind::Opaque });
+
         // Tz = Utc | Local | Offset(Int) | Iana(Str).
         // Used by std.datetime; the variant-typed alternative to the
         // pre-v1 stringly Tz ("UTC" / "Local" / "+05:30" / IANA name).
