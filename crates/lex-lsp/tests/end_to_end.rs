@@ -408,6 +408,117 @@ fn code_action_returns_empty_when_no_diagnostics() {
 }
 
 #[test]
+fn inline_let_refactor_returns_real_workspace_edit() {
+    // Phase 3b: cursor inside a fn whose body is a top-level
+    // `let` produces a Refactor.Inline action with an applying
+    // WorkspaceEdit. The edit replaces the whole document; new
+    // text omits the let binding (substituted into the body).
+    let mut s = Server::spawn();
+    s.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "capabilities": {}, "processId": null, "rootUri": null }
+    }));
+    let _ = s.recv();
+    s.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "initialized",
+        "params": {}
+    }));
+    let text = "\
+fn one() -> Int {
+    let x := 1
+    x + x
+}
+";
+    s.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {
+                "uri": "file:///tmp/lsp_inline.lex",
+                "languageId": "lex",
+                "version": 1,
+                "text": text,
+            }
+        }
+    }));
+    let _ = s.recv(); // empty diagnostics
+    s.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/codeAction",
+        "params": {
+            "textDocument": { "uri": "file:///tmp/lsp_inline.lex" },
+            "range": { "start": { "line": 1, "character": 0 }, "end": { "line": 1, "character": 0 } },
+            "context": { "diagnostics": [] }
+        }
+    }));
+    let resp = s.recv();
+    let actions = resp["result"].as_array().expect("array of actions");
+    assert_eq!(actions.len(), 1, "one refactor action: {resp}");
+    let a = &actions[0];
+    let title = a["title"].as_str().unwrap_or("");
+    assert!(title.contains("inline let `x`"), "title carries name: {title}");
+    assert_eq!(a["kind"], "refactor.inline");
+    let edits = a["edit"]["documentChanges"][0]["edits"].as_array().expect("edits");
+    assert_eq!(edits.len(), 1, "one TextEdit replaces the whole doc");
+    let new_text = edits[0]["newText"].as_str().expect("newText");
+    assert!(
+        !new_text.contains("let x"),
+        "applied edit removes the let: {new_text}"
+    );
+    assert!(
+        new_text.contains("1 + 1") || new_text.contains("1+1"),
+        "applied edit substitutes the let value: {new_text}"
+    );
+}
+
+#[test]
+fn inline_let_refactor_silent_when_no_top_level_let() {
+    let mut s = Server::spawn();
+    s.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "capabilities": {}, "processId": null, "rootUri": null }
+    }));
+    let _ = s.recv();
+    s.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "initialized",
+        "params": {}
+    }));
+    s.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {
+                "uri": "file:///tmp/lsp_no_inline.lex",
+                "languageId": "lex",
+                "version": 1,
+                "text": "fn plain(x :: Int) -> Int { x + 1 }\n",
+            }
+        }
+    }));
+    let _ = s.recv(); // empty diagnostics
+    s.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/codeAction",
+        "params": {
+            "textDocument": { "uri": "file:///tmp/lsp_no_inline.lex" },
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } },
+            "context": { "diagnostics": [] }
+        }
+    }));
+    let resp = s.recv();
+    let actions = resp["result"].as_array().expect("array");
+    assert!(actions.is_empty(), "no actions: {resp}");
+}
+
+#[test]
 fn clean_program_emits_empty_diagnostics() {
     let mut s = Server::spawn();
     s.send(&json!({
