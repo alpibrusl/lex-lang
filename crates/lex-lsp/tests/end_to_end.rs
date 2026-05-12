@@ -145,6 +145,158 @@ fn type_error_round_trips_through_lsp_protocol() {
 }
 
 #[test]
+fn hover_returns_signature_markdown() {
+    let mut s = Server::spawn();
+    s.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "capabilities": {}, "processId": null, "rootUri": null }
+    }));
+    let _ = s.recv();
+    s.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "initialized",
+        "params": {}
+    }));
+    let text = "fn echo(msg :: Str) -> [io, budget(5)] Nil { msg }\n";
+    s.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {
+                "uri": "file:///tmp/lsp_hover.lex",
+                "languageId": "lex",
+                "version": 1,
+                "text": text,
+            }
+        }
+    }));
+    let _ = s.recv(); // publishDiagnostics
+
+    // Cursor on `echo` (line 0, character 4).
+    s.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/hover",
+        "params": {
+            "textDocument": { "uri": "file:///tmp/lsp_hover.lex" },
+            "position": { "line": 0, "character": 4 }
+        }
+    }));
+    let resp = s.recv();
+    assert_eq!(resp["id"], 2);
+    let contents = &resp["result"]["contents"];
+    assert_eq!(contents["kind"], "markdown");
+    let value = contents["value"].as_str().expect("hover value");
+    assert!(value.contains("fn echo"), "sig in hover: {value}");
+    assert!(value.contains("io"), "effects in hover: {value}");
+    assert!(value.contains("budget"), "budget in hover: {value}");
+}
+
+#[test]
+fn definition_jumps_to_fn_declaration() {
+    let mut s = Server::spawn();
+    s.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "capabilities": {}, "processId": null, "rootUri": null }
+    }));
+    let _ = s.recv();
+    s.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "initialized",
+        "params": {}
+    }));
+    let text = "\
+fn double(n :: Int) -> Int { n + n }
+fn caller() -> Int { double(2) }
+";
+    s.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {
+                "uri": "file:///tmp/lsp_def.lex",
+                "languageId": "lex",
+                "version": 1,
+                "text": text,
+            }
+        }
+    }));
+    let _ = s.recv(); // publishDiagnostics
+
+    // Cursor on the `double` call site in line 1.
+    s.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/definition",
+        "params": {
+            "textDocument": { "uri": "file:///tmp/lsp_def.lex" },
+            "position": { "line": 1, "character": 23 }
+        }
+    }));
+    let resp = s.recv();
+    let result = &resp["result"];
+    let uri = result["uri"].as_str().expect("uri");
+    assert_eq!(uri, "file:///tmp/lsp_def.lex");
+    let line = result["range"]["start"]["line"].as_u64().expect("line");
+    assert_eq!(line, 0, "double is defined on line 0");
+}
+
+#[test]
+fn completion_lists_fns_and_imports() {
+    let mut s = Server::spawn();
+    s.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "capabilities": {}, "processId": null, "rootUri": null }
+    }));
+    let _ = s.recv();
+    s.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "initialized",
+        "params": {}
+    }));
+    let text = "\
+import \"std.io\" as io
+fn helper() -> Int { 1 }
+fn other() -> Int { 2 }
+";
+    s.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {
+                "uri": "file:///tmp/lsp_compl.lex",
+                "languageId": "lex",
+                "version": 1,
+                "text": text,
+            }
+        }
+    }));
+    let _ = s.recv(); // publishDiagnostics
+
+    s.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/completion",
+        "params": {
+            "textDocument": { "uri": "file:///tmp/lsp_compl.lex" },
+            "position": { "line": 3, "character": 0 }
+        }
+    }));
+    let resp = s.recv();
+    let arr = resp["result"].as_array().expect("array");
+    let labels: Vec<&str> = arr.iter().filter_map(|i| i["label"].as_str()).collect();
+    assert!(labels.contains(&"helper"));
+    assert!(labels.contains(&"other"));
+    assert!(labels.contains(&"io"));
+}
+
+#[test]
 fn clean_program_emits_empty_diagnostics() {
     let mut s = Server::spawn();
     s.send(&json!({
