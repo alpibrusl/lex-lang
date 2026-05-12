@@ -14,8 +14,9 @@ pub fn cmd_pkg(args: &[String]) -> Result<()> {
         Some("init")    => cmd_init(),
         Some("add")     => cmd_add(&args[1..]),
         Some("list")    => cmd_list(),
-        Some(other)     => bail!("unknown pkg subcommand `{other}`; try: init, add, list"),
-        None            => bail!("usage: lex pkg <init|add|list>"),
+        Some("install") => cmd_install(),
+        Some(other)     => bail!("unknown pkg subcommand `{other}`; try: init, add, install, list"),
+        None            => bail!("usage: lex pkg <init|add|install|list>"),
     }
 }
 
@@ -82,6 +83,67 @@ fn cmd_add(args: &[String]) -> Result<()> {
     };
 
     upsert_dependency(name, &dep_entry)
+}
+
+// ── lex pkg install ───────────────────────────────────────────────────────────
+
+/// Resolve and install all dependencies declared in the nearest lex.toml.
+///
+/// For path dependencies: verify the directory exists.
+/// For git dependencies: clone into the cache directory if not already present.
+fn cmd_install() -> Result<()> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    let (toml_path, toml_dir) = lex_syntax::find_manifest(&cwd)
+        .ok_or_else(|| anyhow::anyhow!("no lex.toml found (run `lex pkg init` to create one)"))?;
+
+    let manifest = lex_syntax::Manifest::load(&toml_path)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if manifest.dependencies.is_empty() {
+        println!("no dependencies declared in {}", toml_path.display());
+        return Ok(());
+    }
+
+    println!("installing dependencies from {}:", toml_path.display());
+    let mut errors = Vec::new();
+
+    for (name, dep) in &manifest.dependencies {
+        match dep {
+            lex_syntax::workspace::Dependency::Path { path } => {
+                let full = toml_dir.join(path);
+                if full.exists() {
+                    println!("  {} (path)  ok — {}", name, full.display());
+                } else {
+                    let msg = format!("  {} (path)  NOT FOUND: {}", name, full.display());
+                    eprintln!("{msg}");
+                    errors.push(msg);
+                }
+            }
+            lex_syntax::workspace::Dependency::Git { git } => {
+                print!("  {} (git)   {} ... ", name, git);
+                // resolve_package_import triggers git_ensure_cached internally.
+                // We use a dummy module name — we only care about the side-effect.
+                let dummy_file = toml_dir.join("__install_probe__.lex");
+                match lex_syntax::workspace::resolve_package_import(&dummy_file, name, "__probe__") {
+                    Ok(_) | Err(lex_syntax::PackageError::ModuleNotFound { .. }) => {
+                        println!("ok");
+                    }
+                    Err(e) => {
+                        println!("FAILED");
+                        eprintln!("    {e}");
+                        errors.push(format!("{name}: {e}"));
+                    }
+                }
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        println!("all {} dependency/dependencies installed", manifest.dependencies.len());
+        Ok(())
+    } else {
+        bail!("{} dependency/dependencies failed to install", errors.len())
+    }
 }
 
 // ── lex pkg list ──────────────────────────────────────────────────────────────

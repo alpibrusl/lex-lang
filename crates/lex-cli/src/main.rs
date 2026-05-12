@@ -24,6 +24,9 @@ mod lint;
 mod pkg;
 mod test_runner;
 mod watch;
+mod fmt;
+mod init;
+mod ci;
 
 use ::acli::OutputFormat;
 use anyhow::{anyhow, bail, Context, Result};
@@ -118,6 +121,9 @@ fn run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "repl" => repl::cmd_repl(&args[1..]),
         "test" => test_runner::cmd_test(fmt, &args[1..]),
         "watch" => watch::cmd_watch(&args[1..]),
+        "fmt"  => fmt::cmd_fmt(&args[1..]),
+        "init" => init::cmd_init(&args[1..]),
+        "ci"   => ci::cmd_ci(&args[1..]),
         "help" | "--help" | "-h" => { print_usage(); Ok(()) }
         other => bail!("unknown command `{other}`. try `lex help`"),
     }
@@ -154,11 +160,17 @@ fn parse_output_format(args: &[String]) -> Result<(OutputFormat, Vec<String>)> {
 fn print_usage() {
     println!("lex — Lex toolchain\n");
     println!("commands:");
+    println!("  init [<dir>]                       scaffold a new project (lex.toml, src/, tests/, CI)");
     println!("  parse <file>                       print canonical AST as JSON");
     println!("  check [--strict] <file>            type-check; --strict adds lint warnings");
+    println!("  fmt [--check] <file|dir>...        format .lex files; --check exits 1 if any need it");
+    println!("  ci [--no-fmt] [--src <d>] [--tests <d>]");
+    println!("                                     run the full pipeline: pkg install, check --strict,");
+    println!("                                     fmt --check, test — same as CI in lex.yml");
     println!("  pkg init                           create lex.toml in current directory");
     println!("  pkg add <name> --path <p>          add a local path dependency");
     println!("  pkg add <name> --git <url>         add a git dependency");
+    println!("  pkg install                        install/verify all declared dependencies");
     println!("  pkg list                           list declared dependencies");
     println!("  run [policy] <file> <fn> [args]    execute fn (args parsed as JSON)");
     println!("  run --from-store STAGE_ID [--require-signed] [--trusted-key HEX] <fn> [args]");
