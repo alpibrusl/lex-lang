@@ -385,7 +385,6 @@ fn main() -> Int {
 }
 
 #[test]
-#[test]
 fn diamond_via_dotdot_paths_share_one_module_identity() {
     // Regression test for #358: two files reach the same physical module via
     // different relative `..` paths. Before the fix, the loader stored the
