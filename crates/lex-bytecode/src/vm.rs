@@ -13,8 +13,8 @@ pub enum VmError {
     TypeMismatch(String),
     #[error("stack underflow")]
     StackUnderflow,
-    #[error("unknown function id: {0}")]
-    UnknownFunction(u32),
+    #[error("unknown function: {0}")]
+    UnknownFunction(String),
     #[error("effect handler error: {0}")]
     Effect(String),
     #[error("call stack overflow: recursion depth exceeded ({0})")]
@@ -577,8 +577,11 @@ impl<'a> Vm<'a> {
     fn run_to(&mut self, base_depth: usize) -> Result<Value, VmError> {
         loop {
             if self.steps > self.step_limit {
+                let frame_idx = self.frames.len() - 1;
+                let fn_id = self.frames[frame_idx].fn_id;
+                let fn_name = &self.program.functions[fn_id as usize].name;
                 return Err(VmError::Panic(format!(
-                    "step limit exceeded ({} > {})",
+                    "step limit exceeded in `{fn_name}` ({} > {})",
                     self.steps, self.step_limit,
                 )));
             }
@@ -588,7 +591,8 @@ impl<'a> Vm<'a> {
             let fn_id = self.frames[frame_idx].fn_id;
             let code = &self.program.functions[fn_id as usize].code;
             if pc >= code.len() {
-                return Err(VmError::Panic("ran past end of code".into()));
+                let fn_name = &self.program.functions[fn_id as usize].name;
+                return Err(VmError::Panic(format!("ran past end of code in `{fn_name}`")));
             }
             let op = code[pc].clone();
             self.frames[frame_idx].pc = pc + 1;

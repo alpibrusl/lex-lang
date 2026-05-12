@@ -25,9 +25,31 @@ use std::io::{BufRead, Write};
 
 const BANNER: &str = "lex repl — type .help for commands, .quit to exit";
 
-pub fn cmd_repl(_args: &[String]) -> Result<()> {
+pub fn cmd_repl(args: &[String]) -> Result<()> {
     println!("{BANNER}");
     let mut session = Session::new();
+
+    // --load <file> (repeatable): pre-load Lex source files into the session.
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--load" {
+            let path = args.get(i + 1)
+                .ok_or_else(|| anyhow!("--load requires a file path"))?;
+            let src = std::fs::read_to_string(path)
+                .map_err(|e| anyhow!("--load {path}: {e}"))?;
+            session.add_stage(&src);
+            match session.check() {
+                Ok(_) => println!("loaded {path}"),
+                Err(e) => {
+                    session.rollback();
+                    return Err(anyhow!("--load {path}: type error: {e}"));
+                }
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
     let stdin = std::io::stdin();
     let mut stdin = stdin.lock();
     let mut buf = String::new();
@@ -95,6 +117,9 @@ fn print_help() {
     println!("  .quit       exit the REPL");
     println!("  .reset      drop all defined stages, start over");
     println!("  .list       print the current accumulated source");
+    println!();
+    println!("Flags (pass before entering the REPL):");
+    println!("  --load <file>   pre-load a .lex source file (repeatable)");
     println!();
     println!("Top-level inputs (`fn …`, `type …`, `import …`) are added");
     println!("to the session. Anything else is evaluated as an expression");

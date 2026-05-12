@@ -20,6 +20,7 @@ mod acli;
 mod docs;
 mod op;
 mod repl;
+mod test_runner;
 mod watch;
 
 use ::acli::OutputFormat;
@@ -112,6 +113,7 @@ fn run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "canonical" => cmd_canonical(fmt, &args[1..]),
         "keygen" => cmd_keygen(fmt, &args[1..]),
         "repl" => repl::cmd_repl(&args[1..]),
+        "test" => test_runner::cmd_test(fmt, &args[1..]),
         "watch" => watch::cmd_watch(&args[1..]),
         "help" | "--help" | "-h" => { print_usage(); Ok(()) }
         other => bail!("unknown command `{other}`. try `lex help`"),
@@ -179,6 +181,8 @@ fn print_usage() {
     println!("                                     re-execute with effect overrides keyed by NodeId");
     println!("  diff <run_a> <run_b>               first NodeId where two traces diverge");
     println!("  serve [--port N] [--store DIR]     start the agent API HTTP server");
+    println!("  repl [--load <file>]...            interactive evaluator; --load pre-loads source");
+    println!("  test [<dir>]                       run tests/test_*.lex files (calls run_all in each)");
     println!("  conformance <dir>                  run all JSON test descriptors in <dir>");
     println!("  spec check <spec> --source <file> [--store DIR] [--trials N]");
     println!("                                     check a Spec against a Lex source");
