@@ -272,14 +272,17 @@ fn extract_record_fields_from_result(
 }
 
 /// Standalone version of `Checker::unfold_record_alias` —
-/// resolves a `Ty::Con` whose definition is a record alias to
-/// the underlying record. Module-level helper because we need it
-/// after the `Checker` has been moved/destructured.
+/// resolves a `Ty::Con` whose definition is a type alias (record
+/// or otherwise) to the underlying type. Module-level helper
+/// because we need it after the `Checker` has been
+/// moved/destructured.
 fn unfold_record_alias_static(env: &TypeEnv, ty: Ty) -> Ty {
-    if let Ty::Con(ref n, _) = ty {
-        if let Some(td) = env.types.get(n) {
-            if let TypeDefKind::Alias(inner @ Ty::Record(_)) = &td.kind {
-                return inner.clone();
+    if let Ty::Con(ref n, ref args) = ty {
+        if args.is_empty() {
+            if let Some(td) = env.types.get(n) {
+                if let TypeDefKind::Alias(inner) = &td.kind {
+                    return inner.clone();
+                }
             }
         }
     }
@@ -397,14 +400,16 @@ impl Checker {
         }
     }
 
-    /// If `ty` is a `Ty::Con(name, _)` whose definition is a record
-    /// alias (`type Foo = { ... }`), return the inner record type.
+    /// If `ty` is a `Ty::Con(name, [])` whose definition is a type
+    /// alias (record or otherwise), return the aliased type.
     /// Otherwise return `ty` unchanged.
     fn unfold_record_alias(&self, ty: Ty) -> Ty {
-        if let Ty::Con(ref n, _) = ty {
-            if let Some(td) = self.type_env.types.get(n) {
-                if let TypeDefKind::Alias(inner @ Ty::Record(_)) = &td.kind {
-                    return inner.clone();
+        if let Ty::Con(ref n, ref args) = ty {
+            if args.is_empty() {
+                if let Some(td) = self.type_env.types.get(n) {
+                    if let TypeDefKind::Alias(inner) = &td.kind {
+                        return inner.clone();
+                    }
                 }
             }
         }
@@ -470,6 +475,14 @@ impl Checker {
             }
             (Ty::Tuple(xs), Ty::Tuple(ys)) if xs.len() == ys.len() => {
                 for (x, y) in xs.clone().into_iter().zip(ys.clone()) {
+                    self.unify_coerce_inner(x, y)?;
+                }
+                Ok(())
+            }
+            // Recurse into Con-Con pairs so record-alias coercion reaches
+            // arbitrary nesting depth (e.g. Result[T, MyAlias]) (#328).
+            (Ty::Con(n1, a1), Ty::Con(n2, a2)) if n1 == n2 && a1.len() == a2.len() => {
+                for (x, y) in a1.clone().into_iter().zip(a2.clone()) {
                     self.unify_coerce_inner(x, y)?;
                 }
                 Ok(())
