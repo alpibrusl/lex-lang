@@ -372,10 +372,10 @@ impl Parser {
     fn parse_examples_block(&mut self) -> Result<Vec<Example>, ParseError> {
         // Contextual: not a reserved keyword. Peek for the literal
         // identifier `examples` followed by `{`; otherwise no block.
-        let is_examples_kw = match self.peek_skip_newlines() {
-            Some(TokenKind::Ident(s)) if s == "examples" => true,
-            _ => false,
-        };
+        let is_examples_kw = matches!(
+            self.peek_skip_newlines(),
+            Some(TokenKind::Ident(s)) if s == "examples"
+        );
         if !is_examples_kw {
             return Ok(Vec::new());
         }
