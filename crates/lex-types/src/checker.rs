@@ -478,6 +478,21 @@ impl Checker {
         ty
     }
 
+    /// True iff `ty` is a 0-arg `Ty::Con(name, [])` whose definition
+    /// is a `TypeDefKind::Alias`. Used by `unify_coerce_inner` to
+    /// detect the case where both sides are nominal aliases and
+    /// unfolding would collapse the nominal distinction (#323).
+    fn is_alias_con(&self, ty: &Ty) -> bool {
+        if let Ty::Con(name, args) = ty {
+            if args.is_empty() {
+                if let Some(td) = self.type_env.types.get(name) {
+                    return matches!(td.kind, TypeDefKind::Alias(_));
+                }
+            }
+        }
+        false
+    }
+
     /// Whether `callee` is a `<alias>.parse` field access where
     /// `<alias>` was imported from one of the stdlib modules whose
     /// `parse` returns `Result[T, Str]` and whose `parse_strict`
@@ -512,11 +527,52 @@ impl Checker {
     }
 
     fn unify_coerce_inner(&mut self, a: Ty, b: Ty) -> Result<(), UnifyError> {
-        // Asymmetric Record↔Con(record-alias) coercion at this level.
+        // #323: alias unfolding. If exactly one side is an `alias-Con`
+        // — a 0-arg `Ty::Con(name, [])` whose definition is a type
+        // alias (Record or non-record) — unfold both sides so the
+        // structural cases below can match (`Errors` ↔ `List[…]`,
+        // `Path` ↔ `Tuple(…)`, `Maybe` ↔ `Option[…]`,
+        // `UserId` ↔ `Int`, …).
+        //
+        // Three cases intentionally bypass unfolding:
+        //
+        // - **Same-named Cons** (`Test` vs `Test`): preserve nominal
+        //   identity. The Con-Con same-name case below recurses on
+        //   args; eager unfold here would force the nominal name
+        //   to evaporate, breaking unifications elsewhere that
+        //   still see the nominal `Con`.
+        // - **Var on either side**: don't unfold against an unbound
+        //   variable, because the plain unifier would bind the var
+        //   to the unfolded shape and lose the nominal name. The
+        //   var binds to the nominal `Con` instead, and later
+        //   unifications against concrete shapes re-enter this
+        //   function and unfold then.
+        // - **Two distinct alias-Cons** (`Apple` vs `Box`, both
+        //   declared as record aliases with identical shapes):
+        //   preserve nominal distinction between aliases. Unfolding
+        //   both would collapse the test of "same shape, different
+        //   names" into "same shape" and erase the names.
         let (a, b) = match (&a, &b) {
-            (Ty::Record(_), Ty::Con(_, _)) => (a, self.unfold_record_alias(b.clone())),
-            (Ty::Con(_, _), Ty::Record(_)) => (self.unfold_record_alias(a.clone()), b),
-            _ => (a, b),
+            (Ty::Con(n1, _), Ty::Con(n2, _)) if n1 == n2 => (a, b),
+            (Ty::Var(_), _) | (_, Ty::Var(_)) => (a, b),
+            (Ty::Con(_, _), Ty::Con(_, _))
+                if self.is_alias_con(&a) && self.is_alias_con(&b) =>
+            {
+                (a, b)
+            }
+            _ => {
+                let a_u = if let Ty::Con(_, _) = &a {
+                    self.unfold_record_alias(a.clone())
+                } else {
+                    a
+                };
+                let b_u = if let Ty::Con(_, _) = &b {
+                    self.unfold_record_alias(b.clone())
+                } else {
+                    b
+                };
+                (a_u, b_u)
+            }
         };
 
         match (&a, &b) {
@@ -804,8 +860,12 @@ impl Checker {
                 // #308: `+` is overloaded over Int, Float, and Str.
                 // Str concatenation dispatches at the VM layer
                 // (Op::NumAdd in bytecode handles all three).
+                // #323: unfold one-step type aliases on the resolved
+                // type so `type UserId = Int; id + id` works under
+                // Option-A transparency. Same below for the other
+                // numeric operator groups.
                 self.u.unify(&lt, &rt).map_err(|e| mismatch_err(node_id, e, &self.u, vec![format!("operator `{op}`")]))?;
-                let r = self.u.resolve(&lt);
+                let r = self.unfold_record_alias(self.u.resolve(&lt));
                 match r {
                     Ty::Prim(Prim::Int) | Ty::Prim(Prim::Float) | Ty::Prim(Prim::Str) => Ok(lt),
                     Ty::Var(_) => {
@@ -822,7 +882,7 @@ impl Checker {
             }
             "-" | "*" | "/" | "%" => {
                 self.u.unify(&lt, &rt).map_err(|e| mismatch_err(node_id, e, &self.u, vec![format!("operator `{op}`")]))?;
-                let r = self.u.resolve(&lt);
+                let r = self.unfold_record_alias(self.u.resolve(&lt));
                 match r {
                     Ty::Prim(Prim::Int) | Ty::Prim(Prim::Float) => Ok(lt),
                     Ty::Var(_) => {
@@ -843,7 +903,7 @@ impl Checker {
             }
             "<" | "<=" | ">" | ">=" => {
                 self.u.unify(&lt, &rt).map_err(|e| mismatch_err(node_id, e, &self.u, vec![format!("operator `{op}`")]))?;
-                let r = self.u.resolve(&lt);
+                let r = self.unfold_record_alias(self.u.resolve(&lt));
                 match r {
                     Ty::Prim(Prim::Int) | Ty::Prim(Prim::Float) | Ty::Prim(Prim::Str) => Ok(Ty::bool()),
                     Ty::Var(_) => {
