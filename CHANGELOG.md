@@ -9,6 +9,27 @@ bumps may carry breaking changes when justified).
 
 ### Added
 
+- **#305 slice 3: `Stream[T]` + `agent.cloud_stream`.** Closes
+  #305. Lex agents can now consume LLM completions chunk-by-chunk
+  instead of blocking on the full response. New nominal `Stream[T]`
+  opaque type registered in the type checker; new `stream` builtins
+  module with `stream.next(Stream[T]) -> [stream] Option[T]` and
+  `stream.collect(Stream[T]) -> [stream] List[T]`; new
+  `agent.cloud_stream(prompt) -> [llm_cloud] Result[Stream[Str], Str]`
+  producer. The runtime represents a Stream value as the opaque
+  variant `__StreamHandle(handle_id)` and holds an
+  `Arc<Mutex<HashMap<handle_id, Box<dyn Iterator + Send>>>>` on
+  `DefaultHandler`; the registry is shared across par_map workers
+  via slice 2's `spawn_for_worker`. The fixture path
+  (`LEX_LLM_STREAM_FIXTURE='chunk1|chunk2|…'`) is the test hook;
+  live HTTP chunked-response support is deferred. Coverage: 5
+  conformance tests in `crates/lex-runtime/tests/stream_basic.rs`
+  pin laziness (next + next + collect splits the stream at the
+  right boundary), the `None` past-end contract, and effect-gate
+  refusal. Tests serialise on a per-file mutex so cargo's parallel
+  scheduler can't race the process-global fixture env var.
+
+
 - **#307: cost-aware planner (`lex plan`).** Closes the loop opened
   by `[budget(N)]` declarations and the session-budget gate (#292):
   given a `goal` function, enumerate every linear call chain from

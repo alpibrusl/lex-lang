@@ -1617,6 +1617,44 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::singleton("mcp"),
                 Ty::Con("Result".into(), vec![Ty::str(), Ty::str()]),
             ));
+            // cloud_stream :: Str -> [llm_cloud] Result[Stream[Str], Str]
+            // (#305 slice 3). Streaming counterpart to cloud_complete.
+            // The result is `Result[Stream[Str], Str]` rather than a
+            // bare Stream so transport errors surface synchronously
+            // at handshake time; per-chunk errors collapse the
+            // stream to early termination.
+            fields.insert("cloud_stream".into(), Ty::function(
+                vec![Ty::str()],
+                EffectSet::singleton("llm_cloud"),
+                Ty::Con("Result".into(), vec![
+                    Ty::Con("Stream".into(), vec![Ty::str()]),
+                    Ty::str(),
+                ]),
+            ));
+            Some(Ty::Record(fields))
+        }
+        "stream" => {
+            // #305 slice 3: opaque consumer-side operations on
+            // `Stream[T]`. Producers live elsewhere (`agent.cloud_stream`
+            // for now); future producers (`http.get_stream`, etc.)
+            // will register the same Stream[T] surface.
+            let mut fields = IndexMap::new();
+            // next :: Stream[T] -> [stream] Option[T]
+            // One pull. `None` signals end-of-stream (consumed by
+            // the producer's lazy generator).
+            fields.insert("next".into(), Ty::function(
+                vec![Ty::Con("Stream".into(), vec![Ty::Var(0)])],
+                EffectSet::singleton("stream"),
+                Ty::Con("Option".into(), vec![Ty::Var(0)]),
+            ));
+            // collect :: Stream[T] -> [stream] List[T]
+            // Drain to a list. Eager; blocks until the producer
+            // signals end-of-stream.
+            fields.insert("collect".into(), Ty::function(
+                vec![Ty::Con("Stream".into(), vec![Ty::Var(0)])],
+                EffectSet::singleton("stream"),
+                Ty::List(Box::new(Ty::Var(0))),
+            ));
             Some(Ty::Record(fields))
         }
         _ => None,
@@ -1666,6 +1704,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "test" => "test",
         "agent" => "agent",
         "cli" => "cli",
+        "stream" => "stream",
         _ => return None,
     })
 }
