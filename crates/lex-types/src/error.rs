@@ -64,6 +64,24 @@ pub enum TypeError {
         binding: String,
         reason: String,
     },
+    /// A function carrying signature-level examples (#369) declares
+    /// at least one effect. v1 restricts examples to pure functions so
+    /// the "same inputs ⇒ same outputs" invariant (rule #5) holds
+    /// without modeling effect responses.
+    ExamplesOnEffectfulFn {
+        at_node: String,
+        fn_name: String,
+    },
+    /// A signature-level example case (#369) supplies the wrong number
+    /// of arguments for the function it documents.
+    ExampleArityMismatch {
+        at_node: String,
+        fn_name: String,
+        /// Zero-based index of the failing case in the `examples` block.
+        case_index: usize,
+        expected: usize,
+        got: usize,
+    },
 }
 
 impl TypeError {
@@ -80,7 +98,9 @@ impl TypeError {
             | TypeError::InfiniteType { at_node, .. }
             | TypeError::AmbiguousType { at_node, .. }
             | TypeError::RecursiveTypeWithoutConstructor { at_node, .. }
-            | TypeError::RefinementViolation { at_node, .. } => at_node,
+            | TypeError::RefinementViolation { at_node, .. }
+            | TypeError::ExamplesOnEffectfulFn { at_node, .. }
+            | TypeError::ExampleArityMismatch { at_node, .. } => at_node,
         }
     }
 }
@@ -106,6 +126,12 @@ impl std::fmt::Display for TypeError {
             TypeError::RefinementViolation { at_node, fn_name, param_index, binding, reason } =>
                 write!(f, "refinement violated at {at_node}: argument {} of `{fn_name}` (binding `{binding}`): {reason}",
                     param_index + 1),
+            TypeError::ExamplesOnEffectfulFn { at_node, fn_name } =>
+                write!(f, "function `{fn_name}` at {at_node} carries `examples` but declares effects; \
+                          v1 restricts examples to pure functions"),
+            TypeError::ExampleArityMismatch { at_node, fn_name, case_index, expected, got } =>
+                write!(f, "example #{} of `{fn_name}` at {at_node}: expected {expected} argument(s), got {got}",
+                    case_index + 1),
         }
     }
 }

@@ -648,6 +648,7 @@ pub fn extract_function(
         effects: spec.effects,
         return_type: spec.return_type,
         body: extracted_expr,
+        examples: Vec::new(),
     });
 
     Ok((modified, new_fn))
@@ -790,6 +791,7 @@ mod tests {
             effects: Vec::new(),
             return_type: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
             body,
+            examples: Vec::new(),
         })
     }
 
@@ -841,6 +843,7 @@ mod tests {
             effects: Vec::new(),
             return_type: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
             body,
+            examples: Vec::new(),
         });
         let out = rename_local(&stage, &NodeId("n_0.1".into()), "y").unwrap();
         let Stage::FnDecl(fd) = out else { panic!() };
@@ -882,6 +885,7 @@ mod tests {
                 ret: Box::new(TypeExpr::Named { name: "Int".into(), args: Vec::new() }),
             },
             body,
+            examples: Vec::new(),
         });
         let out = rename_local(&stage, &NodeId("n_0.1".into()), "y").unwrap();
         let Stage::FnDecl(fd) = out else { panic!() };
@@ -926,6 +930,7 @@ mod tests {
             effects: Vec::new(),
             return_type: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
             body,
+            examples: Vec::new(),
         });
         let out = rename_local(&stage, &NodeId("n_0.1".into()), "y").unwrap();
         let Stage::FnDecl(fd) = out else { panic!() };
@@ -971,6 +976,7 @@ mod tests {
             effects: Vec::new(),
             return_type: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
             body,
+            examples: Vec::new(),
         })
     }
 
@@ -1003,6 +1009,7 @@ mod tests {
             effects: Vec::new(),
             return_type: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
             body,
+            examples: Vec::new(),
         });
         let err = inline_let(&stage, &NodeId("n_0.1".into())).unwrap_err();
         assert!(matches!(err, TransformError::InlineLetRefused { .. }), "got {err:?}");
@@ -1038,6 +1045,7 @@ mod tests {
             effects: Vec::new(),
             return_type: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
             body,
+            examples: Vec::new(),
         });
         // Let `x` is at child index 2 (1 param + return + body slot).
         let err = inline_let(&stage, &NodeId("n_0.2".into())).unwrap_err();
@@ -1076,6 +1084,7 @@ mod tests {
             effects: Vec::new(),
             return_type: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
             body,
+            examples: Vec::new(),
         });
         let out = inline_let(&stage, &NodeId("n_0.2".into())).unwrap();
         let Stage::FnDecl(fd) = out else { panic!() };
@@ -1121,6 +1130,7 @@ mod tests {
             effects: Vec::new(),
             return_type: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
             body,
+            examples: Vec::new(),
         })
     }
 
@@ -1212,6 +1222,7 @@ mod tests {
             effects: Vec::new(),
             return_type: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
             body,
+            examples: Vec::new(),
         });
         let spec = ExtractFnSpec {
             name: "one".into(),
@@ -1272,6 +1283,7 @@ mod tests {
             effects: Vec::new(),
             return_type: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
             body,
+            examples: Vec::new(),
         })
     }
 

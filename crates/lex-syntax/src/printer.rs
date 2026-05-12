@@ -72,9 +72,38 @@ impl Printer {
         write!(self.out, ") -> ").unwrap();
         self.effects(&fd.effects);
         self.type_expr(&fd.return_type);
-        write!(self.out, " ").unwrap();
+        if fd.examples.is_empty() {
+            write!(self.out, " ").unwrap();
+        } else {
+            self.examples(&fd.name, &fd.examples);
+            self.nl();
+        }
         self.block(&fd.body);
         self.nl();
+    }
+
+    fn examples(&mut self, fn_name: &str, examples: &[Example]) {
+        if examples.is_empty() { return; }
+        self.nl();
+        write!(self.out, "  examples {{").unwrap();
+        self.indent += 2;
+        for (i, ex) in examples.iter().enumerate() {
+            self.nl();
+            self.write_indent();
+            write!(self.out, "{}(", fn_name).unwrap();
+            for (j, a) in ex.args.iter().enumerate() {
+                if j > 0 { write!(self.out, ", ").unwrap(); }
+                self.expr(a);
+            }
+            write!(self.out, ") => ").unwrap();
+            self.expr(&ex.expected);
+            if i + 1 < examples.len() {
+                write!(self.out, ",").unwrap();
+            }
+        }
+        self.indent -= 2;
+        self.nl();
+        write!(self.out, "  }}").unwrap();
     }
 
     fn effects(&mut self, effects: &[Effect]) {

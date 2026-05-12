@@ -361,8 +361,49 @@ impl Parser {
         self.expect(&TokenKind::Arrow, "before return type")?;
         let effects = self.parse_effects()?;
         let return_type = self.parse_type_expr()?;
+        let examples = self.parse_examples_block()?;
         let body = self.parse_block()?;
-        Ok(FnDecl { name, type_params, params, effects, return_type, body })
+        Ok(FnDecl { name, type_params, params, effects, return_type, body, examples })
+    }
+
+    /// Parse an optional `examples { call(a, b) => expected, ... }` block
+    /// sitting between the return type and the body (#369). Returns an
+    /// empty vec when no block is present.
+    fn parse_examples_block(&mut self) -> Result<Vec<Example>, ParseError> {
+        // Contextual: not a reserved keyword. Peek for the literal
+        // identifier `examples` followed by `{`; otherwise no block.
+        let is_examples_kw = match self.peek_skip_newlines() {
+            Some(TokenKind::Ident(s)) if s == "examples" => true,
+            _ => false,
+        };
+        if !is_examples_kw {
+            return Ok(Vec::new());
+        }
+        self.skip_newlines();
+        self.bump(); // consume `examples`
+        self.expect(&TokenKind::LBrace, "after `examples`")?;
+        let mut cases = Vec::new();
+        loop {
+            self.skip_newlines();
+            if matches!(self.peek(), Some(TokenKind::RBrace)) { break; }
+            let call = self.parse_expr()?;
+            self.expect(&TokenKind::FatArrow, "in example case (between call and expected)")?;
+            let expected = self.parse_expr()?;
+            let (args, _) = match call {
+                Expr::Call { callee: _, args } => (args, ()),
+                other => return Err(self.error(
+                    format!("example case must be a call to the function under definition; got {other:?}")
+                )),
+            };
+            cases.push(Example { args, expected });
+            self.skip_newlines();
+            if !self.eat(&TokenKind::Comma) {
+                self.skip_newlines();
+                break;
+            }
+        }
+        self.expect(&TokenKind::RBrace, "to close examples block")?;
+        Ok(cases)
     }
 
     fn parse_param(&mut self) -> Result<Param, ParseError> {

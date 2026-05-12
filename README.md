@@ -77,6 +77,32 @@ is a signed attestation that walks with the code.
 7. **Small total surface.** Grammar fits in ≤ 500 tokens; stdlib index ≤ 2000.
 8. **The AST is the interface.** Source text is a projection.
 
+### Signature-level examples
+
+A pure function can carry an optional `examples { ... }` block. Each case
+is folded into the canonical AST, so the **examples are part of the
+signature's identity** — two implementations with different example sets
+hash to different SigIds. The type checker validates every case before a
+byte runs.
+
+```lex
+fn factorial(n :: Int) -> Int
+  examples {
+    factorial(0) => 1,
+    factorial(5) => 120,
+  }
+{
+  match n {
+    0 => 1,
+    _ => n * factorial(n - 1),
+  }
+}
+```
+
+v1 restricts the block to functions with no declared effects (rule 5 —
+determinism). See [issue #369](https://github.com/alpibrusl/lex-lang/issues/369)
+for the design and follow-ups (behavioral evaluation, mocked effects).
+
 ## Quickstart
 
 ```bash

@@ -54,6 +54,13 @@ fn sig_hash(stage: &Stage, include_name: bool) -> Option<[u8; 32]> {
                 fd.params.iter().map(|p| &p.ty).collect::<Vec<_>>()
             ).unwrap());
             v.insert("output_type".into(), serde_json::to_value(&fd.return_type).unwrap());
+            // Signature-level examples (#369) are part of the contract:
+            // two signatures with different example sets hash differently.
+            // Omitted entirely when there are no examples, preserving
+            // pre-#369 SigIds bit-for-bit.
+            if !fd.examples.is_empty() {
+                v.insert("examples".into(), serde_json::to_value(&fd.examples).unwrap());
+            }
             if include_name { v.insert("name".into(), serde_json::Value::String(fd.name.clone())); }
             serde_json::Value::Object(v)
         }

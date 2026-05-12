@@ -96,3 +96,74 @@ fn every_error_has_node_id() {
     let errs = check(src).unwrap_err();
     for e in &errs { assert!(!e.node().is_empty(), "missing node id: {e:?}"); }
 }
+
+// --- #369: signature-level examples ---
+
+#[test]
+fn examples_with_matching_types_check() {
+    let src = "fn id(x :: Int) -> Int\nexamples { id(7) => 7, id(0) => 0 }\n{ x }\n";
+    check(src).unwrap_or_else(|errs| panic!("type errors: {errs:#?}"));
+}
+
+#[test]
+fn example_arg_type_mismatch_is_caught() {
+    let src = "fn id(x :: Int) -> Int\nexamples { id(\"oops\") => 7 }\n{ x }\n";
+    let errs = check(src).unwrap_err();
+    assert!(
+        errs.iter().any(|e| matches!(e, TypeError::TypeMismatch { .. })),
+        "expected TypeMismatch, got {errs:#?}"
+    );
+}
+
+#[test]
+fn example_expected_type_mismatch_is_caught() {
+    let src = "fn id(x :: Int) -> Int\nexamples { id(7) => \"seven\" }\n{ x }\n";
+    let errs = check(src).unwrap_err();
+    assert!(
+        errs.iter().any(|e| matches!(e, TypeError::TypeMismatch { .. })),
+        "expected TypeMismatch, got {errs:#?}"
+    );
+}
+
+#[test]
+fn example_arity_mismatch_is_caught() {
+    let src = "fn add(x :: Int, y :: Int) -> Int\nexamples { add(1) => 1 }\n{ x + y }\n";
+    let errs = check(src).unwrap_err();
+    assert!(
+        errs.iter().any(|e| matches!(e, TypeError::ExampleArityMismatch { .. })),
+        "expected ExampleArityMismatch, got {errs:#?}"
+    );
+}
+
+#[test]
+fn examples_on_effectful_fn_are_rejected() {
+    let src = r#"
+import "std.io" as io
+fn echoes(s :: Str) -> [io] Str
+  examples { echoes("hi") => "hi" }
+{ s }
+"#;
+    let errs = check(src).unwrap_err();
+    assert!(
+        errs.iter().any(|e| matches!(e, TypeError::ExamplesOnEffectfulFn { .. })),
+        "expected ExamplesOnEffectfulFn, got {errs:#?}"
+    );
+}
+
+#[test]
+fn example_rule_tags_round_trip() {
+    // Both new rule tags must be reachable via `TypeError::rule_tag()`.
+    let arity = TypeError::ExampleArityMismatch {
+        at_node: "n_0".into(),
+        fn_name: "f".into(),
+        case_index: 0,
+        expected: 2,
+        got: 1,
+    };
+    let effectful = TypeError::ExamplesOnEffectfulFn {
+        at_node: "n_0".into(),
+        fn_name: "f".into(),
+    };
+    assert_eq!(arity.rule_tag(), "example-arity-mismatch");
+    assert_eq!(effectful.rule_tag(), "examples-on-effectful-fn");
+}

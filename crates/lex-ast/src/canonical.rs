@@ -29,6 +29,18 @@ pub struct FnDecl {
     pub effects: Vec<Effect>,
     pub return_type: TypeExpr,
     pub body: CExpr,
+    /// Signature-level examples (#369). Empty when the source carried no
+    /// `examples { ... }` block; in that case the field is omitted from
+    /// the canonical-JSON encoding, so SigId / StageId are bit-identical
+    /// to pre-#369 stages.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub examples: Vec<Example>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Example {
+    pub args: Vec<CExpr>,
+    pub expected: CExpr,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

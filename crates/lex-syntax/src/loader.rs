@@ -357,6 +357,11 @@ impl<'a> Mangler<'a> {
             effects: fd.effects,
             return_type: self.mangle_type_expr(fd.return_type),
             body: self.mangle_block(fd.body, &shadow),
+            // Examples (#369) ride through the loader unchanged. They
+            // are self-contained calls with pure args; cross-module
+            // identifier rewriting inside example expressions is a
+            // follow-up if it becomes a real need.
+            examples: fd.examples,
         }
     }
 

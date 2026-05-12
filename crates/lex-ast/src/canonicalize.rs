@@ -55,6 +55,14 @@ fn canonicalize_fn_decl(fd: &s::FnDecl) -> FnDecl {
         effects: fd.effects.iter().map(canonicalize_effect).collect(),
         return_type: canonicalize_type(&fd.return_type),
         body: canonicalize_block(&fd.body),
+        examples: fd.examples.iter().map(canonicalize_example).collect(),
+    }
+}
+
+fn canonicalize_example(ex: &s::Example) -> Example {
+    Example {
+        args: ex.args.iter().map(canonicalize_expr).collect(),
+        expected: canonicalize_expr(&ex.expected),
     }
 }
 
