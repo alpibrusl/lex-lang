@@ -247,6 +247,13 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::empty(),
                 Ty::List(Box::new(Ty::Var(0))),
             ));
+            // enumerate :: List[T] -> List[(Int, T)]
+            // Pairs each element with its zero-based index.
+            fields.insert("enumerate".into(), Ty::function(
+                vec![Ty::List(Box::new(Ty::Var(0)))],
+                EffectSet::empty(),
+                Ty::List(Box::new(Ty::Tuple(vec![Ty::int(), Ty::Var(0)]))),
+            ));
             Some(Ty::Record(fields))
         }
         "bytes" => {
@@ -533,6 +540,17 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             fields.insert("unwrap_or".into(), Ty::function(
                 vec![Ty::Con("Option".into(), vec![Ty::Var(0)]), Ty::Var(0)],
                 EffectSet::empty(),
+                Ty::Var(0),
+            ));
+            // option.unwrap_or_else :: Option[T], () -> [E] T -> [E] T
+            // Lazy variant of unwrap_or: the default is computed by a closure
+            // only when the value is None (effect-polymorphic on the closure).
+            fields.insert("unwrap_or_else".into(), Ty::function(
+                vec![
+                    Ty::Con("Option".into(), vec![Ty::Var(0)]),
+                    Ty::function(vec![], EffectSet::open_var(5), Ty::Var(0)),
+                ],
+                EffectSet::open_var(5),
                 Ty::Var(0),
             ));
             // option.or_else :: Option[T], () -> [E] Option[T] -> [E] Option[T]
@@ -1357,6 +1375,11 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             // is_match :: Regex, Str -> Bool
             fields.insert("is_match".into(), Ty::function(
                 vec![regex_t(), Ty::str()], EffectSet::empty(), Ty::bool()));
+            // is_match_str :: Str, Str -> Bool
+            // Compiles the first argument as a pattern and matches against the second.
+            // Returns false on invalid pattern instead of propagating an error.
+            fields.insert("is_match_str".into(), Ty::function(
+                vec![Ty::str(), Ty::str()], EffectSet::empty(), Ty::bool()));
             // find :: Regex, Str -> Option[Match]
             fields.insert("find".into(), Ty::function(
                 vec![regex_t(), Ty::str()], EffectSet::empty(),

@@ -618,6 +618,7 @@ impl<'a> FnCompiler<'a> {
             ("option", "map") => self.emit_variant_map(args, "Some", true),
             ("option", "and_then") => self.emit_variant_map(args, "Some", false),
             ("option", "or_else") => self.emit_variant_or_else(args, "None", 0),
+            ("option", "unwrap_or_else") => self.emit_option_unwrap_or_else(args),
             ("list", "map") => self.emit_list_map(args),
             ("list", "par_map") => self.emit_list_par_map(args),
             ("list", "filter") => self.emit_list_filter(args),
@@ -1029,6 +1030,54 @@ impl<'a> FnCompiler<'a> {
             *off = skip_target - (j_skip as i32 + 1);
         }
 
+        let end_target = self.code.len() as i32;
+        if let Op::Jump(off) = &mut self.code[j_end] {
+            *off = end_target - (j_end as i32 + 1);
+        }
+    }
+
+    /// `option.unwrap_or_else(opt, f)` — lazy default via zero-arg thunk.
+    ///   Some(x) → x          (unwrap; no wrapping)
+    ///   None    → f()        (call thunk; return its result directly)
+    fn emit_option_unwrap_or_else(&mut self, args: &[a::CExpr]) {
+        let some_idx = self.pool.variant("Some");
+
+        // Compile opt and f; stash both so they're accessible on both arms.
+        self.compile_expr(&args[0], false);
+        let val_slot = self.alloc_local("__uoe_val");
+        self.emit(Op::StoreLocal(val_slot));
+
+        self.compile_expr(&args[1], false);
+        let f_slot = self.alloc_local("__uoe_f");
+        self.emit(Op::StoreLocal(f_slot));
+
+        // Test whether opt is Some.
+        //   load val ⇒ [v]
+        //   dup      ⇒ [v, v]
+        //   test     ⇒ [v, Bool]
+        //   jumpifnot → None arm
+        self.emit(Op::LoadLocal(val_slot));
+        self.emit(Op::Dup);
+        self.emit(Op::TestVariant(some_idx));
+        let j_none = self.code.len();
+        self.emit(Op::JumpIfNot(0));
+
+        // Some arm: extract the payload from [v] left on the stack.
+        self.emit(Op::GetVariantArg(0));
+        let j_end = self.code.len();
+        self.emit(Op::Jump(0));
+
+        // None arm: pop the [v] duplicate, call the thunk.
+        let none_target = self.code.len() as i32;
+        if let Op::JumpIfNot(off) = &mut self.code[j_none] {
+            *off = none_target - (j_none as i32 + 1);
+        }
+        self.emit(Op::Pop);
+        self.emit(Op::LoadLocal(f_slot));
+        let nid = self.pool.node_id("n_uoe");
+        self.emit(Op::CallClosure { arity: 0, node_id_idx: nid });
+
+        // Patch jump-to-end from Some arm.
         let end_target = self.code.len() as i32;
         if let Op::Jump(off) = &mut self.code[j_end] {
             *off = end_target - (j_end as i32 + 1);

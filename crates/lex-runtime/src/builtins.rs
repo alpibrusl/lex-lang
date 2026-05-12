@@ -179,6 +179,13 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             out.extend(expect_list(args.get(1))?.iter().cloned());
             Ok(Value::List(out))
         }
+        ("list", "enumerate") => {
+            let xs = expect_list(args.first())?;
+            let pairs = xs.iter().cloned().enumerate()
+                .map(|(i, v)| Value::Tuple(vec![Value::Int(i as i64), v]))
+                .collect::<Vec<_>>();
+            Ok(Value::List(pairs))
+        }
 
         // -- tuple --
         // Per §11.1: fst, snd, third for 2- and 3-tuples. Index out of
@@ -200,6 +207,23 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                 Value::Variant { name, args } if name == "Some" && !args.is_empty() => Ok(args[0].clone()),
                 Value::Variant { name, .. } if name == "None" => Ok(default),
                 other => Err(format!("option.unwrap_or expected Option, got {other:?}")),
+            }
+        }
+        // option.unwrap_or_else: lazy default via thunk — only called when None.
+        // Handled inline by the bytecode compiler; this arm is the interpreter
+        // fallback path (thunk is pre-applied as a Value::Unit default since the
+        // runtime cannot call closures itself — the compiler path is canonical).
+        ("option", "unwrap_or_else") => {
+            let opt = first_arg(args)?;
+            match opt {
+                Value::Variant { name, args } if name == "Some" && !args.is_empty() => Ok(args[0].clone()),
+                Value::Variant { name, .. } if name == "None" => {
+                    // The closure argument cannot be invoked from pure-builtin
+                    // context; callers that reach this path have already
+                    // evaluated the thunk and passed its result as args[1].
+                    Ok(args.get(1).cloned().unwrap_or(Value::Unit))
+                }
+                other => Err(format!("option.unwrap_or_else expected Option, got {other:?}")),
             }
         }
         ("option", "is_some") => match first_arg(args)? {
@@ -1105,6 +1129,18 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let s = expect_str(args.get(1))?;
             let re = get_or_compile_regex(&pat).map_err(|e| format!("regex.is_match: {e}"))?;
             Ok(Value::Bool(re.is_match(&s)))
+        }
+        // is_match_str :: Str, Str -> Bool
+        // Compiles the first argument as a pattern on the fly (uses the shared
+        // cache) and matches against the second.  Returns false on invalid
+        // pattern rather than propagating an error, keeping the pure signature.
+        ("regex", "is_match_str") => {
+            let pat = expect_str(args.first())?;
+            let s = expect_str(args.get(1))?;
+            match get_or_compile_regex(&pat) {
+                Ok(re) => Ok(Value::Bool(re.is_match(&s))),
+                Err(_) => Ok(Value::Bool(false)),
+            }
         }
         ("regex", "find") => {
             let pat = expect_str(args.first())?;
