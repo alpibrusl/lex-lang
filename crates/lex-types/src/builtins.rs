@@ -247,6 +247,12 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::empty(),
                 Ty::List(Box::new(Ty::Var(0))),
             ));
+            // reverse :: List[T] -> List[T]
+            fields.insert("reverse".into(), Ty::function(
+                vec![Ty::List(Box::new(Ty::Var(0)))],
+                EffectSet::empty(),
+                Ty::List(Box::new(Ty::Var(0))),
+            ));
             // enumerate :: List[T] -> List[(Int, T)]
             // Pairs each element with its zero-based index.
             fields.insert("enumerate".into(), Ty::function(

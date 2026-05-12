@@ -1081,8 +1081,8 @@ impl<'a> Vm<'a> {
                     }
                 }
                 Op::NumEq => self.bin_eq()?,
-                Op::NumLt => self.bin_num(|a, b| Value::Bool(a < b), |a, b| Value::Bool(a < b))?,
-                Op::NumLe => self.bin_num(|a, b| Value::Bool(a <= b), |a, b| Value::Bool(a <= b))?,
+                Op::NumLt => self.bin_ord(|a, b| Value::Bool(a < b), |a, b| Value::Bool(a < b), |a, b| Value::Bool(a < b))?,
+                Op::NumLe => self.bin_ord(|a, b| Value::Bool(a <= b), |a, b| Value::Bool(a <= b), |a, b| Value::Bool(a <= b))?,
                 Op::BoolAnd => {
                     let b = self.pop()?.as_bool();
                     let a = self.pop()?.as_bool();
@@ -1161,6 +1161,25 @@ impl<'a> Vm<'a> {
         match (a, b) {
             (Value::Int(x), Value::Int(y)) => { self.stack.push(i(x, y)); Ok(()) }
             (Value::Float(x), Value::Float(y)) => { self.stack.push(f(x, y)); Ok(()) }
+            (a, b) => Err(VmError::TypeMismatch(format!("Num op: {a:?} {b:?}"))),
+        }
+    }
+
+    /// Like `bin_num` but also handles `Str` operands via lexicographic order.
+    /// Used by `NumLt` / `NumLe` because the type checker admits `Str < Str`
+    /// and `>` / `>=` compile as swap+NumLt / swap+NumLe (#332).
+    fn bin_ord(
+        &mut self,
+        i: impl Fn(i64, i64) -> Value,
+        f: impl Fn(f64, f64) -> Value,
+        s: impl Fn(&str, &str) -> Value,
+    ) -> Result<(), VmError> {
+        let b = self.pop()?;
+        let a = self.pop()?;
+        match (a, b) {
+            (Value::Int(x), Value::Int(y)) => { self.stack.push(i(x, y)); Ok(()) }
+            (Value::Float(x), Value::Float(y)) => { self.stack.push(f(x, y)); Ok(()) }
+            (Value::Str(x), Value::Str(y)) => { self.stack.push(s(&x, &y)); Ok(()) }
             (a, b) => Err(VmError::TypeMismatch(format!("Num op: {a:?} {b:?}"))),
         }
     }

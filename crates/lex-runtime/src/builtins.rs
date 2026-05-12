@@ -179,6 +179,11 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             out.extend(expect_list(args.get(1))?.iter().cloned());
             Ok(Value::List(out))
         }
+        ("list", "reverse") => {
+            let mut out = expect_list(args.first())?.clone();
+            out.reverse();
+            Ok(Value::List(out))
+        }
         ("list", "enumerate") => {
             let xs = expect_list(args.first())?;
             let pairs = xs.iter().cloned().enumerate()
