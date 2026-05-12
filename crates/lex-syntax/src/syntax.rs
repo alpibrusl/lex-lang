@@ -137,6 +137,11 @@ pub enum Expr {
     /// constructors into.
     Constructor { name: String, args: Vec<Expr> },
     Lambda(Box<Lambda>),
+    /// Inline type ascription `(expr :: Type)`. The declared type is checked
+    /// against the inferred type at type-check time; at runtime it compiles
+    /// identically to the inner expression (type-only annotation, erased at
+    /// bytecode level). (#319)
+    Ascription { value: Box<Expr>, ty: TypeExpr },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

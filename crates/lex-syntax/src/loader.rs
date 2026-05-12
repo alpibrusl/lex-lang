@@ -512,6 +512,10 @@ impl<'a> Mangler<'a> {
                     .map(|a| self.mangle_expr(a, shadow))
                     .collect(),
             },
+            Expr::Ascription { value, ty } => Expr::Ascription {
+                value: Box::new(self.mangle_expr(*value, shadow)),
+                ty: self.mangle_type_expr(ty),
+            },
             Expr::Lambda(lambda) => {
                 let mut lam_shadow = shadow.clone();
                 for p in &lambda.params {

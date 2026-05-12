@@ -732,6 +732,13 @@ impl Parser {
             return Ok(Expr::Lit(Literal::Unit));
         }
         let first = self.parse_expr()?;
+        // Inline type ascription: `(expr :: Type)` — peek for `::` before
+        // deciding whether this is a tuple, a grouping, or an ascription.
+        if self.eat(&TokenKind::ColonColon) {
+            let ty = self.parse_type_expr()?;
+            self.expect(&TokenKind::RParen, "after type ascription")?;
+            return Ok(Expr::Ascription { value: Box::new(first), ty });
+        }
         if self.eat(&TokenKind::Comma) {
             let mut items = vec![first];
             if !matches!(self.peek_skip_newlines(), Some(TokenKind::RParen)) {

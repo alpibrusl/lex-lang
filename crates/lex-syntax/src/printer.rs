@@ -294,6 +294,13 @@ impl Printer {
                     write!(self.out, ")").unwrap();
                 }
             }
+            Expr::Ascription { value, ty } => {
+                write!(self.out, "(").unwrap();
+                self.expr(value);
+                write!(self.out, " :: ").unwrap();
+                self.type_expr(ty);
+                write!(self.out, ")").unwrap();
+            }
             Expr::Lambda(l) => {
                 write!(self.out, "fn (").unwrap();
                 for (i, p) in l.params.iter().enumerate() {
