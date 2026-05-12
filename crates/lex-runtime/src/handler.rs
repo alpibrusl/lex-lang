@@ -692,6 +692,12 @@ impl EffectHandler for DefaultHandler {
         // declared kind is `time`, matching the existing `time.now`.
         if kind == "datetime" && op == "now" {
             self.ensure_kind_allowed("time")?;
+            // LEX_TEST_NOW (Unix seconds) pins the clock for deterministic tests (#350).
+            if let Ok(s) = std::env::var("LEX_TEST_NOW") {
+                if let Ok(secs) = s.trim().parse::<i64>() {
+                    return Ok(Value::Int(secs.saturating_mul(1_000_000_000)));
+                }
+            }
             let now = chrono::Utc::now();
             let nanos = now.timestamp_nanos_opt().unwrap_or(i64::MAX);
             return Ok(Value::Int(nanos));
