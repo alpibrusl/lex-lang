@@ -4,7 +4,7 @@ Language Server Protocol bridge for Lex. Pipes
 `lex_types::check_program` errors to editor inline-error surfaces
 (VS Code, Cursor, Continue, Zed, JetBrains AI).
 
-## What's shipped (phases 1 + 2a + 3a + 3b of #304)
+## What's shipped (phases 1 + 2a + 3a + 3b + 4 of #304)
 
 **Phase 1** — read-only diagnostics:
 
@@ -50,6 +50,17 @@ Language Server Protocol bridge for Lex. Pipes
   (`RenameLocal`, `ReplaceMatchArm`, `ExtractFunction`) need
   cursor-to-NodeId mapping queued for a follow-up.
 
+**Phase 4** — `RepairHint` surface from the store:
+
+- Launch the LSP with `LEX_STORE=<path>` and every fn in the open
+  file whose `stage_id` has an active `RepairHint` attestation
+  (#281) surfaces as a QuickFix titled *"Lex: repair hint for
+  `<fn>` (<rule_tag>) — <kind_hint>"*. The action's `data`
+  carries `failed_op_id`, `stage_id`, structured errors,
+  `suggested_transform`, and `attestation_id` so a client
+  extension can pipe to `lex repair --apply`. Stores not
+  configured (no `LEX_STORE`) degrade silently.
+
 ## Build
 
 ```bash
@@ -94,12 +105,13 @@ A `.vscode/launch.json` snippet for debugging the LSP itself:
 }
 ```
 
-## What's queued (phases 2b / 3c / 4 of #304)
+## What's queued (phases 2b / 3c / 4b of #304)
 
 - Phase 2b: cross-file definition jumps, references, stdlib-module-
   member completion.
 - Phase 3c: applying refactors for the remaining #280 transforms
   (`RenameLocal`, `ReplaceMatchArm`, `ExtractFunction`). Needs
   cursor-to-NodeId mapping.
-- Phase 4: surface `RepairHint` attestations directly (one-click
-  `lex repair --apply` over the latest hint for a stage).
+- Phase 4b: invoking `lex repair --apply` directly from the LSP
+  command handler so the RepairHint action lands a real
+  `WorkspaceEdit` inline.

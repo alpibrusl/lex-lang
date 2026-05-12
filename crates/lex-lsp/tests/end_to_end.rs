@@ -23,12 +23,18 @@ struct Server {
 
 impl Server {
     fn spawn() -> Self {
-        let mut child = Command::new(lsp_bin())
-            .stdin(Stdio::piped())
+        Self::spawn_with_env(&[])
+    }
+
+    fn spawn_with_env(env: &[(&str, &str)]) -> Self {
+        let mut cmd = Command::new(lsp_bin());
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn lex-lsp");
+            .stderr(Stdio::piped());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().expect("spawn lex-lsp");
         let stdin = child.stdin.take().expect("stdin");
         let stdout = child.stdout.take().expect("stdout");
         Self { child, stdin, reader: BufReader::new(stdout) }
@@ -516,6 +522,125 @@ fn inline_let_refactor_silent_when_no_top_level_let() {
     let resp = s.recv();
     let actions = resp["result"].as_array().expect("array");
     assert!(actions.is_empty(), "no actions: {resp}");
+}
+
+#[test]
+fn repair_hint_surfaces_as_code_action_when_store_has_one() {
+    // Phase 4a end-to-end: build a real store + push a typecheck-
+    // rejected variant so the gate auto-emits a RepairHint
+    // attestation. Spawn the LSP with LEX_STORE pointing at it,
+    // open the file whose stage_id matches the candidate, and
+    // expect a QuickFix code action carrying the hint metadata.
+    use lex_ast::{canonicalize_program, sig_id, stage_id, CExpr, CLit, NodeId, Stage};
+    let tmp = tempfile::TempDir::new().unwrap();
+    let store_path = tmp.path().to_path_buf();
+    let store = lex_store::Store::open(&store_path).unwrap();
+
+    let original_src = "fn pick(n :: Int) -> Int { match n { 0 => 1, _ => 2 } }\n";
+    let prog = lex_syntax::parse_source(original_src).unwrap();
+    let stage = canonicalize_program(&prog)
+        .into_iter()
+        .find(|s| matches!(s, Stage::FnDecl(fd) if fd.name == "pick"))
+        .unwrap();
+    let sig = sig_id(&stage).unwrap();
+    let stg = stage_id(&stage).unwrap();
+    store.publish(&stage).unwrap();
+    let op = lex_vcs::Operation::new(
+        lex_vcs::OperationKind::AddFunction {
+            sig_id: sig.clone(),
+            stage_id: stg.clone(),
+            effects: Default::default(),
+            budget_cost: None,
+        },
+        [],
+    );
+    let t = lex_vcs::StageTransition::Create {
+        sig_id: sig.clone(),
+        stage_id: stg.clone(),
+    };
+    store
+        .apply_operation(lex_store::DEFAULT_BRANCH, op, t)
+        .unwrap();
+    // Push a typecheck-rejected variant to plant the RepairHint.
+    let ill = CExpr::Literal {
+        value: CLit::Str { value: "boom".into() },
+    };
+    let _ = store
+        .apply_replace_match_arm(
+            lex_store::DEFAULT_BRANCH,
+            &stg,
+            &NodeId("n_0.2".into()),
+            0,
+            ill,
+        )
+        .unwrap_err();
+    // The LSP looks up by stage_id of the fn in the open source.
+    // The hint is attached to the candidate stage, so re-derive
+    // the candidate and use its canonical source.
+    let cand = lex_ast::replace_match_arm(
+        &stage,
+        &NodeId("n_0.2".into()),
+        0,
+        CExpr::Literal { value: CLit::Str { value: "boom".into() } },
+    )
+    .unwrap();
+    let cand_src = lex_ast::print_stages(&[cand]);
+
+    let mut s = Server::spawn_with_env(&[("LEX_STORE", store_path.to_str().unwrap())]);
+    s.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "capabilities": {}, "processId": null, "rootUri": null }
+    }));
+    let _ = s.recv();
+    s.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "initialized",
+        "params": {}
+    }));
+    s.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {
+                "uri": "file:///tmp/lsp_repair_hint.lex",
+                "languageId": "lex",
+                "version": 1,
+                "text": cand_src,
+            }
+        }
+    }));
+    let diag = s.recv(); // publishDiagnostics (the file has a type error)
+    let diagnostics = diag["params"]["diagnostics"].clone();
+
+    s.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/codeAction",
+        "params": {
+            "textDocument": { "uri": "file:///tmp/lsp_repair_hint.lex" },
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } },
+            "context": { "diagnostics": diagnostics }
+        }
+    }));
+    let resp = s.recv();
+    let actions = resp["result"].as_array().expect("array");
+    let titles: Vec<&str> = actions.iter().filter_map(|a| a["title"].as_str()).collect();
+    let hint_action = actions
+        .iter()
+        .find(|a| {
+            a["title"]
+                .as_str()
+                .is_some_and(|t| t.contains("repair hint"))
+        })
+        .unwrap_or_else(|| panic!("missing repair-hint action; saw: {titles:?}"));
+    let title = hint_action["title"].as_str().unwrap();
+    assert!(title.contains("pick"), "fn name in title: {title}");
+    assert!(title.contains("type-mismatch"), "rule_tag in title: {title}");
+    let data = &hint_action["data"];
+    assert!(data["failed_op_id"].as_str().is_some(), "failed_op_id present: {data}");
+    assert!(data["suggested_transform"].is_object());
 }
 
 #[test]

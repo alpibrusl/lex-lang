@@ -116,6 +116,26 @@ bumps may carry breaking changes when justified).
 
 ### Added
 
+- **#304 phase 4: `RepairHint` surface in `lex-lsp`.** Closes the
+  loop from typecheck failure → durable `RepairHint` attestation
+  (#281) → editor lightbulb. When the LSP is launched with
+  `LEX_STORE=<store-path>`, every fn in the open file whose
+  `stage_id` has an active `RepairHint` attestation surfaces as a
+  QuickFix code action titled
+  *"Lex: repair hint for `<fn>` (<rule_tag>) — <kind_hint>"*.
+  The `data` payload carries `failed_op_id`, `stage_id`, the
+  structured errors, the `suggested_transform`, and the
+  `attestation_id`, so a client extension (or phase 4b) can
+  invoke `lex repair --apply` and refresh the buffer. Hints are
+  resolved lazily per code-action request (no upfront index
+  build); the store is opened with `Store::open` on each request
+  and falls through silently when `LEX_STORE` is unset or the
+  path doesn't open — editors without a configured store see the
+  same surface as before. Coverage: 3 new lib unit tests
+  (round-trip through a real temp store; missing store → empty;
+  unparseable source → empty) + 1 e2e test through the protocol
+  with a real store that has a planted RepairHint.
+
 - **#304 phase 3b: applying `Inline let` refactor in `lex-lsp`.**
   First typed-transform (`InlineLet` from #280) that lands a real
   `WorkspaceEdit` instead of just a hint. The `textDocument/codeAction`

@@ -8,7 +8,8 @@
 
 use lex_lsp::{
     analyze_source, code_actions_for_diagnostics, completions, definition_at,
-    diagnostics_for_source, hover_at, inline_let_actions, Documents,
+    diagnostics_for_source, hover_at, inline_let_actions, repair_hint_actions_for_file,
+    Documents,
 };
 use lsp_server::{Connection, Message, Notification, Request, Response};
 use lsp_types::notification::{
@@ -215,6 +216,33 @@ fn handle_request(
                         disabled: None,
                         data: None,
                     }));
+                }
+
+                // Phase 4a: RepairHint surface. When `LEX_STORE`
+                // points at a lex-store and a stage in this file
+                // has a `RepairHint` attestation (#281), surface
+                // the hint as a QuickFix. The data payload carries
+                // failed_op_id + the structured suggestion so a
+                // client extension (or phase 4b) can invoke
+                // `lex repair --apply` and refresh the buffer.
+                if let Ok(store_dir) = std::env::var("LEX_STORE") {
+                    let store_path = std::path::PathBuf::from(store_dir);
+                    for hint in repair_hint_actions_for_file(&store_path, src) {
+                        let title = format!(
+                            "Lex: repair hint for `{}` ({}) — {}",
+                            hint.fn_name, hint.rule_tag, hint.kind_hint
+                        );
+                        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                            title,
+                            kind: Some(CodeActionKind::QUICKFIX),
+                            diagnostics: None,
+                            edit: None,
+                            command: None,
+                            is_preferred: None,
+                            disabled: None,
+                            data: Some(hint.data),
+                        }));
+                    }
                 }
             }
 
