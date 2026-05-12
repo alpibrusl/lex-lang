@@ -152,6 +152,31 @@ impl TypeEnv {
             kind: TypeDefKind::Alias(Ty::Record(mat_fields)),
         });
 
+        // Request = { method :: Str, path :: Str, query :: Str, body :: Str,
+        //             headers :: Map[Str, Str] }
+        // Inbound request shape used by net.serve_fn handlers.
+        let mut net_req_fields = IndexMap::new();
+        net_req_fields.insert("method".into(), Ty::str());
+        net_req_fields.insert("path".into(), Ty::str());
+        net_req_fields.insert("query".into(), Ty::str());
+        net_req_fields.insert("body".into(), Ty::str());
+        net_req_fields.insert("headers".into(), Ty::Con("Map".into(), vec![Ty::str(), Ty::str()]));
+        e.types.insert("Request".into(), TypeDef {
+            params: vec![],
+            kind: TypeDefKind::Alias(Ty::Record(net_req_fields)),
+        });
+
+        // Response = { status :: Int, body :: Str, headers :: Map[Str, Str] }
+        // Outbound response shape returned by net.serve_fn handlers.
+        let mut net_resp_fields = IndexMap::new();
+        net_resp_fields.insert("status".into(), Ty::int());
+        net_resp_fields.insert("body".into(), Ty::str());
+        net_resp_fields.insert("headers".into(), Ty::Con("Map".into(), vec![Ty::str(), Ty::str()]));
+        e.types.insert("Response".into(), TypeDef {
+            params: vec![],
+            kind: TypeDefKind::Alias(Ty::Record(net_resp_fields)),
+        });
+
         e
     }
 

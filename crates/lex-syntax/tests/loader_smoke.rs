@@ -385,6 +385,43 @@ fn main() -> Int {
 }
 
 #[test]
+fn diamond_via_dotdot_paths_share_one_module_identity() {
+    // Regression test for #358: two files reach the same physical module via
+    // different relative `..` paths. Before the fix, the loader stored the
+    // non-canonical PathBuf as the dedup key, so `lib/shared.lex` was loaded
+    // twice (with two different mangling prefixes), causing type errors.
+    //
+    // Layout:
+    //   tmp/lib/shared.lex    — defines `util`
+    //   tmp/src/body.lex      — imports "../lib/shared" as s
+    //   tmp/tests/test.lex    — imports "../src/body" as b
+    //                         + imports "../lib/shared" as s  (direct + indirect)
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("lib");
+    let src = dir.path().join("src");
+    let tests = dir.path().join("tests");
+    std::fs::create_dir_all(&lib).unwrap();
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&tests).unwrap();
+
+    write(&lib, "shared.lex", "fn util(x :: Int) -> Int { x + 1 }\n");
+    write(&src, "body.lex",
+        "import \"../lib/shared\" as s\nfn wrap(x :: Int) -> Int { s.util(x) }\n");
+    write(&tests, "test.lex",
+        "import \"../src/body\" as b\nimport \"../lib/shared\" as s\nfn run(x :: Int) -> Int { b.wrap(s.util(x)) }\n");
+
+    let prog = load_program(&tests.join("test.lex")).expect("load");
+
+    // util must appear exactly once — the shared module must not be loaded twice.
+    assert_eq!(
+        count_with_suffix(&prog, "util"),
+        1,
+        "shared.util should appear once after cross-dir dedupe; got fns: {:?}",
+        fn_names(&prog),
+    );
+}
+
+#[test]
 fn std_import_in_imported_file_is_preserved() {
     let dir = tempfile::tempdir().unwrap();
     write(

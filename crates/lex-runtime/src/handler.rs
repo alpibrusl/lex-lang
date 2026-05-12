@@ -895,6 +895,20 @@ impl EffectHandler for DefaultHandler {
                 let policy = self.policy.clone();
                 serve_http(port, handler_name, program, policy, None)
             }
+            ("net", "serve_fn") => {
+                let port = match args.first() {
+                    Some(Value::Int(n)) if (0..=65535).contains(n) => *n as u16,
+                    _ => return Err("net.serve_fn(port, handler): port must be Int 0..=65535".into()),
+                };
+                let closure = match args.into_iter().nth(1) {
+                    Some(c @ Value::Closure { .. }) => c,
+                    _ => return Err("net.serve_fn(port, handler): handler must be a closure".into()),
+                };
+                let program = self.program.clone()
+                    .ok_or_else(|| "net.serve_fn requires a Program reference; use DefaultHandler::with_program".to_string())?;
+                let policy = self.policy.clone();
+                serve_http_fn(port, closure, program, policy)
+            }
             ("net", "serve_tls") => {
                 let port = match args.first() {
                     Some(Value::Int(n)) if (0..=65535).contains(n) => *n as u16,
@@ -1255,8 +1269,55 @@ fn handle_request(
     let mut vm = Vm::with_handler(&program, Box::new(handler));
     match vm.call(&handler_name, vec![lex_req]) {
         Ok(resp) => {
-            let (status, body) = unpack_response(&resp);
-            let response = tiny_http::Response::from_string(body).with_status_code(status);
+            let (status, body, headers) = unpack_response(&resp);
+            let mut response = tiny_http::Response::from_string(body).with_status_code(status);
+            for h in headers {
+                response.add_header(h);
+            }
+            let _ = req.respond(response);
+        }
+        Err(e) => {
+            let response = tiny_http::Response::from_string(format!("internal error: {e}"))
+                .with_status_code(500);
+            let _ = req.respond(response);
+        }
+    }
+}
+
+fn serve_http_fn(
+    port: u16,
+    closure: Value,
+    program: Arc<Program>,
+    policy: Policy,
+) -> Result<Value, String> {
+    let server = tiny_http::Server::http(("127.0.0.1", port))
+        .map_err(|e| format!("net.serve_fn bind {port}: {e}"))?;
+    eprintln!("net.serve_fn: listening on http://127.0.0.1:{port}");
+    for req in server.incoming_requests() {
+        let program = Arc::clone(&program);
+        let policy = policy.clone();
+        let closure = closure.clone();
+        std::thread::spawn(move || handle_request_fn(req, program, policy, closure));
+    }
+    Ok(Value::Unit)
+}
+
+fn handle_request_fn(
+    mut req: tiny_http::Request,
+    program: Arc<Program>,
+    policy: Policy,
+    closure: Value,
+) {
+    let lex_req = build_request_value(&mut req);
+    let handler = DefaultHandler::new(policy).with_program(Arc::clone(&program));
+    let mut vm = Vm::with_handler(&program, Box::new(handler));
+    match vm.invoke_closure_value(closure, vec![lex_req]) {
+        Ok(resp) => {
+            let (status, body, headers) = unpack_response(&resp);
+            let mut response = tiny_http::Response::from_string(body).with_status_code(status);
+            for h in headers {
+                response.add_header(h);
+            }
             let _ = req.respond(response);
         }
         Err(e) => {
@@ -1274,6 +1335,13 @@ fn build_request_value(req: &mut tiny_http::Request) -> Value {
         Some((p, q)) => (p.to_string(), q.to_string()),
         None => (url, String::new()),
     };
+    let mut headers_map = std::collections::BTreeMap::new();
+    for h in req.headers() {
+        headers_map.insert(
+            lex_bytecode::MapKey::Str(h.field.as_str().as_str().to_ascii_lowercase()),
+            Value::Str(h.value.as_str().to_string()),
+        );
+    }
     let mut body = String::new();
     let _ = req.as_reader().read_to_string(&mut body);
     let mut rec = indexmap::IndexMap::new();
@@ -1281,10 +1349,11 @@ fn build_request_value(req: &mut tiny_http::Request) -> Value {
     rec.insert("path".into(), Value::Str(path));
     rec.insert("query".into(), Value::Str(query));
     rec.insert("body".into(), Value::Str(body));
+    rec.insert("headers".into(), Value::Map(headers_map));
     Value::Record(rec)
 }
 
-fn unpack_response(v: &Value) -> (u16, String) {
+fn unpack_response(v: &Value) -> (u16, String, Vec<tiny_http::Header>) {
     if let Value::Record(rec) = v {
         let status = rec.get("status").and_then(|s| match s {
             Value::Int(n) => Some(*n as u16),
@@ -1294,9 +1363,20 @@ fn unpack_response(v: &Value) -> (u16, String) {
             Value::Str(s) => Some(s.clone()),
             _ => None,
         }).unwrap_or_default();
-        return (status, body);
+        let headers = if let Some(Value::Map(hmap)) = rec.get("headers") {
+            hmap.iter().filter_map(|(k, v)| {
+                if let (lex_bytecode::MapKey::Str(name), Value::Str(val)) = (k, v) {
+                    format!("{name}: {val}").parse::<tiny_http::Header>().ok()
+                } else {
+                    None
+                }
+            }).collect()
+        } else {
+            vec![]
+        };
+        return (status, body, headers);
     }
-    (500, format!("handler returned non-record: {v:?}"))
+    (500, format!("handler returned non-record: {v:?}"), vec![])
 }
 
 /// HTTP/1.1 client backed by `ureq` + `rustls`. Accepts both

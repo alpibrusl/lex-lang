@@ -256,7 +256,13 @@ fn resolve_import(importer: &Path, reference: &str) -> Result<PathBuf, LoadError
             reference: reference.to_string(),
         });
     }
-    Ok(resolved)
+    // Canonicalize so that `../../shared/foo` and `../other/../shared/foo`
+    // resolve to the same HashMap key, preventing duplicate loads and
+    // mismatched mangling prefixes in diamond-import graphs (#358).
+    resolved.canonicalize().map_err(|source| LoadError::Io {
+        path: resolved.display().to_string(),
+        source,
+    })
 }
 
 struct Mangler<'a> {
