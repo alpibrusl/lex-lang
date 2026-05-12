@@ -182,6 +182,14 @@ fn walk_type<'a>(t: &'a TypeExpr, parent: &NodeId, out: &mut Vec<(NodeId, NodeRe
                 idx += 1;
             }
         }
+        TypeExpr::RecordWithSpreads { fields, .. } => {
+            for f in fields {
+                let id = parent.child(idx);
+                out.push((id.clone(), NodeRef::TypeExpr(&f.ty)));
+                walk_type(&f.ty, &id, out);
+                idx += 1;
+            }
+        }
         TypeExpr::Tuple { items } => {
             for it in items {
                 let id = parent.child(idx);

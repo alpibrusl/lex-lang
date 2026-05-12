@@ -264,7 +264,7 @@ impl TypeEnv {
                 });
             }
             other => {
-                let ty = ty_from_canon(other, &decl.params);
+                let ty = ty_from_canon_env(other, &decl.params, self);
                 self.types.insert(name.to_string(), TypeDef {
                     params: decl.params.clone(),
                     kind: TypeDefKind::Alias(ty),
@@ -353,5 +353,34 @@ pub fn ty_from_canon(t: &lex_ast::TypeExpr, params: &[String]) -> Ty {
             // wired up.
             ty_from_canon(base, params)
         }
+        lex_ast::TypeExpr::RecordWithSpreads { .. } => {
+            // Caller should use ty_from_canon_env for spread resolution.
+            Ty::Unit
+        }
+    }
+}
+
+/// Like `ty_from_canon` but resolves `RecordWithSpreads` by looking up base
+/// type names in `env`. Called from `add_user_type` and `function_scheme` so
+/// that `{ ...Post, extra :: Int }` expands to a flat `Ty::Record`.
+pub fn ty_from_canon_env(t: &lex_ast::TypeExpr, params: &[String], env: &TypeEnv) -> Ty {
+    match t {
+        lex_ast::TypeExpr::RecordWithSpreads { spreads, fields } => {
+            let mut m = IndexMap::new();
+            for spread_name in spreads {
+                if let Some(td) = env.types.get(spread_name.as_str()) {
+                    if let TypeDefKind::Alias(Ty::Record(spread_fields)) = &td.kind {
+                        for (k, v) in spread_fields {
+                            m.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+            for f in fields {
+                m.insert(f.name.clone(), ty_from_canon_env(&f.ty, params, env));
+            }
+            Ty::Record(m)
+        }
+        other => ty_from_canon(other, params),
     }
 }

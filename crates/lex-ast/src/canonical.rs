@@ -86,6 +86,13 @@ pub enum TypeExpr {
     Tuple { items: Vec<TypeExpr> },
     Function { params: Vec<TypeExpr>, effects: Vec<Effect>, ret: Box<TypeExpr> },
     Union { variants: Vec<UnionVariant> },
+    /// Record type with spread bases (#363): `{ ...TypeName, extra :: Type }`.
+    /// Kept in canonical form unresolved; type-checker expands to `Ty::Record`.
+    RecordWithSpreads {
+        spreads: Vec<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        fields: Vec<TypeField>,
+    },
     /// Refinement type (#209). Carries the predicate as a canonical
     /// expression so `lex-vcs` content-addressing picks up changes
     /// to the refinement just like changes to the base type. The

@@ -103,6 +103,15 @@ fn canonicalize_type(t: &s::TypeExpr) -> TypeExpr {
             },
             ret: Box::new(canonicalize_type(ret)),
         },
+        s::TypeExpr::RecordWithSpreads { spreads, fields } => {
+            TypeExpr::RecordWithSpreads {
+                spreads: spreads.clone(),
+                fields: fields
+                    .iter()
+                    .map(|f| TypeField { name: f.name.clone(), ty: canonicalize_type(&f.ty) })
+                    .collect(),
+            }
+        }
         s::TypeExpr::Union(variants) => {
             let mut vs: Vec<UnionVariant> = variants
                 .iter()

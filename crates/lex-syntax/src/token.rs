@@ -32,6 +32,9 @@ pub enum TokenKind {
     #[token("<=")] LtEq,
     #[token(">=")] GtEq,
 
+    // spread operator (record type spread `{ ...TypeName }`)
+    #[token("...")] DotDotDot,
+
     // single-char operators
     #[token("+")] Plus,
     #[token("-")] Minus,

@@ -2,7 +2,7 @@
 //! and checks declared signatures and effects.
 
 use crate::builtins::{module_for_import, module_scope};
-use crate::env::{TypeDefKind, TypeEnv, ty_from_canon};
+use crate::env::{TypeDefKind, TypeEnv, ty_from_canon_env};
 use crate::error::{PositionedError, TypeError};
 use crate::position::Position;
 use crate::types::*;
@@ -107,7 +107,7 @@ fn check_program_inner(
     // Pass 3: register fn signatures (so mutual recursion works).
     for stage in stages {
         if let a::Stage::FnDecl(fd) = stage {
-            let scheme = function_scheme(fd);
+            let scheme = function_scheme(fd, &tcx.type_env);
             tcx.globals.insert(fd.name.clone(), scheme);
             // #209 slice 2: keep the original params so call-site
             // refinement discharge can see the predicate before it
@@ -396,10 +396,10 @@ fn collect_eff_vars(t: &Ty) -> Vec<u32> {
     out
 }
 
-fn function_scheme(fd: &a::FnDecl) -> Scheme {
+fn function_scheme(fd: &a::FnDecl, env: &TypeEnv) -> Scheme {
     // Collect type-param ids in order; map their names to fresh Var(idx).
-    let params: Vec<Ty> = fd.params.iter().map(|p| ty_from_canon(&p.ty, &fd.type_params)).collect();
-    let ret = ty_from_canon(&fd.return_type, &fd.type_params);
+    let params: Vec<Ty> = fd.params.iter().map(|p| ty_from_canon_env(&p.ty, &fd.type_params, env)).collect();
+    let ret = ty_from_canon_env(&fd.return_type, &fd.type_params, env);
     // Plumb effect args (#207). A canonical-AST `EffectDecl` already
     // carries `Option<EffectArg>`; map it into the type-system kind so
     // subsumption can honor parameterized effects.
@@ -624,7 +624,7 @@ impl Checker {
 
     fn check_fn(&mut self, fd: &a::FnDecl) -> Result<Scheme, Vec<TypeError>> {
         // Instantiate fn's signature with fresh vars for its type params.
-        let scheme = function_scheme(fd);
+        let scheme = function_scheme(fd, &self.type_env);
         let (param_tys, declared_effects, ret_ty) = match instantiate(&scheme, &mut self.u) {
             Ty::Function { params, effects, ret } => (params, effects, *ret),
             _ => unreachable!(),
@@ -759,7 +759,7 @@ impl Checker {
             a::CExpr::Let { name, ty, value, body } => {
                 let v_ty = self.check_expr(value, node_id, locals, effs)?;
                 if let Some(declared) = ty {
-                    let d = ty_from_canon(declared, &[]);
+                    let d = ty_from_canon_env(declared, &[], &self.type_env);
                     if let Err(err) = self.unify_with_record_coercion(&v_ty, &d) {
                         return Err(mismatch_err(node_id, err, &self.u, vec![format!("in let `{}`", name)]));
                     }
@@ -854,8 +854,8 @@ impl Checker {
                 }
             }
             a::CExpr::Lambda { params, return_type, effects: l_effects, body } => {
-                let param_tys: Vec<Ty> = params.iter().map(|p| ty_from_canon(&p.ty, &[])).collect();
-                let ret_ty = ty_from_canon(return_type, &[]);
+                let param_tys: Vec<Ty> = params.iter().map(|p| ty_from_canon_env(&p.ty, &[], &self.type_env)).collect();
+                let ret_ty = ty_from_canon_env(return_type, &[], &self.type_env);
                 let declared = EffectSet {
                     concrete: {
                         let mut s = std::collections::BTreeSet::new();
