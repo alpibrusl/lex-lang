@@ -7,9 +7,17 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
-## [0.8.1] — 2026-05-12
+## [0.8.2] — 2026-05-12
 
 ### Fixed
+
+- **#345: type-alias unfold now reaches closure params and return types.**
+  `unify_coerce_inner` previously fell through to plain `unify` for
+  `Function` types, so a closure annotated `(Errors, Errors) -> Errors`
+  failed to unify with `list.fold`'s expected `(List[?n], ?m) -> List[?n]`
+  even when `Errors = List[Error]`. Adding a recursive `Function` case
+  (mirroring the existing `Tuple` and `Con-Con` cases) closes the gap for
+  all polymorphic stdlib HOFs. Closes #345.
 
 - **#332: `Str < Str` / `Str <= Str` / `Str > Str` / `Str >= Str` no longer
   crash at runtime.** The type checker already admitted string comparisons; the
