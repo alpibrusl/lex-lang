@@ -938,6 +938,22 @@ impl EffectHandler for DefaultHandler {
                 let registry = Arc::new(crate::ws::ChatRegistry::default());
                 crate::ws::serve_ws(port, handler_name, program, policy, registry)
             }
+            ("net", "serve_ws_fn") => {
+                let port = match args.first() {
+                    Some(Value::Int(n)) if (0..=65535).contains(n) => *n as u16,
+                    _ => return Err("net.serve_ws_fn(port, subprotocol, handler): port must be Int 0..=65535".into()),
+                };
+                let subprotocol = expect_str(args.get(1))?.to_string();
+                let closure = match args.into_iter().nth(2) {
+                    Some(c @ Value::Closure { .. }) => c,
+                    _ => return Err("net.serve_ws_fn(port, subprotocol, handler): handler must be a closure".into()),
+                };
+                let program = self.program.clone()
+                    .ok_or_else(|| "net.serve_ws_fn requires a Program reference; use DefaultHandler::with_program".to_string())?;
+                let policy = self.policy.clone();
+                let registry = Arc::new(crate::ws::ChatRegistry::default());
+                crate::ws::serve_ws_fn(port, subprotocol, closure, program, policy, registry)
+            }
             ("chat", "broadcast") => {
                 let registry = self.chat_registry.as_ref()
                     .ok_or_else(|| "chat.broadcast called outside a net.serve_ws handler".to_string())?;

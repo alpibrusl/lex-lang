@@ -57,6 +57,7 @@ use thiserror::Error;
 use sha2::{Digest, Sha256};
 
 use crate::syntax::*;
+use crate::workspace::{resolve_package_import, PackageError};
 use crate::{parse_source, SyntaxError};
 
 #[derive(Debug, Error)]
@@ -79,6 +80,8 @@ pub enum LoadError {
     NotFound { importer: String, reference: String },
     #[error("local imports (`./`, `../`, `/`) require a base path; cannot resolve from a string source")]
     LocalImportInStringSource,
+    #[error("package import error: {0}")]
+    Package(#[from] PackageError),
 }
 
 /// Load a multi-file Lex program, expanding local imports relative to
@@ -108,7 +111,9 @@ pub fn load_program_from_str(src: &str) -> Result<Program, LoadError> {
     })?;
     for item in &prog.items {
         if let Item::Import(imp) = item {
-            if is_path_import(&imp.reference) {
+            if is_path_import(&imp.reference)
+                || split_package_import(&imp.reference).is_some()
+            {
                 return Err(LoadError::LocalImportInStringSource);
             }
         }
@@ -203,6 +208,24 @@ impl LoaderState {
                     let child_prog = self.load(&resolved)?;
                     merged_children.extend(child_prog.items);
                 }
+                Item::Import(ref imp)
+                    if split_package_import(&imp.reference).is_some() =>
+                {
+                    let (pkg, module) =
+                        split_package_import(&imp.reference).unwrap();
+                    let resolved =
+                        resolve_package_import(canonical, pkg, module)
+                            .map_err(LoadError::Package)?
+                            .canonicalize()
+                            .map_err(|source| LoadError::Io {
+                                path: imp.reference.clone(),
+                                source,
+                            })?;
+                    let child_prefix = self.prefix_for(&resolved);
+                    path_imports.insert(imp.alias.clone(), child_prefix);
+                    let child_prog = self.load(&resolved)?;
+                    merged_children.extend(child_prog.items);
+                }
                 Item::Import(_) => std_imports.push(item),
                 _ => my_items.push(item),
             }
@@ -238,6 +261,20 @@ impl LoaderState {
 
 fn is_path_import(reference: &str) -> bool {
     reference.starts_with("./") || reference.starts_with("../") || reference.starts_with('/')
+}
+
+/// Returns `Some((pkg_name, module_path))` for package imports like
+/// `"lex-schema/validate"`. Stdlib (`std.*`) and relative paths are
+/// excluded — they are handled elsewhere.
+fn split_package_import(reference: &str) -> Option<(&str, &str)> {
+    if reference.starts_with("./")
+        || reference.starts_with("../")
+        || reference.starts_with('/')
+        || reference.starts_with("std.")
+    {
+        return None;
+    }
+    reference.split_once('/')
 }
 
 fn resolve_import(importer: &Path, reference: &str) -> Result<PathBuf, LoadError> {

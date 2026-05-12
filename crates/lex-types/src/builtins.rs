@@ -433,6 +433,28 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::singleton("net"),
                 Ty::Unit,
             ));
+            // serve_ws_fn[Eff] :: (Int, Str, (WsConn, WsMessage) -> [Eff] WsAction)
+            //                      -> [net, Eff] Unit
+            // Effect-polymorphic WebSocket server that accepts a handler closure.
+            // The second argument is the subprotocol string for the
+            // Sec-WebSocket-Protocol handshake header ("" for none).
+            // open_var(0) propagates the handler's effect row to the call site.
+            fields.insert("serve_ws_fn".into(), Ty::function(
+                vec![
+                    Ty::int(),
+                    Ty::str(), // subprotocol
+                    Ty::function(
+                        vec![
+                            Ty::Con("WsConn".into(), vec![]),
+                            Ty::Con("WsMessage".into(), vec![]),
+                        ],
+                        EffectSet::open_var(0),
+                        Ty::Con("WsAction".into(), vec![]),
+                    ),
+                ],
+                EffectSet::open_var(0).union(&EffectSet::singleton("net")),
+                Ty::Unit,
+            ));
             // serve_fn[Eff] :: (Int, (Request) -> [Eff] Response) -> [net, Eff] Unit
             // Effect-polymorphic variant of serve that accepts a first-class closure
             // instead of a handler name. open_var(0) captures the handler's effect row

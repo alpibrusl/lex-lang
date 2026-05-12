@@ -138,8 +138,59 @@ Set `LEX_TEST_NOW=<unix_seconds>` to pin the clock in tests (#350).
 ### `std.http`
 `get`, `post`, `put`, `delete`, `patch` — all require `[http.*]` effect.
 
+### `std.net`
+`net.serve(port, handler_name)` — HTTP server, handler looked up by name string.
+`net.serve_fn(port, handler)` — HTTP server with a first-class closure handler:
+```lex
+fn my_handler(req :: Request) -> [io] Response {
+  { status: 200, body: "ok", headers: map.new() }
+}
+fn main() -> [net, io] Nil { net.serve_fn(8080, my_handler) }
+```
+`net.serve_ws_fn(port, subprotocol, handler)` — WebSocket server:
+```lex
+fn on_msg(conn :: WsConn, msg :: WsMessage) -> WsAction {
+  match msg {
+    WsText(s) => WsSend("echo: " + s),
+    _         => WsNoOp,
+  }
+}
+fn main() -> [net] Nil { net.serve_ws_fn(9000, "", on_msg) }
+```
+Types: `Request`, `Response`, `WsConn`, `WsMessage`, `WsAction` are global (no import needed).
+
 ### `std.crypto`
 `hash`, `random` — `random` requires `[random]` effect.
+
+---
+
+## `lex.toml` — package dependencies
+
+Projects with dependencies declare them in a `lex.toml` at the project root:
+
+```toml
+[package]
+name = "my-app"
+version = "0.1.0"
+
+[dependencies]
+lex-schema = { path = "../lex-schema" }
+# or:
+lex-schema = { git = "https://github.com/alpibrusl/lex-schema" }
+```
+
+Then import with the package name instead of a relative path:
+
+```lex
+import "lex-schema/validate" as v
+import "lex-schema/schema"   as s
+```
+
+Module resolution: `{pkg_root}/src/{module}.lex`, then `{pkg_root}/{module}.lex`.
+
+Git dependencies are cloned to `~/.lex/packages/` on first use (override with `$LEX_PACKAGES_DIR`).
+
+Manage with `lex pkg init / add / list`.
 
 ---
 
@@ -212,6 +263,7 @@ arm (`_ => ...`) if you don't handle every case.
 
 ```bash
 lex check --output json program.lex        # structured errors
+lex check --strict program.lex             # + STR_CMP / SHADOW_FN lint
 lex run program.lex fn_name '"arg"' 42     # args are JSON
 lex test                                   # run tests/test_*.lex
 lex repl --load src/rules.lex              # interactive with project loaded
@@ -219,6 +271,10 @@ lex audit program.lex --effect http        # find all http effect calls
 lex hash program.lex                       # canonical content hashes
 lex publish --activate program.lex         # publish to local store
 LEX_TEST_NOW=1700000000 lex test           # deterministic time in tests
+lex pkg init                               # create lex.toml
+lex pkg add lex-schema --path ../lex-schema  # add local dep
+lex pkg add lex-schema --git https://github.com/alpibrusl/lex-schema
+lex pkg list                               # show deps
 ```
 
 ---
