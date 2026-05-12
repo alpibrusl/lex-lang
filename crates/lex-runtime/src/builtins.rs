@@ -30,7 +30,7 @@ pub fn try_pure_builtin(kind: &str, op: &str, args: &[Value]) -> Option<Result<V
 pub fn is_pure_module(kind: &str) -> bool {
     matches!(kind, "str" | "int" | "float" | "bool" | "list"
         | "option" | "result" | "tuple" | "json" | "bytes" | "flow" | "math"
-        | "map" | "set" | "crypto" | "regex" | "deque" | "datetime" | "http"
+        | "map" | "set" | "crypto" | "regex" | "deque" | "datetime" | "duration" | "http"
         | "toml" | "yaml" | "dotenv" | "csv" | "test" | "random" | "parser"
         | "cli")
 }
@@ -182,6 +182,13 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         ("list", "reverse") => {
             let mut out = expect_list(args.first())?.clone();
             out.reverse();
+            Ok(Value::List(out))
+        }
+        // #334: cons — prepend a single element to a list.
+        ("list", "cons") => {
+            let head = args.first().cloned().unwrap_or(Value::Unit);
+            let mut out = vec![head];
+            out.extend(expect_list(args.get(1))?.iter().cloned());
             Ok(Value::List(out))
         }
         ("list", "enumerate") => {
@@ -1326,6 +1333,27 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         ("datetime", "duration_days") => {
             let d = expect_int(args.first())?;
             Ok(Value::Int(d.saturating_mul(86_400_000_000_000)))
+        }
+        // #331: Instant comparison ops.
+        ("datetime", "before") => {
+            let a = expect_int(args.first())?;
+            let b = expect_int(args.get(1))?;
+            Ok(Value::Bool(a < b))
+        }
+        ("datetime", "after") => {
+            let a = expect_int(args.first())?;
+            let b = expect_int(args.get(1))?;
+            Ok(Value::Bool(a > b))
+        }
+        ("datetime", "compare") => {
+            let a = expect_int(args.first())?;
+            let b = expect_int(args.get(1))?;
+            Ok(Value::Int(a.cmp(&b) as i64))
+        }
+        // #331: Duration scalar extraction.
+        ("duration", "seconds") => {
+            let nanos = expect_int(args.first())?;
+            Ok(Value::Int(nanos / 1_000_000_000))
         }
 
         ("regex", "split") => {

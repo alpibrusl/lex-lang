@@ -605,6 +605,19 @@ impl Checker {
                 }
                 Ok(())
             }
+            // #345: recurse into Function types so alias coercion fires on
+            // closure params / return types. Without this, a closure annotated
+            // `(Errors, Errors) -> Errors` fails to unify with the expected
+            // `(List[?n], ?m) -> List[?n]` even though `Errors = List[Error]`.
+            (Ty::Function { params: pa, effects: ea, ret: ra },
+             Ty::Function { params: pb, effects: eb, ret: rb })
+            if pa.len() == pb.len() => {
+                for (x, y) in pa.clone().into_iter().zip(pb.clone()) {
+                    self.unify_coerce_inner(x, y)?;
+                }
+                self.u.unify_effects(ea, eb).map_err(|_| UnifyError::Mismatch { a: a.clone(), b: b.clone() })?;
+                self.unify_coerce_inner((**ra).clone(), (**rb).clone())
+            }
             _ => self.u.unify(&a, &b),
         }
     }

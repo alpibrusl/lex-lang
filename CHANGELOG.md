@@ -7,6 +7,38 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.8.2] — 2026-05-12
+
+### Fixed
+
+- **#345: type-alias unfold now reaches closure params and return types.**
+  `unify_coerce_inner` previously fell through to plain `unify` for
+  `Function` types, so a closure annotated `(Errors, Errors) -> Errors`
+  failed to unify with `list.fold`'s expected `(List[?n], ?m) -> List[?n]`
+  even when `Errors = List[Error]`. Adding a recursive `Function` case
+  (mirroring the existing `Tuple` and `Con-Con` cases) closes the gap for
+  all polymorphic stdlib HOFs. Closes #345.
+
+- **#332: `Str < Str` / `Str <= Str` / `Str > Str` / `Str >= Str` no longer
+  crash at runtime.** The type checker already admitted string comparisons; the
+  VM's `bin_ord` helper now handles `Value::Str` operands via lexicographic
+  order. Closes #332.
+
+### Added
+
+- **#334: `list.cons :: T, List[T] -> List[T]`** — O(1)-amortised prepend.
+  Enables the idiomatic functional builder loop: cons elements in reverse, call
+  `list.reverse` once at the end. `list.reverse` was already present; `cons`
+  was the missing half. Closes #334.
+
+- **#331: `datetime.before`, `datetime.after`, `datetime.compare` + new
+  `duration` module.** `datetime.before/after :: Instant, Instant -> Bool` and
+  `datetime.compare :: Instant, Instant -> Int` (-1/0/+1) expose typed
+  Instant ordering without falling back to ISO 8601 string comparison. New
+  `import "std.duration" as duration` module exposes `duration.seconds ::
+  Duration -> Int` (truncates nanoseconds to whole seconds), complementing the
+  existing `datetime.duration_seconds` constructor. Closes #331.
+
 ## [0.8.0] — 2026-05-12
 
 ### Added

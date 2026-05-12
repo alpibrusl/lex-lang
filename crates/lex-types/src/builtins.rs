@@ -269,6 +269,12 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::empty(),
                 Ty::List(Box::new(Ty::Var(0))),
             ));
+            // #334: cons :: T, List[T] -> List[T]  — O(1)-amortised prepend.
+            fields.insert("cons".into(), Ty::function(
+                vec![Ty::Var(0), Ty::List(Box::new(Ty::Var(0)))],
+                EffectSet::empty(),
+                Ty::List(Box::new(Ty::Var(0))),
+            ));
             // enumerate :: List[T] -> List[(Int, T)]
             // Pairs each element with its zero-based index.
             fields.insert("enumerate".into(), Ty::function(
@@ -1002,6 +1008,23 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 vec![Ty::int()], EffectSet::empty(), dur()));
             fields.insert("duration_days".into(), Ty::function(
                 vec![Ty::int()], EffectSet::empty(), dur()));
+            // #331: comparison ops on Instant.
+            fields.insert("before".into(), Ty::function(
+                vec![inst(), inst()], EffectSet::empty(), Ty::bool()));
+            fields.insert("after".into(), Ty::function(
+                vec![inst(), inst()], EffectSet::empty(), Ty::bool()));
+            // compare :: Instant, Instant -> Int  (-1 / 0 / +1)
+            fields.insert("compare".into(), Ty::function(
+                vec![inst(), inst()], EffectSet::empty(), Ty::int()));
+            Some(Ty::Record(fields))
+        }
+        // #331: duration module — scalar extraction from Duration values.
+        "duration" => {
+            let dur = || Ty::Con("Duration".into(), vec![]);
+            let mut fields = IndexMap::new();
+            // seconds :: Duration -> Int  (truncates toward zero)
+            fields.insert("seconds".into(), Ty::function(
+                vec![dur()], EffectSet::empty(), Ty::int()));
             Some(Ty::Record(fields))
         }
         "process" => {
@@ -1741,6 +1764,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "fs" => "fs",
         "process" => "process",
         "datetime" => "datetime",
+        "duration" => "duration",
         "log" => "log",
         "http" => "http",
         "toml" => "toml",

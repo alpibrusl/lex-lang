@@ -25,9 +25,9 @@ serde_json.workspace = true
 # are rust-analyzer-team-maintained.
 lsp-server = "0.7"
 lsp-types = "0.97"
-lex-syntax = { path = "../lex-syntax", version = "0.8.0" }
-lex-ast = { path = "../lex-ast", version = "0.8.0" }
-lex-types = { path = "../lex-types", version = "0.8.0" }
+lex-syntax = { path = "../lex-syntax", version = "0.8.2" }
+lex-ast = { path = "../lex-ast", version = "0.8.2" }
+lex-types = { path = "../lex-types", version = "0.8.2" }
 
 [dev-dependencies]
 tempfile = "3"
