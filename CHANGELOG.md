@@ -7,6 +7,79 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-05-12
+
+### Added
+
+- **#347 A2: `lex check --strict`** — runs two AST lint passes after a
+  clean type-check. `STR_CMP` warns when an ordering operator (`<`, `<=`,
+  `>`, `>=`) is applied to a `Str` literal (lexicographic ordering is
+  rarely the intent). `SHADOW_FN` warns when a function parameter, `let`
+  binding, or lambda parameter shadows a top-level function by the same
+  name. Lint warnings are emitted as JSON and cause exit 1 so CI can
+  enforce them. Closes #347 (item A2).
+
+- **#349: `lex test` subcommand** — walks `tests/test_*.lex`, calls
+  `run_all()` in each file under a permissive policy, and exits non-zero
+  on any failure. Replaces per-project shell loops; gives CI a stable
+  entry point. Closes #349.
+
+- **#351: `lex repl --load <file>`** — pre-loads one or more `.lex` source
+  files into the REPL session before the prompt appears. Repeatable.
+  Closes #351.
+
+- **#352: `docs/AGENT.md`** — cold-start guide for AI agents covering the
+  iteration loop, `lex check` JSON error envelope, effect system, stdlib
+  surface, and known sharp edges. Closes #352.
+
+- **#354: `net.serve_fn`** — effect-polymorphic HTTP server variant that
+  accepts a first-class closure `(Request) -> [Eff] Response` instead of
+  a handler name string. The handler's effect row propagates to the call
+  site. Closes #354.
+
+- **#355: Response headers** — `Request` now carries an incoming
+  `headers :: Map[Str, Str]` field (keys lowercased). `Response` gains a
+  `headers :: Map[Str, Str]` field; the runtime forwards those headers
+  through `tiny_http`. Closes #355.
+
+- **#358: Import path canonicalization** — `resolve_import` now calls
+  `.canonicalize()` after resolving a relative path, so `../../shared/foo`
+  and `../other/../shared/foo` hash to the same key in the loader's dedup
+  maps. Prevents duplicate loads and mismatched mangling prefixes in
+  diamond-import graphs. Closes #358.
+
+- **#359: `net.serve_ws_fn` + `WsConn`/`WsMessage`/`WsAction` types** —
+  three new global types model the WebSocket primitive surface:
+  `WsConn = { id :: Str, path :: Str, subprotocol :: Str }`,
+  `WsMessage = WsText(Str) | WsBinary(List[Int]) | WsPing | WsClose`,
+  `WsAction = WsSend(Str) | WsSendBinary(List[Int]) | WsNoOp`.
+  `net.serve_ws_fn :: (Int, Str, (WsConn, WsMessage) -> [Eff] WsAction) -> [net, Eff] Unit`
+  accepts a typed closure handler with effect propagation. The existing
+  string-based `net.serve_ws` is unchanged. Closes #359.
+
+- **`lex.toml` package manifest (Phase 1)** — projects declare
+  dependencies in a `lex.toml` file at the project root. Import paths of
+  the form `"pkg-name/module"` are resolved against the nearest manifest
+  found by walking up the directory tree. Supported dependency kinds:
+  `path = "../local/dir"` and `git = "https://..."` (clones to
+  `~/.lex/packages/` on first use; override with `$LEX_PACKAGES_DIR`).
+  Module search: `{pkg_root}/src/{module}.lex`, then
+  `{pkg_root}/{module}.lex`. New `lex pkg` subcommands: `init`, `add
+  --path`, `add --git`, `list`.
+
+### Fixed
+
+- **#348: VM panic messages now include function names.** Panics such as
+  "step limit exceeded" and "ran past end of code" previously showed a raw
+  `fn_id` integer. They now include the declared function name (e.g.
+  `step limit exceeded in 'tally_escapes'`). `VmError::UnknownFunction`
+  also carries the name string. Closes #348.
+
+- **#350: `LEX_TEST_NOW` pins `datetime.now()` in tests.** Setting
+  `LEX_TEST_NOW=<unix_seconds>` makes `datetime.now()` return a fixed
+  nanosecond timestamp derived from that value. Effect tracking is
+  unchanged (`[time]` is still required). Closes #350.
+
 ## [0.8.2] — 2026-05-12
 
 ### Fixed

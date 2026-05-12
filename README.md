@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/alpibrusl/lex-lang/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/alpibrusl/lex-lang/actions/workflows/ci.yml)
 [![fuzz](https://github.com/alpibrusl/lex-lang/actions/workflows/fuzz.yml/badge.svg?branch=main)](https://github.com/alpibrusl/lex-lang/actions/workflows/fuzz.yml)
-[![tests](https://img.shields.io/badge/tests-1373_passing-success.svg)](#building-from-source)
+[![tests](https://img.shields.io/badge/tests-1389_passing-success.svg)](#building-from-source)
 [![License: EUPL-1.2](https://img.shields.io/badge/license-EUPL--1.2-blue.svg)](LICENSE)
 [![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](#building-from-source)
 
@@ -465,8 +465,12 @@ them to GIFs for README / Twitter / LinkedIn.
 | Command | Purpose |
 |---|---|
 | `lex parse <file>` | Print the canonical AST as JSON |
-| `lex check <file>` | Type-check; exit 0 or print structured errors |
-| `lex repl` | Interactive evaluator. `fn`/`type`/`import` extend the session; expressions are evaluated under a permissive policy. `.help`, `.list`, `.reset`, `.quit` |
+| `lex check [--strict] <file>` | Type-check; exit 0 or print structured errors. `--strict` runs additional lint passes: `STR_CMP` (ordering operators on Str literals) and `SHADOW_FN` (bindings that shadow a top-level fn). Exit 1 on warnings. |
+| `lex test [dir]` | Run all `test_*.lex` files in `dir` (default `tests/`). Each file must export `fn run_all() -> ()`. Exit non-zero on any failure. |
+| `lex repl [--load <file>...]` | Interactive evaluator. `--load` pre-loads source files into the session. `fn`/`type`/`import` extend the session; expressions are evaluated under a permissive policy. `.help`, `.list`, `.reset`, `.quit` |
+| `lex pkg init` | Create a starter `lex.toml` in the current directory |
+| `lex pkg add <name> (--path p \| --git url)` | Add or update a dependency in `lex.toml` |
+| `lex pkg list` | List declared dependencies |
 | `lex watch <file> [check\|run] [args...]` | Re-run on every save. Default action is `check`; `run` re-executes. Forwarded args (`--allow-effects ...`) pass through to the underlying subcommand |
 | `lex hash <file>` | Print SigId / StageId per stage |
 | `lex blame [--store DIR] <file>` | Per-fn stage history from the store: which StageId is currently in source, which is Active, predecessors with statuses + timestamps |
