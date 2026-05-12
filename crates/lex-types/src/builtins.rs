@@ -200,6 +200,22 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::open_var(7),
                 Ty::List(Box::new(Ty::Var(1))),
             ));
+            // #338: sort_by :: List[T], (T) -> [E] K -> [E] List[T]
+            // Stable sort by the key the closure derives from each
+            // element. K is intended to be one of Int / Float / Str
+            // (the runtime comparator falls back to equality for
+            // other shapes, preserving original order via the
+            // stable sort) but the type system doesn't enforce that
+            // — keep the signature minimal so callers can pass any
+            // K and trust the comparator.
+            fields.insert("sort_by".into(), Ty::function(
+                vec![
+                    Ty::List(Box::new(Ty::Var(0))),
+                    Ty::function(vec![Ty::Var(0)], EffectSet::open_var(8), Ty::Var(1)),
+                ],
+                EffectSet::open_var(8),
+                Ty::List(Box::new(Ty::Var(0))),
+            ));
             fields.insert("filter".into(), Ty::function(
                 vec![
                     Ty::List(Box::new(Ty::Var(0))),

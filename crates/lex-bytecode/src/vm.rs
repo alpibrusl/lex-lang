@@ -326,6 +326,22 @@ fn const_str(constants: &[Const], idx: u32) -> String {
 /// Read `LEX_PAR_MAX_CONCURRENCY` (default = available CPU cores,
 /// fallback 4). Capped at 64 so a malformed env var can't spawn an
 /// unreasonable number of OS threads.
+/// Order-defining comparator for `list.sort_by` keys (#338).
+/// Same-typed Int / Float / Str pairs compare via their native
+/// `Ord` / `PartialOrd`. Mixed-type or other key shapes compare
+/// as Equal; combined with `Vec::sort_by`'s stability that
+/// preserves the original element order — best-effort fallback
+/// that never panics.
+fn compare_sort_keys(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        (Value::Str(x), Value::Str(y)) => x.cmp(y),
+        _ => Ordering::Equal,
+    }
+}
+
 fn par_max_concurrency() -> usize {
     let from_env = std::env::var("LEX_PAR_MAX_CONCURRENCY")
         .ok()
@@ -794,6 +810,34 @@ impl<'a> Vm<'a> {
                         // Direct Op::Call is the v1 surface.
                         memo_key: None,
                     })?;
+                }
+                Op::SortByKey { node_id_idx: _ } => {
+                    // #338: pop (xs, f). For each x in xs, invoke
+                    // f(x) to derive a sortable key. Stable-sort the
+                    // (key, value) pairs by key. Return the values
+                    // in sorted order. Keys must be Int / Float /
+                    // Str; mixed-type pairs and other types compare
+                    // as equal (preserving original order — stable
+                    // sort).
+                    let f = self.pop()?;
+                    let xs = self.pop()?;
+                    let items = match xs {
+                        Value::List(v) => v,
+                        other => return Err(VmError::TypeMismatch(
+                            format!("SortByKey requires a List, got: {other:?}"))),
+                    };
+                    if !matches!(f, Value::Closure { .. }) {
+                        return Err(VmError::TypeMismatch(
+                            format!("SortByKey requires a closure, got: {f:?}")));
+                    }
+                    let mut keyed: Vec<(Value, Value)> = Vec::with_capacity(items.len());
+                    for item in items {
+                        let key = self.invoke_closure_value(f.clone(), vec![item.clone()])?;
+                        keyed.push((key, item));
+                    }
+                    keyed.sort_by(|(ka, _), (kb, _)| compare_sort_keys(ka, kb));
+                    let sorted: Vec<Value> = keyed.into_iter().map(|(_, v)| v).collect();
+                    self.stack.push(Value::List(sorted));
                 }
                 Op::ParallelMap { node_id_idx: _ } => {
                     // #305 slice 1: pop (xs, f) and apply f to each

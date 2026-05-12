@@ -65,6 +65,13 @@ pub enum Op {
     MakeClosure { fn_id: u32, capture_count: u16 },
     /// Call a closure: pop `arity` args + 1 closure (top of stack), invoke.
     CallClosure { arity: u16, node_id_idx: u32 },
+    /// Stable sort-by-key (#338). Stack: `[xs, f]` (xs underneath).
+    /// Pops the key-fn `f` and the list `xs`, applies `f` to each
+    /// element to derive a sortable key, returns the list reordered
+    /// so keys ascend. Keys must be one of `Int` / `Float` / `Str`;
+    /// other key types pair-wise compare as equal (preserving
+    /// insertion order). `node_id_idx` is the originating NodeId.
+    SortByKey { node_id_idx: u32 },
     /// Parallel map (#305 slice 1). Stack: `[xs, f]` (xs underneath).
     /// Pops the closure `f` and the list `xs`, applies `f` to each
     /// element in parallel via OS threads, pushes the result list
