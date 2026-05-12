@@ -589,10 +589,16 @@ impl<'a> FnCompiler<'a> {
         let mut frees: Vec<String> = Vec::new();
         free_vars(body, &mut bound, &mut frees);
 
-        // Filter to those that are in the enclosing locals (captures) —
-        // skip globals (function names) which are referenced directly.
+        // Filter to those that are in the enclosing locals (captures).
+        // Don't exclude names that *also* exist in `function_names`:
+        // if the name is in `locals`, the local shadows the global
+        // within this scope, and the lambda needs to capture the
+        // local's value, not the global fn. (#339) Names that are
+        // ONLY in `function_names` (no local) stay external — the
+        // lambda's body resolves them at call time, same as the
+        // enclosing fn would.
         let captures: Vec<String> = frees.into_iter()
-            .filter(|n| self.locals.contains_key(n) && !self.function_names.contains_key(n))
+            .filter(|n| self.locals.contains_key(n))
             .collect();
 
         // Allocate a fresh fn_id by appending a placeholder Function.
