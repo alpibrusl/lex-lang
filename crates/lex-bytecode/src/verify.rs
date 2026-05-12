@@ -246,84 +246,9 @@ mod tests {
 
     #[test]
     fn leaked_scrutinee_detected() {
-        // Simulates a buggy match where the fail path doesn't pop the dup'd
-        // scrutinee, so the wildcard arm sees depth 2 instead of 1.
-        //   LoadLocal(0)    depth=1
-        //   Dup             depth=2
-        //   TestVariant(0)  depth=2
-        //   JumpIfNot(2)    depth=1; target=pc6 (but scrutinee still on stack → depth=2)
-        //   Pop             depth=0
-        //   PushConst(0)    depth=1
-        //   Jump(1)         target=pc8
-        //   // pc 6: wildcard arm entered at depth=2 (BUG: leaked scrutinee)
-        //   PushConst(1)    depth=3
-        //   Return
-        let code = vec![
-            Op::LoadLocal(0),           // pc 0  0→1
-            Op::Dup,                    // pc 1  1→2
-            Op::TestVariant(0),         // pc 2  2→2
-            Op::JumpIfNot(2),           // pc 3  2→1; target pc6 with depth=1
-            Op::Pop,                    // pc 4  1→0
-            Op::PushConst(0),           // pc 5  0→1
-            Op::Jump(1),                // pc 6  1→1; target pc8
-            // PC 6 receives two incoming depths: 1 (from JumpIfNot) and 1 (from Jump).
-            // To simulate the bug, make the JumpIfNot land at pc 7 without a Pop.
-            Op::PushConst(1),           // pc 7  — reached at depth 1 (ok arm) OR depth 2 (leaked)
-            Op::Return,                 // pc 8
-        ];
-        // Manually construct the buggy version: JumpIfNot lands at pc7 *without* the Pop.
-        // That means arm fail path enters pc7 at depth 2 (Dup'd scrutinee still there).
-        // Encode: pc3 JumpIfNot(3) → target = pc3+1+3 = pc7
-        let mut buggy = code.clone();
-        buggy[3] = Op::JumpIfNot(3);   // skip Pop+PushConst+Jump → land at pc7 at depth=2
-        // Jump at pc6 also reaches pc8(=pc7+1 after the shift... let's simplify)
-        // Actually to keep indices sane: make a minimal failing case.
-        //
-        // Minimal: two paths to pc=3, one at depth=1, one at depth=2.
-        let minimal_buggy = vec![
-            Op::PushConst(0),    // pc0 depth 0→1
-            Op::Jump(1),         // pc1 target=pc3, depth=1
-            Op::PushConst(0),    // pc2 depth 0→1 (dead, but we push from depth 0 to simulate a push)
-            Op::Return,          // pc3: receives depth=1 from pc1's Jump
-                                 //      if we also add a path from pc2 at depth=1+1=2, mismatch
-        ];
-        // Simpler approach: directly inject two worklist entries for the same pc.
-        // We test via a hand-rolled function that guarantees the two paths.
-        let _ = minimal_buggy;
-
-        // Simplest reproducer: unconditional path to pc2 at depth 1,
-        // conditional path to pc2 at depth 2.
-        let reproducer = vec![
-            Op::PushConst(0),    // pc0 → depth 1
-            Op::Dup,             // pc1 → depth 2
-            Op::Jump(0),         // pc2 (target=pc3) → depth 2  [one path to pc3 at depth 2]
-            Op::Return,          // pc3 → depth 2 (registered here from above jump)
-            // But we also need a second path to pc3 at a different depth.
-            // Instead, let's just verify the clean test passes and trust the logic.
-        ];
-        let _ = reproducer;
-
-        // The real test: verify_function catches depth mismatches.
-        // Construct a function where pc=5 is reachable at depths 1 and 2.
-        let mismatched = vec![
-            Op::PushConst(0),    // pc0 depth 0→1
-            Op::JumpIfNot(2),    // pc1 depth 1→0; fall=pc2(depth0), jump=pc4(depth0)
-            Op::PushConst(0),    // pc2 depth 0→1
-            Op::Jump(1),         // pc3 depth 1→1; target=pc5 (depth=1)
-            Op::PushConst(0),    // pc4 depth 0→1
-            Op::PushConst(0),    // pc5 target from pc3(depth=1) AND fall from pc4→pc5(depth=1+1=2) BUG
-            Op::Return,
-        ];
-        // In the above: after JumpIfNot at pc1:
-        //   fall-through to pc2 at depth 0
-        //   pc2: PushConst → depth 1
-        //   pc3: Jump(1) → target pc5 at depth 1
-        // Jump target at pc1: pc4 at depth 0
-        //   pc4: PushConst → depth 1
-        //   falls to pc5 at depth 1
-        // So both paths reach pc5 at depth 1. No mismatch. ✓
-
-        // Real mismatch: make pc4 push TWO items:
+        // Two paths reach pc6 at different depths — mismatch detected.
+        // Fall path: pc2→pc3→pc6 at depth 1.
+        // Jump path: pc4→pc5→pc6 at depth 2 (extra push leaks).
         let mismatch2 = vec![
             Op::PushConst(0),    // pc0 depth 0→1
             Op::JumpIfNot(2),    // pc1 depth 1→0; fall=pc2 depth0, jump=pc4 depth0
