@@ -267,16 +267,21 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             }
         }
         // Tactical fix for #168: validate required fields before
-        // returning Ok. The full type-driven fix (derive `required`
-        // from `T` at type-check time) tracked in #168.
+        // returning Ok. #322: also validate field types via schema.
         ("json", "parse_strict") => {
             let s = expect_str(args.first())?;
             let required = required_field_names(args.get(1))?;
+            let schema = extract_type_schema(args.get(2));
             match serde_json::from_str::<serde_json::Value>(&s) {
-                Ok(v) => match check_required_fields(&v, &required) {
-                    Ok(()) => Ok(ok_v(json_to_value(&v))),
-                    Err(e) => Ok(err_v(Value::Str(e))),
-                },
+                Ok(v) => {
+                    if let Err(e) = check_required_fields(&v, &required) {
+                        return Ok(err_v(Value::Str(e)));
+                    }
+                    if let Err(e) = validate_field_types(&v, &schema) {
+                        return Ok(err_v(Value::Str(e)));
+                    }
+                    Ok(ok_v(json_to_value(&v)))
+                }
                 Err(e) => Ok(err_v(Value::Str(format!("{e}")))),
             }
         }
@@ -296,19 +301,21 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             }
         }
         // Tactical fix for #168: validate required fields before
-        // returning Ok. Caller passes the field names explicitly
-        // so the runtime doesn't need T's shape (which lex-bytecode
-        // doesn't carry today). Full type-driven fix tracked in #168.
+        // returning Ok. #322: also validate field types via schema.
         ("toml", "parse_strict") => {
             let s = expect_str(args.first())?;
             let required = required_field_names(args.get(1))?;
+            let schema = extract_type_schema(args.get(2));
             match toml::from_str::<serde_json::Value>(&s) {
                 Ok(mut v) => {
                     unwrap_toml_datetime_markers(&mut v);
-                    match check_required_fields(&v, &required) {
-                        Ok(()) => Ok(ok_v(json_to_value(&v))),
-                        Err(e) => Ok(err_v(Value::Str(e))),
+                    if let Err(e) = check_required_fields(&v, &required) {
+                        return Ok(err_v(Value::Str(e)));
                     }
+                    if let Err(e) = validate_field_types(&v, &schema) {
+                        return Ok(err_v(Value::Str(e)));
+                    }
+                    Ok(ok_v(json_to_value(&v)))
                 }
                 Err(e) => Ok(err_v(Value::Str(format!("{e}")))),
             }
@@ -340,14 +347,21 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             }
         }
         // Tactical fix for #168 — same shape as toml.parse_strict.
+        // #322: also validate field types via schema.
         ("yaml", "parse_strict") => {
             let s = expect_str(args.first())?;
             let required = required_field_names(args.get(1))?;
+            let schema = extract_type_schema(args.get(2));
             match serde_yaml::from_str::<serde_json::Value>(&s) {
-                Ok(v) => match check_required_fields(&v, &required) {
-                    Ok(()) => Ok(ok_v(json_to_value(&v))),
-                    Err(e) => Ok(err_v(Value::Str(e))),
-                },
+                Ok(v) => {
+                    if let Err(e) = check_required_fields(&v, &required) {
+                        return Ok(err_v(Value::Str(e)));
+                    }
+                    if let Err(e) = validate_field_types(&v, &schema) {
+                        return Ok(err_v(Value::Str(e)));
+                    }
+                    Ok(ok_v(json_to_value(&v)))
+                }
                 Err(e) => Ok(err_v(Value::Str(format!("{e}")))),
             }
         }
@@ -1864,6 +1878,96 @@ fn split_dotted_path(path: &str) -> Vec<String> {
     }
     out.push(cur);
     out
+}
+
+/// Extract the `List[(Str, Str)]` type schema from the third argument
+/// of `*.parse_strict` (#322). If the argument is absent or malformed,
+/// returns an empty vec — callers treat that as "skip type validation".
+fn extract_type_schema(v: Option<&Value>) -> Vec<(String, String)> {
+    match v {
+        Some(Value::List(pairs)) => pairs.iter().filter_map(|p| {
+            if let Value::Tuple(items) = p {
+                if items.len() == 2 {
+                    if let (Value::Str(name), Value::Str(tag)) = (&items[0], &items[1]) {
+                        return Some((name.clone(), tag.clone()));
+                    }
+                }
+            }
+            None
+        }).collect(),
+        _ => vec![],
+    }
+}
+
+/// Validate each field in `json` against its declared type tag from
+/// the schema. Returns `Err` for the first field whose JSON value
+/// doesn't match its tag. Fields not present in the JSON object are
+/// silently skipped (presence is enforced separately by
+/// `check_required_fields`).
+fn validate_field_types(
+    json: &serde_json::Value,
+    schema: &[(String, String)],
+) -> Result<(), String> {
+    if schema.is_empty() {
+        return Ok(());
+    }
+    let obj = match json.as_object() {
+        Some(o) => o,
+        None => return Ok(()), // not an object — let other validation handle it
+    };
+    for (field, tag) in schema {
+        if let Some(val) = obj.get(field) {
+            if let Err(e) = check_json_type(val, tag) {
+                return Err(format!("field `{field}`: {e}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Recursively check that `val` conforms to the compact type `tag`.
+fn check_json_type(val: &serde_json::Value, tag: &str) -> Result<(), String> {
+    use serde_json::Value as J;
+    match (tag, val) {
+        ("Int", J::Number(n)) if n.is_i64() || n.is_u64() => Ok(()),
+        ("Int", other) => Err(format!("expected Int, got {}", json_type_name(other))),
+        ("Float", J::Number(_)) => Ok(()),
+        ("Float", other) => Err(format!("expected Float, got {}", json_type_name(other))),
+        ("Bool", J::Bool(_)) => Ok(()),
+        ("Bool", other) => Err(format!("expected Bool, got {}", json_type_name(other))),
+        ("Str", J::String(_)) => Ok(()),
+        ("Str", other) => Err(format!("expected Str, got {}", json_type_name(other))),
+        // Option[X]: null maps to None — any null is acceptable
+        (tag, J::Null) if tag.starts_with("Option[") => Ok(()),
+        (tag, val) if tag.starts_with("Option[") && tag.ends_with(']') => {
+            let inner = &tag[7..tag.len() - 1]; // strip "Option[" and "]"
+            check_json_type(val, inner)
+        }
+        // List[X]: validate each element
+        (tag, J::Array(items)) if tag.starts_with("List[") && tag.ends_with(']') => {
+            let inner = &tag[5..tag.len() - 1]; // strip "List[" and "]"
+            for (i, item) in items.iter().enumerate() {
+                if let Err(e) = check_json_type(item, inner) {
+                    return Err(format!("[{i}]: {e}"));
+                }
+            }
+            Ok(())
+        }
+        ("Record", _) => Ok(()), // opaque nested record — skip deep check
+        ("Any", _) => Ok(()),    // unknown type — skip
+        _ => Ok(()),             // unrecognized tag — skip
+    }
+}
+
+fn json_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "Bool",
+        serde_json::Value::Number(_) => "Number",
+        serde_json::Value::String(_) => "Str",
+        serde_json::Value::Array(_) => "Array",
+        serde_json::Value::Object(_) => "Object",
+    }
 }
 
 /// Parse a `.env`-style file into key→value pairs. Accepts:
