@@ -621,6 +621,7 @@ impl<'a> FnCompiler<'a> {
             ("option", "unwrap_or_else") => self.emit_option_unwrap_or_else(args),
             ("list", "map") => self.emit_list_map(args),
             ("list", "par_map") => self.emit_list_par_map(args),
+            ("list", "sort_by") => self.emit_list_sort_by(args),
             ("list", "filter") => self.emit_list_filter(args),
             ("list", "fold") => self.emit_list_fold(args),
             ("map", "fold") => self.emit_map_fold(args, node_id_idx),
@@ -707,6 +708,20 @@ impl<'a> FnCompiler<'a> {
         self.compile_expr(&args[1], false);
         let nid = self.pool.node_id("n_list_par_map");
         self.emit(Op::ParallelMap { node_id_idx: nid });
+    }
+
+    /// `list.sort_by(xs, f)` (#338). Pushes `xs` and the key-fn
+    /// `f`, then emits a single `Op::SortByKey` — the VM invokes
+    /// `f` on each element to derive a sortable key, stable-sorts
+    /// by key, and returns the values in sorted order. Keys must
+    /// resolve to `Int` / `Float` / `Str`; mixed-type pairs are
+    /// treated as equal by the comparator (preserving insertion
+    /// order via the stable sort).
+    fn emit_list_sort_by(&mut self, args: &[a::CExpr]) {
+        self.compile_expr(&args[0], false);
+        self.compile_expr(&args[1], false);
+        let nid = self.pool.node_id("n_list_sort_by");
+        self.emit(Op::SortByKey { node_id_idx: nid });
     }
 
     /// `list.filter(xs, pred)` — keep elements where pred returns true.
