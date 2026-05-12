@@ -457,18 +457,13 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 vec![Ty::str()], EffectSet::empty(),
                 Ty::Con("Result".into(), vec![Ty::Var(0), Ty::str()]),
             ));
-            // parse_strict :: (Str, List[Str], List[(Str, Str)]) -> Result[T, Str]
+            // parse_strict :: (Str, List[Str]) -> Result[T, Str]
             // Tactical fix for #168 — caller passes the field names
             // T requires; runtime returns Err if any are missing
             // from the parsed object instead of letting field
-            // access panic later. Third arg is the type schema for
-            // deep type validation (#322).
+            // access panic later.
             fields.insert("parse_strict".into(), Ty::function(
-                vec![
-                    Ty::str(),
-                    Ty::List(Box::new(Ty::str())),
-                    Ty::List(Box::new(Ty::Tuple(vec![Ty::str(), Ty::str()]))),
-                ],
+                vec![Ty::str(), Ty::List(Box::new(Ty::str()))],
                 EffectSet::empty(),
                 Ty::Con("Result".into(), vec![Ty::Var(0), Ty::str()]),
             ));
@@ -1494,14 +1489,9 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 Ty::Con("Result".into(), vec![Ty::Var(0), Ty::str()]),
             ));
             // Tactical fix for #168 — caller-supplied required-field
-            // list. Third arg is the type schema for deep type
-            // validation (#322). See std.json's parse_strict for context.
+            // list. See std.json's parse_strict for context.
             fields.insert("parse_strict".into(), Ty::function(
-                vec![
-                    Ty::str(),
-                    Ty::List(Box::new(Ty::str())),
-                    Ty::List(Box::new(Ty::Tuple(vec![Ty::str(), Ty::str()]))),
-                ],
+                vec![Ty::str(), Ty::List(Box::new(Ty::str()))],
                 EffectSet::empty(),
                 Ty::Con("Result".into(), vec![Ty::Var(0), Ty::str()]),
             ));
@@ -1593,18 +1583,13 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 vec![Ty::str()], EffectSet::empty(),
                 Ty::Con("Result".into(), vec![Ty::Var(0), Ty::str()]),
             ));
-            // parse_strict :: (Str, List[Str], List[(Str, Str)]) -> Result[T, Str]
+            // parse_strict :: (Str, List[Str]) -> Result[T, Str]
             // Tactical fix for #168 — caller passes the field
             // names T requires; runtime returns Err if any are
             // missing from the parsed table instead of letting
-            // field access panic later. Third arg is the type
-            // schema for deep type validation (#322).
+            // field access panic later.
             fields.insert("parse_strict".into(), Ty::function(
-                vec![
-                    Ty::str(),
-                    Ty::List(Box::new(Ty::str())),
-                    Ty::List(Box::new(Ty::Tuple(vec![Ty::str(), Ty::str()]))),
-                ],
+                vec![Ty::str(), Ty::List(Box::new(Ty::str()))],
                 EffectSet::empty(),
                 Ty::Con("Result".into(), vec![Ty::Var(0), Ty::str()]),
             ));

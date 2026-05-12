@@ -252,7 +252,9 @@ fn rewrite_in_expr(
                 if let a::CExpr::FieldAccess { field, .. } = callee.as_mut() {
                     debug_assert_eq!(field, "parse",
                         "rewrite_in_expr: only `.parse` calls should be in the table");
-                    *field = "parse_strict".to_string();
+                    // Use parse_strict_typed (internal, 3-arg) rather than the
+                    // public 2-arg parse_strict so direct callers aren't broken.
+                    *field = "parse_strict_typed".to_string();
                 }
                 // Second argument: List[Str] of required field names.
                 args.push(a::CExpr::ListLit {

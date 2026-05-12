@@ -300,9 +300,62 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                 Err(e) => Ok(err_v(Value::Str(format!("{e}")))),
             }
         }
+        // Compiler-emitted variant of parse_strict that carries the type
+        // schema injected by the type-checker rewrite pass (#322).
+        // Identical to parse_strict but the 3rd arg (schema) is always present.
+        ("json", "parse_strict_typed") => {
+            let s = expect_str(args.first())?;
+            let required = required_field_names(args.get(1))?;
+            let schema = extract_type_schema(args.get(2));
+            match serde_json::from_str::<serde_json::Value>(&s) {
+                Ok(v) => {
+                    if let Err(e) = check_required_fields(&v, &required) {
+                        return Ok(err_v(Value::Str(e)));
+                    }
+                    if let Err(e) = validate_field_types(&v, &schema) {
+                        return Ok(err_v(Value::Str(e)));
+                    }
+                    Ok(ok_v(json_to_value(&v)))
+                }
+                Err(e) => Ok(err_v(Value::Str(format!("{e}")))),
+            }
+        }
+
+        // -- toml (config parser; routes through serde_json::Value
+        // so the parsed shape composes with the existing json
+        // tooling. Datetimes become RFC 3339 strings — the only
+        // info-losing step) --
+        ("toml", "parse") => {
+            let s = expect_str(args.first())?;
+            match toml::from_str::<serde_json::Value>(&s) {
+                Ok(mut v) => {
+                    unwrap_toml_datetime_markers(&mut v);
+                    Ok(ok_v(json_to_value(&v)))
+                }
+                Err(e) => Ok(err_v(Value::Str(format!("{e}")))),
+            }
+        }
         // Tactical fix for #168: validate required fields before
         // returning Ok. #322: also validate field types via schema.
         ("toml", "parse_strict") => {
+            let s = expect_str(args.first())?;
+            let required = required_field_names(args.get(1))?;
+            let schema = extract_type_schema(args.get(2));
+            match toml::from_str::<serde_json::Value>(&s) {
+                Ok(mut v) => {
+                    unwrap_toml_datetime_markers(&mut v);
+                    if let Err(e) = check_required_fields(&v, &required) {
+                        return Ok(err_v(Value::Str(e)));
+                    }
+                    if let Err(e) = validate_field_types(&v, &schema) {
+                        return Ok(err_v(Value::Str(e)));
+                    }
+                    Ok(ok_v(json_to_value(&v)))
+                }
+                Err(e) => Ok(err_v(Value::Str(format!("{e}")))),
+            }
+        }
+        ("toml", "parse_strict_typed") => {
             let s = expect_str(args.first())?;
             let required = required_field_names(args.get(1))?;
             let schema = extract_type_schema(args.get(2));
@@ -349,6 +402,23 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         // Tactical fix for #168 — same shape as toml.parse_strict.
         // #322: also validate field types via schema.
         ("yaml", "parse_strict") => {
+            let s = expect_str(args.first())?;
+            let required = required_field_names(args.get(1))?;
+            let schema = extract_type_schema(args.get(2));
+            match serde_yaml::from_str::<serde_json::Value>(&s) {
+                Ok(v) => {
+                    if let Err(e) = check_required_fields(&v, &required) {
+                        return Ok(err_v(Value::Str(e)));
+                    }
+                    if let Err(e) = validate_field_types(&v, &schema) {
+                        return Ok(err_v(Value::Str(e)));
+                    }
+                    Ok(ok_v(json_to_value(&v)))
+                }
+                Err(e) => Ok(err_v(Value::Str(format!("{e}")))),
+            }
+        }
+        ("yaml", "parse_strict_typed") => {
             let s = expect_str(args.first())?;
             let required = required_field_names(args.get(1))?;
             let schema = extract_type_schema(args.get(2));
