@@ -9,6 +9,20 @@ bumps may carry breaking changes when justified).
 
 ### Added
 
+- **#304 phase 3a: code-action surface in `lex-lsp`.** Editors
+  now show a lightbulb on every type-error diagnostic that has a
+  static `suggested_transform` (#306 slice 3): the action title is
+  the suggestion's `summary` plus the typed-transform `kind_hint`
+  (e.g. *"Lex: Replace the offending match arm... (ReplaceMatchArm)"*).
+  The full suggestion JSON is attached as `data` so a client
+  extension can pipe it to `lex repair --apply --transform '<json>'`.
+  Computing a real `WorkspaceEdit` (so the edit applies in the
+  editor without a CLI round-trip) is queued for phase 3b — that
+  needs cursor-to-NodeId mapping plus AST-roundtrip pretty-printing.
+  Coverage: 2 new lib unit tests on `code_actions_for_diagnostics`,
+  2 new e2e tests through the protocol (action surfaces with the
+  right title / kind / data; no diagnostics → no actions).
+
 - **#304 phase 2a: hover / definition / completion in `lex-lsp`.**
   Builds on phase 1's read-only diagnostics. Editors get three
   new request handlers:

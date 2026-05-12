@@ -395,6 +395,71 @@ pub fn completions(file: &FileAnalysis) -> Vec<(String, String, u8)> {
     out
 }
 
+// ---------------------------------------------------------------
+// #304 phase 3a: code actions surfaced from diagnostic suggestions
+// ---------------------------------------------------------------
+
+/// One code action surfaced in the editor's lightbulb menu.
+///
+/// Slice-3a deliverable: the action carries the suggestion's
+/// `summary` as `title`, the diagnostic it addresses, and the
+/// full suggestion JSON in `data` so an editor extension (or a
+/// custom command handler in slice 3b) can pipe it to
+/// `lex repair --apply --transform '<json>'`. The actual
+/// `WorkspaceEdit` is **not** computed here — that's slice 3b,
+/// which needs cursor-to-NodeId mapping plus AST-roundtrip
+/// pretty-printing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeActionStub {
+    pub title: String,
+    pub kind_hint: String,
+    pub rule_tag: String,
+    pub diagnostic: lsp_types::Diagnostic,
+    pub data: serde_json::Value,
+}
+
+/// Iterate `diagnostics` and produce a code-action stub for each
+/// one whose `data.suggested_transform` is populated. Diagnostics
+/// without a static suggestion (e.g. `infinite-type`,
+/// `refinement-violation`) yield no actions; the LLM-driven
+/// `lex repair --apply` path still works for those.
+pub fn code_actions_for_diagnostics(diagnostics: &[lsp_types::Diagnostic]) -> Vec<CodeActionStub> {
+    let mut out = Vec::new();
+    for d in diagnostics {
+        let data = match &d.data {
+            Some(v) => v,
+            None => continue,
+        };
+        let sug = match data.get("suggested_transform") {
+            Some(s) if s.is_object() => s,
+            _ => continue,
+        };
+        let title = sug
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .unwrap_or("apply suggested transform")
+            .to_string();
+        let kind_hint = sug
+            .get("kind_hint")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let rule_tag = data
+            .get("rule_tag")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        out.push(CodeActionStub {
+            title,
+            kind_hint,
+            rule_tag,
+            diagnostic: d.clone(),
+            data: sug.clone(),
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,6 +598,49 @@ fn bar() -> Int { 2 }
         assert!(labels.contains(&"foo"));
         assert!(labels.contains(&"bar"));
         assert!(labels.contains(&"io"), "import alias must appear: {labels:?}");
+    }
+
+    #[test]
+    fn code_actions_surface_from_suggested_transform() {
+        // Build a real diagnostic via the standard pipeline so we
+        // exercise the data shape end-to-end (no mocking).
+        let src = "fn bad(x :: Int) -> Int { \"oops\" }\n";
+        let diags = diagnostics_for_source(src, Some("/tmp/qf.lex"));
+        let actions = code_actions_for_diagnostics(&diags);
+        assert_eq!(actions.len(), 1, "one action: {actions:?}");
+        let a = &actions[0];
+        assert_eq!(a.rule_tag, "type-mismatch");
+        // type-mismatch maps to ReplaceMatchArm in the static
+        // (rule_tag → kind_hint) table from #306 slice 3.
+        assert_eq!(a.kind_hint, "ReplaceMatchArm");
+        assert!(!a.title.is_empty(), "non-empty title for the action");
+    }
+
+    #[test]
+    fn diagnostics_without_suggestion_yield_no_action() {
+        // Hand-build a Diagnostic whose `data` has no
+        // `suggested_transform` field — simulates a rule without
+        // a static suggestion (e.g. infinite-type).
+        let d = Diagnostic {
+            range: Range {
+                start: Position { line: 0, character: 0 },
+                end: Position { line: 0, character: 0 },
+            },
+            severity: Some(DiagnosticSeverity::ERROR),
+            code: Some(lsp_types::NumberOrString::String("infinite-type".into())),
+            code_description: None,
+            source: Some("lex".into()),
+            message: "infinite type".into(),
+            related_information: None,
+            tags: None,
+            data: Some(serde_json::json!({
+                "rule_tag": "infinite-type",
+                "rule_explanation": "Inference would require...",
+                "suggested_transform": serde_json::Value::Null,
+            })),
+        };
+        let actions = code_actions_for_diagnostics(&[d]);
+        assert!(actions.is_empty());
     }
 
     #[test]

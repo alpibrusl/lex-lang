@@ -297,6 +297,117 @@ fn other() -> Int { 2 }
 }
 
 #[test]
+fn code_action_surfaces_suggested_transform() {
+    let mut s = Server::spawn();
+    s.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "capabilities": {}, "processId": null, "rootUri": null }
+    }));
+    let init = s.recv();
+    // Capability is advertised so editors enable the lightbulb.
+    assert!(
+        init["result"]["capabilities"]["codeActionProvider"] == json!(true)
+            || init["result"]["capabilities"]["codeActionProvider"].is_object(),
+        "codeActionProvider must be advertised: {init}"
+    );
+    s.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "initialized",
+        "params": {}
+    }));
+    let text = "fn bad(x :: Int) -> Int { \"oops\" }\n";
+    s.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {
+                "uri": "file:///tmp/lsp_qf.lex",
+                "languageId": "lex",
+                "version": 1,
+                "text": text,
+            }
+        }
+    }));
+    // Pull the publishDiagnostics so we can echo its diagnostic
+    // back into the codeAction request — that's the realistic
+    // editor-side flow.
+    let diag = s.recv();
+    let diagnostics = diag["params"]["diagnostics"].clone();
+    assert!(diagnostics.as_array().is_some_and(|a| !a.is_empty()));
+
+    s.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/codeAction",
+        "params": {
+            "textDocument": { "uri": "file:///tmp/lsp_qf.lex" },
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } },
+            "context": { "diagnostics": diagnostics }
+        }
+    }));
+    let resp = s.recv();
+    let actions = resp["result"].as_array().expect("array of actions");
+    assert_eq!(actions.len(), 1, "one action for the type-mismatch: {resp}");
+    let a = &actions[0];
+    let title = a["title"].as_str().unwrap_or("");
+    assert!(title.starts_with("Lex:"), "title prefixed: {title}");
+    assert!(title.contains("ReplaceMatchArm"), "kind_hint in title: {title}");
+    assert_eq!(a["kind"], "quickfix");
+    assert_eq!(a["isPreferred"], true);
+    // The suggestion data round-trips so client extensions can
+    // pipe it to `lex repair --apply --transform '<json>'`.
+    let data = &a["data"];
+    assert_eq!(data["rule_tag"], "type-mismatch");
+    assert!(data["details"].as_str().is_some_and(|s| !s.is_empty()));
+}
+
+#[test]
+fn code_action_returns_empty_when_no_diagnostics() {
+    let mut s = Server::spawn();
+    s.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "capabilities": {}, "processId": null, "rootUri": null }
+    }));
+    let _ = s.recv();
+    s.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "initialized",
+        "params": {}
+    }));
+    s.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "textDocument/didOpen",
+        "params": {
+            "textDocument": {
+                "uri": "file:///tmp/lsp_no_qf.lex",
+                "languageId": "lex",
+                "version": 1,
+                "text": "fn ok_fn(x :: Int) -> Int { x + 1 }\n",
+            }
+        }
+    }));
+    let _ = s.recv(); // empty diagnostics
+
+    s.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/codeAction",
+        "params": {
+            "textDocument": { "uri": "file:///tmp/lsp_no_qf.lex" },
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } },
+            "context": { "diagnostics": [] }
+        }
+    }));
+    let resp = s.recv();
+    let actions = resp["result"].as_array().expect("array");
+    assert!(actions.is_empty(), "no diagnostics → no actions: {resp}");
+}
+
+#[test]
 fn clean_program_emits_empty_diagnostics() {
     let mut s = Server::spawn();
     s.send(&json!({
