@@ -11,6 +11,10 @@ use indexmap::IndexMap;
 use lex_ast as a;
 use std::collections::{BTreeMap, HashMap};
 
+/// Field names + type-tag schema extracted from a `Result[Record{...}, _]`
+/// return type. Used by the `parse` → `parse_strict_typed` rewrite (#322).
+type FieldSchema = (Vec<String>, Vec<(String, String)>);
+
 /// Result of checking a whole program.
 pub struct ProgramTypes {
     pub fn_signatures: IndexMap<String, Scheme>,
@@ -291,7 +295,7 @@ fn extract_record_fields_and_schema(
     u: &Unifier,
     env: &TypeEnv,
     ty: &Ty,
-) -> Option<(Vec<String>, Vec<(String, String)>)> {
+) -> Option<FieldSchema> {
     let resolved = u.resolve(ty);
     let Ty::Con(ref name, ref args) = resolved else { return None; };
     if name != "Result" || args.len() != 2 { return None; }

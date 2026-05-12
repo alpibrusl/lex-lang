@@ -321,20 +321,6 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             }
         }
 
-        // -- toml (config parser; routes through serde_json::Value
-        // so the parsed shape composes with the existing json
-        // tooling. Datetimes become RFC 3339 strings — the only
-        // info-losing step) --
-        ("toml", "parse") => {
-            let s = expect_str(args.first())?;
-            match toml::from_str::<serde_json::Value>(&s) {
-                Ok(mut v) => {
-                    unwrap_toml_datetime_markers(&mut v);
-                    Ok(ok_v(json_to_value(&v)))
-                }
-                Err(e) => Ok(err_v(Value::Str(format!("{e}")))),
-            }
-        }
         // Tactical fix for #168: validate required fields before
         // returning Ok. #322: also validate field types via schema.
         ("toml", "parse_strict") => {
