@@ -375,9 +375,9 @@ fn cmd_check(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 
     match check_result {
         Ok(_) => {
-            // --strict: run AST lint passes after the type check succeeds (#347 A2).
+            // --strict: run AST lint passes + bytecode stack verifier (#347 A2).
             // Warnings are non-fatal but exit 1 so CI can enforce them.
-            let lint_warnings = if strict && !from_canonical && path != "-" {
+            let mut lint_warnings = if strict && !from_canonical && path != "-" {
                 std::fs::read_to_string(path).ok()
                     .and_then(|src| lex_syntax::parse_source(&src).ok())
                     .map(|prog| lint::lint_program(&prog))
@@ -385,6 +385,26 @@ fn cmd_check(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             } else {
                 vec![]
             };
+
+            // Third --strict check (#347 A2): bytecode stack-depth verifier.
+            // Compiles the type-checked program and verifies that every branch
+            // merge point has a consistent stack depth — catching PConstructor
+            // stack leaks that the type checker cannot see.
+            if strict {
+                let bytecode = compile_program(&stages);
+                for err in lex_bytecode::verify_program(&bytecode.functions) {
+                    lint_warnings.push(lint::LintWarning {
+                        code: "STACK_DEPTH",
+                        message: format!(
+                            "stack depth mismatch at pc {} in `{}`: \
+                             path A depth {}, path B depth {} — \
+                             a match arm may have leaked or over-consumed stack values",
+                            err.pc, err.fn_name, err.depth_a, err.depth_b
+                        ),
+                        location: format!("fn `{}`", err.fn_name),
+                    });
+                }
+            }
 
             let summary = effects_summary(&stages);
             let data = serde_json::json!({
