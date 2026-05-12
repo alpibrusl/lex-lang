@@ -21,6 +21,7 @@ mod docs;
 mod op;
 mod repl;
 mod lint;
+mod pkg;
 mod test_runner;
 mod watch;
 
@@ -113,6 +114,7 @@ fn run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "producer-trust" => cmd_producer_trust(fmt, &args[1..]),
         "canonical" => cmd_canonical(fmt, &args[1..]),
         "keygen" => cmd_keygen(fmt, &args[1..]),
+        "pkg"  => pkg::cmd_pkg(&args[1..]),
         "repl" => repl::cmd_repl(&args[1..]),
         "test" => test_runner::cmd_test(fmt, &args[1..]),
         "watch" => watch::cmd_watch(&args[1..]),
@@ -154,6 +156,10 @@ fn print_usage() {
     println!("commands:");
     println!("  parse <file>                       print canonical AST as JSON");
     println!("  check [--strict] <file>            type-check; --strict adds lint warnings");
+    println!("  pkg init                           create lex.toml in current directory");
+    println!("  pkg add <name> --path <p>          add a local path dependency");
+    println!("  pkg add <name> --git <url>         add a git dependency");
+    println!("  pkg list                           list declared dependencies");
     println!("  run [policy] <file> <fn> [args]    execute fn (args parsed as JSON)");
     println!("  run --from-store STAGE_ID [--require-signed] [--trusted-key HEX] <fn> [args]");
     println!("                                     run a stage straight out of the store;");

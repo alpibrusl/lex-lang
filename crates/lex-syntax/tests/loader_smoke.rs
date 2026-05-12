@@ -464,3 +464,59 @@ fn main(s :: Str) -> [io] Nil { h.say(s) }
     }
     panic!("say body not preserving io.print: {:?}", say.body.result);
 }
+
+#[test]
+fn package_import_via_lex_toml_path_dep() {
+    // Layout:
+    //   tmp/
+    //     lex-math/
+    //       lex.toml    (defines package "lex-math", no deps needed)
+    //       src/
+    //         arith.lex
+    //     app/
+    //       lex.toml    (depends on lex-math via path = "../lex-math")
+    //       main.lex    (imports "lex-math/arith" as m)
+    let dir = tempfile::tempdir().unwrap();
+    let math_dir = dir.path().join("lex-math");
+    let math_src = math_dir.join("src");
+    let app_dir  = dir.path().join("app");
+    std::fs::create_dir_all(&math_src).unwrap();
+    std::fs::create_dir_all(&app_dir).unwrap();
+
+    write(&math_dir, "lex.toml", "[package]\nname = \"lex-math\"\nversion = \"0.1.0\"\n");
+    write(&math_src, "arith.lex", "fn add(a :: Int, b :: Int) -> Int { a + b }\n");
+
+    write(&app_dir, "lex.toml", concat!(
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n",
+        "[dependencies]\nlex-math = { path = \"../lex-math\" }\n",
+    ));
+    write(&app_dir, "main.lex",
+        "import \"lex-math/arith\" as m\nfn main(x :: Int) -> Int { m.add(x, 1) }\n");
+
+    let prog = load_program(&app_dir.join("main.lex")).expect("load");
+    let fns = fn_names(&prog);
+
+    assert!(fns.contains(&"main".to_string()), "got fns: {fns:?}");
+    assert_eq!(count_with_suffix(&prog, "add"), 1, "got fns: {fns:?}");
+}
+
+#[test]
+fn package_import_missing_from_toml_errors_clearly() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "lex.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n");
+    write(dir.path(), "main.lex",
+        "import \"no-such-pkg/foo\" as x\nfn main() -> Int { 0 }\n");
+
+    let err = load_program(&dir.path().join("main.lex"))
+        .expect_err("expected package error");
+    let msg = format!("{err}");
+    assert!(msg.contains("no-such-pkg"), "msg: {msg}");
+}
+
+#[test]
+fn string_source_rejects_package_imports() {
+    let err = load_program_from_str("import \"lex-schema/schema\" as s\nfn main() -> Int { 0 }\n")
+        .expect_err("expected rejection");
+    matches!(err, LoadError::LocalImportInStringSource);
+}
