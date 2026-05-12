@@ -73,10 +73,10 @@ fn create_insert_query(path :: Str) -> [sql, fs_write] List[{ id :: Int, name ::
       let c := match sql.exec(db, "CREATE TABLE users(id INTEGER, name TEXT)", []) {
         Ok(_) => 0, Err(_) => 0 - 1,
       }
-      let i1 := match sql.exec(db, "INSERT INTO users VALUES (?1, ?2)", ["1", "alice"]) {
+      let i1 := match sql.exec(db, "INSERT INTO users VALUES (?1, ?2)", [PStr("1"), PStr("alice")]) {
         Ok(_) => 0, Err(_) => 0 - 1,
       }
-      let i2 := match sql.exec(db, "INSERT INTO users VALUES (?1, ?2)", ["2", "bob"]) {
+      let i2 := match sql.exec(db, "INSERT INTO users VALUES (?1, ?2)", [PStr("2"), PStr("bob")]) {
         Ok(_) => 0, Err(_) => 0 - 1,
       }
       let result :: Result[List[{ id :: Int, name :: Str }], Str] :=
@@ -115,7 +115,7 @@ fn pick_by_id(path :: Str, id :: Str) -> [sql, fs_write] Str {
   match sql.open(path) {
     Ok(db) => {
       let result :: Result[List[{ name :: Str }], Str] :=
-        sql.query(db, "SELECT name FROM users WHERE id = ?1", [id])
+        sql.query(db, "SELECT name FROM users WHERE id = ?1", [PStr(id)])
       match result {
         Ok(rows) => match list.head(rows) {
           Some(r) => r.name,
@@ -131,7 +131,7 @@ fn pick_by_id(path :: Str, id :: Str) -> [sql, fs_write] Str {
 # Confirm exec returns the row count.
 fn delete_count(path :: Str) -> [sql, fs_write] Int {
   match sql.open(path) {
-    Ok(db) => match sql.exec(db, "DELETE FROM users WHERE id = ?1", ["1"]) {
+    Ok(db) => match sql.exec(db, "DELETE FROM users WHERE id = ?1", [PStr("1")]) {
       Ok(n)  => n,
       Err(_) => 0 - 1,
     },

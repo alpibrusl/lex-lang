@@ -62,6 +62,29 @@ impl TypeEnv {
         e.types.insert("Map".into(), TypeDef { params: vec!["K".into(), "V".into()], kind: TypeDefKind::Opaque });
         e.types.insert("Set".into(), TypeDef { params: vec!["T".into()], kind: TypeDefKind::Opaque });
 
+        // SqlParam = PStr(Str) | PInt(Int) | PFloat(Float) | PBool(Bool) | PNull
+        // Typed parameter binding for std.sql (#362). Replaces the v1 List[Str]
+        // approach so callers don't have to stringify non-string values.
+        let mut sp_variants = IndexMap::new();
+        sp_variants.insert("PStr".into(),   Some(Ty::str()));
+        sp_variants.insert("PInt".into(),   Some(Ty::int()));
+        sp_variants.insert("PFloat".into(), Some(Ty::Con("Float".into(), vec![])));
+        sp_variants.insert("PBool".into(),  Some(Ty::Con("Bool".into(), vec![])));
+        sp_variants.insert("PNull".into(),  None);
+        e.types.insert("SqlParam".into(), TypeDef {
+            params: vec![],
+            kind: TypeDefKind::Union(sp_variants),
+        });
+        for ctor in &["PStr", "PInt", "PFloat", "PBool", "PNull"] {
+            e.ctor_to_type.insert((*ctor).into(), "SqlParam".into());
+        }
+
+        // SqlTx: opaque transaction handle (#362). Backed by the same
+        // Int registry key as Db; the type system enforces that commit/
+        // rollback can only be called on a value from sql.begin, not on
+        // a raw Db connection.
+        e.types.insert("SqlTx".into(), TypeDef { params: vec![], kind: TypeDefKind::Opaque });
+
         // Stream[T]: opaque streaming iterator (#305 slice 3).
         // Built and consumed exclusively through the `stream.*` and
         // `agent.cloud_stream` effect builtins; the runtime
