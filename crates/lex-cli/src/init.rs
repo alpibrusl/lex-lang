@@ -29,11 +29,12 @@ pub fn cmd_init(args: &[String]) -> Result<()> {
     let mut created = Vec::new();
     let mut skipped = Vec::new();
 
-    let files: &[(&str, &dyn Fn(&str) -> String)] = &[
-        ("lex.toml",                    &lex_toml),
-        ("src/main.lex",                &main_lex),
-        ("tests/test_main.lex",         &test_lex),
-        (".github/workflows/lex.yml",   &ci_yml),
+    type Gen = fn(&str) -> String;
+    let files: &[(&str, Gen)] = &[
+        ("lex.toml",                    lex_toml),
+        ("src/main.lex",                main_lex),
+        ("tests/test_main.lex",         test_lex),
+        (".github/workflows/lex.yml",   ci_yml),
     ];
 
     for (rel, gen) in files {
