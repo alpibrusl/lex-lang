@@ -172,6 +172,229 @@ impl Documents {
     }
 }
 
+// ---------------------------------------------------------------
+// #304 phase 2a: hover / definition / completion
+// ---------------------------------------------------------------
+
+/// One indexed function from a single Lex source — enough to drive
+/// hover, definition, and completion without re-running the
+/// parser for each request. Built once per source by
+/// [`analyze_source`] and cached by the server loop per Uri.
+#[derive(Debug, Clone)]
+pub struct FnSummary {
+    pub name: String,
+    /// 0-based LSP position of the `fn` keyword.
+    pub def: Position,
+    /// One-line render: `(params) -> ret [effects]`.
+    pub signature: String,
+    /// Declared effect names (excludes `budget` — that's surfaced
+    /// separately in [`Self::budget`]).
+    pub effects: Vec<String>,
+    /// Sum of `[budget(N)]` declarations on the signature, when
+    /// any are present.
+    pub budget: Option<u64>,
+}
+
+/// Per-source analysis cache for hover / definition / completion.
+#[derive(Debug, Default, Clone)]
+pub struct FileAnalysis {
+    pub fns: std::collections::BTreeMap<String, FnSummary>,
+    /// Stdlib + path aliases brought into scope (`import "std.io" as io` → `"io"`).
+    pub imports: Vec<String>,
+}
+
+/// Parse + canonicalise + index the source. Returns `None` when
+/// parsing fails (the caller's diagnostics path already shows the
+/// parse error; hover/definition/completion just silently
+/// degrade until the source parses again).
+pub fn analyze_source(src: &str) -> Option<FileAnalysis> {
+    let (program, fn_positions) = lex_syntax::parse_source_with_positions(src).ok()?;
+    let stages = lex_ast::canonicalize_program(&program);
+    let mut fns: std::collections::BTreeMap<String, FnSummary> = Default::default();
+    for stage in &stages {
+        let lex_ast::Stage::FnDecl(fd) = stage else { continue };
+        let signature = render_signature(fd);
+        let (effects, budget) = effects_and_budget(&fd.effects);
+        let def = match fn_positions.get(&fd.name) {
+            Some(&byte) => {
+                let (line, col) = lex_types::byte_to_line_col(src, byte);
+                Position { line: line.saturating_sub(1), character: col.saturating_sub(1) }
+            }
+            None => Position { line: 0, character: 0 },
+        };
+        fns.insert(
+            fd.name.clone(),
+            FnSummary { name: fd.name.clone(), def, signature, effects, budget },
+        );
+    }
+    let imports: Vec<String> = stages
+        .iter()
+        .filter_map(|s| match s {
+            lex_ast::Stage::Import(i) => Some(i.alias.clone()),
+            _ => None,
+        })
+        .collect();
+    Some(FileAnalysis { fns, imports })
+}
+
+fn render_signature(fd: &lex_ast::FnDecl) -> String {
+    let params: Vec<String> = fd
+        .params
+        .iter()
+        .map(|p| format!("{} :: {}", p.name, render_type(&p.ty)))
+        .collect();
+    let ret = render_type(&fd.return_type);
+    let effs = if fd.effects.is_empty() {
+        String::new()
+    } else {
+        let names: Vec<String> = fd
+            .effects
+            .iter()
+            .map(|e| match &e.arg {
+                Some(lex_ast::EffectArg::Int { value }) => format!("{}({})", e.name, value),
+                Some(lex_ast::EffectArg::Str { value }) => format!("{}({:?})", e.name, value),
+                Some(lex_ast::EffectArg::Ident { value }) => format!("{}({})", e.name, value),
+                None => e.name.clone(),
+            })
+            .collect();
+        format!(" [{}]", names.join(", "))
+    };
+    format!("fn {}({}) -> {}{}", fd.name, params.join(", "), ret, effs)
+}
+
+fn render_type(t: &lex_ast::TypeExpr) -> String {
+    use lex_ast::TypeExpr::*;
+    match t {
+        Named { name, args } if args.is_empty() => name.clone(),
+        Named { name, args } => {
+            let inner: Vec<String> = args.iter().map(render_type).collect();
+            format!("{}[{}]", name, inner.join(", "))
+        }
+        Tuple { items } => {
+            let inner: Vec<String> = items.iter().map(render_type).collect();
+            format!("({})", inner.join(", "))
+        }
+        Record { fields } => {
+            let inner: Vec<String> = fields
+                .iter()
+                .map(|f| format!("{}: {}", f.name, render_type(&f.ty)))
+                .collect();
+            format!("{{{}}}", inner.join(", "))
+        }
+        Function { params, ret, .. } => {
+            let inner: Vec<String> = params.iter().map(render_type).collect();
+            format!("({}) -> {}", inner.join(", "), render_type(ret))
+        }
+        Union { variants } => {
+            let inner: Vec<String> = variants.iter().map(|v| v.name.clone()).collect();
+            inner.join(" | ")
+        }
+        Refined { base, .. } => format!("{}{{...}}", render_type(base)),
+    }
+}
+
+fn effects_and_budget(effects: &[lex_ast::Effect]) -> (Vec<String>, Option<u64>) {
+    let mut budget: u64 = 0;
+    let mut had_budget = false;
+    let mut other: Vec<String> = Vec::new();
+    for e in effects {
+        if e.name == "budget" {
+            if let Some(lex_ast::EffectArg::Int { value }) = &e.arg {
+                budget = budget.saturating_add(*value as u64);
+                had_budget = true;
+            }
+        } else {
+            other.push(e.name.clone());
+        }
+    }
+    (other, if had_budget { Some(budget) } else { None })
+}
+
+/// Identifier under `pos` in `src`, if any. Matches ASCII alphanumeric
+/// + `_`; non-identifier positions return `None`.
+pub fn word_at(src: &str, pos: Position) -> Option<String> {
+    let byte = position_to_byte(src, pos)?;
+    let bytes = src.as_bytes();
+    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut start = byte;
+    while start > 0 && is_word(bytes[start - 1]) {
+        start -= 1;
+    }
+    let mut end = byte;
+    while end < bytes.len() && is_word(bytes[end]) {
+        end += 1;
+    }
+    if start == end {
+        return None;
+    }
+    Some(std::str::from_utf8(&bytes[start..end]).ok()?.to_string())
+}
+
+fn position_to_byte(src: &str, pos: Position) -> Option<usize> {
+    let mut line: u32 = 0;
+    let mut col: u32 = 0;
+    let mut byte: usize = 0;
+    for (i, ch) in src.char_indices() {
+        if line == pos.line && col == pos.character {
+            return Some(i);
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+        byte = i + ch.len_utf8();
+    }
+    if line == pos.line && col == pos.character {
+        Some(byte)
+    } else {
+        None
+    }
+}
+
+/// Hover content for the symbol at `pos`. Returns `None` when the
+/// symbol is unknown to this file (e.g. a parameter binding, a
+/// stdlib function, or whitespace).
+pub fn hover_at(file: &FileAnalysis, src: &str, pos: Position) -> Option<String> {
+    let word = word_at(src, pos)?;
+    let f = file.fns.get(&word)?;
+    let mut s = format!("```lex\n{}\n```", f.signature);
+    if !f.effects.is_empty() {
+        s.push_str(&format!("\n\n**effects**: `{}`", f.effects.join(", ")));
+    }
+    if let Some(b) = f.budget {
+        s.push_str(&format!("\n\n**budget**: `{b}`"));
+    }
+    Some(s)
+}
+
+/// Definition position for the symbol at `pos` — points at the
+/// `fn` keyword of the matching declaration in the same file.
+/// Returns `None` for cross-file or stdlib symbols (queued for
+/// phase 2b).
+pub fn definition_at(file: &FileAnalysis, src: &str, pos: Position) -> Option<Position> {
+    let word = word_at(src, pos)?;
+    Some(file.fns.get(&word)?.def)
+}
+
+/// Completion candidates: every fn defined in the file plus every
+/// import alias. Stdlib module members (e.g. `io.print`) require
+/// the stdlib type registry, which is queued for phase 2b.
+pub fn completions(file: &FileAnalysis) -> Vec<(String, String, u8)> {
+    let mut out: Vec<(String, String, u8)> = Vec::new();
+    // (label, detail, kind code per LSP CompletionItemKind:
+    //  3 = Function, 9 = Module)
+    for f in file.fns.values() {
+        out.push((f.name.clone(), f.signature.clone(), 3));
+    }
+    for alias in &file.imports {
+        out.push((alias.clone(), format!("import alias `{alias}`"), 9));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,6 +454,85 @@ fn broken(x :: Int) -> Str { x }
             diags[0].code,
             Some(lsp_types::NumberOrString::String("parse-error".into()))
         );
+    }
+
+    #[test]
+    fn word_at_picks_identifier_under_cursor() {
+        let src = "fn add(x :: Int, y :: Int) -> Int { x + y }\n";
+        // Cursor on the `a` in `add` (line 0, col 3).
+        let w = word_at(src, Position { line: 0, character: 4 });
+        assert_eq!(w.as_deref(), Some("add"));
+    }
+
+    #[test]
+    fn word_at_returns_none_on_whitespace() {
+        let src = "fn foo() -> Int { 1 }";
+        // Cursor on the space before `->`.
+        assert_eq!(word_at(src, Position { line: 0, character: 8 }), None);
+    }
+
+    #[test]
+    fn analyze_source_indexes_fns_with_signatures() {
+        let src = "\
+import \"std.io\" as io
+
+fn echo(msg :: Str) -> [io, budget(5)] Nil {
+    io.print(msg)
+}
+
+fn double(n :: Int) -> Int { n + n }
+";
+        let file = analyze_source(src).expect("parses");
+        assert_eq!(file.fns.len(), 2);
+        let echo = file.fns.get("echo").expect("echo present");
+        assert_eq!(echo.def.line, 2, "echo is on the 3rd line (0-based: 2)");
+        assert!(echo.signature.contains("Str"), "sig: {}", echo.signature);
+        assert!(echo.effects.contains(&"io".to_string()));
+        assert_eq!(echo.budget, Some(5));
+        let dbl = file.fns.get("double").unwrap();
+        assert_eq!(dbl.effects, Vec::<String>::new());
+        assert_eq!(dbl.budget, None);
+        assert!(file.imports.contains(&"io".to_string()));
+    }
+
+    #[test]
+    fn hover_renders_signature_and_effects() {
+        let src = "fn echo(msg :: Str) -> [io] Nil { msg }\n";
+        let file = analyze_source(src).unwrap();
+        // Cursor on `echo` (line 0, col 5).
+        let h = hover_at(&file, src, Position { line: 0, character: 5 }).expect("hover");
+        assert!(h.contains("fn echo"), "expected sig in hover: {h}");
+        assert!(h.contains("**effects**"), "expected effects line: {h}");
+    }
+
+    #[test]
+    fn definition_jumps_to_fn_keyword() {
+        let src = "\
+fn double(n :: Int) -> Int { n + n }
+fn caller() -> Int { double(2) }
+";
+        let file = analyze_source(src).unwrap();
+        // Cursor on `double` inside `caller`'s body.
+        // Line 1 (0-based), word starts around column 21.
+        let pos = Position { line: 1, character: 22 };
+        let def = definition_at(&file, src, pos).expect("definition");
+        assert_eq!(def.line, 0, "`double` is defined on line 0");
+        assert_eq!(def.character, 0);
+    }
+
+    #[test]
+    fn completions_list_fns_and_imports() {
+        let src = "\
+import \"std.io\" as io
+fn foo() -> Int { 1 }
+fn bar() -> Int { 2 }
+";
+        let file = analyze_source(src).unwrap();
+        let items = completions(&file);
+        let labels: Vec<&str> = items.iter().map(|(l, _, _)| l.as_str()).collect();
+        assert!(labels.contains(&"foo"));
+        assert!(labels.contains(&"bar"));
+        assert!(labels.contains(&"io"), "import alias must appear: {labels:?}");
     }
 
     #[test]

@@ -9,6 +9,24 @@ bumps may carry breaking changes when justified).
 
 ### Added
 
+- **#304 phase 2a: hover / definition / completion in `lex-lsp`.**
+  Builds on phase 1's read-only diagnostics. Editors get three
+  new request handlers:
+  - `textDocument/hover` — renders the function signature plus
+    declared effects and budget at the cursor as Markdown.
+  - `textDocument/definition` — jumps to the `fn` keyword of the
+    declaration when invoked on a call site in the same file.
+    Cross-file definition is queued for phase 2b.
+  - `textDocument/completion` — proposes in-scope fn names and
+    import aliases. Trigger character `.` is registered so phase
+    2b can wire up `io.<TAB>` / `list.<TAB>` stdlib-member
+    completion.
+
+  Coverage: 6 new lib unit tests on `word_at` / `analyze_source` /
+  `hover_at` / `definition_at` / `completions`, plus 3 new e2e
+  tests spawning the binary and round-tripping each request
+  through the protocol. Workspace test count: 1389 passing.
+
 - **#304 phase 1: `lex-lsp` Language Server.** Editors that speak
   LSP (VS Code, Cursor, Continue, Zed, JetBrains AI) now light up
   Lex files with inline red squiggles for type errors instead of

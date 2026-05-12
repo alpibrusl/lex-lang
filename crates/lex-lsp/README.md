@@ -4,7 +4,9 @@ Language Server Protocol bridge for Lex. Pipes
 `lex_types::check_program` errors to editor inline-error surfaces
 (VS Code, Cursor, Continue, Zed, JetBrains AI).
 
-## Phase 1 (this slice — closes the first AC block of #304)
+## What's shipped (phases 1 + 2a of #304)
+
+**Phase 1** — read-only diagnostics:
 
 - `initialize` / `initialized` / `shutdown` lifecycle.
 - `textDocument/didOpen` / `didChange` / `didSave` / `didClose`
@@ -18,6 +20,16 @@ Language Server Protocol bridge for Lex. Pipes
   - `data = { rule_tag, rule_explanation, suggested_transform, at_node }`
     — code-action providers in phase 3 read the
     `suggested_transform` from here.
+
+**Phase 2a** — navigation:
+
+- `textDocument/hover` — renders the function signature + declared
+  effects + budget at the cursor as Markdown.
+- `textDocument/definition` — jumps to the `fn` keyword of the
+  declaration in the same file.
+- `textDocument/completion` — proposes in-scope fn names and
+  import aliases. Stdlib-module-member completion (`io.<TAB>`,
+  `list.<TAB>`) is queued for phase 2b.
 
 ## Build
 
@@ -63,9 +75,10 @@ A `.vscode/launch.json` snippet for debugging the LSP itself:
 }
 ```
 
-## What's queued (phases 2–4 of #304)
+## What's queued (phases 2b–4 of #304)
 
-- Phase 2: hover, definition, completion, references.
+- Phase 2b: cross-file definition jumps, references, stdlib-module-
+  member completion.
 - Phase 3: code actions backed by #280's typed transforms.
 - Phase 4: surface `RepairHint` attestations as code actions
   (one-click `lex repair --apply`).
