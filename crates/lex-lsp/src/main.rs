@@ -7,21 +7,26 @@
 //! as follow-up slices.
 
 use lex_lsp::{
-    analyze_source, completions, definition_at, diagnostics_for_source, hover_at, Documents,
+    analyze_source, code_actions_for_diagnostics, completions, definition_at,
+    diagnostics_for_source, hover_at, Documents,
 };
 use lsp_server::{Connection, Message, Notification, Request, Response};
 use lsp_types::notification::{
     DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
     Notification as NotificationTrait, PublishDiagnostics,
 };
-use lsp_types::request::{Completion, GotoDefinition, HoverRequest, Request as RequestTrait};
+use lsp_types::request::{
+    CodeActionRequest, Completion, GotoDefinition, HoverRequest, Request as RequestTrait,
+};
 use lsp_types::{
-    CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
-    HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, Location,
-    MarkupContent, MarkupKind, OneOf, PublishDiagnosticsParams, Range, ServerCapabilities,
-    ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
+    CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
+    CodeActionProviderCapability, CodeActionResponse, CompletionItem, CompletionItemKind,
+    CompletionOptions, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
+    HoverProviderCapability, InitializeParams, InitializeResult, Location, MarkupContent,
+    MarkupKind, OneOf, PublishDiagnosticsParams, Range, ServerCapabilities, ServerInfo,
+    TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -39,6 +44,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             trigger_characters: Some(vec![".".to_string()]),
             ..Default::default()
         }),
+        // Phase 3a: surface code actions derived from each
+        // diagnostic's `suggested_transform` (#306 slice 3).
+        // The action stub carries the suggestion in `data` so a
+        // client extension can pipe it to `lex repair --apply`;
+        // computing a full `WorkspaceEdit` is queued for phase 3b.
+        code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
         ..Default::default()
     };
     let server_capabilities_json = serde_json::to_value(&server_capabilities)?;
@@ -155,6 +166,38 @@ fn handle_request(
             Response {
                 id: req.id,
                 result: Some(serde_json::to_value(CompletionResponse::Array(items))?),
+                error: None,
+            }
+        }
+        m if m == CodeActionRequest::METHOD => {
+            let params: CodeActionParams = serde_json::from_value(req.params)?;
+            // Phase 3a: every diagnostic in the request whose
+            // `data.suggested_transform` is populated becomes one
+            // code-action stub. Selecting it (in slice 3b) will
+            // produce a `WorkspaceEdit`; for now the action carries
+            // the suggestion JSON in `data` for client extensions.
+            let actions: Vec<CodeActionOrCommand> =
+                code_actions_for_diagnostics(&params.context.diagnostics)
+                    .into_iter()
+                    .map(|stub| {
+                        CodeActionOrCommand::CodeAction(CodeAction {
+                            title: format!(
+                                "Lex: {} ({})",
+                                stub.title, stub.kind_hint
+                            ),
+                            kind: Some(CodeActionKind::QUICKFIX),
+                            diagnostics: Some(vec![stub.diagnostic]),
+                            edit: None,
+                            command: None,
+                            is_preferred: Some(true),
+                            disabled: None,
+                            data: Some(stub.data),
+                        })
+                    })
+                    .collect();
+            Response {
+                id: req.id,
+                result: Some(serde_json::to_value(CodeActionResponse::from(actions))?),
                 error: None,
             }
         }

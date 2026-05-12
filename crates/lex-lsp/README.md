@@ -4,7 +4,7 @@ Language Server Protocol bridge for Lex. Pipes
 `lex_types::check_program` errors to editor inline-error surfaces
 (VS Code, Cursor, Continue, Zed, JetBrains AI).
 
-## What's shipped (phases 1 + 2a of #304)
+## What's shipped (phases 1 + 2a + 3a of #304)
 
 **Phase 1** — read-only diagnostics:
 
@@ -30,6 +30,17 @@ Language Server Protocol bridge for Lex. Pipes
 - `textDocument/completion` — proposes in-scope fn names and
   import aliases. Stdlib-module-member completion (`io.<TAB>`,
   `list.<TAB>`) is queued for phase 2b.
+
+**Phase 3a** — code-action surface:
+
+- `textDocument/codeAction` returns one `QuickFix` action per
+  diagnostic whose `data.suggested_transform` is populated (from
+  #306 slice 3). The action's `data` carries the full suggestion
+  so a client extension can pipe it to
+  `lex repair --apply --transform '<json>'`. Computing a real
+  `WorkspaceEdit` so the fix applies inline (no CLI round-trip)
+  is queued for phase 3b — that needs cursor-to-NodeId mapping +
+  AST-roundtrip pretty-printing.
 
 ## Build
 
@@ -75,10 +86,11 @@ A `.vscode/launch.json` snippet for debugging the LSP itself:
 }
 ```
 
-## What's queued (phases 2b–4 of #304)
+## What's queued (phases 2b / 3b / 4 of #304)
 
 - Phase 2b: cross-file definition jumps, references, stdlib-module-
   member completion.
-- Phase 3: code actions backed by #280's typed transforms.
-- Phase 4: surface `RepairHint` attestations as code actions
-  (one-click `lex repair --apply`).
+- Phase 3b: real `WorkspaceEdit` from each code action so the
+  typed-transform fix applies inline without a CLI round-trip.
+- Phase 4: surface `RepairHint` attestations directly (one-click
+  `lex repair --apply` over the latest hint for a stage).
