@@ -9,6 +9,29 @@ bumps may carry breaking changes when justified).
 
 ### Added
 
+- **#307: cost-aware planner (`lex plan`).** Closes the loop opened
+  by `[budget(N)]` declarations and the session-budget gate (#292):
+  given a `goal` function, enumerate every linear call chain from
+  `goal` to a leaf, sum declared budget along each chain, and rank
+  cheapest-first. Each path carries the union of declared effects so
+  the agent can also gate by policy. The output is advisory —
+  paths are returned with a `fits` flag against the effective cap
+  (`min(--max-cost, session-remaining)`); the agent (or downstream
+  policy) chooses which path to apply.
+  - New `lex_store::planner` module with `Store::plan(branch,
+    goal, max_cost, session_id) -> Plan`.
+  - Recursive self-calls are detected via a visited-set and
+    budgeted once — no infinite-loop expansion.
+  - When `session_id` is supplied, the planner consults
+    `Store::session_budget` and merges remaining with `--max-cost`.
+  - New `lex plan --goal <fn> [--max-cost N] [--intent <id>]
+    [--branch B] [--store DIR]` CLI subcommand.
+  - 6 conformance tests in `crates/lex-store/tests/planner.rs`
+    pin the contract (linear chain budget sum, max-cost
+    would-exceed marking, branching → multiple sorted paths,
+    recursive self-call budgeted once, effect-set union, unknown
+    goal yields empty paths).
+
 - **#305 slice 2: per-thread effect handler split for
   `list.par_map`.** Slice 1 ran each worker with `DenyAllEffects`,
   so effectful closures (MCP calls, LLM invocations, io.print)
