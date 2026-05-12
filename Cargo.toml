@@ -13,6 +13,7 @@ members = [
     "crates/lex-stdlib",
     "crates/lex-cli",
     "crates/lex-api",
+    "crates/lex-lsp",
     "crates/core-syntax",
     "crates/core-compiler",
     "crates/spec-checker",
