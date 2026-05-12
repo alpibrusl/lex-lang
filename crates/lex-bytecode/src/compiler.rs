@@ -658,6 +658,16 @@ impl<'a> FnCompiler<'a> {
             ("list", "sort_by") => self.emit_list_sort_by(args),
             ("list", "filter") => self.emit_list_filter(args),
             ("list", "fold") => self.emit_list_fold(args),
+            ("iter", "from_list") => self.emit_iter_from_list(args),
+            ("iter", "next")      => self.emit_iter_next(args),
+            ("iter", "is_empty")  => self.emit_iter_is_empty(args),
+            ("iter", "count")     => self.emit_iter_count(args),
+            ("iter", "take")      => self.emit_iter_take(args),
+            ("iter", "skip")      => self.emit_iter_skip(args),
+            ("iter", "to_list")   => self.emit_iter_to_list(args),
+            ("iter", "map")       => self.emit_iter_map(args),
+            ("iter", "filter")    => self.emit_iter_filter(args),
+            ("iter", "fold")      => self.emit_iter_fold(args),
             ("map", "fold") => self.emit_map_fold(args, node_id_idx),
             ("flow", "sequential") => self.emit_flow_sequential(args),
             ("flow", "branch") => self.emit_flow_branch(args),
@@ -878,6 +888,450 @@ impl<'a> FnCompiler<'a> {
         if let Op::JumpIfNot(off) = &mut self.code[j_exit] {
             *off = exit_target - (j_exit as i32 + 1);
         }
+        self.emit(Op::LoadLocal(acc));
+    }
+
+    // ── Iter[T] operations (#364) ─────────────────────────────────────────
+    // Internal representation: Value::Tuple([list, index]) where list is the
+    // backing List[T] and index is the current cursor (Int). All operations
+    // are compiler-inlined; no runtime effect dispatch is needed.
+
+    /// `iter.from_list(xs)` — wrap a list in an iterator at position 0.
+    fn emit_iter_from_list(&mut self, args: &[a::CExpr]) {
+        self.compile_expr(&args[0], false);
+        let zero = self.pool.int(0);
+        self.emit(Op::PushConst(zero));
+        self.emit(Op::MakeTuple(2));
+    }
+
+    /// `iter.next(it)` — advance one step; returns `Option[(T, Iter[T])]`.
+    fn emit_iter_next(&mut self, args: &[a::CExpr]) {
+        self.compile_expr(&args[0], false);
+        let it   = self.alloc_local("__in_it");
+        self.emit(Op::StoreLocal(it));
+
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(0));
+        let list = self.alloc_local("__in_list");
+        self.emit(Op::StoreLocal(list));
+
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(1));
+        let idx  = self.alloc_local("__in_idx");
+        self.emit(Op::StoreLocal(idx));
+
+        // condition: idx < len(list)
+        self.emit(Op::LoadLocal(idx));
+        self.emit(Op::LoadLocal(list)); self.emit(Op::GetListLen);
+        self.emit(Op::NumLt);
+        let j_else = self.code.len();
+        self.emit(Op::JumpIfNot(0));
+
+        // Some((item, new_iter)):
+        self.emit(Op::LoadLocal(list));
+        self.emit(Op::LoadLocal(idx));
+        self.emit(Op::GetListElemDyn);              // item
+
+        self.emit(Op::LoadLocal(list));
+        self.emit(Op::LoadLocal(idx));
+        let one = self.pool.int(1);
+        self.emit(Op::PushConst(one));
+        self.emit(Op::NumAdd);
+        self.emit(Op::MakeTuple(2));                // new Iter = (list, idx+1)
+
+        self.emit(Op::MakeTuple(2));                // (item, new_iter)
+        let some_idx = self.pool.variant("Some");
+        self.emit(Op::MakeVariant { name_idx: some_idx, arity: 1 });
+        let j_end = self.code.len();
+        self.emit(Op::Jump(0));
+
+        // None:
+        let else_t = self.code.len() as i32;
+        if let Op::JumpIfNot(off) = &mut self.code[j_else] {
+            *off = else_t - (j_else as i32 + 1);
+        }
+        let none_idx = self.pool.variant("None");
+        self.emit(Op::MakeVariant { name_idx: none_idx, arity: 0 });
+
+        let end_t = self.code.len() as i32;
+        if let Op::Jump(off) = &mut self.code[j_end] {
+            *off = end_t - (j_end as i32 + 1);
+        }
+    }
+
+    /// `iter.is_empty(it)` — true iff the cursor is at or past the end.
+    fn emit_iter_is_empty(&mut self, args: &[a::CExpr]) {
+        self.compile_expr(&args[0], false);
+        let it = self.alloc_local("__ie_it");
+        self.emit(Op::StoreLocal(it));
+
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(1)); // idx
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(0)); // list
+        self.emit(Op::GetListLen);                               // len
+        self.emit(Op::NumLt);                                    // idx < len
+        self.emit(Op::BoolNot);                                  // NOT(idx < len)
+    }
+
+    /// `iter.count(it)` — number of remaining elements.
+    fn emit_iter_count(&mut self, args: &[a::CExpr]) {
+        self.compile_expr(&args[0], false);
+        let it = self.alloc_local("__ic_it");
+        self.emit(Op::StoreLocal(it));
+
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(0));
+        self.emit(Op::GetListLen);                  // len
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(1)); // idx
+        self.emit(Op::NumSub);                      // len - idx
+    }
+
+    /// `iter.take(it, n)` — collect up to n elements, return as new Iter.
+    fn emit_iter_take(&mut self, args: &[a::CExpr]) {
+        self.compile_expr(&args[0], false);
+        let it   = self.alloc_local("__itk_it");
+        self.emit(Op::StoreLocal(it));
+
+        self.compile_expr(&args[1], false);
+        let n    = self.alloc_local("__itk_n");
+        self.emit(Op::StoreLocal(n));
+
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(0));
+        let list = self.alloc_local("__itk_list");
+        self.emit(Op::StoreLocal(list));
+
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(1));
+        let i    = self.alloc_local("__itk_i");
+        self.emit(Op::StoreLocal(i));
+
+        self.emit(Op::MakeList(0));
+        let out  = self.alloc_local("__itk_out");
+        self.emit(Op::StoreLocal(out));
+
+        let zero = self.pool.int(0);
+        self.emit(Op::PushConst(zero));
+        let cnt  = self.alloc_local("__itk_cnt");
+        self.emit(Op::StoreLocal(cnt));
+
+        let loop_top = self.code.len();
+
+        // while cnt < n
+        self.emit(Op::LoadLocal(cnt));
+        self.emit(Op::LoadLocal(n));
+        self.emit(Op::NumLt);
+        let j_exit_n = self.code.len();
+        self.emit(Op::JumpIfNot(0));
+
+        // AND i < len(list)
+        self.emit(Op::LoadLocal(i));
+        self.emit(Op::LoadLocal(list)); self.emit(Op::GetListLen);
+        self.emit(Op::NumLt);
+        let j_exit_l = self.code.len();
+        self.emit(Op::JumpIfNot(0));
+
+        // out = out ++ [list[i]]
+        self.emit(Op::LoadLocal(out));
+        self.emit(Op::LoadLocal(list));
+        self.emit(Op::LoadLocal(i));
+        self.emit(Op::GetListElemDyn);
+        self.emit(Op::ListAppend);
+        self.emit(Op::StoreLocal(out));
+
+        let one = self.pool.int(1);
+        // i = i + 1
+        self.emit(Op::LoadLocal(i));
+        self.emit(Op::PushConst(one));
+        self.emit(Op::NumAdd);
+        self.emit(Op::StoreLocal(i));
+        // cnt = cnt + 1
+        self.emit(Op::LoadLocal(cnt));
+        self.emit(Op::PushConst(one));
+        self.emit(Op::NumAdd);
+        self.emit(Op::StoreLocal(cnt));
+
+        let jback = self.code.len();
+        self.emit(Op::Jump((loop_top as i32) - (jback as i32 + 1)));
+
+        let exit_t = self.code.len() as i32;
+        if let Op::JumpIfNot(off) = &mut self.code[j_exit_n] { *off = exit_t - (j_exit_n as i32 + 1); }
+        if let Op::JumpIfNot(off) = &mut self.code[j_exit_l] { *off = exit_t - (j_exit_l as i32 + 1); }
+
+        // return (out, 0) as new Iter
+        self.emit(Op::LoadLocal(out));
+        self.emit(Op::PushConst(zero));
+        self.emit(Op::MakeTuple(2));
+    }
+
+    /// `iter.skip(it, n)` — advance cursor by n (or to end), return new Iter.
+    fn emit_iter_skip(&mut self, args: &[a::CExpr]) {
+        self.compile_expr(&args[0], false);
+        let it   = self.alloc_local("__isk_it");
+        self.emit(Op::StoreLocal(it));
+
+        self.compile_expr(&args[1], false);
+        let n    = self.alloc_local("__isk_n");
+        self.emit(Op::StoreLocal(n));
+
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(0));
+        let list = self.alloc_local("__isk_list");
+        self.emit(Op::StoreLocal(list));
+
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(1));
+        let idx  = self.alloc_local("__isk_idx");
+        self.emit(Op::StoreLocal(idx));
+
+        // raw = idx + n
+        self.emit(Op::LoadLocal(idx));
+        self.emit(Op::LoadLocal(n));
+        self.emit(Op::NumAdd);
+        let raw  = self.alloc_local("__isk_raw");
+        self.emit(Op::StoreLocal(raw));
+
+        // new_idx = if raw < len then raw else len
+        self.emit(Op::LoadLocal(raw));
+        self.emit(Op::LoadLocal(list)); self.emit(Op::GetListLen);
+        self.emit(Op::NumLt);
+        let j_use_raw = self.code.len();
+        self.emit(Op::JumpIf(0));
+
+        // use len
+        self.emit(Op::LoadLocal(list)); self.emit(Op::GetListLen);
+        let j_end = self.code.len();
+        self.emit(Op::Jump(0));
+
+        // use raw
+        let raw_t = self.code.len() as i32;
+        if let Op::JumpIf(off) = &mut self.code[j_use_raw] { *off = raw_t - (j_use_raw as i32 + 1); }
+        self.emit(Op::LoadLocal(raw));
+
+        let end_t = self.code.len() as i32;
+        if let Op::Jump(off) = &mut self.code[j_end] { *off = end_t - (j_end as i32 + 1); }
+
+        // new_idx on stack; build new Iter
+        let new_idx = self.alloc_local("__isk_ni");
+        self.emit(Op::StoreLocal(new_idx));
+        self.emit(Op::LoadLocal(list));
+        self.emit(Op::LoadLocal(new_idx));
+        self.emit(Op::MakeTuple(2));
+    }
+
+    /// `iter.to_list(it)` — materialise remaining elements into a List.
+    fn emit_iter_to_list(&mut self, args: &[a::CExpr]) {
+        self.compile_expr(&args[0], false);
+        let it   = self.alloc_local("__itl_it");
+        self.emit(Op::StoreLocal(it));
+
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(0));
+        let list = self.alloc_local("__itl_list");
+        self.emit(Op::StoreLocal(list));
+
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(1));
+        let i    = self.alloc_local("__itl_i");
+        self.emit(Op::StoreLocal(i));
+
+        self.emit(Op::MakeList(0));
+        let out  = self.alloc_local("__itl_out");
+        self.emit(Op::StoreLocal(out));
+
+        let loop_top = self.code.len();
+        self.emit(Op::LoadLocal(i));
+        self.emit(Op::LoadLocal(list)); self.emit(Op::GetListLen);
+        self.emit(Op::NumLt);
+        let j_exit = self.code.len();
+        self.emit(Op::JumpIfNot(0));
+
+        self.emit(Op::LoadLocal(out));
+        self.emit(Op::LoadLocal(list));
+        self.emit(Op::LoadLocal(i));
+        self.emit(Op::GetListElemDyn);
+        self.emit(Op::ListAppend);
+        self.emit(Op::StoreLocal(out));
+
+        self.emit(Op::LoadLocal(i));
+        let one = self.pool.int(1);
+        self.emit(Op::PushConst(one));
+        self.emit(Op::NumAdd);
+        self.emit(Op::StoreLocal(i));
+
+        let jback = self.code.len();
+        self.emit(Op::Jump((loop_top as i32) - (jback as i32 + 1)));
+
+        let exit_t = self.code.len() as i32;
+        if let Op::JumpIfNot(off) = &mut self.code[j_exit] { *off = exit_t - (j_exit as i32 + 1); }
+        self.emit(Op::LoadLocal(out));
+    }
+
+    /// `iter.map(it, f)` — apply `f` to each remaining element; returns new Iter.
+    fn emit_iter_map(&mut self, args: &[a::CExpr]) {
+        self.compile_expr(&args[0], false);
+        let it   = self.alloc_local("__im_it");
+        self.emit(Op::StoreLocal(it));
+
+        self.compile_expr(&args[1], false);
+        let f    = self.alloc_local("__im_f");
+        self.emit(Op::StoreLocal(f));
+
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(0));
+        let list = self.alloc_local("__im_list");
+        self.emit(Op::StoreLocal(list));
+
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(1));
+        let i    = self.alloc_local("__im_i");
+        self.emit(Op::StoreLocal(i));
+
+        self.emit(Op::MakeList(0));
+        let out  = self.alloc_local("__im_out");
+        self.emit(Op::StoreLocal(out));
+
+        let loop_top = self.code.len();
+        self.emit(Op::LoadLocal(i));
+        self.emit(Op::LoadLocal(list)); self.emit(Op::GetListLen);
+        self.emit(Op::NumLt);
+        let j_exit = self.code.len();
+        self.emit(Op::JumpIfNot(0));
+
+        let nid = self.pool.node_id("n_iter_map");
+        self.emit(Op::LoadLocal(out));
+        self.emit(Op::LoadLocal(f));
+        self.emit(Op::LoadLocal(list));
+        self.emit(Op::LoadLocal(i));
+        self.emit(Op::GetListElemDyn);
+        self.emit(Op::CallClosure { arity: 1, node_id_idx: nid });
+        self.emit(Op::ListAppend);
+        self.emit(Op::StoreLocal(out));
+
+        self.emit(Op::LoadLocal(i));
+        let one = self.pool.int(1);
+        self.emit(Op::PushConst(one));
+        self.emit(Op::NumAdd);
+        self.emit(Op::StoreLocal(i));
+
+        let jback = self.code.len();
+        self.emit(Op::Jump((loop_top as i32) - (jback as i32 + 1)));
+
+        let exit_t = self.code.len() as i32;
+        if let Op::JumpIfNot(off) = &mut self.code[j_exit] { *off = exit_t - (j_exit as i32 + 1); }
+
+        let zero = self.pool.int(0);
+        self.emit(Op::LoadLocal(out));
+        self.emit(Op::PushConst(zero));
+        self.emit(Op::MakeTuple(2));
+    }
+
+    /// `iter.filter(it, pred)` — keep elements where pred is true; returns new Iter.
+    fn emit_iter_filter(&mut self, args: &[a::CExpr]) {
+        self.compile_expr(&args[0], false);
+        let it   = self.alloc_local("__if_it");
+        self.emit(Op::StoreLocal(it));
+
+        self.compile_expr(&args[1], false);
+        let f    = self.alloc_local("__if_f");
+        self.emit(Op::StoreLocal(f));
+
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(0));
+        let list = self.alloc_local("__if_list");
+        self.emit(Op::StoreLocal(list));
+
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(1));
+        let i    = self.alloc_local("__if_i");
+        self.emit(Op::StoreLocal(i));
+
+        self.emit(Op::MakeList(0));
+        let out  = self.alloc_local("__if_out");
+        self.emit(Op::StoreLocal(out));
+
+        let loop_top = self.code.len();
+        self.emit(Op::LoadLocal(i));
+        self.emit(Op::LoadLocal(list)); self.emit(Op::GetListLen);
+        self.emit(Op::NumLt);
+        let j_exit = self.code.len();
+        self.emit(Op::JumpIfNot(0));
+
+        // elem := list[i]
+        self.emit(Op::LoadLocal(list));
+        self.emit(Op::LoadLocal(i));
+        self.emit(Op::GetListElemDyn);
+        let x    = self.alloc_local("__if_x");
+        self.emit(Op::StoreLocal(x));
+
+        let nid = self.pool.node_id("n_iter_filter");
+        self.emit(Op::LoadLocal(f));
+        self.emit(Op::LoadLocal(x));
+        self.emit(Op::CallClosure { arity: 1, node_id_idx: nid });
+        let j_skip = self.code.len();
+        self.emit(Op::JumpIfNot(0));
+
+        self.emit(Op::LoadLocal(out));
+        self.emit(Op::LoadLocal(x));
+        self.emit(Op::ListAppend);
+        self.emit(Op::StoreLocal(out));
+
+        let skip_t = self.code.len() as i32;
+        if let Op::JumpIfNot(off) = &mut self.code[j_skip] { *off = skip_t - (j_skip as i32 + 1); }
+
+        self.emit(Op::LoadLocal(i));
+        let one = self.pool.int(1);
+        self.emit(Op::PushConst(one));
+        self.emit(Op::NumAdd);
+        self.emit(Op::StoreLocal(i));
+
+        let jback = self.code.len();
+        self.emit(Op::Jump((loop_top as i32) - (jback as i32 + 1)));
+
+        let exit_t = self.code.len() as i32;
+        if let Op::JumpIfNot(off) = &mut self.code[j_exit] { *off = exit_t - (j_exit as i32 + 1); }
+
+        let zero = self.pool.int(0);
+        self.emit(Op::LoadLocal(out));
+        self.emit(Op::PushConst(zero));
+        self.emit(Op::MakeTuple(2));
+    }
+
+    /// `iter.fold(it, init, f)` — left fold over remaining elements.
+    fn emit_iter_fold(&mut self, args: &[a::CExpr]) {
+        self.compile_expr(&args[0], false);
+        let it   = self.alloc_local("__ifo_it");
+        self.emit(Op::StoreLocal(it));
+
+        self.compile_expr(&args[1], false);
+        let acc  = self.alloc_local("__ifo_acc");
+        self.emit(Op::StoreLocal(acc));
+
+        self.compile_expr(&args[2], false);
+        let f    = self.alloc_local("__ifo_f");
+        self.emit(Op::StoreLocal(f));
+
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(0));
+        let list = self.alloc_local("__ifo_list");
+        self.emit(Op::StoreLocal(list));
+
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(1));
+        let i    = self.alloc_local("__ifo_i");
+        self.emit(Op::StoreLocal(i));
+
+        let loop_top = self.code.len();
+        self.emit(Op::LoadLocal(i));
+        self.emit(Op::LoadLocal(list)); self.emit(Op::GetListLen);
+        self.emit(Op::NumLt);
+        let j_exit = self.code.len();
+        self.emit(Op::JumpIfNot(0));
+
+        let nid = self.pool.node_id("n_iter_fold");
+        self.emit(Op::LoadLocal(f));
+        self.emit(Op::LoadLocal(acc));
+        self.emit(Op::LoadLocal(list));
+        self.emit(Op::LoadLocal(i));
+        self.emit(Op::GetListElemDyn);
+        self.emit(Op::CallClosure { arity: 2, node_id_idx: nid });
+        self.emit(Op::StoreLocal(acc));
+
+        self.emit(Op::LoadLocal(i));
+        let one = self.pool.int(1);
+        self.emit(Op::PushConst(one));
+        self.emit(Op::NumAdd);
+        self.emit(Op::StoreLocal(i));
+
+        let jback = self.code.len();
+        self.emit(Op::Jump((loop_top as i32) - (jback as i32 + 1)));
+
+        let exit_t = self.code.len() as i32;
+        if let Op::JumpIfNot(off) = &mut self.code[j_exit] { *off = exit_t - (j_exit as i32 + 1); }
         self.emit(Op::LoadLocal(acc));
     }
 

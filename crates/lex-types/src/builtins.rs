@@ -783,6 +783,63 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 vec![st(), st()], EffectSet::empty(), Ty::bool()));
             Some(Ty::Record(fields))
         }
+        "iter" => {
+            // Lazy positional iterator (#364). Internally a (List[T], Int) tuple;
+            // all operations are compiler-inlined — no effect annotation required.
+            // Type var: 0 = T (element), 1 = U (mapped element), 2 = A (fold acc).
+            let it = |n: u32| Ty::Con("Iter".into(), vec![Ty::Var(n)]);
+            let mut fields = IndexMap::new();
+            // from_list :: List[T] -> Iter[T]
+            fields.insert("from_list".into(), Ty::function(
+                vec![Ty::List(Box::new(Ty::Var(0)))],
+                EffectSet::empty(), it(0)));
+            // next :: Iter[T] -> Option[(T, Iter[T])]
+            fields.insert("next".into(), Ty::function(
+                vec![it(0)],
+                EffectSet::empty(),
+                Ty::Con("Option".into(), vec![
+                    Ty::Tuple(vec![Ty::Var(0), it(0)])
+                ])));
+            // is_empty :: Iter[T] -> Bool
+            fields.insert("is_empty".into(), Ty::function(
+                vec![it(0)], EffectSet::empty(), Ty::bool()));
+            // count :: Iter[T] -> Int   (remaining elements)
+            fields.insert("count".into(), Ty::function(
+                vec![it(0)], EffectSet::empty(), Ty::int()));
+            // take :: Iter[T], Int -> Iter[T]
+            fields.insert("take".into(), Ty::function(
+                vec![it(0), Ty::int()], EffectSet::empty(), it(0)));
+            // skip :: Iter[T], Int -> Iter[T]
+            fields.insert("skip".into(), Ty::function(
+                vec![it(0), Ty::int()], EffectSet::empty(), it(0)));
+            // to_list :: Iter[T] -> List[T]
+            fields.insert("to_list".into(), Ty::function(
+                vec![it(0)], EffectSet::empty(),
+                Ty::List(Box::new(Ty::Var(0)))));
+            // map :: [E] Iter[T], (T) -> [E] U -> [E] Iter[U]
+            fields.insert("map".into(), Ty::function(
+                vec![
+                    it(0),
+                    Ty::function(vec![Ty::Var(0)], EffectSet::open_var(2), Ty::Var(1)),
+                ],
+                EffectSet::open_var(2), it(1)));
+            // filter :: [E] Iter[T], (T) -> [E] Bool -> [E] Iter[T]
+            fields.insert("filter".into(), Ty::function(
+                vec![
+                    it(0),
+                    Ty::function(vec![Ty::Var(0)], EffectSet::open_var(1), Ty::bool()),
+                ],
+                EffectSet::open_var(1), it(0)));
+            // fold :: [E] Iter[T], A, (A, T) -> [E] A -> [E] A
+            fields.insert("fold".into(), Ty::function(
+                vec![
+                    it(0),
+                    Ty::Var(1),
+                    Ty::function(vec![Ty::Var(1), Ty::Var(0)], EffectSet::open_var(2), Ty::Var(1)),
+                ],
+                EffectSet::open_var(2), Ty::Var(1)));
+            Some(Ty::Record(fields))
+        }
         "flow" => {
             // Orchestration primitives (spec §11.2). Each takes one or
             // more closures and returns a closure with a derived shape.
@@ -1842,6 +1899,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "math" => "math",
         "map" => "map",
         "set" => "set",
+        "iter" => "iter",
         "proc" => "proc",
         "crypto" => "crypto",
         "regex" => "regex",

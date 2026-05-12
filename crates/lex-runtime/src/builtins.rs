@@ -28,7 +28,7 @@ pub fn try_pure_builtin(kind: &str, op: &str, args: &[Value]) -> Option<Result<V
 /// `kind` is one of the known pure module aliases — used by the policy
 /// walk to skip pure builtins that programs reference via imports.
 pub fn is_pure_module(kind: &str) -> bool {
-    matches!(kind, "str" | "int" | "float" | "bool" | "list"
+    matches!(kind, "str" | "int" | "float" | "bool" | "list" | "iter"
         | "option" | "result" | "tuple" | "json" | "bytes" | "flow" | "math"
         | "map" | "set" | "crypto" | "regex" | "deque" | "datetime" | "duration" | "http"
         | "toml" | "yaml" | "dotenv" | "csv" | "test" | "random" | "parser"

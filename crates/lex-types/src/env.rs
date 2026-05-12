@@ -85,6 +85,11 @@ impl TypeEnv {
         // a raw Db connection.
         e.types.insert("SqlTx".into(), TypeDef { params: vec![], kind: TypeDefKind::Opaque });
 
+        // Iter[T]: lazy positional iterator (#364). Backed at runtime by a
+        // (List[T], Int) tuple; the Int is the current cursor index. All
+        // iter.* operations are compiler-inlined so no effect is needed.
+        e.types.insert("Iter".into(), TypeDef { params: vec!["T".into()], kind: TypeDefKind::Opaque });
+
         // Stream[T]: opaque streaming iterator (#305 slice 3).
         // Built and consumed exclusively through the `stream.*` and
         // `agent.cloud_stream` effect builtins; the runtime
