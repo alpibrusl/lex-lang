@@ -615,7 +615,7 @@ impl Checker {
                 for (x, y) in pa.clone().into_iter().zip(pb.clone()) {
                     self.unify_coerce_inner(x, y)?;
                 }
-                self.u.unify_effects(&ea, &eb).map_err(|_| UnifyError::Mismatch { a: a.clone(), b: b.clone() })?;
+                self.u.unify_effects(ea, eb).map_err(|_| UnifyError::Mismatch { a: a.clone(), b: b.clone() })?;
                 self.unify_coerce_inner((**ra).clone(), (**rb).clone())
             }
             _ => self.u.unify(&a, &b),
