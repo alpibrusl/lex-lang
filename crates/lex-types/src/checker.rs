@@ -723,14 +723,12 @@ impl Checker {
                 // The example's args/expected are expected to be pure
                 // by construction (literals in the common case); if
                 // they invoked effects, they'd break the pure-only
-                // discipline. Reject quietly via the same effect rule.
-                if !example_effects.concrete.is_empty() {
-                    for e in example_effects.concrete.iter() {
-                        return Err(vec![TypeError::EffectNotDeclared {
-                            at_node: "n_0".into(),
-                            effect: e.pretty(),
-                        }]);
-                    }
+                // discipline. Reject the first one via the same effect rule.
+                if let Some(e) = example_effects.concrete.iter().next() {
+                    return Err(vec![TypeError::EffectNotDeclared {
+                        at_node: "n_0".into(),
+                        effect: e.pretty(),
+                    }]);
                 }
             }
         }
