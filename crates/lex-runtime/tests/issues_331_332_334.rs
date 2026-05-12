@@ -17,14 +17,6 @@ fn run_one(src: &str, entry: &str, args: Vec<Value>) -> Value {
     vm.call(entry, args).unwrap()
 }
 
-fn type_errors(src: &str) -> Vec<lex_types::TypeError> {
-    let prog = parse_source(src).unwrap();
-    let stages = canonicalize_program(&prog);
-    match lex_types::check_program(&stages) {
-        Err(errs) => errs,
-        Ok(_) => panic!("expected type error but check passed"),
-    }
-}
 
 // ── #332: Str < Str at runtime ───────────────────────────────────────────────
 
