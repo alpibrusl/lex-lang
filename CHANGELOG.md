@@ -7,6 +7,8 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-05-12
+
 ### Added
 
 - **#304 phase 3b: applying `Inline let` refactor in `lex-lsp`.**
