@@ -1082,13 +1082,13 @@ impl EffectHandler for DefaultHandler {
             ("sql", "exec") => {
                 let h = expect_sql_handle(args.first())?;
                 let stmt = expect_str(args.get(1))?.to_string();
-                let params = expect_str_list(args.get(2))?;
+                let params = expect_sql_params(args.get(2))?;
                 let arc = sql_registry().lock().unwrap()
                     .touch_get(h)
                     .ok_or_else(|| "sql.exec: closed or unknown Db handle".to_string())?;
                 let conn = arc.lock().unwrap();
                 let bind: Vec<&dyn rusqlite::ToSql> = params.iter()
-                    .map(|s| s as &dyn rusqlite::ToSql)
+                    .map(|p| p as &dyn rusqlite::ToSql)
                     .collect();
                 match conn.execute(&stmt, rusqlite::params_from_iter(bind.iter())) {
                     Ok(n)  => Ok(ok(Value::Int(n as i64))),
@@ -1098,13 +1098,96 @@ impl EffectHandler for DefaultHandler {
             ("sql", "query") => {
                 let h = expect_sql_handle(args.first())?;
                 let stmt_str = expect_str(args.get(1))?.to_string();
-                let params = expect_str_list(args.get(2))?;
+                let params = expect_sql_params(args.get(2))?;
                 let arc = sql_registry().lock().unwrap()
                     .touch_get(h)
                     .ok_or_else(|| "sql.query: closed or unknown Db handle".to_string())?;
                 let conn = arc.lock().unwrap();
                 Ok(sql_run_query(&conn, &stmt_str, &params))
             }
+            // Transactions: begin issues BEGIN SQL on the connection;
+            // commit/rollback issue COMMIT/ROLLBACK. SqlTx reuses the
+            // same Int handle as Db — the type system enforces correct
+            // usage; the runtime treats both as the same registry key.
+            ("sql", "begin") => {
+                let h = expect_sql_handle(args.first())?;
+                let arc = sql_registry().lock().unwrap()
+                    .touch_get(h)
+                    .ok_or_else(|| "sql.begin: closed or unknown Db handle".to_string())?;
+                let conn = arc.lock().unwrap();
+                match conn.execute_batch("BEGIN") {
+                    Ok(()) => Ok(ok(Value::Int(h as i64))),
+                    Err(e) => Ok(err(Value::Str(format!("sql.begin: {e}")))),
+                }
+            }
+            ("sql", "commit") => {
+                let h = expect_sql_handle(args.first())?;
+                let arc = sql_registry().lock().unwrap()
+                    .touch_get(h)
+                    .ok_or_else(|| "sql.commit: closed or unknown SqlTx handle".to_string())?;
+                let conn = arc.lock().unwrap();
+                match conn.execute_batch("COMMIT") {
+                    Ok(()) => Ok(ok(Value::Unit)),
+                    Err(e) => Ok(err(Value::Str(format!("sql.commit: {e}")))),
+                }
+            }
+            ("sql", "rollback") => {
+                let h = expect_sql_handle(args.first())?;
+                let arc = sql_registry().lock().unwrap()
+                    .touch_get(h)
+                    .ok_or_else(|| "sql.rollback: closed or unknown SqlTx handle".to_string())?;
+                let conn = arc.lock().unwrap();
+                match conn.execute_batch("ROLLBACK") {
+                    Ok(()) => Ok(ok(Value::Unit)),
+                    Err(e) => Ok(err(Value::Str(format!("sql.rollback: {e}")))),
+                }
+            }
+            ("sql", "exec_tx") => {
+                let h = expect_sql_handle(args.first())?;
+                let stmt = expect_str(args.get(1))?.to_string();
+                let params = expect_sql_params(args.get(2))?;
+                let arc = sql_registry().lock().unwrap()
+                    .touch_get(h)
+                    .ok_or_else(|| "sql.exec_tx: closed or unknown SqlTx handle".to_string())?;
+                let conn = arc.lock().unwrap();
+                let bind: Vec<&dyn rusqlite::ToSql> = params.iter()
+                    .map(|p| p as &dyn rusqlite::ToSql)
+                    .collect();
+                match conn.execute(&stmt, rusqlite::params_from_iter(bind.iter())) {
+                    Ok(n)  => Ok(ok(Value::Int(n as i64))),
+                    Err(e) => Ok(err(Value::Str(format!("sql.exec_tx: {e}")))),
+                }
+            }
+            ("sql", "query_tx") => {
+                let h = expect_sql_handle(args.first())?;
+                let stmt_str = expect_str(args.get(1))?.to_string();
+                let params = expect_sql_params(args.get(2))?;
+                let arc = sql_registry().lock().unwrap()
+                    .touch_get(h)
+                    .ok_or_else(|| "sql.query_tx: closed or unknown SqlTx handle".to_string())?;
+                let conn = arc.lock().unwrap();
+                Ok(sql_run_query(&conn, &stmt_str, &params))
+            }
+            ("sql", "get_str") => Ok(sql_get_col(&args, |v| match v {
+                Value::Str(s) => Some(Value::Str(s.clone())),
+                Value::Int(n) => Some(Value::Str(n.to_string())),
+                _ => None,
+            })?),
+            ("sql", "get_int") => Ok(sql_get_col(&args, |v| match v {
+                Value::Int(n) => Some(Value::Int(*n)),
+                Value::Float(f) => Some(Value::Int(*f as i64)),
+                _ => None,
+            })?),
+            ("sql", "get_float") => Ok(sql_get_col(&args, |v| match v {
+                Value::Float(f) => Some(Value::Float(*f)),
+                Value::Int(n)   => Some(Value::Float(*n as f64)),
+                _ => None,
+            })?),
+            ("sql", "get_bool") => Ok(sql_get_col(&args, |v| match v {
+                Value::Bool(b)  => Some(Value::Bool(*b)),
+                Value::Int(n)   => Some(Value::Bool(*n != 0)),
+                _ => None,
+            })?),
             ("proc", "spawn") => {
                 // The escape hatch effect. Spawns a child process,
                 // collects its stdout/stderr, returns a structured
@@ -1848,15 +1931,49 @@ fn expect_str_list(v: Option<&Value>) -> Result<Vec<String>, String> {
     }
 }
 
-/// Run a `SELECT` (or any returning statement) and pack the rows
-/// into `Value::List(Value::Record(...))` shape — column-name keys,
-/// SQLite-typed values mapped one-for-one to Lex value variants
-/// (Null → Unit, Integer → Int, Real → Float, Text → Str, Blob →
-/// Bytes). Returns the standard `Result[List[T], Str]` Lex shape.
+/// Convert a `List[SqlParam]` value to rusqlite-boxed parameter values.
+/// SqlParam = PStr(Str) | PInt(Int) | PFloat(Float) | PBool(Bool) | PNull
+fn expect_sql_params(v: Option<&Value>) -> Result<Vec<rusqlite::types::Value>, String> {
+    let items = match v {
+        Some(Value::List(xs)) => xs,
+        Some(other) => return Err(format!("expected List[SqlParam], got {other:?}")),
+        None => return Err("missing params argument".into()),
+    };
+    items.iter().map(|item| {
+        match item {
+            Value::Variant { name, args } => match name.as_str() {
+                "PStr"   => match args.first() {
+                    Some(Value::Str(s)) => Ok(rusqlite::types::Value::Text(s.clone())),
+                    _ => Err("PStr requires a Str argument".into()),
+                },
+                "PInt"   => match args.first() {
+                    Some(Value::Int(n)) => Ok(rusqlite::types::Value::Integer(*n)),
+                    _ => Err("PInt requires an Int argument".into()),
+                },
+                "PFloat" => match args.first() {
+                    Some(Value::Float(f)) => Ok(rusqlite::types::Value::Real(*f)),
+                    _ => Err("PFloat requires a Float argument".into()),
+                },
+                "PBool"  => match args.first() {
+                    Some(Value::Bool(b)) => Ok(rusqlite::types::Value::Integer(*b as i64)),
+                    _ => Err("PBool requires a Bool argument".into()),
+                },
+                "PNull"  => Ok(rusqlite::types::Value::Null),
+                other    => Err(format!("unknown SqlParam constructor `{other}`")),
+            },
+            // Backward-compat: bare strings are accepted as PStr.
+            Value::Str(s) => Ok(rusqlite::types::Value::Text(s.clone())),
+            other => Err(format!("expected SqlParam variant, got {other:?}")),
+        }
+    }).collect()
+}
+
+/// Run a statement and pack the rows into `Value::List(Value::Record(...))`.
+/// Returns the standard `Result[List[T], Str]` Lex shape.
 fn sql_run_query(
     conn: &rusqlite::Connection,
     stmt_str: &str,
-    params: &[String],
+    params: &[rusqlite::types::Value],
 ) -> Value {
     let mut stmt = match conn.prepare(stmt_str) {
         Ok(s)  => s,
@@ -1867,7 +1984,7 @@ fn sql_run_query(
         .map(|i| stmt.column_name(i).unwrap_or("").to_string())
         .collect();
     let bind: Vec<&dyn rusqlite::ToSql> = params.iter()
-        .map(|s| s as &dyn rusqlite::ToSql)
+        .map(|p| p as &dyn rusqlite::ToSql)
         .collect();
     let mut rows = match stmt.query(rusqlite::params_from_iter(bind.iter())) {
         Ok(r)  => r,
@@ -1891,6 +2008,27 @@ fn sql_run_query(
         out.push(Value::Record(rec));
     }
     ok(Value::List(out))
+}
+
+/// Extract a column value from a row record by name, returning `Option[X]`.
+fn sql_get_col<F>(args: &[Value], convert: F) -> Result<Value, String>
+where
+    F: Fn(&Value) -> Option<Value>,
+{
+    let row = args.first().ok_or("sql.get_*: missing row argument")?;
+    let col = match args.get(1) {
+        Some(Value::Str(s)) => s.as_str(),
+        Some(other) => return Err(format!("sql.get_*: column name must be Str, got {other:?}")),
+        None => return Err("sql.get_*: missing column name argument".into()),
+    };
+    let cell = match row {
+        Value::Record(rec) => rec.get(col).cloned(),
+        other => return Err(format!("sql.get_*: row must be a Record, got {other:?}")),
+    };
+    Ok(match cell.and_then(|v| convert(&v)) {
+        Some(v) => Value::Variant { name: "Some".into(), args: vec![v] },
+        None    => Value::Variant { name: "None".into(), args: vec![] },
+    })
 }
 
 fn sql_value_ref_to_lex(v: rusqlite::types::ValueRef<'_>) -> Value {

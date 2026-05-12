@@ -1225,58 +1225,107 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             Some(Ty::Record(fields))
         }
         "sql" => {
-            // Embedded SQL (SQLite). The opaque `Db` type is backed
-            // by an Int handle into a process-wide registry, same
-            // shape as `Kv`. v1 surface focuses on read-heavy and
-            // simple-write workloads — the kind that drove the
-            // requirement (audit history, "filter by verdict where
-            // score > 60", joins). Transactions, heterogeneous
-            // typed parameter binding, and named params are
-            // deferred to v1.5.
+            // Embedded SQL (SQLite via rusqlite). The opaque `Db` type is
+            // backed by an Int handle into a process-wide registry (#362).
             //
-            // Params are `List[Str]` for v1: callers stringify Int /
-            // Float values before binding, and SQLite's column type
-            // affinity coerces back at insert time. This is the one
-            // honest ergonomics caveat; the alternative (a tagged
-            // `SqlValue` variant) is forward-compatible but adds a
-            // type to the global scope that v1 doesn't need.
-            let db_t = || Ty::Con("Db".into(), vec![]);
+            // Params use the typed `SqlParam` ADT (PStr|PInt|PFloat|PBool|PNull)
+            // registered in env.rs, so callers don't have to stringify values.
+            //
+            // Transactions: sql.begin(db) → SqlTx; sql.commit/rollback(tx).
+            // exec_tx / query_tx mirror exec / query but operate on a SqlTx.
+            //
+            // Row decoders: get_str / get_int / get_float / get_bool extract
+            // typed columns from a row record by name.
+            let db_t  = || Ty::Con("Db".into(), vec![]);
+            let tx_t  = || Ty::Con("SqlTx".into(), vec![]);
+            let sp_t  = || Ty::Con("SqlParam".into(), vec![]);
+            let params_t = || Ty::List(Box::new(sp_t()));
             let mut fields = IndexMap::new();
+
             // open :: Str -> [sql, fs_write] Result[Db, Str]
-            // Path is the SQLite filename; ":memory:" works for
-            // ephemeral stores. fs_write is required because the
-            // DB file is created on first open.
             fields.insert("open".into(), Ty::function(
                 vec![Ty::str()],
                 EffectSet {
-                    concrete: [crate::types::EffectKind::bare("sql"), crate::types::EffectKind::bare("fs_write")].into_iter().collect(),
+                    concrete: [crate::types::EffectKind::bare("sql"),
+                               crate::types::EffectKind::bare("fs_write")]
+                        .into_iter().collect(),
                     var: None,
                 },
                 Ty::Con("Result".into(), vec![db_t(), Ty::str()])));
-            // close :: Db -> [sql] Nil
+
+            // close :: Db -> [sql] Unit
             fields.insert("close".into(), Ty::function(
                 vec![db_t()],
                 EffectSet::singleton("sql"),
                 Ty::Unit));
-            // exec :: Db, Str, List[Str] -> [sql] Result[Int, Str]
-            // Returns the affected row count (rusqlite's `execute`).
-            // Suitable for INSERT / UPDATE / DELETE / DDL.
+
+            // exec :: Db, Str, List[SqlParam] -> [sql] Result[Int, Str]
             fields.insert("exec".into(), Ty::function(
-                vec![db_t(), Ty::str(), Ty::List(Box::new(Ty::str()))],
+                vec![db_t(), Ty::str(), params_t()],
                 EffectSet::singleton("sql"),
                 Ty::Con("Result".into(), vec![Ty::int(), Ty::str()])));
-            // query[T] :: Db, Str, List[Str] -> [sql] Result[List[T], Str]
-            // Polymorphic on the row record shape. Each row is
-            // decoded into a record keyed by column name, with
-            // SQLite values mapped to the same Lex `Value` shape
-            // as `json.parse` and `toml.parse` produce.
+
+            // query[T] :: Db, Str, List[SqlParam] -> [sql] Result[List[T], Str]
             fields.insert("query".into(), Ty::function(
-                vec![db_t(), Ty::str(), Ty::List(Box::new(Ty::str()))],
+                vec![db_t(), Ty::str(), params_t()],
                 EffectSet::singleton("sql"),
                 Ty::Con("Result".into(), vec![
                     Ty::List(Box::new(Ty::Var(0))),
                     Ty::str(),
                 ])));
+
+            // begin :: Db -> [sql] Result[SqlTx, Str]
+            fields.insert("begin".into(), Ty::function(
+                vec![db_t()],
+                EffectSet::singleton("sql"),
+                Ty::Con("Result".into(), vec![tx_t(), Ty::str()])));
+
+            // commit :: SqlTx -> [sql] Result[Unit, Str]
+            fields.insert("commit".into(), Ty::function(
+                vec![tx_t()],
+                EffectSet::singleton("sql"),
+                Ty::Con("Result".into(), vec![Ty::Unit, Ty::str()])));
+
+            // rollback :: SqlTx -> [sql] Result[Unit, Str]
+            fields.insert("rollback".into(), Ty::function(
+                vec![tx_t()],
+                EffectSet::singleton("sql"),
+                Ty::Con("Result".into(), vec![Ty::Unit, Ty::str()])));
+
+            // exec_tx :: SqlTx, Str, List[SqlParam] -> [sql] Result[Int, Str]
+            fields.insert("exec_tx".into(), Ty::function(
+                vec![tx_t(), Ty::str(), params_t()],
+                EffectSet::singleton("sql"),
+                Ty::Con("Result".into(), vec![Ty::int(), Ty::str()])));
+
+            // query_tx[T] :: SqlTx, Str, List[SqlParam] -> [sql] Result[List[T], Str]
+            fields.insert("query_tx".into(), Ty::function(
+                vec![tx_t(), Ty::str(), params_t()],
+                EffectSet::singleton("sql"),
+                Ty::Con("Result".into(), vec![
+                    Ty::List(Box::new(Ty::Var(0))),
+                    Ty::str(),
+                ])));
+
+            // Row decoders: get_X[T] :: T, Str -> Option[X]
+            // T is polymorphic so these work on any row record shape.
+            fields.insert("get_str".into(), Ty::function(
+                vec![Ty::Var(0), Ty::str()],
+                EffectSet::empty(),
+                Ty::Con("Option".into(), vec![Ty::str()])));
+            fields.insert("get_int".into(), Ty::function(
+                vec![Ty::Var(0), Ty::str()],
+                EffectSet::empty(),
+                Ty::Con("Option".into(), vec![Ty::int()])));
+            fields.insert("get_float".into(), Ty::function(
+                vec![Ty::Var(0), Ty::str()],
+                EffectSet::empty(),
+                Ty::Con("Option".into(), vec![Ty::Con("Float".into(), vec![])])));
+            fields.insert("get_bool".into(), Ty::function(
+                vec![Ty::Var(0), Ty::str()],
+                EffectSet::empty(),
+                Ty::Con("Option".into(), vec![Ty::Con("Bool".into(), vec![])])));
+
             Some(Ty::Record(fields))
         }
         "parser" => {
