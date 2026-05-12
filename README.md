@@ -2,15 +2,69 @@
 
 [![CI](https://github.com/alpibrusl/lex-lang/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/alpibrusl/lex-lang/actions/workflows/ci.yml)
 [![fuzz](https://github.com/alpibrusl/lex-lang/actions/workflows/fuzz.yml/badge.svg?branch=main)](https://github.com/alpibrusl/lex-lang/actions/workflows/fuzz.yml)
-[![tests](https://img.shields.io/badge/tests-285_passing-success.svg)](#building-from-source)
+[![tests](https://img.shields.io/badge/tests-1373_passing-success.svg)](#building-from-source)
 [![License: EUPL-1.2](https://img.shields.io/badge/license-EUPL--1.2-blue.svg)](LICENSE)
 [![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](#building-from-source)
 
-A language family designed for code no one will read. AI agents write more than humans review; Lex's bet is that when nobody reads bodies, the function signature has to be the contract. Effects are part of the type; the type checker, runtime policy gate, and Spec proofs verify the body honors it — without anyone reading the body.
+**The contract layer agents emit into.** Lex is a language plus an
+audit substrate purpose-built for the case where an LLM, not a
+human, is the primary author of source. Bodies are short-lived;
+what persists is the signature, the effect annotation, the
+content-addressed AST, and an append-only log of every operation
+and attestation that touched the code. Reviewers don't read every
+line — they read the contract and trust the substrate to enforce it.
 
-**Lex** is the general-purpose surface; **Core** covers performance-critical work (sized numerics, tensor shapes); **Spec** carries proof annotations. Implementation of `langspecs.md`; this README focuses on what currently runs.
+What makes that work, end-to-end:
+
+- **Effects are types.** Every function declares the effects its
+  body uses (`[io]`, `[net]`, `[fs_write("/tmp/...")]`, `[budget(N)]`,
+  `[llm_cloud]`, …). The type checker refuses any body that reaches
+  outside the declaration *before a single byte runs*.
+- **Content-addressed AST.** Two programs that mean the same thing
+  hash to the same SigId; a body edit produces a new StageId. The
+  source text is a projection.
+- **Op log + attestation graph.** Every `AddFunction`,
+  `ModifyBody`, `ReplaceMatchArm`, `Merge`, `Candidate`, `Promote`
+  is a typed operation in a durable log. Every typecheck, spec
+  proof, example run, and repair attempt produces a signed
+  attestation against the stage it covered. `lex blame
+  --with-evidence` walks the chain.
+- **Repair loop.** When a transform fails typecheck, the gate
+  emits a `RepairHint` attestation carrying the structured
+  errors + a `suggested_transform` derived from a static
+  (rule_tag → typed-transform) table. `lex repair --apply` runs
+  the LLM-driven fix path; every attempt is recorded as a
+  `RepairAttempt` attestation.
+- **Cost-aware planner.** `lex plan --goal <fn> --max-cost N`
+  walks the call graph and ranks paths cheapest-first by declared
+  `[budget(N)]`. Multi-agent `Candidate`/`Promote` lets several
+  proposers race; the planner (or a downstream policy) picks the
+  winner.
+
+The conventional "general-purpose language" framing is here too —
+Lex/Core/Spec are a real toolchain you can write code in — but the
+load-bearing surface is the contract layer, not the syntax.
+
+**Lex** is the general-purpose surface; **Core** covers
+performance-critical work (sized numerics, tensor shapes); **Spec**
+carries proof annotations. Implementation of `langspecs.md`; this
+README focuses on what currently runs.
 
 Full pitch lives at [`docs/index.html`](docs/index.html) (also published via GitHub Pages — see the repo About panel for the live URL).
+
+### How Lex compares for AI-emitted-code sandboxing
+
+|  | Effect/permission model | Enforcement point | Audit substrate |
+|---|---|---|---|
+| **Lex** | Per-fn effect declarations (`[net]`, `[fs_write(...)]`, `[budget(N)]`, …) typed and checked statically | **Before execution** — type checker refuses the body | Content-addressed AST + op log + signed attestation graph |
+| WASM (component model, WASI 0.2) | Capability-per-instance (filesystem, sockets, env, …) granted by host at instantiation | Runtime trap on unwithdrawn capability | Per-instance; persistence is the host's problem |
+| Deno permissions (`--allow-*`) | Process-level allowlists (net hosts, fs paths, env vars) | Runtime prompt or refusal at syscall boundary | None built in; relies on shell history / wrapper |
+| Python `RestrictedPython` | AST rewrite + `safe_builtins` allowlist | Runtime `NameError` / `AttributeError` | None built in |
+
+The differentiator on the right column is what Lex specifically
+ships beyond the other three: every operation that changes a stage
+is a typed log entry, and every gate that approved or rejected it
+is a signed attestation that walks with the code.
 
 ## Design rules at a glance
 
@@ -514,8 +568,9 @@ lex/
 | `lex-tea` (web browser) | **v1 ✅** — three read-only HTML pages over the JSON API: `/` (branch list), `/web/branch/<name>` (fns), `/web/stage/<id>` (stage info + attestation trail). Served by `lex serve` itself, no extra port. v2 (merge UI, comments via Intent, basic auth) tracked separately. |
 | LLM-agnostic discovery | ✅ — full [ACLI](https://github.com/alpibrusl/acli) compliance: `lex introspect` / `lex skill` / `lex version`, `--output text\|json\|table` on every subcommand, `--dry-run` on state-modifying ones, error envelopes with semantic exit codes |
 | Hardening | [`SECURITY.md`](SECURITY.md) threat model ✅ ; parser-recursion DoS gate (`MAX_DEPTH=96`) ✅ ; **VM call-stack depth gate (`MAX_CALL_DEPTH=1024`) ✅** ; libFuzzer CI for parser + type checker ✅ ; VM-level memory bounds remain delegated to the host (container memory caps) |
+| Agent-substrate (0.6.x – 0.7.x) | **typed transforms ✅** (`ReplaceMatchArm` / `RenameLocal` / `InlineLet` / `ExtractFunction` as first-class ops) ; **closed repair loop ✅** (`lex repair --apply` runs the LLM-driven fix; every attempt is a `RepairAttempt` attestation) ; **per-session budget gate ✅** (#292) with HTTP `503 Retry-After: 0` ; **positive `ProducerTrust` ✅** (#293) ; **multi-agent `Candidate`/`Promote` ✅** (#294 — race proposers without CAS contention) ; **position-aware errors + rule_tag + auto-populated `suggested_transform` ✅** (#306) — every type error carries `file:line:col`, a stable `rule_tag`, a plain-language `rule_explanation`, and a static transform suggestion the LLM can build from ; **`list.par_map` with OS-thread parallelism ✅** (#305) — effectful closures share the parent's budget pool via per-thread `EffectHandler` ; **`Stream[T]` + `agent.cloud_stream` ✅** — chunk-by-chunk LLM consumption ; **cost-aware planner `lex plan` ✅** (#307) — rank call-graph paths cheapest-first against `min(--max-cost, session-remaining)` |
 
-**Workspace test count:** 560 passing, 0 failing, 5 ignored (WS chat example + handful of slow examples, flaky on CI runners — pass locally with `--ignored`). `cargo clippy --workspace --all-targets -- -D warnings` clean. Fuzz CI: 60 s/PR, 5 min nightly across both targets.
+**Workspace test count:** 1373 passing, 0 failing, 8 `#[ignore]`-d slow/flaky examples (run locally with `--ignored`). `cargo clippy --workspace --all-targets -- -D warnings` clean. Fuzz CI: 60 s/PR, 5 min nightly across both targets.
 
 ## Install
 
@@ -540,7 +595,7 @@ Requires a recent Rust toolchain (any 1.80+ stable should work).
 
 ```bash
 cargo build --release       # full toolchain
-cargo test --workspace      # 285 tests (+ 3 ws_chat ignored — `--ignored` to run locally)
+cargo test --workspace      # 1373 tests (+ 8 #[ignore]-d — `--ignored` to run locally)
 cargo test --release -p core-compiler -- --ignored   # release-only matmul perf gates
 
 # Optional: run the fuzz suite locally (nightly + cargo-fuzz needed).
