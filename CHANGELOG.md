@@ -9,6 +9,25 @@ bumps may carry breaking changes when justified).
 
 ### Added
 
+- **#304 phase 1: `lex-lsp` Language Server.** Editors that speak
+  LSP (VS Code, Cursor, Continue, Zed, JetBrains AI) now light up
+  Lex files with inline red squiggles for type errors instead of
+  needing a separate `lex check` pass. New `lex-lsp` crate ships
+  the JSON-RPC loop over stdin/stdout (`lsp-server` +
+  `lsp-types`); `initialize` / `initialized` / `shutdown`
+  lifecycle plus `textDocument/didOpen` / `didChange` / `didSave`
+  / `didClose` with full-document sync. Every type error becomes
+  a `Diagnostic` carrying severity ERROR, the stable
+  `rule_tag` (#306 slice 2) as `code`, source `"lex"`, and a
+  `data` payload with `rule_explanation`,
+  `suggested_transform` (#306 slice 3), and the `at_node` —
+  phase-3 code-action providers will read the suggestion from
+  there. Phase 2 (hover / definition / completion), phase 3
+  (typed-transform code actions), and phase 4 (RepairHint
+  surface) are queued as follow-up slices. Coverage: 5 lib unit
+  tests on the diagnostic-translation path + 2 e2e tests
+  spawning the compiled binary and round-tripping the protocol.
+
 - **#305 slice 3: `Stream[T]` + `agent.cloud_stream`.** Closes
   #305. Lex agents can now consume LLM completions chunk-by-chunk
   instead of blocking on the full response. New nominal `Stream[T]`
