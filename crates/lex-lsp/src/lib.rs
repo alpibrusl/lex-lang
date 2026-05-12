@@ -557,6 +557,116 @@ pub fn inline_let_actions(src: &str, range: &Range) -> Vec<InlineLetAction> {
     out
 }
 
+// ---------------------------------------------------------------
+// #304 phase 4: surface RepairHint attestations from the store
+// ---------------------------------------------------------------
+
+/// A RepairHint attestation surfaced by the LSP as a clickable
+/// code action. Each instance corresponds to one previously-rejected
+/// op recorded in the store via `Store::apply_operation_checked`
+/// (#281): the LLM-driven repair flow's persistent breadcrumb.
+///
+/// Phase 4a (this slice) surfaces hints as **diagnostic-like
+/// markers** in the code-action lightbulb. The `data` payload
+/// carries `failed_op_id` and the structured suggestion so a
+/// client extension (or phase 4b) can invoke
+/// `lex repair --apply` and refresh the buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepairHintAction {
+    pub fn_name: String,
+    pub rule_tag: String,
+    pub kind_hint: String,
+    pub summary: String,
+    pub failed_op_id: String,
+    pub stage_id: String,
+    /// Full hint payload as serde JSON — `{rule_tag, errors,
+    /// suggested_transform, failed_op_id}` — for client-side
+    /// consumption.
+    pub data: serde_json::Value,
+}
+
+/// Surface every active RepairHint attestation that references a
+/// stage produced by an `fn` in `src`.
+///
+/// Lookup: for each `FnDecl` in the file, compute its
+/// `stage_id` from the canonical AST. The store's attestation
+/// log indexes attestations by `stage_id`; we filter to
+/// `RepairHint` kinds. When multiple hints exist for the same
+/// stage (e.g. multiple repair attempts), the most recent one
+/// wins by `timestamp`.
+///
+/// Returns an empty vec when `store_path` is missing or the
+/// store fails to open — the LSP degrades gracefully so editors
+/// without a configured store don't error out.
+pub fn repair_hint_actions_for_file(
+    store_path: &std::path::Path,
+    src: &str,
+) -> Vec<RepairHintAction> {
+    let Ok(store) = lex_store::Store::open(store_path) else { return Vec::new() };
+    let Ok(attlog) = store.attestation_log() else { return Vec::new() };
+    let Ok(program) = lex_syntax::parse_source(src) else { return Vec::new() };
+    let stages = lex_ast::canonicalize_program(&program);
+
+    let mut out: Vec<RepairHintAction> = Vec::new();
+    for stage in &stages {
+        let lex_ast::Stage::FnDecl(fd) = stage else { continue };
+        let Some(stage_id) = lex_ast::stage_id(stage) else { continue };
+        let Ok(atts) = attlog.list_for_stage(&stage_id) else { continue };
+        let latest = atts
+            .into_iter()
+            .filter(|a| matches!(&a.kind, lex_vcs::AttestationKind::RepairHint { .. }))
+            .max_by_key(|a| a.timestamp);
+        let Some(att) = latest else { continue };
+        let lex_vcs::AttestationKind::RepairHint {
+            failed_op_id,
+            errors,
+            suggested_transform,
+        } = &att.kind
+        else {
+            continue;
+        };
+        let (rule_tag, kind_hint, summary) = extract_hint_metadata(suggested_transform.as_ref());
+        let data = serde_json::json!({
+            "failed_op_id": failed_op_id,
+            "stage_id": stage_id,
+            "errors": errors,
+            "suggested_transform": suggested_transform,
+            "attestation_id": att.attestation_id,
+        });
+        out.push(RepairHintAction {
+            fn_name: fd.name.clone(),
+            rule_tag,
+            kind_hint,
+            summary,
+            failed_op_id: failed_op_id.clone(),
+            stage_id,
+            data,
+        });
+    }
+    out
+}
+
+fn extract_hint_metadata(suggestion: Option<&serde_json::Value>) -> (String, String, String) {
+    let s = match suggestion {
+        Some(v) if v.is_object() => v,
+        _ => {
+            return (
+                "unknown".into(),
+                "ModifyBody".into(),
+                "apply LLM-driven repair (no static hint)".into(),
+            );
+        }
+    };
+    let rule_tag = s.get("rule_tag").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+    let kind_hint = s.get("kind_hint").and_then(|v| v.as_str()).unwrap_or("ModifyBody").to_string();
+    let summary = s
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .unwrap_or("apply suggested transform")
+        .to_string();
+    (rule_tag, kind_hint, summary)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -814,6 +924,105 @@ fn second() -> Int {
             end: Position { line: 0, character: 0 },
         };
         assert!(inline_let_actions(src, &cursor).is_empty());
+    }
+
+    #[test]
+    fn repair_hint_action_surfaces_from_store() {
+        // Build a tiny store, publish a fn, push a typecheck-
+        // rejected variant so the gate auto-emits a RepairHint
+        // (#281), then ask the LSP for the action.
+        use lex_ast::{canonicalize_program, sig_id, stage_id, CExpr, CLit, NodeId, Stage};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = lex_store::Store::open(tmp.path()).unwrap();
+
+        let src = "fn pick(n :: Int) -> Int { match n { 0 => 1, _ => 2 } }\n";
+        let prog = lex_syntax::parse_source(src).unwrap();
+        let stages = canonicalize_program(&prog);
+        let stage = stages
+            .into_iter()
+            .find(|s| matches!(s, Stage::FnDecl(fd) if fd.name == "pick"))
+            .unwrap();
+        let sig = sig_id(&stage).unwrap();
+        let stg = stage_id(&stage).unwrap();
+        store.publish(&stage).unwrap();
+        let op = lex_vcs::Operation::new(
+            lex_vcs::OperationKind::AddFunction {
+                sig_id: sig.clone(),
+                stage_id: stg.clone(),
+                effects: Default::default(),
+                budget_cost: None,
+            },
+            [],
+        );
+        let t = lex_vcs::StageTransition::Create {
+            sig_id: sig.clone(),
+            stage_id: stg.clone(),
+        };
+        store
+            .apply_operation(lex_store::DEFAULT_BRANCH, op, t)
+            .unwrap();
+
+        // Trigger a typecheck-rejected variant via apply_replace_match_arm:
+        // replace arm 0's body with a Str literal — type mismatch.
+        let ill = CExpr::Literal {
+            value: CLit::Str { value: "boom".into() },
+        };
+        let _ = store
+            .apply_replace_match_arm(
+                lex_store::DEFAULT_BRANCH,
+                &stg,
+                &NodeId("n_0.2".into()),
+                0,
+                ill,
+            )
+            .unwrap_err();
+        // The RepairHint is on the candidate stage that didn't
+        // typecheck, *not* on the original `pick`. We surface
+        // hints for any stage produced by any fn in the file —
+        // re-read the source so the LSP sees the candidate.
+        // For this test the original fn body is still in source.
+        // To exercise the lookup, derive the candidate stage_id by
+        // re-running the transform on the AST directly.
+        let cand = lex_ast::replace_match_arm(
+            &stage,
+            &NodeId("n_0.2".into()),
+            0,
+            CExpr::Literal { value: CLit::Str { value: "boom".into() } },
+        )
+        .unwrap();
+        let cand_stage_id = lex_ast::stage_id(&cand).unwrap();
+        // Source the LSP sees is the candidate's source, not pick's.
+        let cand_src = lex_ast::print_stages(&[cand]);
+
+        let actions = repair_hint_actions_for_file(tmp.path(), &cand_src);
+        assert_eq!(
+            actions.len(),
+            1,
+            "exactly one hint for the candidate stage: {actions:?}"
+        );
+        let a = &actions[0];
+        assert_eq!(a.fn_name, "pick");
+        assert_eq!(a.stage_id, cand_stage_id);
+        // Slice 3 of #306 wired type-mismatch → ReplaceMatchArm.
+        assert_eq!(a.rule_tag, "type-mismatch");
+        assert_eq!(a.kind_hint, "ReplaceMatchArm");
+        assert!(!a.summary.is_empty(), "summary populated: {a:?}");
+        assert_eq!(a.data["failed_op_id"], a.failed_op_id);
+    }
+
+    #[test]
+    fn repair_hint_action_returns_empty_when_no_store() {
+        let actions =
+            repair_hint_actions_for_file(std::path::Path::new("/nonexistent/path"), "fn x() -> Int { 1 }\n");
+        assert!(actions.is_empty(), "missing store → empty list");
+    }
+
+    #[test]
+    fn repair_hint_action_returns_empty_when_source_is_unparseable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _ = lex_store::Store::open(tmp.path()).unwrap();
+        let actions = repair_hint_actions_for_file(tmp.path(), "fn bad( :: Int { 1 }\n");
+        assert!(actions.is_empty());
     }
 
     #[test]
