@@ -433,6 +433,23 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::singleton("net"),
                 Ty::Unit,
             ));
+            // serve_fn[Eff] :: (Int, (Request) -> [Eff] Response) -> [net, Eff] Unit
+            // Effect-polymorphic variant of serve that accepts a first-class closure
+            // instead of a handler name. open_var(0) captures the handler's effect row
+            // so callers that invoke e.g. [io] effects inside the closure propagate them
+            // to the serve_fn call site.
+            fields.insert("serve_fn".into(), Ty::function(
+                vec![
+                    Ty::int(),
+                    Ty::function(
+                        vec![Ty::Con("Request".into(), vec![])],
+                        EffectSet::open_var(0),
+                        Ty::Con("Response".into(), vec![]),
+                    ),
+                ],
+                EffectSet::open_var(0).union(&EffectSet::singleton("net")),
+                Ty::Unit,
+            ));
             Some(Ty::Record(fields))
         }
         "chat" => {
