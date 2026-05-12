@@ -11,6 +11,10 @@ use indexmap::IndexMap;
 use lex_ast as a;
 use std::collections::{BTreeMap, HashMap};
 
+/// Field names + type-tag schema extracted from a `Result[Record{...}, _]`
+/// return type. Used by the `parse` → `parse_strict_typed` rewrite (#322).
+type FieldSchema = (Vec<String>, Vec<(String, String)>);
+
 /// Result of checking a whole program.
 pub struct ProgramTypes {
     pub fn_signatures: IndexMap<String, Scheme>,
@@ -24,6 +28,11 @@ pub struct ProgramTypes {
     /// See [`check_and_rewrite_program`] for the function that
     /// populates this and applies the rewrite in one step.
     pub parse_required_fields: HashMap<usize, Vec<String>>,
+    /// For #322: per-call type schema alongside the field names.
+    /// Each entry is a `Vec<(field_name, type_tag)>` parallel to
+    /// `parse_required_fields`. Used by the rewrite pass to inject
+    /// the third argument to `parse_strict`.
+    pub parse_type_schemas: HashMap<usize, Vec<(String, String)>>,
 }
 
 /// Variant of [`check_program`] that stamps a source [`Position`]
@@ -130,15 +139,18 @@ fn check_program_inner(
         // looks like `<alias>.parse(s)` for an alias bound to one
         // of {json, toml, yaml} via the import pass.
         let mut parse_required_fields = HashMap::new();
+        let mut parse_type_schemas = HashMap::new();
         for (call_ptr, ret_ty) in &tcx.pending_parse_calls {
-            if let Some(fields) = extract_record_fields_from_result(&tcx.u, &tcx.type_env, ret_ty) {
+            if let Some((fields, schema)) = extract_record_fields_and_schema(&tcx.u, &tcx.type_env, ret_ty) {
                 parse_required_fields.insert(*call_ptr, fields);
+                parse_type_schemas.insert(*call_ptr, schema);
             }
         }
         Ok(ProgramTypes {
             fn_signatures: signatures,
             type_env: tcx.type_env,
             parse_required_fields,
+            parse_type_schemas,
         })
     } else {
         Err(errors)
@@ -159,14 +171,14 @@ pub fn check_and_rewrite_program(
     // mutable one below.
     let pt = check_program(&*stages)?;
     if !pt.parse_required_fields.is_empty() {
-        rewrite_parse_calls(stages, &pt.parse_required_fields);
+        rewrite_parse_calls(stages, &pt.parse_required_fields, &pt.parse_type_schemas);
     }
     Ok(pt)
 }
 
 /// Walk `stages` mutably and, for every `CExpr::Call` whose
 /// pointer (cast to `usize`) is a key in `required`, rewrite it
-/// from `module.parse(s)` into `module.parse_strict(s, [...])`.
+/// from `module.parse(s)` into `module.parse_strict(s, [...], [...])`.
 ///
 /// Assumptions:
 ///
@@ -177,17 +189,26 @@ pub fn check_and_rewrite_program(
 ///   `FieldAccess(_, "parse")`. The type-checker only inserts
 ///   keys when this holds, so we panic if the assumption is
 ///   violated — that's a checker bug, not a user error.
-fn rewrite_parse_calls(stages: &mut [a::Stage], required: &HashMap<usize, Vec<String>>) {
+fn rewrite_parse_calls(
+    stages: &mut [a::Stage],
+    required: &HashMap<usize, Vec<String>>,
+    schemas: &HashMap<usize, Vec<(String, String)>>,
+) {
     for stage in stages.iter_mut() {
         if let a::Stage::FnDecl(fd) = stage {
-            rewrite_in_expr(&mut fd.body, required);
+            rewrite_in_expr(&mut fd.body, required, schemas);
         }
     }
 }
 
-fn rewrite_in_expr(expr: &mut a::CExpr, required: &HashMap<usize, Vec<String>>) {
+fn rewrite_in_expr(
+    expr: &mut a::CExpr,
+    required: &HashMap<usize, Vec<String>>,
+    schemas: &HashMap<usize, Vec<(String, String)>>,
+) {
     let ptr = expr as *const a::CExpr as usize;
     let do_rewrite = required.get(&ptr).cloned();
+    let do_schema = schemas.get(&ptr).cloned();
     // Recurse into children first; rewriting the call itself
     // doesn't touch the source-arg, so the order doesn't change
     // semantics — but processing children up front means a
@@ -195,38 +216,38 @@ fn rewrite_in_expr(expr: &mut a::CExpr, required: &HashMap<usize, Vec<String>>) 
     // correctly.
     match expr {
         a::CExpr::Call { callee, args } => {
-            rewrite_in_expr(callee, required);
-            for a in args.iter_mut() { rewrite_in_expr(a, required); }
+            rewrite_in_expr(callee, required, schemas);
+            for a in args.iter_mut() { rewrite_in_expr(a, required, schemas); }
         }
         a::CExpr::Let { value, body, .. } => {
-            rewrite_in_expr(value, required);
-            rewrite_in_expr(body, required);
+            rewrite_in_expr(value, required, schemas);
+            rewrite_in_expr(body, required, schemas);
         }
         a::CExpr::Match { scrutinee, arms } => {
-            rewrite_in_expr(scrutinee, required);
-            for arm in arms.iter_mut() { rewrite_in_expr(&mut arm.body, required); }
+            rewrite_in_expr(scrutinee, required, schemas);
+            for arm in arms.iter_mut() { rewrite_in_expr(&mut arm.body, required, schemas); }
         }
         a::CExpr::Block { statements, result } => {
-            for s in statements.iter_mut() { rewrite_in_expr(s, required); }
-            rewrite_in_expr(result, required);
+            for s in statements.iter_mut() { rewrite_in_expr(s, required, schemas); }
+            rewrite_in_expr(result, required, schemas);
         }
         a::CExpr::Constructor { args, .. } => {
-            for a in args.iter_mut() { rewrite_in_expr(a, required); }
+            for a in args.iter_mut() { rewrite_in_expr(a, required, schemas); }
         }
         a::CExpr::RecordLit { fields } => {
-            for f in fields.iter_mut() { rewrite_in_expr(&mut f.value, required); }
+            for f in fields.iter_mut() { rewrite_in_expr(&mut f.value, required, schemas); }
         }
         a::CExpr::TupleLit { items } | a::CExpr::ListLit { items } => {
-            for it in items.iter_mut() { rewrite_in_expr(it, required); }
+            for it in items.iter_mut() { rewrite_in_expr(it, required, schemas); }
         }
-        a::CExpr::FieldAccess { value, .. } => rewrite_in_expr(value, required),
-        a::CExpr::Lambda { body, .. } => rewrite_in_expr(body, required),
+        a::CExpr::FieldAccess { value, .. } => rewrite_in_expr(value, required, schemas),
+        a::CExpr::Lambda { body, .. } => rewrite_in_expr(body, required, schemas),
         a::CExpr::BinOp { lhs, rhs, .. } => {
-            rewrite_in_expr(lhs, required);
-            rewrite_in_expr(rhs, required);
+            rewrite_in_expr(lhs, required, schemas);
+            rewrite_in_expr(rhs, required, schemas);
         }
-        a::CExpr::UnaryOp { expr, .. } => rewrite_in_expr(expr, required),
-        a::CExpr::Return { value } => rewrite_in_expr(value, required),
+        a::CExpr::UnaryOp { expr, .. } => rewrite_in_expr(expr, required, schemas),
+        a::CExpr::Return { value } => rewrite_in_expr(value, required, schemas),
         a::CExpr::Literal { .. } | a::CExpr::Var { .. } => {}
     }
     if let Some(fields) = do_rewrite {
@@ -235,12 +256,27 @@ fn rewrite_in_expr(expr: &mut a::CExpr, required: &HashMap<usize, Vec<String>>) 
                 if let a::CExpr::FieldAccess { field, .. } = callee.as_mut() {
                     debug_assert_eq!(field, "parse",
                         "rewrite_in_expr: only `.parse` calls should be in the table");
-                    *field = "parse_strict".to_string();
+                    // Use parse_strict_typed (internal, 3-arg) rather than the
+                    // public 2-arg parse_strict so direct callers aren't broken.
+                    *field = "parse_strict_typed".to_string();
                 }
+                // Second argument: List[Str] of required field names.
                 args.push(a::CExpr::ListLit {
                     items: fields.into_iter()
                         .map(|f| a::CExpr::Literal {
                             value: a::CLit::Str { value: f },
+                        })
+                        .collect(),
+                });
+                // Third argument: List[(Str, Str)] type schema (#322).
+                let schema = do_schema.unwrap_or_default();
+                args.push(a::CExpr::ListLit {
+                    items: schema.into_iter()
+                        .map(|(name, tag)| a::CExpr::TupleLit {
+                            items: vec![
+                                a::CExpr::Literal { value: a::CLit::Str { value: name } },
+                                a::CExpr::Literal { value: a::CLit::Str { value: tag } },
+                            ],
                         })
                         .collect(),
                 });
@@ -252,34 +288,63 @@ fn rewrite_in_expr(expr: &mut a::CExpr, required: &HashMap<usize, Vec<String>>) 
 
 /// Given an inferred return type from a `module.parse(s)` call,
 /// resolve through the unifier and any type aliases, then look
-/// for `Result[Record{...}, _]`. Returns the field names if the
-/// shape matches; `None` otherwise.
-fn extract_record_fields_from_result(
+/// for `Result[Record{...}, _]`. Returns `(field_names, schema)`
+/// where `schema` is a `Vec<(field_name, type_tag)>` for #322.
+/// Returns `None` if the shape doesn't match.
+fn extract_record_fields_and_schema(
     u: &Unifier,
     env: &TypeEnv,
     ty: &Ty,
-) -> Option<Vec<String>> {
+) -> Option<FieldSchema> {
     let resolved = u.resolve(ty);
     let Ty::Con(ref name, ref args) = resolved else { return None; };
     if name != "Result" || args.len() != 2 { return None; }
     let ok_ty = u.resolve(&args[0]);
     let unfolded = unfold_record_alias_static(env, ok_ty);
     if let Ty::Record(fields) = unfolded {
-        Some(fields.keys().cloned().collect())
+        let names: Vec<String> = fields.keys().cloned().collect();
+        let schema: Vec<(String, String)> = fields.iter()
+            .map(|(k, v)| (k.clone(), ty_to_tag(u, v)))
+            .collect();
+        Some((names, schema))
     } else {
         None
     }
 }
 
+/// Convert a `Ty` to a compact string tag for the type schema
+/// injected by the rewrite pass (#322). The runtime uses these
+/// tags to validate JSON field values against the declared Lex type.
+fn ty_to_tag(u: &Unifier, ty: &Ty) -> String {
+    let resolved = u.resolve(ty);
+    match &resolved {
+        Ty::Prim(Prim::Int)   => "Int".to_string(),
+        Ty::Prim(Prim::Float) => "Float".to_string(),
+        Ty::Prim(Prim::Bool)  => "Bool".to_string(),
+        Ty::Prim(Prim::Str)   => "Str".to_string(),
+        Ty::Con(name, args) if name == "Option" && args.len() == 1 => {
+            format!("Option[{}]", ty_to_tag(u, &args[0]))
+        }
+        Ty::List(inner) => {
+            format!("List[{}]", ty_to_tag(u, inner))
+        }
+        Ty::Record(_) => "Record".to_string(),
+        _ => "Any".to_string(),
+    }
+}
+
 /// Standalone version of `Checker::unfold_record_alias` —
-/// resolves a `Ty::Con` whose definition is a record alias to
-/// the underlying record. Module-level helper because we need it
-/// after the `Checker` has been moved/destructured.
+/// resolves a `Ty::Con` whose definition is a type alias (record
+/// or otherwise) to the underlying type. Module-level helper
+/// because we need it after the `Checker` has been
+/// moved/destructured.
 fn unfold_record_alias_static(env: &TypeEnv, ty: Ty) -> Ty {
-    if let Ty::Con(ref n, _) = ty {
-        if let Some(td) = env.types.get(n) {
-            if let TypeDefKind::Alias(inner @ Ty::Record(_)) = &td.kind {
-                return inner.clone();
+    if let Ty::Con(ref n, ref args) = ty {
+        if args.is_empty() {
+            if let Some(td) = env.types.get(n) {
+                if let TypeDefKind::Alias(inner) = &td.kind {
+                    return inner.clone();
+                }
             }
         }
     }
@@ -397,14 +462,16 @@ impl Checker {
         }
     }
 
-    /// If `ty` is a `Ty::Con(name, _)` whose definition is a record
-    /// alias (`type Foo = { ... }`), return the inner record type.
+    /// If `ty` is a `Ty::Con(name, [])` whose definition is a type
+    /// alias (record or otherwise), return the aliased type.
     /// Otherwise return `ty` unchanged.
     fn unfold_record_alias(&self, ty: Ty) -> Ty {
-        if let Ty::Con(ref n, _) = ty {
-            if let Some(td) = self.type_env.types.get(n) {
-                if let TypeDefKind::Alias(inner @ Ty::Record(_)) = &td.kind {
-                    return inner.clone();
+        if let Ty::Con(ref n, ref args) = ty {
+            if args.is_empty() {
+                if let Some(td) = self.type_env.types.get(n) {
+                    if let TypeDefKind::Alias(inner) = &td.kind {
+                        return inner.clone();
+                    }
                 }
             }
         }
@@ -470,6 +537,14 @@ impl Checker {
             }
             (Ty::Tuple(xs), Ty::Tuple(ys)) if xs.len() == ys.len() => {
                 for (x, y) in xs.clone().into_iter().zip(ys.clone()) {
+                    self.unify_coerce_inner(x, y)?;
+                }
+                Ok(())
+            }
+            // Recurse into Con-Con pairs so record-alias coercion reaches
+            // arbitrary nesting depth (e.g. Result[T, MyAlias]) (#328).
+            (Ty::Con(n1, a1), Ty::Con(n2, a2)) if n1 == n2 && a1.len() == a2.len() => {
+                for (x, y) in a1.clone().into_iter().zip(a2.clone()) {
                     self.unify_coerce_inner(x, y)?;
                 }
                 Ok(())

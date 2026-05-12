@@ -366,7 +366,14 @@ impl Parser {
     }
 
     fn parse_param(&mut self) -> Result<Param, ParseError> {
-        let name = self.expect_ident("for parameter name")?;
+        let name = if matches!(self.peek_skip_newlines(), Some(TokenKind::Underscore)) {
+            self.skip_newlines();
+            self.bump();
+            self.discard_counter += 1;
+            format!("__lex_discard_{}", self.discard_counter)
+        } else {
+            self.expect_ident("for parameter name")?
+        };
         self.expect(&TokenKind::ColonColon, "after parameter name")?;
         let ty = self.parse_type_expr()?;
         Ok(Param { name, ty })
@@ -725,6 +732,13 @@ impl Parser {
             return Ok(Expr::Lit(Literal::Unit));
         }
         let first = self.parse_expr()?;
+        // Inline type ascription: `(expr :: Type)` — peek for `::` before
+        // deciding whether this is a tuple, a grouping, or an ascription.
+        if self.eat(&TokenKind::ColonColon) {
+            let ty = self.parse_type_expr()?;
+            self.expect(&TokenKind::RParen, "after type ascription")?;
+            return Ok(Expr::Ascription { value: Box::new(first), ty });
+        }
         if self.eat(&TokenKind::Comma) {
             let mut items = vec![first];
             if !matches!(self.peek_skip_newlines(), Some(TokenKind::RParen)) {
@@ -753,6 +767,21 @@ impl Parser {
     fn parse_pattern(&mut self) -> Result<Pattern, ParseError> {
         self.skip_newlines();
         match self.peek() {
+            Some(TokenKind::Minus) => {
+                self.bump();
+                self.skip_newlines();
+                match self.peek() {
+                    Some(TokenKind::Int(_)) => match self.bump().unwrap().kind {
+                        TokenKind::Int(n) => Ok(Pattern::Lit(Literal::Int(-n))),
+                        _ => unreachable!(),
+                    },
+                    Some(TokenKind::Float(_)) => match self.bump().unwrap().kind {
+                        TokenKind::Float(n) => Ok(Pattern::Lit(Literal::Float(-n))),
+                        _ => unreachable!(),
+                    },
+                    other => Err(self.error(format!("expected Int or Float after `-` in pattern, got {other:?}"))),
+                }
+            }
             Some(TokenKind::Underscore) => { self.bump(); Ok(Pattern::Wild) }
             Some(TokenKind::Int(_)) => match self.bump().unwrap().kind {
                 TokenKind::Int(n) => Ok(Pattern::Lit(Literal::Int(n))),

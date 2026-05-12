@@ -285,6 +285,23 @@ fn canonicalize_expr(e: &s::Expr) -> CExpr {
             name: name.clone(),
             args: args.iter().map(canonicalize_expr).collect(),
         },
+        // Type ascription is erased during canonicalization: `(expr :: T)`
+        // becomes the canonical form of `expr` unchanged. Type checking
+        // (which runs on the canonical AST after a `Let`-wrapping pass for
+        // annotations) handles the type constraint via `CExpr::Let { ty }`.
+        // Here we simply strip the annotation and canonicalize the value.
+        s::Expr::Ascription { value, ty } => {
+            // Wrap as a typed `Let` so the type checker can unify the
+            // declared type against the inferred type, mirroring the
+            // `let x :: T := expr` path in `check_expr`.
+            let inner = canonicalize_expr(value);
+            CExpr::Let {
+                name: "__ascription".into(),
+                ty: Some(canonicalize_type(ty)),
+                value: Box::new(inner),
+                body: Box::new(CExpr::Var { name: "__ascription".into() }),
+            }
+        }
         s::Expr::Lambda(l) => CExpr::Lambda {
             params: l.params.iter().map(|p| Param {
                 name: p.name.clone(),
