@@ -1055,23 +1055,34 @@ impl EffectHandler for DefaultHandler {
             }
             ("sql", "open") => {
                 let path = expect_str(args.first())?.to_string();
-                // Same shape as `kv.open`: opening creates the
-                // SQLite file, so the fs-write allowlist applies
-                // (in-memory paths are exempt).
-                if path != ":memory:" && !self.policy.allow_fs_write.is_empty() {
-                    let p = std::path::Path::new(&path);
-                    if !self.policy.allow_fs_write.iter().any(|a| p.starts_with(a)) {
-                        return Ok(err(Value::Str(format!(
-                            "sql.open: `{path}` outside --allow-fs-write"))));
+                if path.starts_with("postgres://") || path.starts_with("postgresql://") {
+                    // Postgres: connect via sync driver; no fs-write policy applies.
+                    match postgres::Client::connect(&path, postgres::NoTls) {
+                        Ok(client) => {
+                            let handle = next_sql_handle();
+                            sql_registry().lock().unwrap().insert(handle, SqlConn::Postgres(client));
+                            Ok(ok(Value::Int(handle as i64)))
+                        }
+                        Err(e) => Ok(err(Value::Str(format!("sql.open: {e}")))),
                     }
-                }
-                match rusqlite::Connection::open(&path) {
-                    Ok(conn) => {
-                        let handle = next_sql_handle();
-                        sql_registry().lock().unwrap().insert(handle, conn);
-                        Ok(ok(Value::Int(handle as i64)))
+                } else {
+                    // SQLite: same shape as `kv.open`; fs-write allowlist applies
+                    // (in-memory paths are exempt).
+                    if path != ":memory:" && !self.policy.allow_fs_write.is_empty() {
+                        let p = std::path::Path::new(&path);
+                        if !self.policy.allow_fs_write.iter().any(|a| p.starts_with(a)) {
+                            return Ok(err(Value::Str(format!(
+                                "sql.open: `{path}` outside --allow-fs-write"))));
+                        }
                     }
-                    Err(e) => Ok(err(Value::Str(format!("sql.open: {e}")))),
+                    match rusqlite::Connection::open(&path) {
+                        Ok(conn) => {
+                            let handle = next_sql_handle();
+                            sql_registry().lock().unwrap().insert(handle, SqlConn::Sqlite(conn));
+                            Ok(ok(Value::Int(handle as i64)))
+                        }
+                        Err(e) => Ok(err(Value::Str(format!("sql.open: {e}")))),
+                    }
                 }
             }
             ("sql", "close") => {
@@ -1086,13 +1097,26 @@ impl EffectHandler for DefaultHandler {
                 let arc = sql_registry().lock().unwrap()
                     .touch_get(h)
                     .ok_or_else(|| "sql.exec: closed or unknown Db handle".to_string())?;
-                let conn = arc.lock().unwrap();
-                let bind: Vec<&dyn rusqlite::ToSql> = params.iter()
-                    .map(|p| p as &dyn rusqlite::ToSql)
-                    .collect();
-                match conn.execute(&stmt, rusqlite::params_from_iter(bind.iter())) {
-                    Ok(n)  => Ok(ok(Value::Int(n as i64))),
-                    Err(e) => Ok(err(Value::Str(format!("sql.exec: {e}")))),
+                let mut conn = arc.lock().unwrap();
+                match &mut *conn {
+                    SqlConn::Sqlite(c) => {
+                        let bound = sqlite_params(&params);
+                        let bind: Vec<&dyn rusqlite::ToSql> =
+                            bound.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+                        match c.execute(&stmt, rusqlite::params_from_iter(bind.iter())) {
+                            Ok(n)  => Ok(ok(Value::Int(n as i64))),
+                            Err(e) => Ok(err(Value::Str(format!("sql.exec: {e}")))),
+                        }
+                    }
+                    SqlConn::Postgres(c) => {
+                        let pg = pg_param_refs(&params);
+                        let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
+                            pg.iter().map(|b| b.as_ref()).collect();
+                        match c.execute(stmt.as_str(), &refs) {
+                            Ok(n)  => Ok(ok(Value::Int(n as i64))),
+                            Err(e) => Ok(err(Value::Str(format!("sql.exec: {e}")))),
+                        }
+                    }
                 }
             }
             ("sql", "query") => {
@@ -1102,8 +1126,11 @@ impl EffectHandler for DefaultHandler {
                 let arc = sql_registry().lock().unwrap()
                     .touch_get(h)
                     .ok_or_else(|| "sql.query: closed or unknown Db handle".to_string())?;
-                let conn = arc.lock().unwrap();
-                Ok(sql_run_query(&conn, &stmt_str, &params))
+                let mut conn = arc.lock().unwrap();
+                Ok(match &mut *conn {
+                    SqlConn::Sqlite(c)   => sql_run_query_sqlite(c, &stmt_str, &params),
+                    SqlConn::Postgres(c) => sql_run_query_pg(c, &stmt_str, &params),
+                })
             }
             // Transactions: begin issues BEGIN SQL on the connection;
             // commit/rollback issue COMMIT/ROLLBACK. SqlTx reuses the
@@ -1114,8 +1141,12 @@ impl EffectHandler for DefaultHandler {
                 let arc = sql_registry().lock().unwrap()
                     .touch_get(h)
                     .ok_or_else(|| "sql.begin: closed or unknown Db handle".to_string())?;
-                let conn = arc.lock().unwrap();
-                match conn.execute_batch("BEGIN") {
+                let mut conn = arc.lock().unwrap();
+                let res = match &mut *conn {
+                    SqlConn::Sqlite(c)   => c.execute_batch("BEGIN").map_err(|e| e.to_string()),
+                    SqlConn::Postgres(c) => c.batch_execute("BEGIN").map_err(|e| e.to_string()),
+                };
+                match res {
                     Ok(()) => Ok(ok(Value::Int(h as i64))),
                     Err(e) => Ok(err(Value::Str(format!("sql.begin: {e}")))),
                 }
@@ -1125,8 +1156,12 @@ impl EffectHandler for DefaultHandler {
                 let arc = sql_registry().lock().unwrap()
                     .touch_get(h)
                     .ok_or_else(|| "sql.commit: closed or unknown SqlTx handle".to_string())?;
-                let conn = arc.lock().unwrap();
-                match conn.execute_batch("COMMIT") {
+                let mut conn = arc.lock().unwrap();
+                let res = match &mut *conn {
+                    SqlConn::Sqlite(c)   => c.execute_batch("COMMIT").map_err(|e| e.to_string()),
+                    SqlConn::Postgres(c) => c.batch_execute("COMMIT").map_err(|e| e.to_string()),
+                };
+                match res {
                     Ok(()) => Ok(ok(Value::Unit)),
                     Err(e) => Ok(err(Value::Str(format!("sql.commit: {e}")))),
                 }
@@ -1136,8 +1171,12 @@ impl EffectHandler for DefaultHandler {
                 let arc = sql_registry().lock().unwrap()
                     .touch_get(h)
                     .ok_or_else(|| "sql.rollback: closed or unknown SqlTx handle".to_string())?;
-                let conn = arc.lock().unwrap();
-                match conn.execute_batch("ROLLBACK") {
+                let mut conn = arc.lock().unwrap();
+                let res = match &mut *conn {
+                    SqlConn::Sqlite(c)   => c.execute_batch("ROLLBACK").map_err(|e| e.to_string()),
+                    SqlConn::Postgres(c) => c.batch_execute("ROLLBACK").map_err(|e| e.to_string()),
+                };
+                match res {
                     Ok(()) => Ok(ok(Value::Unit)),
                     Err(e) => Ok(err(Value::Str(format!("sql.rollback: {e}")))),
                 }
@@ -1149,13 +1188,26 @@ impl EffectHandler for DefaultHandler {
                 let arc = sql_registry().lock().unwrap()
                     .touch_get(h)
                     .ok_or_else(|| "sql.exec_tx: closed or unknown SqlTx handle".to_string())?;
-                let conn = arc.lock().unwrap();
-                let bind: Vec<&dyn rusqlite::ToSql> = params.iter()
-                    .map(|p| p as &dyn rusqlite::ToSql)
-                    .collect();
-                match conn.execute(&stmt, rusqlite::params_from_iter(bind.iter())) {
-                    Ok(n)  => Ok(ok(Value::Int(n as i64))),
-                    Err(e) => Ok(err(Value::Str(format!("sql.exec_tx: {e}")))),
+                let mut conn = arc.lock().unwrap();
+                match &mut *conn {
+                    SqlConn::Sqlite(c) => {
+                        let bound = sqlite_params(&params);
+                        let bind: Vec<&dyn rusqlite::ToSql> =
+                            bound.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+                        match c.execute(&stmt, rusqlite::params_from_iter(bind.iter())) {
+                            Ok(n)  => Ok(ok(Value::Int(n as i64))),
+                            Err(e) => Ok(err(Value::Str(format!("sql.exec_tx: {e}")))),
+                        }
+                    }
+                    SqlConn::Postgres(c) => {
+                        let pg = pg_param_refs(&params);
+                        let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
+                            pg.iter().map(|b| b.as_ref()).collect();
+                        match c.execute(stmt.as_str(), &refs) {
+                            Ok(n)  => Ok(ok(Value::Int(n as i64))),
+                            Err(e) => Ok(err(Value::Str(format!("sql.exec_tx: {e}")))),
+                        }
+                    }
                 }
             }
             ("sql", "query_tx") => {
@@ -1165,8 +1217,11 @@ impl EffectHandler for DefaultHandler {
                 let arc = sql_registry().lock().unwrap()
                     .touch_get(h)
                     .ok_or_else(|| "sql.query_tx: closed or unknown SqlTx handle".to_string())?;
-                let conn = arc.lock().unwrap();
-                Ok(sql_run_query(&conn, &stmt_str, &params))
+                let mut conn = arc.lock().unwrap();
+                Ok(match &mut *conn {
+                    SqlConn::Sqlite(c)   => sql_run_query_sqlite(c, &stmt_str, &params),
+                    SqlConn::Postgres(c) => sql_run_query_pg(c, &stmt_str, &params),
+                })
             }
             ("sql", "get_str") => Ok(sql_get_col(&args, |v| match v {
                 Value::Str(s) => Some(Value::Str(s.clone())),
@@ -1920,6 +1975,7 @@ fn expect_sql_handle(v: Option<&Value>) -> Result<u64, String> {
     }
 }
 
+#[allow(dead_code)]
 fn expect_str_list(v: Option<&Value>) -> Result<Vec<String>, String> {
     match v {
         Some(Value::List(items)) => items.iter().map(|x| match x {
@@ -1931,9 +1987,9 @@ fn expect_str_list(v: Option<&Value>) -> Result<Vec<String>, String> {
     }
 }
 
-/// Convert a `List[SqlParam]` value to rusqlite-boxed parameter values.
+/// Convert a `List[SqlParam]` value to driver-neutral `SqlParamValue`s.
 /// SqlParam = PStr(Str) | PInt(Int) | PFloat(Float) | PBool(Bool) | PNull
-fn expect_sql_params(v: Option<&Value>) -> Result<Vec<rusqlite::types::Value>, String> {
+fn expect_sql_params(v: Option<&Value>) -> Result<Vec<SqlParamValue>, String> {
     let items = match v {
         Some(Value::List(xs)) => xs,
         Some(other) => return Err(format!("expected List[SqlParam], got {other:?}")),
@@ -1943,37 +1999,60 @@ fn expect_sql_params(v: Option<&Value>) -> Result<Vec<rusqlite::types::Value>, S
         match item {
             Value::Variant { name, args } => match name.as_str() {
                 "PStr"   => match args.first() {
-                    Some(Value::Str(s)) => Ok(rusqlite::types::Value::Text(s.clone())),
+                    Some(Value::Str(s)) => Ok(SqlParamValue::Text(s.clone())),
                     _ => Err("PStr requires a Str argument".into()),
                 },
                 "PInt"   => match args.first() {
-                    Some(Value::Int(n)) => Ok(rusqlite::types::Value::Integer(*n)),
+                    Some(Value::Int(n)) => Ok(SqlParamValue::Integer(*n)),
                     _ => Err("PInt requires an Int argument".into()),
                 },
                 "PFloat" => match args.first() {
-                    Some(Value::Float(f)) => Ok(rusqlite::types::Value::Real(*f)),
+                    Some(Value::Float(f)) => Ok(SqlParamValue::Real(*f)),
                     _ => Err("PFloat requires a Float argument".into()),
                 },
                 "PBool"  => match args.first() {
-                    Some(Value::Bool(b)) => Ok(rusqlite::types::Value::Integer(*b as i64)),
+                    Some(Value::Bool(b)) => Ok(SqlParamValue::Bool(*b)),
                     _ => Err("PBool requires a Bool argument".into()),
                 },
-                "PNull"  => Ok(rusqlite::types::Value::Null),
+                "PNull"  => Ok(SqlParamValue::Null),
                 other    => Err(format!("unknown SqlParam constructor `{other}`")),
             },
             // Backward-compat: bare strings are accepted as PStr.
-            Value::Str(s) => Ok(rusqlite::types::Value::Text(s.clone())),
+            Value::Str(s) => Ok(SqlParamValue::Text(s.clone())),
             other => Err(format!("expected SqlParam variant, got {other:?}")),
         }
     }).collect()
 }
 
-/// Run a statement and pack the rows into `Value::List(Value::Record(...))`.
-/// Returns the standard `Result[List[T], Str]` Lex shape.
-fn sql_run_query(
+/// Convert `SqlParamValue`s to rusqlite-typed values for SQLite binding.
+fn sqlite_params(params: &[SqlParamValue]) -> Vec<rusqlite::types::Value> {
+    params.iter().map(|p| match p {
+        SqlParamValue::Text(s)    => rusqlite::types::Value::Text(s.clone()),
+        SqlParamValue::Integer(n) => rusqlite::types::Value::Integer(*n),
+        SqlParamValue::Real(f)    => rusqlite::types::Value::Real(*f),
+        SqlParamValue::Bool(b)    => rusqlite::types::Value::Integer(*b as i64),
+        SqlParamValue::Null       => rusqlite::types::Value::Null,
+    }).collect()
+}
+
+/// Box `SqlParamValue`s as `dyn ToSql + Sync` for Postgres binding.
+fn pg_param_refs(params: &[SqlParamValue]) -> Vec<Box<dyn postgres::types::ToSql + Sync>> {
+    params.iter().map(|p| -> Box<dyn postgres::types::ToSql + Sync> {
+        match p {
+            SqlParamValue::Text(s)    => Box::new(s.clone()),
+            SqlParamValue::Integer(n) => Box::new(*n),
+            SqlParamValue::Real(f)    => Box::new(*f),
+            SqlParamValue::Bool(b)    => Box::new(*b),
+            SqlParamValue::Null       => Box::new(Option::<String>::None),
+        }
+    }).collect()
+}
+
+/// Run a statement on SQLite and pack rows into `Value::List(Value::Record(...))`.
+fn sql_run_query_sqlite(
     conn: &rusqlite::Connection,
     stmt_str: &str,
-    params: &[rusqlite::types::Value],
+    params: &[SqlParamValue],
 ) -> Value {
     let mut stmt = match conn.prepare(stmt_str) {
         Ok(s)  => s,
@@ -1983,7 +2062,8 @@ fn sql_run_query(
     let column_names: Vec<String> = (0..column_count)
         .map(|i| stmt.column_name(i).unwrap_or("").to_string())
         .collect();
-    let bind: Vec<&dyn rusqlite::ToSql> = params.iter()
+    let bound = sqlite_params(params);
+    let bind: Vec<&dyn rusqlite::ToSql> = bound.iter()
         .map(|p| p as &dyn rusqlite::ToSql)
         .collect();
     let mut rows = match stmt.query(rusqlite::params_from_iter(bind.iter())) {
@@ -2008,6 +2088,47 @@ fn sql_run_query(
         out.push(Value::Record(rec));
     }
     ok(Value::List(out))
+}
+
+/// Run a statement on Postgres and pack rows into `Value::List(Value::Record(...))`.
+fn sql_run_query_pg(
+    client: &mut postgres::Client,
+    stmt_str: &str,
+    params: &[SqlParamValue],
+) -> Value {
+    let pg = pg_param_refs(params);
+    let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
+        pg.iter().map(|b| b.as_ref()).collect();
+    let rows = match client.query(stmt_str, &refs) {
+        Ok(r)  => r,
+        Err(e) => return err(Value::Str(format!("sql.query: {e}"))),
+    };
+    let out: Vec<Value> = rows.iter().map(|row| {
+        Value::Record(pg_row_to_lex_record(row))
+    }).collect();
+    ok(Value::List(out))
+}
+
+/// Convert a Postgres row to a Lex record, mapping column types to Lex values.
+fn pg_row_to_lex_record(row: &postgres::Row) -> indexmap::IndexMap<String, Value> {
+    use postgres::types::Type;
+    let mut rec = indexmap::IndexMap::new();
+    for (i, col) in row.columns().iter().enumerate() {
+        let ty = col.type_();
+        let val = if *ty == Type::INT2 || *ty == Type::INT4 || *ty == Type::INT8 {
+            row.get::<_, Option<i64>>(i).map(Value::Int).unwrap_or(Value::Unit)
+        } else if *ty == Type::FLOAT4 || *ty == Type::FLOAT8 {
+            row.get::<_, Option<f64>>(i).map(Value::Float).unwrap_or(Value::Unit)
+        } else if *ty == Type::BOOL {
+            row.get::<_, Option<bool>>(i).map(Value::Bool).unwrap_or(Value::Unit)
+        } else if *ty == Type::BYTEA {
+            row.get::<_, Option<Vec<u8>>>(i).map(Value::Bytes).unwrap_or(Value::Unit)
+        } else {
+            row.get::<_, Option<String>>(i).map(Value::Str).unwrap_or(Value::Unit)
+        };
+        rec.insert(col.name().to_string(), val);
+    }
+    rec
 }
 
 /// Extract a column value from a row record by name, returning `Option[X]`.
@@ -2385,7 +2506,23 @@ fn sql_registry() -> &'static Mutex<SqlRegistry> {
 
 const MAX_SQL_HANDLES: usize = 256;
 
-type SharedConn = Arc<Mutex<rusqlite::Connection>>;
+/// Driver-neutral SQL parameter value shared between SQLite and Postgres paths.
+#[derive(Debug, Clone)]
+enum SqlParamValue {
+    Text(String),
+    Integer(i64),
+    Real(f64),
+    Bool(bool),
+    Null,
+}
+
+/// Abstraction over a SQLite connection or a Postgres client.
+pub(crate) enum SqlConn {
+    Sqlite(rusqlite::Connection),
+    Postgres(postgres::Client),
+}
+
+type SharedConn = Arc<Mutex<SqlConn>>;
 
 pub(crate) struct SqlRegistry {
     entries: indexmap::IndexMap<u64, SharedConn>,
@@ -2397,7 +2534,7 @@ impl SqlRegistry {
         Self { entries: indexmap::IndexMap::new(), cap }
     }
 
-    pub(crate) fn insert(&mut self, handle: u64, conn: rusqlite::Connection) {
+    pub(crate) fn insert(&mut self, handle: u64, conn: SqlConn) {
         if self.entries.len() >= self.cap {
             self.entries.shift_remove_index(0);
         }
@@ -2428,10 +2565,10 @@ fn next_sql_handle() -> u64 {
 
 #[cfg(test)]
 mod sql_registry_tests {
-    use super::SqlRegistry;
+    use super::{SqlConn, SqlRegistry};
 
-    fn fresh() -> rusqlite::Connection {
-        rusqlite::Connection::open_in_memory().expect("open in-memory sqlite")
+    fn fresh() -> SqlConn {
+        SqlConn::Sqlite(rusqlite::Connection::open_in_memory().expect("open in-memory sqlite"))
     }
 
     #[test]
