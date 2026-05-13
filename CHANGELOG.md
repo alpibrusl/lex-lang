@@ -9,6 +9,41 @@ bumps may carry breaking changes when justified).
 
 ### Added
 
+- **#382 (slice 3): `std.crypto` KDF primitives.** Key-derivation
+  functions, all pure (no new effects), all returning
+  `Result[Bytes, Str]` so caller-controlled inputs that violate the
+  underlying primitive's contract surface as `Err` rather than
+  panicking the VM:
+  - **`crypto.pbkdf2_sha256(password, salt, iterations, len) ->
+    Result[Bytes, Str]`** — RFC 8018 PBKDF2 with HMAC-SHA256. Backed
+    by the `pbkdf2` crate. OWASP 2024 baseline is ≥ 600 000 iterations
+    for password storage; older deployments pinning < 100 000 should
+    rotate. Surface validations: iterations > 0, 0 < len ≤ 1 MiB,
+    iterations fits in `u32`. Verified against the RFC 7914 §11
+    test vector.
+  - **`crypto.hkdf_sha256(ikm, salt, info, len) -> Result[Bytes, Str]`**
+    — RFC 5869 extract+expand KDF over SHA-256. Use for deriving
+    multiple keys from one high-entropy input (TLS / Noise key
+    schedules, JWT-key rotation, per-session encryption keys). Empty
+    salt is allowed (RFC substitutes a zero-string of `HashLen`).
+    Output length capped at 255 × 32 = 8160 bytes by the primitive;
+    a 1 MiB upper bound also applies. Verified against the RFC 5869
+    Test Case 1 vector.
+  - **`crypto.argon2id(password, salt, t_cost, m_cost, len) ->
+    Result[Bytes, Str]`** — RFC 9106 Argon2id. The recommended choice
+    for *new* password hashing. Backed by the `argon2` crate. The
+    parallelism parameter `p` is pinned at 1 so hashes are comparable
+    across machines; for variable `p`, build on top of the underlying
+    crate via `lex-crypto`. Surface validations: `t_cost ≥ 1`,
+    `m_cost ≥ Params::MIN_M_COST` (8), `len > 0`, salt ≥ 8 bytes (an
+    Argon2 spec requirement, surfaced as `Err`).
+
+  Closes #382 — together with slices 1 (convenience) and 2 (AEAD), the
+  symmetric `std.crypto` surface specified in the issue is complete.
+  Higher-level constructions (JWT, OAuth2 PKCE, signed cookies,
+  password-storage wrappers with vetted defaults) land in the
+  follow-up `lex-crypto` package (#383).
+
 - **#382 (slice 2): `std.crypto` AEAD primitives.** Authenticated
   encryption with associated data, via:
   - **`crypto.aes_gcm_seal(key, nonce, aad, plaintext) -> Result[AeadResult, Str]`**
@@ -29,8 +64,8 @@ bumps may carry breaking changes when justified).
     tag, modified ciphertext, modified AAD, wrong key, wrong nonce)
     is `Err`.
 
-  KDF primitives (`pbkdf2_sha256`, `hkdf_sha256`, `argon2id`) remain
-  the next slice and will land as a focused follow-up PR.
+  KDF primitives (`pbkdf2_sha256`, `hkdf_sha256`, `argon2id`) land in
+  slice 3, immediately above.
 
 - **#382 (slice 1): `std.crypto` convenience adds.** Five new
   primitives on top of the existing `std.crypto` surface, no new
