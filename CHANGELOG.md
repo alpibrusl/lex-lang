@@ -7,6 +7,32 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added
+
+- **#375: streaming HTTP response bodies for `net.serve_fn`.** The
+  registered `Response` alias's `body` field changes from `Str` to a
+  new `ResponseBody` union:
+  ```
+  type ResponseBody =
+      BodyStr(Str)
+    | BodyStream(Iter[Str])
+    | BodyBytes(Iter[List[Int]])
+  ```
+  `BodyStr` is the existing eager-string path. `BodyStream` and
+  `BodyBytes` drain an `Iter[T]` and emit the body under
+  `Transfer-Encoding: chunked` (no `Content-Length`). Drains the
+  iter eagerly in v1 — see #376 for lazy producers (infinite SSE,
+  large-file streaming). The runtime keeps an escape hatch that
+  accepts a bare `Str` body field for handlers that declare their
+  own structural `Response` type instead of the registered alias,
+  so existing example apps (analytics_app, gateway_app, etc.) keep
+  working without changes. New `examples/streaming_app.lex`
+  showcase serves three routes — `/`, `/sse`, `/blob` — covering
+  all three variants. Wire-level integration test in
+  `crates/lex-runtime/tests/net_streaming.rs` confirms
+  `Transfer-Encoding: chunked` is set and the decoded body matches
+  the joined iter items.
+
 ## [0.9.1] — 2026-05-13
 
 ### Added
