@@ -27,6 +27,7 @@ mod watch;
 mod fmt;
 mod init;
 mod ci;
+mod examples_eval;
 
 use ::acli::OutputFormat;
 use anyhow::{anyhow, bail, Context, Result};
@@ -375,6 +376,34 @@ fn cmd_check(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 
     match check_result {
         Ok(_) => {
+            // #369 slice 2: behavioral evaluation of `examples { ... }` blocks.
+            // Type-level checks ran inside `check_program`; now we actually
+            // run each example case through the VM and compare to the
+            // declared expected value. Any mismatches surface through the
+            // same JSON envelope as type errors and exit 2 — they're hard
+            // errors, not lints, because the `examples` block is meant to
+            // be load-bearing contract, not a warning.
+            let example_errors = examples_eval::evaluate_examples(&stages);
+            if !example_errors.is_empty() {
+                let positioned: Vec<lex_types::PositionedError> = example_errors
+                    .into_iter()
+                    .map(lex_types::PositionedError::from)
+                    .collect();
+                let arr: Vec<serde_json::Value> = positioned
+                    .iter()
+                    .map(|e| serde_json::to_value(e).unwrap())
+                    .collect();
+                let data = serde_json::json!({ "ok": false, "errors": arr });
+                acli::emit_or_text("check", data, fmt, || {
+                    for e in &positioned {
+                        if let Ok(j) = serde_json::to_string(e) {
+                            println!("{j}");
+                        }
+                    }
+                });
+                std::process::exit(2);
+            }
+
             // --strict: run AST lint passes + bytecode stack verifier (#347 A2).
             // Warnings are non-fatal but exit 1 so CI can enforce them.
             let mut lint_warnings = if strict && !from_canonical && path != "-" {

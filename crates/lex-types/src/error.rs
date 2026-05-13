@@ -82,6 +82,19 @@ pub enum TypeError {
         expected: usize,
         got: usize,
     },
+    /// A signature-level example case (#369 slice 2) ran successfully
+    /// but the function's actual output disagrees with the declared
+    /// `expected` value. This is the load-bearing check that makes the
+    /// `examples` block enforce behavior, not just types.
+    ExampleMismatch {
+        at_node: String,
+        fn_name: String,
+        case_index: usize,
+        /// Pretty-printed expected value (LHS of the `=>` in the example).
+        expected: String,
+        /// Pretty-printed actual value the function body produced.
+        got: String,
+    },
 }
 
 impl TypeError {
@@ -100,7 +113,8 @@ impl TypeError {
             | TypeError::RecursiveTypeWithoutConstructor { at_node, .. }
             | TypeError::RefinementViolation { at_node, .. }
             | TypeError::ExamplesOnEffectfulFn { at_node, .. }
-            | TypeError::ExampleArityMismatch { at_node, .. } => at_node,
+            | TypeError::ExampleArityMismatch { at_node, .. }
+            | TypeError::ExampleMismatch { at_node, .. } => at_node,
         }
     }
 }
@@ -131,6 +145,9 @@ impl std::fmt::Display for TypeError {
                           v1 restricts examples to pure functions"),
             TypeError::ExampleArityMismatch { at_node, fn_name, case_index, expected, got } =>
                 write!(f, "example #{} of `{fn_name}` at {at_node}: expected {expected} argument(s), got {got}",
+                    case_index + 1),
+            TypeError::ExampleMismatch { at_node, fn_name, case_index, expected, got } =>
+                write!(f, "example #{} of `{fn_name}` at {at_node}: expected {expected}, got {got}",
                     case_index + 1),
         }
     }

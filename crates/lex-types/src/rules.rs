@@ -41,6 +41,7 @@ impl TypeError {
             TypeError::RefinementViolation { .. } => "refinement-violation",
             TypeError::ExamplesOnEffectfulFn { .. } => "examples-on-effectful-fn",
             TypeError::ExampleArityMismatch { .. } => "example-arity-mismatch",
+            TypeError::ExampleMismatch { .. } => "example-mismatch",
         }
     }
 
@@ -92,6 +93,9 @@ and rely on external tests.",
         "example-arity-mismatch" => "A case inside an `examples { ... }` block (#369) supplies a \
 different number of arguments than the function declares. Match the call's argument count to the \
 function's parameter count.",
+        "example-mismatch" => "A case inside an `examples { ... }` block (#369) ran successfully \
+but the function body's actual return value differs from the declared `expected` value. Either \
+update the example to match the new behavior, or fix the body to produce the declared value.",
         _ => "Unknown rule. The rule_tag may have been introduced after this Lex release.",
     }
 }
@@ -115,6 +119,7 @@ pub fn all_rules() -> &'static [RuleInfo] {
         RuleInfo { tag: "refinement-violation", explanation: REFINEMENT_VIOLATION },
         RuleInfo { tag: "examples-on-effectful-fn", explanation: EXAMPLES_ON_EFFECTFUL_FN },
         RuleInfo { tag: "example-arity-mismatch", explanation: EXAMPLE_ARITY_MISMATCH },
+        RuleInfo { tag: "example-mismatch", explanation: EXAMPLE_MISMATCH },
     ]
 }
 
@@ -189,6 +194,14 @@ the missing field to the type declaration. Use the LLM-driven `lex repair --appl
 the offending `let` binding, function parameter, or function return type via `ModifyBody`. The \
 LLM-driven `lex repair --apply` flow can synthesize the annotation from the surrounding context.",
         ),
+        "example-mismatch" => (
+            "ModifyBody",
+            "Reconcile the body with its declared example — fix one or the other.",
+            "An `examples { ... }` case ran but produced a value different from the declared \
+`expected`. Either the example is stale (LLM should rewrite the case via `ReplaceMatchArm` against \
+the `examples` block) or the body regressed (LLM should rewrite the body via `ModifyBody` to make \
+the case pass). The `case_index` field in the error identifies which case to act on.",
+        ),
         _ => return None,
     };
     Some(serde_json::json!({
@@ -240,6 +253,9 @@ and rely on external tests.";
 const EXAMPLE_ARITY_MISMATCH: &str = "A case inside an `examples { ... }` block (#369) supplies a \
 different number of arguments than the function declares. Match the call's argument count to the \
 function's parameter count.";
+const EXAMPLE_MISMATCH: &str = "A case inside an `examples { ... }` block (#369) ran successfully \
+but the function body's actual return value differs from the declared `expected` value. Either \
+update the example to match the new behavior, or fix the body to produce the declared value.";
 
 #[cfg(test)]
 mod tests {
@@ -311,6 +327,13 @@ mod tests {
                 case_index: 0,
                 expected: 2,
                 got: 1,
+            },
+            TypeError::ExampleMismatch {
+                at_node: "n_0".into(),
+                fn_name: "f".into(),
+                case_index: 0,
+                expected: "1".into(),
+                got: "2".into(),
             },
         ];
         let catalog: std::collections::BTreeMap<&str, &str> =
