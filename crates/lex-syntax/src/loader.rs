@@ -380,6 +380,16 @@ impl<'a> Mangler<'a> {
                     })
                     .collect(),
             ),
+            TypeExpr::RecordWithSpreads { spreads, fields } => TypeExpr::RecordWithSpreads {
+                spreads: spreads.into_iter().map(|s| self.rewrite_type_name(&s)).collect(),
+                fields: fields
+                    .into_iter()
+                    .map(|f| TypeField {
+                        name: f.name,
+                        ty: self.mangle_type_expr(f.ty),
+                    })
+                    .collect(),
+            },
             TypeExpr::Tuple(items) => {
                 TypeExpr::Tuple(items.into_iter().map(|t| self.mangle_type_expr(t)).collect())
             }

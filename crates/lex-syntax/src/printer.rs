@@ -145,6 +145,18 @@ impl Printer {
                 }
                 write!(self.out, " }}").unwrap();
             }
+            TypeExpr::RecordWithSpreads { spreads, fields } => {
+                write!(self.out, "{{ ").unwrap();
+                for (i, s) in spreads.iter().enumerate() {
+                    if i > 0 { write!(self.out, ", ").unwrap(); }
+                    write!(self.out, "...{}", s).unwrap();
+                }
+                for f in fields {
+                    write!(self.out, ", {} :: ", f.name).unwrap();
+                    self.type_expr(&f.ty);
+                }
+                write!(self.out, " }}").unwrap();
+            }
             TypeExpr::Tuple(items) => {
                 write!(self.out, "(").unwrap();
                 for (i, it) in items.iter().enumerate() {

@@ -292,20 +292,31 @@ impl Parser {
     fn parse_record_type(&mut self) -> Result<TypeExpr, ParseError> {
         self.expect(&TokenKind::LBrace, "in record type")?;
         let mut fields = Vec::new();
+        let mut spreads = Vec::new();
         if !matches!(self.peek_skip_newlines(), Some(TokenKind::RBrace)) {
             loop {
                 self.skip_newlines();
-                let name = self.expect_ident("in record field")?;
-                self.expect(&TokenKind::ColonColon, "after record field name")?;
-                let ty = self.parse_type_expr()?;
-                fields.push(TypeField { name, ty });
+                if matches!(self.peek(), Some(TokenKind::DotDotDot)) {
+                    self.bump(); // consume `...`
+                    let name = self.expect_ident("after `...` in record type spread")?;
+                    spreads.push(name);
+                } else {
+                    let name = self.expect_ident("in record field")?;
+                    self.expect(&TokenKind::ColonColon, "after record field name")?;
+                    let ty = self.parse_type_expr()?;
+                    fields.push(TypeField { name, ty });
+                }
                 self.skip_newlines();
                 if !self.eat(&TokenKind::Comma) { break; }
                 if matches!(self.peek_skip_newlines(), Some(TokenKind::RBrace)) { break; }
             }
         }
         self.expect(&TokenKind::RBrace, "in record type")?;
-        Ok(TypeExpr::Record(fields))
+        if spreads.is_empty() {
+            Ok(TypeExpr::Record(fields))
+        } else {
+            Ok(TypeExpr::RecordWithSpreads { spreads, fields })
+        }
     }
 
     fn parse_paren_type_or_function(&mut self) -> Result<TypeExpr, ParseError> {

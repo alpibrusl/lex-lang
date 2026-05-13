@@ -390,6 +390,11 @@ fn render_type(t: &lex_ast::TypeExpr) -> String {
             inner.join(" | ")
         }
         Refined { base, .. } => format!("{}{{…}}", render_type(base)),
+        RecordWithSpreads { spreads, fields } => {
+            let mut parts: Vec<String> = spreads.iter().map(|s| format!("...{}", s)).collect();
+            parts.extend(fields.iter().map(|f| format!("{}: {}", f.name, render_type(&f.ty))));
+            format!("{{{}}}", parts.join(", "))
+        }
     }
 }
 

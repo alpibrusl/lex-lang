@@ -88,6 +88,12 @@ pub enum TypeExpr {
         ret: Box<TypeExpr>,
     },
     Union(Vec<UnionVariant>),
+    /// Record type with one or more spread bases (#363): `{ ...TypeName, field :: Type }`.
+    /// Resolved to a flat `Ty::Record` during type-checking.
+    RecordWithSpreads {
+        spreads: Vec<String>,
+        fields: Vec<TypeField>,
+    },
     /// Refinement type (#209): a base type plus a predicate the
     /// inhabitant must satisfy. `Int{x | x > 0 and x <= balance}`
     /// parses with `base = Named { name: "Int", args: [] }`,
