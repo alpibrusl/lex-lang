@@ -7,6 +7,8 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.9.2] — 2026-05-13
+
 ### Added
 
 - **#382 (slice 3): `std.crypto` KDF primitives.** Key-derivation
@@ -64,9 +66,6 @@ bumps may carry breaking changes when justified).
     tag, modified ciphertext, modified AAD, wrong key, wrong nonce)
     is `Err`.
 
-  KDF primitives (`pbkdf2_sha256`, `hkdf_sha256`, `argon2id`) land in
-  slice 3, immediately above.
-
 - **#382 (slice 1): `std.crypto` convenience adds.** Five new
   primitives on top of the existing `std.crypto` surface, no new
   effects required:
@@ -86,14 +85,6 @@ bumps may carry breaking changes when justified).
     gated by `[random]`. The canonical token-mint shape (session ids,
     OAuth `state`, CSRF tokens, request ids).
 
-  AEAD primitives (`aes_gcm_seal/open`, `chacha20_poly1305_seal/open`)
-  and KDFs (`pbkdf2_sha256`, `hkdf_sha256`, `argon2id`) are the next
-  slices — each adds 2–3 new crypto crates and warrants its own
-  focused PR.
-
-
-### Added
-
 - **#378: `std.time` extensions — `now_ms`, `now_str`, `mono_ns`.**
   Three new ops on the existing `time` module: `time.now_ms()` (Unix
   milliseconds, the natural resolution for request-latency and
@@ -109,20 +100,35 @@ bumps may carry breaking changes when justified).
   pinnable via `LEX_TEST_NOW`, closing a small consistency gap with
   `datetime.now`.
 
-### Changed
+- **#376: lazy `Iter[T]` via `iter.unfold(seed, step)`.** The
+  positional `Iter[T]` stdlib added in 0.9.1 (#364) gains a true lazy
+  constructor: `iter.unfold(seed :: S, step :: (S) -> Option[(T, S)])
+  -> Iter[T]`. The step closure is invoked once per `iter.next` call;
+  returning `None` ends the iteration. Internal `Iter[T]` representation
+  changed from `(List[T], Int)` to a tagged Variant
+  (`__IterEager(list, idx)` / `__IterLazy(seed, step)`); the variant
+  names are `__`-prefixed so user code can't construct or match them
+  and `Iter[T]` stays opaque from the type system's perspective. Both
+  `iter.next` and `iter.to_list` dispatch on the variant — eager iters
+  use the existing positional cursor, lazy iters call the step closure
+  and re-wrap the result. Unblocks unbounded sources (range generators,
+  paged-API fetchers) without materialising into a list first. The
+  other iter ops (`map`, `filter`, `take`, `fold`, etc.) remain eager-
+  only in this release; call `iter.to_list` first if you need them on
+  a lazy iter. Closes #376.
 
-- **#380: structured `SqlError` on the `Err` side of every `std.sql`
-  Result.** Replaces `Err(Str)` with `Err(SqlError { message :: Str,
-  code :: Option[Str], detail :: Option[Str] })`. `code` carries the
-  symbolic SQLite extended-result-code name (`SQLITE_CONSTRAINT_UNIQUE`,
-  `SQLITE_BUSY`, …) or the 5-character Postgres SQLSTATE (`23505`,
-  `40P01`, …) so dialect-aware retry / conflict handling can dispatch
-  without parsing error messages. **Breaking change** — callers
-  pattern-matching `Err(s)` where `s` was treated as `Str` must access
-  `e.message` instead. Affects `sql.open`, `exec`, `query`,
-  `query_iter`, `begin`, `commit`, `rollback`, `exec_tx`, `query_tx`.
-
-### Added
+- **#379: streaming SQL cursor — `sql.query_iter[T]`.** New
+  `sql.query_iter[T](db, q, params) -> [sql] Result[Iter[T], Str]`
+  returns rows one at a time through an `Iter[T]` instead of
+  materialising the full result set into a `List[T]`. Backed by a
+  per-cursor mpsc channel (capacity 64 rows, LRU-bounded at 256
+  cursors per process); the producer thread blocks at backlog so
+  resident memory stays bounded regardless of result-set size.
+  SQLite uses `Statement::query`'s row iterator; Postgres opens a
+  transaction with `DECLARE … CURSOR FOR …` and loops on `FETCH 64`.
+  Dropping the `Iter[T]` closes the cursor and releases the connection.
+  Pairs with #376 (lazy iter) for true row-by-row streaming downstream.
+  Closes #379.
 
 - **#375: streaming HTTP response bodies for `net.serve_fn`.** The
   registered `Response` alias's `body` field changes from `Str` to a
@@ -148,6 +154,77 @@ bumps may carry breaking changes when justified).
   `crates/lex-runtime/tests/net_streaming.rs` confirms
   `Transfer-Encoding: chunked` is set and the decoded body matches
   the joined iter items.
+
+- **`lex init`: AI-assistant-ready scaffold (PR #396).** `lex init`
+  now produces a project that's `lex ci`-green from minute one and
+  ready for an AI assistant to start working in:
+  - **`AGENTS.md`** dropped at the project root — short cold-start
+    guide for Claude Code / Cursor / Aider / Copilot covering
+    install (cross-platform `curl + tar -xz` from GitHub Releases),
+    the `lex check → lex test → lex fmt → lex ci` loop, the 6-8
+    Lex-isms most likely to trip up a model (`::` vs `:=`,
+    effects-as-types, `Result`/`Option`, `examples { }` blocks),
+    and pointers to upstream `docs/AGENT.md`.
+  - **CI workflow pins to the scaffolding toolchain version** —
+    `LEX_VERSION: v<version>` env at the top of
+    `.github/workflows/lex.yml`. The install step downloads the
+    pre-built binary tarball from GitHub Releases instead of
+    `cargo build`-ing (~30s vs ~3min, no Rust required). Same
+    `LEX_VERSION` recipe in `AGENTS.md` keeps local and CI on the
+    same toolchain.
+  - **`lex ci` step appended** to the workflow alongside the four
+    explicit named steps. The named steps stay so failures remain
+    categorised in the GH Actions UI; the trailing `lex ci` is a
+    belt-and-braces full repro of the local command.
+  - **`src/main.lex` and `tests/test_main.lex` carry `examples { }`
+    blocks** — surfaces the convention from line 1 of every new
+    repo. Bug fix: the previous test stub had `fn run_all() -> ()
+    { ... }` which failed type-checking (`expected ()`, `got Unit`),
+    leaving a fresh `lex init` red on minute one — now returns
+    `Int` 0.
+  - **`docs/QUICKSTART.md`** added to lex-lang itself — single URL
+    an operator can hand to an AI assistant (`Implement <project>
+    in Lex. Follow <URL>`) covering empty-repo to green CI without
+    duplicating per-project AGENTS.md content.
+
+### Changed
+
+- **#380: structured `SqlError` on the `Err` side of every `std.sql`
+  Result.** Replaces `Err(Str)` with `Err(SqlError { message :: Str,
+  code :: Option[Str], detail :: Option[Str] })`. `code` carries the
+  symbolic SQLite extended-result-code name (`SQLITE_CONSTRAINT_UNIQUE`,
+  `SQLITE_BUSY`, …) or the 5-character Postgres SQLSTATE (`23505`,
+  `40P01`, …) so dialect-aware retry / conflict handling can dispatch
+  without parsing error messages. **Breaking change** — callers
+  pattern-matching `Err(s)` where `s` was treated as `Str` must access
+  `e.message` instead. Affects `sql.open`, `exec`, `query`,
+  `query_iter`, `begin`, `commit`, `rollback`, `exec_tx`, `query_tx`.
+
+### Fixed
+
+- **#391: `examples { }` block name resolution across cross-file
+  imports.** When the multi-file loader pulled in an imported file,
+  it rewrote references in the function body to the file's mangled
+  prefix but passed the `examples { }` block through unchanged — so
+  a fn whose example called another top-level fn in the same file
+  type-checked cleanly inside the defining package but failed with
+  `unknown_identifier` when imported from another package. Loader
+  now mangles example `args` and `expected` with the same rules as
+  the body (with an empty shadow set, since examples sit outside
+  the param scope). Self-references continue to work because the
+  fn's own mangled name is registered in `local_names`.
+
+- **#395: `lex test` aliased imports unresolved
+  (`unknown_identifier` on every `import … as X`).** `lex test`'s
+  per-file runner called `parse_source` directly on each test file,
+  skipping the multi-file loader entirely. Aliased imports like
+  `import "../src/lib" as lib` or `import "pkg-name/mod" as p` never
+  had their aliases bound or their referenced files merged into the
+  program; the same file that passed `lex check` failed `lex test`.
+  Routes test files through `lex_syntax::load_program` so they get
+  the same import expansion, mangling, and stdlib pass-through as
+  `cmd_check`. Effectively unblocked `lex test` (and therefore
+  `lex ci`'s test step) for every multi-module project.
 
 ## [0.9.1] — 2026-05-13
 
