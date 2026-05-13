@@ -520,3 +520,94 @@ fn string_source_rejects_package_imports() {
         .expect_err("expected rejection");
     matches!(err, LoadError::LocalImportInStringSource);
 }
+
+#[test]
+fn examples_in_imported_file_mangle_local_references() {
+    // Regression for #391: a fn whose `examples` block references
+    // another top-level fn in the same file must keep working when
+    // the file is imported from another package/file. The loader
+    // used to skip mangling inside examples, so a cross-file load
+    // produced an `unknown_identifier` at type-check time.
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "widget.lex",
+        r#"fn helper(x :: Int) -> Int { x * 2 }
+
+fn use_helper(n :: Int) -> Int
+  examples {
+    use_helper(5) => helper(5),
+  }
+{
+  helper(n)
+}
+"#,
+    );
+    write(
+        dir.path(),
+        "main.lex",
+        r#"import "./widget" as w
+fn run() -> Int { w.use_helper(3) }
+"#,
+    );
+
+    let prog = load_program(&dir.path().join("main.lex")).expect("load");
+    let use_helper = unique_fn(&prog, "use_helper");
+    let helper = unique_fn(&prog, "helper");
+
+    assert_eq!(use_helper.examples.len(), 1, "expected one example case");
+    let ex = &use_helper.examples[0];
+    match &ex.expected {
+        Expr::Call { callee, .. } => match &**callee {
+            Expr::Var(name) => assert_eq!(
+                name, &helper.name,
+                "example's `expected` should reference helper via its mangled name",
+            ),
+            other => panic!("example expected callee not a Var: {other:?}"),
+        },
+        other => panic!("example expected not a Call: {other:?}"),
+    }
+}
+
+#[test]
+fn examples_in_imported_file_with_self_reference_mangles() {
+    // Variant of #391 where the example's `expected` calls the fn
+    // under definition itself (the schema.lex `join_path` /
+    // `elem_path` pattern). Self-references must resolve to the
+    // mangled name of the same fn.
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "widget.lex",
+        r#"fn identity(n :: Int) -> Int
+  examples {
+    identity(7) => identity(7),
+  }
+{
+  n
+}
+"#,
+    );
+    write(
+        dir.path(),
+        "main.lex",
+        r#"import "./widget" as w
+fn run() -> Int { w.identity(1) }
+"#,
+    );
+
+    let prog = load_program(&dir.path().join("main.lex")).expect("load");
+    let identity = unique_fn(&prog, "identity");
+    assert_eq!(identity.examples.len(), 1);
+    let ex = &identity.examples[0];
+    match &ex.expected {
+        Expr::Call { callee, .. } => match &**callee {
+            Expr::Var(name) => assert_eq!(
+                name, &identity.name,
+                "self-reference in example should mangle to the fn's own mangled name",
+            ),
+            other => panic!("example expected callee not a Var: {other:?}"),
+        },
+        other => panic!("example expected not a Call: {other:?}"),
+    }
+}
