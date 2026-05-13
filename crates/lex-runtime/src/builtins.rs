@@ -1128,6 +1128,20 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             Ok(Value::Bool(eq))
         }
 
+        // -- AEAD (#382 AEAD slice). Pure: same key + nonce + aad +
+        // plaintext always produce the same ciphertext + tag. The
+        // `[random]` effect lives one level up at the caller, where the
+        // nonce is generated; AEAD ops themselves are deterministic and
+        // therefore pure.
+        //
+        // AES-GCM key length is 128 / 192 / 256 bits; we pick the
+        // variant from the key size at runtime so callers don't have
+        // to choose between three near-identical wrappers.
+        ("crypto", "aes_gcm_seal") => Ok(aes_gcm_seal_impl(args)),
+        ("crypto", "aes_gcm_open") => Ok(aes_gcm_open_impl(args)),
+        ("crypto", "chacha20_poly1305_seal") => Ok(chacha20_seal_impl(args)),
+        ("crypto", "chacha20_poly1305_open") => Ok(chacha20_open_impl(args)),
+
         // -- random (#219): pure, seeded RNG. Backed by SplitMix64;
         // state is the u64 mixer state stored as a single i64 in
         // `Rng = { state :: Int }`. Threading the Rng through the
@@ -2292,4 +2306,231 @@ fn instant_from_components(rec: &indexmap::IndexMap<String, Value>) -> Result<i6
         .ok_or("from_components: invalid or ambiguous date/time")?;
     let dt = dt + chrono::Duration::nanoseconds(ns as i64);
     Ok(instant_from_chrono(dt))
+}
+
+// ── AEAD helpers (#382 AEAD slice) ────────────────────────────────────
+//
+// Each `*_seal_impl` returns a `Result[AeadResult, Str]` Lex Variant:
+// `Ok(AeadResult { ciphertext, tag })` on success, `Err(msg)` on input
+// validation failure (wrong key/nonce length). Each `*_open_impl`
+// returns `Result[Bytes, Str]` — authentication failure (bad tag /
+// modified ciphertext) surfaces as `Err`, not a panic.
+//
+// Pure ops: every output is a deterministic function of the inputs;
+// no syscalls, no clock reads, no entropy. Live in the pure-builtin
+// dispatch table so callers don't need an effect grant beyond
+// whatever they used to obtain key + nonce in the first place.
+
+/// `(key, nonce, aad, plaintext)` references unpacked from a 4-arg
+/// AEAD seal call. Aliased so the `type_complexity` clippy lint stays
+/// quiet on the tuple of four borrows.
+type Aead4<'a> = (&'a Vec<u8>, &'a Vec<u8>, &'a Vec<u8>, &'a Vec<u8>);
+
+/// `(key, nonce, aad, ciphertext, tag)` references unpacked from a
+/// 5-arg AEAD open call.
+type Aead5<'a> = (&'a Vec<u8>, &'a Vec<u8>, &'a Vec<u8>, &'a Vec<u8>, &'a Vec<u8>);
+
+fn unpack4_bytes<'a>(
+    args: &'a [Value],
+    op: &str,
+) -> Result<Aead4<'a>, String> {
+    let pick = |i: usize, name: &str| -> Result<&'a Vec<u8>, String> {
+        match args.get(i) {
+            Some(Value::Bytes(b)) => Ok(b),
+            Some(other) => Err(format!("{op}: {name} must be Bytes, got {other:?}")),
+            None => Err(format!("{op}: missing {name} argument")),
+        }
+    };
+    Ok((pick(0, "key")?, pick(1, "nonce")?, pick(2, "aad")?, pick(3, "plaintext")?))
+}
+
+fn unpack5_bytes<'a>(
+    args: &'a [Value],
+    op: &str,
+) -> Result<Aead5<'a>, String> {
+    let pick = |i: usize, name: &str| -> Result<&'a Vec<u8>, String> {
+        match args.get(i) {
+            Some(Value::Bytes(b)) => Ok(b),
+            Some(other) => Err(format!("{op}: {name} must be Bytes, got {other:?}")),
+            None => Err(format!("{op}: missing {name} argument")),
+        }
+    };
+    Ok((
+        pick(0, "key")?,
+        pick(1, "nonce")?,
+        pick(2, "aad")?,
+        pick(3, "ciphertext")?,
+        pick(4, "tag")?,
+    ))
+}
+
+fn aead_result(ciphertext: Vec<u8>, tag: Vec<u8>) -> Value {
+    let mut rec = indexmap::IndexMap::new();
+    rec.insert("ciphertext".into(), Value::Bytes(ciphertext));
+    rec.insert("tag".into(), Value::Bytes(tag));
+    Value::Record(rec)
+}
+
+fn aead_err(msg: impl Into<String>) -> Value {
+    err_v(Value::Str(msg.into()))
+}
+
+fn aes_gcm_seal_impl(args: &[Value]) -> Value {
+    use aes_gcm::aead::{Aead, KeyInit, Payload};
+    use aes_gcm::{Aes128Gcm, Aes256Gcm, Nonce};
+    let (key, nonce, aad, plaintext) = match unpack4_bytes(args, "aes_gcm_seal") {
+        Ok(t) => t,
+        Err(e) => return aead_err(e),
+    };
+    if nonce.len() != 12 {
+        return aead_err(format!(
+            "aes_gcm_seal: nonce must be exactly 12 bytes, got {}", nonce.len()
+        ));
+    }
+    let n = Nonce::from_slice(nonce);
+    let payload = Payload { msg: plaintext, aad };
+    // Encrypts and appends the 16-byte tag. We split the tag back out so
+    // the caller sees the structured AeadResult shape.
+    let combined = match key.len() {
+        16 => {
+            let cipher = Aes128Gcm::new_from_slice(key)
+                .map_err(|e| e.to_string());
+            match cipher {
+                Ok(c) => c.encrypt(n, payload).map_err(|e| format!("aes_gcm_seal: {e}")),
+                Err(e) => Err(format!("aes_gcm_seal: {e}")),
+            }
+        }
+        32 => {
+            let cipher = Aes256Gcm::new_from_slice(key)
+                .map_err(|e| e.to_string());
+            match cipher {
+                Ok(c) => c.encrypt(n, payload).map_err(|e| format!("aes_gcm_seal: {e}")),
+                Err(e) => Err(format!("aes_gcm_seal: {e}")),
+            }
+        }
+        // AES-192 is rarely used; the aes-gcm crate doesn't expose
+        // Aes192Gcm in its default API. Reject other sizes explicitly.
+        other => return aead_err(format!(
+            "aes_gcm_seal: key must be 16 or 32 bytes, got {other}"
+        )),
+    };
+    match combined {
+        Ok(mut buf) => {
+            // tag is the last 16 bytes.
+            let tag_start = buf.len() - 16;
+            let tag = buf.split_off(tag_start);
+            ok_v(aead_result(buf, tag))
+        }
+        Err(e) => aead_err(e),
+    }
+}
+
+fn aes_gcm_open_impl(args: &[Value]) -> Value {
+    use aes_gcm::aead::{Aead, KeyInit, Payload};
+    use aes_gcm::{Aes128Gcm, Aes256Gcm, Nonce};
+    let (key, nonce, aad, ciphertext, tag) = match unpack5_bytes(args, "aes_gcm_open") {
+        Ok(t) => t,
+        Err(e) => return err_v(Value::Str(e)),
+    };
+    if nonce.len() != 12 {
+        return err_v(Value::Str(format!(
+            "aes_gcm_open: nonce must be exactly 12 bytes, got {}", nonce.len()
+        )));
+    }
+    if tag.len() != 16 {
+        return err_v(Value::Str(format!(
+            "aes_gcm_open: tag must be exactly 16 bytes, got {}", tag.len()
+        )));
+    }
+    // Rebuild the "ciphertext || tag" buffer the aes-gcm crate expects.
+    let mut combined = Vec::with_capacity(ciphertext.len() + tag.len());
+    combined.extend_from_slice(ciphertext);
+    combined.extend_from_slice(tag);
+    let n = Nonce::from_slice(nonce);
+    let payload = Payload { msg: &combined, aad };
+    let plaintext = match key.len() {
+        16 => Aes128Gcm::new_from_slice(key)
+            .map_err(|e| format!("aes_gcm_open: {e}"))
+            .and_then(|c| c.decrypt(n, payload).map_err(|e| format!("aes_gcm_open: {e}"))),
+        32 => Aes256Gcm::new_from_slice(key)
+            .map_err(|e| format!("aes_gcm_open: {e}"))
+            .and_then(|c| c.decrypt(n, payload).map_err(|e| format!("aes_gcm_open: {e}"))),
+        other => return err_v(Value::Str(format!(
+            "aes_gcm_open: key must be 16 or 32 bytes, got {other}"
+        ))),
+    };
+    match plaintext {
+        Ok(p) => ok_v(Value::Bytes(p)),
+        Err(e) => err_v(Value::Str(e)),
+    }
+}
+
+fn chacha20_seal_impl(args: &[Value]) -> Value {
+    use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+    use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+    let (key, nonce, aad, plaintext) = match unpack4_bytes(args, "chacha20_poly1305_seal") {
+        Ok(t) => t,
+        Err(e) => return aead_err(e),
+    };
+    if key.len() != 32 {
+        return aead_err(format!(
+            "chacha20_poly1305_seal: key must be exactly 32 bytes, got {}", key.len()
+        ));
+    }
+    if nonce.len() != 12 {
+        return aead_err(format!(
+            "chacha20_poly1305_seal: nonce must be exactly 12 bytes, got {}", nonce.len()
+        ));
+    }
+    let cipher = ChaCha20Poly1305::new_from_slice(key)
+        .map_err(|e| format!("chacha20_poly1305_seal: {e}"));
+    let n = Nonce::from_slice(nonce);
+    let payload = Payload { msg: plaintext, aad };
+    let combined = match cipher {
+        Ok(c) => c.encrypt(n, payload).map_err(|e| format!("chacha20_poly1305_seal: {e}")),
+        Err(e) => Err(e),
+    };
+    match combined {
+        Ok(mut buf) => {
+            let tag_start = buf.len() - 16;
+            let tag = buf.split_off(tag_start);
+            ok_v(aead_result(buf, tag))
+        }
+        Err(e) => aead_err(e),
+    }
+}
+
+fn chacha20_open_impl(args: &[Value]) -> Value {
+    use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+    use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+    let (key, nonce, aad, ciphertext, tag) = match unpack5_bytes(args, "chacha20_poly1305_open") {
+        Ok(t) => t,
+        Err(e) => return err_v(Value::Str(e)),
+    };
+    if key.len() != 32 {
+        return err_v(Value::Str(format!(
+            "chacha20_poly1305_open: key must be exactly 32 bytes, got {}", key.len()
+        )));
+    }
+    if nonce.len() != 12 {
+        return err_v(Value::Str(format!(
+            "chacha20_poly1305_open: nonce must be exactly 12 bytes, got {}", nonce.len()
+        )));
+    }
+    if tag.len() != 16 {
+        return err_v(Value::Str(format!(
+            "chacha20_poly1305_open: tag must be exactly 16 bytes, got {}", tag.len()
+        )));
+    }
+    let mut combined = Vec::with_capacity(ciphertext.len() + tag.len());
+    combined.extend_from_slice(ciphertext);
+    combined.extend_from_slice(tag);
+    let cipher = ChaCha20Poly1305::new_from_slice(key)
+        .map_err(|e| format!("chacha20_poly1305_open: {e}"));
+    let n = Nonce::from_slice(nonce);
+    let payload = Payload { msg: &combined, aad };
+    match cipher.and_then(|c| c.decrypt(n, payload).map_err(|e| format!("chacha20_poly1305_open: {e}"))) {
+        Ok(p) => ok_v(Value::Bytes(p)),
+        Err(e) => err_v(Value::Str(e)),
+    }
 }

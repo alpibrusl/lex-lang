@@ -1060,6 +1060,45 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::singleton("random"),
                 Ty::str(),
             ));
+
+            // AEAD: authenticated encryption with associated data
+            // (#382 AEAD slice). Both algorithms use a 12-byte nonce
+            // and a 16-byte authentication tag. `seal` returns the
+            // structured `AeadResult { ciphertext, tag }`; `open`
+            // returns `Result[Bytes, Str]` so authentication failures
+            // surface as `Err`, not a panic.
+            //
+            // - **AES-GCM** (`aes_gcm_seal/open`): AES-128/192/256-GCM,
+            //   key length determined by the supplied key bytes (16, 24,
+            //   or 32). NIST-recommended; hardware-accelerated on most CPUs.
+            // - **ChaCha20-Poly1305** (`chacha20_poly1305_seal/open`):
+            //   Always a 32-byte key. Equivalent security to AES-GCM
+            //   without needing AES-NI hardware; preferred on constrained
+            //   targets.
+            let aead_t = || Ty::Con("AeadResult".into(), vec![]);
+            // Seal: returns Result[AeadResult, Str] rather than bare
+            // AeadResult so input-validation errors (wrong key length,
+            // wrong nonce length) surface as `Err` to the Lex caller
+            // instead of panicking the VM. AES-GCM expects 16/24/32-byte
+            // keys; ChaCha20-Poly1305 expects exactly 32. Both expect a
+            // 12-byte nonce.
+            for name in &["aes_gcm_seal", "chacha20_poly1305_seal"] {
+                fields.insert((*name).into(), Ty::function(
+                    // (key, nonce, aad, plaintext) -> Result[AeadResult, Str]
+                    vec![Ty::bytes(), Ty::bytes(), Ty::bytes(), Ty::bytes()],
+                    EffectSet::empty(),
+                    Ty::Con("Result".into(), vec![aead_t(), Ty::str()]),
+                ));
+            }
+            for name in &["aes_gcm_open", "chacha20_poly1305_open"] {
+                fields.insert((*name).into(), Ty::function(
+                    // (key, nonce, aad, ciphertext, tag) -> Result[Bytes, Str]
+                    vec![Ty::bytes(), Ty::bytes(), Ty::bytes(), Ty::bytes(), Ty::bytes()],
+                    EffectSet::empty(),
+                    Ty::Con("Result".into(), vec![Ty::bytes(), Ty::str()]),
+                ));
+            }
+
             Some(Ty::Record(fields))
         }
         "deque" => {
