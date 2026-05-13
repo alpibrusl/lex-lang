@@ -9,38 +9,30 @@ bumps may carry breaking changes when justified).
 
 ### Added
 
-- **#379: `sql.query_iter[T]` — streaming cursor returning `Iter[T]`.**
-  New `[sql]` builtin alongside `sql.query`. Returns a server-side
-  cursor wrapped in an `__IterCursor(handle)` iter variant; rows are
-  pulled one at a time through an mpsc-backed producer thread that
-  holds the underlying SQL connection lock for the cursor's lifetime.
-  Channel capacity is bounded (64 rows) so resident memory stays
-  constant regardless of result-set size. `iter.next` gains a third
-  dispatch branch alongside `__IterEager` (#364) and `__IterLazy`
-  (#376) that effect-calls `sql.cursor_next(handle)` to advance.
-  SQLite uses `rusqlite::Statement::query` with `Rows::next` row-by-row;
-  Postgres uses a `DECLARE … CURSOR FOR …` + `FETCH 64` batching loop.
-  Closing the cursor is implicit — drop the `Iter[T]` and the receiver
-  goes out of scope, the producer's next send fails, the thread exits
-  and releases the connection lock. While a cursor is open, other ops
-  on the same `Db` handle block — unavoidable for both drivers since
-  each connection runs one statement at a time.
-
-- **#376: `iter.unfold(seed, step)` + lazy `Iter[T]` runtime form.** The
-  iter stdlib gains a lazy constructor that produces an iterator whose
-  `iter.next` invokes a user-supplied step closure on demand. The
-  closure has shape `(S) -> Option[(T, S)]`; returning `None` ends the
-  iteration. Internally the iter representation switches from
-  `Tuple([list, idx])` to a tagged `Variant("__IterEager", [list, idx])`
-  vs. `Variant("__IterLazy", [seed, step_closure])`, with bytecode
-  dispatch on the variant tag. `iter.next` and `iter.to_list` are
-  lazy-aware (drain via the step closure); the remaining iter ops
-  (`map`, `filter`, `take`, `skip`, `fold`, `count`, `is_empty`) stay
-  eager-only in this slice — call `iter.to_list` first to materialize a
-  lazy iter, or use `iter.next` and pattern-match. Wire-streaming
-  integration for `net.serve_fn` (so each `iter.next` call lands as a
-  distinct HTTP chunk) is tracked separately — this issue ships the
-  language-level primitive that the wire layer will consume.
+- **#375: streaming HTTP response bodies for `net.serve_fn`.** The
+  registered `Response` alias's `body` field changes from `Str` to a
+  new `ResponseBody` union:
+  ```
+  type ResponseBody =
+      BodyStr(Str)
+    | BodyStream(Iter[Str])
+    | BodyBytes(Iter[List[Int]])
+  ```
+  `BodyStr` is the existing eager-string path. `BodyStream` and
+  `BodyBytes` drain an `Iter[T]` and emit the body under
+  `Transfer-Encoding: chunked` (no `Content-Length`). With `Iter[T]`
+  now lazy via `iter.unfold` (#376), the drain pulls from a
+  closure-backed producer one item at a time — true SSE / large-file
+  streaming. The runtime keeps an escape hatch that accepts a bare
+  `Str` body field for handlers that declare their own structural
+  `Response` type instead of the registered alias, so existing
+  example apps (analytics_app, gateway_app, etc.) keep working
+  without changes. New `examples/streaming_app.lex` showcase serves
+  three routes — `/`, `/sse`, `/blob` — covering all three variants.
+  Wire-level integration test in
+  `crates/lex-runtime/tests/net_streaming.rs` confirms
+  `Transfer-Encoding: chunked` is set and the decoded body matches
+  the joined iter items.
 
 ## [0.9.1] — 2026-05-13
 

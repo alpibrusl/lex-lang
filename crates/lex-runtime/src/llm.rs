@@ -222,6 +222,19 @@ pub fn cloud_complete(prompt: &str) -> Result<String, String> {
 mod tests {
     use super::*;
 
+    /// Serializes every test in this module that mutates process-global
+    /// environment variables. cargo test's default thread pool runs unit
+    /// tests in parallel; without this lock, the snapshot/restore pattern
+    /// races (test A removes a var, test B reads `prior = None` while A
+    /// briefly has it set, both restore differently and leak state). The
+    /// lock keeps the snapshot/restore protocol sound by ensuring only
+    /// one env-touching test executes at a time. Pure tests (body shape,
+    /// extract helpers) don't need it and skip the lock.
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
     #[test]
     fn ollama_body_is_non_streaming() {
         let b = ollama_request_body("llama3", "hello");
@@ -273,10 +286,12 @@ mod tests {
 
     #[test]
     fn cloud_config_fails_without_api_key() {
-        // Note: this mutates process-global state. Other tests in
-        // this module read these env vars too — keep the snapshot/
-        // restore pattern uniform so suite-level parallelism stays
-        // safe.
+        // Mutates LEX_LLM_CLOUD_API_KEY + OPENAI_API_KEY. The shared
+        // env_lock() guard prevents racing with the other env tests.
+        // `PoisonError` here just means a sibling test panicked while
+        // holding the lock; we still need a consistent snapshot/restore
+        // cycle, so unwrap the inner guard either way.
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let prior_lex = std::env::var("LEX_LLM_CLOUD_API_KEY").ok();
         let prior_oai = std::env::var("OPENAI_API_KEY").ok();
         std::env::remove_var("LEX_LLM_CLOUD_API_KEY");
@@ -290,6 +305,7 @@ mod tests {
 
     #[test]
     fn cloud_config_prefers_lex_prefix_then_falls_back_to_openai() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let prior_lex_key = std::env::var("LEX_LLM_CLOUD_API_KEY").ok();
         let prior_lex_url = std::env::var("LEX_LLM_CLOUD_BASE_URL").ok();
         let prior_oai_key = std::env::var("OPENAI_API_KEY").ok();
@@ -315,6 +331,7 @@ mod tests {
 
     #[test]
     fn local_config_uses_defaults_without_env() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let prior_h = std::env::var("OLLAMA_HOST").ok();
         let prior_m = std::env::var("LEX_LLM_LOCAL_MODEL").ok();
         std::env::remove_var("OLLAMA_HOST");

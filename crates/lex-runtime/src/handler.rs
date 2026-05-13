@@ -1505,11 +1505,7 @@ fn handle_request(
     match vm.call(&handler_name, vec![lex_req]) {
         Ok(resp) => {
             let (status, body, headers) = unpack_response(&resp);
-            let mut response = tiny_http::Response::from_string(body).with_status_code(status);
-            for h in headers {
-                response.add_header(h);
-            }
-            let _ = req.respond(response);
+            respond_with_body(req, status, body, headers);
         }
         Err(e) => {
             let response = tiny_http::Response::from_string(format!("internal error: {e}"))
@@ -1549,11 +1545,7 @@ fn handle_request_fn(
     match vm.invoke_closure_value(closure, vec![lex_req]) {
         Ok(resp) => {
             let (status, body, headers) = unpack_response(&resp);
-            let mut response = tiny_http::Response::from_string(body).with_status_code(status);
-            for h in headers {
-                response.add_header(h);
-            }
-            let _ = req.respond(response);
+            respond_with_body(req, status, body, headers);
         }
         Err(e) => {
             let response = tiny_http::Response::from_string(format!("internal error: {e}"))
@@ -1588,16 +1580,28 @@ fn build_request_value(req: &mut tiny_http::Request) -> Value {
     Value::Record(rec)
 }
 
-fn unpack_response(v: &Value) -> (u16, String, Vec<tiny_http::Header>) {
+fn unpack_response(v: &Value) -> (u16, ResponseBodyOut, Vec<tiny_http::Header>) {
     if let Value::Record(rec) = v {
         let status = rec.get("status").and_then(|s| match s {
             Value::Int(n) => Some(*n as u16),
             _ => None,
         }).unwrap_or(200);
-        let body = rec.get("body").and_then(|b| match b {
-            Value::Str(s) => Some(s.clone()),
-            _ => None,
-        }).unwrap_or_default();
+        let body = match rec.get("body") {
+            // Tagged ResponseBody (#375): BodyStr | BodyStream | BodyBytes.
+            Some(Value::Variant { name, args }) => match (name.as_str(), args.as_slice()) {
+                ("BodyStr",    [Value::Str(s)])             => ResponseBodyOut::Str(s.clone()),
+                ("BodyStream", [iter_v])                    => ResponseBodyOut::TextChunks(drain_iter_str(iter_v)),
+                ("BodyBytes",  [iter_v])                    => ResponseBodyOut::BytesChunks(drain_iter_bytes(iter_v)),
+                _ => ResponseBodyOut::Str(String::new()),
+            },
+            // Escape hatch for handlers that don't use the nominal
+            // `Response` alias and just return a structural record with
+            // `body :: Str` (the pre-#375 contract). Lets internal
+            // test handlers and one-liners keep working without
+            // wrapping in `BodyStr(...)`.
+            Some(Value::Str(s)) => ResponseBodyOut::Str(s.clone()),
+            _ => ResponseBodyOut::Str(String::new()),
+        };
         let headers = if let Some(Value::Map(hmap)) = rec.get("headers") {
             hmap.iter().filter_map(|(k, v)| {
                 if let (lex_bytecode::MapKey::Str(name), Value::Str(val)) = (k, v) {
@@ -1611,7 +1615,164 @@ fn unpack_response(v: &Value) -> (u16, String, Vec<tiny_http::Header>) {
         };
         return (status, body, headers);
     }
-    (500, format!("handler returned non-record: {v:?}"), vec![])
+    (
+        500,
+        ResponseBodyOut::Str(format!("handler returned non-record: {v:?}")),
+        vec![],
+    )
+}
+
+/// Send `body` back on `req` using the right `tiny_http` path for the
+/// variant. The `Str` arm uses `Response::from_string` (content-length
+/// set, no chunked encoding). The streaming arms use `Response::new`
+/// with `content_length = None`, which makes `tiny_http` switch to
+/// `Transfer-Encoding: chunked` on the wire.
+///
+/// v1 caveat: the chunked-transfer encoder buffers across `read()` calls,
+/// so per-iter-item boundaries are not preserved on the wire — the body
+/// is correctly chunk-encoded but may land as one large HTTP chunk. The
+/// lazy-iter follow-up will expose Lex iter items as distinct HTTP chunks
+/// because each `read()` will block on `iter.next` and produce one item.
+fn respond_with_body(
+    req: tiny_http::Request,
+    status: u16,
+    body: ResponseBodyOut,
+    headers: Vec<tiny_http::Header>,
+) {
+    match body {
+        ResponseBodyOut::Str(s) => {
+            let mut response = tiny_http::Response::from_string(s).with_status_code(status);
+            for h in headers {
+                response.add_header(h);
+            }
+            let _ = req.respond(response);
+        }
+        ResponseBodyOut::TextChunks(chunks) | ResponseBodyOut::BytesChunks(chunks) => {
+            let reader = ChunkReader::new(chunks);
+            let response = tiny_http::Response::new(
+                tiny_http::StatusCode(status),
+                headers,
+                reader,
+                None, // content_length: None → chunked transfer-encoding
+                None,
+            );
+            let _ = req.respond(response);
+        }
+    }
+}
+
+/// Decoded `Response.body` (#375). The runtime emits each variant via a
+/// different `tiny_http` path: a single `Response::from_string` for
+/// `Str`, and a chunked-encoding `Response::new` with a `Read`-backed
+/// chunk list for the streaming variants.
+enum ResponseBodyOut {
+    Str(String),
+    /// Pre-drained text chunks. v1 ships eager-iter only; lazy producers
+    /// (#376 follow-up) will replace this with a Read adapter that pulls
+    /// chunks on demand from the VM.
+    TextChunks(Vec<Vec<u8>>),
+    /// Pre-drained binary chunks. Each inner `Vec<u8>` is one Lex
+    /// `List[Int]` collapsed down to a byte vector.
+    BytesChunks(Vec<Vec<u8>>),
+}
+
+/// Walk a Lex `Iter[Str]` (eager (List, Int) representation) and produce
+/// a chunk list. The chunks are byte vectors so the chunked-Read adapter
+/// is uniform across text and binary streams.
+///
+/// Iter[T] representation shifted in #376: from `Tuple([list, idx])` to
+/// `Variant("__IterEager", [list, idx])` for the eager form. Lazy iters
+/// produced by `iter.unfold` (`Variant("__IterLazy", [seed, step])`) and
+/// cursor-backed iters (`Variant("__IterCursor", [handle])` from #379)
+/// are not drained eagerly here — the v1 streaming path covers only the
+/// eager form. Lazy/cursor producers will be wired through the
+/// `ChunkReader` in a follow-up so each `read()` calls `iter.next` via
+/// the VM, preserving wall-clock chunk boundaries on the wire.
+fn drain_iter_str(v: &Value) -> Vec<Vec<u8>> {
+    match v {
+        Value::Variant { name, args }
+            if name == "__IterEager" && args.len() == 2 =>
+        {
+            if let (Value::List(items), Value::Int(idx)) = (&args[0], &args[1]) {
+                items.iter().skip(*idx as usize).filter_map(|item| {
+                    if let Value::Str(s) = item { Some(s.as_bytes().to_vec()) } else { None }
+                }).collect()
+            } else {
+                Vec::new()
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Walk a Lex `Iter[List[Int]]` and produce a chunk list. Each `List[Int]`
+/// element is collapsed by truncating each Int to u8 (0..=255). See
+/// `drain_iter_str` for the lazy/cursor-iter limitation.
+fn drain_iter_bytes(v: &Value) -> Vec<Vec<u8>> {
+    match v {
+        Value::Variant { name, args }
+            if name == "__IterEager" && args.len() == 2 =>
+        {
+            if let (Value::List(items), Value::Int(idx)) = (&args[0], &args[1]) {
+                items.iter().skip(*idx as usize).filter_map(|item| {
+                    if let Value::List(ints) = item {
+                        Some(ints.iter().filter_map(|i| match i {
+                            Value::Int(n) => Some((*n & 0xff) as u8),
+                            _ => None,
+                        }).collect::<Vec<u8>>())
+                    } else {
+                        None
+                    }
+                }).collect()
+            } else {
+                Vec::new()
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// `Read` adapter that returns one Lex chunk per `read()` call so
+/// `tiny_http`'s chunked transfer-encoding emits each Lex chunk as a
+/// distinct HTTP chunk on the wire. When the requested buffer is smaller
+/// than the current chunk we serve a slice and keep the remainder for
+/// the next call.
+struct ChunkReader {
+    chunks: std::collections::VecDeque<Vec<u8>>,
+    cursor: usize,
+}
+
+impl ChunkReader {
+    fn new(chunks: Vec<Vec<u8>>) -> Self {
+        Self {
+            chunks: chunks.into_iter().filter(|c| !c.is_empty()).collect(),
+            cursor: 0,
+        }
+    }
+}
+
+impl std::io::Read for ChunkReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let Some(front) = self.chunks.front() else {
+                return Ok(0);
+            };
+            let remaining = &front[self.cursor..];
+            if remaining.is_empty() {
+                self.chunks.pop_front();
+                self.cursor = 0;
+                continue;
+            }
+            let n = remaining.len().min(buf.len());
+            buf[..n].copy_from_slice(&remaining[..n]);
+            self.cursor += n;
+            if self.cursor >= front.len() {
+                self.chunks.pop_front();
+                self.cursor = 0;
+            }
+            return Ok(n);
+        }
+    }
 }
 
 /// HTTP/1.1 client backed by `ureq` + `rustls`. Accepts both
