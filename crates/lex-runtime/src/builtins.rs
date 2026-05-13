@@ -2321,10 +2321,19 @@ fn instant_from_components(rec: &indexmap::IndexMap<String, Value>) -> Result<i6
 // dispatch table so callers don't need an effect grant beyond
 // whatever they used to obtain key + nonce in the first place.
 
+/// `(key, nonce, aad, plaintext)` references unpacked from a 4-arg
+/// AEAD seal call. Aliased so the `type_complexity` clippy lint stays
+/// quiet on the tuple of four borrows.
+type Aead4<'a> = (&'a Vec<u8>, &'a Vec<u8>, &'a Vec<u8>, &'a Vec<u8>);
+
+/// `(key, nonce, aad, ciphertext, tag)` references unpacked from a
+/// 5-arg AEAD open call.
+type Aead5<'a> = (&'a Vec<u8>, &'a Vec<u8>, &'a Vec<u8>, &'a Vec<u8>, &'a Vec<u8>);
+
 fn unpack4_bytes<'a>(
     args: &'a [Value],
     op: &str,
-) -> Result<(&'a Vec<u8>, &'a Vec<u8>, &'a Vec<u8>, &'a Vec<u8>), String> {
+) -> Result<Aead4<'a>, String> {
     let pick = |i: usize, name: &str| -> Result<&'a Vec<u8>, String> {
         match args.get(i) {
             Some(Value::Bytes(b)) => Ok(b),
@@ -2338,7 +2347,7 @@ fn unpack4_bytes<'a>(
 fn unpack5_bytes<'a>(
     args: &'a [Value],
     op: &str,
-) -> Result<(&'a Vec<u8>, &'a Vec<u8>, &'a Vec<u8>, &'a Vec<u8>, &'a Vec<u8>), String> {
+) -> Result<Aead5<'a>, String> {
     let pick = |i: usize, name: &str| -> Result<&'a Vec<u8>, String> {
         match args.get(i) {
             Some(Value::Bytes(b)) => Ok(b),
