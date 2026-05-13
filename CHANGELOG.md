@@ -9,6 +9,29 @@ bumps may carry breaking changes when justified).
 
 ### Added
 
+- **#382 (slice 2): `std.crypto` AEAD primitives.** Authenticated
+  encryption with associated data, via:
+  - **`crypto.aes_gcm_seal(key, nonce, aad, plaintext) -> Result[AeadResult, Str]`**
+    and **`crypto.aes_gcm_open(key, nonce, aad, ciphertext, tag) -> Result[Bytes, Str]`**
+    — AES-128-GCM or AES-256-GCM, picked from the supplied key length
+    (16 or 32 bytes). Hardware-accelerated on most CPUs via AES-NI.
+  - **`crypto.chacha20_poly1305_seal/open`** — same shape, fixed
+    32-byte key, no hardware dependency. Preferred on constrained
+    targets or when AES-NI isn't available.
+  - **`AeadResult = { ciphertext :: Bytes, tag :: Bytes }`** — return
+    shape for every seal op. Tag is split out from the ciphertext so
+    callers don't have to know each algorithm's tag length (both
+    happen to be 16 bytes today).
+  - Both algorithms expect a 12-byte nonce. Seal returns
+    `Result[AeadResult, Str]` (not bare `AeadResult`) so wrong
+    key/nonce sizes surface as `Err` instead of panicking the VM.
+    Open returns `Result[Bytes, Str]`; authentication failure (bad
+    tag, modified ciphertext, modified AAD, wrong key, wrong nonce)
+    is `Err`.
+
+  KDF primitives (`pbkdf2_sha256`, `hkdf_sha256`, `argon2id`) remain
+  the next slice and will land as a focused follow-up PR.
+
 - **#382 (slice 1): `std.crypto` convenience adds.** Five new
   primitives on top of the existing `std.crypto` surface, no new
   effects required:

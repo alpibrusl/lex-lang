@@ -101,6 +101,20 @@ impl TypeEnv {
             kind: TypeDefKind::Alias(Ty::Record(se_fields)),
         });
 
+        // AeadResult = { ciphertext :: Bytes, tag :: Bytes } — return
+        // shape for every AEAD seal op in `std.crypto` (#382 AEAD slice).
+        // The auth tag is split out from the ciphertext so callers don't
+        // have to know each algorithm's tag length: AES-GCM and
+        // ChaCha20-Poly1305 both happen to be 16 bytes today, but the
+        // shape keeps that detail encapsulated.
+        let mut ar_fields = IndexMap::new();
+        ar_fields.insert("ciphertext".into(), Ty::bytes());
+        ar_fields.insert("tag".into(), Ty::bytes());
+        e.types.insert("AeadResult".into(), TypeDef {
+            params: vec![],
+            kind: TypeDefKind::Alias(Ty::Record(ar_fields)),
+        });
+
         // Iter[T]: lazy positional iterator (#364). Backed at runtime by a
         // (List[T], Int) tuple; the Int is the current cursor index. All
         // iter.* operations are compiler-inlined so no effect is needed.
