@@ -20,15 +20,16 @@ bumps may carry breaking changes when justified).
   ```
   `BodyStr` is the existing eager-string path. `BodyStream` and
   `BodyBytes` drain an `Iter[T]` and emit the body under
-  `Transfer-Encoding: chunked` (no `Content-Length`). Drains the
-  iter eagerly in v1 — see #376 for lazy producers (infinite SSE,
-  large-file streaming). The runtime keeps an escape hatch that
-  accepts a bare `Str` body field for handlers that declare their
-  own structural `Response` type instead of the registered alias,
-  so existing example apps (analytics_app, gateway_app, etc.) keep
-  working without changes. New `examples/streaming_app.lex`
-  showcase serves three routes — `/`, `/sse`, `/blob` — covering
-  all three variants. Wire-level integration test in
+  `Transfer-Encoding: chunked` (no `Content-Length`). With `Iter[T]`
+  now lazy via `iter.unfold` (#376), the drain pulls from a
+  closure-backed producer one item at a time — true SSE / large-file
+  streaming. The runtime keeps an escape hatch that accepts a bare
+  `Str` body field for handlers that declare their own structural
+  `Response` type instead of the registered alias, so existing
+  example apps (analytics_app, gateway_app, etc.) keep working
+  without changes. New `examples/streaming_app.lex` showcase serves
+  three routes — `/`, `/sse`, `/blob` — covering all three variants.
+  Wire-level integration test in
   `crates/lex-runtime/tests/net_streaming.rs` confirms
   `Transfer-Encoding: chunked` is set and the decoded body matches
   the joined iter items.

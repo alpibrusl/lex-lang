@@ -784,14 +784,33 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             Some(Ty::Record(fields))
         }
         "iter" => {
-            // Lazy positional iterator (#364). Internally a (List[T], Int) tuple;
-            // all operations are compiler-inlined — no effect annotation required.
-            // Type var: 0 = T (element), 1 = U (mapped element), 2 = A (fold acc).
+            // Positional iterator (#364) + lazy variant via `iter.unfold`
+            // (#376). Internal value shapes are `__IterEager(list, idx)` or
+            // `__IterLazy(seed, step)`; all operations compile-inline and
+            // dispatch on the variant tag at runtime.
+            // Type var slots: 0 = T (element), 1 = U (mapped element) /
+            // A (fold acc), 2 = S (unfold seed).
             let it = |n: u32| Ty::Con("Iter".into(), vec![Ty::Var(n)]);
             let mut fields = IndexMap::new();
             // from_list :: List[T] -> Iter[T]
             fields.insert("from_list".into(), Ty::function(
                 vec![Ty::List(Box::new(Ty::Var(0)))],
+                EffectSet::empty(), it(0)));
+            // unfold[S, T] :: S, (S) -> Option[(T, S)] -> Iter[T] (#376)
+            // The step closure may carry any effect row; the iterator
+            // itself stays effect-free since the effects only fire when
+            // the step is invoked via `iter.next` / `iter.to_list`.
+            fields.insert("unfold".into(), Ty::function(
+                vec![
+                    Ty::Var(2), // seed S
+                    Ty::function(
+                        vec![Ty::Var(2)],
+                        EffectSet::open_var(3),
+                        Ty::Con("Option".into(), vec![
+                            Ty::Tuple(vec![Ty::Var(0), Ty::Var(2)])
+                        ]),
+                    ),
+                ],
                 EffectSet::empty(), it(0)));
             // next :: Iter[T] -> Option[(T, Iter[T])]
             fields.insert("next".into(), Ty::function(
@@ -1328,6 +1347,20 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::singleton("sql"),
                 Ty::Con("Result".into(), vec![
                     Ty::List(Box::new(Ty::Var(0))),
+                    Ty::str(),
+                ])));
+
+            // query_iter[T] :: Db, Str, List[SqlParam] -> [sql] Result[Iter[T], Str]
+            // Streaming variant of `query` (#379). Rows are pulled from
+            // the server one at a time via an mpsc-backed cursor —
+            // memory stays bounded regardless of result-set size.
+            // Other ops on the same `Db` handle block until the cursor
+            // is drained (single connection per Db).
+            fields.insert("query_iter".into(), Ty::function(
+                vec![db_t(), Ty::str(), params_t()],
+                EffectSet::singleton("sql"),
+                Ty::Con("Result".into(), vec![
+                    Ty::Con("Iter".into(), vec![Ty::Var(0)]),
                     Ty::str(),
                 ])));
 
