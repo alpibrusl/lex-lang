@@ -121,48 +121,63 @@ fn test_lex(_name: &str) -> String {
 }
 
 fn ci_yml(_name: &str) -> String {
-    // $GITHUB_PATH is a shell variable, not a Rust format specifier.
-    // We build the string without format! to avoid escaping every $.
-    [
-        "name: CI\n",
-        "\n",
-        "on:\n",
-        "  push:\n",
-        "    branches: [main]\n",
-        "  pull_request:\n",
-        "\n",
-        "jobs:\n",
-        "  build:\n",
-        "    runs-on: ubuntu-latest\n",
-        "    steps:\n",
-        "      - uses: actions/checkout@v4\n",
-        "\n",
-        "      - name: Install Lex toolchain\n",
-        "        run: |\n",
-        "          git clone --depth=1 https://github.com/alpibrusl/lex-lang /tmp/lex-lang\n",
-        "          cd /tmp/lex-lang && cargo build --release -p lex-cli\n",
-        "          echo \"/tmp/lex-lang/target/release\" >> $GITHUB_PATH\n",
-        "\n",
-        "      - name: Install package dependencies\n",
-        "        run: lex pkg install\n",
-        "\n",
-        "      - name: Type-check (strict)\n",
-        "        run: lex check --strict src/main.lex\n",
-        "\n",
-        "      - name: Format check\n",
-        "        run: lex fmt --check src/ tests/\n",
-        "\n",
-        "      - name: Test\n",
-        "        run: lex test\n",
-        "\n",
-        "      # Belt-and-braces: re-run the same checks via the `lex ci`\n",
-        "      # umbrella so this workflow stays in sync with whatever\n",
-        "      # `lex ci` runs locally (contributors run `lex ci` before\n",
-        "      # pushing). Remove if you find the duplication too noisy.\n",
-        "      - name: lex ci (full repro)\n",
-        "        run: lex ci\n",
-    ]
-    .concat()
+    // Pin to the lex version that scaffolded the project so CI is
+    // reproducible. Bump manually (`LEX_VERSION` env in the workflow)
+    // when you upgrade the toolchain.
+    //
+    // We download the pre-built binary from GitHub Releases instead of
+    // `cargo build`-ing — ~30s vs ~3min, no Rust required.
+    // `$GITHUB_PATH` is a shell variable, not a Rust format specifier;
+    // we build with `format!` and escape every `{`/`}` accordingly.
+    let version = env!("CARGO_PKG_VERSION");
+    format!(
+        r#"name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  # Pinned at scaffold time. Bump when you upgrade the toolchain.
+  LEX_VERSION: v{version}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Lex toolchain (pre-built binary)
+        run: |
+          set -euo pipefail
+          TARGET=x86_64-unknown-linux-gnu
+          URL="https://github.com/alpibrusl/lex-lang/releases/download/${{LEX_VERSION}}/lex-${{LEX_VERSION}}-${{TARGET}}.tar.gz"
+          curl -sSfL "$URL" | tar -xz
+          sudo install -m 0755 "lex-${{LEX_VERSION}}-${{TARGET}}/lex" /usr/local/bin/lex
+          lex --version
+
+      - name: Install package dependencies
+        run: lex pkg install
+
+      - name: Type-check (strict)
+        run: lex check --strict src/main.lex
+
+      - name: Format check
+        run: lex fmt --check src/ tests/
+
+      - name: Test
+        run: lex test
+
+      # Belt-and-braces: re-run the same checks via the `lex ci`
+      # umbrella so this workflow stays in sync with whatever
+      # `lex ci` runs locally (contributors run `lex ci` before
+      # pushing). Remove if you find the duplication too noisy.
+      - name: lex ci (full repro)
+        run: lex ci
+"#,
+        version = version,
+    )
 }
 
 /// AI-assistant cold-start guide dropped at the project root. Read by
@@ -170,6 +185,7 @@ fn ci_yml(_name: &str) -> String {
 /// agent tools that look for a project-conventions file. Deliberately
 /// short — points at the upstream `docs/AGENT.md` for the deep dive.
 fn agents_md(name: &str) -> String {
+    let version = env!("CARGO_PKG_VERSION");
     format!(
         r#"# AGENTS.md — {name}
 
@@ -179,18 +195,38 @@ read this **first**, then the upstream guide it points at.
 
 ## 1. Install the Lex toolchain
 
-If `lex --version` doesn't work, build it from source — there are no
-pre-built binaries yet:
+If `lex --version` doesn't work, download the pre-built binary for your
+platform. This project was scaffolded against **v{version}** — the CI
+workflow is pinned to that version, so use it locally too.
+
+```sh
+LEX_VERSION=v{version}
+case "$(uname -s)-$(uname -m)" in
+  Linux-x86_64)   TARGET=x86_64-unknown-linux-gnu  ;;
+  Linux-aarch64)  TARGET=aarch64-unknown-linux-gnu ;;
+  Darwin-x86_64)  TARGET=x86_64-apple-darwin       ;;
+  Darwin-arm64)   TARGET=aarch64-apple-darwin      ;;
+  *) echo "unsupported platform" >&2; exit 1 ;;
+esac
+curl -sSfL "https://github.com/alpibrusl/lex-lang/releases/download/${{LEX_VERSION}}/lex-${{LEX_VERSION}}-${{TARGET}}.tar.gz" | tar -xz
+sudo install -m 0755 "lex-${{LEX_VERSION}}-${{TARGET}}/lex" /usr/local/bin/lex
+lex --version
+```
+
+Windows: download `lex-v{version}-x86_64-pc-windows-msvc.zip` from
+<https://github.com/alpibrusl/lex-lang/releases/tag/v{version}> and put
+`lex.exe` on `PATH`.
+
+**Fallback (build from source).** Only needed if you want a version
+that has no published release yet (off-`main` fixes, custom branches):
 
 ```sh
 git clone --depth=1 https://github.com/alpibrusl/lex-lang /tmp/lex-lang
 cd /tmp/lex-lang && cargo build --release -p lex-cli
 export PATH="/tmp/lex-lang/target/release:$PATH"
-lex --version
 ```
 
-Requires Rust 1.80+. The CI workflow at `.github/workflows/lex.yml`
-does the same thing.
+Requires Rust 1.80+. Takes ~3 minutes the first time.
 
 ## 2. The loop
 

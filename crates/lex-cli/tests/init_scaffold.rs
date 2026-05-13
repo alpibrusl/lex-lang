@@ -80,6 +80,40 @@ fn init_workflow_runs_lex_ci_after_explicit_steps() {
 }
 
 #[test]
+fn init_workflow_downloads_pinned_binary_not_cargo_build() {
+    // Workflow should install lex by downloading the pre-built binary
+    // from the GitHub Release pinned to the toolchain version that
+    // scaffolded the project — not by cloning + `cargo build`. The
+    // binary path is ~30s; building was ~3min. Pinning keeps CI
+    // reproducible across toolchain bumps.
+    let dir = unique_dir("workflow-binary");
+    let (code, _, _) = run_in(&dir, &["init", "my-app"]);
+    assert_eq!(code, 0);
+
+    let yml = std::fs::read_to_string(dir.join("my-app/.github/workflows/lex.yml"))
+        .expect("read workflow");
+
+    let expected_version = env!("CARGO_PKG_VERSION");
+
+    assert!(
+        yml.contains(&format!("LEX_VERSION: v{expected_version}")),
+        "workflow should pin LEX_VERSION to the scaffolding toolchain version (v{expected_version}):\n{yml}"
+    );
+    assert!(
+        yml.contains("github.com/alpibrusl/lex-lang/releases/download"),
+        "workflow should download from GitHub Releases:\n{yml}"
+    );
+    assert!(
+        !yml.contains("cargo build"),
+        "workflow should NOT cargo-build the toolchain (slow + needs Rust):\n{yml}"
+    );
+    assert!(
+        !yml.contains("git clone"),
+        "workflow should NOT clone lex-lang at CI time:\n{yml}"
+    );
+}
+
+#[test]
 fn init_agents_md_points_at_install_loop_and_upstream() {
     let dir = unique_dir("agents");
     let (code, _, _) = run_in(&dir, &["init", "my-app"]);
@@ -88,20 +122,31 @@ fn init_agents_md_points_at_install_loop_and_upstream() {
     let agents = std::fs::read_to_string(dir.join("my-app/AGENTS.md"))
         .expect("read AGENTS.md");
 
-    // The three load-bearing sections an agent depends on.
-    for marker in [
+    // The load-bearing sections an agent depends on.
+    let expected_version = env!("CARGO_PKG_VERSION");
+    for marker in &[
         // Title personalised to the project name.
-        "AGENTS.md — my-app",
-        // Install instructions (so an agent on a fresh box can bootstrap).
-        "cargo build --release -p lex-cli",
+        "AGENTS.md — my-app".to_string(),
+        // Primary install path: pre-built binary download.
+        "github.com/alpibrusl/lex-lang/releases/download".to_string(),
+        // Pinned to the toolchain version that scaffolded the project.
+        format!("v{expected_version}"),
+        // Cross-platform target detection so the recipe works on
+        // Linux x86_64 / aarch64 and macOS Intel / Apple Silicon.
+        "uname -s".to_string(),
+        // Fallback `cargo build` still documented for off-release versions.
+        "cargo build --release -p lex-cli".to_string(),
         // The loop with `lex ci` as the gate.
-        "lex ci",
+        "lex ci".to_string(),
         // Reference to the upstream cold-start guide.
-        "docs/AGENT.md",
+        "docs/AGENT.md".to_string(),
         // Effects-as-types reminder — the single biggest Lex-ism.
-        "Effects are types",
+        "Effects are types".to_string(),
     ] {
-        assert!(agents.contains(marker), "AGENTS.md missing `{marker}`");
+        assert!(
+            agents.contains(marker.as_str()),
+            "AGENTS.md missing `{marker}`"
+        );
     }
 }
 
