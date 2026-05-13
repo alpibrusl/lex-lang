@@ -981,12 +981,27 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
         }
         "crypto" => {
             let mut fields = IndexMap::new();
-            // Hashes: Bytes -> Bytes (digest as raw bytes)
-            for name in &["sha256", "sha512", "md5"] {
+            // Hashes: Bytes -> Bytes (digest as raw bytes).
+            // SHA-256 / SHA-512 are vetted. MD5 is retained only for
+            // interop with legacy systems — new code should not use it.
+            // BLAKE2b (#382) is included as a faster alternative to
+            // SHA-512 with the same security level.
+            for name in &["sha256", "sha512", "md5", "blake2b"] {
                 fields.insert((*name).into(), Ty::function(
                     vec![Ty::bytes()],
                     EffectSet::empty(),
                     Ty::bytes(),
+                ));
+            }
+            // Hex-string convenience hashers (#382): hash a Str directly,
+            // return the digest as a lowercase hex Str. Equivalent to
+            // `crypto.hex_encode(crypto.shaN(bytes_from_str(s)))` but
+            // saves the two-step incantation for the common case.
+            for name in &["sha256_str", "sha512_str"] {
+                fields.insert((*name).into(), Ty::function(
+                    vec![Ty::str()],
+                    EffectSet::empty(),
+                    Ty::str(),
                 ));
             }
             // HMAC: (key :: Bytes, data :: Bytes) -> Bytes
@@ -1003,14 +1018,28 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             fields.insert("base64_decode".into(), Ty::function(
                 vec![Ty::str()], EffectSet::empty(),
                 Ty::Con("Result".into(), vec![Ty::bytes(), Ty::str()])));
+            // URL-safe base64 (#382): the alphabet swaps `+/` for `-_`
+            // and omits padding. Required by JWT, signed-cookie, and
+            // most token-bearing URL paths.
+            fields.insert("base64url_encode".into(), Ty::function(
+                vec![Ty::bytes()], EffectSet::empty(), Ty::str()));
+            fields.insert("base64url_decode".into(), Ty::function(
+                vec![Ty::str()], EffectSet::empty(),
+                Ty::Con("Result".into(), vec![Ty::bytes(), Ty::str()])));
             fields.insert("hex_encode".into(), Ty::function(
                 vec![Ty::bytes()], EffectSet::empty(), Ty::str()));
             fields.insert("hex_decode".into(), Ty::function(
                 vec![Ty::str()], EffectSet::empty(),
                 Ty::Con("Result".into(), vec![Ty::bytes(), Ty::str()])));
-            // constant-time equality (for HMAC verification etc.)
+            // Constant-time equality (for HMAC verification etc.).
+            // `eq` / `eq_str` (#382) are the recommended spelling;
+            // `constant_time_eq` stays as a deprecated alias.
             fields.insert("constant_time_eq".into(), Ty::function(
                 vec![Ty::bytes(), Ty::bytes()], EffectSet::empty(), Ty::bool()));
+            fields.insert("eq".into(), Ty::function(
+                vec![Ty::bytes(), Ty::bytes()], EffectSet::empty(), Ty::bool()));
+            fields.insert("eq_str".into(), Ty::function(
+                vec![Ty::str(), Ty::str()], EffectSet::empty(), Ty::bool()));
             // Cryptographically-secure random bytes — OS RNG, not the
             // deterministic `rand.int_in` stub. The new `[random]`
             // effect is fine-grained on purpose so reviewers can find
@@ -1020,6 +1049,16 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 vec![Ty::int()],
                 EffectSet::singleton("random"),
                 Ty::bytes(),
+            ));
+            // random_str_hex (#382): the most common token-mint pattern
+            // — N random bytes rendered as 2N lowercase hex chars.
+            // Suitable for session ids, request ids, OAuth `state`,
+            // CSRF tokens; not suitable as a JWT signing key (use raw
+            // `random` for that).
+            fields.insert("random_str_hex".into(), Ty::function(
+                vec![Ty::int()],
+                EffectSet::singleton("random"),
+                Ty::str(),
             ));
             Some(Ty::Record(fields))
         }

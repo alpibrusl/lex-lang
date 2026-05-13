@@ -714,6 +714,22 @@ impl EffectHandler for DefaultHandler {
                 .map_err(|e| format!("crypto.random: OS RNG: {e}"))?;
             return Ok(Value::Bytes(buf));
         }
+        // crypto.random_str_hex(n) — N random bytes rendered as 2N
+        // lowercase hex chars (#382). The most common token-mint
+        // pattern (session ids, OAuth `state`, CSRF, request ids).
+        // Same `[random]` gate as `crypto.random`.
+        if kind == "crypto" && op == "random_str_hex" {
+            self.ensure_kind_allowed("random")?;
+            let n = expect_int(args.first())?;
+            if !(0..=1_048_576).contains(&n) {
+                return Err("crypto.random_str_hex: n must be in 0..=1048576".into());
+            }
+            use rand::{rngs::SysRng, TryRng};
+            let mut buf = vec![0u8; n as usize];
+            SysRng.try_fill_bytes(&mut buf)
+                .map_err(|e| format!("crypto.random_str_hex: OS RNG: {e}"))?;
+            return Ok(Value::Str(hex::encode(&buf)));
+        }
         // `std.http` wire ops (send/get/post) gate on the `net`
         // effect kind, not the module name. This matches the
         // declared signature (`http.get :: Str -> [net] ...`) and

@@ -10,10 +10,12 @@ use std::sync::{Mutex, OnceLock};
 /// `None` means "not handled here; fall through to effect dispatch".
 pub fn try_pure_builtin(kind: &str, op: &str, args: &[Value]) -> Option<Result<Value, String>> {
     if !is_pure_module(kind) { return None; }
-    // `crypto.random` is the lone effectful op in an otherwise-pure
-    // module; let the handler dispatch it under the `[random]` effect
-    // kind instead of the pure-builtin bypass.
+    // `crypto.random` and `crypto.random_str_hex` (#382) are the
+    // effectful ops in an otherwise-pure module; let the handler
+    // dispatch them under the `[random]` effect kind instead of the
+    // pure-builtin bypass.
     if (kind, op) == ("crypto", "random") { return None; }
+    if (kind, op) == ("crypto", "random_str_hex") { return None; }
     // Same shape: `datetime.now` is the only effectful op in
     // `std.datetime` (all the parse/format/arithmetic ops are pure).
     if (kind, op) == ("datetime", "now") { return None; }
@@ -1006,6 +1008,33 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             h.update(data);
             Ok(Value::Bytes(h.finalize().to_vec()))
         }
+        // BLAKE2b (#382) — 64-byte digest, faster than SHA-512 on most
+        // CPUs with the same security level. Backed by the `blake2`
+        // crate; uses `Blake2b512` (the standard 512-bit variant).
+        ("crypto", "blake2b") => {
+            use blake2::{Blake2b512, Digest};
+            let data = expect_bytes(args.first())?;
+            let mut h = Blake2b512::new();
+            h.update(data);
+            Ok(Value::Bytes(h.finalize().to_vec()))
+        }
+        // Hex-string convenience hashers (#382). Equivalent to
+        // `hex_encode(shaN(bytes_of_str(s)))` for the common case
+        // where the caller has a Str and wants a hex Str digest.
+        ("crypto", "sha256_str") => {
+            use sha2::{Digest, Sha256};
+            let s = expect_str(args.first())?;
+            let mut h = Sha256::new();
+            h.update(s.as_bytes());
+            Ok(Value::Str(hex::encode(h.finalize())))
+        }
+        ("crypto", "sha512_str") => {
+            use sha2::{Digest, Sha512};
+            let s = expect_str(args.first())?;
+            let mut h = Sha512::new();
+            h.update(s.as_bytes());
+            Ok(Value::Str(hex::encode(h.finalize())))
+        }
         ("crypto", "hmac_sha256") => {
             use hmac::{Hmac, KeyInit, Mac};
             type HmacSha256 = Hmac<sha2::Sha256>;
@@ -1039,6 +1068,22 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                 Err(e) => Ok(err_v(Value::Str(format!("base64: {e}")))),
             }
         }
+        // URL-safe base64 (#382). Alphabet `-_` instead of `+/`,
+        // padding stripped. Use for JWT segments, signed cookies, any
+        // token that travels in a URL or path component.
+        ("crypto", "base64url_encode") => {
+            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+            let data = expect_bytes(args.first())?;
+            Ok(Value::Str(URL_SAFE_NO_PAD.encode(data)))
+        }
+        ("crypto", "base64url_decode") => {
+            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+            let s = expect_str(args.first())?;
+            match URL_SAFE_NO_PAD.decode(s) {
+                Ok(b)  => Ok(ok_v(Value::Bytes(b))),
+                Err(e) => Ok(err_v(Value::Str(format!("base64url: {e}")))),
+            }
+        }
         ("crypto", "hex_encode") => {
             let data = expect_bytes(args.first())?;
             Ok(Value::Str(hex::encode(data)))
@@ -1050,7 +1095,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                 Err(e) => Ok(err_v(Value::Str(format!("hex: {e}")))),
             }
         }
-        ("crypto", "constant_time_eq") => {
+        ("crypto", "constant_time_eq") | ("crypto", "eq") => {
             use subtle::ConstantTimeEq;
             let a = expect_bytes(args.first())?;
             let b = expect_bytes(args.get(1))?;
@@ -1058,8 +1103,25 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             // lengths match. For mismatched lengths return false in
             // constant time (length itself isn't secret, but we want
             // a single comparison shape).
+            //
+            // `eq` (#382) is the recommended spelling — same semantics,
+            // shorter name. `constant_time_eq` stays as an alias for
+            // existing callers.
             let eq = if a.len() == b.len() {
                 a.ct_eq(b).into()
+            } else {
+                false
+            };
+            Ok(Value::Bool(eq))
+        }
+        // Constant-time string equality (#382). Compares the bytes of
+        // both strings; semantics identical to `eq` after `.as_bytes()`.
+        ("crypto", "eq_str") => {
+            use subtle::ConstantTimeEq;
+            let a = expect_str(args.first())?;
+            let b = expect_str(args.get(1))?;
+            let eq = if a.len() == b.len() {
+                a.as_bytes().ct_eq(b.as_bytes()).into()
             } else {
                 false
             };
