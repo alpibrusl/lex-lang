@@ -343,6 +343,24 @@ impl<'a> Mangler<'a> {
         for p in &fd.params {
             shadow.insert(p.name.clone());
         }
+        // Example args/expected sit outside the body's parameter scope:
+        // they're top-level expressions evaluated against the function
+        // signature, so the only names they can see are the file's
+        // top-level fns/types and any path-import aliases — i.e., an
+        // empty shadow set (#391).
+        let empty_shadow = HashSet::new();
+        let examples = fd
+            .examples
+            .into_iter()
+            .map(|ex| Example {
+                args: ex
+                    .args
+                    .into_iter()
+                    .map(|a| self.mangle_expr(a, &empty_shadow))
+                    .collect(),
+                expected: self.mangle_expr(ex.expected, &empty_shadow),
+            })
+            .collect();
         FnDecl {
             name: self.qualify(&fd.name),
             type_params: fd.type_params,
@@ -357,11 +375,7 @@ impl<'a> Mangler<'a> {
             effects: fd.effects,
             return_type: self.mangle_type_expr(fd.return_type),
             body: self.mangle_block(fd.body, &shadow),
-            // Examples (#369) ride through the loader unchanged. They
-            // are self-contained calls with pure args; cross-module
-            // identifier rewriting inside example expressions is a
-            // follow-up if it becomes a real need.
-            examples: fd.examples,
+            examples,
         }
     }
 
