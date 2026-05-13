@@ -286,10 +286,11 @@ mod tests {
 
     #[test]
     fn cloud_config_fails_without_api_key() {
-        // Mutates process-global env state; serialize via env_lock()
-        // to prevent racing with the other env tests. Poison just
-        // means a sibling test panicked — proceed with the inner
-        // guard so this test still runs.
+        // Mutates LEX_LLM_CLOUD_API_KEY + OPENAI_API_KEY. The shared
+        // env_lock() guard prevents racing with the other env tests.
+        // `PoisonError` here just means a sibling test panicked while
+        // holding the lock; we still need a consistent snapshot/restore
+        // cycle, so unwrap the inner guard either way.
         let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let prior_lex = std::env::var("LEX_LLM_CLOUD_API_KEY").ok();
         let prior_oai = std::env::var("OPENAI_API_KEY").ok();

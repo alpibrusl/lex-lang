@@ -210,11 +210,32 @@ impl TypeEnv {
             kind: TypeDefKind::Alias(Ty::Record(net_req_fields)),
         });
 
-        // Response = { status :: Int, body :: Str, headers :: Map[Str, Str] }
+        // Response = { status :: Int, body :: ResponseBody, headers :: Map[Str, Str] }
         // Outbound response shape returned by net.serve_fn handlers.
+        // #375: `body` is now an ADT instead of a bare Str. Streaming
+        // variants (BodyStream / BodyBytes) carry an `Iter[T]` that the
+        // server drains chunk-by-chunk under chunked transfer-encoding.
+        let mut rb_variants = IndexMap::new();
+        rb_variants.insert("BodyStr".into(),    Some(Ty::str()));
+        rb_variants.insert(
+            "BodyStream".into(),
+            Some(Ty::Con("Iter".into(), vec![Ty::str()])),
+        );
+        rb_variants.insert(
+            "BodyBytes".into(),
+            Some(Ty::Con("Iter".into(), vec![Ty::List(Box::new(Ty::int()))])),
+        );
+        e.types.insert("ResponseBody".into(), TypeDef {
+            params: vec![],
+            kind: TypeDefKind::Union(rb_variants),
+        });
+        for ctor in &["BodyStr", "BodyStream", "BodyBytes"] {
+            e.ctor_to_type.insert((*ctor).into(), "ResponseBody".into());
+        }
+
         let mut net_resp_fields = IndexMap::new();
         net_resp_fields.insert("status".into(), Ty::int());
-        net_resp_fields.insert("body".into(), Ty::str());
+        net_resp_fields.insert("body".into(), Ty::Con("ResponseBody".into(), vec![]));
         net_resp_fields.insert("headers".into(), Ty::Con("Map".into(), vec![Ty::str(), Ty::str()]));
         e.types.insert("Response".into(), TypeDef {
             params: vec![],
