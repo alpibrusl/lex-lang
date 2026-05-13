@@ -7,6 +7,23 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added
+
+- **#378: `std.time` extensions — `now_ms`, `now_str`, `mono_ns`.**
+  Three new ops on the existing `time` module: `time.now_ms()` (Unix
+  milliseconds, the natural resolution for request-latency and
+  rate-limiter windows), `time.now_str()` (ISO-8601 / RFC 3339 in UTC,
+  for `created_at` / `updated_at` timestamps and structured log
+  lines), and `time.mono_ns()` (monotonic nanoseconds since process
+  start, for duration measurement that's immune to NTP jitter). All
+  three carry the existing `[time]` effect. `time.now`, `time.now_ms`
+  and `time.now_str` all honor `LEX_TEST_NOW` (Unix seconds) for
+  deterministic tests, lifting the seconds value to the right
+  resolution per op; `time.mono_ns` deliberately doesn't pin since a
+  fixed monotonic clock defeats its purpose. `time.now` is now also
+  pinnable via `LEX_TEST_NOW`, closing a small consistency gap with
+  `datetime.now`.
+
 ### Changed
 
 - **#380: structured `SqlError` on the `Err` side of every `std.sql`
