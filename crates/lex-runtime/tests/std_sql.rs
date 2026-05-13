@@ -79,7 +79,7 @@ fn create_insert_query(path :: Str) -> [sql, fs_write] List[{ id :: Int, name ::
       let i2 := match sql.exec(db, "INSERT INTO users VALUES (?1, ?2)", [PStr("2"), PStr("bob")]) {
         Ok(_) => 0, Err(_) => 0 - 1,
       }
-      let result :: Result[List[{ id :: Int, name :: Str }], Str] :=
+      let result :: Result[List[{ id :: Int, name :: Str }], SqlError] :=
         sql.query(db, "SELECT id, name FROM users ORDER BY id", [])
       match result {
         Ok(rows) => rows,
@@ -96,7 +96,7 @@ fn count_empty_table() -> [sql, fs_write] Int {
   match sql.open(":memory:") {
     Ok(db) => {
       let c := match sql.exec(db, "CREATE TABLE t(x INTEGER)", []) { Ok(_) => 0, Err(_) => 0 - 1 }
-      let result :: Result[List[{ n :: Int }], Str] :=
+      let result :: Result[List[{ n :: Int }], SqlError] :=
         sql.query(db, "SELECT COUNT(*) AS n FROM t", [])
       match result {
         Ok(rows) => match list.head(rows) {
@@ -114,14 +114,14 @@ fn count_empty_table() -> [sql, fs_write] Int {
 fn pick_by_id(path :: Str, id :: Str) -> [sql, fs_write] Str {
   match sql.open(path) {
     Ok(db) => {
-      let result :: Result[List[{ name :: Str }], Str] :=
+      let result :: Result[List[{ name :: Str }], SqlError] :=
         sql.query(db, "SELECT name FROM users WHERE id = ?1", [PStr(id)])
       match result {
         Ok(rows) => match list.head(rows) {
           Some(r) => r.name,
           None    => "<missing>",
         },
-        Err(e) => e,
+        Err(e) => e.message,
       }
     },
     Err(_) => "<open failed>",
@@ -143,11 +143,11 @@ fn delete_count(path :: Str) -> [sql, fs_write] Int {
 fn bad_sql_returns_err() -> [sql, fs_write] Str {
   match sql.open(":memory:") {
     Ok(db) => {
-      let result :: Result[List[{ x :: Int }], Str] :=
+      let result :: Result[List[{ x :: Int }], SqlError] :=
         sql.query(db, "SELECT FROM where junk", [])
       match result {
         Ok(_)  => "<unexpectedly ok>",
-        Err(e) => e,
+        Err(e) => e.message,
       }
     },
     Err(_) => "<open failed>",
@@ -248,7 +248,7 @@ import "std.sql" as sql
 fn try_open(p :: Str) -> [sql, fs_write] Str {
   match sql.open(p) {
     Ok(_)  => "<unexpectedly opened>",
-    Err(e) => e,
+    Err(e) => e.message,
   }
 }
 "#;
@@ -282,7 +282,7 @@ fn nullable() -> [sql, fs_write] Bool {
     Ok(db) => {
       let c := match sql.exec(db, "CREATE TABLE t(x INTEGER)", []) { Ok(_) => 0, Err(_) => 0 - 1 }
       let i := match sql.exec(db, "INSERT INTO t(x) VALUES (NULL)", []) { Ok(_) => 0, Err(_) => 0 - 1 }
-      let result :: Result[List[{ x :: Int }], Str] :=
+      let result :: Result[List[{ x :: Int }], SqlError] :=
         sql.query(db, "SELECT x FROM t", [])
       match result {
         Ok(_)  => true,
@@ -308,7 +308,7 @@ fn close_invalidates_subsequent_ops() {
     // shape as kv's closed-handle behavior).
     let src = r#"
 import "std.sql" as sql
-fn close_then_query() -> [sql, fs_write] Result[List[{ x :: Int }], Str] {
+fn close_then_query() -> [sql, fs_write] Result[List[{ x :: Int }], SqlError] {
   match sql.open(":memory:") {
     Ok(db) => {
       let closed := sql.close(db)

@@ -106,7 +106,7 @@ fn with_seeded_db(rows: usize, test_fn: &str, extra_arg: Option<Value>) -> Value
         r#"
 {prelude}
 
-fn run_test() -> [sql, fs_write] Result[List[Str], Str] {{
+fn run_test() -> [sql, fs_write] Result[List[Str], SqlError] {{
   match sql.open(":memory:") {{
     Err(e) => Err(e),
     Ok(db) => {{
@@ -119,7 +119,7 @@ fn run_test() -> [sql, fs_write] Result[List[Str], Str] {{
   }}
 }}
 
-fn run_count() -> [sql, fs_write] Result[Int, Str] {{
+fn run_count() -> [sql, fs_write] Result[Int, SqlError] {{
   match sql.open(":memory:") {{
     Err(e) => Err(e),
     Ok(db) => {{
@@ -128,7 +128,7 @@ fn run_count() -> [sql, fs_write] Result[Int, Str] {{
         Err(_) => 0 - 1,
       }}
       {seed_loop}
-      let result :: Result[Iter[{{ id :: Int, name :: Str }}], Str] :=
+      let result :: Result[Iter[{{ id :: Int, name :: Str }}], SqlError] :=
         sql.query_iter(db, "SELECT id, name FROM rows ORDER BY id", [])
       match result {{
         Err(e) => Err(e),
@@ -150,10 +150,10 @@ fn run_count() -> [sql, fs_write] Result[Int, Str] {{
                 r#"{{
         let _ := 0
         {seed}
-        let result :: Result[Iter[{{ id :: Int, name :: Str }}], Str] :=
+        let result :: Result[Iter[{{ id :: Int, name :: Str }}], SqlError] :=
           sql.query_iter(db, "SELECT id, name FROM rows ORDER BY id", [])
         match result {{
-          Err(e2) => [e2],
+          Err(e2) => [e2.message],
           Ok(it) => drain_names(it),
         }}
       }}"#,
@@ -173,10 +173,10 @@ fn run_count() -> [sql, fs_write] Result[Int, Str] {{
                     r#"{{
         let _ := 0
         {seed}
-        let result :: Result[Iter[{{ id :: Int, name :: Str }}], Str] :=
+        let result :: Result[Iter[{{ id :: Int, name :: Str }}], SqlError] :=
           sql.query_iter(db, "SELECT id, name FROM rows ORDER BY id", [])
         match result {{
-          Err(e2) => [e2],
+          Err(e2) => [e2.message],
           Ok(it) => first_n_names(it, {n}),
         }}
       }}"#,
@@ -227,7 +227,7 @@ fn run_count() -> [sql, fs_write] Int {
       let _ := insert_row(db, 1, "r1")
       let _ := insert_row(db, 2, "r2")
       let _ := insert_row(db, 3, "r3")
-      let result :: Result[Iter[{ id :: Int, name :: Str }], Str] :=
+      let result :: Result[Iter[{ id :: Int, name :: Str }], SqlError] :=
         sql.query_iter(db, "SELECT id, name FROM rows ORDER BY id", [])
       match result {
         Err(_) => 0 - 1,

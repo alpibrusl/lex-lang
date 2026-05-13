@@ -85,6 +85,22 @@ impl TypeEnv {
         // a raw Db connection.
         e.types.insert("SqlTx".into(), TypeDef { params: vec![], kind: TypeDefKind::Opaque });
 
+        // SqlError = { message :: Str, code :: Option[Str], detail :: Option[Str] }
+        // Structured error shape returned by every `std.sql` op (#380).
+        // `code` carries the SQLSTATE (Postgres) or the symbolic SQLite
+        // error name (`SQLITE_BUSY`, `SQLITE_CONSTRAINT_UNIQUE`, …) so
+        // dialect-aware retry / conflict-handling can avoid string
+        // parsing. `message` is always populated; `detail` carries a
+        // driver-side detail string when present.
+        let mut se_fields = IndexMap::new();
+        se_fields.insert("message".into(), Ty::str());
+        se_fields.insert("code".into(), Ty::Con("Option".into(), vec![Ty::str()]));
+        se_fields.insert("detail".into(), Ty::Con("Option".into(), vec![Ty::str()]));
+        e.types.insert("SqlError".into(), TypeDef {
+            params: vec![],
+            kind: TypeDefKind::Alias(Ty::Record(se_fields)),
+        });
+
         // Iter[T]: lazy positional iterator (#364). Backed at runtime by a
         // (List[T], Int) tuple; the Int is the current cursor index. All
         // iter.* operations are compiler-inlined so no effect is needed.
