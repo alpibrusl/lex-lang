@@ -7,6 +7,24 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added
+
+- **#376: `iter.unfold(seed, step)` + lazy `Iter[T]` runtime form.** The
+  iter stdlib gains a lazy constructor that produces an iterator whose
+  `iter.next` invokes a user-supplied step closure on demand. The
+  closure has shape `(S) -> Option[(T, S)]`; returning `None` ends the
+  iteration. Internally the iter representation switches from
+  `Tuple([list, idx])` to a tagged `Variant("__IterEager", [list, idx])`
+  vs. `Variant("__IterLazy", [seed, step_closure])`, with bytecode
+  dispatch on the variant tag. `iter.next` and `iter.to_list` are
+  lazy-aware (drain via the step closure); the remaining iter ops
+  (`map`, `filter`, `take`, `skip`, `fold`, `count`, `is_empty`) stay
+  eager-only in this slice — call `iter.to_list` first to materialize a
+  lazy iter, or use `iter.next` and pattern-match. Wire-streaming
+  integration for `net.serve_fn` (so each `iter.next` call lands as a
+  distinct HTTP chunk) is tracked separately — this issue ships the
+  language-level primitive that the wire layer will consume.
+
 ## [0.9.1] — 2026-05-13
 
 ### Added

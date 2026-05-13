@@ -659,6 +659,7 @@ impl<'a> FnCompiler<'a> {
             ("list", "filter") => self.emit_list_filter(args),
             ("list", "fold") => self.emit_list_fold(args),
             ("iter", "from_list") => self.emit_iter_from_list(args),
+            ("iter", "unfold")    => self.emit_iter_unfold(args),
             ("iter", "next")      => self.emit_iter_next(args),
             ("iter", "is_empty")  => self.emit_iter_is_empty(args),
             ("iter", "count")     => self.emit_iter_count(args),
@@ -892,94 +893,203 @@ impl<'a> FnCompiler<'a> {
     }
 
     // ── Iter[T] operations (#364) ─────────────────────────────────────────
-    // Internal representation: Value::Tuple([list, index]) where list is the
-    // backing List[T] and index is the current cursor (Int). All operations
-    // are compiler-inlined; no runtime effect dispatch is needed.
+    // Internal representation: `Value::Variant("__IterEager", [list, idx])`
+    // for the eager form (a List backing store + Int cursor) and
+    // `Value::Variant("__IterLazy", [seed, step_closure])` for the lazy form
+    // produced by `iter.unfold` (#376). Both are tagged variants so each op
+    // can `TestVariant` at runtime to dispatch. The names start with `__` so
+    // they can't be written by user code (uppercase ASCII-letter is required
+    // for constructor names, and the underscores keep them out of the
+    // user-namespace by convention).
 
-    /// `iter.from_list(xs)` — wrap a list in an iterator at position 0.
+    /// `iter.from_list(xs)` — wrap a list in an eager iterator at position 0.
     fn emit_iter_from_list(&mut self, args: &[a::CExpr]) {
         self.compile_expr(&args[0], false);
         let zero = self.pool.int(0);
         self.emit(Op::PushConst(zero));
-        self.emit(Op::MakeTuple(2));
+        let v = self.pool.variant("__IterEager");
+        self.emit(Op::MakeVariant { name_idx: v, arity: 2 });
     }
 
     /// `iter.next(it)` — advance one step; returns `Option[(T, Iter[T])]`.
+    ///
+    /// Dispatches on the iter's variant tag (#376):
+    /// - `__IterLazy(seed, step)` → invoke `step(seed)`, which itself returns
+    ///   `Option[(T, S)]`. On `Some((t, s'))` wrap as `Some((t, __IterLazy(s', step)))`;
+    ///   on `None` propagate `None`. The seed advances forward each call.
+    /// - `__IterEager(list, idx)` → existing positional cursor.
     fn emit_iter_next(&mut self, args: &[a::CExpr]) {
         self.compile_expr(&args[0], false);
-        let it   = self.alloc_local("__in_it");
+        let it = self.alloc_local("__in_it");
         self.emit(Op::StoreLocal(it));
 
-        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(0));
+        // Dispatch: TestVariant pops; we Dup to keep the iter around.
+        self.emit(Op::LoadLocal(it));
+        self.emit(Op::Dup);
+        let lazy_name = self.pool.variant("__IterLazy");
+        self.emit(Op::TestVariant(lazy_name));
+        let j_to_eager = self.code.len();
+        self.emit(Op::JumpIfNot(0));
+
+        // ── lazy path ────────────────────────────────────────────────
+        // The Dup'd iter is on stack but we've consumed it via TestVariant,
+        // so reload from the local.
+        self.emit(Op::LoadLocal(it));
+        self.emit(Op::GetVariantArg(0)); // seed
+        let seed = self.alloc_local("__in_seed");
+        self.emit(Op::StoreLocal(seed));
+
+        self.emit(Op::LoadLocal(it));
+        self.emit(Op::GetVariantArg(1)); // step closure
+        let step = self.alloc_local("__in_step");
+        self.emit(Op::StoreLocal(step));
+
+        // Call step(seed) → Option[(T, S)].
+        let nid_lazy = self.pool.node_id("n_iter_next_lazy");
+        self.emit(Op::LoadLocal(step));
+        self.emit(Op::LoadLocal(seed));
+        self.emit(Op::CallClosure { arity: 1, node_id_idx: nid_lazy });
+        let opt = self.alloc_local("__in_opt");
+        self.emit(Op::StoreLocal(opt));
+
+        // If `step` returned None, propagate it directly.
+        self.emit(Op::LoadLocal(opt));
+        let some_name = self.pool.variant("Some");
+        self.emit(Op::TestVariant(some_name));
+        let j_lazy_none = self.code.len();
+        self.emit(Op::JumpIfNot(0));
+
+        // Some((t, new_seed)) — extract the inner tuple, repackage as
+        // Some((t, __IterLazy(new_seed, step))) so the next call advances.
+        self.emit(Op::LoadLocal(opt));
+        self.emit(Op::GetVariantArg(0));     // (t, new_seed)
+        let pair = self.alloc_local("__in_pair");
+        self.emit(Op::StoreLocal(pair));
+
+        self.emit(Op::LoadLocal(pair));
+        self.emit(Op::GetElem(0));           // t
+        self.emit(Op::LoadLocal(pair));
+        self.emit(Op::GetElem(1));           // new_seed
+        self.emit(Op::LoadLocal(step));      // step closure
+        let lazy_v = self.pool.variant("__IterLazy");
+        self.emit(Op::MakeVariant { name_idx: lazy_v, arity: 2 }); // __IterLazy(new_seed, step)
+        self.emit(Op::MakeTuple(2));         // (t, new_iter)
+        let some_v = self.pool.variant("Some");
+        self.emit(Op::MakeVariant { name_idx: some_v, arity: 1 });
+        let j_after_lazy = self.code.len();
+        self.emit(Op::Jump(0));
+
+        // Lazy → None: just forward the None.
+        let none_t = self.code.len() as i32;
+        if let Op::JumpIfNot(off) = &mut self.code[j_lazy_none] {
+            *off = none_t - (j_lazy_none as i32 + 1);
+        }
+        let none_v = self.pool.variant("None");
+        self.emit(Op::MakeVariant { name_idx: none_v, arity: 0 });
+        let j_after_lazy_none = self.code.len();
+        self.emit(Op::Jump(0));
+
+        // ── eager path ───────────────────────────────────────────────
+        let eager_t = self.code.len() as i32;
+        if let Op::JumpIfNot(off) = &mut self.code[j_to_eager] {
+            *off = eager_t - (j_to_eager as i32 + 1);
+        }
+
+        self.emit(Op::LoadLocal(it));
+        self.emit(Op::GetVariantArg(0));
         let list = self.alloc_local("__in_list");
         self.emit(Op::StoreLocal(list));
 
-        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(1));
-        let idx  = self.alloc_local("__in_idx");
+        self.emit(Op::LoadLocal(it));
+        self.emit(Op::GetVariantArg(1));
+        let idx = self.alloc_local("__in_idx");
         self.emit(Op::StoreLocal(idx));
 
-        // condition: idx < len(list)
+        // if idx < len(list)
         self.emit(Op::LoadLocal(idx));
-        self.emit(Op::LoadLocal(list)); self.emit(Op::GetListLen);
+        self.emit(Op::LoadLocal(list));
+        self.emit(Op::GetListLen);
         self.emit(Op::NumLt);
-        let j_else = self.code.len();
+        let j_eager_else = self.code.len();
         self.emit(Op::JumpIfNot(0));
 
-        // Some((item, new_iter)):
+        // Some((item, __IterEager(list, idx+1)))
         self.emit(Op::LoadLocal(list));
         self.emit(Op::LoadLocal(idx));
-        self.emit(Op::GetListElemDyn);              // item
+        self.emit(Op::GetListElemDyn);
 
         self.emit(Op::LoadLocal(list));
         self.emit(Op::LoadLocal(idx));
         let one = self.pool.int(1);
         self.emit(Op::PushConst(one));
         self.emit(Op::NumAdd);
-        self.emit(Op::MakeTuple(2));                // new Iter = (list, idx+1)
-
-        self.emit(Op::MakeTuple(2));                // (item, new_iter)
-        let some_idx = self.pool.variant("Some");
-        self.emit(Op::MakeVariant { name_idx: some_idx, arity: 1 });
-        let j_end = self.code.len();
+        let eager_v = self.pool.variant("__IterEager");
+        self.emit(Op::MakeVariant { name_idx: eager_v, arity: 2 });
+        self.emit(Op::MakeTuple(2));
+        let some_e = self.pool.variant("Some");
+        self.emit(Op::MakeVariant { name_idx: some_e, arity: 1 });
+        let j_after_eager = self.code.len();
         self.emit(Op::Jump(0));
 
-        // None:
-        let else_t = self.code.len() as i32;
-        if let Op::JumpIfNot(off) = &mut self.code[j_else] {
-            *off = else_t - (j_else as i32 + 1);
+        // Eager → None
+        let eager_none_t = self.code.len() as i32;
+        if let Op::JumpIfNot(off) = &mut self.code[j_eager_else] {
+            *off = eager_none_t - (j_eager_else as i32 + 1);
         }
-        let none_idx = self.pool.variant("None");
-        self.emit(Op::MakeVariant { name_idx: none_idx, arity: 0 });
+        let none_e = self.pool.variant("None");
+        self.emit(Op::MakeVariant { name_idx: none_e, arity: 0 });
 
-        let end_t = self.code.len() as i32;
-        if let Op::Jump(off) = &mut self.code[j_end] {
-            *off = end_t - (j_end as i32 + 1);
+        // Converge all three paths.
+        let end = self.code.len() as i32;
+        if let Op::Jump(off) = &mut self.code[j_after_lazy] {
+            *off = end - (j_after_lazy as i32 + 1);
+        }
+        if let Op::Jump(off) = &mut self.code[j_after_lazy_none] {
+            *off = end - (j_after_lazy_none as i32 + 1);
+        }
+        if let Op::Jump(off) = &mut self.code[j_after_eager] {
+            *off = end - (j_after_eager as i32 + 1);
         }
     }
 
-    /// `iter.is_empty(it)` — true iff the cursor is at or past the end.
+    /// `iter.unfold(seed, step)` — lazy iterator that calls `step(seed)` on
+    /// each `iter.next` and threads the new seed forward. Internal value
+    /// shape: `__IterLazy(seed, step)`. Step has type `(S) -> Option[(T, S)]`;
+    /// returning `None` ends the iteration (#376).
+    fn emit_iter_unfold(&mut self, args: &[a::CExpr]) {
+        self.compile_expr(&args[0], false); // seed
+        self.compile_expr(&args[1], false); // step
+        let lazy = self.pool.variant("__IterLazy");
+        self.emit(Op::MakeVariant { name_idx: lazy, arity: 2 });
+    }
+
+    /// `iter.is_empty(it)` — true iff no further element. v1 supports the
+    /// eager form O(1); on a lazy iter the seed sits in slot 0 and is not a
+    /// List, so the VM trips on `GetListLen` rather than returning a wrong
+    /// answer. Callers needing lazy support should materialize with
+    /// `iter.to_list` first or call `iter.next` and pattern-match.
     fn emit_iter_is_empty(&mut self, args: &[a::CExpr]) {
         self.compile_expr(&args[0], false);
         let it = self.alloc_local("__ie_it");
         self.emit(Op::StoreLocal(it));
 
-        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(1)); // idx
-        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(0)); // list
-        self.emit(Op::GetListLen);                               // len
-        self.emit(Op::NumLt);                                    // idx < len
-        self.emit(Op::BoolNot);                                  // NOT(idx < len)
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetVariantArg(1)); // idx
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetVariantArg(0)); // list
+        self.emit(Op::GetListLen);                                     // len
+        self.emit(Op::NumLt);                                          // idx < len
+        self.emit(Op::BoolNot);                                        // NOT(idx < len)
     }
 
-    /// `iter.count(it)` — number of remaining elements.
+    /// `iter.count(it)` — number of remaining elements (v1: eager-only).
     fn emit_iter_count(&mut self, args: &[a::CExpr]) {
         self.compile_expr(&args[0], false);
         let it = self.alloc_local("__ic_it");
         self.emit(Op::StoreLocal(it));
 
-        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(0));
-        self.emit(Op::GetListLen);                  // len
-        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(1)); // idx
-        self.emit(Op::NumSub);                      // len - idx
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetVariantArg(0));
+        self.emit(Op::GetListLen);                                     // len
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetVariantArg(1)); // idx
+        self.emit(Op::NumSub);                                         // len - idx
     }
 
     /// `iter.take(it, n)` — collect up to n elements, return as new Iter.
@@ -992,11 +1102,11 @@ impl<'a> FnCompiler<'a> {
         let n    = self.alloc_local("__itk_n");
         self.emit(Op::StoreLocal(n));
 
-        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(0));
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetVariantArg(0));
         let list = self.alloc_local("__itk_list");
         self.emit(Op::StoreLocal(list));
 
-        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(1));
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetVariantArg(1));
         let i    = self.alloc_local("__itk_i");
         self.emit(Op::StoreLocal(i));
 
@@ -1052,10 +1162,11 @@ impl<'a> FnCompiler<'a> {
         if let Op::JumpIfNot(off) = &mut self.code[j_exit_n] { *off = exit_t - (j_exit_n as i32 + 1); }
         if let Op::JumpIfNot(off) = &mut self.code[j_exit_l] { *off = exit_t - (j_exit_l as i32 + 1); }
 
-        // return (out, 0) as new Iter
+        // return new __IterEager(out, 0)
         self.emit(Op::LoadLocal(out));
         self.emit(Op::PushConst(zero));
-        self.emit(Op::MakeTuple(2));
+        let eager_v = self.pool.variant("__IterEager");
+        self.emit(Op::MakeVariant { name_idx: eager_v, arity: 2 });
     }
 
     /// `iter.skip(it, n)` — advance cursor by n (or to end), return new Iter.
@@ -1068,11 +1179,11 @@ impl<'a> FnCompiler<'a> {
         let n    = self.alloc_local("__isk_n");
         self.emit(Op::StoreLocal(n));
 
-        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(0));
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetVariantArg(0));
         let list = self.alloc_local("__isk_list");
         self.emit(Op::StoreLocal(list));
 
-        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(1));
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetVariantArg(1));
         let idx  = self.alloc_local("__isk_idx");
         self.emit(Op::StoreLocal(idx));
 
@@ -1103,31 +1214,102 @@ impl<'a> FnCompiler<'a> {
         let end_t = self.code.len() as i32;
         if let Op::Jump(off) = &mut self.code[j_end] { *off = end_t - (j_end as i32 + 1); }
 
-        // new_idx on stack; build new Iter
+        // new_idx on stack; build new __IterEager(list, new_idx)
         let new_idx = self.alloc_local("__isk_ni");
         self.emit(Op::StoreLocal(new_idx));
         self.emit(Op::LoadLocal(list));
         self.emit(Op::LoadLocal(new_idx));
-        self.emit(Op::MakeTuple(2));
+        let eager_v = self.pool.variant("__IterEager");
+        self.emit(Op::MakeVariant { name_idx: eager_v, arity: 2 });
     }
 
     /// `iter.to_list(it)` — materialise remaining elements into a List.
+    ///
+    /// Dispatches on the iter variant (#376):
+    /// - `__IterLazy`: repeatedly call `step(seed)`; on `Some((t, s'))` append
+    ///   `t` and continue with `s'`; on `None` stop. May hang on truly
+    ///   infinite producers — that's documented as a v1 limitation, the
+    ///   step-limit-protected caller is what catches misuse.
+    /// - `__IterEager`: slice the backing list from `idx` onward (O(n) walk).
     fn emit_iter_to_list(&mut self, args: &[a::CExpr]) {
         self.compile_expr(&args[0], false);
-        let it   = self.alloc_local("__itl_it");
+        let it = self.alloc_local("__itl_it");
         self.emit(Op::StoreLocal(it));
 
-        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(0));
+        // Build the output list up-front, shared across both paths.
+        self.emit(Op::MakeList(0));
+        let out = self.alloc_local("__itl_out");
+        self.emit(Op::StoreLocal(out));
+
+        // Dispatch on variant tag.
+        self.emit(Op::LoadLocal(it));
+        let lazy_name = self.pool.variant("__IterLazy");
+        self.emit(Op::TestVariant(lazy_name));
+        let j_to_eager = self.code.len();
+        self.emit(Op::JumpIfNot(0));
+
+        // ── lazy path ─────────────────────────────────────────────────
+        // seed and step closure live in locals; we update seed each iteration.
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetVariantArg(0));
+        let seed = self.alloc_local("__itl_seed");
+        self.emit(Op::StoreLocal(seed));
+
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetVariantArg(1));
+        let step = self.alloc_local("__itl_step");
+        self.emit(Op::StoreLocal(step));
+
+        let lazy_loop = self.code.len();
+        let nid_lazy = self.pool.node_id("n_iter_to_list_lazy");
+        self.emit(Op::LoadLocal(step));
+        self.emit(Op::LoadLocal(seed));
+        self.emit(Op::CallClosure { arity: 1, node_id_idx: nid_lazy });
+        let opt = self.alloc_local("__itl_opt");
+        self.emit(Op::StoreLocal(opt));
+
+        // If None, drop out of the lazy loop.
+        self.emit(Op::LoadLocal(opt));
+        let some_name = self.pool.variant("Some");
+        self.emit(Op::TestVariant(some_name));
+        let j_lazy_exit = self.code.len();
+        self.emit(Op::JumpIfNot(0));
+
+        // Some((t, new_seed)): append t to out, replace seed.
+        self.emit(Op::LoadLocal(opt));
+        self.emit(Op::GetVariantArg(0));
+        let pair = self.alloc_local("__itl_pair");
+        self.emit(Op::StoreLocal(pair));
+
+        self.emit(Op::LoadLocal(out));
+        self.emit(Op::LoadLocal(pair)); self.emit(Op::GetElem(0));
+        self.emit(Op::ListAppend);
+        self.emit(Op::StoreLocal(out));
+
+        self.emit(Op::LoadLocal(pair)); self.emit(Op::GetElem(1));
+        self.emit(Op::StoreLocal(seed));
+
+        let jback_lazy = self.code.len();
+        self.emit(Op::Jump((lazy_loop as i32) - (jback_lazy as i32 + 1)));
+
+        let lazy_exit_t = self.code.len() as i32;
+        if let Op::JumpIfNot(off) = &mut self.code[j_lazy_exit] {
+            *off = lazy_exit_t - (j_lazy_exit as i32 + 1);
+        }
+        let j_after_lazy = self.code.len();
+        self.emit(Op::Jump(0));
+
+        // ── eager path ────────────────────────────────────────────────
+        let eager_t = self.code.len() as i32;
+        if let Op::JumpIfNot(off) = &mut self.code[j_to_eager] {
+            *off = eager_t - (j_to_eager as i32 + 1);
+        }
+
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetVariantArg(0));
         let list = self.alloc_local("__itl_list");
         self.emit(Op::StoreLocal(list));
 
-        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(1));
-        let i    = self.alloc_local("__itl_i");
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetVariantArg(1));
+        let i = self.alloc_local("__itl_i");
         self.emit(Op::StoreLocal(i));
-
-        self.emit(Op::MakeList(0));
-        let out  = self.alloc_local("__itl_out");
-        self.emit(Op::StoreLocal(out));
 
         let loop_top = self.code.len();
         self.emit(Op::LoadLocal(i));
@@ -1153,7 +1335,15 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::Jump((loop_top as i32) - (jback as i32 + 1)));
 
         let exit_t = self.code.len() as i32;
-        if let Op::JumpIfNot(off) = &mut self.code[j_exit] { *off = exit_t - (j_exit as i32 + 1); }
+        if let Op::JumpIfNot(off) = &mut self.code[j_exit] {
+            *off = exit_t - (j_exit as i32 + 1);
+        }
+
+        // Converge: lazy path falls through here too.
+        let converge = self.code.len() as i32;
+        if let Op::Jump(off) = &mut self.code[j_after_lazy] {
+            *off = converge - (j_after_lazy as i32 + 1);
+        }
         self.emit(Op::LoadLocal(out));
     }
 
@@ -1167,11 +1357,11 @@ impl<'a> FnCompiler<'a> {
         let f    = self.alloc_local("__im_f");
         self.emit(Op::StoreLocal(f));
 
-        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(0));
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetVariantArg(0));
         let list = self.alloc_local("__im_list");
         self.emit(Op::StoreLocal(list));
 
-        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(1));
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetVariantArg(1));
         let i    = self.alloc_local("__im_i");
         self.emit(Op::StoreLocal(i));
 
@@ -1211,7 +1401,8 @@ impl<'a> FnCompiler<'a> {
         let zero = self.pool.int(0);
         self.emit(Op::LoadLocal(out));
         self.emit(Op::PushConst(zero));
-        self.emit(Op::MakeTuple(2));
+        let eager_v = self.pool.variant("__IterEager");
+        self.emit(Op::MakeVariant { name_idx: eager_v, arity: 2 });
     }
 
     /// `iter.filter(it, pred)` — keep elements where pred is true; returns new Iter.
@@ -1224,11 +1415,11 @@ impl<'a> FnCompiler<'a> {
         let f    = self.alloc_local("__if_f");
         self.emit(Op::StoreLocal(f));
 
-        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(0));
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetVariantArg(0));
         let list = self.alloc_local("__if_list");
         self.emit(Op::StoreLocal(list));
 
-        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(1));
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetVariantArg(1));
         let i    = self.alloc_local("__if_i");
         self.emit(Op::StoreLocal(i));
 
@@ -1280,7 +1471,8 @@ impl<'a> FnCompiler<'a> {
         let zero = self.pool.int(0);
         self.emit(Op::LoadLocal(out));
         self.emit(Op::PushConst(zero));
-        self.emit(Op::MakeTuple(2));
+        let eager_v = self.pool.variant("__IterEager");
+        self.emit(Op::MakeVariant { name_idx: eager_v, arity: 2 });
     }
 
     /// `iter.fold(it, init, f)` — left fold over remaining elements.
@@ -1297,11 +1489,11 @@ impl<'a> FnCompiler<'a> {
         let f    = self.alloc_local("__ifo_f");
         self.emit(Op::StoreLocal(f));
 
-        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(0));
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetVariantArg(0));
         let list = self.alloc_local("__ifo_list");
         self.emit(Op::StoreLocal(list));
 
-        self.emit(Op::LoadLocal(it)); self.emit(Op::GetElem(1));
+        self.emit(Op::LoadLocal(it)); self.emit(Op::GetVariantArg(1));
         let i    = self.alloc_local("__ifo_i");
         self.emit(Op::StoreLocal(i));
 

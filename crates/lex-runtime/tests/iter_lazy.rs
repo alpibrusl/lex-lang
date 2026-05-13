@@ -71,6 +71,36 @@ fn fold_sum(xs :: List[Int]) -> Int {
 fn chained_skip_take(xs :: List[Int]) -> List[Int] {
   iter.to_list(iter.take(iter.skip(iter.from_list(xs), 1), 2))
 }
+
+# --- #376: iter.unfold (lazy iterator) -------------------------------
+
+fn unfold_range_to_list(start :: Int, stop :: Int) -> List[Int] {
+  iter.to_list(iter.unfold(start, fn (n :: Int) -> Option[(Int, Int)] {
+    match n < stop {
+      true  => Some((n, n + 1)),
+      false => None,
+    }
+  }))
+}
+
+fn unfold_first_two(start :: Int) -> List[Int] {
+  let it1 := iter.unfold(start, fn (n :: Int) -> Option[(Int, Int)] {
+    Some((n, n + 1))
+  })
+  match iter.next(it1) {
+    None             => [],
+    Some((a, rest1)) => match iter.next(rest1) {
+      None             => [a],
+      Some((b, _))     => [a, b],
+    },
+  }
+}
+
+fn unfold_empty() -> List[Int] {
+  iter.to_list(iter.unfold(0, fn (_n :: Int) -> Option[(Int, Int)] {
+    None
+  }))
+}
 "#;
 
 #[test]
@@ -163,4 +193,47 @@ fn chained_skip_and_take() {
     ]);
     let got = run(SRC, "chained_skip_take", vec![xs]);
     assert_eq!(got, Value::List(vec![Value::Int(2), Value::Int(3)]));
+}
+
+// --- #376: iter.unfold ----------------------------------------------
+
+#[test]
+fn unfold_terminates_when_step_returns_none() {
+    // unfold(0, n -> if n < 4 then Some((n, n+1)) else None) ≡ [0, 1, 2, 3]
+    let got = run(
+        SRC,
+        "unfold_range_to_list",
+        vec![Value::Int(0), Value::Int(4)],
+    );
+    assert_eq!(
+        got,
+        Value::List(vec![Value::Int(0), Value::Int(1), Value::Int(2), Value::Int(3)])
+    );
+}
+
+#[test]
+fn unfold_zero_range_produces_empty_list() {
+    let got = run(
+        SRC,
+        "unfold_range_to_list",
+        vec![Value::Int(5), Value::Int(5)],
+    );
+    assert_eq!(got, Value::List(vec![]));
+}
+
+#[test]
+fn unfold_next_advances_the_seed() {
+    // The new_iter returned by iter.next on a lazy iter must itself be
+    // lazy and advance the seed — calling next twice should yield two
+    // distinct elements, not the same one. Catches a copy-paste bug
+    // where the dispatch loops back on the same seed.
+    let got = run(SRC, "unfold_first_two", vec![Value::Int(10)]);
+    assert_eq!(got, Value::List(vec![Value::Int(10), Value::Int(11)]));
+}
+
+#[test]
+fn unfold_empty_step_yields_empty_list() {
+    // A step that returns None on its first call gives an empty iter.
+    let got = run(SRC, "unfold_empty", vec![]);
+    assert_eq!(got, Value::List(vec![]));
 }
