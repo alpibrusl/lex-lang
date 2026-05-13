@@ -8,7 +8,7 @@ use anyhow::Result;
 use lex_ast::canonicalize_program;
 use lex_bytecode::{compile_program, vm::Vm};
 use lex_runtime::{check_program as check_policy, DefaultHandler, Policy};
-use lex_syntax::parse_source;
+use lex_syntax::load_program;
 use std::path::{Path, PathBuf};
 
 pub fn cmd_test(_fmt: &::acli::OutputFormat, args: &[String]) -> Result<()> {
@@ -70,10 +70,13 @@ fn collect_test_files(dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn run_one(path: &Path) -> Result<()> {
-    let src = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("read: {e}"))?;
-    let prog = parse_source(&src)
-        .map_err(|e| anyhow::anyhow!("parse: {e}"))?;
+    // Route through the multi-file loader so `import "./foo" as f`,
+    // `import "../src/lib" as lib`, and `import "pkg-name/mod" as p`
+    // resolve and get mangled the same way `lex check` does. Without
+    // this, every aliased import in a test file blows up with
+    // `unknown_identifier` at type-check time (#395).
+    let prog = load_program(path)
+        .map_err(|e| anyhow::anyhow!("load: {e}"))?;
     let stages = canonicalize_program(&prog);
     if let Err(errs) = lex_types::check_program(&stages) {
         let msgs: Vec<String> = errs
