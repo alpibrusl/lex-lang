@@ -7,6 +7,48 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added
+
+- **#390: `net.dial_ws` — WebSocket client primitive.** Inverse of
+  `net.serve_ws_fn` (server, shipped in 0.9.0): open an outbound
+  WebSocket connection, fire `on_open` once after the handshake,
+  then loop invoking `on_message` for every inbound frame.
+
+  ```lex
+  fn net.dial_ws[E](
+    url         :: Str,                    # ws:// or wss://
+    subprotocol :: Str,                    # e.g. "ocpp1.6", or "" for none
+    on_open     :: () -> [E] WsAction,
+    on_message  :: (WsMessage) -> [E] WsAction,
+  ) -> [net, E] Result[Unit, Str]
+  ```
+
+  Both callbacks return the same `WsAction` enum (`WsSend(Str)` /
+  `WsSendBinary(List[Int])` / `WsNoOp`) as the server-side
+  `serve_ws_fn` — the action is applied to the socket immediately
+  after the closure returns. `on_message` is also invoked once with
+  `WsClose` before the loop exits, so handlers can run cleanup. The
+  return type is `Result[Unit, Str]` (not bare `Unit` like the
+  server side) because a dial can fail on connect (DNS, refused,
+  bad TLS), bad URL, or mid-stream (read/write error), and the
+  caller usually wants to act on that.
+
+  TLS / `wss://` URLs are supported via tungstenite's
+  `rustls-tls-webpki-roots` feature — production OCPP / signed-WS
+  endpoints work out of the box, no extra config.
+
+  **v1 limitation.** The issue proposed a `send` closure threaded
+  through both handlers so users could push outbound frames from
+  arbitrary `[net]` code (e.g. a charger's heartbeat scheduler).
+  That requires representing Rust-native closures as Lex `Value`s,
+  which is a separate runtime change tracked for a follow-up
+  release. v1 covers the BootNotification + reactive-reply pattern
+  that motivates the issue: `on_open() => WsSend(boot_frame)` plus
+  `on_message(WsText(s)) => WsSend(handle(s))` is enough to write a
+  conforming OCPP charge-point client.
+
+  Closes #390.
+
 ## [0.9.2] — 2026-05-13
 
 ### Added

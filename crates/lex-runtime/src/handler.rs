@@ -1016,6 +1016,28 @@ impl EffectHandler for DefaultHandler {
                 let registry = Arc::new(crate::ws::ChatRegistry::default());
                 crate::ws::serve_ws_fn(port, subprotocol, closure, program, policy, registry)
             }
+            ("net", "dial_ws") => {
+                // dial_ws(url, subprotocol, on_open, on_message)
+                let url = expect_str(args.first())?.to_string();
+                let subprotocol = expect_str(args.get(1))?.to_string();
+                let on_open = match args.get(2).cloned() {
+                    Some(c @ Value::Closure { .. }) => c,
+                    _ => return Err(
+                        "net.dial_ws(url, subprotocol, on_open, on_message): on_open must be a closure".into(),
+                    ),
+                };
+                let on_message = match args.into_iter().nth(3) {
+                    Some(c @ Value::Closure { .. }) => c,
+                    _ => return Err(
+                        "net.dial_ws(url, subprotocol, on_open, on_message): on_message must be a closure".into(),
+                    ),
+                };
+                let program = self.program.clone().ok_or_else(|| {
+                    "net.dial_ws requires a Program reference; use DefaultHandler::with_program".to_string()
+                })?;
+                let policy = self.policy.clone();
+                crate::ws::dial_ws(url, subprotocol, on_open, on_message, program, policy)
+            }
             ("chat", "broadcast") => {
                 let registry = self.chat_registry.as_ref()
                     .ok_or_else(|| "chat.broadcast called outside a net.serve_ws handler".to_string())?;
