@@ -1350,6 +1350,20 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                     Ty::str(),
                 ])));
 
+            // query_iter[T] :: Db, Str, List[SqlParam] -> [sql] Result[Iter[T], Str]
+            // Streaming variant of `query` (#379). Rows are pulled from
+            // the server one at a time via an mpsc-backed cursor —
+            // memory stays bounded regardless of result-set size.
+            // Other ops on the same `Db` handle block until the cursor
+            // is drained (single connection per Db).
+            fields.insert("query_iter".into(), Ty::function(
+                vec![db_t(), Ty::str(), params_t()],
+                EffectSet::singleton("sql"),
+                Ty::Con("Result".into(), vec![
+                    Ty::Con("Iter".into(), vec![Ty::Var(0)]),
+                    Ty::str(),
+                ])));
+
             // begin :: Db -> [sql] Result[SqlTx, Str]
             fields.insert("begin".into(), Ty::function(
                 vec![db_t()],

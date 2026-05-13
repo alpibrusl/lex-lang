@@ -913,10 +913,14 @@ impl<'a> FnCompiler<'a> {
 
     /// `iter.next(it)` — advance one step; returns `Option[(T, Iter[T])]`.
     ///
-    /// Dispatches on the iter's variant tag (#376):
-    /// - `__IterLazy(seed, step)` → invoke `step(seed)`, which itself returns
-    ///   `Option[(T, S)]`. On `Some((t, s'))` wrap as `Some((t, __IterLazy(s', step)))`;
-    ///   on `None` propagate `None`. The seed advances forward each call.
+    /// Dispatches on the iter's variant tag:
+    /// - `__IterLazy(seed, step)` (#376) → invoke `step(seed)`. On
+    ///   `Some((t, s'))` wrap as `Some((t, __IterLazy(s', step)))`; on
+    ///   `None` propagate `None`. The seed advances forward each call.
+    /// - `__IterCursor(handle)` (#379) → effect-call `sql.cursor_next(handle)`
+    ///   which returns `Option[T]`. On `Some(row)` wrap as
+    ///   `Some((row, __IterCursor(handle)))`; on `None` propagate. Handle
+    ///   stays stable across calls — state is server-side / mpsc-buffered.
     /// - `__IterEager(list, idx)` → existing positional cursor.
     fn emit_iter_next(&mut self, args: &[a::CExpr]) {
         self.compile_expr(&args[0], false);
@@ -928,7 +932,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::Dup);
         let lazy_name = self.pool.variant("__IterLazy");
         self.emit(Op::TestVariant(lazy_name));
-        let j_to_eager = self.code.len();
+        let j_to_check_cursor = self.code.len();
         self.emit(Op::JumpIfNot(0));
 
         // ── lazy path ────────────────────────────────────────────────
@@ -989,6 +993,68 @@ impl<'a> FnCompiler<'a> {
         let j_after_lazy_none = self.code.len();
         self.emit(Op::Jump(0));
 
+        // ── cursor path (#379) ───────────────────────────────────────
+        let cursor_check_t = self.code.len() as i32;
+        if let Op::JumpIfNot(off) = &mut self.code[j_to_check_cursor] {
+            *off = cursor_check_t - (j_to_check_cursor as i32 + 1);
+        }
+
+        self.emit(Op::LoadLocal(it));
+        self.emit(Op::Dup);
+        let cursor_name = self.pool.variant("__IterCursor");
+        self.emit(Op::TestVariant(cursor_name));
+        let j_to_eager = self.code.len();
+        self.emit(Op::JumpIfNot(0));
+
+        // Cursor path: extract handle, effect-call sql.cursor_next(handle).
+        // The handler returns Option[T] directly. We then wrap as
+        // Some((T, __IterCursor(handle))) or forward None.
+        self.emit(Op::LoadLocal(it));
+        self.emit(Op::GetVariantArg(0));     // handle
+        let handle = self.alloc_local("__in_handle");
+        self.emit(Op::StoreLocal(handle));
+
+        let kind_idx = self.pool.str("sql");
+        let op_idx = self.pool.str("cursor_next");
+        let nid_cursor = self.pool.node_id("n_iter_next_cursor");
+        self.emit(Op::LoadLocal(handle));
+        self.emit(Op::EffectCall {
+            kind_idx,
+            op_idx,
+            arity: 1,
+            node_id_idx: nid_cursor,
+        });
+        let cur_opt = self.alloc_local("__in_cur_opt");
+        self.emit(Op::StoreLocal(cur_opt));
+
+        self.emit(Op::LoadLocal(cur_opt));
+        let some_c = self.pool.variant("Some");
+        self.emit(Op::TestVariant(some_c));
+        let j_cursor_none = self.code.len();
+        self.emit(Op::JumpIfNot(0));
+
+        // Some(row): build Some((row, __IterCursor(handle)))
+        self.emit(Op::LoadLocal(cur_opt));
+        self.emit(Op::GetVariantArg(0));     // row
+        self.emit(Op::LoadLocal(handle));
+        let cursor_v = self.pool.variant("__IterCursor");
+        self.emit(Op::MakeVariant { name_idx: cursor_v, arity: 1 });
+        self.emit(Op::MakeTuple(2));         // (row, __IterCursor(handle))
+        let some_c2 = self.pool.variant("Some");
+        self.emit(Op::MakeVariant { name_idx: some_c2, arity: 1 });
+        let j_after_cursor = self.code.len();
+        self.emit(Op::Jump(0));
+
+        // Cursor → None
+        let cursor_none_t = self.code.len() as i32;
+        if let Op::JumpIfNot(off) = &mut self.code[j_cursor_none] {
+            *off = cursor_none_t - (j_cursor_none as i32 + 1);
+        }
+        let none_c = self.pool.variant("None");
+        self.emit(Op::MakeVariant { name_idx: none_c, arity: 0 });
+        let j_after_cursor_none = self.code.len();
+        self.emit(Op::Jump(0));
+
         // ── eager path ───────────────────────────────────────────────
         let eager_t = self.code.len() as i32;
         if let Op::JumpIfNot(off) = &mut self.code[j_to_eager] {
@@ -1039,13 +1105,19 @@ impl<'a> FnCompiler<'a> {
         let none_e = self.pool.variant("None");
         self.emit(Op::MakeVariant { name_idx: none_e, arity: 0 });
 
-        // Converge all three paths.
+        // Converge all paths.
         let end = self.code.len() as i32;
         if let Op::Jump(off) = &mut self.code[j_after_lazy] {
             *off = end - (j_after_lazy as i32 + 1);
         }
         if let Op::Jump(off) = &mut self.code[j_after_lazy_none] {
             *off = end - (j_after_lazy_none as i32 + 1);
+        }
+        if let Op::Jump(off) = &mut self.code[j_after_cursor] {
+            *off = end - (j_after_cursor as i32 + 1);
+        }
+        if let Op::Jump(off) = &mut self.code[j_after_cursor_none] {
+            *off = end - (j_after_cursor_none as i32 + 1);
         }
         if let Op::Jump(off) = &mut self.code[j_after_eager] {
             *off = end - (j_after_eager as i32 + 1);
