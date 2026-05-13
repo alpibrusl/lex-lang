@@ -1132,6 +1132,87 @@ impl EffectHandler for DefaultHandler {
                     SqlConn::Postgres(c) => sql_run_query_pg(c, &stmt_str, &params),
                 })
             }
+            // Streaming cursor (#379). Allocates an mpsc-backed cursor
+            // handle, spawns a producer thread to ship rows one at a
+            // time, and returns `__IterCursor(handle)` wrapped in `Ok`.
+            // `iter.next` bytecode dispatches the variant tag and
+            // effect-calls `sql.cursor_next` (below) to advance.
+            ("sql", "query_iter") => {
+                let h = expect_sql_handle(args.first())?;
+                let stmt_str = expect_str(args.get(1))?.to_string();
+                let params = expect_sql_params(args.get(2))?;
+                let arc = sql_registry().lock().unwrap()
+                    .touch_get(h)
+                    .ok_or_else(|| "sql.query_iter: closed or unknown Db handle".to_string())?;
+
+                // Dispatch producer on the connection kind without
+                // holding the SqlRegistry lock — the producer thread
+                // owns its own clone of the connection Arc.
+                let (sender, receiver) = std::sync::mpsc::sync_channel::<Result<Value, String>>(
+                    CURSOR_CHANNEL_CAPACITY,
+                );
+                let cursor_h = next_cursor_handle();
+                cursor_registry().lock().unwrap().insert(cursor_h, receiver);
+
+                let arc_for_thread = Arc::clone(&arc);
+                // Decide which producer to spawn based on the
+                // connection's variant. We can briefly peek at the
+                // variant here without holding the lock for the
+                // producer's lifetime — the producer locks again
+                // inside its thread function.
+                let is_sqlite = matches!(*arc.lock().unwrap(), SqlConn::Sqlite(_));
+                std::thread::spawn(move || {
+                    if is_sqlite {
+                        sqlite_cursor_producer(arc_for_thread, stmt_str, params, sender);
+                    } else {
+                        pg_cursor_producer(arc_for_thread, stmt_str, params, sender);
+                    }
+                });
+
+                Ok(ok(Value::Variant {
+                    name: "__IterCursor".into(),
+                    args: vec![Value::Int(cursor_h as i64)],
+                }))
+            }
+            // Pull one row from the producer; called from
+            // `iter.next`'s `__IterCursor` dispatch branch. Returns
+            // a Lex `Option[Row]`: `Some(row)` while the producer
+            // has more, `None` once the channel closes (producer
+            // done, errored, or cursor evicted from the registry).
+            ("sql", "cursor_next") => {
+                let h = match args.first() {
+                    Some(Value::Int(n)) if *n >= 0 => *n as u64,
+                    _ => return Err("sql.cursor_next: expected cursor handle (Int)".into()),
+                };
+                let rx_arc = match cursor_registry().lock().unwrap().touch_get(h) {
+                    Some(a) => a,
+                    None => return Ok(Value::Variant { name: "None".into(), args: vec![] }),
+                };
+                // Lock the receiver itself (separate from the global
+                // registry lock) and block on `recv()`. The producer
+                // is on a different thread, so this can sleep without
+                // contention beyond the per-cursor mutex.
+                let recv_result = {
+                    let rx = match rx_arc.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    rx.recv()
+                };
+                match recv_result {
+                    Ok(Ok(row)) => Ok(Value::Variant {
+                        name: "Some".into(),
+                        args: vec![row],
+                    }),
+                    Ok(Err(_)) | Err(_) => {
+                        // Channel closed (producer done) or row error
+                        // — drop the registry entry and signal None
+                        // so callers stop polling.
+                        cursor_registry().lock().unwrap().remove(h);
+                        Ok(Value::Variant { name: "None".into(), args: vec![] })
+                    }
+                }
+            }
             // Transactions: begin issues BEGIN SQL on the connection;
             // commit/rollback issue COMMIT/ROLLBACK. SqlTx reuses the
             // same Int handle as Db — the type system enforces correct
@@ -2505,6 +2586,187 @@ fn sql_registry() -> &'static Mutex<SqlRegistry> {
 }
 
 const MAX_SQL_HANDLES: usize = 256;
+
+// ── Streaming cursors (#379) ─────────────────────────────────────────
+//
+// `sql.query_iter[T]` opens a *server-side* cursor and returns an
+// `Iter[T]` backed by a producer thread streaming rows through a
+// bounded mpsc channel. The bytecode `iter.next` op dispatches on the
+// `__IterCursor(handle)` variant tag and effect-calls
+// `sql.cursor_next(handle)` to pull one row at a time.
+//
+// Producer-thread semantics: while the cursor is live, the producer
+// holds the underlying SQL connection's `Arc<Mutex<SqlConn>>` lock.
+// Other ops on the same Db handle block until the cursor is drained
+// or evicted. This matches every server-side cursor protocol
+// (sqlite's `sqlite3_step`, Postgres `DECLARE/FETCH`) — neither
+// driver supports concurrent statements on a single connection.
+//
+// Channel capacity: 64 rows. Producer blocks at 64-row backlog,
+// keeping resident memory bounded regardless of result-set size.
+// Consumer disconnect (Receiver dropped) causes the next send to
+// fail, the producer exits, drops the prepared statement, and
+// releases the SqlConn lock — so closing a cursor is just "stop
+// calling next and let the receiver go out of scope."
+
+const CURSOR_CHANNEL_CAPACITY: usize = 64;
+const MAX_CURSOR_HANDLES: usize = 256;
+
+type CursorReceiver = std::sync::mpsc::Receiver<Result<Value, String>>;
+
+pub(crate) struct CursorRegistry {
+    /// Each cursor's receiver lives behind its own Mutex so multiple
+    /// `sql.cursor_next` calls on the same cursor serialize correctly.
+    /// The outer `Arc` lets the global registry lock be released
+    /// before blocking on `recv()`.
+    entries: indexmap::IndexMap<u64, Arc<Mutex<CursorReceiver>>>,
+    cap: usize,
+}
+
+impl CursorRegistry {
+    pub(crate) fn with_capacity(cap: usize) -> Self {
+        Self { entries: indexmap::IndexMap::new(), cap }
+    }
+
+    pub(crate) fn insert(&mut self, handle: u64, rx: CursorReceiver) {
+        if self.entries.len() >= self.cap {
+            self.entries.shift_remove_index(0);
+        }
+        self.entries.insert(handle, Arc::new(Mutex::new(rx)));
+    }
+
+    pub(crate) fn touch_get(&mut self, handle: u64) -> Option<Arc<Mutex<CursorReceiver>>> {
+        let idx = self.entries.get_index_of(&handle)?;
+        self.entries.move_index(idx, self.entries.len() - 1);
+        self.entries.get(&handle).cloned()
+    }
+
+    pub(crate) fn remove(&mut self, handle: u64) {
+        self.entries.shift_remove(&handle);
+    }
+}
+
+fn cursor_registry() -> &'static Mutex<CursorRegistry> {
+    static REGISTRY: OnceLock<Mutex<CursorRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(CursorRegistry::with_capacity(MAX_CURSOR_HANDLES)))
+}
+
+fn next_cursor_handle() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    COUNTER.fetch_add(1, Ordering::SeqCst)
+}
+
+/// SQLite cursor producer: locks the conn, prepares the statement,
+/// walks rows, ships each to the consumer through `sender`. Exits on
+/// row exhaustion, consumer disconnect, or first error. The lock is
+/// released when the thread function returns (statement dropped first
+/// to satisfy rusqlite's borrow).
+fn sqlite_cursor_producer(
+    conn_arc: Arc<Mutex<SqlConn>>,
+    stmt_str: String,
+    params: Vec<SqlParamValue>,
+    sender: std::sync::mpsc::SyncSender<Result<Value, String>>,
+) {
+    let mut conn_guard = match conn_arc.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let SqlConn::Sqlite(c) = &mut *conn_guard else {
+        let _ = sender.send(Err("sqlite_cursor_producer called on non-sqlite conn".into()));
+        return;
+    };
+    let mut stmt = match c.prepare(&stmt_str) {
+        Ok(s) => s,
+        Err(e) => { let _ = sender.send(Err(format!("prepare: {e}"))); return; }
+    };
+    let column_count = stmt.column_count();
+    let column_names: Vec<String> = (0..column_count)
+        .map(|i| stmt.column_name(i).unwrap_or("").to_string())
+        .collect();
+    let bound = sqlite_params(&params);
+    let bind: Vec<&dyn rusqlite::ToSql> =
+        bound.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+    let mut rows = match stmt.query(rusqlite::params_from_iter(bind.iter())) {
+        Ok(r) => r,
+        Err(e) => { let _ = sender.send(Err(format!("query: {e}"))); return; }
+    };
+    loop {
+        match rows.next() {
+            Ok(None) => break,
+            Err(e) => {
+                let _ = sender.send(Err(format!("row: {e}")));
+                break;
+            }
+            Ok(Some(row)) => {
+                let mut rec = indexmap::IndexMap::new();
+                for (i, name) in column_names.iter().enumerate() {
+                    let val = match row.get_ref(i) {
+                        Ok(vr) => sql_value_ref_to_lex(vr),
+                        Err(_) => Value::Unit,
+                    };
+                    rec.insert(name.clone(), val);
+                }
+                if sender.send(Ok(Value::Record(rec))).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Postgres cursor producer: opens a transaction + named cursor,
+/// fetches rows in batches, ships each one through `sender`. Closes
+/// the cursor and commits the transaction on exit.
+fn pg_cursor_producer(
+    conn_arc: Arc<Mutex<SqlConn>>,
+    stmt_str: String,
+    params: Vec<SqlParamValue>,
+    sender: std::sync::mpsc::SyncSender<Result<Value, String>>,
+) {
+    let mut conn_guard = match conn_arc.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let SqlConn::Postgres(c) = &mut *conn_guard else {
+        let _ = sender.send(Err("pg_cursor_producer called on non-postgres conn".into()));
+        return;
+    };
+    let pg = pg_param_refs(&params);
+    let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
+        pg.iter().map(|b| b.as_ref()).collect();
+    let mut tx = match c.transaction() {
+        Ok(t) => t,
+        Err(e) => { let _ = sender.send(Err(format!("begin: {e}"))); return; }
+    };
+    // Use a uniquely-named cursor so concurrent producers on
+    // distinct Db handles don't collide on the cursor namespace.
+    let cur_name = format!("__lex_cur_{}", next_cursor_handle());
+    if let Err(e) = tx.execute(
+        &format!("DECLARE \"{cur_name}\" NO SCROLL CURSOR FOR {stmt_str}"),
+        &refs,
+    ) {
+        let _ = sender.send(Err(format!("declare: {e}")));
+        return;
+    }
+    let fetch_sql = format!("FETCH 64 FROM \"{cur_name}\"");
+    'outer: loop {
+        let batch = match tx.query(&fetch_sql, &[]) {
+            Ok(r) => r,
+            Err(e) => { let _ = sender.send(Err(format!("fetch: {e}"))); break; }
+        };
+        if batch.is_empty() {
+            break;
+        }
+        for row in batch.iter() {
+            let rec = pg_row_to_lex_record(row);
+            if sender.send(Ok(Value::Record(rec))).is_err() {
+                break 'outer;
+            }
+        }
+    }
+    let _ = tx.execute(&format!("CLOSE \"{cur_name}\""), &[]);
+    let _ = tx.commit();
+}
 
 /// Driver-neutral SQL parameter value shared between SQLite and Postgres paths.
 #[derive(Debug, Clone)]

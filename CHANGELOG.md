@@ -9,6 +9,23 @@ bumps may carry breaking changes when justified).
 
 ### Added
 
+- **#379: `sql.query_iter[T]` — streaming cursor returning `Iter[T]`.**
+  New `[sql]` builtin alongside `sql.query`. Returns a server-side
+  cursor wrapped in an `__IterCursor(handle)` iter variant; rows are
+  pulled one at a time through an mpsc-backed producer thread that
+  holds the underlying SQL connection lock for the cursor's lifetime.
+  Channel capacity is bounded (64 rows) so resident memory stays
+  constant regardless of result-set size. `iter.next` gains a third
+  dispatch branch alongside `__IterEager` (#364) and `__IterLazy`
+  (#376) that effect-calls `sql.cursor_next(handle)` to advance.
+  SQLite uses `rusqlite::Statement::query` with `Rows::next` row-by-row;
+  Postgres uses a `DECLARE … CURSOR FOR …` + `FETCH 64` batching loop.
+  Closing the cursor is implicit — drop the `Iter[T]` and the receiver
+  goes out of scope, the producer's next send fails, the thread exits
+  and releases the connection lock. While a cursor is open, other ops
+  on the same `Db` handle block — unavoidable for both drivers since
+  each connection runs one statement at a time.
+
 - **#376: `iter.unfold(seed, step)` + lazy `Iter[T]` runtime form.** The
   iter stdlib gains a lazy constructor that produces an iterator whose
   `iter.next` invokes a user-supplied step closure on demand. The
