@@ -1063,7 +1063,7 @@ impl EffectHandler for DefaultHandler {
                             sql_registry().lock().unwrap().insert(handle, SqlConn::Postgres(client));
                             Ok(ok(Value::Int(handle as i64)))
                         }
-                        Err(e) => Ok(err(Value::Str(format!("sql.open: {e}")))),
+                        Err(e) => Ok(err(pg_err_to_sql_error(e, "sql.open"))),
                     }
                 } else {
                     // SQLite: same shape as `kv.open`; fs-write allowlist applies
@@ -1071,8 +1071,10 @@ impl EffectHandler for DefaultHandler {
                     if path != ":memory:" && !self.policy.allow_fs_write.is_empty() {
                         let p = std::path::Path::new(&path);
                         if !self.policy.allow_fs_write.iter().any(|a| p.starts_with(a)) {
-                            return Ok(err(Value::Str(format!(
-                                "sql.open: `{path}` outside --allow-fs-write"))));
+                            return Ok(err(sql_error(
+                                format!("sql.open: `{path}` outside --allow-fs-write"),
+                                None, None,
+                            )));
                         }
                     }
                     match rusqlite::Connection::open(&path) {
@@ -1081,7 +1083,7 @@ impl EffectHandler for DefaultHandler {
                             sql_registry().lock().unwrap().insert(handle, SqlConn::Sqlite(conn));
                             Ok(ok(Value::Int(handle as i64)))
                         }
-                        Err(e) => Ok(err(Value::Str(format!("sql.open: {e}")))),
+                        Err(e) => Ok(err(sqlite_err_to_sql_error(e, "sql.open"))),
                     }
                 }
             }
@@ -1105,7 +1107,7 @@ impl EffectHandler for DefaultHandler {
                             bound.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
                         match c.execute(&stmt, rusqlite::params_from_iter(bind.iter())) {
                             Ok(n)  => Ok(ok(Value::Int(n as i64))),
-                            Err(e) => Ok(err(Value::Str(format!("sql.exec: {e}")))),
+                            Err(e) => Ok(err(sqlite_err_to_sql_error(e, "sql.exec"))),
                         }
                     }
                     SqlConn::Postgres(c) => {
@@ -1114,7 +1116,7 @@ impl EffectHandler for DefaultHandler {
                             pg.iter().map(|b| b.as_ref()).collect();
                         match c.execute(stmt.as_str(), &refs) {
                             Ok(n)  => Ok(ok(Value::Int(n as i64))),
-                            Err(e) => Ok(err(Value::Str(format!("sql.exec: {e}")))),
+                            Err(e) => Ok(err(pg_err_to_sql_error(e, "sql.exec"))),
                         }
                     }
                 }
@@ -1223,13 +1225,15 @@ impl EffectHandler for DefaultHandler {
                     .touch_get(h)
                     .ok_or_else(|| "sql.begin: closed or unknown Db handle".to_string())?;
                 let mut conn = arc.lock().unwrap();
-                let res = match &mut *conn {
-                    SqlConn::Sqlite(c)   => c.execute_batch("BEGIN").map_err(|e| e.to_string()),
-                    SqlConn::Postgres(c) => c.batch_execute("BEGIN").map_err(|e| e.to_string()),
-                };
-                match res {
-                    Ok(()) => Ok(ok(Value::Int(h as i64))),
-                    Err(e) => Ok(err(Value::Str(format!("sql.begin: {e}")))),
+                match &mut *conn {
+                    SqlConn::Sqlite(c) => match c.execute_batch("BEGIN") {
+                        Ok(()) => Ok(ok(Value::Int(h as i64))),
+                        Err(e) => Ok(err(sqlite_err_to_sql_error(e, "sql.begin"))),
+                    },
+                    SqlConn::Postgres(c) => match c.batch_execute("BEGIN") {
+                        Ok(()) => Ok(ok(Value::Int(h as i64))),
+                        Err(e) => Ok(err(pg_err_to_sql_error(e, "sql.begin"))),
+                    },
                 }
             }
             ("sql", "commit") => {
@@ -1238,13 +1242,15 @@ impl EffectHandler for DefaultHandler {
                     .touch_get(h)
                     .ok_or_else(|| "sql.commit: closed or unknown SqlTx handle".to_string())?;
                 let mut conn = arc.lock().unwrap();
-                let res = match &mut *conn {
-                    SqlConn::Sqlite(c)   => c.execute_batch("COMMIT").map_err(|e| e.to_string()),
-                    SqlConn::Postgres(c) => c.batch_execute("COMMIT").map_err(|e| e.to_string()),
-                };
-                match res {
-                    Ok(()) => Ok(ok(Value::Unit)),
-                    Err(e) => Ok(err(Value::Str(format!("sql.commit: {e}")))),
+                match &mut *conn {
+                    SqlConn::Sqlite(c) => match c.execute_batch("COMMIT") {
+                        Ok(()) => Ok(ok(Value::Unit)),
+                        Err(e) => Ok(err(sqlite_err_to_sql_error(e, "sql.commit"))),
+                    },
+                    SqlConn::Postgres(c) => match c.batch_execute("COMMIT") {
+                        Ok(()) => Ok(ok(Value::Unit)),
+                        Err(e) => Ok(err(pg_err_to_sql_error(e, "sql.commit"))),
+                    },
                 }
             }
             ("sql", "rollback") => {
@@ -1253,13 +1259,15 @@ impl EffectHandler for DefaultHandler {
                     .touch_get(h)
                     .ok_or_else(|| "sql.rollback: closed or unknown SqlTx handle".to_string())?;
                 let mut conn = arc.lock().unwrap();
-                let res = match &mut *conn {
-                    SqlConn::Sqlite(c)   => c.execute_batch("ROLLBACK").map_err(|e| e.to_string()),
-                    SqlConn::Postgres(c) => c.batch_execute("ROLLBACK").map_err(|e| e.to_string()),
-                };
-                match res {
-                    Ok(()) => Ok(ok(Value::Unit)),
-                    Err(e) => Ok(err(Value::Str(format!("sql.rollback: {e}")))),
+                match &mut *conn {
+                    SqlConn::Sqlite(c) => match c.execute_batch("ROLLBACK") {
+                        Ok(()) => Ok(ok(Value::Unit)),
+                        Err(e) => Ok(err(sqlite_err_to_sql_error(e, "sql.rollback"))),
+                    },
+                    SqlConn::Postgres(c) => match c.batch_execute("ROLLBACK") {
+                        Ok(()) => Ok(ok(Value::Unit)),
+                        Err(e) => Ok(err(pg_err_to_sql_error(e, "sql.rollback"))),
+                    },
                 }
             }
             ("sql", "exec_tx") => {
@@ -1277,7 +1285,7 @@ impl EffectHandler for DefaultHandler {
                             bound.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
                         match c.execute(&stmt, rusqlite::params_from_iter(bind.iter())) {
                             Ok(n)  => Ok(ok(Value::Int(n as i64))),
-                            Err(e) => Ok(err(Value::Str(format!("sql.exec_tx: {e}")))),
+                            Err(e) => Ok(err(sqlite_err_to_sql_error(e, "sql.exec_tx"))),
                         }
                     }
                     SqlConn::Postgres(c) => {
@@ -1286,7 +1294,7 @@ impl EffectHandler for DefaultHandler {
                             pg.iter().map(|b| b.as_ref()).collect();
                         match c.execute(stmt.as_str(), &refs) {
                             Ok(n)  => Ok(ok(Value::Int(n as i64))),
-                            Err(e) => Ok(err(Value::Str(format!("sql.exec_tx: {e}")))),
+                            Err(e) => Ok(err(pg_err_to_sql_error(e, "sql.exec_tx"))),
                         }
                     }
                 }
@@ -2006,6 +2014,102 @@ fn err(v: Value) -> Value {
     Value::Variant { name: "Err".into(), args: vec![v] }
 }
 
+/// Build a `SqlError = { message, code, detail }` Lex record (#380).
+/// `code` and `detail` are `None` by default; the driver-specific
+/// converters below populate them with real values.
+fn sql_error(message: impl Into<String>, code: Option<String>, detail: Option<String>) -> Value {
+    let some = |s: String| Value::Variant { name: "Some".into(), args: vec![Value::Str(s)] };
+    let none = || Value::Variant { name: "None".into(), args: vec![] };
+    let mut rec = indexmap::IndexMap::new();
+    rec.insert("message".into(), Value::Str(message.into()));
+    rec.insert("code".into(), match code {
+        Some(c) => some(c),
+        None => none(),
+    });
+    rec.insert("detail".into(), match detail {
+        Some(d) => some(d),
+        None => none(),
+    });
+    Value::Record(rec)
+}
+
+/// Convert a rusqlite error into a `SqlError`. The `code` is the
+/// symbolic extended-result-code name (`SQLITE_BUSY`,
+/// `SQLITE_CONSTRAINT_UNIQUE`, …) when present — this is what
+/// callers want for dialect-aware retry / conflict handling.
+///
+/// rusqlite has two main error shapes that carry a numeric code:
+/// `SqliteFailure` (driver-side runtime errors — constraints, busy,
+/// IO) and `SqlInputError` (statement-preparation failures —
+/// syntax, unknown table). Both are unpacked the same way.
+fn sqlite_err_to_sql_error(e: rusqlite::Error, op: &str) -> Value {
+    let message = format!("{op}: {e}");
+    match &e {
+        rusqlite::Error::SqliteFailure(ffi, detail_opt) => {
+            sql_error(
+                message,
+                Some(sqlite_extended_code_name(ffi.extended_code)),
+                detail_opt.clone(),
+            )
+        }
+        rusqlite::Error::SqlInputError { error, msg, .. } => {
+            sql_error(
+                message,
+                Some(sqlite_extended_code_name(error.extended_code)),
+                Some(msg.clone()),
+            )
+        }
+        _ => sql_error(message, None, None),
+    }
+}
+
+/// Map a SQLite extended result code (numeric) to its symbolic name.
+/// We only cover the codes a Lex caller is likely to dispatch on
+/// (constraint kinds, busy/locked, read-only, IO); anything else
+/// falls back to a generic `SQLITE_ERROR_<n>` stringification so the
+/// numeric code is still recoverable.
+fn sqlite_extended_code_name(code: i32) -> String {
+    use rusqlite::ffi::*;
+    let s = match code {
+        SQLITE_BUSY => "SQLITE_BUSY",
+        SQLITE_LOCKED => "SQLITE_LOCKED",
+        SQLITE_READONLY => "SQLITE_READONLY",
+        SQLITE_IOERR => "SQLITE_IOERR",
+        SQLITE_CORRUPT => "SQLITE_CORRUPT",
+        SQLITE_NOTFOUND => "SQLITE_NOTFOUND",
+        SQLITE_FULL => "SQLITE_FULL",
+        SQLITE_CANTOPEN => "SQLITE_CANTOPEN",
+        SQLITE_PROTOCOL => "SQLITE_PROTOCOL",
+        SQLITE_SCHEMA => "SQLITE_SCHEMA",
+        SQLITE_TOOBIG => "SQLITE_TOOBIG",
+        SQLITE_CONSTRAINT => "SQLITE_CONSTRAINT",
+        SQLITE_CONSTRAINT_CHECK => "SQLITE_CONSTRAINT_CHECK",
+        SQLITE_CONSTRAINT_FOREIGNKEY => "SQLITE_CONSTRAINT_FOREIGNKEY",
+        SQLITE_CONSTRAINT_NOTNULL => "SQLITE_CONSTRAINT_NOTNULL",
+        SQLITE_CONSTRAINT_PRIMARYKEY => "SQLITE_CONSTRAINT_PRIMARYKEY",
+        SQLITE_CONSTRAINT_TRIGGER => "SQLITE_CONSTRAINT_TRIGGER",
+        SQLITE_CONSTRAINT_UNIQUE => "SQLITE_CONSTRAINT_UNIQUE",
+        SQLITE_CONSTRAINT_VTAB => "SQLITE_CONSTRAINT_VTAB",
+        SQLITE_CONSTRAINT_ROWID => "SQLITE_CONSTRAINT_ROWID",
+        SQLITE_MISMATCH => "SQLITE_MISMATCH",
+        SQLITE_RANGE => "SQLITE_RANGE",
+        SQLITE_NOTADB => "SQLITE_NOTADB",
+        SQLITE_AUTH => "SQLITE_AUTH",
+        _ => return format!("SQLITE_ERROR_{code}"),
+    };
+    s.to_string()
+}
+
+/// Convert a postgres error into a `SqlError`. The `code` is the
+/// 5-character SQLSTATE (`23505`, `40P01`, …); `detail` is the
+/// driver's optional detail message when present.
+fn pg_err_to_sql_error(e: postgres::Error, op: &str) -> Value {
+    let message = format!("{op}: {e}");
+    let code = e.as_db_error().map(|db| db.code().code().to_string());
+    let detail = e.as_db_error().and_then(|db| db.detail().map(|s| s.to_string()));
+    sql_error(message, code, detail)
+}
+
 impl DefaultHandler {
     /// Implementation of `agent.call_mcp(server, tool, args_json)`.
     /// Goes through the LRU client cache (#197): the named server
@@ -2298,7 +2402,7 @@ fn sql_run_query_sqlite(
 ) -> Value {
     let mut stmt = match conn.prepare(stmt_str) {
         Ok(s)  => s,
-        Err(e) => return err(Value::Str(format!("sql.query: {e}"))),
+        Err(e) => return err(sqlite_err_to_sql_error(e, "sql.query")),
     };
     let column_count = stmt.column_count();
     let column_names: Vec<String> = (0..column_count)
@@ -2310,20 +2414,20 @@ fn sql_run_query_sqlite(
         .collect();
     let mut rows = match stmt.query(rusqlite::params_from_iter(bind.iter())) {
         Ok(r)  => r,
-        Err(e) => return err(Value::Str(format!("sql.query: {e}"))),
+        Err(e) => return err(sqlite_err_to_sql_error(e, "sql.query")),
     };
     let mut out: Vec<Value> = Vec::new();
     loop {
         let row = match rows.next() {
             Ok(Some(r)) => r,
             Ok(None)    => break,
-            Err(e)      => return err(Value::Str(format!("sql.query: {e}"))),
+            Err(e)      => return err(sqlite_err_to_sql_error(e, "sql.query")),
         };
         let mut rec = indexmap::IndexMap::new();
         for (i, name) in column_names.iter().enumerate() {
             let cell = match row.get_ref(i) {
                 Ok(c)  => sql_value_ref_to_lex(c),
-                Err(e) => return err(Value::Str(format!("sql.query: column {i}: {e}"))),
+                Err(e) => return err(sqlite_err_to_sql_error(e, &format!("sql.query: column {i}"))),
             };
             rec.insert(name.clone(), cell);
         }
@@ -2343,7 +2447,7 @@ fn sql_run_query_pg(
         pg.iter().map(|b| b.as_ref()).collect();
     let rows = match client.query(stmt_str, &refs) {
         Ok(r)  => r,
-        Err(e) => return err(Value::Str(format!("sql.query: {e}"))),
+        Err(e) => return err(pg_err_to_sql_error(e, "sql.query")),
     };
     let out: Vec<Value> = rows.iter().map(|row| {
         Value::Record(pg_row_to_lex_record(row))

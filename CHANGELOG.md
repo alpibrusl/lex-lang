@@ -7,6 +7,19 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Changed
+
+- **#380: structured `SqlError` on the `Err` side of every `std.sql`
+  Result.** Replaces `Err(Str)` with `Err(SqlError { message :: Str,
+  code :: Option[Str], detail :: Option[Str] })`. `code` carries the
+  symbolic SQLite extended-result-code name (`SQLITE_CONSTRAINT_UNIQUE`,
+  `SQLITE_BUSY`, …) or the 5-character Postgres SQLSTATE (`23505`,
+  `40P01`, …) so dialect-aware retry / conflict handling can dispatch
+  without parsing error messages. **Breaking change** — callers
+  pattern-matching `Err(s)` where `s` was treated as `Str` must access
+  `e.message` instead. Affects `sql.open`, `exec`, `query`,
+  `query_iter`, `begin`, `commit`, `rollback`, `exec_tx`, `query_tx`.
+
 ### Added
 
 - **#375: streaming HTTP response bodies for `net.serve_fn`.** The

@@ -1318,7 +1318,11 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             let params_t = || Ty::List(Box::new(sp_t()));
             let mut fields = IndexMap::new();
 
-            // open :: Str -> [sql, fs_write] Result[Db, Str]
+            // SqlError = { message, code, detail } — populated with
+            // SQLSTATE (Postgres) or symbolic SQLite error name (#380).
+            let se_t = || Ty::Con("SqlError".into(), vec![]);
+
+            // open :: Str -> [sql, fs_write] Result[Db, SqlError]
             fields.insert("open".into(), Ty::function(
                 vec![Ty::str()],
                 EffectSet {
@@ -1327,7 +1331,7 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                         .into_iter().collect(),
                     var: None,
                 },
-                Ty::Con("Result".into(), vec![db_t(), Ty::str()])));
+                Ty::Con("Result".into(), vec![db_t(), se_t()])));
 
             // close :: Db -> [sql] Unit
             fields.insert("close".into(), Ty::function(
@@ -1335,22 +1339,22 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::singleton("sql"),
                 Ty::Unit));
 
-            // exec :: Db, Str, List[SqlParam] -> [sql] Result[Int, Str]
+            // exec :: Db, Str, List[SqlParam] -> [sql] Result[Int, SqlError]
             fields.insert("exec".into(), Ty::function(
                 vec![db_t(), Ty::str(), params_t()],
                 EffectSet::singleton("sql"),
-                Ty::Con("Result".into(), vec![Ty::int(), Ty::str()])));
+                Ty::Con("Result".into(), vec![Ty::int(), se_t()])));
 
-            // query[T] :: Db, Str, List[SqlParam] -> [sql] Result[List[T], Str]
+            // query[T] :: Db, Str, List[SqlParam] -> [sql] Result[List[T], SqlError]
             fields.insert("query".into(), Ty::function(
                 vec![db_t(), Ty::str(), params_t()],
                 EffectSet::singleton("sql"),
                 Ty::Con("Result".into(), vec![
                     Ty::List(Box::new(Ty::Var(0))),
-                    Ty::str(),
+                    se_t(),
                 ])));
 
-            // query_iter[T] :: Db, Str, List[SqlParam] -> [sql] Result[Iter[T], Str]
+            // query_iter[T] :: Db, Str, List[SqlParam] -> [sql] Result[Iter[T], SqlError]
             // Streaming variant of `query` (#379). Rows are pulled from
             // the server one at a time via an mpsc-backed cursor —
             // memory stays bounded regardless of result-set size.
@@ -1361,40 +1365,40 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::singleton("sql"),
                 Ty::Con("Result".into(), vec![
                     Ty::Con("Iter".into(), vec![Ty::Var(0)]),
-                    Ty::str(),
+                    se_t(),
                 ])));
 
-            // begin :: Db -> [sql] Result[SqlTx, Str]
+            // begin :: Db -> [sql] Result[SqlTx, SqlError]
             fields.insert("begin".into(), Ty::function(
                 vec![db_t()],
                 EffectSet::singleton("sql"),
-                Ty::Con("Result".into(), vec![tx_t(), Ty::str()])));
+                Ty::Con("Result".into(), vec![tx_t(), se_t()])));
 
-            // commit :: SqlTx -> [sql] Result[Unit, Str]
+            // commit :: SqlTx -> [sql] Result[Unit, SqlError]
             fields.insert("commit".into(), Ty::function(
                 vec![tx_t()],
                 EffectSet::singleton("sql"),
-                Ty::Con("Result".into(), vec![Ty::Unit, Ty::str()])));
+                Ty::Con("Result".into(), vec![Ty::Unit, se_t()])));
 
-            // rollback :: SqlTx -> [sql] Result[Unit, Str]
+            // rollback :: SqlTx -> [sql] Result[Unit, SqlError]
             fields.insert("rollback".into(), Ty::function(
                 vec![tx_t()],
                 EffectSet::singleton("sql"),
-                Ty::Con("Result".into(), vec![Ty::Unit, Ty::str()])));
+                Ty::Con("Result".into(), vec![Ty::Unit, se_t()])));
 
-            // exec_tx :: SqlTx, Str, List[SqlParam] -> [sql] Result[Int, Str]
+            // exec_tx :: SqlTx, Str, List[SqlParam] -> [sql] Result[Int, SqlError]
             fields.insert("exec_tx".into(), Ty::function(
                 vec![tx_t(), Ty::str(), params_t()],
                 EffectSet::singleton("sql"),
-                Ty::Con("Result".into(), vec![Ty::int(), Ty::str()])));
+                Ty::Con("Result".into(), vec![Ty::int(), se_t()])));
 
-            // query_tx[T] :: SqlTx, Str, List[SqlParam] -> [sql] Result[List[T], Str]
+            // query_tx[T] :: SqlTx, Str, List[SqlParam] -> [sql] Result[List[T], SqlError]
             fields.insert("query_tx".into(), Ty::function(
                 vec![tx_t(), Ty::str(), params_t()],
                 EffectSet::singleton("sql"),
                 Ty::Con("Result".into(), vec![
                     Ty::List(Box::new(Ty::Var(0))),
-                    Ty::str(),
+                    se_t(),
                 ])));
 
             // Row decoders: get_X[T] :: T, Str -> Option[X]
