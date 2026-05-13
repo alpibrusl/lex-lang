@@ -7,6 +7,74 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.9.1] — 2026-05-13
+
+### Added
+
+- **#369: signature-level `examples { ... }` block on `FnDecl`.** A pure
+  function can now carry an optional block between its return type and
+  body listing input/output examples that fold into the canonical AST. Two
+  signatures with different example sets hash to different SigIds —
+  examples are part of the contract, not an external test file. Slice 1
+  (PR #370) added the AST + parser + canonical-hash compat (regression
+  test pins `FnDecl { examples: vec![], .. }` to its pre-#369 hash) + the
+  type-level checks: argument arity, arg types against parameter types,
+  expected type against return type, and pure-only enforcement
+  (`ExamplesOnEffectfulFn` rule tag). Slice 2 (PR #373) added behavioral
+  evaluation: every example case runs through the bytecode VM at
+  `lex check` time and is compared to the declared expected value;
+  mismatches surface as `ExampleMismatch` with stable rule_tag
+  `example-mismatch` and a `suggested_transform` payload for the repair
+  flow. The `factorial`, `parse_int`, `double_input`, and `area` examples
+  carry working `examples` blocks as showcases. Closes #369.
+
+- **#363: record row spreads — `{ ...TypeName }` in type expressions.**
+  Type expressions accept the spread form so a record type can be defined
+  as the union of fields from one or more other record types. Unblocks
+  type-safe JOIN results in lex-orm — `Merge[A, B] = { ...A, ...B }` now
+  has a direct surface form. Closes #363.
+
+- **#364: `Iter[T]` lazy positional iterator stdlib.** New `std.iter`
+  module with `from_list / next / is_empty / count / take / skip /
+  to_list / map / filter / fold`. Backed at runtime by a
+  `(List[T], Int)` tuple with the Int as the cursor; all operations are
+  compiler-inlined as bytecode so no runtime effect dispatch is needed.
+  `Iter[T]` registered as an opaque type. Enables short-circuiting,
+  one-row-at-a-time consumption patterns over `std.list` and (in
+  combination with #362) over `std.sql` result sets. Closes #364.
+
+- **#362: Postgres support in `std.sql` + typed `SqlParam` ADT +
+  transactions + row decoders.** `sql.open` now dispatches on URL prefix:
+  `postgres://` / `postgresql://` connect via the sync `postgres` crate,
+  anything else opens SQLite as before. Parameters use the new
+  `SqlParam = PStr(Str) | PInt(Int) | PFloat(Float) | PBool(Bool) | PNull`
+  union instead of the v1 `List[Str]` workaround. New transaction surface:
+  `sql.begin(db) -> SqlTx`, `sql.commit / rollback(tx)`, and
+  `sql.exec_tx / query_tx(tx, ...)`. New row decoders
+  `sql.get_str / get_int / get_float / get_bool :: T, Str -> Option[X]`.
+  Effect annotations: `[sql]` for query/exec/begin/commit/rollback;
+  `[sql, fs_write]` for `open` (SQLite creates the file on first open).
+  Closes #362.
+
+- **#365: `lex fmt`, `lex init`, `lex ci` + `lex pkg install`.**
+  `lex init [<dir>]` scaffolds a new project with `lex.toml`,
+  `src/main.lex`, `tests/test_main.lex`, and a `.github/workflows/lex.yml`.
+  `lex fmt [--check] <file|dir>...` formats `.lex` files via the
+  canonical pretty-printer; `--check` exits 1 if any file needs
+  formatting (suitable for CI). `lex ci [--no-fmt] [--src <d>]
+  [--tests <d>]` runs the full local CI pipeline: `pkg install →
+  check --strict → fmt --check → test`. `lex pkg install` resolves and
+  installs all dependencies from `lex.toml`, cloning git dependencies
+  into the cache on first use. Closes #365.
+
+- **#347 A2 phase 3: bytecode stack-depth verifier as third
+  `--strict` check.** `lex check --strict` now runs a bytecode pass that
+  walks each function's instruction stream, tracks abstract stack depth
+  through opcodes and branches, and warns when two paths into the same
+  program counter carry different depths — catching `PConstructor` stack
+  leaks that the type checker cannot see. Surfaces as a `STACK_DEPTH`
+  lint warning (exit 1 in CI, non-fatal otherwise). Closes #347 (A2 phase).
+
 ## [0.9.0] — 2026-05-12
 
 ### Added
