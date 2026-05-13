@@ -1141,6 +1141,9 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         ("crypto", "aes_gcm_open") => Ok(aes_gcm_open_impl(args)),
         ("crypto", "chacha20_poly1305_seal") => Ok(chacha20_seal_impl(args)),
         ("crypto", "chacha20_poly1305_open") => Ok(chacha20_open_impl(args)),
+        ("crypto", "pbkdf2_sha256") => Ok(pbkdf2_sha256_impl(args)),
+        ("crypto", "hkdf_sha256")   => Ok(hkdf_sha256_impl(args)),
+        ("crypto", "argon2id")      => Ok(argon2id_impl(args)),
 
         // -- random (#219): pure, seeded RNG. Backed by SplitMix64;
         // state is the u64 mixer state stored as a single i64 in
@@ -2533,4 +2536,182 @@ fn chacha20_open_impl(args: &[Value]) -> Value {
         Ok(p) => ok_v(Value::Bytes(p)),
         Err(e) => err_v(Value::Str(e)),
     }
+}
+
+// ── KDFs (#382 KDF slice) ──────────────────────────────────────────────────
+//
+// All three primitives return Result[Bytes, Str] so caller-controlled
+// inputs (iteration count, output length, argon2id work factors) that
+// violate the underlying crate's contract surface as Err, never as a
+// VM panic.
+
+/// `(password :: Bytes, salt :: Bytes, iterations :: Int, len :: Int)`
+/// references unpacked from a 4-arg KDF call.
+type Kdf4<'a> = (&'a Vec<u8>, &'a Vec<u8>, i64, i64);
+
+/// `(ikm :: Bytes, salt :: Bytes, info :: Bytes, len :: Int)`
+/// references unpacked from a 4-arg HKDF call.
+type Hkdf4<'a> = (&'a Vec<u8>, &'a Vec<u8>, &'a Vec<u8>, i64);
+
+/// `(password :: Bytes, salt :: Bytes, t_cost :: Int, m_cost :: Int, len :: Int)`
+/// for argon2id.
+type Argon5<'a> = (&'a Vec<u8>, &'a Vec<u8>, i64, i64, i64);
+
+fn pick_bytes<'a>(args: &'a [Value], i: usize, op: &str, name: &str)
+    -> Result<&'a Vec<u8>, String>
+{
+    match args.get(i) {
+        Some(Value::Bytes(b)) => Ok(b),
+        Some(other) => Err(format!("{op}: {name} must be Bytes, got {other:?}")),
+        None => Err(format!("{op}: missing {name} argument")),
+    }
+}
+
+fn pick_int(args: &[Value], i: usize, op: &str, name: &str) -> Result<i64, String> {
+    match args.get(i) {
+        Some(Value::Int(n)) => Ok(*n),
+        Some(other) => Err(format!("{op}: {name} must be Int, got {other:?}")),
+        None => Err(format!("{op}: missing {name} argument")),
+    }
+}
+
+fn unpack_kdf4<'a>(args: &'a [Value], op: &str) -> Result<Kdf4<'a>, String> {
+    Ok((
+        pick_bytes(args, 0, op, "password")?,
+        pick_bytes(args, 1, op, "salt")?,
+        pick_int(args, 2, op, "iterations")?,
+        pick_int(args, 3, op, "len")?,
+    ))
+}
+
+fn unpack_hkdf4<'a>(args: &'a [Value], op: &str) -> Result<Hkdf4<'a>, String> {
+    Ok((
+        pick_bytes(args, 0, op, "ikm")?,
+        pick_bytes(args, 1, op, "salt")?,
+        pick_bytes(args, 2, op, "info")?,
+        pick_int(args, 3, op, "len")?,
+    ))
+}
+
+fn unpack_argon5<'a>(args: &'a [Value], op: &str) -> Result<Argon5<'a>, String> {
+    Ok((
+        pick_bytes(args, 0, op, "password")?,
+        pick_bytes(args, 1, op, "salt")?,
+        pick_int(args, 2, op, "t_cost")?,
+        pick_int(args, 3, op, "m_cost")?,
+        pick_int(args, 4, op, "len")?,
+    ))
+}
+
+/// Output-length sanity check shared by all three KDFs. A negative or
+/// absurdly large `len` is a programmer error, not a runtime concern;
+/// we cap at 1 MiB to keep accidental `i64::MAX` calls from OOMing the
+/// process.
+const KDF_MAX_LEN: usize = 1024 * 1024;
+
+fn check_len(op: &str, len: i64) -> Result<usize, String> {
+    if len <= 0 {
+        return Err(format!("{op}: len must be > 0, got {len}"));
+    }
+    if (len as u64) > KDF_MAX_LEN as u64 {
+        return Err(format!(
+            "{op}: len must be <= {KDF_MAX_LEN}, got {len}"
+        ));
+    }
+    Ok(len as usize)
+}
+
+fn pbkdf2_sha256_impl(args: &[Value]) -> Value {
+    use hmac::Hmac;
+    use sha2::Sha256;
+    let op = "pbkdf2_sha256";
+    let (password, salt, iterations, len) = match unpack_kdf4(args, op) {
+        Ok(t) => t,
+        Err(e) => return err_v(Value::Str(e)),
+    };
+    if iterations <= 0 {
+        return err_v(Value::Str(format!(
+            "{op}: iterations must be > 0, got {iterations}"
+        )));
+    }
+    let out_len = match check_len(op, len) {
+        Ok(n) => n,
+        Err(e) => return err_v(Value::Str(e)),
+    };
+    let rounds = match u32::try_from(iterations) {
+        Ok(r) => r,
+        Err(_) => {
+            return err_v(Value::Str(format!(
+                "{op}: iterations must fit in u32, got {iterations}"
+            )))
+        }
+    };
+    let mut out = vec![0u8; out_len];
+    if let Err(e) = pbkdf2::pbkdf2::<Hmac<Sha256>>(password, salt, rounds, &mut out) {
+        return err_v(Value::Str(format!("{op}: {e}")));
+    }
+    ok_v(Value::Bytes(out))
+}
+
+fn hkdf_sha256_impl(args: &[Value]) -> Value {
+    use hkdf::Hkdf;
+    use sha2::Sha256;
+    let op = "hkdf_sha256";
+    let (ikm, salt, info, len) = match unpack_hkdf4(args, op) {
+        Ok(t) => t,
+        Err(e) => return err_v(Value::Str(e)),
+    };
+    let out_len = match check_len(op, len) {
+        Ok(n) => n,
+        Err(e) => return err_v(Value::Str(e)),
+    };
+    // RFC 5869 caps output at 255 * HashLen; the `expand` call below
+    // returns InvalidLength when exceeded — surface that as Err.
+    let salt_opt: Option<&[u8]> = if salt.is_empty() { None } else { Some(salt) };
+    let hk = Hkdf::<Sha256>::new(salt_opt, ikm);
+    let mut out = vec![0u8; out_len];
+    match hk.expand(info, &mut out) {
+        Ok(()) => ok_v(Value::Bytes(out)),
+        Err(e) => err_v(Value::Str(format!("{op}: {e}"))),
+    }
+}
+
+fn argon2id_impl(args: &[Value]) -> Value {
+    use argon2::{Algorithm, Argon2, Params, Version};
+    let op = "argon2id";
+    let (password, salt, t_cost, m_cost, len) = match unpack_argon5(args, op) {
+        Ok(t) => t,
+        Err(e) => return err_v(Value::Str(e)),
+    };
+    let out_len = match check_len(op, len) {
+        Ok(n) => n,
+        Err(e) => return err_v(Value::Str(e)),
+    };
+    let t = match u32::try_from(t_cost) {
+        Ok(n) if n >= 1 => n,
+        _ => return err_v(Value::Str(format!(
+            "{op}: t_cost must be a u32 >= 1, got {t_cost}"
+        ))),
+    };
+    let m = match u32::try_from(m_cost) {
+        Ok(n) if n >= Params::MIN_M_COST => n,
+        _ => return err_v(Value::Str(format!(
+            "{op}: m_cost must be a u32 >= {}, got {m_cost}",
+            Params::MIN_M_COST
+        ))),
+    };
+    // p=1 is the default and what every interop spec assumes (PHC
+    // string, libsodium's argon2id_str). We don't expose parallelism
+    // as a knob for now to keep callers from picking a value that
+    // makes hashes uncomparable across machines.
+    let params = match Params::new(m, t, 1, Some(out_len)) {
+        Ok(p) => p,
+        Err(e) => return err_v(Value::Str(format!("{op}: {e}"))),
+    };
+    let hasher = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut out = vec![0u8; out_len];
+    if let Err(e) = hasher.hash_password_into(password, salt, &mut out) {
+        return err_v(Value::Str(format!("{op}: {e}")));
+    }
+    ok_v(Value::Bytes(out))
 }

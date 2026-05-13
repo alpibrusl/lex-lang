@@ -1099,6 +1099,44 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 ));
             }
 
+            // KDFs: key-derivation functions (#382 KDF slice). All three
+            // return `Result[Bytes, Str]` so caller-controlled inputs
+            // (iteration count, output length, argon2id work factors)
+            // that violate the underlying primitive's contract surface
+            // as `Err` rather than panicking the VM. None require a new
+            // effect — these are pure derivations.
+            //
+            // - **`pbkdf2_sha256(password, salt, iterations, len)`** —
+            //   RFC 8018 PBKDF2 with HMAC-SHA256. Use ≥ 600_000 iterations
+            //   for password storage (OWASP 2024). Older deployments
+            //   pinning < 100_000 should rotate.
+            // - **`hkdf_sha256(ikm, salt, info, len)`** — RFC 5869 extract+
+            //   expand. Use for deriving multiple keys from a single
+            //   high-entropy input (TLS, Noise, JWT-key rotation).
+            //   Output length capped at 255 × 32 = 8160 bytes.
+            // - **`argon2id(password, salt, t_cost, m_cost, len)`** —
+            //   RFC 9106 Argon2id. Recommended for *new* password
+            //   hashing. OWASP 2024 baseline: `t_cost=2, m_cost=19456`
+            //   (19 MiB), or use `lex-crypto`'s vetted wrapper.
+            fields.insert("pbkdf2_sha256".into(), Ty::function(
+                // (password, salt, iterations, len) -> Result[Bytes, Str]
+                vec![Ty::bytes(), Ty::bytes(), Ty::int(), Ty::int()],
+                EffectSet::empty(),
+                Ty::Con("Result".into(), vec![Ty::bytes(), Ty::str()]),
+            ));
+            fields.insert("hkdf_sha256".into(), Ty::function(
+                // (ikm, salt, info, len) -> Result[Bytes, Str]
+                vec![Ty::bytes(), Ty::bytes(), Ty::bytes(), Ty::int()],
+                EffectSet::empty(),
+                Ty::Con("Result".into(), vec![Ty::bytes(), Ty::str()]),
+            ));
+            fields.insert("argon2id".into(), Ty::function(
+                // (password, salt, t_cost, m_cost, len) -> Result[Bytes, Str]
+                vec![Ty::bytes(), Ty::bytes(), Ty::int(), Ty::int(), Ty::int()],
+                EffectSet::empty(),
+                Ty::Con("Result".into(), vec![Ty::bytes(), Ty::str()]),
+            ));
+
             Some(Ty::Record(fields))
         }
         "deque" => {
