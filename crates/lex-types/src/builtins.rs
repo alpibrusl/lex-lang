@@ -320,6 +320,37 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::singleton("time"),
                 Ty::int(),
             ));
+            // now_ms :: () -> [time] Int — unix milliseconds (#378).
+            // Resolution beyond what `time.now` (seconds) offers, for
+            // request-latency measurement / rate-limiter windows.
+            // Honors `LEX_TEST_NOW` for deterministic tests.
+            fields.insert("now_ms".into(), Ty::function(
+                vec![],
+                EffectSet::singleton("time"),
+                Ty::int(),
+            ));
+            // now_str :: () -> [time] Str — wall-clock instant rendered
+            // as an ISO-8601 / RFC 3339 string in UTC (#378). Suitable
+            // for auto-managed `created_at` / `updated_at` timestamps
+            // and structured log lines. Honors `LEX_TEST_NOW`.
+            fields.insert("now_str".into(), Ty::function(
+                vec![],
+                EffectSet::singleton("time"),
+                Ty::str(),
+            ));
+            // mono_ns :: () -> [time] Int — monotonic-clock nanoseconds
+            // since process start (#378). Use for *duration*
+            // measurement (`end - start`); the value carries no wall-
+            // clock meaning and the clock can never go backwards
+            // (unlike `time.now_ms` under NTP jitter). Not affected by
+            // `LEX_TEST_NOW` — pinning a monotonic clock would defeat
+            // its purpose; tests that need a fake monotonic clock
+            // should inject one through `EffectHandler`.
+            fields.insert("mono_ns".into(), Ty::function(
+                vec![],
+                EffectSet::singleton("time"),
+                Ty::int(),
+            ));
             // sleep_ms :: Int -> [time] Unit (#226).
             // Used internally by flow.retry_with_backoff for
             // exponential-backoff delays; also available to user

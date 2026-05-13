@@ -829,9 +829,55 @@ impl EffectHandler for DefaultHandler {
                 }
             }
             ("time", "now") => {
+                // LEX_TEST_NOW (Unix seconds) pins for deterministic tests.
+                if let Ok(s) = std::env::var("LEX_TEST_NOW") {
+                    if let Ok(secs) = s.trim().parse::<i64>() {
+                        return Ok(Value::Int(secs));
+                    }
+                }
                 let secs = SystemTime::now().duration_since(UNIX_EPOCH)
                     .map_err(|e| format!("time: {e}"))?.as_secs();
                 Ok(Value::Int(secs as i64))
+            }
+            ("time", "now_ms") => {
+                // Unix epoch in milliseconds (#378). `LEX_TEST_NOW` is
+                // documented in seconds, so we lift it to ms by *1000
+                // to keep the pinning story uniform across `time.now`
+                // and `time.now_ms`.
+                if let Ok(s) = std::env::var("LEX_TEST_NOW") {
+                    if let Ok(secs) = s.trim().parse::<i64>() {
+                        return Ok(Value::Int(secs.saturating_mul(1000)));
+                    }
+                }
+                let ms = SystemTime::now().duration_since(UNIX_EPOCH)
+                    .map_err(|e| format!("time: {e}"))?.as_millis();
+                Ok(Value::Int(ms as i64))
+            }
+            ("time", "now_str") => {
+                // ISO-8601 / RFC 3339 in UTC (#378). Format mirrors
+                // `chrono::Utc::now().to_rfc3339()` already used
+                // elsewhere in the handler.
+                if let Ok(s) = std::env::var("LEX_TEST_NOW") {
+                    if let Ok(secs) = s.trim().parse::<i64>() {
+                        let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0)
+                            .unwrap_or_else(chrono::Utc::now);
+                        return Ok(Value::Str(dt.to_rfc3339()));
+                    }
+                }
+                Ok(Value::Str(chrono::Utc::now().to_rfc3339()))
+            }
+            ("time", "mono_ns") => {
+                // Monotonic clock relative to process start. Cached
+                // `Instant::now()` anchor so successive `mono_ns`
+                // calls return strictly non-decreasing values without
+                // depending on the wall clock. Not affected by
+                // `LEX_TEST_NOW` — pinning a monotonic clock would
+                // defeat its purpose; tests needing a fake monotonic
+                // clock should swap in their own `EffectHandler`.
+                static MONO_START: OnceLock<std::time::Instant> = OnceLock::new();
+                let start = MONO_START.get_or_init(std::time::Instant::now);
+                let dur = std::time::Instant::now().duration_since(*start);
+                Ok(Value::Int(dur.as_nanos() as i64))
             }
             ("time", "sleep_ms") => {
                 // Block the current thread for `n` ms (#226). Used
