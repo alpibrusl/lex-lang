@@ -17,6 +17,7 @@ thiserror.workspace = true
 indexmap.workspace = true
 sha2.workspace = true
 hmac = "0.13"
+blake2 = "0.10"
 regex = "1"
 sled = "0.34"
 walkdir = "2"

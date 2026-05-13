@@ -9,6 +9,33 @@ bumps may carry breaking changes when justified).
 
 ### Added
 
+- **#382 (slice 1): `std.crypto` convenience adds.** Five new
+  primitives on top of the existing `std.crypto` surface, no new
+  effects required:
+  - **`blake2b(bytes)`** — 64-byte digest, BLAKE2b-512. Faster than
+    SHA-512 with the same security level. Backed by the `blake2` crate.
+  - **`sha256_str(s)` / `sha512_str(s)`** — hash a `Str` directly and
+    return the digest as a lowercase hex `Str`. Equivalent to
+    `crypto.hex_encode(crypto.shaN(bytes_of_str(s)))` for the common
+    case where the caller already has a string.
+  - **`base64url_encode` / `base64url_decode`** — URL-safe base64
+    (`-_` alphabet, no padding). Required for JWT segments, signed
+    cookies, and any token traveling in a URL.
+  - **`eq` / `eq_str`** — constant-time equality on `Bytes` and `Str`
+    respectively. `eq` is the recommended spelling; `constant_time_eq`
+    stays as an alias.
+  - **`random_str_hex(n)`** — N random bytes rendered as 2N hex chars,
+    gated by `[random]`. The canonical token-mint shape (session ids,
+    OAuth `state`, CSRF tokens, request ids).
+
+  AEAD primitives (`aes_gcm_seal/open`, `chacha20_poly1305_seal/open`)
+  and KDFs (`pbkdf2_sha256`, `hkdf_sha256`, `argon2id`) are the next
+  slices — each adds 2–3 new crypto crates and warrants its own
+  focused PR.
+
+
+### Added
+
 - **#378: `std.time` extensions — `now_ms`, `now_str`, `mono_ns`.**
   Three new ops on the existing `time` module: `time.now_ms()` (Unix
   milliseconds, the natural resolution for request-latency and
