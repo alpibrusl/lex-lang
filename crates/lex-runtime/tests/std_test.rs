@@ -100,7 +100,7 @@ fn suite_runner_counts_failures() {
         err_msg("first failure"),               // fail
         ok_unit(),                              // pass
         err_msg("second failure"),              // fail
-    ]);
+    ].into());
     let v = run(SRC, "run_suite", vec![suite]);
     assert_eq!(v, Value::Int(2));
 }

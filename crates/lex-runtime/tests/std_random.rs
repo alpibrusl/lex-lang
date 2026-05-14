@@ -127,7 +127,7 @@ fn ranged_int_collapses_to_singleton_when_lo_eq_hi() {
 
 #[test]
 fn choose_returns_some_for_nonempty_list() {
-    let xs = Value::List(vec![Value::Int(10), Value::Int(20), Value::Int(30)]);
+    let xs = Value::List(vec![Value::Int(10), Value::Int(20), Value::Int(30)].into());
     let v = call("pick_from", vec![Value::Int(123), xs]);
     match v {
         Value::Variant { name, args } => {
@@ -143,7 +143,7 @@ fn choose_returns_some_for_nonempty_list() {
 
 #[test]
 fn choose_returns_none_for_empty_list() {
-    let v = call("pick_from", vec![Value::Int(7), Value::List(vec![])]);
+    let v = call("pick_from", vec![Value::Int(7), Value::List(vec![].into())]);
     match v {
         Value::Variant { name, .. } => assert_eq!(name, "None"),
         other => panic!("expected Variant, got {other:?}"),

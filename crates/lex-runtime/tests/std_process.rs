@@ -103,7 +103,7 @@ fn streaming_spawn_and_read_lines() {
         "run_and_count_stdout",
         vec![
             Value::Str("printf".into()),
-            Value::List(vec![Value::Str("a\nb\nc\n".into())]),
+            Value::List(vec![Value::Str("a\nb\nc\n".into())].into()),
         ],
         policy_with_proc(),
     );
@@ -117,7 +117,7 @@ fn first_stdout_line_returns_first_line() {
         "first_stdout_line",
         vec![
             Value::Str("printf".into()),
-            Value::List(vec![Value::Str("alpha\nbeta\ngamma\n".into())]),
+            Value::List(vec![Value::Str("alpha\nbeta\ngamma\n".into())].into()),
         ],
         policy_with_proc(),
     );
@@ -131,7 +131,7 @@ fn run_capture_returns_full_stdout() {
         "run_capture_stdout",
         vec![
             Value::Str("printf".into()),
-            Value::List(vec![Value::Str("hello, world".into())]),
+            Value::List(vec![Value::Str("hello, world".into())].into()),
         ],
         policy_with_proc(),
     );
@@ -144,7 +144,7 @@ fn run_capture_exit_for_failing_command() {
     let v = run_with_policy(
         SRC,
         "run_capture_exit",
-        vec![Value::Str("false".into()), Value::List(vec![])],
+        vec![Value::Str("false".into()), Value::List(std::collections::VecDeque::new())],
         policy_with_proc(),
     );
     assert_eq!(v, Value::Int(1));
@@ -155,7 +155,7 @@ fn run_capture_exit_for_succeeding_command() {
     let v = run_with_policy(
         SRC,
         "run_capture_exit",
-        vec![Value::Str("true".into()), Value::List(vec![])],
+        vec![Value::Str("true".into()), Value::List(std::collections::VecDeque::new())],
         policy_with_proc(),
     );
     assert_eq!(v, Value::Int(0));
@@ -215,7 +215,7 @@ fn drain(h :: ProcessHandle) -> [proc] Int {
     let mut vm = Vm::with_handler(&bc, Box::new(handler));
     let r = vm.call("read_after_wait", vec![
         Value::Str("printf".into()),
-        Value::List(vec![Value::Str("a\n".into())]),
+        Value::List(vec![Value::Str("a\n".into())].into()),
     ]);
     let err = r.expect_err("post-wait read should hit closed-or-unknown");
     let msg = format!("{err:?}");
@@ -232,7 +232,7 @@ fn allow_proc_basename_blocks_unlisted() {
     let v = run_with_policy(
         SRC,
         "run_capture_stdout",
-        vec![Value::Str("printf".into()), Value::List(vec![Value::Str("x".into())])],
+        vec![Value::Str("printf".into()), Value::List(vec![Value::Str("x".into())].into())],
         p,
     );
     // The Err case in the Lex match returns "<run failed>".

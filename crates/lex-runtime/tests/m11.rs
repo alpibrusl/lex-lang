@@ -60,7 +60,7 @@ fn list_basics() {
 import "std.list" as list
 fn count(xs :: List[Int]) -> Int { list.len(xs) }
 "#;
-    let xs = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+    let xs = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)].into());
     assert_eq!(run(src, "count", vec![xs]), Value::Int(3));
 }
 
@@ -71,7 +71,7 @@ import "std.list" as list
 fn r(lo :: Int, hi :: Int) -> List[Int] { list.range(lo, hi) }
 "#;
     let v = run(src, "r", vec![Value::Int(0), Value::Int(3)]);
-    assert_eq!(v, Value::List(vec![Value::Int(0), Value::Int(1), Value::Int(2)]));
+    assert_eq!(v, Value::List(vec![Value::Int(0), Value::Int(1), Value::Int(2)].into()));
 }
 
 #[test]

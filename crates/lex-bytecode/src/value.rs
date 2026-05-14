@@ -12,7 +12,7 @@ pub enum Value {
     Str(String),
     Bytes(Vec<u8>),
     Unit,
-    List(Vec<Value>),
+    List(VecDeque<Value>),
     Tuple(Vec<Value>),
     Record(IndexMap<String, Value>),
     Variant { name: String, args: Vec<Value> },
@@ -248,7 +248,7 @@ impl Value {
                 else { Value::Unit }
             }
             J::String(s) => Value::Str(s.clone()),
-            J::Array(items) => Value::List(items.iter().map(Value::from_json).collect()),
+            J::Array(items) => Value::List(items.iter().map(Value::from_json).collect::<VecDeque<_>>()),
             J::Object(map) => {
                 if let (Some(J::String(name)), Some(J::Array(args))) =
                     (map.get("$variant"), map.get("args"))

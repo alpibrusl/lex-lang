@@ -104,7 +104,7 @@ fn join_with_dash(xs :: List[Str]) -> Str {
   list.fold(xs, "", fn (acc :: Str, x :: Str) -> Str { str.concat(acc, x) })
 }
 "#;
-    let xs = Value::List(vec![Value::Str("a".into()), Value::Str("b".into()), Value::Str("c".into())]);
+    let xs = Value::List(vec![Value::Str("a".into()), Value::Str("b".into()), Value::Str("c".into())].into());
     assert_eq!(run(src, "join_with_dash", vec![xs]), Value::Str("abc".into()));
 }
 

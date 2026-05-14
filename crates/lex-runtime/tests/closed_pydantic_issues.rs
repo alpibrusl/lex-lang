@@ -108,7 +108,7 @@ fn r(xs :: List[Str]) -> List[(Int, Str)] { list.enumerate(xs) }
         Value::Str("a".into()),
         Value::Str("b".into()),
         Value::Str("c".into()),
-    ]);
+    ].into());
     let out = run(src, "r", vec![xs]);
     let Value::List(items) = out else { panic!() };
     assert_eq!(items.len(), 3);
@@ -231,7 +231,7 @@ fn count(xs :: List[Int]) -> Int {
   list.fold(xs, 0, fn(acc :: Int, _ :: Int) -> Int { acc + 1 })
 }
 "#;
-    let xs = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+    let xs = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)].into());
     assert_eq!(run(src, "count", vec![xs]), Value::Int(3));
 }
 
@@ -245,8 +245,8 @@ fn nest(xs :: List[Int], ys :: List[Int]) -> Int {
   })
 }
 "#;
-    let xs = Value::List(vec![Value::Int(0), Value::Int(0)]);
-    let ys = Value::List(vec![Value::Int(0), Value::Int(0), Value::Int(0)]);
+    let xs = Value::List(vec![Value::Int(0), Value::Int(0)].into());
+    let ys = Value::List(vec![Value::Int(0), Value::Int(0), Value::Int(0)].into());
     assert_eq!(run(src, "nest", vec![xs, ys]), Value::Int(6));
 }
 
@@ -374,10 +374,10 @@ fn issue_334_list_reverse_inverts_order() {
 import "std.list" as list
 fn r(xs :: List[Int]) -> List[Int] { list.reverse(xs) }
 "#;
-    let xs = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+    let xs = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)].into());
     assert_eq!(
         run(src, "r", vec![xs]),
-        Value::List(vec![Value::Int(3), Value::Int(2), Value::Int(1)]),
+        Value::List(vec![Value::Int(3), Value::Int(2), Value::Int(1)].into()),
     );
 }
 

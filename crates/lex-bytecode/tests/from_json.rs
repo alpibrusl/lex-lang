@@ -125,7 +125,7 @@ fn list_round_trip() {
         Value::Int(1),
         Value::Int(2),
         Value::Int(3),
-    ]));
+    ].into()));
 }
 
 #[test]
@@ -139,7 +139,7 @@ fn list_of_variants_round_trips() {
             name: "Green".into(),
             args: vec![],
         },
-    ]));
+    ].into()));
 }
 
 #[test]

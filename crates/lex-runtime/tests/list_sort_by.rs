@@ -32,14 +32,14 @@ fn r(xs :: List[Int]) -> List[Int] {
     let xs = Value::List(vec![
         Value::Int(3), Value::Int(1), Value::Int(4), Value::Int(1),
         Value::Int(5), Value::Int(9), Value::Int(2), Value::Int(6),
-    ]);
+    ].into());
     let out = run(src, "r", vec![xs]);
     assert_eq!(
         out,
         Value::List(vec![
             Value::Int(1), Value::Int(1), Value::Int(2), Value::Int(3),
             Value::Int(4), Value::Int(5), Value::Int(6), Value::Int(9),
-        ]),
+        ].into()),
     );
 }
 
@@ -51,10 +51,10 @@ fn r(xs :: List[Int]) -> List[Int] {
   list.sort_by(xs, fn(x :: Int) -> Int { 0 - x })
 }
 "#;
-    let xs = Value::List(vec![Value::Int(2), Value::Int(7), Value::Int(1), Value::Int(4)]);
+    let xs = Value::List(vec![Value::Int(2), Value::Int(7), Value::Int(1), Value::Int(4)].into());
     assert_eq!(
         run(src, "r", vec![xs]),
-        Value::List(vec![Value::Int(7), Value::Int(4), Value::Int(2), Value::Int(1)]),
+        Value::List(vec![Value::Int(7), Value::Int(4), Value::Int(2), Value::Int(1)].into()),
     );
 }
 
@@ -70,14 +70,14 @@ fn r(xs :: List[Str]) -> List[Str] {
         Value::Str("banana".into()),
         Value::Str("apple".into()),
         Value::Str("cherry".into()),
-    ]);
+    ].into());
     assert_eq!(
         run(src, "r", vec![xs]),
         Value::List(vec![
             Value::Str("apple".into()),
             Value::Str("banana".into()),
             Value::Str("cherry".into()),
-        ]),
+        ].into()),
     );
 }
 
@@ -97,7 +97,7 @@ fn r(xs :: List[Order]) -> List[Order] {
         fields.insert("qty".into(), Value::Int(qty));
         Value::Record(fields)
     };
-    let xs = Value::List(vec![mk("bob", 5), mk("alice", 2), mk("carl", 3)]);
+    let xs = Value::List(vec![mk("bob", 5), mk("alice", 2), mk("carl", 3)].into());
     let Value::List(out) = run(src, "r", vec![xs]) else { panic!() };
     let qtys: Vec<i64> = out
         .iter()
@@ -131,7 +131,7 @@ fn r(xs :: List[R]) -> List[R] {
     };
     let xs = Value::List(vec![
         mk(1, "a"), mk(2, "b"), mk(1, "c"), mk(2, "d"), mk(1, "e"),
-    ]);
+    ].into());
     let Value::List(out) = run(src, "r", vec![xs]) else { panic!() };
     let tags: Vec<String> = out
         .iter()
@@ -156,10 +156,10 @@ fn r(xs :: List[Int]) -> List[Int] {
   list.sort_by(xs, fn(x :: Int) -> Int { x })
 }
 "#;
-    assert_eq!(run(src, "r", vec![Value::List(vec![])]), Value::List(vec![]));
+    assert_eq!(run(src, "r", vec![Value::List(vec![].into())]), Value::List(vec![].into()));
     assert_eq!(
-        run(src, "r", vec![Value::List(vec![Value::Int(42)])]),
-        Value::List(vec![Value::Int(42)]),
+        run(src, "r", vec![Value::List(vec![Value::Int(42)].into())]),
+        Value::List(vec![Value::Int(42)].into()),
     );
 }
 
@@ -171,9 +171,9 @@ fn r(xs :: List[Float]) -> List[Float] {
   list.sort_by(xs, fn(x :: Float) -> Float { x })
 }
 "#;
-    let xs = Value::List(vec![Value::Float(3.5), Value::Float(1.25), Value::Float(2.75)]);
+    let xs = Value::List(vec![Value::Float(3.5), Value::Float(1.25), Value::Float(2.75)].into());
     assert_eq!(
         run(src, "r", vec![xs]),
-        Value::List(vec![Value::Float(1.25), Value::Float(2.75), Value::Float(3.5)]),
+        Value::List(vec![Value::Float(1.25), Value::Float(2.75), Value::Float(3.5)].into()),
     );
 }

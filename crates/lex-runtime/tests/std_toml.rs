@@ -160,7 +160,7 @@ tags = ["alpha", "beta", "gamma"]
             Value::Str("alpha".into()),
             Value::Str("beta".into()),
             Value::Str("gamma".into()),
-        ])),
+        ].into())),
     );
 }
 

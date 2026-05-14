@@ -62,7 +62,7 @@ fn proc_spawn_runs_echo_and_returns_stdout() {
         vec![Value::List(vec![
             Value::Str("hello".into()),
             Value::Str("world".into()),
-        ])],
+        ].into())],
         policy_with(&["proc"], &["echo"])).expect("run");
     let inner = variant_args(&r, "Ok");
     let rec = unwrap_record(&inner[0]);
@@ -90,7 +90,7 @@ fn proc_spawn_with_empty_allow_proc_is_escape_hatch() {
     // Empty allow_proc list = any binary permitted (escape hatch).
     // Documented in SECURITY.md and in the policy field doc-comment.
     let r = run(SRC, "echo",
-        vec![Value::List(vec![Value::Str("x".into())])],
+        vec![Value::List(vec![Value::Str("x".into())].into())],
         policy_with(&["proc"], &[])).expect("run");
     let inner = variant_args(&r, "Ok");
     let rec = unwrap_record(&inner[0]);
@@ -117,7 +117,7 @@ fn proc_spawn_without_proc_in_allow_effects_is_runtime_rejected() {
     // bypass by not granting the effect kind. The handler errors
     // before running.
     let r = run(SRC, "echo",
-        vec![Value::List(vec![Value::Str("x".into())])],
+        vec![Value::List(vec![Value::Str("x".into())].into())],
         policy_with(&[], &[]));  // proc not granted
     let err = r.expect_err("proc.spawn without --allow-effects proc must error");
     assert!(err.contains("proc"), "err: {err}");

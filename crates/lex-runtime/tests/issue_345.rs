@@ -47,11 +47,11 @@ fn flatten(parts :: List[Errors]) -> Errors {
         "code".into() => Value::Str("e2".into())
     });
     let parts = Value::List(vec![
-        Value::List(vec![e1.clone()]),
-        Value::List(vec![e2.clone()]),
-    ]);
+        Value::List(vec![e1.clone()].into()),
+        Value::List(vec![e2.clone()].into()),
+    ].into());
     let result = run_one(src, "flatten", vec![parts]);
-    assert_eq!(result, Value::List(vec![e1, e2]));
+    assert_eq!(result, Value::List(vec![e1, e2].into()));
 }
 
 #[test]
@@ -65,11 +65,11 @@ fn names(xs :: List[Str]) -> List[Name] {
 }
 "#;
     let result = run_one(src, "names", vec![
-        Value::List(vec![Value::Str("alice".into()), Value::Str("bob".into())])
+        Value::List(vec![Value::Str("alice".into()), Value::Str("bob".into())].into())
     ]);
     assert_eq!(result, Value::List(vec![
         Value::Str("alice".into()), Value::Str("bob".into())
-    ]));
+    ].into()));
 }
 
 #[test]
@@ -82,9 +82,9 @@ fn high(scores :: List[Score]) -> List[Score] {
 }
 "#;
     let result = run_one(src, "high", vec![
-        Value::List(vec![Value::Int(30), Value::Int(70), Value::Int(90)])
+        Value::List(vec![Value::Int(30), Value::Int(70), Value::Int(90)].into())
     ]);
-    assert_eq!(result, Value::List(vec![Value::Int(70), Value::Int(90)]));
+    assert_eq!(result, Value::List(vec![Value::Int(70), Value::Int(90)].into()));
 }
 
 #[test]

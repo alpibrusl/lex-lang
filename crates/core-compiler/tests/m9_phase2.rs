@@ -265,8 +265,8 @@ fn native_matmul_perf_256() {
 #[test]
 fn native_dot_works() {
     let registry = NativeRegistry::with_defaults();
-    let a = Value::List(vec![Value::Float(1.0), Value::Float(2.0), Value::Float(3.0)]);
-    let b = Value::List(vec![Value::Float(4.0), Value::Float(5.0), Value::Float(6.0)]);
+    let a = Value::List(vec![Value::Float(1.0), Value::Float(2.0), Value::Float(3.0)].into());
+    let b = Value::List(vec![Value::Float(4.0), Value::Float(5.0), Value::Float(6.0)].into());
     let r = registry.dispatch("dot", &[a, b]).unwrap().unwrap();
     assert_eq!(r, Value::Float(32.0));
 }

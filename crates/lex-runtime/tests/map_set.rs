@@ -242,7 +242,7 @@ fn keys_in_iter_order() -> List[Str] {
             Value::Str("a".into()),
             Value::Str("m".into()),
             Value::Str("z".into()),
-        ])
+        ].into())
     );
 }
 
