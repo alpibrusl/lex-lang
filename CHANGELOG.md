@@ -7,6 +7,32 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Performance
+
+- **#388: `net.serve` / `net.serve_fn` — replaced `tiny_http` with
+  hyper 1.x + tokio multi-thread runtime.** The blocking,
+  one-thread-per-connection tiny_http server (p50 ≈ 28 ms for a
+  no-op handler on a 4-core VM) is replaced with a hyper 1.x
+  HTTP/1.1 server backed by a work-stealing tokio runtime. Each
+  accepted connection runs in a `tokio::spawn` task; the
+  synchronous Lex VM call executes inside `spawn_blocking` so it
+  never starves the executor. Expected lift: 5–8× throughput on the
+  same hardware (40–60k req/s on a 4-core VM vs the previous 7.7k
+  baseline). `net.serve_tls` retains the tiny_http path pending a
+  tokio-rustls migration. Public Lex API unchanged.
+
+- **#389 (slice 1): VM dispatch — eliminate per-instruction `Op`
+  clone.** The bytecode interpreter's inner loop previously cloned
+  the current `Op` on every tick. For `Op::MakeRecord
+  { field_name_indices: Vec<u32> }` — emitted for every record
+  literal and every HTTP request/response construction — this meant
+  a heap allocation per dispatch. Replaced with an unsafe raw-pointer
+  borrow of the instruction in-place: the pointer is valid for the
+  VM's lifetime because `Program` is `&'a` and never mutated during
+  `run_to`. All match arms updated to copy scalar payloads via `*`
+  rather than cloning. Net result: zero allocations in the dispatch
+  loop hot path for the common case.
+
 ### Fixed
 
 - **#399: `Policy::permissive()` was missing several stdlib effect
