@@ -21,6 +21,19 @@ bumps may carry breaking changes when justified).
 
 ### Performance
 
+- **#389 (slice 3): VM locals — stack-allocator arena.** Replaced the
+  per-call-frame `Vec<Value>` for function locals with a shared slab
+  (`Vm::locals_storage: Vec<Value>`) that acts as a stack allocator. Each
+  `Op::Call` / `Op::CallClosure` / `invoke()` claims a contiguous slice from
+  the top of the slab; `Op::Return` releases it with a single `truncate` call
+  (O(1), no individual `drop` per slot). `Op::TailCall` reuses the current
+  frame's start position so the hot tail-recursion path never touches the
+  allocator at all. The slab is pre-allocated to 256 slots at VM construction
+  and retains its capacity across consecutive `vm.call()` invocations, so
+  steady-state request handling incurs zero allocations for locals up to the
+  high-water mark. `stack` and `frames` Vecs are also pre-allocated (128 and
+  32 slots respectively) for the same reason.
+
 - **#389 (slice 2): VM `GetField` — monomorphic inline cache.** Each
   `Op::GetField` bytecode site now carries a per-call-site cache entry
   keyed by `(fn_id, pc)`. On a hit the VM verifies the field name at the

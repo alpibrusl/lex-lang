@@ -159,12 +159,31 @@ pub struct Vm<'a> {
     /// in O(1) and skip the hash-table lookup entirely; on a miss we
     /// fall back to `IndexMap::get_full` and populate the cache.
     field_ics: std::collections::HashMap<u64, usize>,
+    /// Stack allocator for function locals (#389 slice 3).
+    ///
+    /// Every function frame claims `locals_count` contiguous slots from
+    /// this Vec on push and releases them on pop.  Because Lex uses
+    /// strictly LIFO frame semantics the most-recently-pushed frame's
+    /// slots always sit at the top of the Vec, so `truncate` is the
+    /// correct (and O(1)) release operation.
+    ///
+    /// The Vec is pre-allocated once at VM construction and then grows
+    /// only if the actual call depth × locals width exceeds the initial
+    /// capacity.  After a top-level `vm.call` returns the Vec is empty
+    /// again but its capacity is retained, so the next request incurs
+    /// zero allocations for locals up to the high-water mark.
+    locals_storage: Vec<Value>,
 }
 
 struct Frame {
     fn_id: u32,
     pc: usize,
-    locals: Vec<Value>,
+    /// Start index of this frame's locals in `Vm::locals_storage` (#389
+    /// slice 3). The frame owns `locals_storage[locals_start..locals_start
+    /// + locals_len]`; `Op::Return` truncates the Vec back to
+    /// `locals_start`, releasing the slots in O(1).
+    locals_start: usize,
+    locals_len: usize,
     /// Stack base when this frame started (for cleanup on return).
     stack_base: usize,
     trace_kind: FrameKind,
@@ -444,14 +463,19 @@ impl<'a> Vm<'a> {
             program,
             handler,
             tracer: Box::new(NullTracer),
-            frames: Vec::new(),
-            stack: Vec::new(),
+            // Pre-allocate enough capacity for a typical request so the first
+            // call incurs no reallocation (#389 slice 3).
+            frames: Vec::with_capacity(32),
+            stack: Vec::with_capacity(128),
             step_limit: 10_000_000,
             steps: 0,
             pure_memo: std::collections::HashMap::new(),
             pure_memo_hits: 0,
             pure_memo_misses: 0,
             field_ics: std::collections::HashMap::new(),
+            // 256 slots handles ~32 frames × 8 locals; grows on demand and
+            // retains capacity across consecutive vm.call() invocations.
+            locals_storage: Vec::with_capacity(256),
         }
     }
 
@@ -616,14 +640,20 @@ impl<'a> Vm<'a> {
             }
         }
         let f = &self.program.functions[fn_id as usize];
-        let mut locals = vec![Value::Unit; f.locals_count.max(f.arity) as usize];
-        for (i, v) in args.into_iter().enumerate() { locals[i] = v; }
+        // Claim slots from the locals stack allocator (#389 slice 3).
+        let locals_start = self.locals_storage.len();
+        let locals_len = f.locals_count.max(f.arity) as usize;
+        self.locals_storage.resize(locals_start + locals_len, Value::Unit);
+        for (i, v) in args.into_iter().enumerate() {
+            self.locals_storage[locals_start + i] = v;
+        }
         // Record the depth before pushing — this is what `run` will
         // exit at, supporting reentrant invocation from inside the
         // VM (e.g. the parser interpreter calling closures, #221).
         let base_depth = self.frames.len();
         self.push_frame(Frame {
-            fn_id, pc: 0, locals, stack_base: self.stack.len(),
+            fn_id, pc: 0, locals_start, locals_len,
+            stack_base: self.stack.len(),
             trace_kind: FrameKind::Entry,
             memo_key: None,
         })?;
@@ -680,12 +710,14 @@ impl<'a> Vm<'a> {
                     self.stack.push(v);
                 }
                 Op::LoadLocal(i) => {
-                    let v = self.frames[frame_idx].locals[i as usize].clone();
+                    let base = self.frames[frame_idx].locals_start;
+                    let v = self.locals_storage[base + i as usize].clone();
                     self.stack.push(v);
                 }
                 Op::StoreLocal(i) => {
                     let v = self.pop()?;
-                    self.frames[frame_idx].locals[i as usize] = v;
+                    let base = self.frames[frame_idx].locals_start;
+                    self.locals_storage[base + i as usize] = v;
                 }
                 Op::MakeRecord { field_name_indices } => {
                     let n = field_name_indices.len();
@@ -897,10 +929,15 @@ impl<'a> Vm<'a> {
                     combined.extend(args);
                     self.tracer.enter_call(&node_id, &callee_name, &combined);
                     let f = &self.program.functions[fn_id as usize];
-                    let mut locals = vec![Value::Unit; f.locals_count.max(f.arity) as usize];
-                    for (i, v) in combined.into_iter().enumerate() { locals[i] = v; }
+                    let locals_start = self.locals_storage.len();
+                    let locals_len = f.locals_count.max(f.arity) as usize;
+                    self.locals_storage.resize(locals_start + locals_len, Value::Unit);
+                    for (i, v) in combined.into_iter().enumerate() {
+                        self.locals_storage[locals_start + i] = v;
+                    }
                     self.push_frame(Frame {
-                        fn_id, pc: 0, locals, stack_base: self.stack.len(),
+                        fn_id, pc: 0, locals_start, locals_len,
+                        stack_base: self.stack.len(),
                         trace_kind: FrameKind::Call(node_id),
                         // Op::CallClosure intentionally doesn't memoize
                         // for v1 (#229) — closures over captures need a
@@ -1046,10 +1083,15 @@ impl<'a> Vm<'a> {
                         self.pure_memo_misses += 1;
                     }
                     self.tracer.enter_call(&node_id, &callee_name, &args);
-                    let mut locals = vec![Value::Unit; f.locals_count.max(f.arity) as usize];
-                    for (i, v) in args.into_iter().enumerate() { locals[i] = v; }
+                    let locals_start = self.locals_storage.len();
+                    let locals_len = f.locals_count.max(f.arity) as usize;
+                    self.locals_storage.resize(locals_start + locals_len, Value::Unit);
+                    for (i, v) in args.into_iter().enumerate() {
+                        self.locals_storage[locals_start + i] = v;
+                    }
                     self.push_frame(Frame {
-                        fn_id, pc: 0, locals, stack_base: self.stack.len(),
+                        fn_id, pc: 0, locals_start, locals_len,
+                        stack_base: self.stack.len(),
                         trace_kind: FrameKind::Call(node_id),
                         memo_key,
                     })?;
@@ -1096,11 +1138,21 @@ impl<'a> Vm<'a> {
                     self.tracer.exit_call_tail();
                     self.tracer.enter_call(&node_id, &callee_name, &args);
                     let f = &self.program.functions[fn_id as usize];
+                    // Reuse the current frame's locals_start position:
+                    // truncate to release old locals then extend for the
+                    // new function (#389 slice 3, same as Op::Return but
+                    // without popping the frame).
+                    let old_locals_start = self.frames.last().unwrap().locals_start;
+                    self.locals_storage.truncate(old_locals_start);
+                    let new_locals_len = f.locals_count.max(f.arity) as usize;
+                    self.locals_storage.resize(old_locals_start + new_locals_len, Value::Unit);
+                    for (i, v) in args.into_iter().enumerate() {
+                        self.locals_storage[old_locals_start + i] = v;
+                    }
                     let frame = self.frames.last_mut().unwrap();
                     frame.fn_id = fn_id;
                     frame.pc = 0;
-                    frame.locals = vec![Value::Unit; f.locals_count.max(f.arity) as usize];
-                    for (i, v) in args.into_iter().enumerate() { frame.locals[i] = v; }
+                    frame.locals_len = new_locals_len;
                     frame.trace_kind = FrameKind::Call(node_id);
                 }
                 Op::EffectCall { kind_idx, op_idx, arity, node_id_idx } => {
@@ -1149,6 +1201,9 @@ impl<'a> Vm<'a> {
                     let frame = self.frames.pop().unwrap();
                     // Trim any extra stuff that the function pushed but didn't pop.
                     self.stack.truncate(frame.stack_base);
+                    // Release this frame's locals back to the arena (#389 slice 3).
+                    // LIFO frame ordering guarantees this frame's slots are at the top.
+                    self.locals_storage.truncate(frame.locals_start);
                     if matches!(frame.trace_kind, FrameKind::Call(_)) {
                         self.tracer.exit_ok(&v);
                     }
