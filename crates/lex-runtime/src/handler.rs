@@ -12,7 +12,7 @@ use std::sync::{Mutex, OnceLock};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::builtins::try_pure_builtin;
+use crate::builtins::{call_pure_builtin, is_pure_call};
 use crate::policy::Policy;
 
 /// Output sink used by `io.print`. Tests inject a buffer; production prints
@@ -643,8 +643,8 @@ impl EffectHandler for DefaultHandler {
         // Pure stdlib builtins (str, list, json, ...) bypass the policy
         // gate — they have no observable side effects and aren't tracked
         // by the type system as effects.
-        if let Some(r) = try_pure_builtin(kind, op, &args) {
-            return r;
+        if is_pure_call(kind, op) {
+            return call_pure_builtin(kind, op, args);
         }
         // `std.fs` ops use the fine-grained `[fs_walk]` and `[fs_write]`
         // effect kinds (distinct from the module name `fs`); the

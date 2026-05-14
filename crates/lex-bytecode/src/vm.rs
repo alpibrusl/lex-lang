@@ -1030,8 +1030,8 @@ impl<'a> Vm<'a> {
                         // VM access to invoke `Value::Closure` values
                         // from `Map` / `AndThen` nodes.
                         None if (kind.as_str(), op_name.as_str()) == ("parser", "run")
-                            => self.run_parser_op(args.clone()),
-                        None => self.handler.dispatch(&kind, &op_name, args.clone()),
+                            => self.run_parser_op(args),
+                        None => self.handler.dispatch(&kind, &op_name, args),
                     };
                     match result {
                         Ok(v) => {
