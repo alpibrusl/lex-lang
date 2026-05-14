@@ -202,6 +202,7 @@ fn main() -> [net] Result[Unit, Str] {
 }
 
 #[test]
+#[allow(clippy::result_large_err)] // tungstenite::accept_hdr callback Err type is large
 fn dial_ws_subprotocol_header_is_sent_when_non_empty() {
     // Bind a server that records the Sec-WebSocket-Protocol header
     // out of the handshake request and then closes immediately.
