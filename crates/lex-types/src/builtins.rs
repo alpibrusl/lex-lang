@@ -486,6 +486,44 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::open_var(0).union(&EffectSet::singleton("net")),
                 Ty::Unit,
             ));
+            // dial_ws[Eff] :: (Str, Str, () -> [Eff] WsAction,
+            //                  (WsMessage) -> [Eff] WsAction)
+            //                  -> [net, Eff] Result[Unit, Str]
+            //
+            // WebSocket *client* — the inverse of serve_ws_fn (#390).
+            // Connects to `url` (ws:// or wss://) with the given
+            // subprotocol header, calls `on_open` once after the
+            // handshake completes, then loops invoking `on_message`
+            // for every inbound frame. Each callback returns a
+            // `WsAction` that gets applied to the socket — same enum
+            // as the server side, same semantics for `WsSend` /
+            // `WsSendBinary` / `WsNoOp`. open_var(0) propagates the
+            // handler effects so callers that touch [io], [time],
+            // [random] etc. inside their handlers see those propagate
+            // out of the dial_ws call.
+            //
+            // Returns `Result[Unit, Str]` rather than the bare `Unit`
+            // that serve_ws_fn returns: a dial can fail on connect
+            // (DNS, refused, bad TLS) or mid-stream (read error,
+            // unexpected close) and the caller usually wants to know.
+            fields.insert("dial_ws".into(), Ty::function(
+                vec![
+                    Ty::str(), // url (ws:// or wss://)
+                    Ty::str(), // subprotocol (Sec-WebSocket-Protocol)
+                    Ty::function(
+                        vec![],
+                        EffectSet::open_var(0),
+                        Ty::Con("WsAction".into(), vec![]),
+                    ),
+                    Ty::function(
+                        vec![Ty::Con("WsMessage".into(), vec![])],
+                        EffectSet::open_var(0),
+                        Ty::Con("WsAction".into(), vec![]),
+                    ),
+                ],
+                EffectSet::open_var(0).union(&EffectSet::singleton("net")),
+                Ty::Con("Result".into(), vec![Ty::Unit, Ty::str()]),
+            ));
             // serve_fn[Eff] :: (Int, (Request) -> [Eff] Response) -> [net, Eff] Unit
             // Effect-polymorphic variant of serve that accepts a first-class closure
             // instead of a handler name. open_var(0) captures the handler's effect row

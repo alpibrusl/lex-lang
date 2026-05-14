@@ -229,10 +229,18 @@ fn build_ws_message_ping() -> Value {
     Value::Variant { name: "WsPing".into(), args: vec![] }
 }
 
+fn build_ws_message_binary(payload: &[u8]) -> Value {
+    let bytes = payload.iter().map(|b| Value::Int(*b as i64)).collect();
+    Value::Variant { name: "WsBinary".into(), args: vec![Value::List(bytes)] }
+}
+
 /// Interpret a `WsAction` variant and send the appropriate frame.
-fn apply_ws_action(
+/// Generic over the stream so this serves both the plaintext-only
+/// server path (`TcpStream`) and the dial path that may sit on top
+/// of a TLS-wrapped stream (`MaybeTlsStream<TcpStream>`).
+fn apply_ws_action<S: std::io::Read + std::io::Write>(
     action: &Value,
-    ws: &mut tungstenite::WebSocket<std::net::TcpStream>,
+    ws: &mut tungstenite::WebSocket<S>,
 ) -> Result<(), String> {
     use tungstenite::Message;
     match action {
@@ -395,4 +403,193 @@ fn run_loop_fn(
         }
     }
     Ok(())
+}
+
+// ── Closure-based WebSocket client (#390) ────────────────────────────────────
+//
+// Inverse of `serve_ws_fn`: open a connection to a remote WS server and
+// run two Lex callbacks against it.
+//
+// - `on_open : () -> [E] WsAction` is invoked once after the handshake
+//   completes. The returned `WsAction` (typically `WsSend(boot_frame)`)
+//   is applied to the socket immediately. This is the hook for
+//   protocols like OCPP where the client sends a `BootNotification`
+//   the moment it connects.
+// - `on_message : (WsMessage) -> [E] WsAction` is invoked for every
+//   inbound frame. Same `WsAction` semantics as the server-side
+//   handler. A `WsClose` message is delivered once before the loop
+//   exits so handlers can run shutdown logic.
+//
+// Multi-frame sends from `on_open` (e.g. a charger that wants to
+// also kick off a heartbeat scheduler at connect-time) aren't
+// expressible in v1 — the issue's `send :: (Str) -> [net]
+// Result[Unit, Str]` closure would let users push outbound frames
+// from arbitrary `[net]` code, but that requires representing
+// Rust-native closures as Lex `Value`s, which is a separate
+// runtime change. v1 covers the BootNotification + reactive reply
+// pattern that motivates the issue.
+
+fn build_dial_result(ok: Result<(), String>) -> Value {
+    match ok {
+        Ok(()) => Value::Variant {
+            name: "Ok".into(),
+            args: vec![Value::Unit],
+        },
+        Err(msg) => Value::Variant {
+            name: "Err".into(),
+            args: vec![Value::Str(msg)],
+        },
+    }
+}
+
+/// `net.dial_ws(url, subprotocol, on_open, on_message) -> [net, E]
+/// Result[Unit, Str]`. Blocks for the lifetime of the connection;
+/// returns `Ok(())` on a clean close from the server, `Err(reason)`
+/// on dial failure, handshake failure, read error, or write error.
+pub fn dial_ws(
+    url: String,
+    subprotocol: String,
+    on_open: Value,
+    on_message: Value,
+    program: Arc<Program>,
+    policy: Policy,
+) -> Result<Value, String> {
+    use tungstenite::client::IntoClientRequest;
+    use tungstenite::http::HeaderValue;
+
+    // Build the request — when `subprotocol` is non-empty, attach the
+    // Sec-WebSocket-Protocol header so the server's accept-handler
+    // can match on it. Empty subprotocol → header omitted (the same
+    // contract as `serve_ws_fn`'s subprotocol arg).
+    //
+    // Caller-controlled inputs (URL syntax, subprotocol header value)
+    // surface as a Lex `Err(reason)`, not a Rust panic / handler
+    // error, so `match net.dial_ws(...) { Err(_) => ..., Ok(_) => ... }`
+    // works at the Lex level.
+    let mut req = match url.as_str().into_client_request() {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(build_dial_result(Err(format!(
+                "net.dial_ws: bad URL `{url}`: {e}"
+            ))));
+        }
+    };
+    if !subprotocol.is_empty() {
+        let header = match HeaderValue::from_str(&subprotocol) {
+            Ok(h) => h,
+            Err(e) => {
+                return Ok(build_dial_result(Err(format!(
+                    "net.dial_ws: invalid subprotocol `{subprotocol}`: {e}"
+                ))));
+            }
+        };
+        req.headers_mut().insert("Sec-WebSocket-Protocol", header);
+    }
+
+    let (mut ws, _resp) = match tungstenite::connect(req) {
+        Ok(pair) => pair,
+        Err(e) => {
+            return Ok(build_dial_result(Err(format!(
+                "net.dial_ws: connect to `{url}`: {e}"
+            ))));
+        }
+    };
+
+    // Non-blocking-ish reads so we don't tie up the thread on an idle
+    // socket, mirroring the server's read-timeout multiplexing.
+    if let Some(stream) = stream_for(&mut ws) {
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+    }
+
+    // 1. Fire on_open once and apply its action.
+    {
+        let handler = crate::handler::DefaultHandler::new(policy.clone())
+            .with_program(Arc::clone(&program));
+        let mut vm = Vm::with_handler(&program, Box::new(handler));
+        match vm.invoke_closure_value(on_open.clone(), vec![]) {
+            Ok(action) => {
+                if let Err(e) = apply_ws_action(&action, &mut ws) {
+                    return Ok(build_dial_result(Err(format!(
+                        "net.dial_ws: on_open action: {e}"
+                    ))));
+                }
+            }
+            Err(e) => {
+                return Ok(build_dial_result(Err(format!(
+                    "net.dial_ws: on_open: {e}"
+                ))));
+            }
+        }
+    }
+
+    // 2. Run the read loop, dispatching each inbound frame to on_message.
+    let loop_result = dial_run_loop(&mut ws, &on_message, &program, &policy);
+    let _ = ws.close(None);
+    Ok(build_dial_result(loop_result))
+}
+
+/// Pull the underlying TCP stream out of a `MaybeTlsStream` so we can
+/// set a read timeout. For plaintext connections this is the
+/// `TcpStream` directly; for `rustls`-wrapped streams it's the inner
+/// socket. Returns `None` if the wrapping is some other variant —
+/// in that case we just skip the timeout and rely on blocking reads.
+fn stream_for(
+    ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+) -> Option<&mut std::net::TcpStream> {
+    use tungstenite::stream::MaybeTlsStream;
+    match ws.get_mut() {
+        MaybeTlsStream::Plain(s) => Some(s),
+        MaybeTlsStream::Rustls(s) => Some(s.get_mut()),
+        _ => None,
+    }
+}
+
+fn dial_run_loop(
+    ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+    on_message: &Value,
+    program: &Arc<Program>,
+    policy: &Policy,
+) -> Result<(), String> {
+    use std::io::ErrorKind;
+    use tungstenite::Message;
+
+    loop {
+        let ws_msg = match ws.read() {
+            Ok(Message::Text(body)) => Some(build_ws_message_text(&body)),
+            Ok(Message::Binary(payload)) => Some(build_ws_message_binary(&payload)),
+            Ok(Message::Ping(_)) => Some(build_ws_message_ping()),
+            Ok(Message::Close(_)) | Err(tungstenite::Error::ConnectionClosed) => {
+                // Deliver WsClose so the handler can do shutdown work.
+                let handler = crate::handler::DefaultHandler::new(policy.clone())
+                    .with_program(Arc::clone(program));
+                let mut vm = Vm::with_handler(program, Box::new(handler));
+                let _ = vm.invoke_closure_value(
+                    on_message.clone(),
+                    vec![build_ws_message_close()],
+                );
+                return Ok(());
+            }
+            Ok(_) => None, // pong / raw frame
+            Err(tungstenite::Error::Io(ref e))
+                if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
+            {
+                None
+            }
+            Err(e) => return Err(format!("net.dial_ws: read: {e}")),
+        };
+
+        if let Some(msg) = ws_msg {
+            let handler = crate::handler::DefaultHandler::new(policy.clone())
+                .with_program(Arc::clone(program));
+            let mut vm = Vm::with_handler(program, Box::new(handler));
+            match vm.invoke_closure_value(on_message.clone(), vec![msg]) {
+                Ok(action) => {
+                    if let Err(e) = apply_ws_action(&action, ws) {
+                        return Err(format!("net.dial_ws: action: {e}"));
+                    }
+                }
+                Err(e) => return Err(format!("net.dial_ws: on_message: {e}")),
+            }
+        }
+    }
 }
