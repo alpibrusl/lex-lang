@@ -37,6 +37,17 @@ rand = { version = "0.10", features = ["sys_rng"] }
 tiny_http = { version = "0.12", features = ["ssl-rustls"] }
 tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 ureq = { version = "3.3", default-features = false, features = ["rustls", "platform-verifier"] }
+# Hyper-based HTTP server replaces tiny_http for plaintext `net.serve_fn`
+# / `net.serve` (#388). tiny_http stays for the TLS path until the
+# follow-up hyper-rustls migration; once that lands, tiny_http can go.
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "server"] }
+http-body-util = "0.1"
+bytes = "1"
+tokio = { version = "1", features = [
+    "rt-multi-thread", "net", "io-util", "sync", "time", "macros",
+] }
+futures-util = { version = "0.3", default-features = false }
 toml = "1.1"
 serde_yaml = "0.9"
 csv = "1"

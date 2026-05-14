@@ -17,6 +17,7 @@ pub mod builtins;
 pub mod cli;
 pub mod policy;
 pub mod handler;
+pub mod http_server;
 pub mod ws;
 pub mod mcp_client;
 pub mod llm;

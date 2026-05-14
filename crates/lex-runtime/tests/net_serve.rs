@@ -227,6 +227,104 @@ fn main() -> [net] Nil { net.serve(18095, "handle") }
     assert!(elapsed.as_secs() < 10, "8 concurrent requests took {}s — handler stuck?", elapsed.as_secs());
 }
 
+/// Send two HTTP/1.1 requests on the same TCP connection and read both
+/// responses back. The hyper-backed plaintext server (#388) speaks
+/// keep-alive natively; under the previous tiny_http backend each
+/// connection served exactly one request and the second `read_response`
+/// here would hang on EOF. Used by `net_serve_keeps_connection_alive`.
+fn http_two_on_one(port: u16, paths: [&str; 2]) -> [(u16, String); 2] {
+    use std::io::Read;
+    let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    let mut out: Vec<(u16, String)> = Vec::with_capacity(2);
+    for (i, path) in paths.iter().enumerate() {
+        // Tell hyper to keep the connection open for the first request
+        // and only close after the second so we can detect the boundary.
+        let conn_hdr = if i == 0 { "keep-alive" } else { "close" };
+        let req = format!(
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: {conn_hdr}\r\n\r\n",
+        );
+        s.write_all(req.as_bytes()).unwrap();
+
+        if i == 0 {
+            // Read just up to one response: parse status line + headers,
+            // pull Content-Length bytes, stop. Naive but enough for the
+            // server-side responses this test exercises (no chunked
+            // bodies, no folded headers).
+            let mut header_buf = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                let n = s.read(&mut byte).expect("read header byte");
+                assert!(n > 0, "EOF reading first response headers");
+                header_buf.push(byte[0]);
+                if header_buf.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let head = String::from_utf8_lossy(&header_buf).into_owned();
+            let status: u16 = head
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0);
+            let mut content_length = 0usize;
+            for line in head.split("\r\n") {
+                if let Some(rest) = line
+                    .to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                {
+                    content_length = rest.trim().parse().unwrap_or(0);
+                    break;
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            s.read_exact(&mut body).expect("read body 1");
+            out.push((status, String::from_utf8_lossy(&body).into_owned()));
+        } else {
+            // Second response — server will close after sending, so a
+            // simple read-to-EOF gives us the framed body.
+            let mut buf = String::new();
+            s.read_to_string(&mut buf).expect("read second response");
+            let (head, body) = buf.split_once("\r\n\r\n").unwrap_or((&buf, ""));
+            let status: u16 = head
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0);
+            out.push((status, body.to_string()));
+        }
+    }
+    [out.remove(0), out.remove(0)]
+}
+
+#[test]
+fn net_serve_keeps_connection_alive() {
+    // Hyper-backed server (#388) speaks HTTP/1.1 keep-alive — two
+    // sequential requests on the same TCP connection both get answered
+    // without the client having to reconnect. Under the previous
+    // tiny_http backend this test would hang on the second read.
+    let src = r#"
+import "std.net" as net
+
+fn handle(req :: { body :: Str, method :: Str, path :: Str, query :: Str }) -> { body :: Str, status :: Int } {
+  { status: 200, body: req.path }
+}
+
+fn main() -> [net] Nil { net.serve(18096, "handle") }
+"#;
+    spawn_lex_server(src, "main");
+    wait_for_bind(18096, Duration::from_secs(5));
+
+    let [(s1, b1), (s2, b2)] = http_two_on_one(18096, ["/first", "/second"]);
+    assert_eq!(s1, 200);
+    assert_eq!(b1, "/first");
+    assert_eq!(s2, 200);
+    assert_eq!(b2, "/second");
+}
+
 // ---- HTTPS (net.serve_tls) -------------------------------------------
 
 #[test]

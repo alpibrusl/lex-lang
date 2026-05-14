@@ -947,6 +947,9 @@ impl EffectHandler for DefaultHandler {
                 Ok(http_request("POST", &url, Some(&body)))
             }
             ("net", "serve") => {
+                // Plaintext HTTP now runs on hyper + tokio (#388). The
+                // TLS path further down still uses tiny_http until the
+                // hyper-rustls follow-up.
                 let port = match args.first() {
                     Some(Value::Int(n)) if (0..=65535).contains(n) => *n as u16,
                     _ => return Err("net.serve(port, handler): port must be Int 0..=65535".into()),
@@ -955,9 +958,10 @@ impl EffectHandler for DefaultHandler {
                 let program = self.program.clone()
                     .ok_or_else(|| "net.serve requires a Program reference; use DefaultHandler::with_program".to_string())?;
                 let policy = self.policy.clone();
-                serve_http(port, handler_name, program, policy, None)
+                crate::http_server::serve_http_by_name(port, handler_name, program, policy)
             }
             ("net", "serve_fn") => {
+                // Plaintext HTTP now runs on hyper + tokio (#388).
                 let port = match args.first() {
                     Some(Value::Int(n)) if (0..=65535).contains(n) => *n as u16,
                     _ => return Err("net.serve_fn(port, handler): port must be Int 0..=65535".into()),
@@ -969,7 +973,7 @@ impl EffectHandler for DefaultHandler {
                 let program = self.program.clone()
                     .ok_or_else(|| "net.serve_fn requires a Program reference; use DefaultHandler::with_program".to_string())?;
                 let policy = self.policy.clone();
-                serve_http_fn(port, closure, program, policy)
+                crate::http_server::serve_http_fn(port, closure, program, policy)
             }
             ("net", "serve_tls") => {
                 let port = match args.first() {
@@ -1607,45 +1611,14 @@ fn handle_request(
     }
 }
 
-fn serve_http_fn(
-    port: u16,
-    closure: Value,
-    program: Arc<Program>,
-    policy: Policy,
-) -> Result<Value, String> {
-    let server = tiny_http::Server::http(("127.0.0.1", port))
-        .map_err(|e| format!("net.serve_fn bind {port}: {e}"))?;
-    eprintln!("net.serve_fn: listening on http://127.0.0.1:{port}");
-    for req in server.incoming_requests() {
-        let program = Arc::clone(&program);
-        let policy = policy.clone();
-        let closure = closure.clone();
-        std::thread::spawn(move || handle_request_fn(req, program, policy, closure));
-    }
-    Ok(Value::Unit)
-}
-
-fn handle_request_fn(
-    mut req: tiny_http::Request,
-    program: Arc<Program>,
-    policy: Policy,
-    closure: Value,
-) {
-    let lex_req = build_request_value(&mut req);
-    let handler = DefaultHandler::new(policy).with_program(Arc::clone(&program));
-    let mut vm = Vm::with_handler(&program, Box::new(handler));
-    match vm.invoke_closure_value(closure, vec![lex_req]) {
-        Ok(resp) => {
-            let (status, body, headers) = unpack_response(&resp);
-            respond_with_body(req, status, body, headers);
-        }
-        Err(e) => {
-            let response = tiny_http::Response::from_string(format!("internal error: {e}"))
-                .with_status_code(500);
-            let _ = req.respond(response);
-        }
-    }
-}
+// The closure-based plaintext server (`net.serve_fn`) and the by-name
+// plaintext server (`net.serve` with `tls = None`) both moved to the
+// hyper+tokio backend in `crate::http_server` (#388). `serve_http`
+// below stays for the TLS path until `net.serve_tls` migrates to
+// `hyper` + `tokio-rustls`. The tiny_http helpers
+// (`build_request_value`, `unpack_response`, `respond_with_body`,
+// `ChunkReader`, `drain_iter_*`) below remain because `handle_request`
+// still calls them via the TLS path.
 
 fn build_request_value(req: &mut tiny_http::Request) -> Value {
     let method = format!("{:?}", req.method()).to_uppercase();
