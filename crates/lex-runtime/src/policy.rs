@@ -57,13 +57,14 @@ impl Policy {
             // entries here cause valid stdlib calls to fail under
             // `lex test` / `lex repl` / any other consumer that opts
             // into the permissive policy.
-            "sql",       // std.sql (#362, #379)
-            "random",    // crypto.random / crypto.random_str_hex (#382)
-            "chat",      // chat.broadcast / chat.send (#359)
-            "log",       // std.log structured logging
-            "kv",        // std.kv key-value store
-            "stream",    // std.stream
-            "fs_walk",   // std.fs directory traversal
+            "sql",         // std.sql (#362, #379)
+            "random",      // crypto.random / crypto.random_str_hex (#382)
+            "chat",        // chat.broadcast / chat.send (#359)
+            "log",         // std.log structured logging
+            "kv",          // std.kv key-value store
+            "stream",      // std.stream
+            "fs_walk",     // std.fs directory traversal
+            "concurrent",  // conc.spawn / conc.ask / conc.tell (#381)
         ] {
             s.insert(k.to_string());
         }

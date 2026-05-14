@@ -3,6 +3,18 @@
 use crate::program::BodyHash;
 use indexmap::IndexMap;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::{Arc, Mutex};
+
+/// Internal state of a `conc.Actor`. Protected by a `Mutex` so that
+/// concurrent callers serialise on message delivery (the actor processes
+/// one message at a time). The `handler` closure is called on the
+/// *calling* VM's thread — no extra OS thread required — which lets it
+/// invoke arbitrary effects (sql, net, …) through the same handler chain.
+#[derive(Debug, Clone)]
+pub struct ActorCell {
+    pub state: Value,
+    pub handler: Value,
+}
 
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -49,6 +61,12 @@ pub enum Value {
     /// uses this dedicated variant rather than backing a deque on top
     /// of `Value::List` (which would make `push_front` O(n)).
     Deque(VecDeque<Value>),
+    /// A handle to a `conc.Actor`. The `Arc<Mutex<ActorCell>>` allows
+    /// cheap cloning and safe concurrent access — the mutex serialises
+    /// message delivery so the actor processes one message at a time.
+    /// Two actor handles compare equal iff they point to the same cell
+    /// (identity equality, not structural equality).
+    Actor(Arc<Mutex<ActorCell>>),
 }
 
 /// Manual `PartialEq` for `Value` (#222). Mirrors the auto-derived
@@ -81,6 +99,8 @@ impl PartialEq for Value {
             (Map(a), Map(b)) => a == b,
             (Set(a), Set(b)) => a == b,
             (Deque(a), Deque(b)) => a == b,
+            // Actor identity: same if both handles point to the same cell.
+            (Actor(a), Actor(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -218,6 +238,7 @@ impl Value {
             Value::Set(s) => J::Array(
                 s.iter().map(|k| k.as_value().to_json()).collect()),
             Value::Deque(items) => J::Array(items.iter().map(Value::to_json).collect()),
+            Value::Actor(_) => J::String("<actor>".into()),
         }
     }
 
