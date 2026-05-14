@@ -6,24 +6,53 @@ use lex_bytecode::{MapKey, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Mutex, OnceLock};
 
+/// Returns `true` if `(kind, op)` will be handled by the pure-builtin
+/// path (no side effects, no policy gate needed). Used by the effect
+/// handler to decide whether to consume `args` by value.
+pub fn is_pure_call(kind: &str, op: &str) -> bool {
+    if !is_pure_module(kind) { return false; }
+    !matches!(
+        (kind, op),
+        ("crypto", "random")
+        | ("crypto", "random_str_hex")
+        | ("datetime", "now")
+        | ("http", "send")
+        | ("http", "get")
+        | ("http", "post")
+    )
+}
+
+/// Dispatch a pure-builtin call with owned args (no clone of arg values).
+/// Callers must first verify `is_pure_call(kind, op)` to ensure args
+/// ownership is only transferred for known-pure ops.
+///
+/// `list.cons` is handled here with move semantics so the tail `Vec<Value>`
+/// is extended without cloning each element (#405).
+pub fn call_pure_builtin(kind: &str, op: &str, args: Vec<Value>) -> Result<Value, String> {
+    if (kind, op) == ("list", "cons") {
+        let mut it = args.into_iter();
+        let head = it.next().unwrap_or(Value::Unit);
+        let tail = match it.next() {
+            Some(Value::List(v)) => v,
+            Some(other) => return Err(format!("list.cons: expected List, got {other:?}")),
+            None => vec![],
+        };
+        let mut out = Vec::with_capacity(1 + tail.len());
+        out.push(head);
+        out.extend(tail);
+        return Ok(Value::List(out));
+    }
+    dispatch(kind, op, &args)
+}
+
 /// Returns Some(...) if `(kind, op)` names a known pure builtin.
 /// `None` means "not handled here; fall through to effect dispatch".
+///
+/// Prefer `is_pure_call` + `call_pure_builtin` in hot paths — this
+/// variant takes `&[Value]` and must clone args for operations like
+/// `list.cons`; kept for external callers that already hold a slice.
 pub fn try_pure_builtin(kind: &str, op: &str, args: &[Value]) -> Option<Result<Value, String>> {
-    if !is_pure_module(kind) { return None; }
-    // `crypto.random` and `crypto.random_str_hex` (#382) are the
-    // effectful ops in an otherwise-pure module; let the handler
-    // dispatch them under the `[random]` effect kind instead of the
-    // pure-builtin bypass.
-    if (kind, op) == ("crypto", "random") { return None; }
-    if (kind, op) == ("crypto", "random_str_hex") { return None; }
-    // Same shape: `datetime.now` is the only effectful op in
-    // `std.datetime` (all the parse/format/arithmetic ops are pure).
-    if (kind, op) == ("datetime", "now") { return None; }
-    // `std.http` is mostly pure (builders + decoders); only the
-    // wire ops `send`/`get`/`post` need the [net] effect handler.
-    if (kind, "send") == (kind, op) && kind == "http" { return None; }
-    if (kind, "get")  == (kind, op) && kind == "http" { return None; }
-    if (kind, "post") == (kind, op) && kind == "http" { return None; }
+    if !is_pure_call(kind, op) { return None; }
     Some(dispatch(kind, op, args))
 }
 

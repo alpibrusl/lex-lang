@@ -7,7 +7,22 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.9.3] — 2026-05-14
+
 ### Performance
+
+- **#405 (partial): eliminate redundant `args` clone on every `EffectCall`
+  dispatch and `list.cons` tail clone.** Two hot-path allocations removed:
+  (1) the VM's `EffectCall` handler previously cloned the entire args
+  `Vec<Value>` before passing it to the effect handler — now moved by
+  value (zero copy); (2) `list.cons` previously cloned every element of
+  the tail list because the pure-builtin dispatch accepted only `&[Value]`
+  — a new `call_pure_builtin(Vec<Value>)` owned entry-point lets `list.cons`
+  extend the output vec by moving elements from the tail instead of cloning
+  them. Combined impact: programs that accumulate results with `list.cons`
+  (e.g. CSV parsing, group-by aggregation) see substantially lower
+  allocation pressure; the algorithmic O(n²) from prepend-in-a-loop is
+  unchanged (tracked for 0.9.4).
 
 - **#388: `net.serve` / `net.serve_fn` — replaced `tiny_http` with
   hyper 1.x + tokio multi-thread runtime.** The blocking,
