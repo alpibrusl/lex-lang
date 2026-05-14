@@ -9,6 +9,17 @@ bumps may carry breaking changes when justified).
 
 ### Performance
 
+- **#389 (slice 2): VM `GetField` — monomorphic inline cache.** Each
+  `Op::GetField` bytecode site now carries a per-call-site cache entry
+  keyed by `(fn_id, pc)`. On a hit the VM verifies the field name at the
+  cached `IndexMap` offset in O(1) (one array index + string pointer
+  comparison) and skips the hash-table lookup entirely. On a miss (first
+  access or shape change) it falls back to `IndexMap::get_full`, stores the
+  offset, and subsequent accesses are O(1). This eliminates the field-name
+  hash on every record access; typical Lex-web handlers touch 6–10 record
+  fields per request (Request, Response, Ctx, RouteRecord …), so the
+  savings compound tightly on high-RPS paths.
+
 - **#405: `list.cons` — O(n²) → O(n) for accumulation loops.** Changed
   `Value::List` backing store from `Vec<Value>` to `VecDeque<Value>`.
   `list.cons` now uses `VecDeque::push_front` (O(1) amortized) instead of

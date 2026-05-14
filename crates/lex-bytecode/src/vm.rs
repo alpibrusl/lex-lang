@@ -151,6 +151,13 @@ pub struct Vm<'a> {
     /// Diagnostic counters for `--trace` observability (#229).
     pub pure_memo_hits: u64,
     pub pure_memo_misses: u64,
+    /// Monomorphic inline caches for `Op::GetField` (#389 slice 2).
+    /// Key: `(fn_id as u64) << 32 | pc as u64` — one entry per
+    /// call site. Value: the IndexMap offset of the field at that
+    /// site. On a hit we verify the field name at the cached offset
+    /// in O(1) and skip the hash-table lookup entirely; on a miss we
+    /// fall back to `IndexMap::get_full` and populate the cache.
+    field_ics: std::collections::HashMap<u64, usize>,
 }
 
 struct Frame {
@@ -443,6 +450,7 @@ impl<'a> Vm<'a> {
             pure_memo: std::collections::HashMap::new(),
             pure_memo_hits: 0,
             pure_memo_misses: 0,
+            field_ics: std::collections::HashMap::new(),
         }
     }
 
@@ -652,18 +660,40 @@ impl<'a> Vm<'a> {
                     self.stack.push(Value::Variant { name, args });
                 }
                 Op::GetField(i) => {
-                    let name = match &self.program.constants[i as usize] {
-                        Const::FieldName(s) => s.clone(),
-                        _ => return Err(VmError::TypeMismatch("expected FieldName const".into())),
-                    };
+                    let name_idx = i;
                     let v = self.pop()?;
                     match v {
                         Value::Record(r) => {
-                            let v = r.get(&name).cloned()
-                                .ok_or_else(|| VmError::TypeMismatch(format!("missing field `{name}`")))?;
-                            self.stack.push(v);
+                            // Inline cache keyed by call site: (fn_id << 32 | pc).
+                            // On hit: verify field name at cached offset (O(1), no
+                            // string hash); on miss: walk by name + populate cache.
+                            let site = (fn_id as u64) << 32 | pc as u64;
+                            let value = 'ic: {
+                                if let Some(&off) = self.field_ics.get(&site) {
+                                    if let Some((k, val)) = r.get_index(off) {
+                                        if let Const::FieldName(s) =
+                                            &self.program.constants[name_idx as usize]
+                                        {
+                                            if s == k { break 'ic val.clone(); } // cache hit
+                                        }
+                                    }
+                                }
+                                // Cache miss: resolve by name, populate IC.
+                                let name = match &self.program.constants[name_idx as usize] {
+                                    Const::FieldName(s) => s.as_str(),
+                                    _ => return Err(VmError::TypeMismatch(
+                                        "expected FieldName const".into())),
+                                };
+                                let (off, _, val) = r.get_full(name)
+                                    .ok_or_else(|| VmError::TypeMismatch(
+                                        format!("missing field `{name}`")))?;
+                                self.field_ics.insert(site, off);
+                                val.clone()
+                            };
+                            self.stack.push(value);
                         }
-                        other => return Err(VmError::TypeMismatch(format!("GetField on non-record: {other:?}"))),
+                        other => return Err(VmError::TypeMismatch(
+                            format!("GetField on non-record: {other:?}"))),
                     }
                 }
                 Op::GetElem(i) => {
