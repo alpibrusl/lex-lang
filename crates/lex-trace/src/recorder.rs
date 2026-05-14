@@ -172,7 +172,7 @@ fn value_to_json(v: &Value) -> serde_json::Value {
         Value::Int(n) => J::from(*n),
         Value::Float(f) => J::from(*f),
         Value::Bool(b) => J::Bool(*b),
-        Value::Str(s) => J::String(s.clone()),
+        Value::Str(s) => J::String(s.to_string()),
         Value::Bytes(b) => J::String(b.iter().map(|b| format!("{:02x}", b)).collect()),
         Value::Unit => J::Null,
         Value::List(items) => J::Array(items.iter().map(value_to_json).collect()),
@@ -241,7 +241,7 @@ pub(crate) fn json_to_value(v: &serde_json::Value) -> Value {
             else if let Some(f) = n.as_f64() { Value::Float(f) }
             else { Value::Unit }
         }
-        J::String(s) => Value::Str(s.clone()),
+        J::String(s) => Value::Str(s.as_str().into()),
         J::Array(items) => Value::List(items.iter().map(json_to_value).collect()),
         J::Object(map) => {
             // Detect the $variant shape we emit on the way out.

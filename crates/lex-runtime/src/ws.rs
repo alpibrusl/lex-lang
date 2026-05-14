@@ -199,9 +199,9 @@ fn run_loop(
 
 fn build_ws_event(conn_id: u64, room: &str, body: &str) -> Value {
     let mut rec = IndexMap::new();
-    rec.insert("body".into(), Value::Str(body.to_string()));
+    rec.insert("body".into(), Value::Str(body.into()));
     rec.insert("conn_id".into(), Value::Int(conn_id as i64));
-    rec.insert("room".into(), Value::Str(room.to_string()));
+    rec.insert("room".into(), Value::Str(room.into()));
     Value::Record(rec)
 }
 
@@ -210,15 +210,15 @@ fn build_ws_event(conn_id: u64, room: &str, body: &str) -> Value {
 /// Build a `WsConn` record value for the typed closure-based handler.
 fn build_ws_conn(conn_id: u64, path: &str, subprotocol: &str) -> Value {
     let mut rec = IndexMap::new();
-    rec.insert("id".into(), Value::Str(conn_id.to_string()));
-    rec.insert("path".into(), Value::Str(path.to_string()));
-    rec.insert("subprotocol".into(), Value::Str(subprotocol.to_string()));
+    rec.insert("id".into(), Value::Str(conn_id.to_string().into()));
+    rec.insert("path".into(), Value::Str(path.into()));
+    rec.insert("subprotocol".into(), Value::Str(subprotocol.into()));
     Value::Record(rec)
 }
 
 /// Build a `WsMessage` variant value.
 fn build_ws_message_text(body: &str) -> Value {
-    Value::Variant { name: "WsText".into(), args: vec![Value::Str(body.to_string())] }
+    Value::Variant { name: "WsText".into(), args: vec![Value::Str(body.into())] }
 }
 
 fn build_ws_message_close() -> Value {
@@ -249,7 +249,7 @@ fn apply_ws_action<S: std::io::Read + std::io::Write>(
                 Some(Value::Str(s)) => s.clone(),
                 _ => return Err("WsSend payload must be Str".into()),
             };
-            ws.send(Message::Text(text.into()))
+            ws.send(Message::Text(text.to_string().into()))
                 .map_err(|e| format!("ws send: {e}"))
         }
         Value::Variant { name, args } if name == "WsSendBinary" => {
@@ -437,7 +437,7 @@ fn build_dial_result(ok: Result<(), String>) -> Value {
         },
         Err(msg) => Value::Variant {
             name: "Err".into(),
-            args: vec![Value::Str(msg)],
+            args: vec![Value::Str(msg.into())],
         },
     }
 }

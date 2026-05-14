@@ -42,6 +42,7 @@ thiserror = "2"
 anyhow = "1"
 logos = "0.16"
 indexmap = { version = "2", features = ["serde"] }
+smol_str = { version = "0.3", features = ["serde"] }
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast"] }
 getrandom = "0.4"
 hex = "0.4"

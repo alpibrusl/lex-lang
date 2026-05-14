@@ -15,6 +15,7 @@
 //!     to invoke it on the parsed result.
 
 use crate::Value;
+use smol_str::SmolStr;
 
 /// Trait the parser interpreter uses to invoke captured closures
 /// during the recursive walk. The Vm implements it via
@@ -74,7 +75,7 @@ pub fn run_parser(
         "Digit" => {
             if let Some(&b) = bytes.get(pos) {
                 if b.is_ascii_digit() {
-                    return Ok((Value::Str((b as char).to_string()), pos + 1));
+                    return Ok((Value::Str(SmolStr::new_inline(&(b as char).to_string())), pos + 1));
                 }
             }
             Err((pos, "expected digit".into()))
@@ -82,7 +83,7 @@ pub fn run_parser(
         "Alpha" => {
             if let Some(&b) = bytes.get(pos) {
                 if b.is_ascii_alphabetic() {
-                    return Ok((Value::Str((b as char).to_string()), pos + 1));
+                    return Ok((Value::Str(SmolStr::new_inline(&(b as char).to_string())), pos + 1));
                 }
             }
             Err((pos, "expected alpha".into()))
@@ -90,7 +91,7 @@ pub fn run_parser(
         "Whitespace" => {
             if let Some(&b) = bytes.get(pos) {
                 if b.is_ascii_whitespace() {
-                    return Ok((Value::Str((b as char).to_string()), pos + 1));
+                    return Ok((Value::Str(SmolStr::new_inline(&(b as char).to_string())), pos + 1));
                 }
             }
             Err((pos, "expected whitespace".into()))

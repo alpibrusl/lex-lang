@@ -2,6 +2,7 @@
 
 use crate::program::BodyHash;
 use indexmap::IndexMap;
+use smol_str::SmolStr;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
@@ -21,7 +22,10 @@ pub enum Value {
     Int(i64),
     Float(f64),
     Bool(bool),
-    Str(String),
+    /// String value. `SmolStr` stores strings ≤ 22 bytes inline — no heap
+    /// allocation for identifiers, HTTP methods, status codes, short keys, etc.
+    /// Clone of a short `SmolStr` is a 24-byte stack copy (#389 slice 4).
+    Str(SmolStr),
     Bytes(Vec<u8>),
     Unit,
     List(VecDeque<Value>),
@@ -119,7 +123,7 @@ pub enum MapKey {
 impl MapKey {
     pub fn from_value(v: &Value) -> Result<Self, String> {
         match v {
-            Value::Str(s) => Ok(MapKey::Str(s.clone())),
+            Value::Str(s) => Ok(MapKey::Str(s.to_string())),
             Value::Int(n) => Ok(MapKey::Int(*n)),
             other => Err(format!(
                 "map/set key must be Str or Int, got {other:?}")),
@@ -127,13 +131,13 @@ impl MapKey {
     }
     pub fn into_value(self) -> Value {
         match self {
-            MapKey::Str(s) => Value::Str(s),
+            MapKey::Str(s) => Value::Str(s.into()),
             MapKey::Int(n) => Value::Int(n),
         }
     }
     pub fn as_value(&self) -> Value {
         match self {
-            MapKey::Str(s) => Value::Str(s.clone()),
+            MapKey::Str(s) => Value::Str(s.as_str().into()),
             MapKey::Int(n) => Value::Int(*n),
         }
     }
@@ -181,7 +185,7 @@ impl Value {
             Value::Int(n) => J::from(*n),
             Value::Float(f) => J::from(*f),
             Value::Bool(b) => J::Bool(*b),
-            Value::Str(s) => J::String(s.clone()),
+            Value::Str(s) => J::String(s.to_string()),
             Value::Bytes(b) => {
                 let hex: String = b.iter().map(|b| format!("{:02x}", b)).collect();
                 let mut m = serde_json::Map::new();
@@ -268,7 +272,7 @@ impl Value {
                 else if let Some(f) = n.as_f64() { Value::Float(f) }
                 else { Value::Unit }
             }
-            J::String(s) => Value::Str(s.clone()),
+            J::String(s) => Value::Str(s.as_str().into()),
             J::Array(items) => Value::List(items.iter().map(Value::from_json).collect::<VecDeque<_>>()),
             J::Object(map) => {
                 if let (Some(J::String(name)), Some(J::Array(args))) =
