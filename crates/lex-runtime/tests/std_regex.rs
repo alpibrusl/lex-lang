@@ -20,7 +20,7 @@ fn run(src: &str, fn_name: &str, args: Vec<Value>) -> Value {
 
 fn s(v: Value) -> String {
     match v {
-        Value::Str(s) => s,
+        Value::Str(s) => s.to_string(),
         other => panic!("expected Str, got {other:?}"),
     }
 }
@@ -37,7 +37,7 @@ fn list_of_strs(v: Value) -> Vec<String> {
         Value::List(items) => items
             .into_iter()
             .map(|i| match i {
-                Value::Str(s) => s,
+                Value::Str(s) => s.to_string(),
                 other => panic!("expected Str in list, got {other:?}"),
             })
             .collect(),

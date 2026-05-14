@@ -36,7 +36,7 @@ fn bytes(v: Value) -> Vec<u8> {
     match v { Value::Bytes(b) => b, other => panic!("expected Bytes, got {other:?}") }
 }
 fn s(v: Value) -> String {
-    match v { Value::Str(x) => x, other => panic!("expected Str, got {other:?}") }
+    match v { Value::Str(x) => x.to_string(), other => panic!("expected Str, got {other:?}") }
 }
 fn b(v: Value) -> bool {
     match v { Value::Bool(x) => x, other => panic!("expected Bool, got {other:?}") }

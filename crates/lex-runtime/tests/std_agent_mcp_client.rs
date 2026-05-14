@@ -90,7 +90,7 @@ fn check_remotely(server :: Str, source :: Str) -> [mcp] Result[Str, Str] {
     // trivial but non-empty fn so success is unambiguous.
     let lex_src = r#"fn id(n :: Int) -> Int { n }"#;
     let v = run_program(src, "check_remotely",
-        vec![Value::Str(server_cmd), Value::Str(lex_src.to_string())],
+        vec![Value::Str(server_cmd.into()), Value::Str(lex_src.to_string().into())],
         Policy::permissive());
     match &v {
         Value::Variant { name, args } if name == "Ok" => match &args[0] {

@@ -93,7 +93,7 @@ fn exists_returns_true_for_a_real_path() {
     let v = run(
         SRC,
         "does_exist",
-        vec![Value::Str(dir.to_string_lossy().to_string())],
+        vec![Value::Str(dir.to_string_lossy().to_string().into())],
         policy_walk_only(&dir),
     );
     assert_eq!(v, Value::Bool(true));
@@ -106,7 +106,7 @@ fn exists_returns_false_for_nonexistent_path() {
     let v = run(
         SRC,
         "does_exist",
-        vec![Value::Str(phantom.to_string_lossy().to_string())],
+        vec![Value::Str(phantom.to_string_lossy().to_string().into())],
         policy_walk_only(&dir),
     );
     assert_eq!(v, Value::Bool(false));
@@ -118,10 +118,10 @@ fn is_dir_distinguishes_dir_from_file() {
     let file = dir.join("a.txt");
     std::fs::write(&file, "hi").unwrap();
 
-    let v = run(SRC, "is_a_dir", vec![Value::Str(dir.to_string_lossy().to_string())], policy_walk_only(&dir));
+    let v = run(SRC, "is_a_dir", vec![Value::Str(dir.to_string_lossy().to_string().into())], policy_walk_only(&dir));
     assert_eq!(v, Value::Bool(true));
 
-    let v = run(SRC, "is_a_dir", vec![Value::Str(file.to_string_lossy().to_string())], policy_walk_only(&dir));
+    let v = run(SRC, "is_a_dir", vec![Value::Str(file.to_string_lossy().to_string().into())], policy_walk_only(&dir));
     assert_eq!(v, Value::Bool(false));
 }
 
@@ -135,7 +135,7 @@ fn walk_returns_recursive_path_count() {
     let v = run(
         SRC,
         "count_walk",
-        vec![Value::Str(dir.to_string_lossy().to_string())],
+        vec![Value::Str(dir.to_string_lossy().to_string().into())],
         policy_walk_only(&dir),
     );
     assert_eq!(v, Value::Int(4));
@@ -151,7 +151,7 @@ fn list_dir_returns_immediate_children_only() {
     let v = run(
         SRC,
         "list_dir_count",
-        vec![Value::Str(dir.to_string_lossy().to_string())],
+        vec![Value::Str(dir.to_string_lossy().to_string().into())],
         policy_walk_only(&dir),
     );
     assert_eq!(v, Value::Int(2));
@@ -164,7 +164,7 @@ fn mkdir_p_creates_nested() {
     let v = run(
         SRC,
         "make_dir",
-        vec![Value::Str(nested.to_string_lossy().to_string())],
+        vec![Value::Str(nested.to_string_lossy().to_string().into())],
         policy_walk_and_write(&root, &root),
     );
     assert_eq!(v, Value::Bool(true));
@@ -178,7 +178,7 @@ fn mkdir_p_outside_write_root_returns_err() {
     let v = run(
         SRC,
         "make_dir",
-        vec![Value::Str(outside.to_string_lossy().to_string())],
+        vec![Value::Str(outside.to_string_lossy().to_string().into())],
         policy_walk_and_write(&allowed, &allowed),
     );
     assert_eq!(v, Value::Bool(false));
@@ -192,7 +192,7 @@ fn stat_returns_size_of_file() {
     let v = run(
         SRC,
         "stat_size",
-        vec![Value::Str(file.to_string_lossy().to_string())],
+        vec![Value::Str(file.to_string_lossy().to_string().into())],
         policy_walk_only(&dir),
     );
     assert_eq!(v, Value::Int(6));
