@@ -7,6 +7,17 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Performance
+
+- **#405: `list.cons` — O(n²) → O(n) for accumulation loops.** Changed
+  `Value::List` backing store from `Vec<Value>` to `VecDeque<Value>`.
+  `list.cons` now uses `VecDeque::push_front` (O(1) amortized) instead of
+  Vec element-shifting (O(n)). Programs that build lists by prepending in
+  a loop — e.g. CSV parsing, group-by aggregation, recursive folds — drop
+  from O(n²) to O(n). All other list operations (`list.append`, indexing,
+  iteration, `list.sort`) are unchanged in complexity; `list.sort`
+  round-trips through a temporary Vec for the sort step.
+
 ## [0.9.3] — 2026-05-14
 
 ### Performance
