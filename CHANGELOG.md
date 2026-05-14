@@ -7,6 +7,8 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.9.3] — 2026-05-14
+
 ### Performance
 
 - **#388: `net.serve` / `net.serve_fn` — replaced `tiny_http` with
