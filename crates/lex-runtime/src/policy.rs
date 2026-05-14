@@ -51,6 +51,19 @@ impl Policy {
             // arrives with the per-capability effect parameterization
             // work (#207); the flat `[env]` is the v1 surface.
             "env",
+            // #399: keep this set in sync with every effect declared
+            // in `crates/lex-types/src/builtins.rs`. The "permissive"
+            // contract is "everything stdlib knows about"; missing
+            // entries here cause valid stdlib calls to fail under
+            // `lex test` / `lex repl` / any other consumer that opts
+            // into the permissive policy.
+            "sql",       // std.sql (#362, #379)
+            "random",    // crypto.random / crypto.random_str_hex (#382)
+            "chat",      // chat.broadcast / chat.send (#359)
+            "log",       // std.log structured logging
+            "kv",        // std.kv key-value store
+            "stream",    // std.stream
+            "fs_walk",   // std.fs directory traversal
         ] {
             s.insert(k.to_string());
         }
