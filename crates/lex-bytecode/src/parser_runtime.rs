@@ -127,7 +127,7 @@ pub fn run_parser(
                     _ => break,
                 }
             }
-            Ok((Value::List(out), cur))
+            Ok((Value::List(out.into()), cur))
         }
         "Optional" => {
             let p = rec.get("p").ok_or((pos, "optional: missing p".to_string()))?;

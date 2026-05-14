@@ -4,6 +4,7 @@ use crate::op::*;
 use crate::program::*;
 use crate::value::Value;
 use indexmap::IndexMap;
+use std::collections::VecDeque;
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum VmError {
@@ -639,7 +640,7 @@ impl<'a> Vm<'a> {
                 Op::MakeList(n) => {
                     let mut items: Vec<Value> = (0..n).map(|_| Value::Unit).collect();
                     for i in (0..n as usize).rev() { items[i] = self.pop()?; }
-                    self.stack.push(Value::List(items));
+                    self.stack.push(Value::List(items.into()));
                 }
                 Op::MakeVariant { name_idx, arity } => {
                     let mut args: Vec<Value> = (0..arity).map(|_| Value::Unit).collect();
@@ -751,7 +752,7 @@ impl<'a> Vm<'a> {
                     let list = self.pop()?;
                     match list {
                         Value::List(mut items) => {
-                            items.push(value);
+                            items.push_back(value);
                             self.stack.push(Value::List(items));
                         }
                         other => return Err(VmError::TypeMismatch(format!("ListAppend on non-list: {other:?}"))),
@@ -840,7 +841,7 @@ impl<'a> Vm<'a> {
                         keyed.push((key, item));
                     }
                     keyed.sort_by(|(ka, _), (kb, _)| compare_sort_keys(ka, kb));
-                    let sorted: Vec<Value> = keyed.into_iter().map(|(_, v)| v).collect();
+                    let sorted: VecDeque<Value> = keyed.into_iter().map(|(_, v)| v).collect();
                     self.stack.push(Value::List(sorted));
                 }
                 Op::ParallelMap { node_id_idx: _ } => {
@@ -881,8 +882,8 @@ impl<'a> Vm<'a> {
                                 .unwrap_or_else(|| Box::new(DenyAllEffects)),
                         );
                     }
-                    let results = par_map_run(self.program, f, items, worker_handlers)?;
-                    self.stack.push(Value::List(results));
+                    let results = par_map_run(self.program, f, items.into_iter().collect(), worker_handlers)?;
+                    self.stack.push(Value::List(results.into()));
                 }
                 Op::Call { fn_id, arity, node_id_idx } => {
                     let mut args: Vec<Value> = (0..arity).map(|_| Value::Unit).collect();
