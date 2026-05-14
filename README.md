@@ -2,119 +2,191 @@
 
 [![CI](https://github.com/alpibrusl/lex-lang/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/alpibrusl/lex-lang/actions/workflows/ci.yml)
 [![fuzz](https://github.com/alpibrusl/lex-lang/actions/workflows/fuzz.yml/badge.svg?branch=main)](https://github.com/alpibrusl/lex-lang/actions/workflows/fuzz.yml)
-[![tests](https://img.shields.io/badge/tests-1389_passing-success.svg)](#building-from-source)
 [![License: EUPL-1.2](https://img.shields.io/badge/license-EUPL--1.2-blue.svg)](LICENSE)
 [![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](#building-from-source)
 
 **The contract layer agents emit into.** Lex is a language plus an
-audit substrate purpose-built for the case where an LLM, not a
-human, is the primary author of source. Bodies are short-lived;
-what persists is the signature, the effect annotation, the
-content-addressed AST, and an append-only log of every operation
-and attestation that touched the code. Reviewers don't read every
-line — they read the contract and trust the substrate to enforce it.
+audit substrate purpose-built for the case where an LLM, not a human,
+is the primary author of source. Bodies are short-lived; what persists
+is the signature, the effect annotation, the content-addressed AST,
+and an append-only log of every operation and attestation that
+touched the code. Reviewers don't read every line — they read the
+contract and trust the substrate to enforce it.
 
-What makes that work, end-to-end:
+Lex is for the slice where **agents emit source, the runtime decides
+whether to run it, and the audit graph survives the next ten model
+upgrades.** Other slices (long-running services in Go/Rust, scripts
+in Python) compose with Lex rather than replace it — `lex serve` and
+`lex tool-registry` give you the embedding seams.
 
-- **Effects are types.** Every function declares the effects its
-  body uses (`[io]`, `[net]`, `[fs_write("/tmp/...")]`, `[budget(N)]`,
-  `[llm_cloud]`, …). The type checker refuses any body that reaches
-  outside the declaration *before a single byte runs*.
-- **Content-addressed AST.** Two programs that mean the same thing
-  hash to the same SigId; a body edit produces a new StageId. The
-  source text is a projection.
-- **Op log + attestation graph.** Every `AddFunction`,
-  `ModifyBody`, `ReplaceMatchArm`, `Merge`, `Candidate`, `Promote`
-  is a typed operation in a durable log. Every typecheck, spec
-  proof, example run, and repair attempt produces a signed
-  attestation against the stage it covered. `lex blame
-  --with-evidence` walks the chain.
-- **Repair loop.** When a transform fails typecheck, the gate
-  emits a `RepairHint` attestation carrying the structured
-  errors + a `suggested_transform` derived from a static
-  (rule_tag → typed-transform) table. `lex repair --apply` runs
-  the LLM-driven fix path; every attempt is recorded as a
-  `RepairAttempt` attestation.
-- **Cost-aware planner.** `lex plan --goal <fn> --max-cost N`
-  walks the call graph and ranks paths cheapest-first by declared
-  `[budget(N)]`. Multi-agent `Candidate`/`Promote` lets several
-  proposers race; the planner (or a downstream policy) picks the
-  winner.
+## The agent-code loop
 
-The conventional "general-purpose language" framing is here too —
-Lex/Core/Spec are a real toolchain you can write code in — but the
-load-bearing surface is the contract layer, not the syntax.
+Four moving pieces, end-to-end. Each one runs today; the full
+status-by-capability table lives in [§ Status](#status).
 
-**Lex** is the general-purpose surface; **Core** covers
-performance-critical work (sized numerics, tensor shapes); **Spec**
-carries proof annotations. Implementation of `langspecs.md`; this
-README focuses on what currently runs.
+### 1. Sandbox — effects-as-types, pre-execution rejection
 
-Full pitch lives at [`docs/index.html`](docs/index.html) (also published via GitHub Pages — see the repo About panel for the live URL).
+Every function declares its effects (`[io]`, `[net]`,
+`[fs_write("/tmp/...")]`, `[budget(N)]`, `[llm_cloud]`, …). The type
+checker refuses any body that reaches outside the declaration *before
+a single byte runs*.
 
-### How Lex compares for AI-emitted-code sandboxing
+```bash
+lex agent-tool --allow-effects net --input "x" \
+  --body 'match io.read("/etc/passwd") { Ok(s) => s, Err(e) => e }'
+# → TYPE-CHECK REJECTED — tool not run.
+#     effect `io` not declared at n_0
+#   exit 2
+```
 
-|  | Effect/permission model | Enforcement point | Audit substrate |
-|---|---|---|---|
-| **Lex** | Per-fn effect declarations (`[net]`, `[fs_write(...)]`, `[budget(N)]`, …) typed and checked statically | **Before execution** — type checker refuses the body | Content-addressed AST + op log + signed attestation graph |
-| WASM (component model, WASI 0.2) | Capability-per-instance (filesystem, sockets, env, …) granted by host at instantiation | Runtime trap on unwithdrawn capability | Per-instance; persistence is the host's problem |
-| Deno permissions (`--allow-*`) | Process-level allowlists (net hosts, fs paths, env vars) | Runtime prompt or refusal at syscall boundary | None built in; relies on shell history / wrapper |
-| Python `RestrictedPython` | AST rewrite + `safe_builtins` allowlist | Runtime `NameError` / `AttributeError` | None built in |
+Compare against in-process Python sandboxes — Lex blocks 7/7
+adversarial cases pre-execution; RestrictedPython blocks 3/7 and
+relies on runtime NameError for the rest. Full report (and the axis
+comparison against WASM / Deno / gVisor / Firecracker) in
+[`bench/REPORT.md`](bench/REPORT.md).
 
-The differentiator on the right column is what Lex specifically
-ships beyond the other three: every operation that changes a stage
-is a typed log entry, and every gate that approved or rejected it
-is a signed attestation that walks with the code.
+### 2. Repair — `RepairHint` → `lex repair --apply` → typed transform
+
+When a transform fails type-check, the gate emits a `RepairHint`
+attestation carrying the structured errors plus a `suggested_transform`
+derived from a static `(rule_tag → typed-transform)` table. The LLM
+fix path runs as a typed op, not free-text source rewriting.
+
+```bash
+lex --output json repair <failed_op_id> \
+  --apply --transform '<transform_json>' --store .lex-store
+# → {"outcome":"passed","applied_op_id":"op_..."}
+```
+
+Every attempt — success or failure — lands as a `RepairAttempt`
+attestation linked to the originating hint, so the chain is
+queryable later via `lex blame --with-evidence`.
+
+### 3. Typed-transform VCS — content-addressed stages, structural diff
+
+The store is an append-only log of typed operations (`AddFunction`,
+`ModifyBody`, `ReplaceMatchArm`, `Merge`, `Candidate`, `Promote`, …),
+each producing a `RepairAttempt` / `TypeCheck` / `Spec` /
+`SandboxRun` attestation. Branches are SigId → StageId snapshots
+backed by the same log.
+
+```bash
+lex publish --activate src/route.lex            # Op: ModifyBody
+lex branch create feature
+lex store-merge feature main --commit           # 3-way structural merge
+lex blame route --with-evidence                 # walk the attestation chain
+```
+
+Conflicts surface as JSON, not `<<<<<< HEAD` markers. Body-level
+merge is per-stage today; sub-body merge is deferred to tier-3
+(see [§ Deferred](#status)).
+
+### 4. Coordination — session budgets, ProducerTrust, multi-agent
+
+Multiple proposers race via `Candidate` / `Promote` without CAS
+contention. Per-session budget gates the cost across all participating
+agents; `ProducerTrust` scores tools across a rolling window of
+attestations.
+
+```bash
+# Budget exceeded surfaces as HTTP 503 with structured detail:
+curl -X POST localhost:4040/v1/run -d @body.json
+# HTTP/1.1 503 Service Unavailable
+# Retry-After: 0
+# {"error":"session 'sid_xyz' budget exceeded (spent_after=450, cap=400)",
+#  "detail":{"kind":"budget_exceeded","cap":400,"spent_after":450}}
+
+# Recompute trust score for a tool against the last 1000 attestations:
+lex producer-trust recompute --tool weather-fetcher --window 1000
+# → {"tool":"weather-fetcher","ok":true,"attestation_id":"att_..."}
+
+# Cost-aware path planning — cheapest first:
+lex plan --goal generate_report --max-cost 500
+# plan from `generate_report` (effective cap: 500):
+#   session `sid_xyz`: remaining budget 380
+#   ok  cost=350 generate_report -> fetch -> summarize
+#   no  cost=905 generate_report -> fetch_full -> summarize [io]
+```
+
+`Retry-After: 0` on the budget path is the signal: don't retry as-is,
+raise the cap or refactor.
 
 ## Design rules at a glance
 
-1. **One canonical AST per meaning.** Two programs that mean the same thing have the same canonical AST and the same hash.
-2. **Local reasoning.** Any 30-line span is understandable using only types of called functions and stdlib documentation.
-3. **Effects are types.** Functions declare their effects in their signatures; the compiler enforces them; the runtime sandboxes them.
-4. **Errors are values.** No exceptions. `Result[T, E]` is the only error channel.
-5. **Determinism by default.** Same inputs + same effect responses produce the same outputs.
+1. **One canonical AST per meaning.** Two programs that mean the same
+   thing have the same canonical AST and the same hash. The full
+   contract — which edits preserve a SigId and which break it — is in
+   [`docs/design/canonicalization.md`](docs/design/canonicalization.md).
+2. **Local reasoning.** Any 30-line span is understandable using only
+   the types of called functions and stdlib documentation.
+3. **Effects are types.** Functions declare their effects in their
+   signatures; the compiler enforces them; the runtime sandboxes them.
+4. **Errors are values.** No exceptions. `Result[T, E]` is the only
+   error channel.
+5. **Determinism by default.** Same inputs + same effect responses
+   produce the same outputs.
 6. **Immutability by default.** Mutation lives in Core, not Lex.
-7. **Small total surface.** Grammar fits in ≤ 500 tokens; stdlib index ≤ 2000.
+7. **Small total surface.** Grammar fits in ≤ 500 tokens; stdlib index
+   ≤ 2000.
 8. **The AST is the interface.** Source text is a projection.
 
-### Signature-level examples
+## Library landscape
 
-A pure function can carry an optional `examples { ... }` block. Each case
-is folded into the canonical AST, so the **examples are part of the
-signature's identity** — two implementations with different example sets
-hash to different SigIds. The type checker validates every case before a
-byte runs.
+Lex ships a stdlib for the slice it owns — agent-emitted handlers,
+tools, and orchestrators.
+
+| Module | Surface | Effect kind |
+|---|---|---|
+| **`std.http`** | Rich client with builders + decoders; `get` / `post` / `send`; per-host scopes | `[net]` (per-host scoped) |
+| **`std.sql`** | Embedded SQLite **or** Postgres (`postgres://...`) under one API; per-connection locking | `[sql, fs_write]` |
+| **`std.kv`** | Persistent key-value store via sled | `[kv, fs_write]` |
+| **`std.crypto`** | SHA-256/512, BLAKE2b, HMAC, AES-GCM / ChaCha20-Poly1305 AEAD, PBKDF2 / HKDF / Argon2id KDFs, base64 / base64url / hex, constant-time `eq` | pure (KDFs / hashes) ; `[random]` for CSPRNG |
+| **`std.conc`** | First-class actors (`conc.spawn` / `conc.ask` / `conc.tell`) — synchronous mailbox model, handler runs on caller's thread | `[concurrent]` |
+| **`std.flow`** | `flow.sequential` / `flow.branch` / `flow.parallel_list` orchestration combinators | inherits caller's effects |
+| **`std.regex`** | Compiled regex against `re2` syntax | pure |
+| **`std.toml`** / **`std.csv`** / **`std.yaml`** | Config / data parsers, polymorphic on the parsed shape | pure |
+| **`std.datetime`** | Typed `Instant` + `Duration`; ordering and arithmetic | `[time]` for `now` |
+| **`std.list`** / **`std.map`** / **`std.set`** / **`std.option`** / **`std.result`** / **`std.tuple`** / **`std.str`** | Persistent collections, HOFs with effect polymorphism on the closure | pure |
+
+Full per-module signatures live in
+[`crates/lex-types/src/builtins.rs`](crates/lex-types/src/builtins.rs).
+
+### Actors and SQL — concrete
 
 ```lex
-fn factorial(n :: Int) -> Int
-  examples {
-    factorial(0) => 1,
-    factorial(5) => 120,
-  }
-{
-  match n {
-    0 => 1,
-    _ => n * factorial(n - 1),
-  }
+import "std.conc" as conc
+
+fn counter(state :: Int, msg :: Int) -> (Int, Int) {
+  let next := state + msg
+  (next, next)        # (new state, reply)
+}
+
+fn use_counter() -> [concurrent] Int {
+  let a := conc.spawn(0, counter)
+  let _ := conc.ask(a, 5)     # state becomes 5, reply 5
+  conc.ask(a, 3)              # state becomes 8, reply 8
 }
 ```
 
-v1 restricts the block to functions with no declared effects (rule 5 —
-determinism). See [issue #369](https://github.com/alpibrusl/lex-lang/issues/369)
-for the design and follow-ups (behavioral evaluation, mocked effects).
+```lex
+import "std.sql" as sql
+
+fn pg_users(conn :: Str) -> [sql, fs_write] Result[List[{ id :: Int, name :: Str }], SqlError] {
+  match sql.open(conn) {                  # accepts "postgres://...", ":memory:", or filepath
+    Ok(db) => sql.query(db, "SELECT id, name FROM users ORDER BY id", []),
+    Err(e) => Err(e),
+  }
+}
+```
 
 ## Quickstart
 
 ```bash
 # Build the toolchain.
 cargo build --release
-
-# Add the binary to your path (or invoke ./target/release/lex directly).
 export PATH="$(pwd)/target/release:$PATH"
 
-# Type-check a program. Pure programs print `ok`; non-pure ones add
-# the effects you'll need to grant when running, plus a suggested
-# `lex run` command.
+# Type-check a program. Non-pure programs get an effects hint.
 lex check examples/a_factorial.lex
 # → ok
 lex check examples/c_echo.lex
@@ -126,53 +198,28 @@ lex check examples/c_echo.lex
 lex run examples/a_factorial.lex factorial 5
 # → 120
 
-# Variants are passed as `{"$variant": "Name", "args": [...]}` —
-# the same shape the runtime emits on output, so `lex run` results
-# can be piped back as inputs to other calls.
-lex run examples/b_parse_int.lex double_input '"21"'
-# → {"$variant":"Ok","args":[42]}
-
 # Run a program that uses effects (the runtime refuses without a grant).
-lex run examples/c_echo.lex echo '"hello, lex"'
-# → {"kind":"effect_not_allowed", ...}; exit 3
 lex run --allow-effects io examples/c_echo.lex echo '"hello, lex"'
 # → hello, lex
 
-# Capture a trace to disk and inspect / replay it.
+# Capture and inspect a trace.
 lex run --trace examples/a_factorial.lex factorial 5
 # → trace saved: 6d2e8187...
 lex trace 6d2e8187...
 
-# Publish stages to the content-addressed store, list them, fetch one.
-lex publish --activate examples/a_factorial.lex
-lex store list
-lex store get <stage_id>
-
-# Run the conformance harness against the canonical descriptors.
-lex conformance conformance/
-
 # Start the agent API server (HTTP/JSON, port 4040 by default).
 lex serve &
-
-# In another shell — type-check a snippet over HTTP:
 curl -sX POST http://localhost:4040/v1/check \
   -H 'content-type: application/json' \
   -d '{"source":"fn add(x :: Int, y :: Int) -> Int { x + y }"}'
 # → {"ok": true}
-
-# Run a function over HTTP with policy:
-curl -sX POST http://localhost:4040/v1/run \
-  -H 'content-type: application/json' \
-  -d '{"source":"fn add(x :: Int, y :: Int) -> Int { x + y }",
-       "fn":"add", "args":[2,3], "policy":{"allow_effects":[]}}'
-# → {"run_id":"...","output":5}
 ```
 
 ### Multi-file projects
 
 Local imports work the same way as `std.*`, just with a path:
 
-```bash
+```lex
 # models.lex
 type Status = Healthy | Sick
 fn label(s :: Status) -> Str {
@@ -181,67 +228,27 @@ fn label(s :: Status) -> Str {
 
 # main.lex
 import "./models" as m
-
 fn describe(s :: m.Status) -> Str { m.label(s) }
 ```
 
 ```bash
 lex check main.lex   # ok — both files are loaded and merged
-lex run main.lex describe '{"$variant":"Healthy","args":[]}'
 ```
 
 Path imports are resolved relative to the importer's directory; the
 `.lex` extension is auto-appended. `../`, `/abs/path.lex`, and
-multi-level nesting all work, with cycle detection that reports the
-full path chain. Stdlib imports are unchanged.
-
-The natural `types/ + behavior/ + runner/` layout works too: when
-two siblings each `import "./models" as m`, both reach the same
-`Report` nominal type — the loader keys mangling on the canonical
-filesystem path and dedupes second loads, so diamond-shaped imports
-collapse to one identity.
+multi-level nesting all work, with cycle detection.
 
 > Identity is per-file-path today: moving or renaming a `.lex` file
 > changes the prefix used in mangled names. The future
 > [store-native imports](https://github.com/alpibrusl/lex-lang/issues/82)
 > tracker is where content-addressed identity will eventually live.
 
-### Quickstart: agent-native tooling
-
-```bash
-# Sandbox an LLM-emitted tool body. Effects outside --allow-effects are
-# rejected at type-check, before any code runs.
-lex agent-tool --allow-effects net --input "x" \
-  --body 'match io.read("/etc/passwd") { Ok(s) => s, Err(e) => e }'
-# → TYPE-CHECK REJECTED — tool not run.   exit 2
-
-# Audit a codebase by structure: every fn that touches the network.
-lex audit --effect net examples/
-
-# AST-native diff. Renames register as "renamed", not "delete + add".
-lex ast-diff before.lex after.lex
-
-# Three-way structural merge. Conflicts are JSON, not <<<<<< HEAD markers.
-lex ast-merge base.lex ours.lex theirs.lex
-
-# Snapshot branches in the store. SigId → StageId map per branch;
-# three-way merge with structured JSON conflicts.
-lex branch create feature
-lex branch use feature
-# … publish edits to the feature branch …
-lex store-merge feature main          # preview the merge
-lex store-merge feature main --commit # apply when clean
-
-# Runtime tool registry: register Lex tools over HTTP, get back a stable
-# /tools/{id}/invoke endpoint with the effect manifest at /tools/{id}.
-lex tool-registry serve --port 8390
-```
-
 ### LLM-agnostic discovery
 
 Lex implements the [ACLI](https://github.com/alpibrusl/acli) spec, so
-**any** LLM agent (Claude Code, Codex, Gemini, Qwen, Mistral, ...)
-can discover the surface and call subcommands without a bespoke skill
+**any** LLM agent (Claude Code, Codex, Gemini, Qwen, Mistral, ...) can
+discover the surface and call subcommands without a bespoke skill
 file:
 
 ```bash
@@ -257,9 +264,64 @@ with semantic exit codes. The auto-generated `.cli/` folder is
 committed in this repo so agents browsing GitHub can read
 `commands.json` without running the binary.
 
-## Examples
+## Toolchain reference
 
-### 1. Factorial — recursion + pattern match
+The full table is regenerable via `lex --output json introspect`; the
+short list of agent-loop-critical commands:
+
+| Command | Purpose |
+|---|---|
+| `lex check [--strict] <file>` | Type-check; structured errors carry `file:line:col` + `rule_tag` + `suggested_transform` |
+| `lex run [policy] <file> <fn> [args]` | Execute under a capability policy |
+| `lex agent-tool --allow-effects k1,k2 --body '<src>'` | Sandbox an LLM-emitted tool body. `--examples` / `--spec` / `--diff-body` cover the correctness ladder |
+| `lex tool-registry serve [--port N]` | HTTP service to register Lex tools at runtime |
+| `lex publish [--activate] <file>` | Publish stages as typed `Operation`s into the store |
+| `lex repair <op_id> --apply --transform <json>` | Apply a typed-transform repair; lands a `RepairAttempt` attestation |
+| `lex plan --goal <fn> --max-cost N` | Rank call-graph paths cheapest-first by declared `[budget(N)]` |
+| `lex branch create/use/show` + `lex store-merge` | Branch + 3-way structural merge with JSON conflicts |
+| `lex blame <fn> --with-evidence` | Per-fn stage history + attestation chain |
+| `lex ast-diff` / `lex ast-merge` | AST-native diff and merge; renames register as renames, not delete+add |
+| `lex audit --effect K --calls FN --uses-host H` | Structural code search |
+| `lex stage promote-candidate <op_id>` | Multi-agent: promote a `Candidate` op to the branch head |
+| `lex producer-trust recompute --tool <id>` | Score a tool against its recent attestations |
+| `lex spec check <spec> --source <file>` | Property-check a Spec (randomized; SMT-LIB export via `lex spec smt`) |
+| `lex serve [--port N]` | Long-running HTTP/JSON API — the embedding seam |
+| `lex introspect` / `lex skill` / `lex version` | ACLI discovery |
+
+### Policy flags
+
+```
+--allow-effects k1,k2,...   permit these effect kinds (io, net, time, rand, ...)
+--allow-fs-read PATH        (repeatable) permit fs_read under PATH
+--allow-fs-write PATH       (repeatable) permit fs_write under PATH
+--allow-net-host HOST       (repeatable) permit net.* against HOST only
+--budget N                  cap aggregate declared budget
+```
+
+## Agent API (`lex serve`)
+
+A long-running HTTP/JSON server that exposes the same operations as
+the CLI; agents don't pay setup cost per request. Highlights:
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /v1/check` | `{source}` → `{ok}` or 422 with structured `TypeError` list (each carries `rule_tag` + `suggested_transform`) |
+| `POST /v1/publish` | `{source, activate?}` → per-fn `{name, sig_id, stage_id, status}` |
+| `POST /v1/run` | `{source, fn, args, policy}` → `{run_id, output}` or 403 / 503 with structured detail |
+| `POST /v1/patch` | `{stage_id, patch}` → `{new_stage_id}` (typed transforms applied server-side) |
+| `GET  /v1/stage/<id>/attestations` | Walk the attestation chain for a stage |
+| `POST /v1/merge/start` / `.../resolve` / `.../commit` | Stateful programmatic merge |
+
+Full list:
+[`docs/AGENT.md`](docs/AGENT.md).
+
+## Language tour
+
+If you're new to Lex syntax, this section is the orientation. None of
+it is load-bearing for the agent-code loop above — agents that emit
+Lex via the API don't need to look at it.
+
+### Factorial — recursion + pattern match
 
 ```
 fn factorial(n :: Int) -> Int {
@@ -270,12 +332,7 @@ fn factorial(n :: Int) -> Int {
 }
 ```
 
-```bash
-lex run examples/a_factorial.lex factorial 10
-# → 3628800
-```
-
-### 2. Parse and double — Result, pipes, lambdas
+### Result, pipes, lambdas
 
 ```
 import "std.str" as str
@@ -299,15 +356,7 @@ fn double_input(s :: Str) -> Result[Int, ParseError] {
 }
 ```
 
-```bash
-lex run examples/b_parse_int.lex double_input '"21"'
-# → {"$variant":"Ok","args":[42]}
-
-lex run examples/b_parse_int.lex double_input '""'
-# → {"$variant":"Err","args":[{"$variant":"Empty","args":[]}]}
-```
-
-### 3. Algebraic data types — structural patterns on records
+### Algebraic data types — structural patterns on records
 
 ```
 type Shape =
@@ -322,112 +371,55 @@ fn area(s :: Shape) -> Float {
 }
 ```
 
-A bare record pattern matches a nominal record alias too — useful
-for flat decision tables over a fixed set of fields:
+### Signature-level examples
 
-```
-type Bands = { idea :: Str, execution :: Str }
+A pure function can carry an optional `examples { ... }` block. Each
+case is folded into the canonical AST, so the **examples are part of
+the signature's identity** — two implementations with different
+example sets hash to different SigIds. The type checker validates
+every case before a byte runs.
 
-fn verdict(b :: Bands) -> Str {
-  match b {
-    { idea: "high", execution: "high" } => "ship",
-    { idea: "high", execution: _      } => "iterate",
-    _                                   => "park",
+```lex
+fn factorial(n :: Int) -> Int
+  examples {
+    factorial(0) => 1,
+    factorial(5) => 120,
+  }
+{
+  match n {
+    0 => 1,
+    _ => n * factorial(n - 1),
   }
 }
 ```
 
-### 4. Higher-order list ops — closures over outer state
+v1 restricts the block to functions with no declared effects (rule 5
+— determinism). See
+[issue #369](https://github.com/alpibrusl/lex-lang/issues/369) for the
+design and follow-ups.
 
-```
-import "std.list" as list
+### Higher-order list ops, closures, orchestration, effects, specs
 
-fn sum_even_squares(xs :: List[Int]) -> Int {
-  let evens   := list.filter(xs, fn (n :: Int) -> Bool { (n % 2) == 0 })
-  let squared := list.map(evens, fn (n :: Int) -> Int { n * n })
-  list.fold(squared, 0, fn (acc :: Int, x :: Int) -> Int { acc + x })
-}
-```
-
-`sum_even_squares([1, 2, 3, 4, 5, 6])` returns 56.
-
-### 5. Orchestration — `flow.branch` over `flow.sequential`
-
-```
-import "std.flow" as flow
-
-fn abs_double() -> (Int) -> Int {
-  flow.branch(
-    fn (n :: Int) -> Bool { n >= 0 },
-    flow.sequential(fn (n :: Int) -> Int { n },     fn (n :: Int) -> Int { n * 2 }),
-    flow.sequential(fn (n :: Int) -> Int { 0 - n }, fn (n :: Int) -> Int { n * 2 })
-  )
-}
-```
-
-The returned closure is itself a Lex value; pass it around or bind it to a stage and call later.
-
-### 6. Effects — `io.print` gated by capability policy
-
-```
-import "std.io" as io
-
-fn echo(line :: Str) -> [io] Nil {
-  io.print(line)
-}
-```
-
-```bash
-# Refused at the policy gate, before any code runs:
-lex run examples/c_echo.lex echo '"x"'
-# {"kind":"effect_not_allowed","detail":"effect `io` not in --allow-effects",
-#  "effect":"io","at":"echo"}
-# exit 3
-
-# With the grant:
-lex run --allow-effects io examples/c_echo.lex echo '"x"'
-# x
-```
-
-### 7. Specs — randomized property checking + SMT-LIB export
-
-```
-spec clamp {
-  forall x :: Int, lo :: Int, hi :: Int where lo <= hi:
-    let r := clamp(x, lo, hi)
-    (r >= lo) and (r <= hi)
-}
-```
-
-```bash
-lex spec check clamp.spec --source clamp.lex --trials 1000
-# {"spec_id":"...","status":"proved",
-#  "evidence":{"method":"randomized","trials":1000,...}}
-
-lex spec smt clamp.spec
-# (SMT-LIB 2 script for `z3 -smt2 -`)
-```
-
-### 8. Real-world examples
-
-Eight runnable example apps live in `examples/`:
+Runnable example apps live in `examples/`:
 
 | File | Shape |
 |---|---|
-| `weather_app.lex` | Single-handler REST API with [net]-only effects |
-| `chat_app.lex` | Multi-user WebSocket chat with [chat] effect + room registry |
-| `analytics_app.lex` | CSV → group-by → JSON over HTTP, with `--allow-fs-read` scope |
-| `ml_app.lex` | Linear + logistic regression trained on a 25-row CSV; `/predict_*` endpoints |
+| `weather_app.lex` | Single-handler REST API with `[net]`-only effects |
+| `chat_app.lex` | Multi-user WebSocket chat with `[chat]` effect + room registry |
+| `analytics_app.lex` | CSV → group-by → JSON over HTTP, `--allow-fs-read` scope |
+| `ml_app.lex` | Linear + logistic regression trained on a 25-row CSV |
 | `inbox_app.lex` | Webhook-driven typed-handler router (4 handlers, 4 effect signatures) |
 | `gateway_app.lex` | Multi-route service; each route has its own narrow effect set |
-| `agent_tool` (binary) | LLM-emitted tool sandbox — see `Sandboxing agent-generated code` below |
-| `tool-registry` (binary) | HTTP service for runtime tool registration with effect manifests |
+| `agent_merge/` | End-to-end multi-agent merge with `Candidate` / `Promote` |
 
-Each example header contains an *Adversarial scenario* spelling out what the runtime gates would reject and the verbatim error string.
+Each header carries an *Adversarial scenario* spelling out what the
+runtime gates would reject and the verbatim error string.
 
-### 9. Core — tensor shape solver
+### Core — sized numerics + tensor shape solver
 
-The Core sibling adds sized numerics (`U8`–`U64`, `I8`–`I64`, `F32`/`F64`) and tensors with type-level shape arithmetic. Shape mismatches are caught at compile time:
+The Core sibling adds sized numerics (`U8`–`U64`, `I8`–`I64`,
+`F32`/`F64`) and tensors with type-level shape arithmetic. Shape
+mismatches are caught at compile time:
 
 ```rust
 // Calling matmul with mismatched inner dims:
@@ -442,178 +434,148 @@ let cs = CoreStage {
 // → CoreError::ShapeMismatch { detail: "inner dim 4 ... doesn't match outer dim 5 ..." }
 ```
 
-A native `matmul` (via `matrixmultiply::dgemm`) is registered in Core's `NativeRegistry` and callable from Lex.
+A native `matmul` (via `matrixmultiply::dgemm`) is registered in
+Core's `NativeRegistry` and callable from Lex.
 
-## Sandboxing agent-generated code
+## For adopters
 
-`lex agent-tool` asks Claude for a tool body, splices it into a fixed signature, and runs it under a declared effect set. The type checker rejects any body that reaches outside that set, **before a single byte runs**.
+### Where does Lex source come from?
 
-```bash
-lex agent-tool --allow-effects net \
-  --request 'fetch http://example.com and return its length'
-# → ok len=1256
+The default expectation is **agents emit Lex** — through
+`lex agent-tool`, `lex tool-registry`, or programmatic calls against
+`POST /v1/publish`. Humans typically write the *contract* (function
+signature + `examples { ... }` + a `spec` if behaviour matters); the
+body is agent-populated and `lex repair --apply`-able.
 
-lex agent-tool --allow-effects net --input "x" \
-  --body 'match io.read("/etc/passwd") { Ok(s) => s, Err(e) => e }'
-# → TYPE-CHECK REJECTED — tool not run.
-#     effect `io` not declared at n_0
-#   exit 2
-```
+If you're hand-writing Lex from scratch, that path works too — the
+language stands on its own — but you're not in the optimisation
+target.
 
-Flags: `--body '<src>'` / `--body-file <path>` skip the API call; `--request '<q>'` needs `ANTHROPIC_API_KEY`. `--max-steps N` (default 1M) caps op count as a runtime DoS guard. `--allow-fs-read PATH` and `--allow-net-host HOST` add per-path / per-host scopes on top of `--allow-effects`. `--examples FILE` runs the tool against a JSON list of `{input, expected}` pairs (exit 5 on mismatch). `--spec FILE` proves a behavioral contract against the emitted body via the spec checker (exit 5 on counterexample, 6 on inconclusive). `--diff-body 'src'` / `--diff-body-file FILE` runs a second body on the same inputs and exits 7 on output divergence — regression detection across model upgrades.
+### Embedding
 
-### Adversarial benchmark
+- **`lex serve`** is the long-running HTTP/JSON seam. Owns one
+  `Store` instance; agents share it across requests.
+- **`lex tool-registry serve`** is the HTTP service for registering
+  Lex tools at runtime. `POST /tools` validates + stores;
+  `POST /tools/{id}/invoke` runs. Effect manifest is exposed at
+  `GET /tools/{id}` so callers can inspect what a tool will reach
+  before invoking it.
+- **`lex-tea`** (web browser) ships read-only HTML pages over the JSON
+  API at the same `lex serve` port: branch list at `/`, stage info +
+  attestation trail at `/web/stage/<id>`.
 
-|  | Actively blocked | Benign allowed | Mechanism |
-|---|---|---|---|
-| **Lex** | **7 / 7** | 2 / 2 | static effect typing — pre-execution |
-| Python (naive `exec`) | 0 / 7 | 2 / 2 | `__builtins__` allowlist + string blocklist |
-| Python (RestrictedPython) | 3 / 7 | 2 / 2 | AST rewrite + `safe_builtins` + `safer_getattr` |
+### Editor / IDE
 
-7 attacks + 2 benign cases through three sandboxes. Full report at [`bench/REPORT.md`](bench/REPORT.md); regenerate with `cargo test -p lex-cli --test agent_sandbox_bench`. The structural pitch — *opt-in granting from a sandboxed default* vs *opt-in restriction of an unrestricted base*, type-check rejection vs runtime NameError — is on the [project landing page](docs/index.html).
+`lex-lsp` is the Language Server. VS Code is supported today via the
+generic-LSP extension; setup notes are at
+[`crates/lex-lsp/README.md`](crates/lex-lsp/README.md). Features today:
+read-only diagnostics, navigation/hover, code-action QuickFix, inline-let
+refactor, and the `RepairHint` surface from the store.
 
-### Live demos
+### Pre-1.0 stability promise
 
-Two asciinema scripts ship under `bench/`:
+- **`OpId`s, `SigId`s, attestation hashes** can rotate at any minor
+  version pre-1.0. If your tooling keys on them across upgrades, pin a
+  Lex version.
+- **The Lex source language** (syntax + type rules) is stable within a
+  minor; deprecations get one minor of warning before removal.
+- **The CLI / HTTP API surface** follows the same minor-cadence rule;
+  semantic exit codes don't change.
+- **The on-disk Operation log format** is the V1 canonical form
+  documented in
+  [`crates/lex-vcs/src/canonical.rs`](crates/lex-vcs/src/canonical.rs).
+  Formal versioning is tracked by
+  [#244](https://github.com/alpibrusl/lex-lang/issues/244); until it
+  lands, treat the V1 rules as load-bearing.
 
-- **[`bench/RECORDING.md`](bench/RECORDING.md)** — `lex agent-tool` blocking
-  Claude-emitted code that tries to escape the declared effect set.
-- **[`bench/RECORDING_VC.md`](bench/RECORDING_VC.md)** — agent-native VC
-  walkthrough: ACLI discovery, structural diff with effect highlighting,
-  `lex branch` + `lex store-merge` with a JSON conflict, `lex log`,
-  `lex blame`. The workflow companion to the security demo.
+## Status
 
-Recorded `.cast` files live under `bench/` once captured; `agg` converts
-them to GIFs for README / Twitter / LinkedIn.
+Capability-grouped, ship-readiness-honest. The previous milestone
+table is preserved at the bottom of this section for historical
+context.
 
-## Toolchain reference
+| Capability | Status | Notes |
+|---|---|---|
+| Effect-typed sandbox + per-path / per-host scopes | **Production-ready** | `lex agent-tool` + `lex run`; 7/7 adversarial blocks in [`bench/REPORT.md`](bench/REPORT.md) |
+| Content-addressed AST + typed `Operation` log | **Production-ready** | Tier-2 VCS shipped (#129–#134) |
+| Typed transforms (`ReplaceMatchArm`, `RenameLocal`, `InlineLet`, `ExtractFunction`) | **Production-ready** | first-class ops, attested |
+| Closed repair loop (`lex repair --apply` + `RepairAttempt`) | **Production-ready** | LLM-driven; every attempt attested |
+| Cost-aware planner (`lex plan`) | **Production-ready** | #307 |
+| Multi-agent `Candidate` / `Promote` + `ProducerTrust` | **Production-ready** | #293–#294; no CAS contention |
+| Per-session budget gate | **Production-ready** | #292 + HTTP 503 `Retry-After: 0` |
+| `Stream[T]` + `agent.cloud_stream` | **Production-ready** | chunk-by-chunk LLM consumption |
+| `std.conc` actor model | **Production-ready** | #381; synchronous mailbox, mutex-serialised |
+| `std.sql` (SQLite + Postgres) | **Production-ready** | `:memory:`, file, or `postgres://...` URI |
+| `std.crypto` (AEAD, KDFs, hashes, MAC, encodings) | **Production-ready** | AES-GCM, ChaCha20-Poly1305, Argon2id, PBKDF2, HKDF |
+| `std.http` rich client | **Production-ready** | per-host scopes; builders + decoders |
+| `lex-lsp` (LSP — VS Code) | **Production-ready** | diagnostics, hover, QuickFix, RepairHint surface |
+| `lex-tea` web browser | **Production-ready** (read-only) | branches / fns / stage info |
+| Conformance harness + property tests | **Production-ready** | JSON descriptors at `conformance/` |
+| Fuzz CI (parser + type-checker) | **Production-ready** | 60s/PR, 5min nightly |
+| ACLI compliance (`lex introspect` / `skill` / `version`) | **Production-ready** | every subcommand has `--output text\|json\|table` + `--dry-run` |
+| Spec checker (randomized + SMT-LIB export) | **Production-ready** | in-process Z3 deferred |
+| `flow.parallel_list` | **Fixture-tested** | sequential v1; true OS-thread parallelism scoped behind `list.par_map` (#305) |
+| Core (sized numerics + tensor shapes + native matmul) | **Fixture-tested** | Cranelift JIT + source-level `mut` / `for` syntax deferred |
+| `flow.parallel_record` | **Deferred** | needs row polymorphism on records |
+| VCS tier-3 (federation, push/pull, body-level merge) | **Deferred** | [#173](https://github.com/alpibrusl/lex-lang/issues/173) |
+| JIT (interpreter slice 5) | **Deferred** | [#389](https://github.com/alpibrusl/lex-lang/issues/389) — slices 1–4 shipped |
+| In-process Z3 | **Deferred** | spec checker shells out today |
+| Store-native imports (content-addressed identity) | **Deferred** | [#82](https://github.com/alpibrusl/lex-lang/issues/82) |
 
-| Command | Purpose |
-|---|---|
-| `lex parse <file>` | Print the canonical AST as JSON |
-| `lex check [--strict] <file>` | Type-check; exit 0 or print structured errors. `--strict` runs additional lint passes: `STR_CMP` (ordering operators on Str literals) and `SHADOW_FN` (bindings that shadow a top-level fn). Exit 1 on warnings. |
-| `lex test [dir]` | Run all `test_*.lex` files in `dir` (default `tests/`). Each file must export `fn run_all() -> ()`. Exit non-zero on any failure. |
-| `lex repl [--load <file>...]` | Interactive evaluator. `--load` pre-loads source files into the session. `fn`/`type`/`import` extend the session; expressions are evaluated under a permissive policy. `.help`, `.list`, `.reset`, `.quit` |
-| `lex pkg init` | Create a starter `lex.toml` in the current directory |
-| `lex pkg add <name> (--path p \| --git url)` | Add or update a dependency in `lex.toml` |
-| `lex pkg list` | List declared dependencies |
-| `lex watch <file> [check\|run] [args...]` | Re-run on every save. Default action is `check`; `run` re-executes. Forwarded args (`--allow-effects ...`) pass through to the underlying subcommand |
-| `lex hash <file>` | Print SigId / StageId per stage |
-| `lex blame [--store DIR] <file>` | Per-fn stage history from the store: which StageId is currently in source, which is Active, predecessors with statuses + timestamps |
-| `lex run [policy] <file> <fn> [args]` | Execute a function (args are JSON) |
-| `lex publish [--store DIR] [--activate] <file>` | Publish stages to the content-addressed store |
-| `lex store list` / `lex store get <id>` | Browse the store |
-| `lex run --trace ...` | Save a trace tree under the store |
-| `lex trace <run_id>` | Print a saved trace tree |
-| `lex replay <run_id> <file> <fn> [args] [--override NODE=JSON]` | Re-execute with effect overrides |
-| `lex diff <run_a> <run_b>` | First NodeId where two traces diverge |
-| `lex conformance <dir>` | Run JSON test descriptors |
-| `lex spec check <spec> --source <file> [--trials N]` | Property-check a Spec |
-| `lex spec smt <spec>` | Emit SMT-LIB 2 for external Z3 |
-| `lex serve [--port N] [--store DIR]` | Run the agent HTTP/JSON API |
-| `lex agent-tool --allow-effects ks (--request 'q' \| --body 'src' \| --body-file F)` | Run an LLM-emitted tool body under declared effects |
-| `lex tool-registry serve [--port N]` | HTTP service to register Lex tools at runtime; `POST /tools` validates + stores, `POST /tools/{id}/invoke` runs |
-| `lex audit [paths...] [--effect K] [--calls FN] [--uses-host H] [--kind K]` | Structural code search by effect / call / hostname / AST kind. `--json` for agent-pipe output |
-| `lex ast-diff <file_a> <file_b> [--json] [--no-body]` | AST-native diff: added / removed / renamed / modified fns, plus body-level patches. Renames detected by body-hash with name normalized |
-| `lex ast-merge <base> <ours> <theirs> [--json] [--write PATH] [--dry-run]` | Three-way structural merge. Conflicts surface as JSON (4 kinds: modify-modify, modify-delete, delete-modify, add-add). Exit 2 on any conflict; `--write` materializes merged source when clean |
-| `lex branch <list \| show \| create \| delete \| use \| current> [--store DIR]` | Snapshot branches in the store. Each branch is a SigId → StageId map persisted at `<store>/branches/<name>.json`. Default `main` materializes from the existing lifecycle |
-| `lex store-merge <src> <dst> [--commit] [--json]` | Three-way merge between two branches; common ancestor is the source branch's `fork_base` snapshot, not the parent's current head. Conflict kinds match `ast-merge`. `--commit` applies a clean merge to dst |
-| `lex introspect [--output text\|json\|table]` | Full command tree per ACLI §1.2 (name, description, args, options, idempotency, examples, see-also). Auto-generated `.cli/commands.json` is also committed in the repo |
-| `lex skill` | agentskills.io-compliant Markdown for Claude Code / Codex / Gemini skill directories |
-| `lex version [--output json]` | Tool version + ACLI spec version, JSON-enveloped under `--output json` |
+**Workspace test count:** see CI badge above. `cargo clippy --workspace
+--all-targets -- -D warnings` is clean. Fuzz CI: 60 s/PR, 5 min
+nightly across both targets.
 
-### Policy flags (run / replay)
+<details>
+<summary>Historical milestone view (M0–M16)</summary>
 
-```
---allow-effects k1,k2,...   permit these effect kinds (io, net, time, rand, ...)
---allow-fs-read PATH        (repeatable) permit fs_read under PATH
---allow-fs-write PATH       (repeatable) permit fs_write under PATH
---budget N                  cap aggregate declared budget
-```
+The original milestone-by-milestone status table lived here before the
+v1.0 ship-readiness flatten. The capability-grouped view above is
+authoritative; the milestone view is preserved in git history at
+[main@1ece294](https://github.com/alpibrusl/lex-lang/blob/1ece294/README.md#status).
 
-## Agent API (`lex serve`)
-
-A long-running HTTP/JSON server that exposes the same operations as the CLI. The server owns a `Store` instance, so agents don't pay setup cost per request.
-
-| Endpoint | Purpose |
-|---|---|
-| `GET  /v1/health` | `{ok: true}` |
-| `POST /v1/parse` | `{source}` → CanonicalAst \| 4xx |
-| `POST /v1/check` | `{source}` → `{ok}` \| 422 with structured TypeError list |
-| `POST /v1/publish` | `{source, activate?}` → `[{name, sig_id, stage_id, status}, ...]` |
-| `POST /v1/patch` | `{stage_id, patch}` → `{new_stage_id}` \| 422 with structured TypeError list if the patched AST doesn't type-check |
-| `GET  /v1/stage/<id>` | `{metadata, ast, status}` |
-| `POST /v1/run` | `{source, fn, args, policy}` → `{run_id, output \| error}`; 403 with structured policy violation if disallowed |
-| `GET  /v1/trace/<run_id>` | TraceTree |
-| `POST /v1/replay` | `{source, fn, args, policy, overrides}` → `{run_id, output \| error}` |
-| `GET  /v1/diff?a=&b=` | `Divergence` \| `{divergence: null}` |
-
-All structured errors come back as `{error, detail?}` with details parseable by callers.
+</details>
 
 ## Repository layout
 
 ```
 lex/
 ├── crates/
-│   ├── lex-syntax/     # M1: lexer, parser, syntax tree, pretty-printer
-│   ├── lex-ast/        # M2: canonical AST, NodeIds, canonical-JSON, SigId/StageId
-│   ├── lex-types/      # M3: HM type checker + effect system
-│   ├── lex-bytecode/   # M4: bytecode definition, compiler, stack VM
-│   ├── lex-runtime/    # M5: capability policy, effect handlers, all stdlib builtins live here
-│   ├── lex-store/      # M6: content-addressed store (filesystem)
-│   ├── lex-trace/      # M7: trace tree + replay + diff
-│   ├── lex-stdlib/     # M11: reserved for stdlib stages-as-store-entries (currently a stub;
-│   │                   #      pure stdlib lives in lex-runtime/builtins.rs)
-│   ├── lex-cli/        # M8/M12: command-line tool (also hosts agent-tool, tool-registry,
-│   │                   #         audit, ast-diff, ast-merge subcommands)
-│   ├── lex-api/        # M8/M12: agent HTTP/JSON server
-│   ├── core-syntax/    # M13: Core lexer/parser (stub; reuses lex-syntax)
-│   ├── core-compiler/  # M9:  Core type system (shape solver, sized numerics, mut analysis, native matmul)
-│   ├── spec-checker/   # M10: Spec proof checker (randomized + SMT-LIB export)
-│   └── conformance/    # M16: conformance harness + property tests
-├── examples/           # Lex source examples used by tests and the harness
-├── conformance/        # JSON test descriptors (canonical acceptance suite)
+│   ├── lex-syntax/        # Lexer, parser, syntax tree, pretty-printer
+│   ├── lex-ast/           # Canonical AST, NodeIds, canonical-JSON, SigId/StageId
+│   ├── lex-types/         # HM type checker + effect system
+│   ├── lex-bytecode/      # Bytecode definition, compiler, stack VM
+│   ├── lex-runtime/       # Capability policy, effect handlers, stdlib builtins
+│   ├── lex-store/         # Content-addressed store (filesystem)
+│   ├── lex-vcs/           # Typed Operation log + attestations + merge
+│   ├── lex-trace/         # Trace tree + replay + diff
+│   ├── lex-lsp/           # Language server (VS Code via generic-LSP)
+│   ├── lex-search/        # Structural code search (`lex audit` backend)
+│   ├── lex-stdlib/        # Reserved for stdlib stages-as-store-entries (pure stdlib lives in lex-runtime)
+│   ├── lex-cli/           # CLI; also hosts agent-tool, tool-registry, audit, ast-diff, ast-merge, repair, plan
+│   ├── lex-api/           # Agent HTTP/JSON server + lex-tea web UI
+│   ├── core-syntax/       # Core lexer/parser (stub; reuses lex-syntax)
+│   ├── core-compiler/     # Core type system (shape solver, sized numerics, native matmul)
+│   ├── spec-checker/      # Spec proof checker (randomized + SMT-LIB export)
+│   └── conformance/       # Conformance harness + property tests
+├── examples/              # Lex source examples used by tests and the harness
+├── conformance/           # JSON test descriptors (canonical acceptance suite)
+├── bench/                 # Adversarial sandbox bench + recordings
 └── docs/
+    ├── AGENT.md           # Agent API reference
+    ├── QUICKSTART.md      # Five-minute tutorial
+    └── design/            # Design notes — canonicalization, trace-vs-vcs, etc.
 ```
-
-## Status
-
-| Milestone | Status |
-|---|---|
-| M0 — Skeleton | ✅ |
-| M1 — Lexer + parser | ✅ |
-| M2 — Canonical AST + NodeIds | ✅ |
-| M3 — Type checker (HM + effects) | ✅ |
-| M4 — Bytecode + VM | ✅ |
-| M5 — Effect runtime + capability layer | ✅ |
-| M6 — Content-addressed store | ✅ |
-| M7 — Trace tree + replay + diff | ✅ |
-| M8 — CLI + agent API server | ✅ |
-| M9 — Core | Phase 1 (shape solver, sized numerics) ✅ ; Phase 2 (mutation analysis, native matmul) ✅ ; Cranelift JIT, source-level `mut`/`for` syntax deferred |
-| M10 — Spec | ✅ randomized + SMT-LIB export ; `--spec` wired into `agent-tool` ; in-process Z3 deferred |
-| Stdlib MVP | ✅ pure builtins + closures + higher-order list ops + `std.flow` orchestration ; `std.math` (linalg + scalar floats) ; `std.tuple` ; **effect polymorphism** on `list.map` / `list.filter` / `list.fold` / `option.map` / `result.map` / `result.and_then` / `result.map_err` ; `flow.parallel` ✅ + **`flow.parallel_list` ✅** (sequential v1 — true threading deferred) ; **`std.map` ✅ ; `std.set` ✅** (persistent collections with `Str`/`Int` keys) ; **`map.fold` ✅** (three-arg HOF over entries) ; **`std.http` ✅** (rich client with builders + decoders, gated on `[net]`) ; **`std.toml` ✅** (TOML config parser, polymorphic on the parsed shape) ; **`std.sql` ✅** (embedded SQLite under `[sql, fs_write]` with per-handle locking) ; `flow.parallel_record` deferred (needs row polymorphism on records) |
-| Conformance harness + token budget | ✅ |
-| Agent integration (post-spec) | `lex agent-tool` (sandbox) ✅ ; `lex tool-registry serve` (HTTP registry) ✅ ; correctness ladder: `--examples` ✅ `--spec` ✅ `--diff-body` ✅ ; AST tooling: `lex audit` ✅ `lex ast-diff` (with effect-change highlighting) ✅ `lex ast-merge` ✅ ; **`lex blame` ✅** (per-fn stage history from the store) |
-| Agent-native version control | **tier-1 ✅** — `lex branch` + `lex store-merge` with structured JSON conflicts ; **`lex log` ✅** (per-branch merge journal). **Tier-2 ✅ — full agent-native VCS shipped**: typed `Operation` log as the store's source of truth (#129) ; write-time type-check gate `Store::publish_program` / `apply_operation_checked` (#130) ; first-class `Intent` provenance (#131) ; durable `Attestation` graph — `TypeCheck` / `Spec` / `Examples` / `DiffBody` / `EffectAudit` / `SandboxRun`, queryable via `lex blame --with-evidence`, `lex stage <id> --attestations`, `lex attest filter`, and `GET /v1/stage/<id>/attestations` (#132) ; **predicate-defined branches** with `peek` / `overlay` (#133) ; **stateful programmatic merge API** — `lex merge start \| resolve \| commit \| status` and `POST /v1/merge/{start, <id>/resolve, <id>/commit}` with all four resolution kinds incl. `Custom { op }` (#134). End-to-end example at `examples/agent_merge/`. Distributed sync + body-level merge deferred to tier-3. |
-| `lex-tea` (web browser) | **v1 ✅** — three read-only HTML pages over the JSON API: `/` (branch list), `/web/branch/<name>` (fns), `/web/stage/<id>` (stage info + attestation trail). Served by `lex serve` itself, no extra port. v2 (merge UI, comments via Intent, basic auth) tracked separately. |
-| LLM-agnostic discovery | ✅ — full [ACLI](https://github.com/alpibrusl/acli) compliance: `lex introspect` / `lex skill` / `lex version`, `--output text\|json\|table` on every subcommand, `--dry-run` on state-modifying ones, error envelopes with semantic exit codes |
-| Hardening | [`SECURITY.md`](SECURITY.md) threat model ✅ ; parser-recursion DoS gate (`MAX_DEPTH=96`) ✅ ; **VM call-stack depth gate (`MAX_CALL_DEPTH=1024`) ✅** ; libFuzzer CI for parser + type checker ✅ ; VM-level memory bounds remain delegated to the host (container memory caps) |
-| Agent-substrate (0.6.x – 0.8.x) | **typed transforms ✅** (`ReplaceMatchArm` / `RenameLocal` / `InlineLet` / `ExtractFunction` as first-class ops) ; **closed repair loop ✅** (`lex repair --apply` runs the LLM-driven fix; every attempt is a `RepairAttempt` attestation) ; **per-session budget gate ✅** (#292) with HTTP `503 Retry-After: 0` ; **positive `ProducerTrust` ✅** (#293) ; **multi-agent `Candidate`/`Promote` ✅** (#294 — race proposers without CAS contention) ; **position-aware errors + rule_tag + auto-populated `suggested_transform` ✅** (#306) — every type error carries `file:line:col`, a stable `rule_tag`, a plain-language `rule_explanation`, and a static transform suggestion the LLM can build from ; **`list.par_map` with OS-thread parallelism ✅** (#305) — effectful closures share the parent's budget pool via per-thread `EffectHandler` ; **`Stream[T]` + `agent.cloud_stream` ✅** — chunk-by-chunk LLM consumption ; **cost-aware planner `lex plan` ✅** (#307) — rank call-graph paths cheapest-first against `min(--max-cost, session-remaining)` ; **`+` overloaded for `Str` ✅** (#308) — `a + b` works for `Int`, `Float`, and `Str` operands; `-/*/%` remain numeric-only ; **`Str` ordering ✅** (#332) — `<`/`<=`/`>`/`>=` work end-to-end for `Str` operands ; **`list.cons` ✅** (#334) — O(1)-amortised prepend enabling the cons-then-reverse builder pattern ; **`datetime.before/after/compare` + `duration` module ✅** (#331) — typed `Instant` ordering and `Duration`→seconds extraction |
-
-**Workspace test count:** 1383 passing, 0 failing, 8 `#[ignore]`-d slow/flaky examples (run locally with `--ignored`). `cargo clippy --workspace --all-targets -- -D warnings` clean. Fuzz CI: 60 s/PR, 5 min nightly across both targets.
 
 ## Install
 
 **Pre-built binaries** (no Rust toolchain needed) are attached to
-[GitHub Releases](https://github.com/alpibrusl/lex-lang/releases)
-for Linux (x86_64 / aarch64), macOS (x86_64 / aarch64), and
-Windows (x86_64). Each archive contains the `lex` binary plus
-README / LICENSE / CHANGELOG. SHA-256 sums are uploaded alongside
-each tarball.
+[GitHub Releases](https://github.com/alpibrusl/lex-lang/releases) for
+Linux (x86_64 / aarch64), macOS (x86_64 / aarch64), and Windows
+(x86_64). Each archive contains the `lex` binary plus README /
+LICENSE / CHANGELOG. SHA-256 sums are uploaded alongside each tarball.
 
 ```bash
-# Pick the right archive for your platform from the Releases page,
-# then:
 tar -xzf lex-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz
 mv lex-vX.Y.Z-x86_64-unknown-linux-gnu/lex /usr/local/bin/
 lex version
@@ -625,7 +587,7 @@ Requires a recent Rust toolchain (any 1.80+ stable should work).
 
 ```bash
 cargo build --release       # full toolchain
-cargo test --workspace      # 1373 tests (+ 8 #[ignore]-d — `--ignored` to run locally)
+cargo test --workspace      # see CI badge for count; --ignored runs slow/flaky examples locally
 cargo test --release -p core-compiler -- --ignored   # release-only matmul perf gates
 
 # Optional: run the fuzz suite locally (nightly + cargo-fuzz needed).
