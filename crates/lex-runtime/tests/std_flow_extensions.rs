@@ -34,7 +34,7 @@ fn run3() -> List[Int] {
     let r = run(src, "run3", vec![]);
     assert_eq!(
         r,
-        Value::List(vec![Value::Int(7), Value::Int(11), Value::Int(13)])
+        Value::List(vec![Value::Int(7), Value::Int(11), Value::Int(13)].into())
     );
 }
 
@@ -47,7 +47,7 @@ fn run0() -> List[Int] {
 }
 "#;
     let r = run(src, "run0", vec![]);
-    assert_eq!(r, Value::List(vec![]));
+    assert_eq!(r, Value::List(vec![].into()));
 }
 
 #[test]
@@ -59,7 +59,7 @@ fn run1() -> List[Int] {
 }
 "#;
     let r = run(src, "run1", vec![]);
-    assert_eq!(r, Value::List(vec![Value::Int(42)]));
+    assert_eq!(r, Value::List(vec![Value::Int(42)].into()));
 }
 
 #[test]
@@ -82,7 +82,7 @@ fn run_caps() -> List[Int] {
     let r = run(src, "run_caps", vec![]);
     assert_eq!(
         r,
-        Value::List(vec![Value::Int(11), Value::Int(22), Value::Int(33)])
+        Value::List(vec![Value::Int(11), Value::Int(22), Value::Int(33)].into())
     );
 }
 
@@ -105,6 +105,6 @@ fn run_strs() -> List[Str] {
             Value::Str("alpha".into()),
             Value::Str("beta".into()),
             Value::Str("gamma".into()),
-        ])
+        ].into())
     );
 }

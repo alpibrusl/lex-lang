@@ -181,9 +181,9 @@ fn csv_parse_counts_rows() {
 #[test]
 fn csv_stringify_round_trips() {
     let rows = Value::List(vec![
-        Value::List(vec![Value::Str("a".into()), Value::Str("b".into())]),
-        Value::List(vec![Value::Str("1".into()), Value::Str("2".into())]),
-    ]);
+        Value::List(vec![Value::Str("a".into()), Value::Str("b".into())].into()),
+        Value::List(vec![Value::Str("1".into()), Value::Str("2".into())].into()),
+    ].into());
     let v = run(CSV_SRC, "round_trip", vec![rows]);
     match v {
         Value::Variant { name, args } if name == "Ok" => match &args[0] {

@@ -105,7 +105,7 @@ fn unfold_empty() -> List[Int] {
 
 #[test]
 fn from_list_and_to_list_roundtrip() {
-    let xs = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+    let xs = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)].into());
     let got = run(SRC, "from_list_to_list", vec![xs.clone()]);
     assert_eq!(got, xs);
 }
@@ -118,70 +118,70 @@ fn next_on_empty_iter_is_none() {
 
 #[test]
 fn next_returns_first_element() {
-    let xs = Value::List(vec![Value::Int(10), Value::Int(20)]);
+    let xs = Value::List(vec![Value::Int(10), Value::Int(20)].into());
     let got = run(SRC, "next_first_elem", vec![xs]);
     assert_eq!(got, Value::Variant { name: "Some".into(), args: vec![Value::Int(10)] });
 }
 
 #[test]
 fn take_limits_to_n_elements() {
-    let xs = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)]);
+    let xs = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)].into());
     let got = run(SRC, "take_two", vec![xs]);
-    assert_eq!(got, Value::List(vec![Value::Int(1), Value::Int(2)]));
+    assert_eq!(got, Value::List(vec![Value::Int(1), Value::Int(2)].into()));
 }
 
 #[test]
 fn take_beyond_length_returns_all() {
-    let xs = Value::List(vec![Value::Int(1), Value::Int(2)]);
+    let xs = Value::List(vec![Value::Int(1), Value::Int(2)].into());
     let got = run(SRC, "take_two", vec![xs.clone()]);
     assert_eq!(got, xs);
 }
 
 #[test]
 fn skip_advances_cursor() {
-    let xs = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)]);
+    let xs = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)].into());
     let got = run(SRC, "skip_two", vec![xs]);
-    assert_eq!(got, Value::List(vec![Value::Int(3), Value::Int(4)]));
+    assert_eq!(got, Value::List(vec![Value::Int(3), Value::Int(4)].into()));
 }
 
 #[test]
 fn skip_beyond_length_gives_empty() {
-    let xs = Value::List(vec![Value::Int(1), Value::Int(2)]);
+    let xs = Value::List(vec![Value::Int(1), Value::Int(2)].into());
     let got = run(SRC, "skip_two", vec![xs]);
-    assert_eq!(got, Value::List(vec![]));
+    assert_eq!(got, Value::List(vec![].into()));
 }
 
 #[test]
 fn is_empty_after_exhaustion() {
-    let xs = Value::List(vec![Value::Int(1), Value::Int(2)]);
+    let xs = Value::List(vec![Value::Int(1), Value::Int(2)].into());
     let got = run(SRC, "is_empty_after_take_all", vec![xs]);
     assert_eq!(got, Value::Bool(true));
 }
 
 #[test]
 fn count_returns_remaining_size() {
-    let xs = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+    let xs = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)].into());
     let got = run(SRC, "count_remaining", vec![xs]);
     assert_eq!(got, Value::Int(3));
 }
 
 #[test]
 fn map_doubles_elements() {
-    let xs = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+    let xs = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)].into());
     let got = run(SRC, "map_double", vec![xs]);
-    assert_eq!(got, Value::List(vec![Value::Int(2), Value::Int(4), Value::Int(6)]));
+    assert_eq!(got, Value::List(vec![Value::Int(2), Value::Int(4), Value::Int(6)].into()));
 }
 
 #[test]
 fn filter_keeps_even_numbers() {
-    let xs = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)]);
+    let xs = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)].into());
     let got = run(SRC, "filter_even", vec![xs]);
-    assert_eq!(got, Value::List(vec![Value::Int(2), Value::Int(4)]));
+    assert_eq!(got, Value::List(vec![Value::Int(2), Value::Int(4)].into()));
 }
 
 #[test]
 fn fold_sums_elements() {
-    let xs = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)]);
+    let xs = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)].into());
     let got = run(SRC, "fold_sum", vec![xs]);
     assert_eq!(got, Value::Int(10));
 }
@@ -190,9 +190,9 @@ fn fold_sums_elements() {
 fn chained_skip_and_take() {
     let xs = Value::List(vec![
         Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4), Value::Int(5),
-    ]);
+    ].into());
     let got = run(SRC, "chained_skip_take", vec![xs]);
-    assert_eq!(got, Value::List(vec![Value::Int(2), Value::Int(3)]));
+    assert_eq!(got, Value::List(vec![Value::Int(2), Value::Int(3)].into()));
 }
 
 // --- #376: iter.unfold ----------------------------------------------
@@ -207,7 +207,7 @@ fn unfold_terminates_when_step_returns_none() {
     );
     assert_eq!(
         got,
-        Value::List(vec![Value::Int(0), Value::Int(1), Value::Int(2), Value::Int(3)])
+        Value::List(vec![Value::Int(0), Value::Int(1), Value::Int(2), Value::Int(3)].into())
     );
 }
 
@@ -218,7 +218,7 @@ fn unfold_zero_range_produces_empty_list() {
         "unfold_range_to_list",
         vec![Value::Int(5), Value::Int(5)],
     );
-    assert_eq!(got, Value::List(vec![]));
+    assert_eq!(got, Value::List(vec![].into()));
 }
 
 #[test]
@@ -228,12 +228,12 @@ fn unfold_next_advances_the_seed() {
     // distinct elements, not the same one. Catches a copy-paste bug
     // where the dispatch loops back on the same seed.
     let got = run(SRC, "unfold_first_two", vec![Value::Int(10)]);
-    assert_eq!(got, Value::List(vec![Value::Int(10), Value::Int(11)]));
+    assert_eq!(got, Value::List(vec![Value::Int(10), Value::Int(11)].into()));
 }
 
 #[test]
 fn unfold_empty_step_yields_empty_list() {
     // A step that returns None on its first call gives an empty iter.
     let got = run(SRC, "unfold_empty", vec![]);
-    assert_eq!(got, Value::List(vec![]));
+    assert_eq!(got, Value::List(vec![].into()));
 }

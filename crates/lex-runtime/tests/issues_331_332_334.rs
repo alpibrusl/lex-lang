@@ -56,8 +56,8 @@ import "std.list" as list
 fn f(x :: Int, xs :: List[Int]) -> List[Int] { list.cons(x, xs) }
 "#;
     assert_eq!(
-        run_one(src, "f", vec![Value::Int(1), Value::List(vec![Value::Int(2), Value::Int(3)])]),
-        Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+        run_one(src, "f", vec![Value::Int(1), Value::List(vec![Value::Int(2), Value::Int(3)].into())]),
+        Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)].into())
     );
 }
 
@@ -69,7 +69,7 @@ fn f(x :: Int) -> List[Int] { list.cons(x, []) }
 "#;
     assert_eq!(
         run_one(src, "f", vec![Value::Int(42)]),
-        Value::List(vec![Value::Int(42)])
+        Value::List(vec![Value::Int(42)].into())
     );
 }
 
@@ -86,7 +86,7 @@ fn build_rev(n :: Int, acc :: List[Int]) -> List[Int] {
     // cons(4,[]) → cons(3,[4]) → cons(2,[3,4]) → cons(1,[2,3,4]) → reverse → [4,3,2,1]
     assert_eq!(
         run_one(src, "build", vec![Value::Int(4)]),
-        Value::List(vec![Value::Int(4), Value::Int(3), Value::Int(2), Value::Int(1)])
+        Value::List(vec![Value::Int(4), Value::Int(3), Value::Int(2), Value::Int(1)].into())
     );
 }
 

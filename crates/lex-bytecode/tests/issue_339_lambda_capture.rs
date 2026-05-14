@@ -98,6 +98,6 @@ fn run_it() -> List[Int] {
 "#;
     assert_eq!(
         run(src, "run_it", vec![]),
-        Value::List(vec![Value::Int(2), Value::Int(4), Value::Int(6)]),
+        Value::List(vec![Value::Int(2), Value::Int(4), Value::Int(6)].into()),
     );
 }

@@ -199,9 +199,9 @@ fn sample(ty: &SpecType, rng: &mut DetRng) -> Value {
         // quickly, not stress-testing throughput.
         SpecType::List { element } => {
             let len = (rng.next_u64() % 9) as usize;
-            let mut out = Vec::with_capacity(len);
+            let mut out = std::collections::VecDeque::with_capacity(len);
             for _ in 0..len {
-                out.push(sample(element, rng));
+                out.push_back(sample(element, rng));
             }
             Value::List(out)
         }

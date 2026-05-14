@@ -325,7 +325,7 @@ pub(crate) fn list_builtin(func: &str, args: &[Value]) -> Option<Result<Value, S
         "head" => {
             if args.len() != 1 { return None; }
             match &args[0] {
-                Value::List(xs) => Some(match xs.first() {
+                Value::List(xs) => Some(match xs.front() {
                     Some(v) => Ok(v.clone()),
                     None => Err("head: empty list".into()),
                 }),
@@ -335,9 +335,10 @@ pub(crate) fn list_builtin(func: &str, args: &[Value]) -> Option<Result<Value, S
         "tail" => {
             if args.len() != 1 { return None; }
             match &args[0] {
-                Value::List(xs) => Some(match xs.split_first() {
-                    Some((_, rest)) => Ok(Value::List(rest.to_vec())),
-                    None => Err("tail: empty list".into()),
+                Value::List(xs) => Some(if xs.is_empty() {
+                    Err("tail: empty list".into())
+                } else {
+                    Ok(Value::List(xs.iter().skip(1).cloned().collect::<std::collections::VecDeque<_>>()))
                 }),
                 _ => None,
             }
@@ -752,7 +753,7 @@ mod tests {
 
     /// Build a `Value::List` from a slice of values.
     fn lst(items: &[Value]) -> Value {
-        Value::List(items.to_vec())
+        Value::List(items.iter().cloned().collect::<std::collections::VecDeque<_>>())
     }
 
     #[test]
@@ -843,7 +844,7 @@ mod tests {
         session.insert("power".into(), Value::Int(50));
         session.insert("budget".into(), Value::Int(80));
         let allow = evaluate_gate(std::slice::from_ref(&spec), &b([
-            ("sessions", Value::List(vec![Value::Record(session.clone())])),
+            ("sessions", Value::List(vec![Value::Record(session.clone())].into())),
         ]), "");
         assert_eq!(allow, GateVerdict::Allow);
 
@@ -851,7 +852,7 @@ mod tests {
         over.insert("power".into(), Value::Int(120));
         over.insert("budget".into(), Value::Int(80));
         let deny = evaluate_gate(&[spec], &b([
-            ("sessions", Value::List(vec![Value::Record(over)])),
+            ("sessions", Value::List(vec![Value::Record(over)].into())),
         ]), "");
         assert!(matches!(deny, GateVerdict::Deny { .. }));
     }

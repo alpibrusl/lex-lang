@@ -273,5 +273,5 @@ fn empty_query_yields_empty_drain() {
         Value::Variant { name, args } if name == "Ok" && args.len() == 1 => args.into_iter().next().unwrap(),
         other => panic!("expected Ok([]), got {other:?}"),
     };
-    assert_eq!(names, Value::List(vec![]));
+    assert_eq!(names, Value::List(vec![].into()));
 }

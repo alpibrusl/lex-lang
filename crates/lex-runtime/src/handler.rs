@@ -459,7 +459,7 @@ impl DefaultHandler {
                                 Err(e) => return Ok(err(Value::Str(format!("fs.list_dir: {e}")))),
                             }
                         }
-                        Ok(ok(Value::List(entries)))
+                        Ok(ok(Value::List(entries.into())))
                     }
                     Err(e) => Ok(err(Value::Str(format!("fs.list_dir `{path}`: {e}")))),
                 }
@@ -477,7 +477,7 @@ impl DefaultHandler {
                         Err(e) => return Ok(err(Value::Str(format!("fs.walk: {e}")))),
                     }
                 }
-                Ok(ok(Value::List(paths)))
+                Ok(ok(Value::List(paths.into())))
             }
             "glob" => {
                 let pattern = expect_str(args.first())?.to_string();
@@ -503,7 +503,7 @@ impl DefaultHandler {
                         Err(e) => return Ok(err(Value::Str(format!("fs.glob: {e}")))),
                     }
                 }
-                Ok(ok(Value::List(paths)))
+                Ok(ok(Value::List(paths.into())))
             }
             "mkdir_p" => {
                 let path = expect_str(args.first())?.to_string();
@@ -1135,7 +1135,7 @@ impl EffectHandler for DefaultHandler {
                     let s = String::from_utf8_lossy(&k).to_string();
                     keys.push(Value::Str(s));
                 }
-                Ok(Value::List(keys))
+                Ok(Value::List(keys.into()))
             }
             ("sql", "open") => {
                 let path = expect_str(args.first())?.to_string();
@@ -2475,21 +2475,21 @@ impl DefaultHandler {
     fn dispatch_stream_collect(&mut self, args: Vec<Value>) -> Value {
         let handle = match args.first().and_then(stream_handle_id) {
             Some(h) => h,
-            None => return Value::List(Vec::new()),
+            None => return Value::List(std::collections::VecDeque::new()),
         };
         let mut iter = {
             let mut streams = match self.streams.lock() {
                 Ok(g) => g,
-                Err(_) => return Value::List(Vec::new()),
+                Err(_) => return Value::List(std::collections::VecDeque::new()),
             };
             match streams.remove(&handle) {
                 Some(it) => it,
-                None => return Value::List(Vec::new()),
+                None => return Value::List(std::collections::VecDeque::new()),
             }
         };
-        let mut out: Vec<Value> = Vec::new();
+        let mut out: std::collections::VecDeque<Value> = std::collections::VecDeque::new();
         for chunk in iter.by_ref() {
-            out.push(Value::Str(chunk));
+            out.push_back(Value::Str(chunk));
         }
         Value::List(out)
     }
@@ -2713,7 +2713,7 @@ fn sql_run_query_sqlite(
         }
         out.push(Value::Record(rec));
     }
-    ok(Value::List(out))
+    ok(Value::List(out.into()))
 }
 
 /// Run a statement on Postgres and pack rows into `Value::List(Value::Record(...))`.
@@ -2729,7 +2729,7 @@ fn sql_run_query_pg(
         Ok(r)  => r,
         Err(e) => return err(pg_err_to_sql_error(e, "sql.query")),
     };
-    let out: Vec<Value> = rows.iter().map(|row| {
+    let out: std::collections::VecDeque<Value> = rows.iter().map(|row| {
         Value::Record(pg_row_to_lex_record(row))
     }).collect();
     ok(Value::List(out))

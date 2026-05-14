@@ -77,7 +77,7 @@ fn drain(prompt :: Str) -> [llm_cloud, stream] Result[List[Str], Str] {
                     Value::Str("beta".into()),
                     Value::Str("gamma".into()),
                     Value::Str("delta".into()),
-                ]),
+                ].into()),
             );
         }
         other => panic!("expected Variant, got {other:?}"),
@@ -139,7 +139,7 @@ fn pull2(prompt :: Str) -> [llm_cloud, stream] Result[(Option[Str], Option[Str],
         Some(Value::List(vec![
             Value::Str("three".into()),
             Value::Str("four".into()),
-        ])),
+        ].into())),
     );
 }
 

@@ -76,8 +76,8 @@ fn doubled(xs :: List[Int]) -> List[Int] {
 }
 "#;
     let r = run(src, "doubled",
-        vec![Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)])]);
-    assert_eq!(r, Value::List(vec![Value::Int(2), Value::Int(4), Value::Int(6)]));
+        vec![Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)].into())]);
+    assert_eq!(r, Value::List(vec![Value::Int(2), Value::Int(4), Value::Int(6)].into()));
 }
 
 // -- list.filter --------------------------------------------------
@@ -168,6 +168,6 @@ fn midpoints(xs :: List[Int]) -> [rand] List[Int] {
 "#;
     // rand.int_in(0, 10) → 5; rand.int_in(0, 100) → 50; rand.int_in(0, 6) → 3
     let r = run(src, "midpoints",
-        vec![Value::List(vec![Value::Int(10), Value::Int(100), Value::Int(6)])]);
-    assert_eq!(r, Value::List(vec![Value::Int(5), Value::Int(50), Value::Int(3)]));
+        vec![Value::List(vec![Value::Int(10), Value::Int(100), Value::Int(6)].into())]);
+    assert_eq!(r, Value::List(vec![Value::Int(5), Value::Int(50), Value::Int(3)].into()));
 }

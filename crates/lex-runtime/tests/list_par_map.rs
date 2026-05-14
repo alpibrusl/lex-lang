@@ -45,9 +45,9 @@ fn doubled(xs :: List[Int]) -> List[Int] {
 "#;
     let bc = build(src);
     let xs: Vec<Value> = (0..8).map(Value::Int).collect();
-    let r = run(&bc, "doubled", vec![Value::List(xs)]);
+    let r = run(&bc, "doubled", vec![Value::List(xs.into())]);
     let expected: Vec<Value> = (0..8).map(|i: i64| Value::Int(i * 2)).collect();
-    assert_eq!(r, Value::List(expected));
+    assert_eq!(r, Value::List(expected.into()));
 }
 
 #[test]
@@ -59,8 +59,8 @@ fn run_(xs :: List[Int]) -> List[Int] {
 }
 "#;
     let bc = build(src);
-    let r = run(&bc, "run_", vec![Value::List(vec![])]);
-    assert_eq!(r, Value::List(vec![]));
+    let r = run(&bc, "run_", vec![Value::List(vec![].into())]);
+    assert_eq!(r, Value::List(vec![].into()));
 }
 
 /// Pure CPU spin: count list elements (via `list.fold`, which is
@@ -82,9 +82,9 @@ fn par_spins(buckets :: List[List[Int]]) -> List[Int] {
 fn measure_par_spin(n_workers: usize, items_per_bucket: usize) -> std::time::Duration {
     let bc = build(SPIN_SRC);
     let bucket: Vec<Value> = (0..items_per_bucket as i64).map(Value::Int).collect();
-    let buckets: Vec<Value> = (0..n_workers).map(|_| Value::List(bucket.clone())).collect();
+    let buckets: Vec<Value> = (0..n_workers).map(|_| Value::List(bucket.clone().into())).collect();
     let t0 = std::time::Instant::now();
-    let _ = run(&bc, "par_spins", vec![Value::List(buckets)]);
+    let _ = run(&bc, "par_spins", vec![Value::List(buckets.into())]);
     t0.elapsed()
 }
 
@@ -158,10 +158,10 @@ fn squared(xs :: List[Int]) -> List[Int] {
 "#;
     let bc = build(src);
     let xs: Vec<Value> = (0..16).map(Value::Int).collect();
-    let r = run(&bc, "squared", vec![Value::List(xs)]);
+    let r = run(&bc, "squared", vec![Value::List(xs.into())]);
     std::env::remove_var("LEX_PAR_MAX_CONCURRENCY");
     let expected: Vec<Value> = (0..16).map(|i: i64| Value::Int(i * i)).collect();
-    assert_eq!(r, Value::List(expected));
+    assert_eq!(r, Value::List(expected.into()));
 }
 
 #[test]
@@ -177,10 +177,10 @@ fn run_(xs :: List[Int]) -> List[Int] {
 "#;
     let bc = build(src);
     let xs: Vec<Value> = (0..32).map(Value::Int).collect();
-    let r = run(&bc, "run_", vec![Value::List(xs)]);
+    let r = run(&bc, "run_", vec![Value::List(xs.into())]);
     std::env::remove_var("LEX_PAR_MAX_CONCURRENCY");
     let expected: Vec<Value> = (0..32).map(|i: i64| Value::Int(i + 1000)).collect();
-    assert_eq!(r, Value::List(expected));
+    assert_eq!(r, Value::List(expected.into()));
 }
 
 #[test]
@@ -225,13 +225,13 @@ fn echo_par(xs :: List[Str]) -> [io] List[Unit] {
                 Value::Str("a".into()),
                 Value::Str("b".into()),
                 Value::Str("c".into()),
-            ])],
+            ].into())],
         )
         .expect("effectful par_map runs under DefaultHandler");
     // Result is a list of three Unit values — one per worker call.
     assert_eq!(
         r,
-        Value::List(vec![Value::Unit, Value::Unit, Value::Unit]),
+        Value::List(vec![Value::Unit, Value::Unit, Value::Unit].into()),
         "result list shape: one Unit per input"
     );
 }
@@ -263,7 +263,7 @@ fn par_steps(xs :: List[Int]) -> List[Int] {
     let mut vm = Vm::with_handler(&bc, Box::new(handler));
     let r = vm.call(
         "par_steps",
-        vec![Value::List(vec![Value::Int(0); 4])],
+        vec![Value::List(vec![Value::Int(0); 4].into())],
     );
     assert!(
         r.is_err(),

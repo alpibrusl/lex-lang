@@ -32,15 +32,13 @@ pub fn call_pure_builtin(kind: &str, op: &str, args: Vec<Value>) -> Result<Value
     if (kind, op) == ("list", "cons") {
         let mut it = args.into_iter();
         let head = it.next().unwrap_or(Value::Unit);
-        let tail = match it.next() {
+        let mut tail = match it.next() {
             Some(Value::List(v)) => v,
             Some(other) => return Err(format!("list.cons: expected List, got {other:?}")),
-            None => vec![],
+            None => std::collections::VecDeque::new(),
         };
-        let mut out = Vec::with_capacity(1 + tail.len());
-        out.push(head);
-        out.extend(tail);
-        return Ok(Value::List(out));
+        tail.push_front(head);
+        return Ok(Value::List(tail));
     }
     dispatch(kind, op, &args)
 }
@@ -86,7 +84,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         ("str", "split") => {
             let s = expect_str(args.first())?;
             let sep = expect_str(args.get(1))?;
-            let items: Vec<Value> = if sep.is_empty() {
+            let items: std::collections::VecDeque<Value> = if sep.is_empty() {
                 s.chars().map(|c| Value::Str(c.to_string())).collect()
             } else {
                 s.split(sep.as_str()).map(|p| Value::Str(p.to_string())).collect()
@@ -190,20 +188,20 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         ("list", "is_empty") => Ok(Value::Bool(expect_list(args.first())?.is_empty())),
         ("list", "head") => {
             let xs = expect_list(args.first())?;
-            match xs.first() {
+            match xs.front() {
                 Some(v) => Ok(some(v.clone())),
                 None => Ok(none()),
             }
         }
         ("list", "tail") => {
             let xs = expect_list(args.first())?;
-            if xs.is_empty() { Ok(Value::List(Vec::new())) }
-            else { Ok(Value::List(xs[1..].to_vec())) }
+            if xs.is_empty() { Ok(Value::List(std::collections::VecDeque::new())) }
+            else { Ok(Value::List(xs.iter().skip(1).cloned().collect::<std::collections::VecDeque<_>>())) }
         }
         ("list", "range") => {
             let lo = expect_int(args.first())?;
             let hi = expect_int(args.get(1))?;
-            Ok(Value::List((lo..hi).map(Value::Int).collect()))
+            Ok(Value::List((lo..hi).map(Value::Int).collect::<std::collections::VecDeque<_>>()))
         }
         ("list", "concat") => {
             let mut out = expect_list(args.first())?.clone();
@@ -211,22 +209,25 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             Ok(Value::List(out))
         }
         ("list", "reverse") => {
-            let mut out = expect_list(args.first())?.clone();
-            out.reverse();
-            Ok(Value::List(out))
+            let out = expect_list(args.first())?.clone();
+            let rev: std::collections::VecDeque<Value> = out.into_iter().rev().collect();
+            Ok(Value::List(rev))
         }
         // #334: cons — prepend a single element to a list.
+        // (fast path via call_pure_builtin; this branch handles the
+        // borrow-based dispatch path which must clone)
         ("list", "cons") => {
             let head = args.first().cloned().unwrap_or(Value::Unit);
-            let mut out = vec![head];
-            out.extend(expect_list(args.get(1))?.iter().cloned());
+            let mut out: std::collections::VecDeque<Value> =
+                expect_list(args.get(1))?.iter().cloned().collect();
+            out.push_front(head);
             Ok(Value::List(out))
         }
         ("list", "enumerate") => {
             let xs = expect_list(args.first())?;
             let pairs = xs.iter().cloned().enumerate()
                 .map(|(i, v)| Value::Tuple(vec![Value::Int(i as i64), v]))
-                .collect::<Vec<_>>();
+                .collect::<std::collections::VecDeque<_>>();
             Ok(Value::List(pairs))
         }
 
@@ -506,14 +507,14 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                 .has_headers(false)
                 .flexible(true)
                 .from_reader(s.as_bytes());
-            let mut rows: Vec<Value> = Vec::new();
+            let mut rows: std::collections::VecDeque<Value> = std::collections::VecDeque::new();
             for r in rdr.records() {
                 match r {
                     Ok(rec) => {
-                        let row: Vec<Value> = rec.iter()
+                        let row: std::collections::VecDeque<Value> = rec.iter()
                             .map(|f| Value::Str(f.to_string()))
                             .collect();
-                        rows.push(Value::List(row));
+                        rows.push_back(Value::List(row));
                     }
                     Err(e) => return Ok(err_v(Value::Str(format!("csv.parse: {e}")))),
                 }
@@ -1348,7 +1349,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let pat = expect_str(args.first())?;
             let s = expect_str(args.get(1))?;
             let re = get_or_compile_regex(&pat).map_err(|e| format!("regex.find_all: {e}"))?;
-            let items: Vec<Value> = re.captures_iter(&s).map(|caps| match_value(&caps)).collect();
+            let items: std::collections::VecDeque<Value> = re.captures_iter(&s).map(|caps| match_value(&caps)).collect();
             Ok(Value::List(items))
         }
         ("regex", "replace") => {
@@ -1468,7 +1469,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let pat = expect_str(args.first())?;
             let s = expect_str(args.get(1))?;
             let re = get_or_compile_regex(&pat).map_err(|e| format!("regex.split: {e}"))?;
-            let parts: Vec<Value> = re.split(&s).map(|p| Value::Str(p.to_string())).collect();
+            let parts: std::collections::VecDeque<Value> = re.split(&s).map(|p| Value::Str(p.to_string())).collect();
             Ok(Value::List(parts))
         }
 
@@ -1645,7 +1646,7 @@ fn match_value(caps: &regex::Captures) -> Value {
     rec.insert("text".into(), Value::Str(m0.as_str().to_string()));
     rec.insert("start".into(), Value::Int(m0.start() as i64));
     rec.insert("end".into(), Value::Int(m0.end() as i64));
-    let groups: Vec<Value> = (1..caps.len())
+    let groups: std::collections::VecDeque<Value> = (1..caps.len())
         .map(|i| {
             Value::Str(
                 caps.get(i)
@@ -1755,7 +1756,7 @@ fn expect_float(v: Option<&Value>) -> Result<f64, String> {
     }
 }
 
-fn expect_list(v: Option<&Value>) -> Result<&Vec<Value>, String> {
+fn expect_list(v: Option<&Value>) -> Result<&std::collections::VecDeque<Value>, String> {
     match v {
         Some(Value::List(xs)) => Ok(xs),
         Some(other) => Err(format!("expected List, got {other:?}")),

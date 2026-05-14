@@ -61,7 +61,7 @@ fn toml_parse_strict_passes_when_all_fields_present() {
     let src = "license = \"EUPL-1.2\"\nversion = \"0.1.0\"\n";
     let v = run(TOML_SRC, "strict", vec![
         Value::Str(src.into()),
-        Value::List(vec![Value::Str("license".into()), Value::Str("version".into())]),
+        Value::List(vec![Value::Str("license".into()), Value::Str("version".into())].into()),
     ]);
     let m = ok(&v);
     // Should be a Record with both fields.
@@ -82,7 +82,7 @@ fn toml_parse_strict_fails_when_required_field_missing() {
     let src = "version = \"0.1.0\"\n";
     let v = run(TOML_SRC, "strict", vec![
         Value::Str(src.into()),
-        Value::List(vec![Value::Str("license".into()), Value::Str("version".into())]),
+        Value::List(vec![Value::Str("license".into()), Value::Str("version".into())].into()),
     ]);
     let detail = err_msg(&v);
     assert!(detail.contains("missing required field"), "got: {detail}");
@@ -94,7 +94,7 @@ fn toml_parse_with_empty_required_degenerates_to_plain_parse() {
     let src = "version = \"0.1.0\"\n";
     let v = run(TOML_SRC, "strict", vec![
         Value::Str(src.into()),
-        Value::List(vec![]),
+        Value::List(vec![].into()),
     ]);
     // Empty required-list ⇒ no validation ⇒ behaves like plain parse.
     let _ = ok(&v);
@@ -129,7 +129,7 @@ fn yaml_parse_strict_fails_on_missing_field() {
     let src = "name: lex\n";
     let v = run(YAML_SRC, "strict", vec![
         Value::Str(src.into()),
-        Value::List(vec![Value::Str("name".into()), Value::Str("version".into())]),
+        Value::List(vec![Value::Str("name".into()), Value::Str("version".into())].into()),
     ]);
     let detail = err_msg(&v);
     assert!(detail.contains("version"), "should name missing field: {detail}");
@@ -140,7 +140,7 @@ fn yaml_parse_strict_passes_when_all_present() {
     let src = "name: lex\nversion: 0.1.0\n";
     let v = run(YAML_SRC, "strict", vec![
         Value::Str(src.into()),
-        Value::List(vec![Value::Str("name".into()), Value::Str("version".into())]),
+        Value::List(vec![Value::Str("name".into()), Value::Str("version".into())].into()),
     ]);
     let _ = ok(&v);
 }
@@ -162,7 +162,7 @@ fn json_parse_strict_fails_on_missing_field() {
     let src = r#"{"url": "https://example.com"}"#;
     let v = run(JSON_SRC, "strict", vec![
         Value::Str(src.into()),
-        Value::List(vec![Value::Str("url".into()), Value::Str("branch".into())]),
+        Value::List(vec![Value::Str("url".into()), Value::Str("branch".into())].into()),
     ]);
     let detail = err_msg(&v);
     assert!(detail.contains("branch"), "should name missing field: {detail}");
@@ -173,7 +173,7 @@ fn json_parse_strict_passes_when_all_present() {
     let src = r#"{"url": "https://example.com", "branch": "main"}"#;
     let v = run(JSON_SRC, "strict", vec![
         Value::Str(src.into()),
-        Value::List(vec![Value::Str("url".into()), Value::Str("branch".into())]),
+        Value::List(vec![Value::Str("url".into()), Value::Str("branch".into())].into()),
     ]);
     let _ = ok(&v);
 }
@@ -185,7 +185,7 @@ fn json_parse_strict_fails_when_top_level_is_not_an_object() {
     let src = "[1, 2, 3]";
     let v = run(JSON_SRC, "strict", vec![
         Value::Str(src.into()),
-        Value::List(vec![Value::Str("url".into())]),
+        Value::List(vec![Value::Str("url".into())].into()),
     ]);
     let _ = err_msg(&v);
 }

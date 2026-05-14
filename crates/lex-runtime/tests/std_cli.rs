@@ -108,7 +108,7 @@ fn parse_argv(argv :: List[Str]) -> Result[Json, Str] {
   cli.parse(s, argv)
 }
 "#;
-    let v = run(src, "parse_argv", vec![Value::List(vec![])]).unwrap();
+    let v = run(src, "parse_argv", vec![Value::List(vec![].into())]).unwrap();
     let err = match v {
         Value::Variant { name, mut args } if name == "Err" => args.remove(0),
         other => panic!("expected Err, got: {other:?}"),
@@ -219,7 +219,7 @@ fn parse_argv(argv :: List[Str]) -> Result[Json, Str] {
   cli.parse(s, argv)
 }
 "#;
-    let v = run(src, "parse_argv", vec![Value::List(vec![])]).unwrap();
+    let v = run(src, "parse_argv", vec![Value::List(vec![].into())]).unwrap();
     let parsed = match v {
         Value::Variant { name, mut args } if name == "Ok" => args.remove(0).to_json(),
         other => panic!("expected Ok, got: {other:?}"),
