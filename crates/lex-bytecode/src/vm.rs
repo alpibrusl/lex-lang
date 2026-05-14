@@ -594,12 +594,18 @@ impl<'a> Vm<'a> {
                 let fn_name = &self.program.functions[fn_id as usize].name;
                 return Err(VmError::Panic(format!("ran past end of code in `{fn_name}`")));
             }
-            let op = code[pc].clone();
+            // SAFETY: `self.program` is `&'a Program` — immutably borrowed for the
+            // entire VM lifetime and never mutated inside `run_to`. Taking a raw
+            // pointer lets us reference the current instruction while also holding
+            // `&mut self` in match-arm bodies, side-stepping the borrow checker's
+            // inability to see that `self.program` and `self.stack`/`self.frames`
+            // are disjoint fields.
+            let op: &Op = unsafe { &*(&code[pc] as *const Op) };
             self.frames[frame_idx].pc = pc + 1;
 
             match op {
                 Op::PushConst(i) => {
-                    let c = &self.program.constants[i as usize];
+                    let c = &self.program.constants[*i as usize];
                     self.stack.push(const_to_value(c));
                 }
                 Op::Pop => { self.pop()?; }
@@ -608,12 +614,12 @@ impl<'a> Vm<'a> {
                     self.stack.push(v);
                 }
                 Op::LoadLocal(i) => {
-                    let v = self.frames[frame_idx].locals[i as usize].clone();
+                    let v = self.frames[frame_idx].locals[*i as usize].clone();
                     self.stack.push(v);
                 }
                 Op::StoreLocal(i) => {
                     let v = self.pop()?;
-                    self.frames[frame_idx].locals[i as usize] = v;
+                    self.frames[frame_idx].locals[*i as usize] = v;
                 }
                 Op::MakeRecord { field_name_indices } => {
                     let n = field_name_indices.len();
@@ -632,26 +638,26 @@ impl<'a> Vm<'a> {
                     self.stack.push(Value::Record(rec));
                 }
                 Op::MakeTuple(n) => {
-                    let mut items: Vec<Value> = (0..n).map(|_| Value::Unit).collect();
-                    for i in (0..n as usize).rev() { items[i] = self.pop()?; }
+                    let mut items: Vec<Value> = (0..*n).map(|_| Value::Unit).collect();
+                    for i in (0..*n as usize).rev() { items[i] = self.pop()?; }
                     self.stack.push(Value::Tuple(items));
                 }
                 Op::MakeList(n) => {
-                    let mut items: Vec<Value> = (0..n).map(|_| Value::Unit).collect();
-                    for i in (0..n as usize).rev() { items[i] = self.pop()?; }
+                    let mut items: Vec<Value> = (0..*n).map(|_| Value::Unit).collect();
+                    for i in (0..*n as usize).rev() { items[i] = self.pop()?; }
                     self.stack.push(Value::List(items));
                 }
                 Op::MakeVariant { name_idx, arity } => {
-                    let mut args: Vec<Value> = (0..arity).map(|_| Value::Unit).collect();
-                    for i in (0..arity as usize).rev() { args[i] = self.pop()?; }
-                    let name = match &self.program.constants[name_idx as usize] {
+                    let mut args: Vec<Value> = (0..*arity).map(|_| Value::Unit).collect();
+                    for i in (0..*arity as usize).rev() { args[i] = self.pop()?; }
+                    let name = match &self.program.constants[*name_idx as usize] {
                         Const::VariantName(s) => s.clone(),
                         _ => return Err(VmError::TypeMismatch("expected VariantName const".into())),
                     };
                     self.stack.push(Value::Variant { name, args });
                 }
                 Op::GetField(i) => {
-                    let name = match &self.program.constants[i as usize] {
+                    let name = match &self.program.constants[*i as usize] {
                         Const::FieldName(s) => s.clone(),
                         _ => return Err(VmError::TypeMismatch("expected FieldName const".into())),
                     };
@@ -669,7 +675,7 @@ impl<'a> Vm<'a> {
                     let v = self.pop()?;
                     match v {
                         Value::Tuple(items) => {
-                            let v = items.into_iter().nth(i as usize)
+                            let v = items.into_iter().nth(*i as usize)
                                 .ok_or_else(|| VmError::TypeMismatch(format!("tuple index {i} out of range")))?;
                             self.stack.push(v);
                         }
@@ -677,7 +683,7 @@ impl<'a> Vm<'a> {
                     }
                 }
                 Op::TestVariant(i) => {
-                    let name = match &self.program.constants[i as usize] {
+                    let name = match &self.program.constants[*i as usize] {
                         Const::VariantName(s) => s.clone(),
                         _ => return Err(VmError::TypeMismatch("expected VariantName const".into())),
                     };
@@ -704,10 +710,10 @@ impl<'a> Vm<'a> {
                     let v = self.pop()?;
                     match v {
                         Value::Variant { mut args, .. } => {
-                            if (i as usize) >= args.len() {
+                            if (*i as usize) >= args.len() {
                                 return Err(VmError::TypeMismatch("variant arg index oob".into()));
                             }
-                            self.stack.push(args.swap_remove(i as usize));
+                            self.stack.push(args.swap_remove(*i as usize));
                         }
                         other => return Err(VmError::TypeMismatch(format!("GetVariantArg on non-variant: {other:?}"))),
                     }
@@ -723,7 +729,7 @@ impl<'a> Vm<'a> {
                     let v = self.pop()?;
                     match v {
                         Value::List(items) => {
-                            let v = items.into_iter().nth(i as usize)
+                            let v = items.into_iter().nth(*i as usize)
                                 .ok_or_else(|| VmError::TypeMismatch("list index oob".into()))?;
                             self.stack.push(v);
                         }
@@ -758,33 +764,36 @@ impl<'a> Vm<'a> {
                     }
                 }
                 Op::Jump(off) => {
-                    let new_pc = (self.frames[frame_idx].pc as i32 + off) as usize;
+                    let new_pc = (self.frames[frame_idx].pc as i32 + *off) as usize;
                     self.frames[frame_idx].pc = new_pc;
                 }
                 Op::JumpIf(off) => {
                     let v = self.pop()?;
                     if v.as_bool() {
-                        let new_pc = (self.frames[frame_idx].pc as i32 + off) as usize;
+                        let new_pc = (self.frames[frame_idx].pc as i32 + *off) as usize;
                         self.frames[frame_idx].pc = new_pc;
                     }
                 }
                 Op::JumpIfNot(off) => {
                     let v = self.pop()?;
                     if !v.as_bool() {
-                        let new_pc = (self.frames[frame_idx].pc as i32 + off) as usize;
+                        let new_pc = (self.frames[frame_idx].pc as i32 + *off) as usize;
                         self.frames[frame_idx].pc = new_pc;
                     }
                 }
-                Op::MakeClosure { fn_id, capture_count } => {
-                    let n = capture_count as usize;
+                Op::MakeClosure { fn_id: closure_fn_id, capture_count } => {
+                    let closure_fn_id = *closure_fn_id;
+                    let n = *capture_count as usize;
                     let mut captures: Vec<Value> = (0..n).map(|_| Value::Unit).collect();
                     for i in (0..n).rev() { captures[i] = self.pop()?; }
                     // Look up the canonical body hash so the resulting
                     // `Value::Closure` carries it for equality (#222).
-                    let body_hash = self.program.functions[fn_id as usize].body_hash;
-                    self.stack.push(Value::Closure { fn_id, body_hash, captures });
+                    let body_hash = self.program.functions[closure_fn_id as usize].body_hash;
+                    self.stack.push(Value::Closure { fn_id: closure_fn_id, body_hash, captures });
                 }
                 Op::CallClosure { arity, node_id_idx } => {
+                    let arity = *arity;
+                    let node_id_idx = *node_id_idx;
                     let mut args: Vec<Value> = (0..arity).map(|_| Value::Unit).collect();
                     for i in (0..arity as usize).rev() { args[i] = self.pop()?; }
                     let closure = self.pop()?;
@@ -885,6 +894,9 @@ impl<'a> Vm<'a> {
                     self.stack.push(Value::List(results));
                 }
                 Op::Call { fn_id, arity, node_id_idx } => {
+                    let fn_id = *fn_id;
+                    let arity = *arity;
+                    let node_id_idx = *node_id_idx;
                     let mut args: Vec<Value> = (0..arity).map(|_| Value::Unit).collect();
                     for i in (0..arity as usize).rev() { args[i] = self.pop()?; }
                     let node_id = const_str(&self.program.constants, node_id_idx);
@@ -961,6 +973,9 @@ impl<'a> Vm<'a> {
                     })?;
                 }
                 Op::TailCall { fn_id, arity, node_id_idx } => {
+                    let fn_id = *fn_id;
+                    let arity = *arity;
+                    let node_id_idx = *node_id_idx;
                     let mut args: Vec<Value> = (0..arity).map(|_| Value::Unit).collect();
                     for i in (0..arity as usize).rev() { args[i] = self.pop()?; }
                     let node_id = const_str(&self.program.constants, node_id_idx);
@@ -1010,6 +1025,10 @@ impl<'a> Vm<'a> {
                     frame.trace_kind = FrameKind::Call(node_id);
                 }
                 Op::EffectCall { kind_idx, op_idx, arity, node_id_idx } => {
+                    let kind_idx = *kind_idx;
+                    let op_idx = *op_idx;
+                    let arity = *arity;
+                    let node_id_idx = *node_id_idx;
                     let mut args: Vec<Value> = (0..arity).map(|_| Value::Unit).collect();
                     for i in (0..arity as usize).rev() { args[i] = self.pop()?; }
                     let kind = match &self.program.constants[kind_idx as usize] {
@@ -1069,7 +1088,7 @@ impl<'a> Vm<'a> {
                     self.stack.push(v);
                 }
                 Op::Panic(i) => {
-                    let msg = match &self.program.constants[i as usize] {
+                    let msg = match &self.program.constants[*i as usize] {
                         Const::Str(s) => s.clone(),
                         _ => "panic".into(),
                     };
