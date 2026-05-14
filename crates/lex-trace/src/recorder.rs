@@ -227,6 +227,7 @@ fn value_to_json(v: &Value) -> serde_json::Value {
                 items.iter().map(value_to_json).collect()));
             J::Object(o)
         }
+        Value::Actor(_) => J::String("<actor>".into()),
     }
 }
 

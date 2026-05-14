@@ -557,6 +557,44 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             ));
             Some(Ty::Record(fields))
         }
+        "conc" => {
+            // Actor model (#381). Effect: [concurrent].
+            // spawn :: S, (S, M) -> [E] (S, R) -> [concurrent] Actor[S]
+            // ask   :: Actor[S], M -> [concurrent] R
+            // tell  :: Actor[S], M -> [concurrent] Unit
+            //
+            // The type variables used here are fresh placeholders;
+            // the checker instantiates them at each call site.
+            //   0 = S (state), 1 = M (message), 2 = R (reply), 3 = E (effect row)
+            let actor_t = |s: Ty| Ty::Con("Actor".into(), vec![s]);
+            let mut fields = IndexMap::new();
+            // spawn :: S, (S, M -> [E] (S, R)) -> [concurrent] Actor[S]
+            fields.insert("spawn".into(), Ty::function(
+                vec![
+                    Ty::Var(0),
+                    Ty::Function {
+                        params: vec![Ty::Var(0), Ty::Var(1)],
+                        effects: EffectSet::open_var(3),
+                        ret: Box::new(Ty::Tuple(vec![Ty::Var(0), Ty::Var(2)])),
+                    },
+                ],
+                EffectSet::singleton("concurrent"),
+                actor_t(Ty::Var(0)),
+            ));
+            // ask :: Actor[S], M -> [concurrent] R
+            fields.insert("ask".into(), Ty::function(
+                vec![actor_t(Ty::Var(0)), Ty::Var(1)],
+                EffectSet::singleton("concurrent"),
+                Ty::Var(2),
+            ));
+            // tell :: Actor[S], M -> [concurrent] Unit
+            fields.insert("tell".into(), Ty::function(
+                vec![actor_t(Ty::Var(0)), Ty::Var(1)],
+                EffectSet::singleton("concurrent"),
+                Ty::Unit,
+            ));
+            Some(Ty::Record(fields))
+        }
         "proc" => {
             // Subprocess dispatch. Effect: [proc]. Returns a Result
             // with a record on success carrying stdout / stderr /
@@ -2143,6 +2181,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "agent" => "agent",
         "cli" => "cli",
         "stream" => "stream",
+        "conc" => "conc",
         _ => return None,
     })
 }

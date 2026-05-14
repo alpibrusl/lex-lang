@@ -2,7 +2,8 @@
 
 use crate::op::*;
 use crate::program::*;
-use crate::value::Value;
+use crate::value::{ActorCell, Value};
+use std::sync::{Arc, Mutex};
 use indexmap::IndexMap;
 use std::collections::VecDeque;
 
@@ -498,6 +499,68 @@ impl<'a> Vm<'a> {
                     args: vec![Value::Record(e)],
                 })
             }
+        }
+    }
+
+    /// VM-level handler for `conc.*` effect ops (#381).
+    ///
+    /// * `conc.spawn(init, handler)` — creates an `Actor` wrapping the
+    ///   initial state and the handler closure. No background thread is
+    ///   started; the actor runs synchronously on the calling thread
+    ///   under a `Mutex` so concurrent callers serialise.
+    ///
+    /// * `conc.ask(actor, msg)` — locks the actor, calls
+    ///   `handler(state, msg)` on *this* VM (reentrant), expects a
+    ///   2-tuple `(new_state, reply)`, updates the actor's state, and
+    ///   returns `reply`.
+    ///
+    /// * `conc.tell(actor, msg)` — same as `ask` but discards the
+    ///   reply and returns `Unit`.
+    fn run_conc_op(&mut self, op: &str, args: Vec<Value>) -> Result<Value, String> {
+        match op {
+            "spawn" => {
+                let mut it = args.into_iter();
+                let init = it.next().unwrap_or(Value::Unit);
+                let handler = it.next().unwrap_or(Value::Unit);
+                if !matches!(handler, Value::Closure { .. }) {
+                    return Err(format!(
+                        "conc.spawn: handler must be a Closure, got {handler:?}"));
+                }
+                Ok(Value::Actor(Arc::new(Mutex::new(ActorCell {
+                    state: init,
+                    handler,
+                }))))
+            }
+            "ask" | "tell" => {
+                let mut it = args.into_iter();
+                let actor_val = it.next().unwrap_or(Value::Unit);
+                let msg = it.next().unwrap_or(Value::Unit);
+                let cell = match actor_val {
+                    Value::Actor(ref arc) => Arc::clone(arc),
+                    other => return Err(format!(
+                        "conc.{op}: first arg must be an Actor, got {other:?}")),
+                };
+                // Lock the actor: guarantees at-most-one-concurrent message.
+                let mut guard = cell.lock().map_err(|e| format!("conc.{op}: actor mutex poisoned: {e}"))?;
+                let handler = guard.handler.clone();
+                let state = guard.state.clone();
+                // Call handler(state, msg) on this VM — full effect access.
+                let result = self.invoke_closure_value(handler, vec![state, msg])
+                    .map_err(|e| format!("conc.{op}: handler error: {e:?}"))?;
+                // Expect (new_state, reply) tuple.
+                match result {
+                    Value::Tuple(mut parts) if parts.len() == 2 => {
+                        let reply = parts.pop().unwrap();
+                        let new_state = parts.pop().unwrap();
+                        guard.state = new_state;
+                        drop(guard);
+                        if op == "ask" { Ok(reply) } else { Ok(Value::Unit) }
+                    }
+                    other => Err(format!(
+                        "conc.{op}: handler must return a 2-tuple (new_state, reply), got {other:?}")),
+                }
+            }
+            other => Err(format!("unknown conc.{other}")),
         }
     }
 
@@ -1062,6 +1125,12 @@ impl<'a> Vm<'a> {
                         // from `Map` / `AndThen` nodes.
                         None if (kind.as_str(), op_name.as_str()) == ("parser", "run")
                             => self.run_parser_op(args),
+                        // VM-level intercept for `conc.*` (#381). The actor
+                        // handler closure must run on the calling VM so it can
+                        // dispatch arbitrary effects through the same handler
+                        // chain (e.g. sql queries inside an actor).
+                        None if kind.as_str() == "conc"
+                            => self.run_conc_op(op_name.as_str(), args),
                         None => self.handler.dispatch(&kind, &op_name, args),
                     };
                     match result {

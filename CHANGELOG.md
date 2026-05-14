@@ -7,6 +7,18 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added
+
+- **#381: `conc.spawn` / `conc.ask` / `conc.tell` — synchronous actor model.**
+  Programs can now create stateful actor handles with `conc.spawn(init_state,
+  handler_fn)` and send messages via `conc.ask` (returns the handler's reply)
+  or `conc.tell` (fire-and-forget, discards reply). Each actor wraps an
+  `Arc<Mutex<ActorCell>>` so message delivery is serialised at the call site —
+  no background OS thread is spawned. The handler closure runs on the calling
+  VM so it has full access to all effects (`sql`, `net`, `kv`, …). Requires
+  the `[concurrent]` effect on any function that spawns or messages an actor.
+  New import: `import "std.conc" as conc`.
+
 ### Performance
 
 - **#389 (slice 2): VM `GetField` — monomorphic inline cache.** Each
