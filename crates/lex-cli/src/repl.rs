@@ -224,7 +224,7 @@ impl Session {
         // original value). Unwrap one layer so the user sees the
         // JSON directly, not a quoted string.
         match v {
-            lex_bytecode::Value::Str(s) => Ok(s),
+            lex_bytecode::Value::Str(s) => Ok(s.to_string()),
             other => Ok(serde_json::to_string(&other.to_json())
                 .unwrap_or_else(|_| format!("{other:?}"))),
         }

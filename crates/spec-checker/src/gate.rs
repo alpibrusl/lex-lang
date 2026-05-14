@@ -183,7 +183,7 @@ fn eval_body(
         SpecExpr::IntLit { value } => Ok(Value::Int(*value)),
         SpecExpr::FloatLit { value } => Ok(Value::Float(*value)),
         SpecExpr::BoolLit { value } => Ok(Value::Bool(*value)),
-        SpecExpr::StrLit { value } => Ok(Value::Str(value.clone())),
+        SpecExpr::StrLit { value } => Ok(Value::Str(value.clone().into())),
         SpecExpr::Var { name } => bindings.get(name).cloned()
             .ok_or_else(|| format!("unbound spec var `{name}` (provide via gate bindings)")),
         SpecExpr::Let { name, value, body } => {

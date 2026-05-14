@@ -4806,7 +4806,7 @@ fn run_tool_once(
     let handler = DefaultHandler::new(policy.clone()).with_program(std::sync::Arc::clone(bc));
     let mut vm = Vm::with_handler(bc, Box::new(handler));
     vm.set_step_limit(max_steps);
-    let result = match vm.call("tool", vec![Value::Str(input.to_string())]) {
+    let result = match vm.call("tool", vec![Value::Str(input.to_string().into())]) {
         Ok(v) => v,
         Err(e) => {
             let msg = format!("{e}");
@@ -4832,7 +4832,7 @@ fn run_tool_once(
         }
     };
     Ok(match result {
-        Value::Str(s) => s,
+        Value::Str(s) => s.to_string(),
         other => value_to_json_string(&other),
     })
 }

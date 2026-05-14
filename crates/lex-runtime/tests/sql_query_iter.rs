@@ -208,7 +208,7 @@ fn drains_all_rows_in_order() {
         other => panic!("expected List, got {other:?}"),
     };
     let expected: Vec<Value> = (0..5)
-        .map(|i| Value::Str(format!("r{i}")))
+        .map(|i| Value::Str(format!("r{i}").into()))
         .collect();
     assert_eq!(list, expected);
 }

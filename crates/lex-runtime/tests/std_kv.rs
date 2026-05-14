@@ -113,7 +113,7 @@ fn put_then_get_round_trips() {
         SRC,
         "put_then_get",
         vec![
-            Value::Str(path.to_string_lossy().to_string()),
+            Value::Str(path.to_string_lossy().to_string().into()),
             Value::Str("k1".into()),
             Value::Bytes(b"hello".to_vec()),
         ],
@@ -136,7 +136,7 @@ fn get_missing_returns_none() {
         SRC,
         "get_missing",
         vec![
-            Value::Str(path.to_string_lossy().to_string()),
+            Value::Str(path.to_string_lossy().to_string().into()),
             Value::Str("never_set".into()),
         ],
         policy,
@@ -152,7 +152,7 @@ fn contains_after_put() {
         SRC,
         "put_then_contains",
         vec![
-            Value::Str(path.to_string_lossy().to_string()),
+            Value::Str(path.to_string_lossy().to_string().into()),
             Value::Str("a".into()),
             Value::Bytes(b"x".to_vec()),
         ],
@@ -169,7 +169,7 @@ fn delete_removes_key() {
         SRC,
         "delete_then_contains",
         vec![
-            Value::Str(path.to_string_lossy().to_string()),
+            Value::Str(path.to_string_lossy().to_string().into()),
             Value::Str("a".into()),
             Value::Bytes(b"x".to_vec()),
         ],
@@ -183,14 +183,14 @@ fn list_prefix_returns_only_matching_keys() {
     let path = unique_db_path("list_prefix");
     let policy = policy_with_kv(&path);
     let v = run_with_policy(SRC, "list_prefix_keys", vec![
-        Value::Str(path.to_string_lossy().to_string()),
+        Value::Str(path.to_string_lossy().to_string().into()),
     ], policy);
 
     let keys: Vec<String> = match v {
         Value::List(items) => items
             .into_iter()
             .map(|i| match i {
-                Value::Str(s) => s,
+                Value::Str(s) => s.to_string(),
                 other => panic!("expected Str in list, got {other:?}"),
             })
             .collect(),
@@ -218,7 +218,7 @@ fn open_outside_fs_write_root_returns_err() {
         SRC,
         "put_then_get",
         vec![
-            Value::Str(outside.to_string_lossy().to_string()),
+            Value::Str(outside.to_string_lossy().to_string().into()),
             Value::Str("k".into()),
             Value::Bytes(b"v".to_vec()),
         ],

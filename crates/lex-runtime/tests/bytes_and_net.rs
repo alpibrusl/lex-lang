@@ -122,7 +122,7 @@ fn net_get_returns_response_body() {
 import "std.net" as net
 fn fetch(u :: Str) -> [net] Result[Str, Str] { net.get(u) }
 "#;
-    let r = run(src, "fetch", vec![Value::Str(url)], allow(&["net"]));
+    let r = run(src, "fetch", vec![Value::Str(url.into())], allow(&["net"]));
     let _ = handle.join();
     let (name, args) = match r {
         Value::Variant { name, args } => (name, args),

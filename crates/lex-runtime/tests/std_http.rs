@@ -382,7 +382,7 @@ fn http_get_returns_response_with_status_and_body() {
 import "std.http" as http
 fn fetch(u :: Str) -> [net] Result[HttpResponse, HttpError] { http.get(u) }
 "#;
-    let v = run(src, "fetch", vec![Value::Str(url)], allow_net());
+    let v = run(src, "fetch", vec![Value::Str(url.into())], allow_net());
     let r = unwrap_ok_record(v);
     assert_eq!(r.get("status"), Some(&Value::Int(200)));
     match r.get("body") {
@@ -417,7 +417,7 @@ fn push(u :: Str, b :: Bytes) -> [net] Result[HttpResponse, HttpError] {
     let v = run(
         src,
         "push",
-        vec![Value::Str(url), Value::Bytes(b"\x00\x01\x02hi".to_vec())],
+        vec![Value::Str(url.into()), Value::Bytes(b"\x00\x01\x02hi".to_vec())],
         allow_net(),
     );
     let r = unwrap_ok_record(v);
@@ -454,7 +454,7 @@ fn fetch_authed(u :: Str, token :: Str) -> [net] Result[HttpResponse, HttpError]
         src,
         "fetch_authed",
         vec![
-            Value::Str(url),
+            Value::Str(url.into()),
             Value::Str("secret-jwt".into()),
         ],
         allow_net(),

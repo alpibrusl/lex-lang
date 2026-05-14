@@ -230,7 +230,7 @@ fn eval(
         SpecExpr::IntLit { value } => Ok(Value::Int(*value)),
         SpecExpr::FloatLit { value } => Ok(Value::Float(*value)),
         SpecExpr::BoolLit { value } => Ok(Value::Bool(*value)),
-        SpecExpr::StrLit { value } => Ok(Value::Str(value.clone())),
+        SpecExpr::StrLit { value } => Ok(Value::Str(value.clone().into())),
         SpecExpr::Var { name } => bindings.get(name).cloned()
             .ok_or_else(|| format!("unbound spec var `{name}`")),
         SpecExpr::Let { name, value, body } => {

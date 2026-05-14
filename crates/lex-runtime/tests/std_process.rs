@@ -90,7 +90,7 @@ fn run_capture_exit(cmd :: Str, args :: List[Str]) -> [proc] Int {
 
 fn s(v: Value) -> String {
     match v {
-        Value::Str(s) => s,
+        Value::Str(s) => s.to_string(),
         other => panic!("expected Str, got {other:?}"),
     }
 }

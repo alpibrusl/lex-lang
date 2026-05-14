@@ -27,7 +27,7 @@ fn run(src: &str, fn_name: &str, args: Vec<Value>, policy: Policy) -> Value {
 
 fn s(v: Value) -> String {
     match v {
-        Value::Str(s) => s,
+        Value::Str(s) => s.to_string(),
         other => panic!("expected Str, got {other:?}"),
     }
 }

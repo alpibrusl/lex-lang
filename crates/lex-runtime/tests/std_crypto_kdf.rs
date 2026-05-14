@@ -49,7 +49,7 @@ fn unwrap_err(v: Value) -> String {
     match v {
         Value::Variant { name, args } if name == "Err" && args.len() == 1 => {
             match args.into_iter().next().unwrap() {
-                Value::Str(s) => s,
+                Value::Str(s) => s.to_string(),
                 other => panic!("Err payload not Str: {other:?}"),
             }
         }

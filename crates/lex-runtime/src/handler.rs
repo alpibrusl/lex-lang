@@ -6,6 +6,7 @@
 
 use lex_bytecode::vm::{EffectHandler, Vm};
 use lex_bytecode::{Program, Value};
+use smol_str::SmolStr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -154,7 +155,7 @@ impl DefaultHandler {
                         Ok(ok(Value::Unit))
                     }
                     None => Ok(err(Value::Str(format!(
-                        "log.set_level: unknown level `{s}`; expected debug|info|warn|error")))),
+                        "log.set_level: unknown level `{s}`; expected debug|info|warn|error").into()))),
                 }
             }
             "set_format" => {
@@ -163,7 +164,7 @@ impl DefaultHandler {
                     "text" => LogFormat::Text,
                     "json" => LogFormat::Json,
                     other => return Ok(err(Value::Str(format!(
-                        "log.set_format: unknown format `{other}`; expected text|json")))),
+                        "log.set_format: unknown format `{other}`; expected text|json").into()))),
                 };
                 log_state().lock().unwrap().format = fmt;
                 Ok(ok(Value::Unit))
@@ -175,7 +176,7 @@ impl DefaultHandler {
                     return Ok(ok(Value::Unit));
                 }
                 if let Err(e) = self.ensure_fs_write_path(path) {
-                    return Ok(err(Value::Str(e)));
+                    return Ok(err(Value::Str(e.into())));
                 }
                 match std::fs::OpenOptions::new()
                     .create(true).append(true).open(path)
@@ -184,7 +185,7 @@ impl DefaultHandler {
                         log_state().lock().unwrap().sink = LogSink::File(std::sync::Arc::new(Mutex::new(f)));
                         Ok(ok(Value::Unit))
                     }
-                    Err(e) => Ok(err(Value::Str(format!("log.set_sink `{path}`: {e}")))),
+                    Err(e) => Ok(err(Value::Str(format!("log.set_sink `{path}`: {e}").into()))),
                 }
             }
             other => Err(format!("unsupported log.{other}")),
@@ -200,7 +201,7 @@ impl DefaultHandler {
                     _ => return Err("process.spawn: args must be List[Str]".into()),
                 };
                 let str_args: Result<Vec<String>, String> = raw_args.iter().map(|v| match v {
-                    Value::Str(s) => Ok(s.clone()),
+                    Value::Str(s) => Ok(s.to_string()),
                     other => Err(format!("process.spawn: arg must be Str, got {other:?}")),
                 }).collect();
                 let str_args = str_args?;
@@ -219,7 +220,7 @@ impl DefaultHandler {
                         return Ok(err(Value::Str(format!(
                             "process.spawn: `{cmd}` not in --allow-proc {:?}",
                             self.policy.allow_proc
-                        ))));
+                        ).into())));
                     }
                 }
 
@@ -256,7 +257,7 @@ impl DefaultHandler {
 
                 let mut child = match command.spawn() {
                     Ok(c) => c,
-                    Err(e) => return Ok(err(Value::Str(format!("process.spawn `{cmd}`: {e}")))),
+                    Err(e) => return Ok(err(Value::Str(format!("process.spawn `{cmd}`: {e}").into()))),
                 };
 
                 if let Some(payload) = stdin_payload {
@@ -319,7 +320,7 @@ impl DefaultHandler {
                 // Windows). Signal-name dispatch is a v1.5 follow-up.
                 match state.child.kill() {
                     Ok(_) => Ok(ok(Value::Unit)),
-                    Err(e) => Ok(err(Value::Str(format!("process.kill: {e}")))),
+                    Err(e) => Ok(err(Value::Str(format!("process.kill: {e}").into()))),
                 }
             }
             "run" => {
@@ -329,7 +330,7 @@ impl DefaultHandler {
                     _ => return Err("process.run: args must be List[Str]".into()),
                 };
                 let str_args: Result<Vec<String>, String> = raw_args.iter().map(|v| match v {
-                    Value::Str(s) => Ok(s.clone()),
+                    Value::Str(s) => Ok(s.to_string()),
                     other => Err(format!("process.run: arg must be Str, got {other:?}")),
                 }).collect();
                 let str_args = str_args?;
@@ -342,21 +343,21 @@ impl DefaultHandler {
                         return Ok(err(Value::Str(format!(
                             "process.run: `{cmd}` not in --allow-proc {:?}",
                             self.policy.allow_proc
-                        ))));
+                        ).into())));
                     }
                 }
                 match std::process::Command::new(&cmd).args(&str_args).output() {
                     Ok(o) => {
                         let mut rec = indexmap::IndexMap::new();
                         rec.insert("stdout".into(), Value::Str(
-                            String::from_utf8_lossy(&o.stdout).to_string()));
+                            String::from_utf8_lossy(&o.stdout).into_owned().into()));
                         rec.insert("stderr".into(), Value::Str(
-                            String::from_utf8_lossy(&o.stderr).to_string()));
+                            String::from_utf8_lossy(&o.stderr).into_owned().into()));
                         rec.insert("exit_code".into(), Value::Int(
                             o.status.code().unwrap_or(-1) as i64));
                         Ok(ok(Value::Record(rec)))
                     }
-                    Err(e) => Ok(err(Value::Str(format!("process.run `{cmd}`: {e}")))),
+                    Err(e) => Ok(err(Value::Str(format!("process.run `{cmd}`: {e}").into()))),
                 }
             }
             other => Err(format!("unsupported process.{other}")),
@@ -391,7 +392,7 @@ impl DefaultHandler {
             Ok(_) => {
                 if line.ends_with('\n') { line.pop(); }
                 if line.ends_with('\r') { line.pop(); }
-                Ok(some(Value::Str(line)))
+                Ok(some(Value::Str(line.into())))
             }
             Err(e) => Err(format!("process.read_*_line: {e}")),
         }
@@ -402,28 +403,28 @@ impl DefaultHandler {
             "exists" => {
                 let path = expect_str(args.first())?.to_string();
                 if let Err(e) = self.ensure_fs_walk_path(&path) {
-                    return Ok(err(Value::Str(e)));
+                    return Ok(err(Value::Str(e.into())));
                 }
                 Ok(Value::Bool(std::path::Path::new(&path).exists()))
             }
             "is_file" => {
                 let path = expect_str(args.first())?.to_string();
                 if let Err(e) = self.ensure_fs_walk_path(&path) {
-                    return Ok(err(Value::Str(e)));
+                    return Ok(err(Value::Str(e.into())));
                 }
                 Ok(Value::Bool(std::path::Path::new(&path).is_file()))
             }
             "is_dir" => {
                 let path = expect_str(args.first())?.to_string();
                 if let Err(e) = self.ensure_fs_walk_path(&path) {
-                    return Ok(err(Value::Str(e)));
+                    return Ok(err(Value::Str(e.into())));
                 }
                 Ok(Value::Bool(std::path::Path::new(&path).is_dir()))
             }
             "stat" => {
                 let path = expect_str(args.first())?.to_string();
                 if let Err(e) = self.ensure_fs_walk_path(&path) {
-                    return Ok(err(Value::Str(e)));
+                    return Ok(err(Value::Str(e.into())));
                 }
                 match std::fs::metadata(&path) {
                     Ok(md) => {
@@ -439,13 +440,13 @@ impl DefaultHandler {
                         rec.insert("is_file".into(), Value::Bool(md.is_file()));
                         Ok(ok(Value::Record(rec)))
                     }
-                    Err(e) => Ok(err(Value::Str(format!("fs.stat `{path}`: {e}")))),
+                    Err(e) => Ok(err(Value::Str(format!("fs.stat `{path}`: {e}").into()))),
                 }
             }
             "list_dir" => {
                 let path = expect_str(args.first())?.to_string();
                 if let Err(e) = self.ensure_fs_walk_path(&path) {
-                    return Ok(err(Value::Str(e)));
+                    return Ok(err(Value::Str(e.into())));
                 }
                 match std::fs::read_dir(&path) {
                     Ok(rd) => {
@@ -454,27 +455,27 @@ impl DefaultHandler {
                             match ent {
                                 Ok(e) => {
                                     let p = e.path();
-                                    entries.push(Value::Str(p.to_string_lossy().into_owned()));
+                                    entries.push(Value::Str(p.to_string_lossy().into_owned().into()));
                                 }
-                                Err(e) => return Ok(err(Value::Str(format!("fs.list_dir: {e}")))),
+                                Err(e) => return Ok(err(Value::Str(format!("fs.list_dir: {e}").into()))),
                             }
                         }
                         Ok(ok(Value::List(entries.into())))
                     }
-                    Err(e) => Ok(err(Value::Str(format!("fs.list_dir `{path}`: {e}")))),
+                    Err(e) => Ok(err(Value::Str(format!("fs.list_dir `{path}`: {e}").into()))),
                 }
             }
             "walk" => {
                 let path = expect_str(args.first())?.to_string();
                 if let Err(e) = self.ensure_fs_walk_path(&path) {
-                    return Ok(err(Value::Str(e)));
+                    return Ok(err(Value::Str(e.into())));
                 }
                 let mut paths: Vec<Value> = Vec::new();
                 for ent in walkdir::WalkDir::new(&path) {
                     match ent {
                         Ok(e) => paths.push(Value::Str(
-                            e.path().to_string_lossy().into_owned())),
-                        Err(e) => return Ok(err(Value::Str(format!("fs.walk: {e}")))),
+                            e.path().to_string_lossy().into_owned().into())),
+                        Err(e) => return Ok(err(Value::Str(format!("fs.walk: {e}").into()))),
                     }
                 }
                 Ok(ok(Value::List(paths.into())))
@@ -487,7 +488,7 @@ impl DefaultHandler {
                 // `--allow-fs-read`.
                 let entries = match glob::glob(&pattern) {
                     Ok(e) => e,
-                    Err(e) => return Ok(err(Value::Str(format!("fs.glob: {e}")))),
+                    Err(e) => return Ok(err(Value::Str(format!("fs.glob: {e}").into()))),
                 };
                 let mut paths: Vec<Value> = Vec::new();
                 for ent in entries {
@@ -497,10 +498,10 @@ impl DefaultHandler {
                             if self.policy.allow_fs_read.is_empty()
                                 || self.policy.allow_fs_read.iter().any(|root| p.starts_with(root))
                             {
-                                paths.push(Value::Str(s));
+                                paths.push(Value::Str(s.into()));
                             }
                         }
-                        Err(e) => return Ok(err(Value::Str(format!("fs.glob: {e}")))),
+                        Err(e) => return Ok(err(Value::Str(format!("fs.glob: {e}").into()))),
                     }
                 }
                 Ok(ok(Value::List(paths.into())))
@@ -508,17 +509,17 @@ impl DefaultHandler {
             "mkdir_p" => {
                 let path = expect_str(args.first())?.to_string();
                 if let Err(e) = self.ensure_fs_write_path(&path) {
-                    return Ok(err(Value::Str(e)));
+                    return Ok(err(Value::Str(e.into())));
                 }
                 match std::fs::create_dir_all(&path) {
                     Ok(_) => Ok(ok(Value::Unit)),
-                    Err(e) => Ok(err(Value::Str(format!("fs.mkdir_p `{path}`: {e}")))),
+                    Err(e) => Ok(err(Value::Str(format!("fs.mkdir_p `{path}`: {e}").into()))),
                 }
             }
             "remove" => {
                 let path = expect_str(args.first())?.to_string();
                 if let Err(e) = self.ensure_fs_write_path(&path) {
-                    return Ok(err(Value::Str(e)));
+                    return Ok(err(Value::Str(e.into())));
                 }
                 let p = std::path::Path::new(&path);
                 let result = if p.is_dir() {
@@ -528,21 +529,21 @@ impl DefaultHandler {
                 };
                 match result {
                     Ok(_) => Ok(ok(Value::Unit)),
-                    Err(e) => Ok(err(Value::Str(format!("fs.remove `{path}`: {e}")))),
+                    Err(e) => Ok(err(Value::Str(format!("fs.remove `{path}`: {e}").into()))),
                 }
             }
             "copy" => {
                 let src = expect_str(args.first())?.to_string();
                 let dst = expect_str(args.get(1))?.to_string();
                 if let Err(e) = self.ensure_fs_walk_path(&src) {
-                    return Ok(err(Value::Str(e)));
+                    return Ok(err(Value::Str(e.into())));
                 }
                 if let Err(e) = self.ensure_fs_write_path(&dst) {
-                    return Ok(err(Value::Str(e)));
+                    return Ok(err(Value::Str(e.into())));
                 }
                 match std::fs::copy(&src, &dst) {
                     Ok(_) => Ok(ok(Value::Unit)),
-                    Err(e) => Ok(err(Value::Str(format!("fs.copy {src} -> {dst}: {e}")))),
+                    Err(e) => Ok(err(Value::Str(format!("fs.copy {src} -> {dst}: {e}").into()))),
                 }
             }
             other => Err(format!("unsupported fs.{other}")),
@@ -728,7 +729,7 @@ impl EffectHandler for DefaultHandler {
             let mut buf = vec![0u8; n as usize];
             SysRng.try_fill_bytes(&mut buf)
                 .map_err(|e| format!("crypto.random_str_hex: OS RNG: {e}"))?;
-            return Ok(Value::Str(hex::encode(&buf)));
+            return Ok(Value::Str(hex::encode(&buf).into()));
         }
         // `std.http` wire ops (send/get/post) gate on the `net`
         // effect kind, not the module name. This matches the
@@ -764,7 +765,7 @@ impl EffectHandler for DefaultHandler {
                 "local_complete" => Ok(dispatch_llm_local(args)),
                 "cloud_complete" => Ok(dispatch_llm_cloud(args)),
                 "cloud_stream"   => Ok(self.dispatch_cloud_stream(args)),
-                _ => Ok(ok(Value::Str(format!("<{effect_kind} stub>")))),
+                _ => Ok(ok(Value::Str(format!("<{effect_kind} stub>").into()))),
             };
         }
         if kind == "stream" {
@@ -825,8 +826,8 @@ impl EffectHandler for DefaultHandler {
                     return Err(format!("read of `{path}` outside --allow-fs-read"));
                 }
                 match std::fs::read_to_string(&resolved) {
-                    Ok(s) => Ok(ok(Value::Str(s))),
-                    Err(e) => Ok(err(Value::Str(format!("{e}")))),
+                    Ok(s) => Ok(ok(Value::Str(s.into()))),
+                    Err(e) => Ok(err(Value::Str(format!("{e}").into()))),
                 }
             }
             ("io", "write") => {
@@ -841,7 +842,7 @@ impl EffectHandler for DefaultHandler {
                 }
                 match std::fs::write(&path, contents) {
                     Ok(_) => Ok(ok(Value::Unit)),
-                    Err(e) => Ok(err(Value::Str(format!("{e}")))),
+                    Err(e) => Ok(err(Value::Str(format!("{e}").into()))),
                 }
             }
             ("time", "now") => {
@@ -877,10 +878,10 @@ impl EffectHandler for DefaultHandler {
                     if let Ok(secs) = s.trim().parse::<i64>() {
                         let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0)
                             .unwrap_or_else(chrono::Utc::now);
-                        return Ok(Value::Str(dt.to_rfc3339()));
+                        return Ok(Value::Str(dt.to_rfc3339().into()));
                     }
                 }
-                Ok(Value::Str(chrono::Utc::now().to_rfc3339()))
+                Ok(Value::Str(chrono::Utc::now().to_rfc3339().into()))
             }
             ("time", "mono_ns") => {
                 // Monotonic clock relative to process start. Cached
@@ -925,7 +926,7 @@ impl EffectHandler for DefaultHandler {
                 Ok(match std::env::var(name) {
                     Ok(v) => Value::Variant {
                         name: "Some".into(),
-                        args: vec![Value::Str(v)],
+                        args: vec![Value::Str(v.into())],
                     },
                     Err(_) => Value::Variant { name: "None".into(), args: Vec::new() },
                 })
@@ -1065,7 +1066,7 @@ impl EffectHandler for DefaultHandler {
                     let p = std::path::Path::new(&path);
                     if !self.policy.allow_fs_write.iter().any(|a| p.starts_with(a)) {
                         return Ok(err(Value::Str(format!(
-                            "kv.open: `{path}` outside --allow-fs-write"))));
+                            "kv.open: `{path}` outside --allow-fs-write").into())));
                     }
                 }
                 match sled::open(&path) {
@@ -1074,7 +1075,7 @@ impl EffectHandler for DefaultHandler {
                         kv_registry().lock().unwrap().insert(handle, db);
                         Ok(ok(Value::Int(handle as i64)))
                     }
-                    Err(e) => Ok(err(Value::Str(format!("kv.open: {e}")))),
+                    Err(e) => Ok(err(Value::Str(format!("kv.open: {e}").into()))),
                 }
             }
             ("kv", "close") => {
@@ -1101,7 +1102,7 @@ impl EffectHandler for DefaultHandler {
                 let db = reg.touch_get(h).ok_or_else(|| "kv.put: closed or unknown Kv handle".to_string())?;
                 match db.insert(key.as_bytes(), val) {
                     Ok(_) => Ok(ok(Value::Unit)),
-                    Err(e) => Ok(err(Value::Str(format!("kv.put: {e}")))),
+                    Err(e) => Ok(err(Value::Str(format!("kv.put: {e}").into()))),
                 }
             }
             ("kv", "delete") => {
@@ -1111,7 +1112,7 @@ impl EffectHandler for DefaultHandler {
                 let db = reg.touch_get(h).ok_or_else(|| "kv.delete: closed or unknown Kv handle".to_string())?;
                 match db.remove(key.as_bytes()) {
                     Ok(_) => Ok(ok(Value::Unit)),
-                    Err(e) => Ok(err(Value::Str(format!("kv.delete: {e}")))),
+                    Err(e) => Ok(err(Value::Str(format!("kv.delete: {e}").into()))),
                 }
             }
             ("kv", "contains") => {
@@ -1133,7 +1134,7 @@ impl EffectHandler for DefaultHandler {
                 for kv in db.scan_prefix(prefix.as_bytes()) {
                     let (k, _) = kv.map_err(|e| format!("kv.list_prefix: {e}"))?;
                     let s = String::from_utf8_lossy(&k).to_string();
-                    keys.push(Value::Str(s));
+                    keys.push(Value::Str(s.into()));
                 }
                 Ok(Value::List(keys.into()))
             }
@@ -1398,7 +1399,7 @@ impl EffectHandler for DefaultHandler {
             }
             ("sql", "get_str") => Ok(sql_get_col(&args, |v| match v {
                 Value::Str(s) => Some(Value::Str(s.clone())),
-                Value::Int(n) => Some(Value::Str(n.to_string())),
+                Value::Int(n) => Some(Value::Str(n.to_string().into())),
                 _ => None,
             })?),
             ("sql", "get_int") => Ok(sql_get_col(&args, |v| match v {
@@ -1438,7 +1439,7 @@ impl EffectHandler for DefaultHandler {
                     None => return Err("proc.spawn: missing args list".into()),
                 };
                 let str_args: Vec<String> = raw_args.iter().map(|v| match v {
-                    Value::Str(s) => Ok(s.clone()),
+                    Value::Str(s) => Ok(s.to_string()),
                     other => Err(format!("proc.spawn: arg must be Str, got {other:?}")),
                 }).collect::<Result<Vec<_>, _>>()?;
 
@@ -1454,7 +1455,7 @@ impl EffectHandler for DefaultHandler {
                         return Ok(err(Value::Str(format!(
                             "proc.spawn: `{cmd}` not in --allow-proc {:?}",
                             self.policy.allow_proc
-                        ))));
+                        ).into())));
                     }
                 }
 
@@ -1462,7 +1463,7 @@ impl EffectHandler for DefaultHandler {
                 // unbounded argv is a DoS vector.
                 if str_args.len() > 1024 {
                     return Ok(err(Value::Str(
-                        "proc.spawn: arg-count exceeds 1024".into())));
+                        SmolStr::new_inline("proc.spawn: arg-count exceeds 1024"))));
                 }
                 if str_args.iter().any(|a| a.len() > 65_536) {
                     return Ok(err(Value::Str(
@@ -1476,14 +1477,14 @@ impl EffectHandler for DefaultHandler {
                     Ok(o) => {
                         let mut rec = indexmap::IndexMap::new();
                         rec.insert("stdout".into(), Value::Str(
-                            String::from_utf8_lossy(&o.stdout).to_string()));
+                            String::from_utf8_lossy(&o.stdout).into_owned().into()));
                         rec.insert("stderr".into(), Value::Str(
-                            String::from_utf8_lossy(&o.stderr).to_string()));
+                            String::from_utf8_lossy(&o.stderr).into_owned().into()));
                         rec.insert("exit_code".into(), Value::Int(
                             o.status.code().unwrap_or(-1) as i64));
                         Ok(ok(Value::Record(rec)))
                     }
-                    Err(e) => Ok(err(Value::Str(format!("spawn `{cmd}`: {e}")))),
+                    Err(e) => Ok(err(Value::Str(format!("spawn `{cmd}`: {e}").into()))),
                 }
             }
             other => Err(format!("unsupported effect {}.{}", other.0, other.1)),
@@ -1760,16 +1761,16 @@ fn build_request_value_parts(
         if let Ok(v) = val.to_str() {
             headers_map.insert(
                 lex_bytecode::MapKey::Str(name.as_str().to_ascii_lowercase()),
-                Value::Str(v.to_string()),
+                Value::Str(v.to_string().into()),
             );
         }
     }
     let body_str = String::from_utf8_lossy(body).into_owned();
     let mut rec = indexmap::IndexMap::new();
-    rec.insert("method".into(), Value::Str(method));
-    rec.insert("path".into(), Value::Str(path));
-    rec.insert("query".into(), Value::Str(query));
-    rec.insert("body".into(), Value::Str(body_str));
+    rec.insert("method".into(), Value::Str(method.into()));
+    rec.insert("path".into(), Value::Str(path.into()));
+    rec.insert("query".into(), Value::Str(query.into()));
+    rec.insert("body".into(), Value::Str(body_str.into()));
     rec.insert("headers".into(), Value::Map(headers_map));
     Value::Record(rec)
 }
@@ -1786,16 +1787,16 @@ fn build_request_value_tiny(req: &mut tiny_http::Request) -> Value {
     for h in req.headers() {
         headers_map.insert(
             lex_bytecode::MapKey::Str(h.field.as_str().as_str().to_ascii_lowercase()),
-            Value::Str(h.value.as_str().to_string()),
+            Value::Str(h.value.as_str().to_string().into()),
         );
     }
     let mut body = String::new();
     let _ = req.as_reader().read_to_string(&mut body);
     let mut rec = indexmap::IndexMap::new();
-    rec.insert("method".into(), Value::Str(method));
-    rec.insert("path".into(), Value::Str(path));
-    rec.insert("query".into(), Value::Str(query));
-    rec.insert("body".into(), Value::Str(body));
+    rec.insert("method".into(), Value::Str(method.into()));
+    rec.insert("path".into(), Value::Str(path.into()));
+    rec.insert("query".into(), Value::Str(query.into()));
+    rec.insert("body".into(), Value::Str(body.into()));
     rec.insert("headers".into(), Value::Map(headers_map));
     Value::Record(rec)
 }
@@ -1809,7 +1810,7 @@ fn unpack_response(v: &Value) -> (u16, ResponseBodyOut, Vec<(String, String)>) {
         let body = match rec.get("body") {
             // Tagged ResponseBody (#375): BodyStr | BodyStream | BodyBytes.
             Some(Value::Variant { name, args }) => match (name.as_str(), args.as_slice()) {
-                ("BodyStr",    [Value::Str(s)])             => ResponseBodyOut::Str(s.clone()),
+                ("BodyStr",    [Value::Str(s)])             => ResponseBodyOut::Str(s.to_string()),
                 ("BodyStream", [iter_v])                    => ResponseBodyOut::TextChunks(drain_iter_str(iter_v)),
                 ("BodyBytes",  [iter_v])                    => ResponseBodyOut::BytesChunks(drain_iter_bytes(iter_v)),
                 _ => ResponseBodyOut::Str(String::new()),
@@ -1819,13 +1820,13 @@ fn unpack_response(v: &Value) -> (u16, ResponseBodyOut, Vec<(String, String)>) {
             // `body :: Str` (the pre-#375 contract). Lets internal
             // test handlers and one-liners keep working without
             // wrapping in `BodyStr(...)`.
-            Some(Value::Str(s)) => ResponseBodyOut::Str(s.clone()),
+            Some(Value::Str(s)) => ResponseBodyOut::Str(s.to_string()),
             _ => ResponseBodyOut::Str(String::new()),
         };
         let headers: Vec<(String, String)> = if let Some(Value::Map(hmap)) = rec.get("headers") {
             hmap.iter().filter_map(|(k, v)| {
                 if let (lex_bytecode::MapKey::Str(name), Value::Str(val)) = (k, v) {
-                    Some((name.clone(), val.clone()))
+                    Some((name.clone(), val.to_string()))
                 } else {
                     None
                 }
@@ -2092,7 +2093,7 @@ fn http_request(method: &str, url: &str, body: Option<&str>) -> Value {
             let status = r.status().as_u16();
             let body = r.body_mut().read_to_string().unwrap_or_default();
             if (200..300).contains(&status) {
-                Value::Variant { name: "Ok".into(), args: vec![Value::Str(body)] }
+                Value::Variant { name: "Ok".into(), args: vec![Value::Str(body.into())] }
             } else {
                 err_value(format!("status {status}: {body}"))
             }
@@ -2130,7 +2131,7 @@ fn http_error_value(e: ureq::Error) -> Value {
         ureq::Error::Rustls(r) => ("TlsError", Some(format!("{r}"))),
         _ => ("NetworkError", Some(format!("{e}"))),
     };
-    let args = match payload { Some(s) => vec![Value::Str(s)], None => vec![] };
+    let args = match payload { Some(s) => vec![Value::Str(s.into())], None => vec![] };
     let inner = Value::Variant { name: ctor.into(), args };
     Value::Variant { name: "Err".into(), args: vec![inner] }
 }
@@ -2138,7 +2139,7 @@ fn http_error_value(e: ureq::Error) -> Value {
 fn http_decode_err(msg: String) -> Value {
     let inner = Value::Variant {
         name: "DecodeError".into(),
-        args: vec![Value::Str(msg)],
+        args: vec![Value::Str(msg.into())],
     };
     Value::Variant { name: "Err".into(), args: vec![inner] }
 }
@@ -2211,7 +2212,7 @@ fn collect_response_headers(
     let mut out = std::collections::BTreeMap::new();
     for (name, value) in headers.iter() {
         let v = value.to_str().unwrap_or("").to_string();
-        out.insert(lex_bytecode::MapKey::Str(name.as_str().to_string()), Value::Str(v));
+        out.insert(lex_bytecode::MapKey::Str(name.as_str().to_string()), Value::Str(v.into()));
     }
     out
 }
@@ -2221,11 +2222,11 @@ fn collect_response_headers(
 /// `--allow-net-host` for the URL before sending.
 fn http_send_record(handler: &DefaultHandler, req: &indexmap::IndexMap<String, Value>) -> Value {
     let method = match req.get("method") {
-        Some(Value::Str(s)) => s.clone(),
+        Some(Value::Str(s)) => s.to_string(),
         _ => return http_decode_err("HttpRequest.method must be Str".into()),
     };
     let url = match req.get("url") {
-        Some(Value::Str(s)) => s.clone(),
+        Some(Value::Str(s)) => s.to_string(),
         _ => return http_decode_err("HttpRequest.url must be Str".into()),
     };
     if let Err(e) = handler.ensure_host_allowed(&url) {
@@ -2251,7 +2252,7 @@ fn http_send_record(handler: &DefaultHandler, req: &indexmap::IndexMap<String, V
     let headers: Vec<(String, String)> = match req.get("headers") {
         Some(Value::Map(m)) => m.iter().filter_map(|(k, v)| {
             let kk = match k { lex_bytecode::MapKey::Str(s) => s.clone(), _ => return None };
-            let vv = match v { Value::Str(s) => s.clone(), _ => return None };
+            let vv = match v { Value::Str(s) => s.to_string(), _ => return None };
             Some((kk, vv))
         }).collect(),
         _ => return http_decode_err("HttpRequest.headers must be Map[Str, Str]".into()),
@@ -2268,7 +2269,7 @@ fn expect_record(v: Option<&Value>) -> Result<&indexmap::IndexMap<String, Value>
 }
 
 fn err_value(msg: String) -> Value {
-    Value::Variant { name: "Err".into(), args: vec![Value::Str(msg)] }
+    Value::Variant { name: "Err".into(), args: vec![Value::Str(msg.into())] }
 }
 
 fn expect_str(v: Option<&Value>) -> Result<&str, String> {
@@ -2298,10 +2299,11 @@ fn err(v: Value) -> Value {
 /// `code` and `detail` are `None` by default; the driver-specific
 /// converters below populate them with real values.
 fn sql_error(message: impl Into<String>, code: Option<String>, detail: Option<String>) -> Value {
-    let some = |s: String| Value::Variant { name: "Some".into(), args: vec![Value::Str(s)] };
+    let some = |s: String| Value::Variant { name: "Some".into(), args: vec![Value::Str(s.into())] };
     let none = || Value::Variant { name: "None".into(), args: vec![] };
     let mut rec = indexmap::IndexMap::new();
-    rec.insert("message".into(), Value::Str(message.into()));
+    let msg: String = message.into();
+    rec.insert("message".into(), Value::Str(msg.into()));
     rec.insert("code".into(), match code {
         Some(c) => some(c),
         None => none(),
@@ -2415,12 +2417,12 @@ impl DefaultHandler {
         let parsed: serde_json::Value = match serde_json::from_str(&args_json) {
             Ok(v) => v,
             Err(e) => return err(Value::Str(format!(
-                "agent.call_mcp: args_json is not valid JSON: {e}"))),
+                "agent.call_mcp: args_json is not valid JSON: {e}").into())),
         };
         match self.mcp_clients.call(&server, &tool, parsed) {
             Ok(result) => ok(Value::Str(
-                serde_json::to_string(&result).unwrap_or_else(|_| "null".into()))),
-            Err(e) => err(Value::Str(e)),
+                serde_json::to_string(&result).unwrap_or_else(|_| "null".into()).into())),
+            Err(e) => err(Value::Str(e.into())),
         }
     }
 
@@ -2460,7 +2462,7 @@ impl DefaultHandler {
             Err(_) => return Value::Variant { name: "None".into(), args: vec![] },
         };
         match streams.get_mut(&handle).and_then(|it| it.next()) {
-            Some(chunk) => some(Value::Str(chunk)),
+            Some(chunk) => some(Value::Str(chunk.into())),
             None => {
                 streams.remove(&handle);
                 Value::Variant { name: "None".into(), args: vec![] }
@@ -2489,7 +2491,7 @@ impl DefaultHandler {
         };
         let mut out: std::collections::VecDeque<Value> = std::collections::VecDeque::new();
         for chunk in iter.by_ref() {
-            out.push_back(Value::Str(chunk));
+            out.push_back(Value::Str(chunk.into()));
         }
         Value::List(out)
     }
@@ -2519,7 +2521,7 @@ impl DefaultHandler {
 fn stream_handle_value(handle: String) -> Value {
     Value::Variant {
         name: "__StreamHandle".into(),
-        args: vec![Value::Str(handle)],
+        args: vec![Value::Str(handle.into())],
     }
 }
 
@@ -2529,7 +2531,7 @@ fn stream_handle_value(handle: String) -> Value {
 fn stream_handle_id(v: &Value) -> Option<String> {
     match v {
         Value::Variant { name, args } if name == "__StreamHandle" => match args.first() {
-            Some(Value::Str(h)) => Some(h.clone()),
+            Some(Value::Str(h)) => Some(h.to_string()),
             _ => None,
         },
         _ => None,
@@ -2547,8 +2549,8 @@ fn dispatch_llm_local(args: Vec<Value>) -> Value {
             "agent.local_complete(prompt): prompt must be Str".into())),
     };
     match crate::llm::local_complete(&prompt) {
-        Ok(text) => ok(Value::Str(text)),
-        Err(e) => err(Value::Str(e)),
+        Ok(text) => ok(Value::Str(text.into())),
+        Err(e) => err(Value::Str(e.into())),
     }
 }
 
@@ -2565,8 +2567,8 @@ fn dispatch_llm_cloud(args: Vec<Value>) -> Value {
             "agent.cloud_complete(prompt): prompt must be Str".into())),
     };
     match crate::llm::cloud_complete(&prompt) {
-        Ok(text) => ok(Value::Str(text)),
-        Err(e) => err(Value::Str(e)),
+        Ok(text) => ok(Value::Str(text.into())),
+        Err(e) => err(Value::Str(e.into())),
     }
 }
 
@@ -2605,7 +2607,7 @@ fn expect_sql_handle(v: Option<&Value>) -> Result<u64, String> {
 fn expect_str_list(v: Option<&Value>) -> Result<Vec<String>, String> {
     match v {
         Some(Value::List(items)) => items.iter().map(|x| match x {
-            Value::Str(s) => Ok(s.clone()),
+            Value::Str(s) => Ok(s.to_string()),
             other => Err(format!("expected List[Str] element, got {other:?}")),
         }).collect(),
         Some(other) => Err(format!("expected List[Str], got {other:?}")),
@@ -2625,7 +2627,7 @@ fn expect_sql_params(v: Option<&Value>) -> Result<Vec<SqlParamValue>, String> {
         match item {
             Value::Variant { name, args } => match name.as_str() {
                 "PStr"   => match args.first() {
-                    Some(Value::Str(s)) => Ok(SqlParamValue::Text(s.clone())),
+                    Some(Value::Str(s)) => Ok(SqlParamValue::Text(s.to_string())),
                     _ => Err("PStr requires a Str argument".into()),
                 },
                 "PInt"   => match args.first() {
@@ -2644,7 +2646,7 @@ fn expect_sql_params(v: Option<&Value>) -> Result<Vec<SqlParamValue>, String> {
                 other    => Err(format!("unknown SqlParam constructor `{other}`")),
             },
             // Backward-compat: bare strings are accepted as PStr.
-            Value::Str(s) => Ok(SqlParamValue::Text(s.clone())),
+            Value::Str(s) => Ok(SqlParamValue::Text(s.to_string())),
             other => Err(format!("expected SqlParam variant, got {other:?}")),
         }
     }).collect()
@@ -2750,7 +2752,7 @@ fn pg_row_to_lex_record(row: &postgres::Row) -> indexmap::IndexMap<String, Value
         } else if *ty == Type::BYTEA {
             row.get::<_, Option<Vec<u8>>>(i).map(Value::Bytes).unwrap_or(Value::Unit)
         } else {
-            row.get::<_, Option<String>>(i).map(Value::Str).unwrap_or(Value::Unit)
+            row.get::<_, Option<String>>(i).map(|s| Value::Str(s.into())).unwrap_or(Value::Unit)
         };
         rec.insert(col.name().to_string(), val);
     }
@@ -2784,7 +2786,7 @@ fn sql_value_ref_to_lex(v: rusqlite::types::ValueRef<'_>) -> Value {
         ValueRef::Null       => Value::Unit,
         ValueRef::Integer(n) => Value::Int(n),
         ValueRef::Real(f)    => Value::Float(f),
-        ValueRef::Text(s)    => Value::Str(String::from_utf8_lossy(s).into_owned()),
+        ValueRef::Text(s)    => Value::Str(String::from_utf8_lossy(s).into_owned().into()),
         ValueRef::Blob(b)    => Value::Bytes(b.to_vec()),
     }
 }

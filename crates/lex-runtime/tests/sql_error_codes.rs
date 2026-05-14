@@ -39,13 +39,13 @@ fn unpack_sql_error(v: &Value) -> (String, Option<String>, Option<String>) {
         other => panic!("expected SqlError record, got {other:?}"),
     };
     let message = match rec.get("message") {
-        Some(Value::Str(s)) => s.clone(),
+        Some(Value::Str(s)) => s.to_string(),
         other => panic!("expected message :: Str, got {other:?}"),
     };
     let read_opt = |key: &str| match rec.get(key) {
         Some(Value::Variant { name, args }) if name == "Some" && args.len() == 1 => {
             match &args[0] {
-                Value::Str(s) => Some(s.clone()),
+                Value::Str(s) => Some(s.to_string()),
                 _ => None,
             }
         }
