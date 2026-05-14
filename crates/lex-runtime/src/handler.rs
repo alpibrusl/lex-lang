@@ -1552,52 +1552,120 @@ fn serve_http(
     policy: Policy,
     tls: Option<TlsConfig>,
 ) -> Result<Value, String> {
-    let (server, scheme) = match tls {
-        None => (
-            tiny_http::Server::http(("127.0.0.1", port))
-                .map_err(|e| format!("net.serve bind {port}: {e}"))?,
-            "http",
-        ),
-        Some(cfg) => {
-            let ssl = tiny_http::SslConfig {
-                certificate: cfg.cert,
-                private_key: cfg.key,
-            };
-            (
-                tiny_http::Server::https(("127.0.0.1", port), ssl)
-                    .map_err(|e| format!("net.serve_tls bind {port}: {e}"))?,
-                "https",
-            )
+    match tls {
+        None => serve_http_plain(port, handler_name, program, policy),
+        Some(cfg) => serve_http_tls_legacy(port, handler_name, program, policy, cfg),
+    }
+}
+
+/// Hyper 1.x + Tokio multi-thread HTTP/1.1 server for `net.serve`.
+/// Each connection is accepted in an async task; the synchronous Lex VM
+/// call runs inside `spawn_blocking` so it doesn't block the executor.
+fn serve_http_plain(
+    port: u16,
+    handler_name: String,
+    program: Arc<Program>,
+    policy: Policy,
+) -> Result<Value, String> {
+    use http_body_util::BodyExt as _;
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
+    use tokio::net::TcpListener as TokioTcpListener;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("net.serve: tokio runtime: {e}"))?;
+    rt.block_on(async move {
+        let listener = TokioTcpListener::bind(("0.0.0.0", port))
+            .await
+            .map_err(|e| format!("net.serve bind {port}: {e}"))?;
+        eprintln!("net.serve: listening on http://0.0.0.0:{port}");
+        loop {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .map_err(|e| format!("net.serve accept: {e}"))?;
+            let io = TokioIo::new(stream);
+            let program = Arc::clone(&program);
+            let policy = policy.clone();
+            let handler_name = handler_name.clone();
+            tokio::spawn(async move {
+                let program2 = Arc::clone(&program);
+                let policy2 = policy.clone();
+                let handler_name2 = handler_name.clone();
+                let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                    let program = Arc::clone(&program2);
+                    let policy = policy2.clone();
+                    let handler_name = handler_name2.clone();
+                    async move {
+                        let (parts, body) = req.into_parts();
+                        let body_bytes = body
+                            .collect()
+                            .await
+                            .map(|c| c.to_bytes())
+                            .unwrap_or_default();
+                        let result = tokio::task::spawn_blocking(move || {
+                            let lex_req = build_request_value_parts(&parts, &body_bytes);
+                            let handler = DefaultHandler::new(policy)
+                                .with_program(Arc::clone(&program));
+                            let mut vm = Vm::with_handler(&program, Box::new(handler));
+                            vm.call(&handler_name, vec![lex_req])
+                        })
+                        .await;
+                        Ok::<_, std::convert::Infallible>(match result {
+                            Ok(Ok(resp)) => build_hyper_response(&resp),
+                            Ok(Err(e)) => error_response(500, &format!("internal error: {e}")),
+                            Err(e) => error_response(500, &format!("task panicked: {e}")),
+                        })
+                    }
+                });
+                if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+                    eprintln!("net.serve: connection error: {e}");
+                }
+            });
         }
+    })
+}
+
+/// TLS path: still uses tiny_http pending a tokio-rustls migration.
+fn serve_http_tls_legacy(
+    port: u16,
+    handler_name: String,
+    program: Arc<Program>,
+    policy: Policy,
+    cfg: TlsConfig,
+) -> Result<Value, String> {
+    let ssl = tiny_http::SslConfig {
+        certificate: cfg.cert,
+        private_key: cfg.key,
     };
-    eprintln!("net.serve: listening on {scheme}://127.0.0.1:{port}");
-    // Thread-per-request: the main loop accepts; each request runs on
-    // its own worker thread with its own fresh Vm. The Program is
-    // shared via Arc; Policy and handler_name are cloned per request.
-    // Lex's immutability means there's no shared mutable state at the
-    // language level — workers don't race.
+    let server = tiny_http::Server::https(("0.0.0.0", port), ssl)
+        .map_err(|e| format!("net.serve_tls bind {port}: {e}"))?;
+    eprintln!("net.serve: listening on https://0.0.0.0:{port}");
     for req in server.incoming_requests() {
         let program = Arc::clone(&program);
         let policy = policy.clone();
         let handler_name = handler_name.clone();
-        std::thread::spawn(move || handle_request(req, program, policy, handler_name));
+        std::thread::spawn(move || handle_request_tls(req, program, policy, handler_name));
     }
     Ok(Value::Unit)
 }
 
-fn handle_request(
+fn handle_request_tls(
     mut req: tiny_http::Request,
     program: Arc<Program>,
     policy: Policy,
     handler_name: String,
 ) {
-    let lex_req = build_request_value(&mut req);
+    let lex_req = build_request_value_tiny(&mut req);
     let handler = DefaultHandler::new(policy).with_program(Arc::clone(&program));
     let mut vm = Vm::with_handler(&program, Box::new(handler));
     match vm.call(&handler_name, vec![lex_req]) {
         Ok(resp) => {
             let (status, body, headers) = unpack_response(&resp);
-            respond_with_body(req, status, body, headers);
+            respond_with_body_tls(req, status, body, headers);
         }
         Err(e) => {
             let response = tiny_http::Response::from_string(format!("internal error: {e}"))
@@ -1607,47 +1675,107 @@ fn handle_request(
     }
 }
 
+/// Hyper 1.x + Tokio multi-thread HTTP/1.1 server for `net.serve_fn`.
 fn serve_http_fn(
     port: u16,
     closure: Value,
     program: Arc<Program>,
     policy: Policy,
 ) -> Result<Value, String> {
-    let server = tiny_http::Server::http(("127.0.0.1", port))
-        .map_err(|e| format!("net.serve_fn bind {port}: {e}"))?;
-    eprintln!("net.serve_fn: listening on http://127.0.0.1:{port}");
-    for req in server.incoming_requests() {
-        let program = Arc::clone(&program);
-        let policy = policy.clone();
-        let closure = closure.clone();
-        std::thread::spawn(move || handle_request_fn(req, program, policy, closure));
-    }
-    Ok(Value::Unit)
+    use http_body_util::BodyExt as _;
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
+    use tokio::net::TcpListener as TokioTcpListener;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("net.serve_fn: tokio runtime: {e}"))?;
+    rt.block_on(async move {
+        let listener = TokioTcpListener::bind(("0.0.0.0", port))
+            .await
+            .map_err(|e| format!("net.serve_fn bind {port}: {e}"))?;
+        eprintln!("net.serve_fn: listening on http://0.0.0.0:{port}");
+        loop {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .map_err(|e| format!("net.serve_fn accept: {e}"))?;
+            let io = TokioIo::new(stream);
+            let program = Arc::clone(&program);
+            let policy = policy.clone();
+            let closure = closure.clone();
+            tokio::spawn(async move {
+                let program2 = Arc::clone(&program);
+                let policy2 = policy.clone();
+                let closure2 = closure.clone();
+                let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                    let program = Arc::clone(&program2);
+                    let policy = policy2.clone();
+                    let closure = closure2.clone();
+                    async move {
+                        let (parts, body) = req.into_parts();
+                        let body_bytes = body
+                            .collect()
+                            .await
+                            .map(|c| c.to_bytes())
+                            .unwrap_or_default();
+                        let result = tokio::task::spawn_blocking(move || {
+                            let lex_req = build_request_value_parts(&parts, &body_bytes);
+                            let handler = DefaultHandler::new(policy)
+                                .with_program(Arc::clone(&program));
+                            let mut vm = Vm::with_handler(&program, Box::new(handler));
+                            vm.invoke_closure_value(closure, vec![lex_req])
+                        })
+                        .await;
+                        Ok::<_, std::convert::Infallible>(match result {
+                            Ok(Ok(resp)) => build_hyper_response(&resp),
+                            Ok(Err(e)) => error_response(500, &format!("internal error: {e}")),
+                            Err(e) => error_response(500, &format!("task panicked: {e}")),
+                        })
+                    }
+                });
+                if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+                    eprintln!("net.serve_fn: connection error: {e}");
+                }
+            });
+        }
+    })
 }
 
-fn handle_request_fn(
-    mut req: tiny_http::Request,
-    program: Arc<Program>,
-    policy: Policy,
-    closure: Value,
-) {
-    let lex_req = build_request_value(&mut req);
-    let handler = DefaultHandler::new(policy).with_program(Arc::clone(&program));
-    let mut vm = Vm::with_handler(&program, Box::new(handler));
-    match vm.invoke_closure_value(closure, vec![lex_req]) {
-        Ok(resp) => {
-            let (status, body, headers) = unpack_response(&resp);
-            respond_with_body(req, status, body, headers);
-        }
-        Err(e) => {
-            let response = tiny_http::Response::from_string(format!("internal error: {e}"))
-                .with_status_code(500);
-            let _ = req.respond(response);
+/// Build a Lex request record from hyper request parts and pre-collected body bytes.
+fn build_request_value_parts(
+    parts: &hyper::http::request::Parts,
+    body: &bytes::Bytes,
+) -> Value {
+    let method = parts.method.as_str().to_string();
+    let uri = parts.uri.to_string();
+    let (path, query) = match uri.split_once('?') {
+        Some((p, q)) => (p.to_string(), q.to_string()),
+        None => (uri, String::new()),
+    };
+    let mut headers_map = std::collections::BTreeMap::new();
+    for (name, val) in &parts.headers {
+        if let Ok(v) = val.to_str() {
+            headers_map.insert(
+                lex_bytecode::MapKey::Str(name.as_str().to_ascii_lowercase()),
+                Value::Str(v.to_string()),
+            );
         }
     }
+    let body_str = String::from_utf8_lossy(body).into_owned();
+    let mut rec = indexmap::IndexMap::new();
+    rec.insert("method".into(), Value::Str(method));
+    rec.insert("path".into(), Value::Str(path));
+    rec.insert("query".into(), Value::Str(query));
+    rec.insert("body".into(), Value::Str(body_str));
+    rec.insert("headers".into(), Value::Map(headers_map));
+    Value::Record(rec)
 }
 
-fn build_request_value(req: &mut tiny_http::Request) -> Value {
+/// Build a Lex request record from a tiny_http request (used by the TLS path).
+fn build_request_value_tiny(req: &mut tiny_http::Request) -> Value {
     let method = format!("{:?}", req.method()).to_uppercase();
     let url = req.url().to_string();
     let (path, query) = match url.split_once('?') {
@@ -1672,7 +1800,7 @@ fn build_request_value(req: &mut tiny_http::Request) -> Value {
     Value::Record(rec)
 }
 
-fn unpack_response(v: &Value) -> (u16, ResponseBodyOut, Vec<tiny_http::Header>) {
+fn unpack_response(v: &Value) -> (u16, ResponseBodyOut, Vec<(String, String)>) {
     if let Value::Record(rec) = v {
         let status = rec.get("status").and_then(|s| match s {
             Value::Int(n) => Some(*n as u16),
@@ -1694,10 +1822,10 @@ fn unpack_response(v: &Value) -> (u16, ResponseBodyOut, Vec<tiny_http::Header>) 
             Some(Value::Str(s)) => ResponseBodyOut::Str(s.clone()),
             _ => ResponseBodyOut::Str(String::new()),
         };
-        let headers = if let Some(Value::Map(hmap)) = rec.get("headers") {
+        let headers: Vec<(String, String)> = if let Some(Value::Map(hmap)) = rec.get("headers") {
             hmap.iter().filter_map(|(k, v)| {
                 if let (lex_bytecode::MapKey::Str(name), Value::Str(val)) = (k, v) {
-                    format!("{name}: {val}").parse::<tiny_http::Header>().ok()
+                    Some((name.clone(), val.clone()))
                 } else {
                     None
                 }
@@ -1714,27 +1842,95 @@ fn unpack_response(v: &Value) -> (u16, ResponseBodyOut, Vec<tiny_http::Header>) 
     )
 }
 
-/// Send `body` back on `req` using the right `tiny_http` path for the
-/// variant. The `Str` arm uses `Response::from_string` (content-length
-/// set, no chunked encoding). The streaming arms use `Response::new`
-/// with `content_length = None`, which makes `tiny_http` switch to
-/// `Transfer-Encoding: chunked` on the wire.
-///
-/// v1 caveat: the chunked-transfer encoder buffers across `read()` calls,
-/// so per-iter-item boundaries are not preserved on the wire — the body
-/// is correctly chunk-encoded but may land as one large HTTP chunk. The
-/// lazy-iter follow-up will expose Lex iter items as distinct HTTP chunks
-/// because each `read()` will block on `iter.next` and produce one item.
-fn respond_with_body(
+type HyperRespBody =
+    http_body_util::combinators::BoxBody<bytes::Bytes, std::convert::Infallible>;
+
+/// Build a hyper response from the Lex value returned by a handler closure.
+/// Streaming bodies (`BodyStream`, `BodyBytes`) use `ChunkedBody` which has no
+/// known `size_hint`, so hyper emits `Transfer-Encoding: chunked` on the wire.
+/// Plain string bodies use `Full<Bytes>` which carries `Content-Length`.
+fn build_hyper_response(v: &Value) -> hyper::Response<HyperRespBody> {
+    use http_body_util::BodyExt as _;
+    let (status, body, headers) = unpack_response(v);
+    let boxed_body: HyperRespBody = match body {
+        ResponseBodyOut::Str(s) => {
+            http_body_util::Full::new(bytes::Bytes::from(s.into_bytes())).boxed()
+        }
+        ResponseBodyOut::TextChunks(chunks) | ResponseBodyOut::BytesChunks(chunks) => {
+            HyperChunkedBody::from(chunks).boxed()
+        }
+    };
+    let mut builder = hyper::Response::builder().status(status);
+    for (name, val) in headers {
+        builder = builder.header(name, val);
+    }
+    builder
+        .body(boxed_body)
+        .unwrap_or_else(|_| error_response(500, "response build error"))
+}
+
+fn error_response(status: u16, msg: &str) -> hyper::Response<HyperRespBody> {
+    use http_body_util::BodyExt as _;
+    hyper::Response::builder()
+        .status(status)
+        .body(
+            http_body_util::Full::new(bytes::Bytes::from(msg.to_owned()))
+                .boxed(),
+        )
+        .unwrap_or_else(|_| {
+            use http_body_util::BodyExt as _;
+            hyper::Response::new(http_body_util::Empty::new().map_err(|e| match e {}).boxed())
+        })
+}
+
+/// Async body that emits pre-collected chunks as separate HTTP frames, causing
+/// hyper to use `Transfer-Encoding: chunked` (no `size_hint` exact count).
+struct HyperChunkedBody {
+    chunks: std::collections::VecDeque<Vec<u8>>,
+}
+
+impl From<Vec<Vec<u8>>> for HyperChunkedBody {
+    fn from(chunks: Vec<Vec<u8>>) -> Self {
+        Self {
+            chunks: chunks.into_iter().filter(|c| !c.is_empty()).collect(),
+        }
+    }
+}
+
+impl hyper::body::Body for HyperChunkedBody {
+    type Data = bytes::Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        match self.chunks.pop_front() {
+            Some(chunk) => std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(
+                bytes::Bytes::from(chunk),
+            )))),
+            None => std::task::Poll::Ready(None),
+        }
+    }
+}
+
+/// Send `body` back on a TLS `tiny_http` request. Used only by the
+/// `net.serve_tls` path which still runs on tiny_http pending a
+/// tokio-rustls migration.
+fn respond_with_body_tls(
     req: tiny_http::Request,
     status: u16,
     body: ResponseBodyOut,
-    headers: Vec<tiny_http::Header>,
+    headers: Vec<(String, String)>,
 ) {
+    let tiny_headers: Vec<tiny_http::Header> = headers
+        .into_iter()
+        .filter_map(|(name, val)| format!("{name}: {val}").parse::<tiny_http::Header>().ok())
+        .collect();
     match body {
         ResponseBodyOut::Str(s) => {
             let mut response = tiny_http::Response::from_string(s).with_status_code(status);
-            for h in headers {
+            for h in tiny_headers {
                 response.add_header(h);
             }
             let _ = req.respond(response);
@@ -1743,9 +1939,9 @@ fn respond_with_body(
             let reader = ChunkReader::new(chunks);
             let response = tiny_http::Response::new(
                 tiny_http::StatusCode(status),
-                headers,
+                tiny_headers,
                 reader,
-                None, // content_length: None → chunked transfer-encoding
+                None,
                 None,
             );
             let _ = req.respond(response);
