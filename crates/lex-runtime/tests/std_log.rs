@@ -111,7 +111,7 @@ fn text_format_includes_level_and_message() {
     let policy = policy_for_log(path.parent().unwrap());
 
     run(SRC, "setup_text",
-        vec![Value::Str(path.to_string_lossy().to_string())], policy.clone());
+        vec![Value::Str(path.to_string_lossy().to_string().into())], policy.clone());
     run(SRC, "emit_each_level", vec![], policy);
 
     let contents = std::fs::read_to_string(&path).expect("read log");
@@ -128,7 +128,7 @@ fn json_format_emits_one_object_per_line() {
     let policy = policy_for_log(path.parent().unwrap());
 
     run(SRC, "setup_json",
-        vec![Value::Str(path.to_string_lossy().to_string())], policy.clone());
+        vec![Value::Str(path.to_string_lossy().to_string().into())], policy.clone());
     run(SRC, "emit_one_info", vec![], policy);
 
     let contents = std::fs::read_to_string(&path).expect("read log");
@@ -146,7 +146,7 @@ fn level_threshold_drops_lower_levels() {
     let policy = policy_for_log(path.parent().unwrap());
 
     run(SRC, "setup_warn_threshold",
-        vec![Value::Str(path.to_string_lossy().to_string())], policy.clone());
+        vec![Value::Str(path.to_string_lossy().to_string().into())], policy.clone());
     run(SRC, "emit_each_level", vec![], policy);
 
     let contents = std::fs::read_to_string(&path).expect("read log");
@@ -195,6 +195,6 @@ fn setup(path :: Str) -> [io, fs_write] Bool {
 "#;
     let policy = policy_for_log(&allowed);
     let v = run(src, "setup",
-        vec![Value::Str(outside.to_string_lossy().to_string())], policy);
+        vec![Value::Str(outside.to_string_lossy().to_string().into())], policy);
     assert_eq!(v, Value::Bool(false));
 }

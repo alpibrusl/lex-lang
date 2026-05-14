@@ -162,7 +162,7 @@ fn create_insert_query_round_trip() {
     let v = run(
         SRC,
         "create_insert_query",
-        vec![Value::Str(path.to_string_lossy().into_owned())],
+        vec![Value::Str(path.to_string_lossy().into_owned().into())],
         policy_with_sql(&dir),
     );
     let rows = match v {
@@ -193,14 +193,14 @@ fn pick_by_id_uses_parameter_binding() {
     let _ = run(
         SRC,
         "create_insert_query",
-        vec![Value::Str(path.to_string_lossy().into_owned())],
+        vec![Value::Str(path.to_string_lossy().into_owned().into())],
         policy_with_sql(&dir),
     );
     let v = run(
         SRC,
         "pick_by_id",
         vec![
-            Value::Str(path.to_string_lossy().into_owned()),
+            Value::Str(path.to_string_lossy().into_owned().into()),
             Value::Str("2".into()),
         ],
         policy_with_sql(&dir),
@@ -215,13 +215,13 @@ fn delete_returns_affected_row_count() {
     let _ = run(
         SRC,
         "create_insert_query",
-        vec![Value::Str(path.to_string_lossy().into_owned())],
+        vec![Value::Str(path.to_string_lossy().into_owned().into())],
         policy_with_sql(&dir),
     );
     let v = run(
         SRC,
         "delete_count",
-        vec![Value::Str(path.to_string_lossy().into_owned())],
+        vec![Value::Str(path.to_string_lossy().into_owned().into())],
         policy_with_sql(&dir),
     );
     assert_eq!(v, Value::Int(1));
@@ -255,7 +255,7 @@ fn try_open(p :: Str) -> [sql, fs_write] Str {
     let v = run(
         src,
         "try_open",
-        vec![Value::Str(outside.to_string_lossy().into_owned())],
+        vec![Value::Str(outside.to_string_lossy().into_owned().into())],
         policy_with_sql(&dir),
     );
     let s = match v {

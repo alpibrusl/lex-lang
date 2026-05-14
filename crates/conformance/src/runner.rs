@@ -172,7 +172,7 @@ fn json_to_value(v: &serde_json::Value) -> Value {
             else if let Some(f) = n.as_f64() { Value::Float(f) }
             else { Value::Unit }
         }
-        J::String(s) => Value::Str(s.clone()),
+        J::String(s) => Value::Str(s.clone().into()),
         J::Array(items) => Value::List(items.iter().map(json_to_value).collect()),
         J::Object(map) => {
             if let (Some(J::String(name)), Some(J::Array(args))) =

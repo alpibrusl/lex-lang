@@ -265,8 +265,8 @@ fn eval_refinement_inner(
             CLit::Int { value } => Value::Int(*value),
             CLit::Float { value } => Value::Float(value.parse().unwrap_or(0.0)),
             CLit::Bool { value } => Value::Bool(*value),
-            CLit::Str { value } => Value::Str(value.clone()),
-            CLit::Bytes { value } => Value::Str(value.clone()), // hex; unusual in predicates
+            CLit::Str { value } => Value::Str(value.as_str().into()),
+            CLit::Bytes { value } => Value::Str(value.as_str().into()), // hex; unusual in predicates
             CLit::Unit => Value::Unit,
         }),
         CExpr::Var { name } if name == binding => Ok(arg.clone()),
@@ -517,7 +517,7 @@ impl<'a> Vm<'a> {
             Err((pos, msg)) => {
                 let mut e = indexmap::IndexMap::new();
                 e.insert("pos".into(), Value::Int(pos as i64));
-                e.insert("message".into(), Value::Str(msg));
+                e.insert("message".into(), Value::Str(msg.into()));
                 Ok(Value::Variant {
                     name: "Err".into(),
                     args: vec![Value::Record(e)],
@@ -1264,9 +1264,11 @@ impl<'a> Vm<'a> {
                         (Value::Int(x), Value::Int(y)) => self.stack.push(Value::Int(x + y)),
                         (Value::Float(x), Value::Float(y)) => self.stack.push(Value::Float(x + y)),
                         (Value::Str(x), Value::Str(y)) => {
-                            let mut s = x;
+                            // SmolStr is immutable; concatenate via a temporary String.
+                            let mut s = String::with_capacity(x.len() + y.len());
+                            s.push_str(&x);
                             s.push_str(&y);
-                            self.stack.push(Value::Str(s));
+                            self.stack.push(Value::Str(s.into()));
                         }
                         (a, b) => return Err(VmError::TypeMismatch(format!("Num op: {a:?} {b:?}"))),
                     }
@@ -1304,7 +1306,7 @@ impl<'a> Vm<'a> {
                     let b = self.pop()?;
                     let a = self.pop()?;
                     let s = format!("{}{}", a.as_str(), b.as_str());
-                    self.stack.push(Value::Str(s));
+                    self.stack.push(Value::Str(s.into()));
                 }
                 Op::StrLen => {
                     let v = self.pop()?;
@@ -1399,9 +1401,9 @@ fn const_to_value(c: &Const) -> Value {
         Const::Int(n) => Value::Int(*n),
         Const::Float(f) => Value::Float(*f),
         Const::Bool(b) => Value::Bool(*b),
-        Const::Str(s) => Value::Str(s.clone()),
+        Const::Str(s) => Value::Str(s.as_str().into()),
         Const::Bytes(b) => Value::Bytes(b.clone()),
         Const::Unit => Value::Unit,
-        Const::FieldName(s) | Const::VariantName(s) | Const::NodeId(s) => Value::Str(s.clone()),
+        Const::FieldName(s) | Const::VariantName(s) | Const::NodeId(s) => Value::Str(s.as_str().into()),
     }
 }

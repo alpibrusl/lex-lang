@@ -72,7 +72,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         ("str", "concat") => {
             let a = expect_str(args.first())?;
             let b = expect_str(args.get(1))?;
-            Ok(Value::Str(format!("{a}{b}")))
+            Ok(Value::Str(format!("{a}{b}").into()))
         }
         ("str", "to_int") => {
             let s = expect_str(args.first())?;
@@ -85,9 +85,9 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let s = expect_str(args.first())?;
             let sep = expect_str(args.get(1))?;
             let items: std::collections::VecDeque<Value> = if sep.is_empty() {
-                s.chars().map(|c| Value::Str(c.to_string())).collect()
+                s.chars().map(|c| Value::Str(c.to_string().into())).collect()
             } else {
-                s.split(sep.as_str()).map(|p| Value::Str(p.to_string())).collect()
+                s.split(sep.as_str()).map(|p| Value::Str(p.into())).collect()
             };
             Ok(Value::List(items))
         }
@@ -102,7 +102,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                     other => return Err(format!("str.join element must be Str, got {other:?}")),
                 }
             }
-            Ok(Value::Str(out))
+            Ok(Value::Str(out.into()))
         }
         ("str", "starts_with") => {
             let s = expect_str(args.first())?;
@@ -123,16 +123,16 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let s = expect_str(args.first())?;
             let from = expect_str(args.get(1))?;
             let to = expect_str(args.get(2))?;
-            Ok(Value::Str(s.replace(from.as_str(), to.as_str())))
+            Ok(Value::Str(s.replace(from.as_str(), to.as_str()).into()))
         }
-        ("str", "trim") => Ok(Value::Str(expect_str(args.first())?.trim().to_string())),
-        ("str", "to_upper") => Ok(Value::Str(expect_str(args.first())?.to_uppercase())),
-        ("str", "to_lower") => Ok(Value::Str(expect_str(args.first())?.to_lowercase())),
+        ("str", "trim") => Ok(Value::Str(expect_str(args.first())?.trim().into())),
+        ("str", "to_upper") => Ok(Value::Str(expect_str(args.first())?.to_uppercase().into())),
+        ("str", "to_lower") => Ok(Value::Str(expect_str(args.first())?.to_lowercase().into())),
         ("str", "strip_prefix") => {
             let s = expect_str(args.first())?;
             let prefix = expect_str(args.get(1))?;
             Ok(match s.strip_prefix(prefix.as_str()) {
-                Some(rest) => some(Value::Str(rest.to_string())),
+                Some(rest) => some(Value::Str(rest.into())),
                 None => none(),
             })
         }
@@ -140,7 +140,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let s = expect_str(args.first())?;
             let suffix = expect_str(args.get(1))?;
             Ok(match s.strip_suffix(suffix.as_str()) {
-                Some(rest) => some(Value::Str(rest.to_string())),
+                Some(rest) => some(Value::Str(rest.into())),
                 None => none(),
             })
         }
@@ -167,14 +167,14 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             if !s.is_char_boundary(lo) || !s.is_char_boundary(hi) {
                 return Err(format!("str.slice: [{lo}..{hi}] not on char boundaries"));
             }
-            Ok(Value::Str(s[lo..hi].to_string()))
+            Ok(Value::Str(s[lo..hi].into()))
         }
 
         // -- int / float --
-        ("int", "to_str") => Ok(Value::Str(expect_int(args.first())?.to_string())),
+        ("int", "to_str") => Ok(Value::Str(expect_int(args.first())?.to_string().into())),
         ("int", "to_float") => Ok(Value::Float(expect_int(args.first())? as f64)),
         ("float", "to_int") => Ok(Value::Int(expect_float(args.first())? as i64)),
-        ("float", "to_str") => Ok(Value::Str(expect_float(args.first())?.to_string())),
+        ("float", "to_str") => Ok(Value::Str(expect_float(args.first())?.to_string().into())),
         ("str", "to_float") => {
             let s = expect_str(args.first())?;
             match s.parse::<f64>() {
@@ -301,13 +301,13 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         // -- json --
         ("json", "stringify") => {
             let v = first_arg(args)?;
-            Ok(Value::Str(serde_json::to_string(&value_to_json(v)).unwrap_or_default()))
+            Ok(Value::Str(serde_json::to_string(&value_to_json(v)).unwrap_or_default().into()))
         }
         ("json", "parse") => {
             let s = expect_str(args.first())?;
             match serde_json::from_str::<serde_json::Value>(&s) {
                 Ok(v) => Ok(ok_v(json_to_value(&v))),
-                Err(e) => Ok(err_v(Value::Str(format!("{e}")))),
+                Err(e) => Ok(err_v(Value::Str(format!("{e}").into()))),
             }
         }
         // Tactical fix for #168: validate required fields before
@@ -319,14 +319,14 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             match serde_json::from_str::<serde_json::Value>(&s) {
                 Ok(v) => {
                     if let Err(e) = check_required_fields(&v, &required) {
-                        return Ok(err_v(Value::Str(e)));
+                        return Ok(err_v(Value::Str(e.into())));
                     }
                     if let Err(e) = validate_field_types(&v, &schema) {
-                        return Ok(err_v(Value::Str(e)));
+                        return Ok(err_v(Value::Str(e.into())));
                     }
                     Ok(ok_v(json_to_value(&v)))
                 }
-                Err(e) => Ok(err_v(Value::Str(format!("{e}")))),
+                Err(e) => Ok(err_v(Value::Str(format!("{e}").into()))),
             }
         }
 
@@ -341,7 +341,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                     unwrap_toml_datetime_markers(&mut v);
                     Ok(ok_v(json_to_value(&v)))
                 }
-                Err(e) => Ok(err_v(Value::Str(format!("{e}")))),
+                Err(e) => Ok(err_v(Value::Str(format!("{e}").into()))),
             }
         }
         // Compiler-emitted variant of parse_strict that carries the type
@@ -354,14 +354,14 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             match serde_json::from_str::<serde_json::Value>(&s) {
                 Ok(v) => {
                     if let Err(e) = check_required_fields(&v, &required) {
-                        return Ok(err_v(Value::Str(e)));
+                        return Ok(err_v(Value::Str(e.into())));
                     }
                     if let Err(e) = validate_field_types(&v, &schema) {
-                        return Ok(err_v(Value::Str(e)));
+                        return Ok(err_v(Value::Str(e.into())));
                     }
                     Ok(ok_v(json_to_value(&v)))
                 }
-                Err(e) => Ok(err_v(Value::Str(format!("{e}")))),
+                Err(e) => Ok(err_v(Value::Str(format!("{e}").into()))),
             }
         }
 
@@ -375,14 +375,14 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                 Ok(mut v) => {
                     unwrap_toml_datetime_markers(&mut v);
                     if let Err(e) = check_required_fields(&v, &required) {
-                        return Ok(err_v(Value::Str(e)));
+                        return Ok(err_v(Value::Str(e.into())));
                     }
                     if let Err(e) = validate_field_types(&v, &schema) {
-                        return Ok(err_v(Value::Str(e)));
+                        return Ok(err_v(Value::Str(e.into())));
                     }
                     Ok(ok_v(json_to_value(&v)))
                 }
-                Err(e) => Ok(err_v(Value::Str(format!("{e}")))),
+                Err(e) => Ok(err_v(Value::Str(format!("{e}").into()))),
             }
         }
         ("toml", "parse_strict_typed") => {
@@ -393,14 +393,14 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                 Ok(mut v) => {
                     unwrap_toml_datetime_markers(&mut v);
                     if let Err(e) = check_required_fields(&v, &required) {
-                        return Ok(err_v(Value::Str(e)));
+                        return Ok(err_v(Value::Str(e.into())));
                     }
                     if let Err(e) = validate_field_types(&v, &schema) {
-                        return Ok(err_v(Value::Str(e)));
+                        return Ok(err_v(Value::Str(e.into())));
                     }
                     Ok(ok_v(json_to_value(&v)))
                 }
-                Err(e) => Ok(err_v(Value::Str(format!("{e}")))),
+                Err(e) => Ok(err_v(Value::Str(format!("{e}").into()))),
             }
         }
         ("toml", "stringify") => {
@@ -412,8 +412,8 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             // rather than panic.
             let json = value_to_json(v);
             match toml::to_string(&json) {
-                Ok(s)  => Ok(ok_v(Value::Str(s))),
-                Err(e) => Ok(err_v(Value::Str(format!("toml.stringify: {e}")))),
+                Ok(s)  => Ok(ok_v(Value::Str(s.into()))),
+                Err(e) => Ok(err_v(Value::Str(format!("toml.stringify: {e}").into()))),
             }
         }
 
@@ -426,7 +426,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let s = expect_str(args.first())?;
             match serde_yaml::from_str::<serde_json::Value>(&s) {
                 Ok(v)  => Ok(ok_v(json_to_value(&v))),
-                Err(e) => Ok(err_v(Value::Str(format!("{e}")))),
+                Err(e) => Ok(err_v(Value::Str(format!("{e}").into()))),
             }
         }
         // Tactical fix for #168 — same shape as toml.parse_strict.
@@ -438,14 +438,14 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             match serde_yaml::from_str::<serde_json::Value>(&s) {
                 Ok(v) => {
                     if let Err(e) = check_required_fields(&v, &required) {
-                        return Ok(err_v(Value::Str(e)));
+                        return Ok(err_v(Value::Str(e.into())));
                     }
                     if let Err(e) = validate_field_types(&v, &schema) {
-                        return Ok(err_v(Value::Str(e)));
+                        return Ok(err_v(Value::Str(e.into())));
                     }
                     Ok(ok_v(json_to_value(&v)))
                 }
-                Err(e) => Ok(err_v(Value::Str(format!("{e}")))),
+                Err(e) => Ok(err_v(Value::Str(format!("{e}").into()))),
             }
         }
         ("yaml", "parse_strict_typed") => {
@@ -455,22 +455,22 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             match serde_yaml::from_str::<serde_json::Value>(&s) {
                 Ok(v) => {
                     if let Err(e) = check_required_fields(&v, &required) {
-                        return Ok(err_v(Value::Str(e)));
+                        return Ok(err_v(Value::Str(e.into())));
                     }
                     if let Err(e) = validate_field_types(&v, &schema) {
-                        return Ok(err_v(Value::Str(e)));
+                        return Ok(err_v(Value::Str(e.into())));
                     }
                     Ok(ok_v(json_to_value(&v)))
                 }
-                Err(e) => Ok(err_v(Value::Str(format!("{e}")))),
+                Err(e) => Ok(err_v(Value::Str(format!("{e}").into()))),
             }
         }
         ("yaml", "stringify") => {
             let v = first_arg(args)?;
             let json = value_to_json(v);
             match serde_yaml::to_string(&json) {
-                Ok(s)  => Ok(ok_v(Value::Str(s))),
-                Err(e) => Ok(err_v(Value::Str(format!("yaml.stringify: {e}")))),
+                Ok(s)  => Ok(ok_v(Value::Str(s.into()))),
+                Err(e) => Ok(err_v(Value::Str(format!("yaml.stringify: {e}").into()))),
             }
         }
 
@@ -489,11 +489,11 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                 Ok(map) => {
                     let mut bt: BTreeMap<MapKey, Value> = BTreeMap::new();
                     for (k, v) in map {
-                        bt.insert(MapKey::Str(k), Value::Str(v));
+                        bt.insert(MapKey::Str(k), Value::Str(v.into()));
                     }
                     Ok(ok_v(Value::Map(bt)))
                 }
-                Err(e) => Ok(err_v(Value::Str(e))),
+                Err(e) => Ok(err_v(Value::Str(e.into()))),
             }
         }
 
@@ -512,11 +512,11 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                 match r {
                     Ok(rec) => {
                         let row: std::collections::VecDeque<Value> = rec.iter()
-                            .map(|f| Value::Str(f.to_string()))
+                            .map(|f| Value::Str(f.into()))
                             .collect();
                         rows.push_back(Value::List(row));
                     }
-                    Err(e) => return Ok(err_v(Value::Str(format!("csv.parse: {e}")))),
+                    Err(e) => return Ok(err_v(Value::Str(format!("csv.parse: {e}").into()))),
                 }
             }
             Ok(ok_v(Value::List(rows)))
@@ -542,21 +542,21 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                         _ => return Ok(err_v(Value::Str("csv.stringify row must be List[Str]".into()))),
                     };
                     let strs: Vec<String> = cells.iter().map(|c| match c {
-                        Value::Str(s) => s.clone(),
+                        Value::Str(s) => s.to_string(),
                         other => serde_json::to_string(&other.to_json())
                             .unwrap_or_else(|_| String::new()),
                     }).collect();
                     if let Err(e) = wtr.write_record(&strs) {
-                        return Ok(err_v(Value::Str(format!("csv.stringify: {e}"))));
+                        return Ok(err_v(Value::Str(format!("csv.stringify: {e}").into())));
                     }
                 }
                 if let Err(e) = wtr.flush() {
-                    return Ok(err_v(Value::Str(format!("csv.stringify flush: {e}"))));
+                    return Ok(err_v(Value::Str(format!("csv.stringify flush: {e}").into())));
                 }
             }
             match String::from_utf8(out) {
-                Ok(s) => Ok(ok_v(Value::Str(s))),
-                Err(e) => Ok(err_v(Value::Str(format!("csv.stringify utf8: {e}")))),
+                Ok(s) => Ok(ok_v(Value::Str(s.into()))),
+                Err(e) => Ok(err_v(Value::Str(format!("csv.stringify utf8: {e}").into()))),
             }
         }
 
@@ -573,7 +573,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                 Ok(ok_v(Value::Unit))
             } else {
                 Ok(err_v(Value::Str(format!("assert_eq: lhs {} != rhs {}",
-                    value_to_json(a), value_to_json(b)))))
+                    value_to_json(a), value_to_json(b)).into())))
             }
         }
         ("test", "assert_ne") => {
@@ -583,7 +583,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                 Ok(ok_v(Value::Unit))
             } else {
                 Ok(err_v(Value::Str(format!("assert_ne: both sides are {}",
-                    value_to_json(a)))))
+                    value_to_json(a)).into())))
             }
         }
         ("test", "assert_true") => {
@@ -618,8 +618,8 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         ("bytes", "to_str") => {
             let b = expect_bytes(args.first())?;
             match String::from_utf8(b.to_vec()) {
-                Ok(s) => Ok(ok_v(Value::Str(s))),
-                Err(e) => Ok(err_v(Value::Str(format!("{e}")))),
+                Ok(s) => Ok(ok_v(Value::Str(s.into()))),
+                Err(e) => Ok(err_v(Value::Str(format!("{e}").into()))),
             }
         }
         ("bytes", "slice") => {
@@ -1056,14 +1056,14 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let s = expect_str(args.first())?;
             let mut h = Sha256::new();
             h.update(s.as_bytes());
-            Ok(Value::Str(hex::encode(h.finalize())))
+            Ok(Value::Str(hex::encode(h.finalize()).into()))
         }
         ("crypto", "sha512_str") => {
             use sha2::{Digest, Sha512};
             let s = expect_str(args.first())?;
             let mut h = Sha512::new();
             h.update(s.as_bytes());
-            Ok(Value::Str(hex::encode(h.finalize())))
+            Ok(Value::Str(hex::encode(h.finalize()).into()))
         }
         ("crypto", "hmac_sha256") => {
             use hmac::{Hmac, KeyInit, Mac};
@@ -1088,14 +1088,14 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         ("crypto", "base64_encode") => {
             use base64::{Engine, engine::general_purpose::STANDARD};
             let data = expect_bytes(args.first())?;
-            Ok(Value::Str(STANDARD.encode(data)))
+            Ok(Value::Str(STANDARD.encode(data).into()))
         }
         ("crypto", "base64_decode") => {
             use base64::{Engine, engine::general_purpose::STANDARD};
             let s = expect_str(args.first())?;
             match STANDARD.decode(s) {
                 Ok(b)  => Ok(ok_v(Value::Bytes(b))),
-                Err(e) => Ok(err_v(Value::Str(format!("base64: {e}")))),
+                Err(e) => Ok(err_v(Value::Str(format!("base64: {e}").into()))),
             }
         }
         // URL-safe base64 (#382). Alphabet `-_` instead of `+/`,
@@ -1104,25 +1104,25 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         ("crypto", "base64url_encode") => {
             use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
             let data = expect_bytes(args.first())?;
-            Ok(Value::Str(URL_SAFE_NO_PAD.encode(data)))
+            Ok(Value::Str(URL_SAFE_NO_PAD.encode(data).into()))
         }
         ("crypto", "base64url_decode") => {
             use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
             let s = expect_str(args.first())?;
             match URL_SAFE_NO_PAD.decode(s) {
                 Ok(b)  => Ok(ok_v(Value::Bytes(b))),
-                Err(e) => Ok(err_v(Value::Str(format!("base64url: {e}")))),
+                Err(e) => Ok(err_v(Value::Str(format!("base64url: {e}").into()))),
             }
         }
         ("crypto", "hex_encode") => {
             let data = expect_bytes(args.first())?;
-            Ok(Value::Str(hex::encode(data)))
+            Ok(Value::Str(hex::encode(data).into()))
         }
         ("crypto", "hex_decode") => {
             let s = expect_str(args.first())?;
             match hex::decode(s) {
                 Ok(b)  => Ok(ok_v(Value::Bytes(b))),
-                Err(e) => Ok(err_v(Value::Str(format!("hex: {e}")))),
+                Err(e) => Ok(err_v(Value::Str(format!("hex: {e}").into()))),
             }
         }
         ("crypto", "constant_time_eq") | ("crypto", "eq") => {
@@ -1248,11 +1248,11 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                 return Err(format!(
                     "parser.char: expected 1-character string, got {s:?}"));
             }
-            Ok(parser_node("Char", &[("ch", Value::Str(s))]))
+            Ok(parser_node("Char", &[("ch", Value::Str(s.into()))]))
         }
         ("parser", "string") => {
             let s = expect_str(args.first())?;
-            Ok(parser_node("String", &[("s", Value::Str(s))]))
+            Ok(parser_node("String", &[("s", Value::Str(s.into()))]))
         }
         ("parser", "digit") => Ok(parser_node("Digit", &[])),
         ("parser", "alpha") => Ok(parser_node("Alpha", &[])),
@@ -1311,8 +1311,8 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         ("regex", "compile") => {
             let pat = expect_str(args.first())?;
             match get_or_compile_regex(&pat) {
-                Ok(_) => Ok(ok_v(Value::Str(pat))),
-                Err(e) => Ok(err_v(Value::Str(e))),
+                Ok(_) => Ok(ok_v(Value::Str(pat.into()))),
+                Err(e) => Ok(err_v(Value::Str(e.into()))),
             }
         }
         ("regex", "is_match") => {
@@ -1357,14 +1357,14 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let s = expect_str(args.get(1))?;
             let rep = expect_str(args.get(2))?;
             let re = get_or_compile_regex(&pat).map_err(|e| format!("regex.replace: {e}"))?;
-            Ok(Value::Str(re.replace(&s, rep.as_str()).into_owned()))
+            Ok(Value::Str(re.replace(&s, rep.as_str()).into_owned().into()))
         }
         ("regex", "replace_all") => {
             let pat = expect_str(args.first())?;
             let s = expect_str(args.get(1))?;
             let rep = expect_str(args.get(2))?;
             let re = get_or_compile_regex(&pat).map_err(|e| format!("regex.replace_all: {e}"))?;
-            Ok(Value::Str(re.replace_all(&s, rep.as_str()).into_owned()))
+            Ok(Value::Str(re.replace_all(&s, rep.as_str()).into_owned().into()))
         }
         // -- datetime (pure ops; datetime.now is effectful and routes
         // through the handler under [time]) --
@@ -1372,12 +1372,12 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let s = expect_str(args.first())?;
             match chrono::DateTime::parse_from_rfc3339(&s) {
                 Ok(dt) => Ok(ok_v(Value::Int(instant_from_chrono(dt)))),
-                Err(e) => Ok(err_v(Value::Str(format!("parse_iso: {e}")))),
+                Err(e) => Ok(err_v(Value::Str(format!("parse_iso: {e}").into()))),
             }
         }
         ("datetime", "format_iso") => {
             let n = expect_int(args.first())?;
-            Ok(Value::Str(format_iso(n)))
+            Ok(Value::Str(format_iso(n).into()))
         }
         ("datetime", "parse") => {
             let s = expect_str(args.first())?;
@@ -1390,24 +1390,24 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                         None => Ok(err_v(Value::Str("parse: ambiguous local time".into()))),
                     }
                 }
-                Err(e) => Ok(err_v(Value::Str(format!("parse: {e}")))),
+                Err(e) => Ok(err_v(Value::Str(format!("parse: {e}").into()))),
             }
         }
         ("datetime", "format") => {
             let n = expect_int(args.first())?;
             let fmt = expect_str(args.get(1))?;
             let dt = chrono_from_instant(n);
-            Ok(Value::Str(dt.format(&fmt).to_string()))
+            Ok(Value::Str(dt.format(&fmt).to_string().into()))
         }
         ("datetime", "to_components") => {
             let n = expect_int(args.first())?;
             let tz = match parse_tz_arg(args.get(1)) {
                 Ok(t) => t,
-                Err(e) => return Ok(err_v(Value::Str(e))),
+                Err(e) => return Ok(err_v(Value::Str(e.into()))),
             };
             match resolve_tz_to_components(n, &tz) {
                 Ok(rec) => Ok(ok_v(rec)),
-                Err(e) => Ok(err_v(Value::Str(e))),
+                Err(e) => Ok(err_v(Value::Str(e.into()))),
             }
         }
         ("datetime", "from_components") => {
@@ -1417,7 +1417,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             };
             match instant_from_components(&rec) {
                 Ok(n) => Ok(ok_v(Value::Int(n))),
-                Err(e) => Ok(err_v(Value::Str(e))),
+                Err(e) => Ok(err_v(Value::Str(e.into()))),
             }
         }
         ("datetime", "add") => {
@@ -1469,7 +1469,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let pat = expect_str(args.first())?;
             let s = expect_str(args.get(1))?;
             let re = get_or_compile_regex(&pat).map_err(|e| format!("regex.split: {e}"))?;
-            let parts: std::collections::VecDeque<Value> = re.split(&s).map(|p| Value::Str(p.to_string())).collect();
+            let parts: std::collections::VecDeque<Value> = re.split(&s).map(|p| Value::Str(p.into())).collect();
             Ok(Value::List(parts))
         }
 
@@ -1530,7 +1530,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                 _ => return Err("http.text_body: HttpResponse.body must be Bytes".into()),
             };
             match String::from_utf8(body) {
-                Ok(s) => Ok(ok_v(Value::Str(s))),
+                Ok(s) => Ok(ok_v(Value::Str(s.into()))),
                 Err(e) => Ok(http_decode_err_pure(format!("body not UTF-8: {e}"))),
             }
         }
@@ -1570,12 +1570,12 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let spec = value_to_json(args.first().unwrap_or(&Value::Unit));
             let argv: Vec<String> = expect_list(args.get(1))?
                 .iter().map(|v| match v {
-                    Value::Str(s) => Ok(s.clone()),
+                    Value::Str(s) => Ok(s.to_string()),
                     other => Err(format!("cli.parse: argv must be List[Str], got {other:?}")),
                 }).collect::<Result<_, _>>()?;
             match crate::cli::parse(&spec, &argv) {
                 Ok(parsed) => Ok(ok_v(value_from_json(parsed))),
-                Err(msg) => Ok(err_v(Value::Str(msg))),
+                Err(msg) => Ok(err_v(Value::Str(msg.into()))),
             }
         }
         ("cli", "envelope") => {
@@ -1590,7 +1590,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         }
         ("cli", "help") => {
             let spec = value_to_json(args.first().unwrap_or(&Value::Unit));
-            Ok(Value::Str(crate::cli::help_text(&spec)))
+            Ok(Value::Str(crate::cli::help_text(&spec).into()))
         }
 
         _ => Err(format!("unknown pure builtin: {kind}.{op}")),
@@ -1604,7 +1604,7 @@ fn opt_str(arg: Option<&Value>) -> Option<String> {
     match arg {
         Some(Value::Variant { name, args }) if name == "Some" => {
             args.first().and_then(|v| match v {
-                Value::Str(s) => Some(s.clone()),
+                Value::Str(s) => Some(s.to_string()),
                 _ => None,
             })
         }
@@ -1643,15 +1643,16 @@ fn get_or_compile_regex(pattern: &str) -> Result<regex::Regex, String> {
 fn match_value(caps: &regex::Captures) -> Value {
     let m0 = caps.get(0).expect("regex match always has group 0");
     let mut rec = indexmap::IndexMap::new();
-    rec.insert("text".into(), Value::Str(m0.as_str().to_string()));
+    rec.insert("text".into(), Value::Str(m0.as_str().into()));
     rec.insert("start".into(), Value::Int(m0.start() as i64));
     rec.insert("end".into(), Value::Int(m0.end() as i64));
     let groups: std::collections::VecDeque<Value> = (1..caps.len())
         .map(|i| {
             Value::Str(
                 caps.get(i)
-                    .map(|m| m.as_str().to_string())
-                    .unwrap_or_default(),
+                    .map(|m| m.as_str())
+                    .unwrap_or_default()
+                    .into(),
             )
         })
         .collect();
@@ -1734,7 +1735,7 @@ fn tuple_index(v: &Value, i: usize) -> Result<Value, String> {
 
 fn expect_str(v: Option<&Value>) -> Result<String, String> {
     match v {
-        Some(Value::Str(s)) => Ok(s.clone()),
+        Some(Value::Str(s)) => Ok(s.to_string()),
         Some(other) => Err(format!("expected Str, got {other:?}")),
         None => Err("missing argument".into()),
     }
@@ -1855,7 +1856,7 @@ fn expect_record_pure(v: Option<&Value>) -> Result<&indexmap::IndexMap<String, V
 fn http_decode_err_pure(msg: String) -> Value {
     let inner = Value::Variant {
         name: "DecodeError".into(),
-        args: vec![Value::Str(msg)],
+        args: vec![Value::Str(msg.into())],
     };
     err_v(inner)
 }
@@ -1882,7 +1883,7 @@ fn http_set_header(
         MapKey::Str(s) => s.to_lowercase() != lowered,
         _ => true,
     });
-    headers.insert(key, Value::Str(value.to_string()));
+    headers.insert(key, Value::Str(value.into()));
     req.insert("headers".into(), Value::Map(headers));
     req
 }
@@ -1903,14 +1904,14 @@ fn http_append_query(
     };
     let mut pieces = Vec::new();
     for (k, v) in params {
-        let kk = match k { MapKey::Str(s) => s.clone(), _ => continue };
-        let vv = match v { Value::Str(s) => s.clone(), _ => continue };
+        let kk = match k { MapKey::Str(s) => s.to_string(), _ => continue };
+        let vv = match v { Value::Str(s) => s.to_string(), _ => continue };
         pieces.push(format!("{}={}", url_encode(&kk), url_encode(&vv)));
     }
     if pieces.is_empty() { return req; }
     let sep = if url.contains('?') { '&' } else { '?' };
     let new_url = format!("{url}{sep}{}", pieces.join("&"));
-    req.insert("url".into(), Value::Str(new_url));
+    req.insert("url".into(), Value::Str(new_url.into()));
     req
 }
 
@@ -1978,7 +1979,7 @@ fn required_field_names(arg: Option<&Value>) -> Result<Vec<String>, String> {
     let mut out = Vec::with_capacity(list.len());
     for v in list {
         match v {
-            Value::Str(s) => out.push(s.clone()),
+            Value::Str(s) => out.push(s.to_string()),
             other => return Err(format!(
                 "parse_strict: required-fields list must contain Str, got {other:?}"
             )),
@@ -2087,7 +2088,7 @@ fn extract_type_schema(v: Option<&Value>) -> Vec<(String, String)> {
             if let Value::Tuple(items) = p {
                 if items.len() == 2 {
                     if let (Value::Str(name), Value::Str(tag)) = (&items[0], &items[1]) {
-                        return Some((name.clone(), tag.clone()));
+                        return Some((name.to_string(), tag.to_string()));
                     }
                 }
             }
@@ -2254,7 +2255,7 @@ fn parse_tz_arg(v: Option<&Value>) -> Result<TzArg, String> {
                 })?;
                 Ok(TzArg::Offset(m))
             }
-            ("Iana", [Value::Str(s)]) => Ok(TzArg::Iana(s.clone())),
+            ("Iana", [Value::Str(s)]) => Ok(TzArg::Iana(s.to_string())),
             (other, _) => Err(format!(
                 "expected Tz variant (Utc | Local | Offset(Int) | Iana(Str)), got `{other}` with {} arg(s)",
                 args.len()
@@ -2405,7 +2406,8 @@ fn aead_result(ciphertext: Vec<u8>, tag: Vec<u8>) -> Value {
 }
 
 fn aead_err(msg: impl Into<String>) -> Value {
-    err_v(Value::Str(msg.into()))
+    let s: String = msg.into();
+    err_v(Value::Str(s.into()))
 }
 
 fn aes_gcm_seal_impl(args: &[Value]) -> Value {
@@ -2463,17 +2465,17 @@ fn aes_gcm_open_impl(args: &[Value]) -> Value {
     use aes_gcm::{Aes128Gcm, Aes256Gcm, Nonce};
     let (key, nonce, aad, ciphertext, tag) = match unpack5_bytes(args, "aes_gcm_open") {
         Ok(t) => t,
-        Err(e) => return err_v(Value::Str(e)),
+        Err(e) => return err_v(Value::Str(e.into())),
     };
     if nonce.len() != 12 {
         return err_v(Value::Str(format!(
             "aes_gcm_open: nonce must be exactly 12 bytes, got {}", nonce.len()
-        )));
+        ).into()));
     }
     if tag.len() != 16 {
         return err_v(Value::Str(format!(
             "aes_gcm_open: tag must be exactly 16 bytes, got {}", tag.len()
-        )));
+        ).into()));
     }
     // Rebuild the "ciphertext || tag" buffer the aes-gcm crate expects.
     let mut combined = Vec::with_capacity(ciphertext.len() + tag.len());
@@ -2490,11 +2492,11 @@ fn aes_gcm_open_impl(args: &[Value]) -> Value {
             .and_then(|c| c.decrypt(n, payload).map_err(|e| format!("aes_gcm_open: {e}"))),
         other => return err_v(Value::Str(format!(
             "aes_gcm_open: key must be 16 or 32 bytes, got {other}"
-        ))),
+        ).into())),
     };
     match plaintext {
         Ok(p) => ok_v(Value::Bytes(p)),
-        Err(e) => err_v(Value::Str(e)),
+        Err(e) => err_v(Value::Str(e.into())),
     }
 }
 
@@ -2538,22 +2540,22 @@ fn chacha20_open_impl(args: &[Value]) -> Value {
     use chacha20poly1305::{ChaCha20Poly1305, Nonce};
     let (key, nonce, aad, ciphertext, tag) = match unpack5_bytes(args, "chacha20_poly1305_open") {
         Ok(t) => t,
-        Err(e) => return err_v(Value::Str(e)),
+        Err(e) => return err_v(Value::Str(e.into())),
     };
     if key.len() != 32 {
         return err_v(Value::Str(format!(
             "chacha20_poly1305_open: key must be exactly 32 bytes, got {}", key.len()
-        )));
+        ).into()));
     }
     if nonce.len() != 12 {
         return err_v(Value::Str(format!(
             "chacha20_poly1305_open: nonce must be exactly 12 bytes, got {}", nonce.len()
-        )));
+        ).into()));
     }
     if tag.len() != 16 {
         return err_v(Value::Str(format!(
             "chacha20_poly1305_open: tag must be exactly 16 bytes, got {}", tag.len()
-        )));
+        ).into()));
     }
     let mut combined = Vec::with_capacity(ciphertext.len() + tag.len());
     combined.extend_from_slice(ciphertext);
@@ -2564,7 +2566,7 @@ fn chacha20_open_impl(args: &[Value]) -> Value {
     let payload = Payload { msg: &combined, aad };
     match cipher.and_then(|c| c.decrypt(n, payload).map_err(|e| format!("chacha20_poly1305_open: {e}"))) {
         Ok(p) => ok_v(Value::Bytes(p)),
-        Err(e) => err_v(Value::Str(e)),
+        Err(e) => err_v(Value::Str(e.into())),
     }
 }
 
@@ -2657,28 +2659,28 @@ fn pbkdf2_sha256_impl(args: &[Value]) -> Value {
     let op = "pbkdf2_sha256";
     let (password, salt, iterations, len) = match unpack_kdf4(args, op) {
         Ok(t) => t,
-        Err(e) => return err_v(Value::Str(e)),
+        Err(e) => return err_v(Value::Str(e.into())),
     };
     if iterations <= 0 {
         return err_v(Value::Str(format!(
             "{op}: iterations must be > 0, got {iterations}"
-        )));
+        ).into()));
     }
     let out_len = match check_len(op, len) {
         Ok(n) => n,
-        Err(e) => return err_v(Value::Str(e)),
+        Err(e) => return err_v(Value::Str(e.into())),
     };
     let rounds = match u32::try_from(iterations) {
         Ok(r) => r,
         Err(_) => {
             return err_v(Value::Str(format!(
                 "{op}: iterations must fit in u32, got {iterations}"
-            )))
+            ).into()))
         }
     };
     let mut out = vec![0u8; out_len];
     if let Err(e) = pbkdf2::pbkdf2::<Hmac<Sha256>>(password, salt, rounds, &mut out) {
-        return err_v(Value::Str(format!("{op}: {e}")));
+        return err_v(Value::Str(format!("{op}: {e}").into()));
     }
     ok_v(Value::Bytes(out))
 }
@@ -2689,11 +2691,11 @@ fn hkdf_sha256_impl(args: &[Value]) -> Value {
     let op = "hkdf_sha256";
     let (ikm, salt, info, len) = match unpack_hkdf4(args, op) {
         Ok(t) => t,
-        Err(e) => return err_v(Value::Str(e)),
+        Err(e) => return err_v(Value::Str(e.into())),
     };
     let out_len = match check_len(op, len) {
         Ok(n) => n,
-        Err(e) => return err_v(Value::Str(e)),
+        Err(e) => return err_v(Value::Str(e.into())),
     };
     // RFC 5869 caps output at 255 * HashLen; the `expand` call below
     // returns InvalidLength when exceeded — surface that as Err.
@@ -2702,7 +2704,7 @@ fn hkdf_sha256_impl(args: &[Value]) -> Value {
     let mut out = vec![0u8; out_len];
     match hk.expand(info, &mut out) {
         Ok(()) => ok_v(Value::Bytes(out)),
-        Err(e) => err_v(Value::Str(format!("{op}: {e}"))),
+        Err(e) => err_v(Value::Str(format!("{op}: {e}").into())),
     }
 }
 
@@ -2711,24 +2713,24 @@ fn argon2id_impl(args: &[Value]) -> Value {
     let op = "argon2id";
     let (password, salt, t_cost, m_cost, len) = match unpack_argon5(args, op) {
         Ok(t) => t,
-        Err(e) => return err_v(Value::Str(e)),
+        Err(e) => return err_v(Value::Str(e.into())),
     };
     let out_len = match check_len(op, len) {
         Ok(n) => n,
-        Err(e) => return err_v(Value::Str(e)),
+        Err(e) => return err_v(Value::Str(e.into())),
     };
     let t = match u32::try_from(t_cost) {
         Ok(n) if n >= 1 => n,
         _ => return err_v(Value::Str(format!(
             "{op}: t_cost must be a u32 >= 1, got {t_cost}"
-        ))),
+        ).into())),
     };
     let m = match u32::try_from(m_cost) {
         Ok(n) if n >= Params::MIN_M_COST => n,
         _ => return err_v(Value::Str(format!(
             "{op}: m_cost must be a u32 >= {}, got {m_cost}",
             Params::MIN_M_COST
-        ))),
+        ).into())),
     };
     // p=1 is the default and what every interop spec assumes (PHC
     // string, libsodium's argon2id_str). We don't expose parallelism
@@ -2736,12 +2738,12 @@ fn argon2id_impl(args: &[Value]) -> Value {
     // makes hashes uncomparable across machines.
     let params = match Params::new(m, t, 1, Some(out_len)) {
         Ok(p) => p,
-        Err(e) => return err_v(Value::Str(format!("{op}: {e}"))),
+        Err(e) => return err_v(Value::Str(format!("{op}: {e}").into())),
     };
     let hasher = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut out = vec![0u8; out_len];
     if let Err(e) = hasher.hash_password_into(password, salt, &mut out) {
-        return err_v(Value::Str(format!("{op}: {e}")));
+        return err_v(Value::Str(format!("{op}: {e}").into()));
     }
     ok_v(Value::Bytes(out))
 }

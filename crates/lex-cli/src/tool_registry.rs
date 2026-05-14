@@ -273,8 +273,8 @@ fn invoke_tool(id: &str, body_str: &str, registry: &Registry) -> Response<std::i
     let handler = DefaultHandler::new(policy).with_program(Arc::clone(&prog));
     let mut vm = Vm::with_handler(&prog, Box::new(handler));
     vm.set_step_limit(1_000_000);
-    match vm.call("tool", vec![Value::Str(parsed.input)]) {
-        Ok(Value::Str(s)) => json_response(200, json!({ "output": s })),
+    match vm.call("tool", vec![Value::Str(parsed.input.into())]) {
+        Ok(Value::Str(s)) => json_response(200, json!({ "output": s.to_string() })),
         Ok(other) => json_response(200, json!({ "output": format!("{other:?}") })),
         Err(e) => {
             let msg = format!("{e}");

@@ -32,7 +32,7 @@ fn unwrap_ok(v: Value) -> Value {
 fn err_msg(v: Value) -> String {
     match v {
         Value::Variant { name, args } if name == "Err" => match args.into_iter().next() {
-            Some(Value::Str(s)) => s,
+            Some(Value::Str(s)) => s.to_string(),
             other => panic!("expected Err(Str), got {other:?}"),
         },
         other => panic!("expected Err, got {other:?}"),

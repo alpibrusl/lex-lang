@@ -48,6 +48,7 @@ csv = "1"
 rusqlite = { version = "0.39", features = ["bundled"] }
 postgres = "0.19"
 lex-bytecode = { path = "../lex-bytecode", version = "0.9.3" }
+smol_str = { workspace = true }
 
 [dev-dependencies]
 lex-syntax = { path = "../lex-syntax", version = "0.9.3" }

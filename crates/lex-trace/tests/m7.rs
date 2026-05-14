@@ -53,7 +53,7 @@ fn value_to_json(v: &Value) -> serde_json::Value {
         Value::Int(n) => J::from(*n),
         Value::Float(f) => J::from(*f),
         Value::Bool(b) => J::Bool(*b),
-        Value::Str(s) => J::String(s.clone()),
+        Value::Str(s) => J::String(s.to_string()),
         Value::Bytes(b) => J::String(b.iter().map(|b| format!("{:02x}", b)).collect()),
         Value::Unit => J::Null,
         Value::List(items) => J::Array(items.iter().map(value_to_json).collect()),

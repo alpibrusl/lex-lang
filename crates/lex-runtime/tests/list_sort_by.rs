@@ -137,7 +137,7 @@ fn r(xs :: List[R]) -> List[R] {
         .iter()
         .map(|v| match v {
             Value::Record(f) => match f.get("tag") {
-                Some(Value::Str(t)) => t.clone(),
+                Some(Value::Str(t)) => t.to_string(),
                 _ => panic!(),
             },
             _ => panic!(),
