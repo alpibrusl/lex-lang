@@ -7,7 +7,28 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Fixed
+
+- **#399: `Policy::permissive()` was missing several stdlib effect
+  kinds**, causing `lex test` (which uses the permissive policy by
+  default) to reject test files that touched stdlib modules whose
+  effects weren't in the runner's allow-list. Most painful case:
+  `[sql]` from `std.sql`, which broke any test that reached the SQL
+  surface — blocking lex-orm and lex-ocpp test suites under
+  `lex ci`. Added `sql`, `random` (`crypto.random` /
+  `crypto.random_str_hex`), `chat`, `log`, `kv`, `stream`, and
+  `fs_walk` to the permissive set; commented the rule that
+  `Policy::permissive()` tracks the stdlib effect catalog so future
+  effect additions get the same treatment.
+
 ### Added
+
+- **#399: `lex test --allow-effects k1,k2,...` flag.** Lets test
+  runs override the runner's permissive policy with an explicit
+  allow-list — covers vendor-extension effects we don't ship in the
+  stdlib catalog, and (in the other direction) lets contributors
+  verify effect-shape contracts by restricting a test run to a
+  tight allow-list. Mirrors `lex run --allow-effects` exactly.
 
 - **#390: `net.dial_ws` — WebSocket client primitive.** Inverse of
   `net.serve_ws_fn` (server, shipped in 0.9.0): open an outbound
