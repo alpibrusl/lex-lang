@@ -11,7 +11,7 @@ pub mod workspace;
 
 pub use loader::{load_program, load_program_from_str, LoadError};
 pub use workspace::{find_manifest, Manifest, PackageError};
-pub use parser::{parse, ParseError};
+pub use parser::{parse, parse_with_src, ParseError};
 pub use printer::print_program;
 pub use syntax::*;
 pub use token::{lex, LexError, Token, TokenKind};
@@ -19,7 +19,7 @@ pub use token::{lex, LexError, Token, TokenKind};
 /// Convenience: lex + parse a source string.
 pub fn parse_source(src: &str) -> Result<Program, SyntaxError> {
     let toks = lex(src).map_err(SyntaxError::Lex)?;
-    parse(toks).map_err(SyntaxError::Parse)
+    parse_with_src(src, toks).map_err(SyntaxError::Parse)
 }
 
 /// Byte-offset start position of each `fn` declaration, keyed by
@@ -58,7 +58,7 @@ pub fn parse_source_with_positions(src: &str) -> Result<(Program, FnPositions), 
         }
         i += 1;
     }
-    let program = parse(toks).map_err(SyntaxError::Parse)?;
+    let program = parse_with_src(src, toks).map_err(SyntaxError::Parse)?;
     Ok((program, fn_positions))
 }
 
