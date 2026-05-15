@@ -17,6 +17,8 @@ serde_json.workspace = true
 thiserror.workspace = true
 indexmap.workspace = true
 sha2.workspace = true
+arrow-array = "55"
+arrow-schema = "55"
 lex-ast = { path = "../lex-ast", version = "0.9.3" }
 lex-types = { path = "../lex-types", version = "0.9.3" }
 

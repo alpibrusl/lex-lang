@@ -9,6 +9,46 @@ bumps may carry breaking changes when justified).
 
 ### Added
 
+- **#426 (slice 1): `std.arrow` — Apache Arrow tables as a first-class
+  `Value`.** Lays the foundation for closing the lex-frame ↔ pandas
+  performance gap (lex-frame#5, lex-frame#6). New
+  `Value::ArrowTable(Arc<RecordBatch>)` variant + `arrow.*` builtins for
+  construction, introspection, numeric reductions, and slicing — all
+  pure (no effects), all running as a single Rust call over the flat
+  Arrow buffer instead of walking a `List[Value]` in the bytecode VM.
+
+  Surface (slice 1):
+  - **Constructors** — `arrow.from_int_columns`, `arrow.from_float_columns`,
+    `arrow.from_str_columns` :: `List[(Str, List[T])] -> Result[Table, Str]`.
+    Length-mismatch surfaces as `Err`, not a runtime panic.
+  - **Introspection** — `arrow.nrows`, `arrow.ncols`, `arrow.col_names`,
+    `arrow.col_type`.
+  - **Column reductions** — `arrow.col_sum_int`, `arrow.col_sum_float`,
+    `arrow.col_mean`, `arrow.col_min_int`, `arrow.col_max_int`,
+    `arrow.col_count`. Each is one `arrow_arith::aggregate::*` call —
+    sum of a 10k-row Int64 column finishes in ~10 µs in the kernel
+    itself; the slice-1 wall-clock 2.5× win is bottlenecked by the
+    `List[Int] → Arrow` construction. The win compounds once
+    `arrow.read_csv` lands and the Lex-list intermediate goes away.
+  - **Slicing / projection** — `arrow.head`, `arrow.tail`, `arrow.slice`
+    (zero-copy via `RecordBatch::slice`), `arrow.select_cols`,
+    `arrow.drop_col`.
+
+  Adds `arrow-array`, `arrow-schema`, `arrow-arith`, `arrow-cast`,
+  `arrow-select` 55.x to the runtime. Binary-size impact: +~3 MB.
+  Compile-time impact: +~30 s incremental on the runtime crate.
+
+  Tests: `crates/lex-runtime/tests/std_arrow.rs` covers each kernel via
+  the Lex VM and via direct `arrow::dispatch` calls. Trace recorder and
+  `Value::to_json` summarise tables by schema + nrows (full data is
+  never serialised — Arrow tables can be GB-scale).
+
+  Out of scope (separate slices): `arrow.read_parquet` /
+  `arrow.read_csv` (effect-gated I/O), nullable / string / mixed-type
+  reductions, row-shaped accessors (`arrow.row_at`,
+  `arrow.col_to_*_list`), the Polars-backed `std.df` for group_by /
+  join / sort (#427), and the `lex-frame` migration (lex-frame#6).
+
 - **#381: `conc.spawn` / `conc.ask` / `conc.tell` — synchronous actor model.**
   Programs can now create stateful actor handles with `conc.spawn(init_state,
   handler_fn)` and send messages via `conc.ask` (returns the handler's reply)

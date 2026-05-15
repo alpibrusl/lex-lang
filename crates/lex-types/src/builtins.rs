@@ -639,6 +639,100 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             ));
             Some(Ty::Record(fields))
         }
+        "arrow" => {
+            // Apache Arrow tables (#426). All ops are pure (no effects);
+            // tables are immutable and conversions / reductions all run as
+            // one Rust call over the flat buffer.
+            //
+            // `arrow.Table` is opaque from the type system's point of view —
+            // the runtime variant `Value::ArrowTable` is the only producer
+            // and consumer, so we model it as a 0-arity type constructor.
+            let table = Ty::Con("Table".into(), vec![]);
+            let str_t   = Ty::str();
+            let int_t   = Ty::int();
+            let float_t = Ty::float();
+            let opt = |inner: Ty| Ty::Con("Option".into(), vec![inner]);
+            let res = |ok: Ty| Ty::Con("Result".into(), vec![ok, Ty::str()]);
+            let no_eff = EffectSet::empty();
+
+            let mut fields = IndexMap::new();
+
+            // -- constructors --
+            // arrow.from_int_columns   :: List[(Str, List[Int])]   -> Result[Table, Str]
+            // arrow.from_float_columns :: List[(Str, List[Float])] -> Result[Table, Str]
+            // arrow.from_str_columns   :: List[(Str, List[Str])]   -> Result[Table, Str]
+            for (name, elem) in [
+                ("from_int_columns",   int_t.clone()),
+                ("from_float_columns", float_t.clone()),
+                ("from_str_columns",   str_t.clone()),
+            ] {
+                fields.insert(name.into(), Ty::function(
+                    vec![Ty::List(Box::new(Ty::Tuple(vec![
+                        str_t.clone(),
+                        Ty::List(Box::new(elem)),
+                    ])))],
+                    no_eff.clone(),
+                    res(table.clone()),
+                ));
+            }
+
+            // -- introspection --
+            // arrow.nrows / arrow.ncols :: Table -> Int
+            fields.insert("nrows".into(), Ty::function(
+                vec![table.clone()], no_eff.clone(), int_t.clone()));
+            fields.insert("ncols".into(), Ty::function(
+                vec![table.clone()], no_eff.clone(), int_t.clone()));
+            // arrow.col_names :: Table -> List[Str]
+            fields.insert("col_names".into(), Ty::function(
+                vec![table.clone()], no_eff.clone(),
+                Ty::List(Box::new(str_t.clone()))));
+            // arrow.col_type :: Table, Str -> Option[Str]
+            fields.insert("col_type".into(), Ty::function(
+                vec![table.clone(), str_t.clone()],
+                no_eff.clone(), opt(str_t.clone())));
+
+            // -- column reductions --
+            // arrow.col_sum_int   :: Table, Str -> Result[Int, Str]
+            // arrow.col_sum_float :: Table, Str -> Result[Float, Str]
+            // arrow.col_mean      :: Table, Str -> Result[Option[Float], Str]
+            // arrow.col_min_int   :: Table, Str -> Result[Option[Int], Str]
+            // arrow.col_max_int   :: Table, Str -> Result[Option[Int], Str]
+            // arrow.col_count     :: Table, Str -> Result[Int, Str]
+            for (name, ret_ok) in [
+                ("col_sum_int",   int_t.clone()),
+                ("col_sum_float", float_t.clone()),
+                ("col_mean",      opt(float_t.clone())),
+                ("col_min_int",   opt(int_t.clone())),
+                ("col_max_int",   opt(int_t.clone())),
+                ("col_count",     int_t.clone()),
+            ] {
+                fields.insert(name.into(), Ty::function(
+                    vec![table.clone(), str_t.clone()],
+                    no_eff.clone(), res(ret_ok)));
+            }
+
+            // -- slicing --
+            // arrow.head / tail :: Table, Int -> Table
+            for name in &["head", "tail"] {
+                fields.insert((*name).into(), Ty::function(
+                    vec![table.clone(), int_t.clone()],
+                    no_eff.clone(), table.clone()));
+            }
+            // arrow.slice :: Table, Int, Int -> Table
+            fields.insert("slice".into(), Ty::function(
+                vec![table.clone(), int_t.clone(), int_t.clone()],
+                no_eff.clone(), table.clone()));
+            // arrow.select_cols :: Table, List[Str] -> Result[Table, Str]
+            fields.insert("select_cols".into(), Ty::function(
+                vec![table.clone(), Ty::List(Box::new(str_t.clone()))],
+                no_eff.clone(), res(table.clone())));
+            // arrow.drop_col :: Table, Str -> Result[Table, Str]
+            fields.insert("drop_col".into(), Ty::function(
+                vec![table.clone(), str_t.clone()],
+                no_eff.clone(), res(table.clone())));
+
+            Some(Ty::Record(fields))
+        }
         "proc" => {
             // Subprocess dispatch. Effect: [proc]. Returns a Result
             // with a record on success carrying stdout / stderr /
@@ -2226,6 +2320,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "cli" => "cli",
         "stream" => "stream",
         "conc" => "conc",
+        "arrow" => "arrow",
         _ => return None,
     })
 }
