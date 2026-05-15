@@ -29,6 +29,16 @@ impl Printer {
     }
 
     fn program(&mut self, p: &Program) {
+        // Top-of-file comments live above any item. Always emitted at
+        // column 0 — agents and humans both expect module-level
+        // documentation to start at the left margin (`lex fmt`
+        // canonical form).
+        for c in &p.leading_comments {
+            writeln!(self.out, "{c}").unwrap();
+        }
+        if !p.leading_comments.is_empty() && !p.items.is_empty() {
+            self.nl();
+        }
         for (i, item) in p.items.iter().enumerate() {
             if i > 0 { self.nl(); }
             self.item(item);
@@ -36,9 +46,29 @@ impl Printer {
         if !p.items.is_empty() {
             self.nl();
         }
+        // Trailing comments at the end of file (after the last item).
+        // Most code doesn't have these; preserved for round-trip
+        // fidelity on the rare file that does.
+        if !p.trailing_comments.is_empty() {
+            if !p.items.is_empty() { self.nl(); }
+            for c in &p.trailing_comments {
+                writeln!(self.out, "{c}").unwrap();
+            }
+        }
     }
 
     fn item(&mut self, item: &Item) {
+        // Emit any leading-comment block attached to the item before
+        // the item itself. Each entry is a raw source line including
+        // the `#` prefix; written verbatim, one per line.
+        let leading: &[String] = match item {
+            Item::Import(i) => &i.leading_comments,
+            Item::TypeDecl(td) => &td.leading_comments,
+            Item::FnDecl(fd) => &fd.leading_comments,
+        };
+        for c in leading {
+            writeln!(self.out, "{c}").unwrap();
+        }
         match item {
             Item::Import(i) => {
                 writeln!(self.out, "import \"{}\" as {}", i.reference, i.alias).unwrap();

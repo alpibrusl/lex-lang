@@ -5,7 +5,18 @@ use crate::syntax::*;
 use crate::token::{Token, TokenKind};
 
 pub fn parse(tokens: Vec<Token>) -> Result<Program, ParseError> {
-    let mut p = Parser::new(tokens);
+    // Back-compat entry: no source available, so leading comments are
+    // not recovered. `parse_source` in `lib.rs` calls
+    // `parse_with_src` directly and is the path that preserves them.
+    parse_with_src("", tokens)
+}
+
+/// Parse + attach `#` line-comments to the AST. The source string is
+/// used only to scan the gaps between tokens (where the lexer skipped
+/// whitespace and comments); the parser itself still operates purely
+/// on tokens. See `Program::leading_comments` for the data model.
+pub fn parse_with_src(src: &str, tokens: Vec<Token>) -> Result<Program, ParseError> {
+    let mut p = Parser::new(src, tokens);
     let program = p.parse_program()?;
     p.skip_newlines();
     if !p.at_eof() {
@@ -21,7 +32,12 @@ pub struct ParseError {
     pub msg: String,
 }
 
-struct Parser {
+struct Parser<'a> {
+    /// Source text — needed only for trivia recovery (line comments
+    /// in the gaps between tokens). Empty when called through the
+    /// legacy `parse(tokens)` entry; comments are silently dropped
+    /// in that path.
+    src: &'a str,
     tokens: Vec<Token>,
     idx: usize,
     /// Recursion depth across `parse_expr`. Capped at `MAX_DEPTH`
@@ -47,9 +63,39 @@ struct Parser {
 /// count around 400-500 — well below even a 2 MiB test stack.
 const MAX_DEPTH: u32 = 96;
 
-impl Parser {
-    fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, idx: 0, depth: 0, discard_counter: 0 }
+impl<'a> Parser<'a> {
+    fn new(src: &'a str, tokens: Vec<Token>) -> Self {
+        Self { src, tokens, idx: 0, depth: 0, discard_counter: 0 }
+    }
+
+    /// Extract `#` line-comments from the source byte range
+    /// `start..end`. The range must be a "gap" between two tokens
+    /// (or between source-start/end and a token); by construction
+    /// such gaps contain only whitespace and `#` comments — string
+    /// contents never appear because the lexer's logos rules would
+    /// have produced a `Str(...)` token covering them.
+    ///
+    /// Each returned entry is a single source line, trimmed of leading
+    /// whitespace (the `#` and everything after it preserved) and of
+    /// trailing whitespace. Blank lines between consecutive comments
+    /// are dropped — preserving inter-comment blank lines is left to
+    /// a follow-up; the bug this addresses (#417) is about comments
+    /// disappearing entirely.
+    fn extract_comments(&self, start: usize, end: usize) -> Vec<String> {
+        if start >= end || end > self.src.len() {
+            return Vec::new();
+        }
+        self.src[start..end]
+            .lines()
+            .filter_map(|line| {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with('#') {
+                    Some(trimmed.trim_end().to_string())
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     fn at_eof(&self) -> bool {
@@ -124,14 +170,39 @@ impl Parser {
 
     fn parse_program(&mut self) -> Result<Program, ParseError> {
         let mut items = Vec::new();
+        let mut leading_comments: Vec<String> = Vec::new();
+        // Byte offset of the end of the last consumed token (or 0 at
+        // start of file). The next gap to scan for comments is from
+        // here up to the start of the upcoming item's first token.
+        let mut gap_start: usize = 0;
         loop {
             self.skip_newlines();
             if self.at_eof() {
                 break;
             }
-            items.push(self.parse_item()?);
+            let item_start = self.tokens[self.idx].span.start;
+            let gap_comments = self.extract_comments(gap_start, item_start);
+            let pending_comments = if items.is_empty() {
+                leading_comments = gap_comments;
+                Vec::new()
+            } else {
+                gap_comments
+            };
+            let mut item = self.parse_item()?;
+            if !pending_comments.is_empty() {
+                attach_leading_comments(&mut item, pending_comments);
+            }
+            gap_start = self
+                .tokens
+                .get(self.idx.saturating_sub(1))
+                .map(|t| t.span.end)
+                .unwrap_or(gap_start);
+            items.push(item);
         }
-        Ok(Program { items })
+        // Trailing comments live after the last consumed token (or
+        // span the whole file when there are no items).
+        let trailing_comments = self.extract_comments(gap_start, self.src.len());
+        Ok(Program { items, leading_comments, trailing_comments })
     }
 
     fn parse_item(&mut self) -> Result<Item, ParseError> {
@@ -153,7 +224,7 @@ impl Parser {
         };
         self.expect(&TokenKind::As, "in import")?;
         let alias = self.expect_ident("for import alias")?;
-        Ok(Import { reference, alias })
+        Ok(Import { reference, alias, leading_comments: Vec::new() })
     }
 
     fn parse_type_decl(&mut self) -> Result<TypeDecl, ParseError> {
@@ -168,7 +239,7 @@ impl Parser {
         };
         self.expect(&TokenKind::Eq, "in type decl")?;
         let definition = self.parse_type_decl_rhs()?;
-        Ok(TypeDecl { name, params, definition })
+        Ok(TypeDecl { name, params, definition, leading_comments: Vec::new() })
     }
 
     fn parse_ident_list(&mut self) -> Result<Vec<String>, ParseError> {
@@ -374,7 +445,7 @@ impl Parser {
         let return_type = self.parse_type_expr()?;
         let examples = self.parse_examples_block()?;
         let body = self.parse_block()?;
-        Ok(FnDecl { name, type_params, params, effects, return_type, body, examples })
+        Ok(FnDecl { name, type_params, params, effects, return_type, body, examples, leading_comments: Vec::new() })
     }
 
     /// Parse an optional `examples { call(a, b) => expected, ... }` block
@@ -932,5 +1003,19 @@ fn type_to_variant(t: TypeExpr) -> Result<UnionVariant, ParseError> {
             pos: 0,
             msg: "union variant must be a constructor name".into(),
         }),
+    }
+}
+
+/// Attach a collected list of `#` comments to whichever top-level
+/// item variant carries them. Empty input is a no-op; the per-variant
+/// `leading_comments: Vec<String>` field is always present.
+fn attach_leading_comments(item: &mut Item, comments: Vec<String>) {
+    if comments.is_empty() {
+        return;
+    }
+    match item {
+        Item::Import(i) => i.leading_comments = comments,
+        Item::TypeDecl(t) => t.leading_comments = comments,
+        Item::FnDecl(f) => f.leading_comments = comments,
     }
 }

@@ -8,6 +8,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Program {
     pub items: Vec<Item>,
+    /// Comments at the top of the file, before the first item. Each
+    /// entry is one line of source, including the leading `#`.
+    /// Preserved by the formatter (`lex fmt`); stripped by the
+    /// canonicalizer so they never participate in SigId.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub leading_comments: Vec<String>,
+    /// Comments after the last item (or all of the file, if `items`
+    /// is empty). Same semantics as `leading_comments`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trailing_comments: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -21,6 +31,11 @@ pub enum Item {
 pub struct Import {
     pub reference: String,
     pub alias: String,
+    /// Comments immediately preceding this import (one line each, `#`
+    /// preserved). Preserved by the formatter; ignored everywhere
+    /// else.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub leading_comments: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -28,6 +43,10 @@ pub struct TypeDecl {
     pub name: String,
     pub params: Vec<String>,
     pub definition: TypeExpr,
+    /// Comments immediately preceding this declaration. See `Import`
+    /// for semantics.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub leading_comments: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -46,6 +65,10 @@ pub struct FnDecl {
     /// with pre-#369 signatures when the block is absent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub examples: Vec<Example>,
+    /// Comments immediately preceding this fn declaration. See
+    /// `Import` for semantics.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub leading_comments: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

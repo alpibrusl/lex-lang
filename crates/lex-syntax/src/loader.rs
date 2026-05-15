@@ -170,7 +170,11 @@ impl LoaderState {
         // call still resolves so the parent's `path_imports` map gets
         // populated below.
         if self.loaded.contains(canonical) {
-            return Ok(Program { items: Vec::new() });
+            return Ok(Program {
+                items: Vec::new(),
+                leading_comments: Vec::new(),
+                trailing_comments: Vec::new(),
+            });
         }
         self.in_progress.push(canonical.to_path_buf());
 
@@ -255,7 +259,17 @@ impl LoaderState {
         }
         out.extend(merged_children);
         out.extend(mangled);
-        Ok(Program { items: out })
+        // Top-of-file comments live on each source file independently;
+        // after import merging the merged Program represents many
+        // files at once, and there is no obvious single "top of file"
+        // to attribute them to. Drop here — they're preserved by
+        // `lex fmt` (which operates per-file) but not by the loader's
+        // import-merging path. Same rationale for trailing_comments.
+        Ok(Program {
+            items: out,
+            leading_comments: Vec::new(),
+            trailing_comments: Vec::new(),
+        })
     }
 }
 
@@ -335,6 +349,7 @@ impl<'a> Mangler<'a> {
             name: self.qualify(&td.name),
             params: td.params,
             definition: self.mangle_type_expr(td.definition),
+            leading_comments: td.leading_comments,
         }
     }
 
@@ -376,6 +391,7 @@ impl<'a> Mangler<'a> {
             return_type: self.mangle_type_expr(fd.return_type),
             body: self.mangle_block(fd.body, &shadow),
             examples,
+            leading_comments: fd.leading_comments,
         }
     }
 
