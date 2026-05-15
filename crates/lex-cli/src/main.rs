@@ -28,6 +28,7 @@ mod fmt;
 mod init;
 mod ci;
 mod examples_eval;
+mod agent_guidelines;
 
 use ::acli::OutputFormat;
 use anyhow::{anyhow, bail, Context, Result};
@@ -125,6 +126,7 @@ fn run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "fmt"  => fmt::cmd_fmt(&args[1..]),
         "init" => init::cmd_init(&args[1..]),
         "ci"   => ci::cmd_ci(&args[1..]),
+        "agent-guidelines" => agent_guidelines::cmd_agent_guidelines(fmt, &args[1..]),
         "help" | "--help" | "-h" => { print_usage(); Ok(()) }
         other => bail!("unknown command `{other}`. try `lex help`"),
     }

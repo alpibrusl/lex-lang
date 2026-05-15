@@ -183,7 +183,9 @@ jobs:
 /// AI-assistant cold-start guide dropped at the project root. Read by
 /// Claude Code (`CLAUDE.md`/`AGENTS.md`), Cursor, Aider, and most other
 /// agent tools that look for a project-conventions file. Deliberately
-/// short — points at the upstream `docs/AGENT.md` for the deep dive.
+/// short — points at `lex agent-guidelines` for the authoritative
+/// prescriptive rules, and at the upstream `docs/AGENT.md` for the
+/// reference deep dive.
 fn agents_md(name: &str) -> String {
     let version = env!("CARGO_PKG_VERSION");
     format!(
@@ -191,7 +193,8 @@ fn agents_md(name: &str) -> String {
 
 This file is for AI assistants (Claude Code, Cursor, Aider, Copilot, …)
 working in this repo. Humans should read `README.md` first; agents should
-read this **first**, then the upstream guide it points at.
+read this **first**, then run `lex agent-guidelines` for the authoritative
+idiom contract before writing any code.
 
 ## 1. Install the Lex toolchain
 
@@ -300,14 +303,43 @@ Key rules:
   after editing.
 - Before pushing: `lex ci`. CI runs the same command.
 
-## 5. Need more?
+## 5. Idiom rules — read before writing code
+
+Run this in the project root:
+
+```sh
+lex agent-guidelines               # full prescriptive contract (~10 pages)
+lex agent-guidelines > AGENTS.md   # capture into the repo so it travels with the code
+```
+
+The rules are numbered and stable. The four that matter most when
+you're tempted to skip them:
+
+1. **Narrow effects, always.** `fn foo() -> [fs_write("/tmp/x")] T`,
+   not `[fs_write]`. If the type checker rejects, narrow the *body*,
+   not the signature. Rule 1.2 in the guidelines.
+2. **Repair, don't regenerate.** When `lex check` fails, run
+   `lex --output json check` to get the structured error, then
+   `lex repair --apply --transform '<suggested_transform>'`. Only
+   regenerate after two failed repair attempts. Rules 4.1–4.3.
+3. **`examples {{}}` blocks on every pure fn.** They're part of the
+   SigId and run at `lex check` time — free regression tests with no
+   `tests/` boilerplate. Rule 2.1.
+4. **Use the stdlib.** `std.crypto` not hand-rolled crypto, `std.conc`
+   not threads, `std.sql` not string-concat SQL. Section 3.
+
+## 6. Need more?
 
 Deep references in the upstream repo:
 
-- **`docs/AGENT.md`** — full cold-start guide: error envelope schema,
-  effect kinds, stdlib module summary, every sharp edge.
-- **`docs/index.html`** — the design pitch (effects-as-types, content-
-  addressed AST, op log, attestations).
+- **`lex agent-guidelines`** — the authoritative idiom contract
+  (travels with the toolchain version).
+- **`docs/AGENT.md`** — reference: error envelope schema, every
+  `rule_tag`, stdlib module summary, every sharp edge.
+- **`docs/design/canonicalization.md`** — which edits preserve a
+  SigId and which break it.
+- **`docs/index.html`** — the design pitch (effects-as-types,
+  content-addressed AST, op log, attestations).
 - **`README.md`** in [alpibrusl/lex-lang](https://github.com/alpibrusl/lex-lang)
   — design rules, stdlib index, examples.
 

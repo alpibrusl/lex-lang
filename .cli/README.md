@@ -1,6 +1,6 @@
 # lex
 
-Version: 0.1.0
+Version: 0.9.3
 ACLI version: 0.1.0
 
 ## Commands
@@ -29,6 +29,12 @@ print canonical SigId/StageId hashes for each function
 
 Idempotent: true
 
+### blame
+
+show each fn's stage history from the store
+
+Idempotent: true
+
 ### publish
 
 publish each stage in a file to the store as Draft
@@ -38,6 +44,16 @@ Idempotent: false
 ### store
 
 browse the content-addressed code store
+
+### stage
+
+print stage info, or list attestations for a stage
+
+Idempotent: true
+
+### attest
+
+cross-stage attestation queries (CI / dashboards)
 
 ### trace
 
@@ -110,4 +126,32 @@ snapshot branches in lex-store (tier-1 agent-native VC)
 three-way merge between two branches in the store
 
 Idempotent: false
+
+### merge
+
+stateful agent-driven merge (CLI mirror of /v1/merge/*)
+
+### log
+
+show the merge journal of a branch (top-level alias for `lex branch log`)
+
+Idempotent: true
+
+### repl
+
+interactive evaluator (Lex source line-by-line)
+
+Idempotent: false
+
+### watch
+
+re-run check or run on file save (agent inner loop)
+
+Idempotent: false
+
+### agent-guidelines
+
+emit the AI-agent authoring contract (idiom rules) for this Lex toolchain
+
+Idempotent: true
 

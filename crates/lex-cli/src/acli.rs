@@ -134,7 +134,23 @@ fn commands() -> Vec<CommandInfo> {
         cmd_log(),
         cmd_repl(),
         cmd_watch(),
+        cmd_agent_guidelines(),
     ]
+}
+
+fn cmd_agent_guidelines() -> CommandInfo {
+    CommandInfo::new(
+        "agent-guidelines",
+        "emit the AI-agent authoring contract (idiom rules) for this Lex toolchain",
+    )
+    .idempotent(true)
+    .add_option("--version-only", "bool", "print only the toolchain version", None)
+    .with_examples(vec![
+        ("Read the rules",         "lex agent-guidelines"),
+        ("Capture into a repo",    "lex agent-guidelines > AGENTS.md"),
+        ("Version of the doc",     "lex agent-guidelines --version-only"),
+    ])
+    .with_see_also(vec!["skill", "introspect", "init"])
 }
 
 fn cmd_repl() -> CommandInfo {
