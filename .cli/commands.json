@@ -1,6 +1,6 @@
 {
   "name": "lex",
-  "version": "0.1.0",
+  "version": "0.9.3",
   "acli_version": "0.1.0",
   "commands": [
     {
@@ -164,6 +164,53 @@
       ]
     },
     {
+      "name": "blame",
+      "description": "show each fn's stage history from the store",
+      "arguments": [
+        {
+          "name": "file",
+          "type": "string",
+          "description": "path to a .lex file",
+          "required": true
+        }
+      ],
+      "options": [
+        {
+          "name": "--store",
+          "type": "string",
+          "description": "store root directory"
+        },
+        {
+          "name": "--with-evidence",
+          "type": "bool",
+          "description": "attach attestations to each history entry"
+        }
+      ],
+      "subcommands": [],
+      "idempotent": true,
+      "examples": [
+        {
+          "description": "Blame a file",
+          "invocation": "lex blame app.lex"
+        },
+        {
+          "description": "With evidence trail",
+          "invocation": "lex blame --with-evidence app.lex"
+        },
+        {
+          "description": "Machine-readable",
+          "invocation": "lex --output json blame app.lex"
+        }
+      ],
+      "see_also": [
+        "hash",
+        "publish",
+        "store",
+        "stage",
+        "log"
+      ]
+    },
+    {
       "name": "publish",
       "description": "publish each stage in a file to the store as Draft",
       "arguments": [
@@ -259,6 +306,106 @@
         "publish",
         "branch",
         "store-merge"
+      ]
+    },
+    {
+      "name": "stage",
+      "description": "print stage info, or list attestations for a stage",
+      "arguments": [
+        {
+          "name": "stage_id",
+          "type": "string",
+          "description": "StageId hex",
+          "required": true
+        }
+      ],
+      "options": [
+        {
+          "name": "--store",
+          "type": "string",
+          "description": "store root directory"
+        },
+        {
+          "name": "--attestations",
+          "type": "bool",
+          "description": "list attestations instead of stage info"
+        }
+      ],
+      "subcommands": [],
+      "idempotent": true,
+      "examples": [
+        {
+          "description": "Print stage info",
+          "invocation": "lex stage abc123..."
+        },
+        {
+          "description": "List attestations",
+          "invocation": "lex stage abc123... --attestations"
+        },
+        {
+          "description": "Machine-readable",
+          "invocation": "lex --output json stage abc123... --attestations"
+        }
+      ],
+      "see_also": [
+        "store",
+        "blame",
+        "publish"
+      ]
+    },
+    {
+      "name": "attest",
+      "description": "cross-stage attestation queries (CI / dashboards)",
+      "arguments": [],
+      "options": [],
+      "subcommands": [
+        {
+          "name": "filter",
+          "description": "list attestations matching kind / result / since filters",
+          "arguments": [],
+          "options": [
+            {
+              "name": "--kind",
+              "type": "string",
+              "description": "attestation kind: type_check | spec | examples | diff_body | effect_audit | sandbox_run"
+            },
+            {
+              "name": "--result",
+              "type": "string",
+              "description": "passed | failed | inconclusive"
+            },
+            {
+              "name": "--since",
+              "type": "string",
+              "description": "epoch seconds or YYYY-MM-DD; only attestations on or after this time"
+            },
+            {
+              "name": "--store",
+              "type": "string",
+              "description": "store root directory"
+            }
+          ],
+          "subcommands": [],
+          "idempotent": true
+        }
+      ],
+      "examples": [
+        {
+          "description": "All Spec verdicts that passed",
+          "invocation": "lex attest filter --kind spec --result passed"
+        },
+        {
+          "description": "Recent type-check evidence",
+          "invocation": "lex attest filter --kind type_check --since 2026-05-01"
+        },
+        {
+          "description": "Machine-readable",
+          "invocation": "lex --output json attest filter --kind spec"
+        }
+      ],
+      "see_also": [
+        "stage",
+        "blame"
       ]
     },
     {
@@ -451,6 +598,16 @@
               "name": "--source",
               "type": "string",
               "description": "source file to verify against"
+            },
+            {
+              "name": "--trials",
+              "type": "string",
+              "description": "randomized trial count (default 1000)"
+            },
+            {
+              "name": "--store",
+              "type": "string",
+              "description": "if set, persist a Spec attestation against the target stage"
             }
           ],
           "subcommands": [],
@@ -533,6 +690,11 @@
           "description": "differential evaluation: alternate body file"
         },
         {
+          "name": "--store",
+          "type": "string",
+          "description": "if set, persist verification attestations against the tool stage"
+        },
+        {
           "name": "--json",
           "type": "bool",
           "description": "machine-readable output"
@@ -548,12 +710,18 @@
         {
           "description": "Verify against spec",
           "invocation": "lex agent-tool --spec sort.spec --body-file body.lex --json"
+        },
+        {
+          "description": "Persist attestations",
+          "invocation": "lex agent-tool --examples cases.json --body-file body.lex --store ~/.lex/store"
         }
       ],
       "see_also": [
         "check",
         "spec",
-        "run"
+        "run",
+        "attest",
+        "stage"
       ]
     },
     {
@@ -624,6 +792,11 @@
           "name": "--json",
           "type": "bool",
           "description": "machine-readable output"
+        },
+        {
+          "name": "--store",
+          "type": "string",
+          "description": "with --effect, persist EffectAudit attestations against each scanned stage"
         }
       ],
       "subcommands": [],
@@ -636,11 +809,17 @@
         {
           "description": "Find a host as JSON",
           "invocation": "lex audit --host api.example.com --json src"
+        },
+        {
+          "description": "Persist effect audits",
+          "invocation": "lex audit --effect fs_write --store ~/.lex/store src"
         }
       ],
       "see_also": [
         "ast-diff",
-        "ast-merge"
+        "ast-merge",
+        "attest",
+        "stage"
       ]
     },
     {
@@ -779,7 +958,7 @@
         },
         {
           "name": "create",
-          "description": "create a branch",
+          "description": "create a branch (snapshot or predicate-defined)",
           "arguments": [
             {
               "name": "name",
@@ -793,6 +972,11 @@
               "name": "--from",
               "type": "string",
               "description": "parent branch (default: main)"
+            },
+            {
+              "name": "--predicate",
+              "type": "string",
+              "description": "JSON expression matching lex_vcs::Predicate; creates a saved query rather than a snapshot"
             },
             {
               "name": "--store",
@@ -858,6 +1042,84 @@
           ],
           "subcommands": [],
           "idempotent": true
+        },
+        {
+          "name": "log",
+          "description": "print the merge journal of a branch",
+          "arguments": [
+            {
+              "name": "name",
+              "type": "string",
+              "description": "branch name (default: current)",
+              "required": false
+            }
+          ],
+          "options": [
+            {
+              "name": "--store",
+              "type": "string",
+              "description": "store root"
+            }
+          ],
+          "subcommands": [],
+          "idempotent": true
+        },
+        {
+          "name": "peek",
+          "description": "list ops on another branch without switching to it",
+          "arguments": [
+            {
+              "name": "name",
+              "type": "string",
+              "description": "branch to inspect",
+              "required": true
+            }
+          ],
+          "options": [
+            {
+              "name": "--since-fork",
+              "type": "bool",
+              "description": "limit to ops since the fork from --vs (or `parent`)"
+            },
+            {
+              "name": "--vs",
+              "type": "string",
+              "description": "compare against this branch (default: <name>'s parent)"
+            },
+            {
+              "name": "--store",
+              "type": "string",
+              "description": "store root"
+            }
+          ],
+          "subcommands": [],
+          "idempotent": true
+        },
+        {
+          "name": "overlay",
+          "description": "preview a merge: project current branch as if <other> were merged in",
+          "arguments": [
+            {
+              "name": "other",
+              "type": "string",
+              "description": "branch whose ops would be merged in",
+              "required": true
+            }
+          ],
+          "options": [
+            {
+              "name": "--on",
+              "type": "string",
+              "description": "destination branch (default: current)"
+            },
+            {
+              "name": "--store",
+              "type": "string",
+              "description": "store root"
+            }
+          ],
+          "subcommands": [],
+          "idempotent": true
         }
       ],
       "examples": [
@@ -868,11 +1130,21 @@
         {
           "description": "Create a feature",
           "invocation": "lex branch create feature --from main"
+        },
+        {
+          "description": "Peek what feature has done since fork",
+          "invocation": "lex branch peek feature --since-fork"
+        },
+        {
+          "description": "Preview merging feature into main",
+          "invocation": "lex branch overlay feature --on main"
         }
       ],
       "see_also": [
         "store-merge",
-        "store"
+        "store",
+        "log",
+        "merge"
       ]
     },
     {
@@ -923,7 +1195,262 @@
       ],
       "see_also": [
         "branch",
-        "ast-merge"
+        "ast-merge",
+        "merge"
+      ]
+    },
+    {
+      "name": "merge",
+      "description": "stateful agent-driven merge (CLI mirror of /v1/merge/*)",
+      "arguments": [],
+      "options": [],
+      "subcommands": [
+        {
+          "name": "start",
+          "description": "open a stateful merge session and surface conflicts",
+          "arguments": [],
+          "options": [
+            {
+              "name": "--src",
+              "type": "string",
+              "description": "source branch (theirs)"
+            },
+            {
+              "name": "--dst",
+              "type": "string",
+              "description": "destination branch (ours)"
+            },
+            {
+              "name": "--store",
+              "type": "string",
+              "description": "store root directory"
+            }
+          ],
+          "subcommands": [],
+          "idempotent": false
+        },
+        {
+          "name": "status",
+          "description": "print remaining conflicts for a session",
+          "arguments": [
+            {
+              "name": "merge_id",
+              "type": "string",
+              "description": "session id from `lex merge start`",
+              "required": true
+            }
+          ],
+          "options": [
+            {
+              "name": "--store",
+              "type": "string",
+              "description": "store root directory"
+            }
+          ],
+          "subcommands": [],
+          "idempotent": true
+        },
+        {
+          "name": "resolve",
+          "description": "submit batched per-conflict resolutions",
+          "arguments": [
+            {
+              "name": "merge_id",
+              "type": "string",
+              "description": "session id",
+              "required": true
+            }
+          ],
+          "options": [
+            {
+              "name": "--file",
+              "type": "string",
+              "description": "JSON array of {conflict_id, resolution}"
+            },
+            {
+              "name": "--store",
+              "type": "string",
+              "description": "store root directory"
+            }
+          ],
+          "subcommands": [],
+          "idempotent": false
+        },
+        {
+          "name": "commit",
+          "description": "finalize the merge and advance dst's head",
+          "arguments": [
+            {
+              "name": "merge_id",
+              "type": "string",
+              "description": "session id",
+              "required": true
+            }
+          ],
+          "options": [
+            {
+              "name": "--store",
+              "type": "string",
+              "description": "store root directory"
+            }
+          ],
+          "subcommands": [],
+          "idempotent": false
+        }
+      ],
+      "examples": [
+        {
+          "description": "Open a merge",
+          "invocation": "lex merge start --src feature --dst main"
+        },
+        {
+          "description": "See remaining work",
+          "invocation": "lex merge status merge_..."
+        },
+        {
+          "description": "Submit resolutions",
+          "invocation": "lex merge resolve merge_... --file resolutions.json"
+        },
+        {
+          "description": "Land the merge",
+          "invocation": "lex merge commit merge_..."
+        }
+      ],
+      "see_also": [
+        "store-merge",
+        "branch",
+        "log"
+      ]
+    },
+    {
+      "name": "log",
+      "description": "show the merge journal of a branch (top-level alias for `lex branch log`)",
+      "arguments": [
+        {
+          "name": "name",
+          "type": "string",
+          "description": "branch name (default: current)",
+          "required": false
+        }
+      ],
+      "options": [
+        {
+          "name": "--store",
+          "type": "string",
+          "description": "store root"
+        }
+      ],
+      "subcommands": [],
+      "idempotent": true,
+      "examples": [
+        {
+          "description": "Log of the current branch",
+          "invocation": "lex log"
+        },
+        {
+          "description": "Log of a named branch as JSON",
+          "invocation": "lex --output json log feature"
+        }
+      ],
+      "see_also": [
+        "branch",
+        "store-merge"
+      ]
+    },
+    {
+      "name": "repl",
+      "description": "interactive evaluator (Lex source line-by-line)",
+      "arguments": [],
+      "options": [],
+      "subcommands": [],
+      "idempotent": false,
+      "examples": [
+        {
+          "description": "Start a session",
+          "invocation": "lex repl"
+        },
+        {
+          "description": "Evaluate at the prompt",
+          "invocation": "lex> 1 + 2 * 3"
+        }
+      ],
+      "see_also": [
+        "check",
+        "run"
+      ]
+    },
+    {
+      "name": "watch",
+      "description": "re-run check or run on file save (agent inner loop)",
+      "arguments": [
+        {
+          "name": "file",
+          "type": "string",
+          "description": "file or directory to watch",
+          "required": true
+        },
+        {
+          "name": "action",
+          "type": "enum[check|run]",
+          "description": "what to re-run on change (default: check)",
+          "required": false
+        },
+        {
+          "name": "forwarded",
+          "type": "string[]",
+          "description": "forwarded to the underlying subcommand",
+          "required": false
+        }
+      ],
+      "options": [],
+      "subcommands": [],
+      "idempotent": false,
+      "examples": [
+        {
+          "description": "Watch + check",
+          "invocation": "lex watch app.lex"
+        },
+        {
+          "description": "Watch + run",
+          "invocation": "lex watch app.lex run main"
+        }
+      ],
+      "see_also": [
+        "check",
+        "run"
+      ]
+    },
+    {
+      "name": "agent-guidelines",
+      "description": "emit the AI-agent authoring contract (idiom rules) for this Lex toolchain",
+      "arguments": [],
+      "options": [
+        {
+          "name": "--version-only",
+          "type": "bool",
+          "description": "print only the toolchain version"
+        }
+      ],
+      "subcommands": [],
+      "idempotent": true,
+      "examples": [
+        {
+          "description": "Read the rules",
+          "invocation": "lex agent-guidelines"
+        },
+        {
+          "description": "Capture into a repo",
+          "invocation": "lex agent-guidelines > AGENTS.md"
+        },
+        {
+          "description": "Version of the doc",
+          "invocation": "lex agent-guidelines --version-only"
+        }
+      ],
+      "see_also": [
+        "skill",
+        "introspect",
+        "init"
       ]
     }
   ]

@@ -6,3 +6,6 @@ lex agent-tool --allow-effects fs_read --request "sum lines of /tmp/log"
 
 # Verify against spec
 lex agent-tool --spec sort.spec --body-file body.lex --json
+
+# Persist attestations
+lex agent-tool --examples cases.json --body-file body.lex --store ~/.lex/store
