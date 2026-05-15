@@ -19,8 +19,8 @@ indexmap.workspace = true
 sha2.workspace = true
 arrow-array = "55"
 arrow-schema = "55"
-lex-ast = { path = "../lex-ast", version = "0.9.3" }
-lex-types = { path = "../lex-types", version = "0.9.3" }
+lex-ast = { path = "../lex-ast", version = "0.9.4" }
+lex-types = { path = "../lex-types", version = "0.9.4" }
 
 [dev-dependencies]
-lex-syntax = { path = "../lex-syntax", version = "0.9.3" }
+lex-syntax = { path = "../lex-syntax", version = "0.9.4" }

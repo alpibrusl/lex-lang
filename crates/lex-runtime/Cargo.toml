@@ -54,11 +54,11 @@ arrow-arith = "55"
 arrow-cast = "55"
 arrow-csv = "55"
 polars = { version = "0.50", default-features = false, features = ["lazy", "is_in", "csv", "performant", "strings"] }
-lex-bytecode = { path = "../lex-bytecode", version = "0.9.3" }
+lex-bytecode = { path = "../lex-bytecode", version = "0.9.4" }
 smol_str = { workspace = true }
 
 [dev-dependencies]
-lex-syntax = { path = "../lex-syntax", version = "0.9.3" }
-lex-ast = { path = "../lex-ast", version = "0.9.3" }
-lex-types = { path = "../lex-types", version = "0.9.3" }
+lex-syntax = { path = "../lex-syntax", version = "0.9.4" }
+lex-ast = { path = "../lex-ast", version = "0.9.4" }
+lex-types = { path = "../lex-types", version = "0.9.4" }
 tempfile = "3"
