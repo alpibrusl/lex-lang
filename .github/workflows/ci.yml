@@ -10,6 +10,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      # The runtime now pulls Polars + arrow-rs for std.df / std.arrow,
+      # roughly doubling target/ size. ubuntu-latest ships with ~14 GB
+      # free; reclaim the preinstalled stacks we don't use (Android SDK,
+      # Haskell, .NET, big preinstalled tool caches) before compiling.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /usr/local/.ghcup /usr/local/share/powershell \
+                      /usr/local/share/chromium /usr/local/lib/node_modules \
+                      /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/PyPy \
+                      /opt/hostedtoolcache/Ruby || true
+          df -h /
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --all-targets
