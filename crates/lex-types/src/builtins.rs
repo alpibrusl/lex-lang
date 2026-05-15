@@ -777,6 +777,7 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             let table = Ty::Con("Table".into(), vec![]);
             let str_t = Ty::str();
             let int_t = Ty::int();
+            let float_t = Ty::float();
             let bool_t = Ty::bool();
             let res = |ok: Ty| Ty::Con("Result".into(), vec![ok, Ty::str()]);
             let no_eff = EffectSet::empty();
@@ -789,6 +790,37 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                     vec![table.clone(), str_t.clone(), int_t.clone()],
                     no_eff.clone(), res(table.clone())));
             }
+
+            // #433 — string filters.
+            // df.filter_eq_str  :: Table, Str, Str       -> Result[Table, Str]
+            // df.filter_in_str  :: Table, Str, List[Str] -> Result[Table, Str]
+            fields.insert("filter_eq_str".into(), Ty::function(
+                vec![table.clone(), str_t.clone(), str_t.clone()],
+                no_eff.clone(), res(table.clone())));
+            fields.insert("filter_in_str".into(), Ty::function(
+                vec![table.clone(), str_t.clone(), Ty::List(Box::new(str_t.clone()))],
+                no_eff.clone(), res(table.clone())));
+
+            // #433 — float filters.
+            // df.filter_{eq,lt,gt}_float :: Table, Str, Float -> Result[Table, Str]
+            for name in &["filter_eq_float", "filter_lt_float", "filter_gt_float"] {
+                fields.insert((*name).into(), Ty::function(
+                    vec![table.clone(), str_t.clone(), float_t.clone()],
+                    no_eff.clone(), res(table.clone())));
+            }
+
+            // #433 — null handling.
+            // df.filter_isnull  :: Table, Str       -> Result[Table, Str]
+            // df.filter_notnull :: Table, Str       -> Result[Table, Str]
+            // df.drop_nulls     :: Table, List[Str] -> Result[Table, Str]
+            for name in &["filter_isnull", "filter_notnull"] {
+                fields.insert((*name).into(), Ty::function(
+                    vec![table.clone(), str_t.clone()],
+                    no_eff.clone(), res(table.clone())));
+            }
+            fields.insert("drop_nulls".into(), Ty::function(
+                vec![table.clone(), Ty::List(Box::new(str_t.clone()))],
+                no_eff.clone(), res(table.clone())));
 
             // df.sort_by :: Table, Str, Bool -> Result[Table, Str]
             fields.insert("sort_by".into(), Ty::function(
