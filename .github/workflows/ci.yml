@@ -10,20 +10,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      # The runtime now pulls Polars + arrow-rs for std.df / std.arrow,
-      # roughly doubling target/ size. ubuntu-latest ships with ~14 GB
-      # free; reclaim the preinstalled stacks we don't use (Android SDK,
-      # Haskell, .NET, big preinstalled tool caches) before compiling.
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
-                      /usr/local/.ghcup /usr/local/share/powershell \
-                      /usr/local/share/chromium /usr/local/lib/node_modules \
-                      /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/PyPy \
-                      /opt/hostedtoolcache/Ruby || true
-          df -h /
+      # std.arrow + std.df pull in arrow-rs + Polars, which roughly
+      # doubles target/ to ~16 GB in debug. ubuntu-latest ships with
+      # ~14 GB free, so we reclaim ~25 GB by removing preinstalled
+      # stacks we don't use (.NET, Haskell, Android, Docker images).
+      - uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --workspace --all-targets
+      # `cargo build --workspace --all-targets` would duplicate work —
+      # `cargo test` already compiles every test target. Dropping the
+      # standalone build step halves the peak debug-target footprint.
       - run: cargo test --workspace --no-fail-fast
       - run: cargo clippy --workspace --all-targets -- -D warnings
