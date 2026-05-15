@@ -743,6 +743,54 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
 
             Some(Ty::Record(fields))
         }
+        "df" => {
+            // Polars-backed query ops over arrow.Table (#427). All pure
+            // (no effects); the Polars DataFrame is internal plumbing,
+            // never leaves the kernel.
+            let table = Ty::Con("Table".into(), vec![]);
+            let str_t = Ty::str();
+            let int_t = Ty::int();
+            let bool_t = Ty::bool();
+            let res = |ok: Ty| Ty::Con("Result".into(), vec![ok, Ty::str()]);
+            let no_eff = EffectSet::empty();
+
+            let mut fields = IndexMap::new();
+
+            // df.filter_{eq,gt,lt}_int :: Table, Str, Int -> Result[Table, Str]
+            for name in &["filter_eq_int", "filter_gt_int", "filter_lt_int"] {
+                fields.insert((*name).into(), Ty::function(
+                    vec![table.clone(), str_t.clone(), int_t.clone()],
+                    no_eff.clone(), res(table.clone())));
+            }
+
+            // df.sort_by :: Table, Str, Bool -> Result[Table, Str]
+            fields.insert("sort_by".into(), Ty::function(
+                vec![table.clone(), str_t.clone(), bool_t.clone()],
+                no_eff.clone(), res(table.clone())));
+
+            // df.group_by_agg :: Table, List[Str], List[(Str, Str, Str)]
+            //                    -> Result[Table, Str]
+            // Spec tuple is (out_col, in_col, op). op ∈
+            // "sum"|"mean"|"min"|"max"|"count"|"n_distinct".
+            fields.insert("group_by_agg".into(), Ty::function(
+                vec![
+                    table.clone(),
+                    Ty::List(Box::new(str_t.clone())),
+                    Ty::List(Box::new(Ty::Tuple(vec![
+                        str_t.clone(), str_t.clone(), str_t.clone(),
+                    ]))),
+                ],
+                no_eff.clone(), res(table.clone())));
+
+            // df.inner_join / left_join :: Table, Table, Str -> Result[Table, Str]
+            for name in &["inner_join", "left_join"] {
+                fields.insert((*name).into(), Ty::function(
+                    vec![table.clone(), table.clone(), str_t.clone()],
+                    no_eff.clone(), res(table.clone())));
+            }
+
+            Some(Ty::Record(fields))
+        }
         "proc" => {
             // Subprocess dispatch. Effect: [proc]. Returns a Result
             // with a record on success carrying stdout / stderr /
@@ -2331,6 +2379,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "stream" => "stream",
         "conc" => "conc",
         "arrow" => "arrow",
+        "df" => "df",
         _ => return None,
     })
 }

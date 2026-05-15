@@ -63,7 +63,7 @@ pub fn is_pure_module(kind: &str) -> bool {
         | "option" | "result" | "tuple" | "json" | "bytes" | "flow" | "math"
         | "map" | "set" | "crypto" | "regex" | "deque" | "datetime" | "duration" | "http"
         | "toml" | "yaml" | "dotenv" | "csv" | "test" | "random" | "parser"
-        | "cli" | "arrow")
+        | "cli" | "arrow" | "df")
 }
 
 fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
@@ -1599,6 +1599,11 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         ("arrow", op) => match crate::arrow::dispatch(op, args) {
             Some(r) => r,
             None => Err(format!("unknown pure builtin: arrow.{op}")),
+        },
+        // -- df -- Polars-backed query ops (#427)
+        ("df", op) => match crate::df::dispatch(op, args) {
+            Some(r) => r,
+            None => Err(format!("unknown pure builtin: df.{op}")),
         },
 
         _ => Err(format!("unknown pure builtin: {kind}.{op}")),

@@ -15,6 +15,7 @@
 
 pub mod arrow;
 pub mod builtins;
+pub mod df;
 pub mod cli;
 pub mod policy;
 pub mod handler;
