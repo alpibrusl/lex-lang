@@ -327,45 +327,13 @@ fn handle_connection_fn(
     registry: Arc<ChatRegistry>,
 ) -> Result<(), String> {
     use tungstenite::{accept_hdr, handshake::server::{Request, Response}};
-    use tungstenite::http::HeaderValue;
 
     let mut path = String::new();
     let path_ref = &mut path;
     let subproto_for_handshake = subprotocol.clone();
     let mut ws = accept_hdr(stream, |req: &Request, mut resp: Response| {
         *path_ref = req.uri().path().to_string();
-        // Echo the negotiated subprotocol back so strict clients
-        // (RFC 6455 §4.1, tungstenite ≥ 0.20) accept the handshake.
-        // Only echo when (a) the server has a non-empty subprotocol,
-        // (b) the client offered subprotocols, and (c) the server's
-        // configured value is among the client's offers. RFC 6455
-        // §4.1 mandates the server MUST select one of the client's
-        // offers — echoing a value the client did not offer would
-        // be spec-noncompliant and trip strict clients. The empty
-        // server-side configuration → no echo branch matches the
-        // dial_ws contract (empty subprotocol = no header).
-        if !subproto_for_handshake.is_empty() {
-            if let Some(offered) = req.headers().get("Sec-WebSocket-Protocol") {
-                if let Ok(offered_str) = offered.to_str() {
-                    let client_offers =
-                        offered_str.split(',').map(|p| p.trim());
-                    if client_offers
-                        .clone()
-                        .any(|p| p == subproto_for_handshake)
-                    {
-                        // from_str cannot fail here: serve_ws_fn
-                        // validated `subprotocol` upfront. Belt-and-
-                        // braces: silently skip if it somehow does.
-                        if let Ok(h) =
-                            HeaderValue::from_str(&subproto_for_handshake)
-                        {
-                            resp.headers_mut()
-                                .insert("Sec-WebSocket-Protocol", h);
-                        }
-                    }
-                }
-            }
-        }
+        maybe_echo_subprotocol(req, &mut resp, &subproto_for_handshake);
         Ok(resp)
     }).map_err(|e| format!("ws handshake: {e}"))?;
 
@@ -380,6 +348,241 @@ fn handle_connection_fn(
     registry.unregister(conn_id);
     let _ = ws.close(None);
     result
+}
+
+/// RFC 6455 §4.1: the server MUST advertise the negotiated
+/// subprotocol back in the handshake response, and MUST select one
+/// of the values the client offered. Echo when (a) the server has
+/// a non-empty subprotocol, (b) the client offered subprotocols,
+/// and (c) the server's configured value is among the client's
+/// offers. Empty server-side configuration → no echo (matches the
+/// dial_ws contract). Shared by `handle_connection_fn` (the
+/// always-accept variant) and `handle_connection_fn_auth` (the
+/// pre-handshake-auth variant).
+fn maybe_echo_subprotocol(
+    req: &tungstenite::handshake::server::Request,
+    resp: &mut tungstenite::handshake::server::Response,
+    subprotocol: &str,
+) {
+    use tungstenite::http::HeaderValue;
+    if subprotocol.is_empty() {
+        return;
+    }
+    let offered = match req.headers().get("Sec-WebSocket-Protocol") {
+        Some(v) => v,
+        None    => return,
+    };
+    let offered_str = match offered.to_str() {
+        Ok(s)  => s,
+        Err(_) => return,
+    };
+    let matches = offered_str
+        .split(',')
+        .map(|p| p.trim())
+        .any(|p| p == subprotocol);
+    if !matches {
+        return;
+    }
+    // from_str cannot fail here: serve_ws_fn[_auth] validated
+    // `subprotocol` upfront. Belt-and-braces: skip silently if it
+    // somehow does.
+    if let Ok(h) = HeaderValue::from_str(subprotocol) {
+        resp.headers_mut().insert("Sec-WebSocket-Protocol", h);
+    }
+}
+
+// ── serve_ws_fn_auth — pre-handshake auth callback (#423) ─────────────────────
+//
+// Variant of `serve_ws_fn` that runs a Lex closure against the
+// upgrade request's path + headers *before* accepting the WS
+// handshake. The closure returns `Result[Unit, Str]`:
+//
+//   Ok(())  → handshake proceeds, on_message handler runs as usual
+//   Err(msg) → respond `401 Unauthorized` with `msg` as the body;
+//              the WS upgrade never completes, on_message is never
+//              called for this connection
+//
+// This is the hook the OCPP Security Profile 2 (Basic Auth) and
+// Profile 3 (Bearer JWT) flows need — both check an `Authorization`
+// header that's present at the HTTP upgrade but not exposed to user
+// code by `serve_ws_fn`. The crypto primitives (`argon2id`,
+// `hs256`) live downstream in lex-crypto / lex-ocpp; this builtin
+// is just the missing transport hook that lets them fire at the
+// right time.
+//
+// Effect-polymorphic in the same row that `serve_ws_fn` is — the
+// auth callback and the on_message handler share `[Eff]`, so a
+// caller can use `[sql]` (look up the CP's password hash) in auth
+// and the same `[sql]` in subsequent message handling without
+// duplicating the row declaration.
+
+/// Closure-based WebSocket server with a pre-handshake auth
+/// callback. Calls `auth_closure(path, headers)` before completing
+/// the WS upgrade; rejects with 401 Unauthorized when the closure
+/// returns `Err(msg)`. See `serve_ws_fn` for the post-handshake
+/// behaviour (identical once auth passes).
+pub fn serve_ws_fn_auth(
+    port: u16,
+    subprotocol: String,
+    auth_closure: Value,
+    handler_closure: Value,
+    program: Arc<Program>,
+    policy: Policy,
+    registry: Arc<ChatRegistry>,
+) -> Result<Value, String> {
+    if !subprotocol.is_empty() {
+        if let Err(e) =
+            tungstenite::http::HeaderValue::from_str(&subprotocol)
+        {
+            return Err(format!(
+                "net.serve_ws_fn_auth: subprotocol {subprotocol:?} is not a \
+                 valid HTTP header value: {e}"
+            ));
+        }
+    }
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .map_err(|e| format!("net.serve_ws_fn_auth bind {port}: {e}"))?;
+    eprintln!("net.serve_ws_fn_auth: listening on ws://127.0.0.1:{port}");
+    for stream in listener.incoming() {
+        let stream = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("net.serve_ws_fn_auth accept: {e}");
+                continue;
+            }
+        };
+        let program = Arc::clone(&program);
+        let policy = policy.clone();
+        let auth_closure = auth_closure.clone();
+        let handler_closure = handler_closure.clone();
+        let subprotocol = subprotocol.clone();
+        let registry = Arc::clone(&registry);
+        thread::spawn(move || {
+            if let Err(e) = handle_connection_fn_auth(
+                stream, program, policy, auth_closure, handler_closure,
+                subprotocol, registry,
+            ) {
+                eprintln!("net.serve_ws_fn_auth connection error: {e}");
+            }
+        });
+    }
+    Ok(Value::Unit)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_connection_fn_auth(
+    stream: std::net::TcpStream,
+    program: Arc<Program>,
+    policy: Policy,
+    auth_closure: Value,
+    handler_closure: Value,
+    subprotocol: String,
+    registry: Arc<ChatRegistry>,
+) -> Result<(), String> {
+    use tungstenite::{accept_hdr, handshake::server::{Request, Response}};
+    use tungstenite::http::StatusCode;
+
+    let mut path = String::new();
+    let path_ref = &mut path;
+    let subproto_for_handshake = subprotocol.clone();
+    // `accept_hdr`'s callback is `FnOnce`, so the closures + program
+    // + policy + registry it needs are moved in directly (no clones
+    // inside the closure body).
+    let auth_program = Arc::clone(&program);
+    let auth_policy = policy.clone();
+    let auth_registry = Arc::clone(&registry);
+    let auth_closure_for_cb = auth_closure;
+
+    let mut ws = accept_hdr(stream, move |req: &Request, mut resp: Response| {
+        *path_ref = req.uri().path().to_string();
+
+        let headers_value = build_headers_value(req);
+        let path_arg = Value::Str(path_ref.clone().into());
+
+        let dh = crate::handler::DefaultHandler::new(auth_policy.clone())
+            .with_program(Arc::clone(&auth_program))
+            .with_chat_registry(Arc::clone(&auth_registry));
+        let mut vm = Vm::with_handler(&auth_program, Box::new(dh));
+        let auth_result = vm.invoke_closure_value(
+            auth_closure_for_cb,
+            vec![path_arg, headers_value],
+        );
+
+        match auth_result {
+            Ok(Value::Variant { name, .. }) if name == "Ok" => {
+                maybe_echo_subprotocol(req, &mut resp, &subproto_for_handshake);
+                Ok(resp)
+            }
+            Ok(Value::Variant { name, args }) if name == "Err" => {
+                let msg = match args.first() {
+                    Some(Value::Str(s)) => s.to_string(),
+                    _                   => "unauthorized".to_string(),
+                };
+                let err = build_unauthorized_response(StatusCode::UNAUTHORIZED, msg);
+                Err(err)
+            }
+            Ok(other) => {
+                let err = build_unauthorized_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "net.serve_ws_fn_auth: auth callback returned \
+                         non-Result value: {other:?}"
+                    ),
+                );
+                Err(err)
+            }
+            Err(e) => {
+                let err = build_unauthorized_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("net.serve_ws_fn_auth: auth callback error: {e:?}"),
+                );
+                Err(err)
+            }
+        }
+    }).map_err(|e| format!("ws handshake: {e}"))?;
+
+    let (tx, rx) = mpsc::channel::<String>();
+    let conn_id = registry.register(path.trim_start_matches('/').to_string(), tx);
+    let _ = ws.get_mut().set_read_timeout(Some(Duration::from_millis(50)));
+
+    let result = run_loop_fn(
+        &mut ws, &rx, conn_id, &path, &subprotocol,
+        &program, &policy, &handler_closure, &registry,
+    );
+    registry.unregister(conn_id);
+    let _ = ws.close(None);
+    result
+}
+
+/// Project the upgrade request headers into a Lex value of type
+/// `List[{ name :: Str, value :: Str }]`. Non-UTF-8 header values
+/// are skipped (the HTTP spec allows them, the Lex `Str` type
+/// doesn't — and OCPP Auth / JWT headers are ASCII by construction
+/// so a strict drop is safe here).
+fn build_headers_value(req: &tungstenite::handshake::server::Request) -> Value {
+    let mut items: std::collections::VecDeque<Value> = std::collections::VecDeque::new();
+    for (name, val) in req.headers().iter() {
+        let v = match val.to_str() {
+            Ok(s)  => s.to_string(),
+            Err(_) => continue,
+        };
+        let mut rec = IndexMap::new();
+        rec.insert("name".into(), Value::Str(name.as_str().into()));
+        rec.insert("value".into(), Value::Str(v.into()));
+        items.push_back(Value::Record(rec));
+    }
+    Value::List(items)
+}
+
+fn build_unauthorized_response(
+    status: tungstenite::http::StatusCode,
+    msg: String,
+) -> tungstenite::handshake::server::ErrorResponse {
+    tungstenite::http::Response::builder()
+        .status(status)
+        .header("Content-Type", "text/plain; charset=utf-8")
+        .body(Some(msg))
+        .expect("ErrorResponse builder")
 }
 
 #[allow(clippy::too_many_arguments)]
