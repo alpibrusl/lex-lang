@@ -59,9 +59,34 @@ impl State {
     /// Construct a per-tenant `State` by prefixing `store_root` with the
     /// tenant id. Single-tenant `lex serve` is unaffected — it calls
     /// `State::open` directly.
+    ///
+    /// `tenant_id` is restricted to `[A-Za-z0-9_-]{1,64}`: anything else
+    /// (path separators, `..`, NUL, absolute paths, dotfiles, empty
+    /// string) is rejected before touching the filesystem. Without this
+    /// `PathBuf::join("/etc")` would silently replace `store_root`, and
+    /// `PathBuf::join("../foo")` would escape the tenant root.
     pub fn new_with_tenant(tenant_id: &str, store_root: PathBuf) -> anyhow::Result<Self> {
+        validate_tenant_id(tenant_id)?;
         Self::open(store_root.join(tenant_id))
     }
+}
+
+fn validate_tenant_id(tenant_id: &str) -> anyhow::Result<()> {
+    if tenant_id.is_empty() {
+        anyhow::bail!("tenant_id must not be empty");
+    }
+    if tenant_id.len() > 64 {
+        anyhow::bail!("tenant_id must be at most 64 bytes");
+    }
+    if !tenant_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        anyhow::bail!(
+            "tenant_id {tenant_id:?} contains characters outside [A-Za-z0-9_-]"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1350,5 +1375,3 @@ pub(crate) fn attestations_since_handler(state: &State, query: &str)
 
     json_response(200, &serde_json::to_value(&filtered).unwrap_or_default())
 }
-
-
