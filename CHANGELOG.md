@@ -9,6 +9,52 @@ bumps may carry breaking changes when justified).
 
 ### Added
 
+- **#427: `std.df` — Polars-backed query ops over `arrow.Table`.** The
+  companion to `std.arrow`: where `std.arrow` covers construction +
+  per-column reductions, `std.df` covers `filter`, `sort`,
+  `group_by_agg`, `inner_join`, `left_join`. All take/return
+  `Value::ArrowTable` so callers compose freely with `std.arrow`; the
+  Polars `DataFrame` is internal plumbing.
+
+  Headline result — **lex now matches or beats pandas** on real
+  workloads, when data arrives columnar via `arrow.read_csv`:
+
+  | op (read CSV + op) | n | lex (std.arrow + std.df) | pandas 3.0 | ratio |
+  |---|---:|---:|---:|---:|
+  | `group_by_agg` | 100 k | 37 ms |  36 ms | within 3% |
+  | `sort_by`      | 100 k | 40 ms |  37 ms | within 8% |
+  | `filter_gt`    | 100 k | 34 ms |  31 ms | within 10% |
+  | `group_by_agg` |   1 M | 231 ms | 285 ms | **lex 1.2× faster** |
+  | `sort_by`      |   1 M | 285 ms | 331 ms | **lex 1.2× faster** |
+  | `filter_gt`    |   1 M | 239 ms | 276 ms | **lex 1.2× faster** |
+
+  Surface (slice 1):
+  - `df.filter_eq_int` / `filter_gt_int` / `filter_lt_int`
+    :: `Table, Str, Int -> Result[Table, Str]`
+  - `df.sort_by` :: `Table, Str, Bool -> Result[Table, Str]` (asc = true|false)
+  - `df.group_by_agg` :: `Table, List[Str], List[(Str, Str, Str)] -> Result[Table, Str]`
+    where each spec tuple is `(out_col, in_col, op)` and op ∈
+    `"sum"|"mean"|"min"|"max"|"count"|"n_distinct"`.
+  - `df.inner_join` / `df.left_join` :: `Table, Table, Str -> Result[Table, Str]`
+
+  Conversion across the arrow-rs ↔ polars-arrow fork boundary is a
+  column-by-column `memcpy` (typed buffer → `Vec<T>` → polars `Series`).
+  O(rows) copy cost each direction; at 1M rows ≈ 5 ms, dominated by the
+  actual query.
+
+  Tests: `crates/lex-runtime/tests/std_df.rs` (5 cases) — VM-level and
+  direct-dispatch round-trip.
+
+  Adds `polars` 0.50 to lex-runtime (features `lazy`, `is_in`, `csv`,
+  `performant`, `strings`). Binary size: +~12 MB. Compile time:
+  +~3 min initial, incremental builds unaffected.
+
+  Out of scope (separate slices): nullable types, list-of-list / struct
+  columns, lazy `Plan` values (no consumer needs them today), window
+  functions, pivot/melt, arrow.write_csv / write_parquet, and the
+  `lex-frame` migration to wrap these (lex-frame#6).
+
+
 - **#426 (slice 1): `std.arrow` — Apache Arrow tables as a first-class
   `Value`.** Lays the foundation for closing the lex-frame ↔ pandas
   performance gap (lex-frame#5, lex-frame#6). New
