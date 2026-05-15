@@ -581,6 +581,36 @@ mv lex-vX.Y.Z-x86_64-unknown-linux-gnu/lex /usr/local/bin/
 lex version
 ```
 
+**Container image** — `ghcr.io/alpibrusl/lex` is published on every
+release tag, multi-arch (`linux/amd64` + `linux/arm64` so it runs
+natively on Apple Silicon and Linux arm hosts under Docker / Podman /
+containerd):
+
+```bash
+# Run the agent VCS server (default; serves on :4040, stores at /data)
+docker run -p 4040:4040 -v lex-store:/data ghcr.io/alpibrusl/lex:v0.9.3
+
+# One-shot CLI invocation (subcommand args override the default CMD)
+docker run --rm ghcr.io/alpibrusl/lex:v0.9.3 --version
+docker run --rm -v "$(pwd):/work" -w /work \
+  ghcr.io/alpibrusl/lex:v0.9.3 check src/main.lex
+
+# Use as a base image for a downstream Lex project
+# (Dockerfile in your repo)
+FROM ghcr.io/alpibrusl/lex:v0.9.3
+COPY src /app/src
+WORKDIR /app
+CMD ["run", "src/main.lex", "main"]
+```
+
+The image is drop-in compatible with the local-build `Dockerfile`
+this repo ships — same base, same uid 1000 `lex` user, same `/data`
+volume, same `lex serve` default — so the Docker Compose stack at
+[`docs/deploy.md`](docs/deploy.md) can switch between
+`build: .` (fast iteration, cargo-chef cached) and
+`image: ghcr.io/alpibrusl/lex:v0.9.3` (fast deploy, ~30s pull vs
+~3 min build) without other changes.
+
 ## Building from source
 
 Requires a recent Rust toolchain (any 1.80+ stable should work).

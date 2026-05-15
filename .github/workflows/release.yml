@@ -121,3 +121,92 @@ jobs:
             dist/*.tar.gz
             dist/*.zip
             dist/*.sha256
+
+  docker:
+    # Multi-arch container image (linux/amd64 + linux/arm64) published
+    # to ghcr.io/alpibrusl/lex on every release tag. Repackages the
+    # pre-built linux-gnu binaries from the `build` job rather than
+    # recompiling — ~30s per arch instead of ~3 min × QEMU emulation.
+    # arm64 is essential for macOS arm hosts (otherwise containers
+    # run under QEMU translation, which is significantly slower).
+    name: docker (multi-arch publish)
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          # Strip the leading `v` so the image tag is `0.9.3` and not
+          # `v0.9.3` — matches the convention agent-skill libs and
+          # most downstream Dockerfiles use. We push both forms
+          # (with and without `v`) so consumers picking either get
+          # a hit.
+          echo "tag_no_v=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download linux-gnu binaries
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: lex-*-linux-gnu
+          merge-multiple: true
+
+      - name: Stage binaries per docker arch
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.tag }}"
+          mkdir -p docker-context/linux/amd64 docker-context/linux/arm64
+          tar -xzf "dist/lex-${TAG}-x86_64-unknown-linux-gnu.tar.gz" -C /tmp
+          cp "/tmp/lex-${TAG}-x86_64-unknown-linux-gnu/lex" \
+             docker-context/linux/amd64/lex
+          tar -xzf "dist/lex-${TAG}-aarch64-unknown-linux-gnu.tar.gz" -C /tmp
+          cp "/tmp/lex-${TAG}-aarch64-unknown-linux-gnu/lex" \
+             docker-context/linux/arm64/lex
+          cp Dockerfile.release docker-context/Dockerfile
+          ls -la docker-context/linux/amd64 docker-context/linux/arm64
+
+      - name: Set up QEMU
+        # QEMU lets the amd64 runner emulate arm64 *for the buildx
+        # invocation* — but we never actually run the arm64 binary
+        # here, only COPY it into the image, so emulation cost is
+        # negligible. Without QEMU, buildx refuses non-native arches.
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (multi-arch)
+        uses: docker/build-push-action@v6
+        with:
+          context: docker-context
+          file: docker-context/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/alpibrusl/lex:${{ steps.tag.outputs.tag }}
+            ghcr.io/alpibrusl/lex:${{ steps.tag.outputs.tag_no_v }}
+            ghcr.io/alpibrusl/lex:latest
+          # OCI labels surface in `docker inspect` and on the GHCR
+          # package page. Keep authoritative source / version /
+          # licence pointers attached to every tag.
+          labels: |
+            org.opencontainers.image.source=https://github.com/alpibrusl/lex-lang
+            org.opencontainers.image.version=${{ steps.tag.outputs.tag }}
+            org.opencontainers.image.licenses=EUPL-1.2
+            org.opencontainers.image.title=lex
+            org.opencontainers.image.description=Lex toolchain — typed-effect language with content-addressed AST and attestation graph
