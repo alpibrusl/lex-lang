@@ -7,6 +7,8 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.9.4] — 2026-05-15
+
 ### Added
 
 - **#427: `std.df` — Polars-backed query ops over `arrow.Table`.** The
@@ -118,6 +120,19 @@ bumps may carry breaking changes when justified).
   VM so it has full access to all effects (`sql`, `net`, `kv`, …). Requires
   the `[concurrent]` effect on any function that spawns or messages an actor.
   New import: `import "std.conc" as conc`.
+
+- **lex-api: `State::new_with_tenant` + `handle_with_auth` pre-routing hook.**
+  Two product-agnostic seams in support of multi-tenant hosts (lex-hub).
+  `State::new_with_tenant(tenant_id, store_root)` opens the store at
+  `<store_root>/<tenant_id>/`; tenant ids are restricted to
+  `[A-Za-z0-9_-]{1,64}`, so path-traversal payloads (`../foo`, absolute
+  `/etc`, embedded NUL, leading `.`) are rejected before they touch the
+  filesystem. `handle_with_auth(state, req, auth)` invokes a
+  `FnOnce(&str, &[Header]) -> bool` closure with the request path (query
+  string stripped) and headers before any routing; on `false` it returns
+  `401 {"error":"unauthorized"}` with `Content-Type: application/json`.
+  Single-tenant `lex serve` and the existing `handle` entry-point are
+  unaffected.
 
 ### Performance
 
