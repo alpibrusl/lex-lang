@@ -162,6 +162,58 @@ Types: `Request`, `Response`, `WsConn`, `WsMessage`, `WsAction` are global (no i
 ### `std.crypto`
 `hash`, `random` — `random` requires `[random]` effect.
 
+### `std.arrow`
+Apache Arrow `RecordBatch` as a first-class `Value::ArrowTable`. Column
+reductions and slicing run as one Rust call over the flat buffer, bypassing
+the bytecode VM for the inner loop (orders-of-magnitude faster than a
+`List[Value]` walk).
+
+Constructors (all return `Result[Table, Str]`; length-mismatch is `Err`, not panic):
+- `from_int_columns   :: List[(Str, List[Int])]   -> Result[Table, Str]`
+- `from_float_columns :: List[(Str, List[Float])] -> Result[Table, Str]`
+- `from_str_columns   :: List[(Str, List[Str])]   -> Result[Table, Str]`
+
+Introspection:
+- `nrows`, `ncols :: Table -> Int`
+- `col_names :: Table -> List[Str]`
+- `col_type  :: (Table, Str) -> Option[Str]` (`"int64" | "float64" | "utf8"`)
+
+Reductions:
+- `col_sum_int   :: (Table, Str) -> Result[Int, Str]`
+- `col_sum_float :: (Table, Str) -> Result[Float, Str]`
+- `col_mean      :: (Table, Str) -> Result[Option[Float], Str]` (`None` on empty)
+- `col_min_int`, `col_max_int :: (Table, Str) -> Result[Option[Int], Str]`
+- `col_count    :: (Table, Str) -> Result[Int, Str]` (non-null count)
+
+Slicing (all zero-copy via `RecordBatch::slice` / `project`):
+- `head`, `tail :: (Table, Int) -> Table`
+- `slice :: (Table, Int, Int) -> Table`
+- `select_cols :: (Table, List[Str]) -> Result[Table, Str]`
+- `drop_col   :: (Table, Str) -> Result[Table, Str]`
+
+I/O (effect-gated):
+- `read_csv :: Str -> [fs_read] Result[Table, Str]` — header row required;
+  schema inferred from the first 100 rows.
+
+### `std.df`
+Polars-backed query ops over `arrow.Table` (#427). All pure — the Polars
+`DataFrame` is internal plumbing, never escapes the kernel; results are
+returned as `Value::ArrowTable`.
+
+Filters:
+- `filter_eq_int`, `filter_gt_int`, `filter_lt_int :: (Table, Str, Int) -> Result[Table, Str]`
+
+Sort:
+- `sort_by :: (Table, Str, Bool) -> Result[Table, Str]` (`asc = true|false`)
+
+Group + aggregate (one call):
+- `group_by_agg :: (Table, List[Str], List[(Str, Str, Str)]) -> Result[Table, Str]`
+
+  Spec tuple is `(out_col, in_col, op)`; `op ∈ "sum"|"mean"|"min"|"max"|"count"|"n_distinct"`.
+
+Joins:
+- `inner_join`, `left_join :: (Table, Table, Str) -> Result[Table, Str]`
+
 ---
 
 ## `lex.toml` — package dependencies
