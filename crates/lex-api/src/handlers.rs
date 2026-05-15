@@ -55,6 +55,13 @@ impl State {
             sessions: Mutex::new(HashMap::new()),
         })
     }
+
+    /// Construct a per-tenant `State` by prefixing `store_root` with the
+    /// tenant id. Single-tenant `lex serve` is unaffected — it calls
+    /// `State::open` directly.
+    pub fn new_with_tenant(tenant_id: &str, store_root: PathBuf) -> anyhow::Result<Self> {
+        Self::open(store_root.join(tenant_id))
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -154,6 +161,26 @@ pub fn handle(state: Arc<State>, mut req: Request) -> std::io::Result<()> {
 
     let resp = route(&state, &method, &path, &query, &body, x_lex_user.as_deref());
     req.respond(resp)
+}
+
+/// Auth-gated entry point. Calls `auth(path, headers)` before routing;
+/// returns 401 JSON when it returns false. Keeps auth logic out of the
+/// product-agnostic core.
+pub fn handle_with_auth<F>(state: Arc<State>, req: Request, auth: F) -> std::io::Result<()>
+where
+    F: FnOnce(&str, &[Header]) -> bool,
+{
+    let path = req.url().split('?').next().unwrap_or("").to_string();
+    if !auth(&path, req.headers()) {
+        return req.respond(
+            Response::from_data(br#"{"error":"unauthorized"}"#.to_vec())
+                .with_status_code(401)
+                .with_header(
+                    Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap(),
+                ),
+        );
+    }
+    handle(state, req)
 }
 
 fn route(
@@ -1323,4 +1350,5 @@ pub(crate) fn attestations_since_handler(state: &State, query: &str)
 
     json_response(200, &serde_json::to_value(&filtered).unwrap_or_default())
 }
+
 
