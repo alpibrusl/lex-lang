@@ -804,6 +804,25 @@ impl EffectHandler for DefaultHandler {
                 _ => unreachable!(),
             };
         }
+        // `arrow.read_csv` declares `[fs_read]`, not `[arrow]` — its effect
+        // string in the type system is `fs_read`. Intercept before the
+        // generic `ensure_kind_allowed(kind)` below so the policy check
+        // looks at `fs_read` rather than `arrow`. Same pattern as
+        // `http.{send,get,post}` mapping to `[net]` above.
+        if kind == "arrow" && op == "read_csv" {
+            self.ensure_kind_allowed("fs_read")?;
+            let path = expect_str(args.first())?.to_string();
+            let resolved = self.resolve_read_path(&path);
+            if !self.policy.allow_fs_read.is_empty()
+                && !self.policy.allow_fs_read.iter().any(|a| resolved.starts_with(a))
+            {
+                return Err(format!("arrow.read_csv: `{path}` outside --allow-fs-read"));
+            }
+            return match crate::arrow::read_csv_at(&resolved) {
+                Ok(v)  => Ok(ok(v)),
+                Err(e) => Ok(err(Value::Str(e.into()))),
+            };
+        }
         self.ensure_kind_allowed(kind)?;
         match (kind, op) {
             ("io", "print") => {

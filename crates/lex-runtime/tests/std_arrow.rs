@@ -191,6 +191,91 @@ fn arrow_length_mismatch_is_err_not_panic() {
     assert_eq!(run(SRC_INT, "build_mismatch_is_err", vec![]), Value::Bool(true));
 }
 
+/// `arrow.read_csv` end-to-end: write a small CSV to a temp dir, grant
+/// `[fs_read]` scoped to that dir, read it back, run a reduction.
+#[test]
+fn arrow_read_csv_end_to_end() {
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.csv");
+    let mut f = std::fs::File::create(&path).unwrap();
+    writeln!(f, "x,y").unwrap();
+    for i in 1..=10 {
+        writeln!(f, "{i},{}", i * 10).unwrap();
+    }
+    drop(f);
+
+    let src = r#"
+import "std.arrow" as arrow
+fn sum_x(p :: Str) -> [fs_read] Int {
+  match arrow.read_csv(p) {
+    Err(_) => -1,
+    Ok(t) => match arrow.col_sum_int(t, "x") {
+      Ok(s) => s,
+      Err(_) => -2,
+    },
+  }
+}
+"#;
+    // Build a policy that grants fs_read scoped to the temp dir.
+    let mut policy = Policy::pure();
+    policy.allow_effects.insert("fs_read".into());
+    policy.allow_fs_read.push(dir.path().to_path_buf());
+
+    let prog = parse_source(src).expect("parse");
+    let stages = canonicalize_program(&prog);
+    if let Err(errs) = lex_types::check_program(&stages) {
+        panic!("type errors:\n{errs:#?}");
+    }
+    let bc = Arc::new(compile_program(&stages));
+    let handler = DefaultHandler::new(policy).with_program(Arc::clone(&bc));
+    let mut vm = Vm::with_handler(&bc, Box::new(handler));
+    let res = vm.call("sum_x", vec![
+        Value::Str(path.to_string_lossy().to_string().into()),
+    ]).unwrap();
+    assert_eq!(res, Value::Int(55));  // 1 + 2 + ... + 10
+}
+
+/// `arrow.read_csv` without an `--allow-fs-read` allowlist that covers
+/// the path must surface as Err, not panic and not read the file.
+#[test]
+fn arrow_read_csv_outside_allow_list_is_err() {
+    let src = r#"
+import "std.arrow" as arrow
+fn sum_x(p :: Str) -> [fs_read] Int {
+  match arrow.read_csv(p) {
+    Err(_) => -1,
+    Ok(t) => match arrow.col_sum_int(t, "x") {
+      Ok(s) => s,
+      Err(_) => -2,
+    },
+  }
+}
+"#;
+    // Grant fs_read effect but scope to /nonexistent, then attempt to
+    // read /etc/passwd — must refuse before opening the file.
+    let mut policy = Policy::pure();
+    policy.allow_effects.insert("fs_read".into());
+    policy.allow_fs_read.push("/nonexistent/path".into());
+
+    let prog = parse_source(src).expect("parse");
+    let stages = canonicalize_program(&prog);
+    let _ = lex_types::check_program(&stages);
+    let bc = Arc::new(compile_program(&stages));
+    let handler = DefaultHandler::new(policy).with_program(Arc::clone(&bc));
+    let mut vm = Vm::with_handler(&bc, Box::new(handler));
+    let err = vm.call("sum_x", vec![
+        Value::Str("/etc/passwd".into()),
+    ]);
+    // Effect-handler returns a host-level error; the VM surfaces that
+    // as VmError. We want the message to mention the scope refusal.
+    assert!(err.is_err(), "expected effect error, got {err:?}");
+    let msg = format!("{:?}", err.err().unwrap());
+    assert!(msg.contains("--allow-fs-read") || msg.contains("/etc/passwd"),
+        "expected scope refusal, got: {msg}");
+}
+
 #[test]
 fn arrow_kernels_match_native_arrow_directly() {
     // Build the table programmatically and run the kernel via dispatch

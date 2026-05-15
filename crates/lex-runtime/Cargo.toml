@@ -52,6 +52,7 @@ arrow-schema = "55"
 arrow-select = "55"
 arrow-arith = "55"
 arrow-cast = "55"
+arrow-csv = "55"
 lex-bytecode = { path = "../lex-bytecode", version = "0.9.3" }
 smol_str = { workspace = true }
 

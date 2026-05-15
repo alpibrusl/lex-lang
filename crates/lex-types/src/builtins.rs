@@ -687,6 +687,16 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 vec![table.clone(), str_t.clone()],
                 no_eff.clone(), res(table.clone())));
 
+            // -- I/O (effect-gated) --
+            // arrow.read_csv :: Str -> [fs_read] Result[Table, Str]
+            // Header row required; schema inferred from the first 100 rows.
+            // The `[fs_read]` effect surfaces in agent-tool policy gates
+            // and `--allow-fs-read` per-path scoping, same as `io.read`.
+            fields.insert("read_csv".into(), Ty::function(
+                vec![str_t.clone()],
+                EffectSet::singleton("fs_read"),
+                res(table.clone())));
+
             Some(Ty::Record(fields))
         }
         "proc" => {
