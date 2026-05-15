@@ -313,11 +313,25 @@ fn handle_connection_fn(
     registry: Arc<ChatRegistry>,
 ) -> Result<(), String> {
     use tungstenite::{accept_hdr, handshake::server::{Request, Response}};
+    use tungstenite::http::HeaderValue;
 
     let mut path = String::new();
     let path_ref = &mut path;
-    let mut ws = accept_hdr(stream, |req: &Request, resp: Response| {
+    let subproto_for_handshake = subprotocol.clone();
+    let mut ws = accept_hdr(stream, |req: &Request, mut resp: Response| {
         *path_ref = req.uri().path().to_string();
+        // Echo the negotiated subprotocol back so strict clients
+        // (RFC 6455 §4.1, tungstenite ≥ 0.20) accept the handshake.
+        // Only echo when the server has a non-empty subprotocol *and*
+        // the client requested one — matches the dial_ws contract
+        // (empty subprotocol → no header on either side).
+        if !subproto_for_handshake.is_empty()
+            && req.headers().get("Sec-WebSocket-Protocol").is_some()
+        {
+            if let Ok(h) = HeaderValue::from_str(&subproto_for_handshake) {
+                resp.headers_mut().insert("Sec-WebSocket-Protocol", h);
+            }
+        }
         Ok(resp)
     }).map_err(|e| format!("ws handshake: {e}"))?;
 
