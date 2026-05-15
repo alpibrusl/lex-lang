@@ -61,7 +61,7 @@ pub fn is_pure_module(kind: &str) -> bool {
         | "option" | "result" | "tuple" | "json" | "bytes" | "flow" | "math"
         | "map" | "set" | "crypto" | "regex" | "deque" | "datetime" | "duration" | "http"
         | "toml" | "yaml" | "dotenv" | "csv" | "test" | "random" | "parser"
-        | "cli")
+        | "cli" | "arrow")
 }
 
 fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
@@ -1592,6 +1592,12 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let spec = value_to_json(args.first().unwrap_or(&Value::Unit));
             Ok(Value::Str(crate::cli::help_text(&spec).into()))
         }
+
+        // -- arrow -- delegated to a dedicated module (#426)
+        ("arrow", op) => match crate::arrow::dispatch(op, args) {
+            Some(r) => r,
+            None => Err(format!("unknown pure builtin: arrow.{op}")),
+        },
 
         _ => Err(format!("unknown pure builtin: {kind}.{op}")),
     }

@@ -47,6 +47,11 @@ serde_yaml = "0.9"
 csv = "1"
 rusqlite = { version = "0.39", features = ["bundled"] }
 postgres = "0.19"
+arrow-array = "55"
+arrow-schema = "55"
+arrow-select = "55"
+arrow-arith = "55"
+arrow-cast = "55"
 lex-bytecode = { path = "../lex-bytecode", version = "0.9.3" }
 smol_str = { workspace = true }
 

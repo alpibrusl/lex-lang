@@ -1,6 +1,7 @@
 //! Runtime values.
 
 use crate::program::BodyHash;
+use arrow_array::RecordBatch;
 use indexmap::IndexMap;
 use smol_str::SmolStr;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -71,6 +72,19 @@ pub enum Value {
     /// Two actor handles compare equal iff they point to the same cell
     /// (identity equality, not structural equality).
     Actor(Arc<Mutex<ActorCell>>),
+    /// Apache Arrow `RecordBatch` — an unboxed columnar table. The
+    /// "fast lane" representation for `lex-frame` and any future
+    /// dataframe code: a `Value::ArrowTable` with one int64 column
+    /// of N rows is N×8 bytes of contiguous memory, not N
+    /// `Value::Int(_)` enum tags inside a `VecDeque`. Reductions
+    /// (`arrow.col_sum_int`, `arrow.col_mean`, …) execute as one
+    /// Rust call over the flat buffer, bypassing the bytecode VM
+    /// for the inner loop.
+    ///
+    /// `Arc` makes clone cheap (refcount bump) — Arrow tables are
+    /// already immutable so structural sharing across closures is
+    /// safe. Equality is structural over schema + columns.
+    ArrowTable(Arc<RecordBatch>),
 }
 
 /// Manual `PartialEq` for `Value` (#222). Mirrors the auto-derived
@@ -105,6 +119,9 @@ impl PartialEq for Value {
             (Deque(a), Deque(b)) => a == b,
             // Actor identity: same if both handles point to the same cell.
             (Actor(a), Actor(b)) => Arc::ptr_eq(a, b),
+            // Arrow table equality: structural over schema + columns.
+            // RecordBatch implements PartialEq directly.
+            (ArrowTable(a), ArrowTable(b)) => a == b,
             _ => false,
         }
     }
@@ -243,6 +260,24 @@ impl Value {
                 s.iter().map(|k| k.as_value().to_json()).collect()),
             Value::Deque(items) => J::Array(items.iter().map(Value::to_json).collect()),
             Value::Actor(_) => J::String("<actor>".into()),
+            Value::ArrowTable(t) => {
+                // Compact summary: schema + nrows. Full data is intentionally
+                // not emitted — Arrow tables can be GB-scale and a JSON dump
+                // would defeat the point. Callers that need the rows go
+                // through `arrow.row_at` / `arrow.col_to_*_list`.
+                let mut m = serde_json::Map::new();
+                m.insert("$arrow_table".into(), J::Bool(true));
+                m.insert("nrows".into(), J::from(t.num_rows() as i64));
+                m.insert("ncols".into(), J::from(t.num_columns() as i64));
+                let cols: Vec<J> = t.schema().fields().iter().map(|f| {
+                    let mut o = serde_json::Map::new();
+                    o.insert("name".into(), J::String(f.name().clone()));
+                    o.insert("type".into(), J::String(format!("{}", f.data_type())));
+                    J::Object(o)
+                }).collect();
+                m.insert("schema".into(), J::Array(cols));
+                J::Object(m)
+            }
         }
     }
 
