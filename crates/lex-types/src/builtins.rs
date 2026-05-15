@@ -486,6 +486,50 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::open_var(0).union(&EffectSet::singleton("net")),
                 Ty::Unit,
             ));
+            // serve_ws_fn_auth[Eff] :: (Int, Str,
+            //   (Str, List[{name :: Str, value :: Str}]) -> [Eff] Result[Unit, Str],
+            //   (WsConn, WsMessage) -> [Eff] WsAction)
+            //   -> [net, Eff] Unit
+            // Variant of serve_ws_fn that runs a pre-handshake auth
+            // callback against the upgrade request's path + headers.
+            // `Err(msg)` from the callback responds 401 Unauthorized
+            // and skips the WS upgrade entirely (#423). The auth and
+            // message-handler closures share the same effect row, so
+            // a caller using e.g. `[sql]` to look up a password hash
+            // in auth can use `[sql]` in subsequent handlers without
+            // duplicating the declaration.
+            let header_entry = || {
+                let mut fs = IndexMap::new();
+                fs.insert("name".into(),  Ty::str());
+                fs.insert("value".into(), Ty::str());
+                Ty::Record(fs)
+            };
+            fields.insert("serve_ws_fn_auth".into(), Ty::function(
+                vec![
+                    Ty::int(),
+                    Ty::str(), // subprotocol
+                    // auth callback: (path, headers) -> [Eff] Result[Unit, Str]
+                    Ty::function(
+                        vec![
+                            Ty::str(),
+                            Ty::List(Box::new(header_entry())),
+                        ],
+                        EffectSet::open_var(0),
+                        Ty::Con("Result".into(), vec![Ty::Unit, Ty::str()]),
+                    ),
+                    // on_message: same shape as serve_ws_fn
+                    Ty::function(
+                        vec![
+                            Ty::Con("WsConn".into(), vec![]),
+                            Ty::Con("WsMessage".into(), vec![]),
+                        ],
+                        EffectSet::open_var(0),
+                        Ty::Con("WsAction".into(), vec![]),
+                    ),
+                ],
+                EffectSet::open_var(0).union(&EffectSet::singleton("net")),
+                Ty::Unit,
+            ));
             // dial_ws[Eff] :: (Str, Str, () -> [Eff] WsAction,
             //                  (WsMessage) -> [Eff] WsAction)
             //                  -> [net, Eff] Result[Unit, Str]

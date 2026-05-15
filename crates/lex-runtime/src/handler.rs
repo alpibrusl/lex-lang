@@ -1017,6 +1017,31 @@ impl EffectHandler for DefaultHandler {
                 let registry = Arc::new(crate::ws::ChatRegistry::default());
                 crate::ws::serve_ws_fn(port, subprotocol, closure, program, policy, registry)
             }
+            ("net", "serve_ws_fn_auth") => {
+                // serve_ws_fn_auth(port, subprotocol, auth, on_message)
+                let port = match args.first() {
+                    Some(Value::Int(n)) if (0..=65535).contains(n) => *n as u16,
+                    _ => return Err("net.serve_ws_fn_auth(port, subprotocol, auth, on_message): port must be Int 0..=65535".into()),
+                };
+                let subprotocol = expect_str(args.get(1))?.to_string();
+                let mut it = args.into_iter().skip(2);
+                let auth_closure = match it.next() {
+                    Some(c @ Value::Closure { .. }) => c,
+                    _ => return Err("net.serve_ws_fn_auth(port, subprotocol, auth, on_message): auth must be a closure".into()),
+                };
+                let handler_closure = match it.next() {
+                    Some(c @ Value::Closure { .. }) => c,
+                    _ => return Err("net.serve_ws_fn_auth(port, subprotocol, auth, on_message): on_message must be a closure".into()),
+                };
+                let program = self.program.clone()
+                    .ok_or_else(|| "net.serve_ws_fn_auth requires a Program reference; use DefaultHandler::with_program".to_string())?;
+                let policy = self.policy.clone();
+                let registry = Arc::new(crate::ws::ChatRegistry::default());
+                crate::ws::serve_ws_fn_auth(
+                    port, subprotocol, auth_closure, handler_closure,
+                    program, policy, registry,
+                )
+            }
             ("net", "dial_ws") => {
                 // dial_ws(url, subprotocol, on_open, on_message)
                 let url = expect_str(args.first())?.to_string();
