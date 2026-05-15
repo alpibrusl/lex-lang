@@ -160,12 +160,40 @@ docker compose up -d
 
 ## Updating to a new lex-lang version
 
+Two paths, depending on whether you build from source locally or
+pull the published image.
+
+**From source (default for the bundled compose stack):**
 ```bash
 cd lex-lang
 git fetch && git checkout v0.2.1   # or whatever the new tag is
 docker compose build --pull
 docker compose up -d
 ```
+
+**Published image** — every release tag publishes a multi-arch
+container to `ghcr.io/alpibrusl/lex` (`linux/amd64` + `linux/arm64`,
+so it runs natively on Apple Silicon and Linux arm hosts). Pin the
+service to that image instead of `build:` to skip the local
+compile step:
+
+```yaml
+# docker-compose.yml — under the `lex` service
+services:
+  lex:
+    image: ghcr.io/alpibrusl/lex:v0.2.1   # was: build: .
+    # everything else (volumes, env, restart) stays as is
+```
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+The published image uses the same runtime environment as the local
+build (distroless base, `lex` on PATH); only the build path
+differs. Pull is ~30 seconds vs ~3 minutes for a local
+`docker compose build`.
 
 The store format is stable across patch releases by design.
 Minor releases (0.X → 0.(X+1)) may add new attestation kinds or

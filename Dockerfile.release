@@ -1,0 +1,73 @@
+# syntax=docker/dockerfile:1.7
+#
+# Release-pipeline Docker image. Repackages the pre-built binaries
+# produced by `.github/workflows/release.yml` into a multi-arch
+# container published to `ghcr.io/alpibrusl/lex` on every `v*` tag.
+#
+# Drop-in compatible with the local-build Dockerfile in this repo
+# (same base, same user, same volume, same default CMD) so a deploy
+# can switch between `build: .` and `image: ghcr.io/alpibrusl/lex:vX.Y.Z`
+# without other changes to the compose stack.
+#
+# This file is invoked by `docker buildx build --platform
+# linux/amd64,linux/arm64`. The release workflow stages both
+# `linux-gnu` binaries from the GitHub Release into a per-arch
+# subdirectory of the build context (`linux/amd64/lex`,
+# `linux/arm64/lex`), and `${TARGETPLATFORM}` selects the right
+# one at COPY time.
+#
+# For local development build-from-source, see the sibling
+# `Dockerfile` (cargo-chef cached, ~3 min on amd64). This release
+# variant builds in ~30s per platform because no compilation runs.
+#
+# Usage:
+#   # Run the agent VCS server (default behaviour):
+#   docker run -p 4040:4040 -v lex-store:/data \
+#     ghcr.io/alpibrusl/lex:v0.9.3
+#
+#   # One-shot CLI invocation:
+#   docker run --rm -v "$(pwd):/work" -w /work \
+#     ghcr.io/alpibrusl/lex:v0.9.3 check src/main.lex
+#
+#   # Use as a base image for a downstream Lex project:
+#   FROM ghcr.io/alpibrusl/lex:v0.9.3
+#   COPY src /app/src
+#   WORKDIR /app
+#   CMD ["run", "src/main.lex", "main"]
+
+FROM debian:bookworm-slim
+
+# tiny_http connects out for nothing — the server is purely
+# inbound — so we only need TLS roots for outbound `[net]` /
+# `[mcp]` calls a Lex program might make. Add ca-certificates +
+# tini for clean signal handling on `docker stop`. Mirrors the
+# build-from-source Dockerfile's runtime stage exactly so the
+# images are interchangeable.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates tini \
+ && rm -rf /var/lib/apt/lists/*
+
+# Non-root user owns /data so a host volume mount with the
+# default permissions doesn't lock the server out. uid 1000 matches
+# the local Dockerfile so /data on a shared volume keeps the same
+# ownership across `image:` ↔ `build:` switches.
+RUN groupadd --system --gid 1000 lex \
+ && useradd --system --uid 1000 --gid 1000 --home /data --shell /usr/sbin/nologin lex \
+ && mkdir -p /data \
+ && chown lex:lex /data
+
+# `docker buildx` sets TARGETPLATFORM to the platform being built
+# (linux/amd64 | linux/arm64). The release workflow stages a binary
+# at `<context>/${TARGETPLATFORM}/lex` for each.
+ARG TARGETPLATFORM
+COPY --chown=lex:lex --chmod=0755 ${TARGETPLATFORM}/lex /usr/local/bin/lex
+
+USER lex
+WORKDIR /data
+EXPOSE 4040
+VOLUME ["/data"]
+
+# `tini` reaps zombies (matters for `agent.call_mcp` which spawns
+# subprocesses) and forwards SIGTERM cleanly.
+ENTRYPOINT ["/usr/bin/tini", "--", "lex"]
+CMD ["serve", "--port", "4040", "--store", "/data"]
