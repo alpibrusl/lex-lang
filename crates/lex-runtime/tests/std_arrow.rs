@@ -221,7 +221,7 @@ fn arrow_kernels_match_native_arrow_directly() {
     assert!(msg.contains("nope"), "expected error to mention column name, got {msg}");
 
     // col_names.
-    let r = lex_runtime::arrow::dispatch("col_names", &[table.clone()]).unwrap().unwrap();
+    let r = lex_runtime::arrow::dispatch("col_names", std::slice::from_ref(&table)).unwrap().unwrap();
     let names: VecDeque<Value> = match r {
         Value::List(v) => v,
         other => panic!("expected List, got {other:?}"),

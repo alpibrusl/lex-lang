@@ -57,9 +57,9 @@ fn expect_list(v: Option<&Value>) -> Result<&VecDeque<Value>, String> {
 
 /// Decode `List[(Str, List[T])]` shape used by all `from_*_columns`
 /// constructors. Returns `Vec<(name, values_list)>`.
-fn decode_columns_list<'a>(
-    list: &'a VecDeque<Value>,
-) -> Result<Vec<(&'a str, &'a VecDeque<Value>)>, String> {
+fn decode_columns_list(
+    list: &VecDeque<Value>,
+) -> Result<Vec<(&str, &VecDeque<Value>)>, String> {
     let mut out = Vec::with_capacity(list.len());
     for (i, item) in list.iter().enumerate() {
         let pair = match item {
@@ -130,7 +130,7 @@ fn from_int_columns(args: &[Value]) -> Result<Value, String> {
         arrays.push(Arc::new(Int64Array::from(buf)) as ArrayRef);
     }
     let cols: Vec<(&str, ArrayRef)> = owned_names.iter().map(|n| n.as_str())
-        .zip(arrays.into_iter()).collect();
+        .zip(arrays).collect();
     pack_table(cols)
 }
 
@@ -154,7 +154,7 @@ fn from_float_columns(args: &[Value]) -> Result<Value, String> {
         arrays.push(Arc::new(Float64Array::from(buf)) as ArrayRef);
     }
     let cols: Vec<(&str, ArrayRef)> = owned_names.iter().map(|n| n.as_str())
-        .zip(arrays.into_iter()).collect();
+        .zip(arrays).collect();
     pack_table(cols)
 }
 
@@ -177,7 +177,7 @@ fn from_str_columns(args: &[Value]) -> Result<Value, String> {
         arrays.push(Arc::new(StringArray::from(buf)) as ArrayRef);
     }
     let cols: Vec<(&str, ArrayRef)> = owned_names.iter().map(|n| n.as_str())
-        .zip(arrays.into_iter()).collect();
+        .zip(arrays).collect();
     pack_table(cols)
 }
 
