@@ -280,6 +280,20 @@ pub fn serve_ws_fn(
     policy: Policy,
     registry: Arc<ChatRegistry>,
 ) -> Result<Value, String> {
+    // Fail fast: a configured subprotocol that can't be a valid HTTP
+    // header value would silently break every handshake later (the
+    // accept_hdr callback's `HeaderValue::from_str` would always
+    // return Err). Reject at startup with a clear message instead.
+    if !subprotocol.is_empty() {
+        if let Err(e) =
+            tungstenite::http::HeaderValue::from_str(&subprotocol)
+        {
+            return Err(format!(
+                "net.serve_ws_fn: subprotocol {subprotocol:?} is not a valid \
+                 HTTP header value: {e}"
+            ));
+        }
+    }
     let listener = TcpListener::bind(("127.0.0.1", port))
         .map_err(|e| format!("net.serve_ws_fn bind {port}: {e}"))?;
     eprintln!("net.serve_ws_fn: listening on ws://127.0.0.1:{port}");
@@ -313,11 +327,45 @@ fn handle_connection_fn(
     registry: Arc<ChatRegistry>,
 ) -> Result<(), String> {
     use tungstenite::{accept_hdr, handshake::server::{Request, Response}};
+    use tungstenite::http::HeaderValue;
 
     let mut path = String::new();
     let path_ref = &mut path;
-    let mut ws = accept_hdr(stream, |req: &Request, resp: Response| {
+    let subproto_for_handshake = subprotocol.clone();
+    let mut ws = accept_hdr(stream, |req: &Request, mut resp: Response| {
         *path_ref = req.uri().path().to_string();
+        // Echo the negotiated subprotocol back so strict clients
+        // (RFC 6455 §4.1, tungstenite ≥ 0.20) accept the handshake.
+        // Only echo when (a) the server has a non-empty subprotocol,
+        // (b) the client offered subprotocols, and (c) the server's
+        // configured value is among the client's offers. RFC 6455
+        // §4.1 mandates the server MUST select one of the client's
+        // offers — echoing a value the client did not offer would
+        // be spec-noncompliant and trip strict clients. The empty
+        // server-side configuration → no echo branch matches the
+        // dial_ws contract (empty subprotocol = no header).
+        if !subproto_for_handshake.is_empty() {
+            if let Some(offered) = req.headers().get("Sec-WebSocket-Protocol") {
+                if let Ok(offered_str) = offered.to_str() {
+                    let client_offers =
+                        offered_str.split(',').map(|p| p.trim());
+                    if client_offers
+                        .clone()
+                        .any(|p| p == subproto_for_handshake)
+                    {
+                        // from_str cannot fail here: serve_ws_fn
+                        // validated `subprotocol` upfront. Belt-and-
+                        // braces: silently skip if it somehow does.
+                        if let Ok(h) =
+                            HeaderValue::from_str(&subproto_for_handshake)
+                        {
+                            resp.headers_mut()
+                                .insert("Sec-WebSocket-Protocol", h);
+                        }
+                    }
+                }
+            }
+        }
         Ok(resp)
     }).map_err(|e| format!("ws handshake: {e}"))?;
 
