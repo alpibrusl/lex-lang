@@ -11,10 +11,14 @@
 //! dependency is `Value::ArrowTable(Arc<RecordBatch>)`. Everything else
 //! is plain Lex values.
 
-use arrow_array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch, RecordBatchReader, StringArray};
 use arrow_csv::ReaderBuilder;
 use arrow_schema::{DataType, Field, Schema};
 use lex_bytecode::Value;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_writer::ArrowWriter;
+use parquet::arrow::ProjectionMask;
+use parquet::file::properties::WriterProperties;
 use std::collections::VecDeque;
 use std::fs::File;
 use std::path::Path;
@@ -426,6 +430,111 @@ pub fn read_csv_at(path: &Path) -> Result<Value, String> {
             .map_err(|e| format!("arrow.read_csv: concat: {e}"))?
     };
     Ok(Value::ArrowTable(Arc::new(combined)))
+}
+
+// ---------- I/O: read_parquet / write_parquet / write_csv ----------
+
+/// Read a Parquet file into an Arrow `RecordBatch`. Schema comes from
+/// the file metadata; all row groups are concatenated into one Table.
+///
+/// Caller is responsible for `[fs_read]` policy enforcement — the
+/// effect-handler dispatch in `handler.rs` verifies the path is in
+/// `--allow-fs-read` before invoking us.
+pub fn read_parquet_at(path: &Path) -> Result<Value, String> {
+    let file = File::open(path)
+        .map_err(|e| format!("arrow.read_parquet: open `{}`: {e}", path.display()))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| format!("arrow.read_parquet: open `{}`: {e}", path.display()))?;
+    let schema = builder.schema().clone();
+    let reader = builder
+        .build()
+        .map_err(|e| format!("arrow.read_parquet: reader build: {e}"))?;
+    let mut batches: Vec<RecordBatch> = Vec::new();
+    for batch in reader {
+        batches.push(batch.map_err(|e| format!("arrow.read_parquet: row-group decode: {e}"))?);
+    }
+    let combined = if batches.is_empty() {
+        RecordBatch::new_empty(schema)
+    } else {
+        arrow_select::concat::concat_batches(&schema, &batches)
+            .map_err(|e| format!("arrow.read_parquet: concat: {e}"))?
+    };
+    Ok(Value::ArrowTable(Arc::new(combined)))
+}
+
+/// `arrow.read_parquet_cols(path, cols)` — projection-pushdown variant.
+/// Only the requested columns are decoded from the file; missing column
+/// names surface as `Err`, not silently dropped.
+pub fn read_parquet_cols_at(path: &Path, cols: &[String]) -> Result<Value, String> {
+    let file = File::open(path)
+        .map_err(|e| format!("arrow.read_parquet_cols: open `{}`: {e}", path.display()))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| format!("arrow.read_parquet_cols: open `{}`: {e}", path.display()))?;
+    // Resolve column names to root indices for ProjectionMask. The
+    // file schema's `root_schema().get_fields()` walks the top-level
+    // columns in declaration order. Scope the borrow before building
+    // the reader (`with_projection` takes ownership of the builder).
+    let mask = {
+        let parquet_schema = builder.parquet_schema();
+        let root_fields = parquet_schema.root_schema().get_fields();
+        let mut indices = Vec::with_capacity(cols.len());
+        for name in cols {
+            let idx = root_fields
+                .iter()
+                .position(|f| f.name() == name.as_str())
+                .ok_or_else(|| format!("arrow.read_parquet_cols: column `{name}` not in file"))?;
+            indices.push(idx);
+        }
+        ProjectionMask::roots(parquet_schema, indices)
+    };
+    let reader = builder
+        .with_projection(mask)
+        .build()
+        .map_err(|e| format!("arrow.read_parquet_cols: reader build: {e}"))?;
+    let projected_schema = reader.schema();
+    let mut batches: Vec<RecordBatch> = Vec::new();
+    for batch in reader {
+        batches
+            .push(batch.map_err(|e| format!("arrow.read_parquet_cols: row-group decode: {e}"))?);
+    }
+    let combined = if batches.is_empty() {
+        RecordBatch::new_empty(projected_schema)
+    } else {
+        arrow_select::concat::concat_batches(&projected_schema, &batches)
+            .map_err(|e| format!("arrow.read_parquet_cols: concat: {e}"))?
+    };
+    Ok(Value::ArrowTable(Arc::new(combined)))
+}
+
+/// Write an Arrow `RecordBatch` to a Parquet file. Default writer
+/// properties (Snappy compression, default page/row-group sizes).
+pub fn write_parquet_at(rb: &RecordBatch, path: &Path) -> Result<Value, String> {
+    let file = File::create(path)
+        .map_err(|e| format!("arrow.write_parquet: create `{}`: {e}", path.display()))?;
+    let props = WriterProperties::builder().build();
+    let mut writer = ArrowWriter::try_new(file, rb.schema(), Some(props))
+        .map_err(|e| format!("arrow.write_parquet: writer init: {e}"))?;
+    writer
+        .write(rb)
+        .map_err(|e| format!("arrow.write_parquet: write: {e}"))?;
+    writer
+        .close()
+        .map_err(|e| format!("arrow.write_parquet: close: {e}"))?;
+    Ok(Value::Unit)
+}
+
+/// Write an Arrow `RecordBatch` to a CSV file (header row + rows).
+/// Bool → "true"/"false"; null → empty cell (arrow-csv default).
+pub fn write_csv_at(rb: &RecordBatch, path: &Path) -> Result<Value, String> {
+    let file = File::create(path)
+        .map_err(|e| format!("arrow.write_csv: create `{}`: {e}", path.display()))?;
+    let mut writer = arrow_csv::WriterBuilder::new()
+        .with_header(true)
+        .build(file);
+    writer
+        .write(rb)
+        .map_err(|e| format!("arrow.write_csv: write: {e}"))?;
+    Ok(Value::Unit)
 }
 
 // ---------- value-conversion helpers (mirror builtins.rs) ----------

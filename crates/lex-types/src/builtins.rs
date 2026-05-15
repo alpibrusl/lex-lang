@@ -741,6 +741,33 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::singleton("fs_read"),
                 res(table.clone())));
 
+            // arrow.read_parquet :: Str -> [fs_read] Result[Table, Str]
+            // arrow.read_parquet_cols :: (Str, List[Str]) -> [fs_read] Result[Table, Str]
+            // Same effect + path-scope rules as read_csv. _cols pushes
+            // the projection into the Parquet reader (no decode of skipped
+            // columns); missing column names surface as Err.
+            fields.insert("read_parquet".into(), Ty::function(
+                vec![str_t.clone()],
+                EffectSet::singleton("fs_read"),
+                res(table.clone())));
+            fields.insert("read_parquet_cols".into(), Ty::function(
+                vec![str_t.clone(), Ty::List(Box::new(str_t.clone()))],
+                EffectSet::singleton("fs_read"),
+                res(table.clone())));
+
+            // arrow.write_parquet :: (Table, Str) -> [fs_write] Result[Unit, Str]
+            // arrow.write_csv     :: (Table, Str) -> [fs_write] Result[Unit, Str]
+            // Path scope uses --allow-fs-write (symmetric with io.write).
+            // Parquet default: Snappy compression, default page/row-group
+            // sizes — sufficient for v1; a write_parquet_opts variant
+            // can ride a later issue if knobs are needed.
+            for name in &["write_parquet", "write_csv"] {
+                fields.insert((*name).into(), Ty::function(
+                    vec![table.clone(), str_t.clone()],
+                    EffectSet::singleton("fs_write"),
+                    res(Ty::Unit)));
+            }
+
             Some(Ty::Record(fields))
         }
         "df" => {

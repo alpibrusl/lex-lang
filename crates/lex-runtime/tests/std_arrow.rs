@@ -313,3 +313,221 @@ fn arrow_kernels_match_native_arrow_directly() {
     };
     assert_eq!(names, VecDeque::from(vec![Value::Str("x".into())]));
 }
+
+// ===== #432 — Parquet + CSV-write I/O =====
+//
+// These tests go through the Rust API directly (`read_parquet_at`,
+// `write_parquet_at`, `write_csv_at`) so we can exercise the kernel
+// without standing up the VM + policy machinery. The end-to-end
+// effect-handler path is covered by `parquet_round_trip_via_vm`.
+
+/// Build a small RecordBatch for the I/O tests: x = [1,2,3], y = [10.0, 20.0, 30.0], g = ["a","b","c"].
+fn small_batch() -> Arc<arrow_array::RecordBatch> {
+    use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("x", DataType::Int64, false),
+        Field::new("y", DataType::Float64, false),
+        Field::new("g", DataType::Utf8, false),
+    ]));
+    let rb = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2, 3])),
+            Arc::new(Float64Array::from(vec![10.0_f64, 20.0, 30.0])),
+            Arc::new(StringArray::from(vec!["a", "b", "c"])),
+        ],
+    )
+    .unwrap();
+    Arc::new(rb)
+}
+
+#[test]
+fn parquet_write_read_round_trip() {
+    let rb = small_batch();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.parquet");
+
+    lex_runtime::arrow::write_parquet_at(&rb, &path).expect("write parquet");
+    assert!(path.exists());
+
+    let v = lex_runtime::arrow::read_parquet_at(&path).expect("read parquet");
+    let rb2 = match v {
+        Value::ArrowTable(t) => t,
+        other => panic!("expected ArrowTable, got {other:?}"),
+    };
+    assert_eq!(rb2.num_rows(), 3);
+    assert_eq!(rb2.num_columns(), 3);
+    assert_eq!(
+        rb2.schema().fields().iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
+        vec!["x", "y", "g"],
+    );
+
+    // Values round-trip.
+    let r = lex_runtime::arrow::dispatch(
+        "col_sum_int", &[Value::ArrowTable(rb2.clone()), Value::Str("x".into())])
+        .unwrap().unwrap();
+    assert_eq!(unwrap_ok(r), Value::Int(6));
+    let r = lex_runtime::arrow::dispatch(
+        "col_sum_float", &[Value::ArrowTable(rb2), Value::Str("y".into())])
+        .unwrap().unwrap();
+    assert_eq!(unwrap_ok(r), Value::Float(60.0));
+}
+
+#[test]
+fn parquet_read_cols_pushes_down_projection() {
+    let rb = small_batch();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.parquet");
+    lex_runtime::arrow::write_parquet_at(&rb, &path).unwrap();
+
+    // Pull only "x" and "g" — "y" must not be in the result.
+    let v = lex_runtime::arrow::read_parquet_cols_at(
+        &path, &["x".to_string(), "g".to_string()]).expect("read");
+    let rb2 = match v {
+        Value::ArrowTable(t) => t,
+        other => panic!("expected ArrowTable, got {other:?}"),
+    };
+    assert_eq!(rb2.num_rows(), 3);
+    let schema = rb2.schema();
+    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert_eq!(names, vec!["x", "g"], "projection pushdown must drop `y`");
+}
+
+#[test]
+fn parquet_read_cols_missing_column_is_err() {
+    let rb = small_batch();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.parquet");
+    lex_runtime::arrow::write_parquet_at(&rb, &path).unwrap();
+
+    let r = lex_runtime::arrow::read_parquet_cols_at(&path, &["nope".to_string()]);
+    assert!(r.is_err(), "expected Err for missing column, got {r:?}");
+    let msg = r.err().unwrap();
+    assert!(msg.contains("nope"), "error should name the missing column: {msg}");
+}
+
+#[test]
+fn write_csv_round_trips_through_read_csv() {
+    let rb = small_batch();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.csv");
+
+    lex_runtime::arrow::write_csv_at(&rb, &path).expect("write csv");
+    assert!(path.exists());
+
+    let v = lex_runtime::arrow::read_csv_at(&path).expect("read csv");
+    let rb2 = match v {
+        Value::ArrowTable(t) => t,
+        other => panic!("expected ArrowTable, got {other:?}"),
+    };
+    assert_eq!(rb2.num_rows(), 3);
+    let r = lex_runtime::arrow::dispatch(
+        "col_sum_int", &[Value::ArrowTable(rb2), Value::Str("x".into())])
+        .unwrap().unwrap();
+    assert_eq!(unwrap_ok(r), Value::Int(6));
+}
+
+/// End-to-end: `arrow.write_parquet` + `arrow.read_parquet` through the
+/// VM with `[fs_read]` + `[fs_write]` scoped to a tempdir. Mirrors the
+/// `arrow_read_csv_end_to_end` test, plus the write side.
+#[test]
+fn parquet_round_trip_via_vm() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.parquet");
+
+    // Build a tiny table via `arrow.from_int_columns`, write it,
+    // read it back, sum the column. End-to-end through the VM.
+    let src = r#"
+import "std.list"  as list
+import "std.arrow" as arrow
+
+fn build_and_write(p :: Str) -> [fs_write] Int {
+  let xs := list.cons(1, list.cons(2, list.cons(3, list.cons(4, list.cons(5, [])))))
+  match arrow.from_int_columns(list.cons(("x", xs), [])) {
+    Err(_) => -1,
+    Ok(t)  => match arrow.write_parquet(t, p) {
+      Ok(_)  => 0,
+      Err(_) => -2,
+    },
+  }
+}
+
+fn sum_x(p :: Str) -> [fs_read] Int {
+  match arrow.read_parquet(p) {
+    Err(_) => -1,
+    Ok(t) => match arrow.col_sum_int(t, "x") {
+      Ok(s)  => s,
+      Err(_) => -2,
+    },
+  }
+}
+"#;
+    let mut policy = Policy::pure();
+    policy.allow_effects.insert("fs_read".into());
+    policy.allow_effects.insert("fs_write".into());
+    policy.allow_fs_read.push(dir.path().to_path_buf());
+    policy.allow_fs_write.push(dir.path().to_path_buf());
+
+    let prog = parse_source(src).expect("parse");
+    let stages = canonicalize_program(&prog);
+    if let Err(errs) = lex_types::check_program(&stages) {
+        panic!("type errors:\n{errs:#?}");
+    }
+    let bc = Arc::new(compile_program(&stages));
+    let handler = DefaultHandler::new(policy).with_program(Arc::clone(&bc));
+    let mut vm = Vm::with_handler(&bc, Box::new(handler));
+
+    let wrote = vm.call(
+        "build_and_write",
+        vec![Value::Str(path.to_string_lossy().to_string().into())],
+    ).unwrap();
+    assert_eq!(wrote, Value::Int(0), "write side should return 0");
+    assert!(path.exists(), "parquet file should exist after write");
+
+    let read = vm.call(
+        "sum_x",
+        vec![Value::Str(path.to_string_lossy().to_string().into())],
+    ).unwrap();
+    assert_eq!(read, Value::Int(15), "1+2+3+4+5 = 15");
+}
+
+/// `arrow.write_parquet` outside the `--allow-fs-write` scope must
+/// surface as Err (not panic, not write the file).
+#[test]
+fn parquet_write_outside_allow_list_is_err() {
+    let src = r#"
+import "std.list"  as list
+import "std.arrow" as arrow
+fn go(p :: Str) -> [fs_write] Int {
+  let xs := list.cons(1, list.cons(2, []))
+  match arrow.from_int_columns(list.cons(("x", xs), [])) {
+    Err(_) => -1,
+    Ok(t)  => match arrow.write_parquet(t, p) {
+      Ok(_)  => 0,
+      Err(_) => -2,
+    },
+  }
+}
+"#;
+    let mut policy = Policy::pure();
+    policy.allow_effects.insert("fs_write".into());
+    policy.allow_fs_write.push("/nonexistent/path".into());
+
+    let prog = parse_source(src).expect("parse");
+    let stages = canonicalize_program(&prog);
+    let _ = lex_types::check_program(&stages);
+    let bc = Arc::new(compile_program(&stages));
+    let handler = DefaultHandler::new(policy).with_program(Arc::clone(&bc));
+    let mut vm = Vm::with_handler(&bc, Box::new(handler));
+
+    // Trying to write to /tmp/refused.parquet must come back as Err(-2),
+    // not as a panic or a successful write outside the allowlist.
+    let r = vm.call(
+        "go",
+        vec![Value::Str("/tmp/refused.parquet".into())],
+    ).unwrap();
+    assert_eq!(r, Value::Int(-2), "write should be refused by policy");
+    assert!(!std::path::Path::new("/tmp/refused.parquet").exists(),
+        "refused write must not have created the file");
+}

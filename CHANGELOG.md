@@ -7,6 +7,25 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added
+
+- **#432: `std.arrow` Parquet + CSV-write I/O.** Three new effect-gated
+  builtins close the I/O matrix that `arrow.read_csv` opened:
+
+  - `arrow.read_parquet :: Str -> [fs_read] Result[Table, Str]`
+  - `arrow.read_parquet_cols :: (Str, List[Str]) -> [fs_read] Result[Table, Str]`
+  - `arrow.write_parquet :: (Table, Str) -> [fs_write] Result[Unit, Str]`
+  - `arrow.write_csv     :: (Table, Str) -> [fs_write] Result[Unit, Str]`
+
+  Path scope uses `--allow-fs-read` / `--allow-fs-write` (same gates
+  as `io.read` / `io.write`). `read_parquet_cols` pushes the projection
+  into the Parquet reader so unrequested columns are never decoded;
+  missing column names surface as `Err`, not silently dropped. Writes
+  default to Snappy compression / default page+row-group sizes; a
+  `write_parquet_opts` variant can ride a follow-up if knobs are
+  needed. Unblocks the H2O.ai db-benchmark workflow and any agent
+  reading commodity Parquet data.
+
 ## [0.9.4] — 2026-05-15
 
 ### Added
