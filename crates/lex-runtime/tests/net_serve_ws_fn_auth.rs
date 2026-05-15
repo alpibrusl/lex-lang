@@ -54,7 +54,9 @@ fn spawn(src: &str) {
         let mut vm = Vm::with_handler(&bc, Box::new(handler));
         let _ = vm.call("main", vec![]);
     });
-    thread::sleep(Duration::from_millis(300));
+    // Match ws_chat.rs's known-good wait — 300ms is fine locally but
+    // CI runners under load occasionally race the bind.
+    thread::sleep(Duration::from_millis(500));
 }
 
 #[test]
