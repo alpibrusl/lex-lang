@@ -1587,6 +1587,12 @@ fn serve_http(
 /// Hyper 1.x + Tokio multi-thread HTTP/1.1 server for `net.serve`.
 /// Each connection is accepted in an async task; the synchronous Lex VM
 /// call runs inside `spawn_blocking` so it doesn't block the executor.
+///
+/// `LEX_NET_INLINE_VM=1` (or `=true`) skips the `spawn_blocking` hop and
+/// runs the VM directly on the tokio worker. Faster for handlers that
+/// return in tens of microseconds; pathological if handlers do real
+/// CPU/blocking work, since they stall the worker. Experimental — see
+/// lex-lang issue #431.
 fn serve_http_plain(
     port: u16,
     handler_name: String,
@@ -1599,6 +1605,7 @@ fn serve_http_plain(
     use hyper_util::rt::TokioIo;
     use tokio::net::TcpListener as TokioTcpListener;
 
+    let inline_vm = env_inline_vm();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -1607,7 +1614,10 @@ fn serve_http_plain(
         let listener = TokioTcpListener::bind(("0.0.0.0", port))
             .await
             .map_err(|e| format!("net.serve bind {port}: {e}"))?;
-        eprintln!("net.serve: listening on http://0.0.0.0:{port}");
+        eprintln!(
+            "net.serve: listening on http://0.0.0.0:{port}{}",
+            if inline_vm { " (inline-vm)" } else { "" }
+        );
         loop {
             let (stream, _) = listener
                 .accept()
@@ -1632,14 +1642,25 @@ fn serve_http_plain(
                             .await
                             .map(|c| c.to_bytes())
                             .unwrap_or_default();
-                        let result = tokio::task::spawn_blocking(move || {
+                        let result = if inline_vm {
+                            // Inline path — run the VM on this tokio worker.
+                            // Cheap when handlers return in microseconds; will
+                            // stall the worker on heavy handlers (caveat per #431).
                             let lex_req = build_request_value_parts(&parts, &body_bytes);
                             let handler = DefaultHandler::new(policy)
                                 .with_program(Arc::clone(&program));
                             let mut vm = Vm::with_handler(&program, Box::new(handler));
-                            vm.call(&handler_name, vec![lex_req])
-                        })
-                        .await;
+                            Ok(vm.call(&handler_name, vec![lex_req]))
+                        } else {
+                            tokio::task::spawn_blocking(move || {
+                                let lex_req = build_request_value_parts(&parts, &body_bytes);
+                                let handler = DefaultHandler::new(policy)
+                                    .with_program(Arc::clone(&program));
+                                let mut vm = Vm::with_handler(&program, Box::new(handler));
+                                vm.call(&handler_name, vec![lex_req])
+                            })
+                            .await
+                        };
                         Ok::<_, std::convert::Infallible>(match result {
                             Ok(Ok(resp)) => build_hyper_response(&resp),
                             Ok(Err(e)) => error_response(500, &format!("internal error: {e}")),
@@ -1702,6 +1723,9 @@ fn handle_request_tls(
 }
 
 /// Hyper 1.x + Tokio multi-thread HTTP/1.1 server for `net.serve_fn`.
+///
+/// `LEX_NET_INLINE_VM=1` skips `spawn_blocking` — see `serve_http_plain`'s
+/// doc-comment for the tradeoffs. Same env var gates both paths.
 fn serve_http_fn(
     port: u16,
     closure: Value,
@@ -1714,6 +1738,7 @@ fn serve_http_fn(
     use hyper_util::rt::TokioIo;
     use tokio::net::TcpListener as TokioTcpListener;
 
+    let inline_vm = env_inline_vm();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -1722,7 +1747,10 @@ fn serve_http_fn(
         let listener = TokioTcpListener::bind(("0.0.0.0", port))
             .await
             .map_err(|e| format!("net.serve_fn bind {port}: {e}"))?;
-        eprintln!("net.serve_fn: listening on http://0.0.0.0:{port}");
+        eprintln!(
+            "net.serve_fn: listening on http://0.0.0.0:{port}{}",
+            if inline_vm { " (inline-vm)" } else { "" }
+        );
         loop {
             let (stream, _) = listener
                 .accept()
@@ -1747,14 +1775,22 @@ fn serve_http_fn(
                             .await
                             .map(|c| c.to_bytes())
                             .unwrap_or_default();
-                        let result = tokio::task::spawn_blocking(move || {
+                        let result = if inline_vm {
                             let lex_req = build_request_value_parts(&parts, &body_bytes);
                             let handler = DefaultHandler::new(policy)
                                 .with_program(Arc::clone(&program));
                             let mut vm = Vm::with_handler(&program, Box::new(handler));
-                            vm.invoke_closure_value(closure, vec![lex_req])
-                        })
-                        .await;
+                            Ok(vm.invoke_closure_value(closure, vec![lex_req]))
+                        } else {
+                            tokio::task::spawn_blocking(move || {
+                                let lex_req = build_request_value_parts(&parts, &body_bytes);
+                                let handler = DefaultHandler::new(policy)
+                                    .with_program(Arc::clone(&program));
+                                let mut vm = Vm::with_handler(&program, Box::new(handler));
+                                vm.invoke_closure_value(closure, vec![lex_req])
+                            })
+                            .await
+                        };
                         Ok::<_, std::convert::Infallible>(match result {
                             Ok(Ok(resp)) => build_hyper_response(&resp),
                             Ok(Err(e)) => error_response(500, &format!("internal error: {e}")),
@@ -1768,6 +1804,20 @@ fn serve_http_fn(
             });
         }
     })
+}
+
+/// Read `LEX_NET_INLINE_VM` and report whether the runtime should skip
+/// `spawn_blocking` on the per-request VM call. Accepts `1` / `true`
+/// (case-insensitive); anything else (including unset) keeps the
+/// default `spawn_blocking` behaviour. See issue #431.
+fn env_inline_vm() -> bool {
+    match std::env::var("LEX_NET_INLINE_VM") {
+        Ok(v) => {
+            let s = v.trim().to_ascii_lowercase();
+            s == "1" || s == "true"
+        }
+        Err(_) => false,
+    }
 }
 
 /// Build a Lex request record from hyper request parts and pre-collected body bytes.
