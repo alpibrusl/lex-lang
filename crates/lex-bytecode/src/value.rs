@@ -269,12 +269,17 @@ impl Value {
                 m.insert("$arrow_table".into(), J::Bool(true));
                 m.insert("nrows".into(), J::from(t.num_rows() as i64));
                 m.insert("ncols".into(), J::from(t.num_columns() as i64));
-                let cols: Vec<J> = t.schema().fields().iter().map(|f| {
-                    let mut o = serde_json::Map::new();
-                    o.insert("name".into(), J::String(f.name().clone()));
-                    o.insert("type".into(), J::String(format!("{}", f.data_type())));
-                    J::Object(o)
-                }).collect();
+                let cols: Vec<J> = t
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| {
+                        let mut o = serde_json::Map::new();
+                        o.insert("name".into(), J::String(f.name().clone()));
+                        o.insert("type".into(), J::String(format!("{}", f.data_type())));
+                        J::Object(o)
+                    })
+                    .collect();
                 m.insert("schema".into(), J::Array(cols));
                 J::Object(m)
             }

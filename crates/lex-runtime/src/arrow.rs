@@ -11,9 +11,7 @@
 //! dependency is `Value::ArrowTable(Arc<RecordBatch>)`. Everything else
 //! is plain Lex values.
 
-use arrow_array::{
-    Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray,
-};
+use arrow_array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_csv::ReaderBuilder;
 use arrow_schema::{DataType, Field, Schema};
 use lex_bytecode::Value;
@@ -24,7 +22,9 @@ use std::sync::Arc;
 
 // ---------- helpers ----------
 
-fn err<T>(s: impl Into<String>) -> Result<T, String> { Err(s.into()) }
+fn err<T>(s: impl Into<String>) -> Result<T, String> {
+    Err(s.into())
+}
 
 fn expect_table(v: Option<&Value>) -> Result<&Arc<RecordBatch>, String> {
     match v {
@@ -60,34 +60,39 @@ fn expect_list(v: Option<&Value>) -> Result<&VecDeque<Value>, String> {
 
 /// Decode `List[(Str, List[T])]` shape used by all `from_*_columns`
 /// constructors. Returns `Vec<(name, values_list)>`.
-fn decode_columns_list(
-    list: &VecDeque<Value>,
-) -> Result<Vec<(&str, &VecDeque<Value>)>, String> {
+fn decode_columns_list(list: &VecDeque<Value>) -> Result<Vec<(&str, &VecDeque<Value>)>, String> {
     let mut out = Vec::with_capacity(list.len());
     for (i, item) in list.iter().enumerate() {
         let pair = match item {
             Value::Tuple(t) if t.len() == 2 => t,
-            other => return err(format!(
-                "from_*_columns: column #{i} must be a (Str, List) tuple, got {other:?}")),
+            other => {
+                return err(format!(
+                    "from_*_columns: column #{i} must be a (Str, List) tuple, got {other:?}"
+                ))
+            }
         };
         let name = match &pair[0] {
             Value::Str(s) => s.as_str(),
-            other => return err(format!(
-                "from_*_columns: column #{i} name must be Str, got {other:?}")),
+            other => {
+                return err(format!(
+                    "from_*_columns: column #{i} name must be Str, got {other:?}"
+                ))
+            }
         };
         let values = match &pair[1] {
             Value::List(items) => items,
-            other => return err(format!(
-                "from_*_columns: column #{i} (`{name}`) values must be List, got {other:?}")),
+            other => {
+                return err(format!(
+                    "from_*_columns: column #{i} (`{name}`) values must be List, got {other:?}"
+                ))
+            }
         };
         out.push((name, values));
     }
     Ok(out)
 }
 
-fn build_schema_and_check_lengths(
-    cols: &[(&str, ArrayRef)],
-) -> Result<Schema, String> {
+fn build_schema_and_check_lengths(cols: &[(&str, ArrayRef)]) -> Result<Schema, String> {
     if cols.is_empty() {
         return Ok(Schema::empty());
     }
@@ -97,7 +102,8 @@ fn build_schema_and_check_lengths(
         if arr.len() != nrows {
             return err(format!(
                 "from_*_columns: column `{name}` has {} rows, expected {nrows}",
-                arr.len()));
+                arr.len()
+            ));
         }
         fields.push(Field::new(*name, arr.data_type().clone(), false));
     }
@@ -126,14 +132,16 @@ fn from_int_columns(args: &[Value]) -> Result<Value, String> {
         for v in values.iter() {
             match v {
                 Value::Int(n) => buf.push(*n),
-                other => return err(format!(
-                    "from_int_columns: column `{name}` non-Int element: {other:?}")),
+                other => {
+                    return err(format!(
+                        "from_int_columns: column `{name}` non-Int element: {other:?}"
+                    ))
+                }
             }
         }
         arrays.push(Arc::new(Int64Array::from(buf)) as ArrayRef);
     }
-    let cols: Vec<(&str, ArrayRef)> = owned_names.iter().map(|n| n.as_str())
-        .zip(arrays).collect();
+    let cols: Vec<(&str, ArrayRef)> = owned_names.iter().map(|n| n.as_str()).zip(arrays).collect();
     pack_table(cols)
 }
 
@@ -150,14 +158,16 @@ fn from_float_columns(args: &[Value]) -> Result<Value, String> {
             match v {
                 Value::Float(f) => buf.push(*f),
                 Value::Int(n) => buf.push(*n as f64),
-                other => return err(format!(
-                    "from_float_columns: column `{name}` non-Float element: {other:?}")),
+                other => {
+                    return err(format!(
+                        "from_float_columns: column `{name}` non-Float element: {other:?}"
+                    ))
+                }
             }
         }
         arrays.push(Arc::new(Float64Array::from(buf)) as ArrayRef);
     }
-    let cols: Vec<(&str, ArrayRef)> = owned_names.iter().map(|n| n.as_str())
-        .zip(arrays).collect();
+    let cols: Vec<(&str, ArrayRef)> = owned_names.iter().map(|n| n.as_str()).zip(arrays).collect();
     pack_table(cols)
 }
 
@@ -173,14 +183,16 @@ fn from_str_columns(args: &[Value]) -> Result<Value, String> {
         for v in values.iter() {
             match v {
                 Value::Str(s) => buf.push(s.to_string()),
-                other => return err(format!(
-                    "from_str_columns: column `{name}` non-Str element: {other:?}")),
+                other => {
+                    return err(format!(
+                        "from_str_columns: column `{name}` non-Str element: {other:?}"
+                    ))
+                }
             }
         }
         arrays.push(Arc::new(StringArray::from(buf)) as ArrayRef);
     }
-    let cols: Vec<(&str, ArrayRef)> = owned_names.iter().map(|n| n.as_str())
-        .zip(arrays).collect();
+    let cols: Vec<(&str, ArrayRef)> = owned_names.iter().map(|n| n.as_str()).zip(arrays).collect();
     pack_table(cols)
 }
 
@@ -196,7 +208,10 @@ fn ncols(args: &[Value]) -> Result<Value, String> {
 
 fn col_names(args: &[Value]) -> Result<Value, String> {
     let t = expect_table(args.first())?;
-    let names: VecDeque<Value> = t.schema().fields().iter()
+    let names: VecDeque<Value> = t
+        .schema()
+        .fields()
+        .iter()
         .map(|f| Value::Str(f.name().as_str().into()))
         .collect();
     Ok(Value::List(names))
@@ -214,23 +229,23 @@ fn col_type(args: &[Value]) -> Result<Value, String> {
 // ---------- column reductions ----------
 
 fn lookup_array<'a>(t: &'a RecordBatch, name: &str) -> Result<&'a ArrayRef, String> {
-    let (idx, _) = t.schema().column_with_name(name)
+    let (idx, _) = t
+        .schema()
+        .column_with_name(name)
         .ok_or_else(|| format!("arrow: column `{name}` not found"))?;
     Ok(t.column(idx))
 }
 
 fn as_int64<'a>(arr: &'a ArrayRef, name: &str) -> Result<&'a Int64Array, String> {
-    arr.as_any().downcast_ref::<Int64Array>()
-        .ok_or_else(|| format!(
-            "arrow: column `{name}` is {}, not Int64",
-            arr.data_type()))
+    arr.as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| format!("arrow: column `{name}` is {}, not Int64", arr.data_type()))
 }
 
 fn as_float64<'a>(arr: &'a ArrayRef, name: &str) -> Result<&'a Float64Array, String> {
-    arr.as_any().downcast_ref::<Float64Array>()
-        .ok_or_else(|| format!(
-            "arrow: column `{name}` is {}, not Float64",
-            arr.data_type()))
+    arr.as_any()
+        .downcast_ref::<Float64Array>()
+        .ok_or_else(|| format!("arrow: column `{name}` is {}, not Float64", arr.data_type()))
 }
 
 fn col_sum_int(args: &[Value]) -> Result<Value, String> {
@@ -248,8 +263,11 @@ fn col_sum_float(args: &[Value]) -> Result<Value, String> {
     let s = match arr.data_type() {
         DataType::Float64 => arrow_arith::aggregate::sum(as_float64(arr, name)?).unwrap_or(0.0),
         DataType::Int64 => arrow_arith::aggregate::sum(as_int64(arr, name)?).unwrap_or(0) as f64,
-        other => return err(format!(
-            "col_sum_float: column `{name}` is {other:?}, expected Int64 or Float64")),
+        other => {
+            return err(format!(
+                "col_sum_float: column `{name}` is {other:?}, expected Int64 or Float64"
+            ))
+        }
     };
     Ok(Value::Float(s))
 }
@@ -259,12 +277,17 @@ fn col_mean(args: &[Value]) -> Result<Value, String> {
     let name = expect_str(args.get(1))?;
     let arr = lookup_array(t, name)?;
     let n = arr.len() as f64 - arr.null_count() as f64;
-    if n == 0.0 { return Ok(none()); }
+    if n == 0.0 {
+        return Ok(none());
+    }
     let total: f64 = match arr.data_type() {
         DataType::Float64 => arrow_arith::aggregate::sum(as_float64(arr, name)?).unwrap_or(0.0),
         DataType::Int64 => arrow_arith::aggregate::sum(as_int64(arr, name)?).unwrap_or(0) as f64,
-        other => return err(format!(
-            "col_mean: column `{name}` is {other:?}, expected Int64 or Float64")),
+        other => {
+            return err(format!(
+                "col_mean: column `{name}` is {other:?}, expected Int64 or Float64"
+            ))
+        }
     };
     Ok(some(Value::Float(total / n)))
 }
@@ -316,7 +339,7 @@ fn tail(args: &[Value]) -> Result<Value, String> {
 fn slice(args: &[Value]) -> Result<Value, String> {
     let t = expect_table(args.first())?;
     let start = expect_int(args.get(1))?.max(0) as usize;
-    let stop  = expect_int(args.get(2))?.max(0) as usize;
+    let stop = expect_int(args.get(2))?.max(0) as usize;
     let total = t.num_rows();
     let s = start.min(total);
     let e = stop.min(total).max(s);
@@ -330,14 +353,20 @@ fn select_cols(args: &[Value]) -> Result<Value, String> {
     for v in names_list.iter() {
         let n = match v {
             Value::Str(s) => s.as_str(),
-            other => return err(format!(
-                "select_cols: name list contained non-Str: {other:?}")),
+            other => {
+                return err(format!(
+                    "select_cols: name list contained non-Str: {other:?}"
+                ))
+            }
         };
-        let (i, _) = t.schema().column_with_name(n)
+        let (i, _) = t
+            .schema()
+            .column_with_name(n)
             .ok_or_else(|| format!("select_cols: column `{n}` not found"))?;
         indices.push(i);
     }
-    let projected = t.project(&indices)
+    let projected = t
+        .project(&indices)
         .map_err(|e| format!("select_cols: {e}"))?;
     Ok(Value::ArrowTable(Arc::new(projected)))
 }
@@ -347,13 +376,14 @@ fn drop_col(args: &[Value]) -> Result<Value, String> {
     let drop_name = expect_str(args.get(1))?;
     let mut keep = Vec::with_capacity(t.num_columns());
     for (i, f) in t.schema().fields().iter().enumerate() {
-        if f.name() != drop_name { keep.push(i); }
+        if f.name() != drop_name {
+            keep.push(i);
+        }
     }
     if keep.len() == t.num_columns() {
         return err(format!("drop_col: column `{drop_name}` not found"));
     }
-    let projected = t.project(&keep)
-        .map_err(|e| format!("drop_col: {e}"))?;
+    let projected = t.project(&keep).map_err(|e| format!("drop_col: {e}"))?;
     Ok(Value::ArrowTable(Arc::new(projected)))
 }
 
@@ -371,8 +401,8 @@ fn drop_col(args: &[Value]) -> Result<Value, String> {
 /// already-resolved `&Path`; the effect-handler dispatch verifies
 /// `policy.allow_fs_read` before calling here.
 pub fn read_csv_at(path: &Path) -> Result<Value, String> {
-    let file = File::open(path)
-        .map_err(|e| format!("arrow.read_csv: open `{}`: {e}", path.display()))?;
+    let file =
+        File::open(path).map_err(|e| format!("arrow.read_csv: open `{}`: {e}", path.display()))?;
     let (schema, _) = arrow_csv::reader::Format::default()
         .with_header(true)
         .infer_schema(&file, Some(100))
@@ -401,19 +431,31 @@ pub fn read_csv_at(path: &Path) -> Result<Value, String> {
 // ---------- value-conversion helpers (mirror builtins.rs) ----------
 
 fn some(v: Value) -> Value {
-    Value::Variant { name: "Some".into(), args: vec![v] }
+    Value::Variant {
+        name: "Some".into(),
+        args: vec![v],
+    }
 }
 
 fn none() -> Value {
-    Value::Variant { name: "None".into(), args: vec![] }
+    Value::Variant {
+        name: "None".into(),
+        args: vec![],
+    }
 }
 
 fn ok(v: Value) -> Value {
-    Value::Variant { name: "Ok".into(), args: vec![v] }
+    Value::Variant {
+        name: "Ok".into(),
+        args: vec![v],
+    }
 }
 
 fn err_variant(s: String) -> Value {
-    Value::Variant { name: "Err".into(), args: vec![Value::Str(s.into())] }
+    Value::Variant {
+        name: "Err".into(),
+        args: vec![Value::Str(s.into())],
+    }
 }
 
 /// Lift a kernel that returns `Result<Value, String>` into a Lex
@@ -423,7 +465,7 @@ fn err_variant(s: String) -> Value {
 /// as `Result<Value, String>` and propagate the host error.
 fn lift_result(r: Result<Value, String>) -> Result<Value, String> {
     match r {
-        Ok(v)  => Ok(ok(v)),
+        Ok(v) => Ok(ok(v)),
         Err(s) => Ok(err_variant(s)),
     }
 }
@@ -442,25 +484,25 @@ fn lift_result(r: Result<Value, String>) -> Result<Value, String> {
 pub fn dispatch(op: &str, args: &[Value]) -> Option<Result<Value, String>> {
     Some(match op {
         // -- Result-returning constructors / ops --
-        "from_int_columns"   => lift_result(from_int_columns(args)),
+        "from_int_columns" => lift_result(from_int_columns(args)),
         "from_float_columns" => lift_result(from_float_columns(args)),
-        "from_str_columns"   => lift_result(from_str_columns(args)),
-        "col_sum_int"        => lift_result(col_sum_int(args)),
-        "col_sum_float"      => lift_result(col_sum_float(args)),
-        "col_mean"           => lift_result(col_mean(args)),
-        "col_min_int"        => lift_result(col_min_int(args)),
-        "col_max_int"        => lift_result(col_max_int(args)),
-        "col_count"          => lift_result(col_count(args)),
-        "select_cols"        => lift_result(select_cols(args)),
-        "drop_col"           => lift_result(drop_col(args)),
+        "from_str_columns" => lift_result(from_str_columns(args)),
+        "col_sum_int" => lift_result(col_sum_int(args)),
+        "col_sum_float" => lift_result(col_sum_float(args)),
+        "col_mean" => lift_result(col_mean(args)),
+        "col_min_int" => lift_result(col_min_int(args)),
+        "col_max_int" => lift_result(col_max_int(args)),
+        "col_count" => lift_result(col_count(args)),
+        "select_cols" => lift_result(select_cols(args)),
+        "drop_col" => lift_result(drop_col(args)),
         // -- bare-return introspection / slicing --
-        "nrows"              => nrows(args),
-        "ncols"              => ncols(args),
-        "col_names"          => col_names(args),
-        "col_type"           => col_type(args),
-        "head"               => head(args),
-        "tail"               => tail(args),
-        "slice"              => slice(args),
+        "nrows" => nrows(args),
+        "ncols" => ncols(args),
+        "col_names" => col_names(args),
+        "col_type" => col_type(args),
+        "head" => head(args),
+        "tail" => tail(args),
+        "slice" => slice(args),
         _ => return None,
     })
 }
