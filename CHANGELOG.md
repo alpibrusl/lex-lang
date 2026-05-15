@@ -43,11 +43,25 @@ bumps may carry breaking changes when justified).
   `Value::to_json` summarise tables by schema + nrows (full data is
   never serialised — Arrow tables can be GB-scale).
 
-  Out of scope (separate slices): `arrow.read_parquet` /
-  `arrow.read_csv` (effect-gated I/O), nullable / string / mixed-type
-  reductions, row-shaped accessors (`arrow.row_at`,
+  Out of scope (separate slices): `arrow.read_parquet`, nullable /
+  string / mixed-type reductions, row-shaped accessors (`arrow.row_at`,
   `arrow.col_to_*_list`), the Polars-backed `std.df` for group_by /
   join / sort (#427), and the `lex-frame` migration (lex-frame#6).
+
+- **#426 (slice 2): `arrow.read_csv` — effect-gated CSV reader.**
+  `arrow.read_csv(path :: Str) -> [fs_read] Result[Table, Str]`. Routes
+  through `arrow_csv::Reader` with schema inference from the first 100
+  rows. Subject to `--allow-fs-read` path scoping like `io.read`. This
+  is the slice that **closes the gap to pandas**: when rows arrive
+  already-columnar (CSV → `RecordBatch` in Rust) and never round-trip
+  through a Lex `List[Value]`, sum/mean/min/max on 100k–1M rows is
+  **within 5% of pandas on small inputs and faster than pandas on
+  large inputs** (28 ms vs 27 ms at n=100k; **168 ms vs 253 ms at
+  n=1M** — `arrow-csv` parses faster than pandas' C parser).
+
+  Tests: `arrow_read_csv_end_to_end` (real temp file round-trip) and
+  `arrow_read_csv_outside_allow_list_is_err` (scope refusal).
+  Adds `arrow-csv` 55.x to lex-runtime.
 
 - **#381: `conc.spawn` / `conc.ask` / `conc.tell` — synchronous actor model.**
   Programs can now create stateful actor handles with `conc.spawn(init_state,

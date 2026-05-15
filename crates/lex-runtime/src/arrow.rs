@@ -14,9 +14,12 @@
 use arrow_array::{
     Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray,
 };
+use arrow_csv::ReaderBuilder;
 use arrow_schema::{DataType, Field, Schema};
 use lex_bytecode::Value;
 use std::collections::VecDeque;
+use std::fs::File;
+use std::path::Path;
 use std::sync::Arc;
 
 // ---------- helpers ----------
@@ -352,6 +355,47 @@ fn drop_col(args: &[Value]) -> Result<Value, String> {
     let projected = t.project(&keep)
         .map_err(|e| format!("drop_col: {e}"))?;
     Ok(Value::ArrowTable(Arc::new(projected)))
+}
+
+// ---------- I/O: read_csv (effect [fs_read]) ----------
+
+/// Read a CSV file into an Arrow `RecordBatch`. Header row required;
+/// schema is inferred from the first 100 rows. All batches are
+/// concatenated into one Table — the v1 API surface returns a single
+/// materialised table, not a stream. For 1M-row inputs that's ~50 MB
+/// in memory which is fine for the agentic workloads `lex-frame`
+/// targets; bigger inputs land in a streaming `read_csv_iter` slice
+/// later.
+///
+/// **Path checking is the caller's job.** This function takes an
+/// already-resolved `&Path`; the effect-handler dispatch verifies
+/// `policy.allow_fs_read` before calling here.
+pub fn read_csv_at(path: &Path) -> Result<Value, String> {
+    let file = File::open(path)
+        .map_err(|e| format!("arrow.read_csv: open `{}`: {e}", path.display()))?;
+    let (schema, _) = arrow_csv::reader::Format::default()
+        .with_header(true)
+        .infer_schema(&file, Some(100))
+        .map_err(|e| format!("arrow.read_csv: schema inference: {e}"))?;
+    // infer_schema consumed some of the file — reopen so the reader sees row 0.
+    let file = File::open(path)
+        .map_err(|e| format!("arrow.read_csv: reopen `{}`: {e}", path.display()))?;
+    let schema = Arc::new(schema);
+    let reader = ReaderBuilder::new(Arc::clone(&schema))
+        .with_header(true)
+        .build(file)
+        .map_err(|e| format!("arrow.read_csv: reader build: {e}"))?;
+    let mut batches: Vec<RecordBatch> = Vec::new();
+    for batch in reader {
+        batches.push(batch.map_err(|e| format!("arrow.read_csv: row decode: {e}"))?);
+    }
+    let combined = if batches.is_empty() {
+        RecordBatch::new_empty(schema)
+    } else {
+        arrow_select::concat::concat_batches(&schema, &batches)
+            .map_err(|e| format!("arrow.read_csv: concat: {e}"))?
+    };
+    Ok(Value::ArrowTable(Arc::new(combined)))
 }
 
 // ---------- value-conversion helpers (mirror builtins.rs) ----------
