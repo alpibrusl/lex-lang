@@ -556,6 +556,52 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::open_var(0).union(&EffectSet::singleton("net")),
                 Ty::Unit,
             ));
+            // serve_ws_fn_actor[Eff] ::
+            //   (Int, Str,
+            //    (WsConn) -> Str,                        # name_of, registry name
+            //    (WsConn, WsMessage) -> [Eff] WsAction)  # on_message
+            //   -> [net, concurrent, Eff] Unit
+            //
+            // Variant of serve_ws_fn that registers each accepted
+            // connection as a named actor in conc_registry. Non-WS
+            // callers can then `conc.lookup(name) |> conc.tell(frame)`
+            // to push outbound frames into the socket from arbitrary
+            // [concurrent]-tagged code (HTTP webhooks, scheduled tasks,
+            // broadcast loops). Documented in #459.
+            //
+            // name_of is intentionally pure: it inspects the WsConn
+            // record (id / path / subprotocol) and decides what
+            // name to register the connection under. Empty string
+            // means "don't register this connection" — `on_message`
+            // still runs but no outbound handle is exposed.
+            //
+            // The result row carries `concurrent` because the runtime
+            // registers an `ActorHandler::Native` bridge in the conc
+            // registry; lookups from non-WS callers are themselves
+            // `[concurrent]` effects.
+            fields.insert("serve_ws_fn_actor".into(), Ty::function(
+                vec![
+                    Ty::int(),
+                    Ty::str(), // subprotocol
+                    Ty::function(
+                        vec![Ty::Con("WsConn".into(), vec![])],
+                        EffectSet::empty(),
+                        Ty::str(),
+                    ),
+                    Ty::function(
+                        vec![
+                            Ty::Con("WsConn".into(), vec![]),
+                            Ty::Con("WsMessage".into(), vec![]),
+                        ],
+                        EffectSet::open_var(0),
+                        Ty::Con("WsAction".into(), vec![]),
+                    ),
+                ],
+                EffectSet::open_var(0)
+                    .union(&EffectSet::singleton("net"))
+                    .union(&EffectSet::singleton("concurrent")),
+                Ty::Unit,
+            ));
             // dial_ws[Eff] :: (Str, Str, () -> [Eff] WsAction,
             //                  (WsMessage) -> [Eff] WsAction)
             //                  -> [net, Eff] Result[Unit, Str]

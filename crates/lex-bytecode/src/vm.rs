@@ -558,7 +558,7 @@ impl<'a> Vm<'a> {
                 }
                 Ok(Value::Actor(Arc::new(Mutex::new(ActorCell {
                     state: init,
-                    handler,
+                    handler: crate::value::ActorHandler::Lex(handler),
                 }))))
             }
             "ask" | "tell" => {
@@ -574,20 +574,35 @@ impl<'a> Vm<'a> {
                 let mut guard = cell.lock().map_err(|e| format!("conc.{op}: actor mutex poisoned: {e}"))?;
                 let handler = guard.handler.clone();
                 let state = guard.state.clone();
-                // Call handler(state, msg) on this VM — full effect access.
-                let result = self.invoke_closure_value(handler, vec![state, msg])
-                    .map_err(|e| format!("conc.{op}: handler error: {e:?}"))?;
-                // Expect (new_state, reply) tuple.
-                match result {
-                    Value::Tuple(mut parts) if parts.len() == 2 => {
-                        let reply = parts.pop().unwrap();
-                        let new_state = parts.pop().unwrap();
-                        guard.state = new_state;
-                        drop(guard);
-                        if op == "ask" { Ok(reply) } else { Ok(Value::Unit) }
+                match handler {
+                    crate::value::ActorHandler::Lex(closure_val) => {
+                        // Call handler(state, msg) on this VM — full effect access.
+                        let result = self.invoke_closure_value(closure_val, vec![state, msg])
+                            .map_err(|e| format!("conc.{op}: handler error: {e:?}"))?;
+                        // Expect (new_state, reply) tuple.
+                        match result {
+                            Value::Tuple(mut parts) if parts.len() == 2 => {
+                                let reply = parts.pop().unwrap();
+                                let new_state = parts.pop().unwrap();
+                                guard.state = new_state;
+                                drop(guard);
+                                if op == "ask" { Ok(reply) } else { Ok(Value::Unit) }
+                            }
+                            other => Err(format!(
+                                "conc.{op}: handler must return a 2-tuple (new_state, reply), got {other:?}")),
+                        }
                     }
-                    other => Err(format!(
-                        "conc.{op}: handler must return a 2-tuple (new_state, reply), got {other:?}")),
+                    crate::value::ActorHandler::Native(native) => {
+                        // Native bridge: fire-and-forget; `state` is unused
+                        // (the bridge's "state" is the external resource, e.g.
+                        // a WebSocket connection). The closure receives `msg`
+                        // directly. `ask` returns whatever the bridge produces;
+                        // `tell` discards it. State stays untouched.
+                        drop(guard);
+                        let result = (native.send)(msg)
+                            .map_err(|e| format!("conc.{op}: native handler error: {e}"))?;
+                        if op == "ask" { Ok(result) } else { Ok(Value::Unit) }
+                    }
                 }
             }
             "register" => {

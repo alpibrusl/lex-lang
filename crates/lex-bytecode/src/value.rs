@@ -10,13 +10,59 @@ use std::sync::{Arc, Mutex};
 
 /// Internal state of a `conc.Actor`. Protected by a `Mutex` so that
 /// concurrent callers serialise on message delivery (the actor processes
-/// one message at a time). The `handler` closure is called on the
-/// *calling* VM's thread — no extra OS thread required — which lets it
-/// invoke arbitrary effects (sql, net, …) through the same handler chain.
+/// one message at a time). The `handler` is dispatched on the
+/// *calling* VM's thread — no extra OS thread required — which lets
+/// Lex handlers invoke arbitrary effects (sql, net, …) through the
+/// same handler chain.
 #[derive(Debug, Clone)]
 pub struct ActorCell {
     pub state: Value,
-    pub handler: Value,
+    pub handler: ActorHandler,
+}
+
+/// Two ways an actor's handler can be implemented.
+///
+/// * `Lex(Value::Closure)` is the user-spawned shape from
+///   `conc.spawn(state, fn (s, m) -> (s, r) { … })`. The VM calls
+///   the closure with `(state, msg)` and expects `(new_state, reply)`.
+///
+/// * `Native(...)` is a Rust-side bridge — the actor cell wraps a
+///   `Box<dyn Fn(Value) -> Result<Value, String>>` that lives outside
+///   the VM. The `state` is ignored; the bridge is fire-and-forget
+///   over an out-of-band channel (e.g. a `mpsc::Sender<String>` to
+///   a WebSocket connection — see `lex-runtime::ws::serve_ws_fn_actor`).
+///   `conc.ask` against a native actor returns whatever the bridge
+///   produces; `conc.tell` discards it. v1 is only used internally by
+///   the WS server's outbound-bridge registration; not exposed via the
+///   `conc` builtin surface.
+#[derive(Clone)]
+pub enum ActorHandler {
+    Lex(Value),
+    Native(Arc<NativeActorHandler>),
+}
+
+/// Erased Rust-side handler for `ActorHandler::Native`. Boxed so we
+/// can store any closure that captures (e.g. an `mpsc::Sender`).
+/// Wrapped in `Arc` so cloning an `ActorCell` (which the existing
+/// `conc.tell` flow does — `let handler = guard.handler.clone()`)
+/// is cheap and the closure isn't duplicated.
+pub struct NativeActorHandler {
+    pub send: Box<dyn Fn(Value) -> Result<Value, String> + Send + Sync>,
+}
+
+impl std::fmt::Debug for NativeActorHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<native actor handler>")
+    }
+}
+
+impl std::fmt::Debug for ActorHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ActorHandler::Lex(v) => f.debug_tuple("Lex").field(v).finish(),
+            ActorHandler::Native(n) => f.debug_tuple("Native").field(n).finish(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
