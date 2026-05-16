@@ -1064,6 +1064,23 @@ impl EffectHandler for DefaultHandler {
                 let policy = self.policy.clone();
                 serve_http_fn(port, closure, program, policy)
             }
+            ("net", "serve_routed") => {
+                let port = match args.first() {
+                    Some(Value::Int(n)) if (0..=65535).contains(n) => *n as u16,
+                    _ => return Err("net.serve_routed(port, routes, fallback): port must be Int 0..=65535".into()),
+                };
+                let routes_val = args.get(1).cloned()
+                    .ok_or_else(|| "net.serve_routed(port, routes, fallback): missing routes".to_string())?;
+                let fallback = match args.into_iter().nth(2) {
+                    Some(c @ Value::Closure { .. }) => c,
+                    _ => return Err("net.serve_routed(port, routes, fallback): fallback must be a closure".into()),
+                };
+                let routes = decode_routes_arg(routes_val)?;
+                let program = self.program.clone()
+                    .ok_or_else(|| "net.serve_routed requires a Program reference; use DefaultHandler::with_program".to_string())?;
+                let policy = self.policy.clone();
+                serve_http_routed(port, routes, fallback, program, policy)
+            }
             ("net", "serve_tls") => {
                 let port = match args.first() {
                     Some(Value::Int(n)) if (0..=65535).contains(n) => *n as u16,
@@ -1898,6 +1915,255 @@ fn serve_http_fn(
     })
 }
 
+/// Compiled segment of a route pattern. Patterns are split on `/`
+/// once at registration time so the per-request match loop is just a
+/// length check + segment-by-segment compare.
+#[derive(Clone, Debug)]
+enum RouteSeg {
+    Literal(String),
+    /// `:name` capture — binds the request segment under `name` in
+    /// `req.path_params`.
+    Param(String),
+}
+
+/// Compile a `:name`-style pattern (e.g. `"/users/:id/posts"`) into a
+/// segment list. Errors out at registration time so bad patterns
+/// surface before the server binds, not on the first matching request.
+fn compile_path_pattern(pat: &str) -> Result<Vec<RouteSeg>, String> {
+    if pat.is_empty() {
+        return Err("path pattern must be non-empty (use \"/\" for the root)".into());
+    }
+    if !pat.starts_with('/') {
+        return Err(format!("path pattern must start with '/' (got {pat:?})"));
+    }
+    let mut segs = Vec::new();
+    for raw in pat.split('/') {
+        if let Some(name) = raw.strip_prefix(':') {
+            if name.is_empty() {
+                return Err(format!(
+                    ":-segment in pattern {pat:?} must have a name (e.g. :id)"
+                ));
+            }
+            segs.push(RouteSeg::Param(name.to_string()));
+        } else {
+            segs.push(RouteSeg::Literal(raw.to_string()));
+        }
+    }
+    Ok(segs)
+}
+
+/// Attempt to match a request `path` against a compiled pattern. On
+/// success returns the captured `:name` segments as a Lex-shaped map
+/// keyed by `MapKey::Str(name)`; on mismatch returns `None`. Strict
+/// segment-count match: trailing slashes matter (caller registers
+/// both forms if both should match).
+fn match_path_pattern(
+    segs: &[RouteSeg],
+    path: &str,
+) -> Option<std::collections::BTreeMap<lex_bytecode::MapKey, Value>> {
+    let path_segs: Vec<&str> = path.split('/').collect();
+    if path_segs.len() != segs.len() {
+        return None;
+    }
+    let mut params = std::collections::BTreeMap::new();
+    for (pat, p) in segs.iter().zip(path_segs.iter()) {
+        match pat {
+            RouteSeg::Literal(lit) => {
+                if lit != p {
+                    return None;
+                }
+            }
+            RouteSeg::Param(name) => {
+                params.insert(
+                    lex_bytecode::MapKey::Str(name.clone()),
+                    Value::Str((*p).into()),
+                );
+            }
+        }
+    }
+    Some(params)
+}
+
+/// Decode the `routes` argument of `net.serve_routed` into a vector
+/// of `(uppercased-method-or-"*", compiled-pattern, handler-closure)`.
+/// Validates and pre-compiles up front so malformed routes fail before
+/// the server starts.
+fn decode_routes_arg(
+    v: Value,
+) -> Result<Vec<(String, Vec<RouteSeg>, Value)>, String> {
+    let list = match v {
+        Value::List(xs) => xs,
+        _ => return Err("net.serve_routed: routes must be a List".into()),
+    };
+    let mut out = Vec::with_capacity(list.len());
+    for (i, item) in list.into_iter().enumerate() {
+        let tup = match item {
+            Value::Tuple(xs) if xs.len() == 3 => xs,
+            other => return Err(format!(
+                "net.serve_routed: route #{i} must be a (method, pattern, handler) 3-tuple, got {other:?}"
+            )),
+        };
+        let mut it = tup.into_iter();
+        let method_raw = match it.next() {
+            Some(Value::Str(s)) => s.to_string(),
+            _ => return Err(format!("net.serve_routed: route #{i} method must be Str")),
+        };
+        // Normalise method to uppercase for matching. "*" stays as-is.
+        let method = if method_raw == "*" { method_raw } else { method_raw.to_uppercase() };
+        let pattern = match it.next() {
+            Some(Value::Str(s)) => s.to_string(),
+            _ => return Err(format!("net.serve_routed: route #{i} path-pattern must be Str")),
+        };
+        let segs = compile_path_pattern(&pattern)
+            .map_err(|e| format!("net.serve_routed: route #{i} ({pattern:?}): {e}"))?;
+        let closure = match it.next() {
+            Some(c @ Value::Closure { .. }) => c,
+            _ => return Err(format!("net.serve_routed: route #{i} handler must be a closure")),
+        };
+        out.push((method, segs, closure));
+    }
+    Ok(out)
+}
+
+/// Pick the first matching route for `(method, path)` and return its
+/// handler closure plus captured path-params. Method match is
+/// case-insensitive vs the request (already uppercased at decode
+/// time); `"*"` in a route matches any method.
+fn dispatch_route<'a>(
+    routes: &'a [(String, Vec<RouteSeg>, Value)],
+    req_method: &str,
+    req_path: &str,
+) -> Option<(&'a Value, std::collections::BTreeMap<lex_bytecode::MapKey, Value>)> {
+    let req_method_upper = req_method.to_ascii_uppercase();
+    for (m, segs, closure) in routes {
+        if m != "*" && m != &req_method_upper {
+            continue;
+        }
+        if let Some(params) = match_path_pattern(segs, req_path) {
+            return Some((closure, params));
+        }
+    }
+    None
+}
+
+/// Overwrite the `path_params` field on a Request record with the
+/// captured map. Request records are always built with an empty
+/// `path_params` field, so this just updates the existing slot.
+fn stamp_path_params(
+    req: &mut Value,
+    params: std::collections::BTreeMap<lex_bytecode::MapKey, Value>,
+) {
+    if let Value::Record(rec) = req {
+        rec.insert("path_params".into(), Value::Map(params));
+    }
+}
+
+/// Hyper 1.x + Tokio multi-thread HTTP/1.1 server for `net.serve_routed`.
+/// Mirrors `serve_http_fn` (#431 inline-vm gate also applies); the only
+/// difference is that route dispatch picks the closure per-request from
+/// the precompiled `routes` table, falling back to the `fallback`
+/// closure when no route matches.
+fn serve_http_routed(
+    port: u16,
+    routes: Vec<(String, Vec<RouteSeg>, Value)>,
+    fallback: Value,
+    program: Arc<Program>,
+    policy: Policy,
+) -> Result<Value, String> {
+    use http_body_util::BodyExt as _;
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
+    use tokio::net::TcpListener as TokioTcpListener;
+
+    let inline_vm = env_inline_vm();
+    let routes = Arc::new(routes);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("net.serve_routed: tokio runtime: {e}"))?;
+    rt.block_on(async move {
+        let listener = TokioTcpListener::bind(("0.0.0.0", port))
+            .await
+            .map_err(|e| format!("net.serve_routed bind {port}: {e}"))?;
+        eprintln!(
+            "net.serve_routed: listening on http://0.0.0.0:{port} ({} routes{})",
+            routes.len(),
+            if inline_vm { ", inline-vm" } else { "" }
+        );
+        loop {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .map_err(|e| format!("net.serve_routed accept: {e}"))?;
+            let io = TokioIo::new(stream);
+            let program = Arc::clone(&program);
+            let policy = policy.clone();
+            let routes = Arc::clone(&routes);
+            let fallback = fallback.clone();
+            tokio::spawn(async move {
+                let program2 = Arc::clone(&program);
+                let policy2 = policy.clone();
+                let routes2 = Arc::clone(&routes);
+                let fallback2 = fallback.clone();
+                let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                    let program = Arc::clone(&program2);
+                    let policy = policy2.clone();
+                    let routes = Arc::clone(&routes2);
+                    let fallback = fallback2.clone();
+                    async move {
+                        let (parts, body) = req.into_parts();
+                        let body_bytes = body
+                            .collect()
+                            .await
+                            .map(|c| c.to_bytes())
+                            .unwrap_or_default();
+                        let method = parts.method.as_str().to_string();
+                        let path = match parts.uri.path() {
+                            "" => "/".to_string(),
+                            p => p.to_string(),
+                        };
+                        let result = if inline_vm {
+                            let mut lex_req = build_request_value_parts(&parts, &body_bytes);
+                            let (closure, params) = match dispatch_route(&routes, &method, &path) {
+                                Some((c, p)) => (c.clone(), p),
+                                None => (fallback.clone(), std::collections::BTreeMap::new()),
+                            };
+                            stamp_path_params(&mut lex_req, params);
+                            let handler = DefaultHandler::new(policy)
+                                .with_program(Arc::clone(&program));
+                            let mut vm = Vm::with_handler(&program, Box::new(handler));
+                            Ok(vm.invoke_closure_value(closure, vec![lex_req]))
+                        } else {
+                            tokio::task::spawn_blocking(move || {
+                                let mut lex_req = build_request_value_parts(&parts, &body_bytes);
+                                let (closure, params) = match dispatch_route(&routes, &method, &path) {
+                                    Some((c, p)) => (c.clone(), p),
+                                    None => (fallback.clone(), std::collections::BTreeMap::new()),
+                                };
+                                stamp_path_params(&mut lex_req, params);
+                                let handler = DefaultHandler::new(policy)
+                                    .with_program(Arc::clone(&program));
+                                let mut vm = Vm::with_handler(&program, Box::new(handler));
+                                vm.invoke_closure_value(closure, vec![lex_req])
+                            })
+                            .await
+                        };
+                        Ok::<_, std::convert::Infallible>(match result {
+                            Ok(Ok(resp)) => build_hyper_response(&resp),
+                            Ok(Err(e)) => error_response(500, &format!("internal error: {e}")),
+                            Err(e) => error_response(500, &format!("task panicked: {e}")),
+                        })
+                    }
+                });
+                if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+                    eprintln!("net.serve_routed: connection error: {e}");
+                }
+            });
+        }
+    })
+}
+
 /// Read `LEX_NET_INLINE_VM` and report whether the runtime should skip
 /// `spawn_blocking` on the per-request VM call. Accepts `1` / `true`
 /// (case-insensitive); anything else (including unset) keeps the
@@ -1939,6 +2205,7 @@ fn build_request_value_parts(
     rec.insert("query".into(), Value::Str(query.into()));
     rec.insert("body".into(), Value::Str(body_str.into()));
     rec.insert("headers".into(), Value::Map(headers_map));
+    rec.insert("path_params".into(), Value::Map(std::collections::BTreeMap::new()));
     Value::Record(rec)
 }
 
@@ -1965,6 +2232,7 @@ fn build_request_value_tiny(req: &mut tiny_http::Request) -> Value {
     rec.insert("query".into(), Value::Str(query.into()));
     rec.insert("body".into(), Value::Str(body.into()));
     rec.insert("headers".into(), Value::Map(headers_map));
+    rec.insert("path_params".into(), Value::Map(std::collections::BTreeMap::new()));
     Value::Record(rec)
 }
 
