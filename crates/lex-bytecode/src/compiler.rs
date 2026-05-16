@@ -14,6 +14,12 @@ struct ConstPool {
     ints: IndexMap<i64, u32>,
     bools: IndexMap<u8, u32>,
     strs: IndexMap<String, u32>,
+    /// Interned record field-name shapes (#461). Deduplicated by content
+    /// so a record literal with the same field-name layout reuses the
+    /// same `shape_idx` across the whole program — keeps the side-table
+    /// small even when the same struct is constructed in many places.
+    record_shapes: Vec<Vec<u32>>,
+    record_shape_dedup: IndexMap<Vec<u32>, u32>,
 }
 
 impl ConstPool {
@@ -71,6 +77,19 @@ impl ConstPool {
         self.pool.push(Const::Unit);
         i
     }
+
+    /// Intern a record field-name shape (#461). Returns the index into
+    /// `record_shapes`; identical shapes (same field-name-index vec)
+    /// always return the same index.
+    fn record_shape(&mut self, idxs: Vec<u32>) -> u32 {
+        if let Some(i) = self.record_shape_dedup.get(&idxs) {
+            return *i;
+        }
+        let i = self.record_shapes.len() as u32;
+        self.record_shape_dedup.insert(idxs.clone(), i);
+        self.record_shapes.push(idxs);
+        i
+    }
 }
 
 pub fn compile_program(stages: &[a::Stage]) -> Program {
@@ -80,6 +99,7 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
         function_names: IndexMap::new(),
         module_aliases: IndexMap::new(),
         entry: None,
+        record_shapes: Vec::new(),
     };
 
     // Collect imports as alias → module-name. The module name is the part
@@ -210,11 +230,12 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
     for f in p.functions.iter_mut() {
         if f.body_hash == crate::program::ZERO_BODY_HASH {
             f.body_hash = crate::program::compute_body_hash(
-                f.arity, f.locals_count, &f.code);
+                f.arity, f.locals_count, &f.code, &pool.record_shapes);
         }
     }
 
     p.constants = pool.pool;
+    p.record_shapes = pool.record_shapes;
     p
 }
 
@@ -302,7 +323,9 @@ impl<'a> FnCompiler<'a> {
                     self.compile_expr(&f.value, false);
                     idxs.push(self.pool.field(&f.name));
                 }
-                self.emit(Op::MakeRecord { field_name_indices: idxs });
+                let field_count = idxs.len() as u16;
+                let shape_idx = self.pool.record_shape(idxs);
+                self.emit(Op::MakeRecord { shape_idx, field_count });
             }
             a::CExpr::TupleLit { items } => {
                 for it in items { self.compile_expr(it, false); }
@@ -1869,7 +1892,8 @@ impl<'a> FnCompiler<'a> {
     /// final hash pass at the end of `compile_program` is a no-op here.
     fn install_trampoline(&mut self, name: &str, arity: u16, locals_count: u16, code: Vec<Op>) -> u32 {
         let fn_id = self.next_fn_id.len() as u32;
-        let body_hash = crate::program::compute_body_hash(arity, locals_count, &code);
+        let body_hash = crate::program::compute_body_hash(
+            arity, locals_count, &code, &self.pool.record_shapes);
         self.next_fn_id.push(Function {
             name: name.into(),
             arity,

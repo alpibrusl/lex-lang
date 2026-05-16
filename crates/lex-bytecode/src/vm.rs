@@ -774,7 +774,7 @@ impl<'a> Vm<'a> {
                 let fn_name = &self.program.functions[fn_id as usize].name;
                 return Err(VmError::Panic(format!("ran past end of code in `{fn_name}`")));
             }
-            let op = code[pc].clone();
+            let op = code[pc];
             self.frames[frame_idx].pc = pc + 1;
 
             match op {
@@ -797,15 +797,18 @@ impl<'a> Vm<'a> {
                     let base = self.frames[frame_idx].locals_start;
                     self.locals_storage[base + i as usize] = v;
                 }
-                Op::MakeRecord { field_name_indices } => {
-                    let n = field_name_indices.len();
+                Op::MakeRecord { shape_idx, field_count } => {
+                    let shape = &self.program.record_shapes[shape_idx as usize];
+                    let n = field_count as usize;
+                    debug_assert_eq!(shape.len(), n,
+                        "MakeRecord field_count must match record_shapes[shape_idx].len()");
                     let mut values: Vec<Value> = (0..n).map(|_| Value::Unit).collect();
                     for i in (0..n).rev() {
                         values[i] = self.pop()?;
                     }
                     let mut rec = IndexMap::new();
                     for (i, val) in values.into_iter().enumerate() {
-                        let name = match &self.program.constants[field_name_indices[i] as usize] {
+                        let name = match &self.program.constants[shape[i] as usize] {
                             Const::FieldName(s) => s.clone(),
                             _ => return Err(VmError::TypeMismatch("expected FieldName const".into())),
                         };

@@ -213,6 +213,7 @@ fn serve_ws_fn_rejects_invalid_subprotocol_at_startup() {
         function_names: IndexMap::new(),
         module_aliases: IndexMap::new(),
         entry: None,
+        record_shapes: vec![],
     });
     let policy = Policy::pure();
     let registry = Arc::new(ChatRegistry::default());
