@@ -692,8 +692,12 @@ impl<'a> Vm<'a> {
         // and the reentrant `invoke_closure_value` path. Same
         // semantics, same error shape.
         let f_name = f.name.clone();
-        let refinements = f.refinements.clone();
-        for (i, refinement) in refinements.iter().enumerate() {
+        // Iterate `f.refinements` by reference — the loop body
+        // only reads from `self.program` (via `r`) and from locals,
+        // so we don't need to clone the Vec to detach it from
+        // `&self`. Removing this clone saves an allocation per
+        // call on the hot path (#461).
+        for (i, refinement) in f.refinements.iter().enumerate() {
             if let Some(r) = refinement {
                 let arg = args.get(i).cloned().unwrap_or(Value::Unit);
                 match eval_refinement(&r.predicate, &r.binding, &arg) {
@@ -1107,8 +1111,13 @@ impl<'a> Vm<'a> {
                     // starts, which means an erroring trace shows the
                     // call as enter+exit_err with the verdict reason
                     // (same shape as `gate.verdict`).
-                    let refinements = self.program.functions[fn_id as usize]
-                        .refinements.clone();
+                    //
+                    // Iterate by reference — the loop body reads only
+                    // through `r` (borrowed from `self.program`) and
+                    // locals; we don't mutate `self` in here, so the
+                    // borrow is fine and we avoid one Vec allocation
+                    // per call on the hot path (#461).
+                    let refinements = &self.program.functions[fn_id as usize].refinements;
                     for (i, refinement) in refinements.iter().enumerate() {
                         if let Some(r) = refinement {
                             let arg = args.get(i).cloned().unwrap_or(Value::Unit);
@@ -1181,9 +1190,10 @@ impl<'a> Vm<'a> {
                             .map_err(VmError::Effect)?;
                     }
                     // Refinement runtime check on tail calls too
-                    // (#209 slice 3). Same shape as Op::Call.
-                    let refinements = self.program.functions[fn_id as usize]
-                        .refinements.clone();
+                    // (#209 slice 3). Same shape as Op::Call —
+                    // iterate by reference to avoid a per-call Vec
+                    // allocation (#461).
+                    let refinements = &self.program.functions[fn_id as usize].refinements;
                     for (i, refinement) in refinements.iter().enumerate() {
                         if let Some(r) = refinement {
                             let arg = args.get(i).cloned().unwrap_or(Value::Unit);
