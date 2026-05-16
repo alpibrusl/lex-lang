@@ -123,7 +123,7 @@ fn stack_delta(op: &Op) -> i32 {
         Op::StoreLocal(_) => -1,
 
         // Record / tuple / list construction
-        Op::MakeRecord { field_name_indices } => -(field_name_indices.len() as i32) + 1,
+        Op::MakeRecord { field_count, .. } => -(*field_count as i32) + 1,
         Op::MakeTuple(n)  => -(*n as i32) + 1,
         Op::MakeList(n)   => -(*n as i32) + 1,
         Op::MakeVariant { arity, .. } => -(*arity as i32) + 1,

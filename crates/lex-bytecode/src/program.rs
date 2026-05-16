@@ -16,6 +16,13 @@ pub struct Program {
     /// Entry function (for `lex run`, set to whatever function the user
     /// chose to invoke). Optional.
     pub entry: Option<u32>,
+    /// Interned record field-name shapes (#461). Each entry is a list
+    /// of constant-pool indices (must point at `Const::FieldName`).
+    /// `Op::MakeRecord { shape_idx, .. }` indexes into this side-table.
+    /// Hoisting the field-name list out of the op stream is what
+    /// lets `Op` be `Copy`.
+    #[serde(default)]
+    pub record_shapes: Vec<Vec<u32>>,
 }
 
 impl Program {
@@ -103,21 +110,43 @@ fn zero_body_hash() -> BodyHash { ZERO_BODY_HASH }
 /// before hashing — within a single compile the pool is shared, so two
 /// equivalent literals produce identical `Op` sequences. Cross-compile
 /// canonicality is deliberately out of scope (#222).
-pub fn compute_body_hash(arity: u16, locals_count: u16, code: &[Op]) -> BodyHash {
+pub fn compute_body_hash(
+    arity: u16,
+    locals_count: u16,
+    code: &[Op],
+    record_shapes: &[Vec<u32>],
+) -> BodyHash {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(arity.to_le_bytes());
     hasher.update(locals_count.to_le_bytes());
     hasher.update((code.len() as u64).to_le_bytes());
-    // Serialize each Op deterministically. `serde_json` doesn't guarantee
-    // field ordering, so we route through bincode-like manual byte layout
-    // instead: we serialize via `serde_json::to_vec` only because Op's
-    // `Serialize` impl is auto-derived and stable across Rust versions
-    // for this enum shape. If determinism ever drifts we'll switch to a
-    // hand-rolled encoder.
+    // Serialize each Op deterministically. The serde-derived JSON form
+    // is the canonical wire shape — closures with the same body must
+    // hash identically across builds. `Op::MakeRecord` is special-cased:
+    // its on-disk representation (a `shape_idx` into the side-table
+    // plus a cached `field_count`) is rehydrated to the historical
+    // inline form `{"MakeRecord":{"field_name_indices":[...]}}` so the
+    // hash bytes stay bit-identical to pre-#461 builds.
     for op in code {
-        let bytes = serde_json::to_vec(op)
-            .expect("Op serialization must succeed");
+        let bytes = match op {
+            Op::MakeRecord { shape_idx, .. } => {
+                let shape = &record_shapes[*shape_idx as usize];
+                #[derive(Serialize)]
+                struct LegacyMakeRecord<'a> {
+                    field_name_indices: &'a [u32],
+                }
+                #[derive(Serialize)]
+                enum LegacyOp<'a> {
+                    MakeRecord(LegacyMakeRecord<'a>),
+                }
+                serde_json::to_vec(&LegacyOp::MakeRecord(LegacyMakeRecord {
+                    field_name_indices: shape,
+                }))
+                .expect("Op serialization must succeed")
+            }
+            _ => serde_json::to_vec(op).expect("Op serialization must succeed"),
+        };
         hasher.update((bytes.len() as u64).to_le_bytes());
         hasher.update(&bytes);
     }

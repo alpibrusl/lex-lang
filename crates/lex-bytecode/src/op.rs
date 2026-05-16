@@ -19,7 +19,7 @@ pub enum Const {
     NodeId(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum Op {
     // stack manipulation
     PushConst(u32),
@@ -31,12 +31,18 @@ pub enum Op {
     StoreLocal(u16),
 
     // constructors / pattern matching
-    /// Builds a record from `count` (name_const_idx, value) pairs on the stack.
-    /// Stack: [name_idx_n, val_n, ..., name_idx_1, val_1] but encoded as
-    /// alternating `<name_idx_const_u32> <value popped from stack>` — for
-    /// simplicity we instead push `count` values and `count` field name
-    /// constants in the same op as a `Vec<u32>` of name indices.
-    MakeRecord { field_name_indices: Vec<u32> },
+    /// Builds a record by interning its field-name shape in
+    /// `Program.record_shapes` (#461). `shape_idx` indexes that
+    /// side-table; `field_count` is `shape.len()` cached inline so the
+    /// stack-effect verifier can compute its delta without needing a
+    /// `Program` reference. The VM pops `field_count` values off the
+    /// stack and pairs them with `Program.record_shapes[shape_idx]`.
+    ///
+    /// Externalizing the field-name vec is what lets `Op` be `Copy`,
+    /// which is the precondition for direct-threaded dispatch
+    /// (`code[pc]` becomes a register-sized read instead of an
+    /// every-step `Vec` clone).
+    MakeRecord { shape_idx: u32, field_count: u16 },
     MakeTuple(u16),
     MakeList(u32),
     MakeVariant { name_idx: u32, arity: u16 },
