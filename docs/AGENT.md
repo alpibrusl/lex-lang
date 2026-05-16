@@ -100,10 +100,12 @@ Import modules with `import "std.X" as X`:
 
 ### `std.str`
 `length`, `to_upper`, `to_lower`, `trim`, `split`, `contains`, `starts_with`,
-`ends_with`, `replace`, `concat`, `slice`, `index_of`
+`ends_with`, `replace`, `concat`, `slice`, `index_of`, `cmp`
 
 String comparison operators (`<`, `<=`, `>`, `>=`, `==`, `!=`) work on `Str`
-via lexicographic order.
+via lexicographic order. `str.cmp(a, b)` returns `-1` / `0` / `1` in the
+same order — use it when you need a three-way function value (e.g. as a
+sort-by closure); use the operators for boolean comparisons.
 
 `Str + Str` concatenates strings.
 
