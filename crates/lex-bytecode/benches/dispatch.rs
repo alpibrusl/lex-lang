@@ -1,22 +1,28 @@
 //! Microbenchmarks for the bytecode VM's dispatch loop (#461).
 //!
 //! Establishes a baseline against which the planned dispatch rewrite
-//! (function-table / computed-goto) is measured. Three workloads stress
+//! (function-table / computed-goto) is measured. Four workloads stress
 //! different shapes of the hot path:
 //!
 //! - `arith_loop` — tight integer arithmetic via tail-recursive `sum_to`.
-//!   Dense mix of trivial-handler opcodes: PushConst, IntAdd, IntSub,
-//!   LoadLocal/StoreLocal, Call, Return, match-arm jumps.
+//!   Dense mix of trivial-handler opcodes plus per-call setup.
 //! - `record_field` — repeated `GetField` over the same record shape.
 //!   Stresses the inline-cache hot path that #462 will rework.
-//! - `call_heavy` — recursive factorial. Stresses Call/Return overhead
-//!   relative to the per-call work done.
+//! - `call_heavy` — recursive factorial. Isolates Call/Return overhead
+//!   relative to per-call work done.
+//! - `straight_arith` — a function whose body is a long flat chain of
+//!   `let aN := a_{N-1} + 1` bindings. No recursion, no calls inside
+//!   the body — just dispatch over a known opcode mix per iteration
+//!   (LoadLocal + PushConst + IntAdd + StoreLocal). The cleanest signal
+//!   for dispatch-loop cost: dividing bench time by the reported
+//!   throughput element count gives ns per dispatch step with
+//!   negligible contamination from call setup or branchy bodies.
 //!
 //! Run with `cargo bench -p lex-bytecode --bench dispatch`.
 
 use std::sync::Arc;
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use lex_ast::canonicalize_program;
 use lex_bytecode::vm::Vm;
 use lex_bytecode::{compile_program, Program, Value};
@@ -117,10 +123,56 @@ fn bench_call_heavy(c: &mut Criterion) {
     group.finish();
 }
 
+/// Build a `straight_arith` source with `n` flat let-bindings.
+///
+/// Each binding compiles to roughly LoadLocal + PushConst + IntAdd +
+/// StoreLocal (4 dispatch steps). The function has no recursion and
+/// no internal calls, so once `straight_arith` is invoked from the
+/// host the VM spends essentially all of its time in the dispatch
+/// loop — no Call/Return setup, no allocations, no IC lookups.
+///
+/// We report throughput as `4 * n` elements so criterion prints
+/// elements/sec (≈ dispatch steps/sec); dividing wall time by the
+/// element count gives ns per dispatch step directly.
+fn make_straight_arith_source(n: usize) -> String {
+    let mut s = String::with_capacity(40 * n);
+    s.push_str("fn straight_arith(start :: Int) -> Int {\n");
+    s.push_str("  let a0 := start\n");
+    for i in 1..=n {
+        s.push_str(&format!("  let a{i} := a{} + 1\n", i - 1));
+    }
+    s.push_str(&format!("  a{n}\n"));
+    s.push_str("}\n");
+    s
+}
+
+fn bench_straight_arith(c: &mut Criterion) {
+    let mut group = c.benchmark_group("dispatch/straight_arith");
+    for n in [100usize, 1_000, 5_000] {
+        let prog = compile(&make_straight_arith_source(n));
+        // 4 dispatch steps per let-binding: LoadLocal + PushConst +
+        // IntAdd + StoreLocal. The trailing `a{n}` adds one
+        // LoadLocal + Return; absorbed into the per-iter constant.
+        group.throughput(Throughput::Elements((4 * n) as u64));
+        group.bench_function(format!("n={n}"), |b| {
+            b.iter(|| {
+                let mut vm = Vm::new(&prog);
+                vm.set_step_limit(u64::MAX);
+                black_box(
+                    vm.call("straight_arith", vec![Value::Int(0)])
+                        .expect("call straight_arith"),
+                )
+            })
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_arith_loop,
     bench_record_field,
-    bench_call_heavy
+    bench_call_heavy,
+    bench_straight_arith
 );
 criterion_main!(benches);
