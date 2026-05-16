@@ -228,6 +228,7 @@ fn value_to_json(v: &Value) -> serde_json::Value {
             J::Object(o)
         }
         Value::Actor(_) => J::String("<actor>".into()),
+        Value::Ticker(_) => J::String("<ticker>".into()),
         Value::ArrowTable(t) => {
             // Trace records the *shape*, not the data — full Arrow tables
             // can be GB-scale. Replay through the agent API doesn't need
