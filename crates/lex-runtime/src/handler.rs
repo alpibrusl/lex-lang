@@ -990,6 +990,19 @@ impl EffectHandler for DefaultHandler {
                 }
                 Ok(Value::Unit)
             }
+            ("time", "sleep") => {
+                // Duration-typed sleep (#445). Duration values are
+                // backed by `Int` nanoseconds at runtime (see the
+                // `datetime.duration_*` constructors). Same 60s cap
+                // as `sleep_ms` — kept consistent so all blocking
+                // sleeps share one ceiling.
+                let nanos = expect_int(args.first())?;
+                if nanos > 0 {
+                    let bounded_nanos = (nanos as u64).min(60_000 * 1_000_000);
+                    std::thread::sleep(std::time::Duration::from_nanos(bounded_nanos));
+                }
+                Ok(Value::Unit)
+            }
             ("rand", "int_in") => {
                 // Deterministic stub: midpoint of [lo, hi].
                 let lo = expect_int(args.first())?;

@@ -371,6 +371,21 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::singleton("time"),
                 Ty::Unit,
             ));
+            // sleep :: Duration -> [time] Unit (#445).
+            // Duration-typed sleep — pairs with the
+            // `datetime.duration_seconds` / `duration_minutes` /
+            // `duration_days` constructors so periodic-task code
+            // expresses the period in units of meaning rather than
+            // raw milliseconds. Backed by `std::thread::sleep` at
+            // runtime — blocks the calling thread, which is the right
+            // semantics for the agent-driven workloads this exists
+            // for. Inside a `net.serve` worker the same caveat as
+            // `LEX_NET_INLINE_VM=1` applies (worker is stalled for `d`).
+            fields.insert("sleep".into(), Ty::function(
+                vec![Ty::Con("Duration".into(), vec![])],
+                EffectSet::singleton("time"),
+                Ty::Unit,
+            ));
             Some(Ty::Record(fields))
         }
         "rand" => {
@@ -647,6 +662,51 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 vec![actor_t(Ty::Var(0)), Ty::Var(1)],
                 EffectSet::singleton("concurrent"),
                 Ty::Unit,
+            ));
+            // #444 — named-actor discovery within a process.
+            //
+            // register :: Actor[S], Str -> [concurrent] Result[Unit, ConcError]
+            //   Returns Err(AlreadyRegistered(name)) if the name is
+            //   taken — registration is exclusive so name collisions
+            //   surface at the source level, not as silent overwrites.
+            //
+            // lookup :: Str -> [concurrent] Option[Actor[S]]
+            //   Returns Some(actor) if registered, None otherwise. The
+            //   static `[S]` parametrisation isn't checked at runtime in
+            //   v1; the caller is responsible for matching the
+            //   registration site's type. SigId-tagged variant deferred —
+            //   see `conc_registry.rs` in lex-bytecode.
+            //
+            // unregister :: Str -> [concurrent] Result[Unit, ConcError]
+            //   Returns Err(NotRegistered(name)) if absent. Existing
+            //   `Actor[S]` handles held by callers continue to work
+            //   after unregistration; the cell is reclaimed when the
+            //   last handle drops.
+            //
+            // registered :: () -> [concurrent] List[Str]
+            //   Sorted snapshot of currently registered names. Debug /
+            //   introspection — not part of the steady-state agent flow.
+            let conc_err = || Ty::Con("ConcError".into(), vec![]);
+            let result_ce = |ok: Ty| Ty::Con("Result".into(), vec![ok, conc_err()]);
+            fields.insert("register".into(), Ty::function(
+                vec![actor_t(Ty::Var(0)), Ty::str()],
+                EffectSet::singleton("concurrent"),
+                result_ce(Ty::Unit),
+            ));
+            fields.insert("lookup".into(), Ty::function(
+                vec![Ty::str()],
+                EffectSet::singleton("concurrent"),
+                Ty::Con("Option".into(), vec![actor_t(Ty::Var(0))]),
+            ));
+            fields.insert("unregister".into(), Ty::function(
+                vec![Ty::str()],
+                EffectSet::singleton("concurrent"),
+                result_ce(Ty::Unit),
+            ));
+            fields.insert("registered".into(), Ty::function(
+                vec![],
+                EffectSet::singleton("concurrent"),
+                Ty::List(Box::new(Ty::str())),
             ));
             Some(Ty::Record(fields))
         }
