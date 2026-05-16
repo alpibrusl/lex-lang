@@ -168,11 +168,70 @@ fn bench_straight_arith(c: &mut Criterion) {
     group.finish();
 }
 
+/// Lower-bound bench: the same work as `straight_arith` (LoadLocal +
+/// PushConst + IntAdd + StoreLocal × n) without any bytecode dispatch.
+/// Runs as inline Rust over a `Vec<Value>` stack and a `Vec<Value>`
+/// locals array, mirroring the storage shapes the real VM uses.
+///
+/// This is an *intervention diagnostic*: the gap between this and
+/// `dispatch/straight_arith` is everything the bytecode interpreter
+/// adds on top of the actual semantic work (dispatch decode, frame
+/// indexing, step-limit check, op-pc advance, etc.). If the gap is
+/// small, dispatch tuning has little headroom and #461 should pivot
+/// to something else (frame caching, stack-storage rework, ...).
+/// If it's large, structural dispatch rewrites are justified.
+///
+/// Caveat: this bench's Value path matches the real VM's (clone on
+/// Load, push on PushConst, pop+pop+IntAdd push on IntAdd, pop+store
+/// on StoreLocal). It does *not* model the Vm's `step_limit` or
+/// `steps += 1` counter. Subtract those if you want the absolute
+/// floor — the dispatch loop's own overhead is what we're isolating
+/// here.
+fn bench_straight_arith_no_dispatch(c: &mut Criterion) {
+    use lex_bytecode::Value;
+    let mut group = c.benchmark_group("dispatch/straight_arith_no_dispatch");
+    for n in [100usize, 1_000, 5_000] {
+        group.throughput(Throughput::Elements((4 * n) as u64));
+        group.bench_function(format!("n={n}"), |b| {
+            b.iter(|| {
+                // One local slot per `aN`. Matches the real VM's
+                // `locals_storage` shape: a flat Vec<Value> indexed
+                // by `base + local_idx`.
+                let mut locals: Vec<Value> = vec![Value::Int(0); n + 1];
+                let mut stack: Vec<Value> = Vec::with_capacity(8);
+                locals[0] = Value::Int(black_box(0));
+                for i in 1..=n {
+                    // LoadLocal(i-1)
+                    stack.push(locals[i - 1].clone());
+                    // PushConst(1) — constant pool lookup elided since
+                    // the real VM also just clones the Const into a
+                    // Value; the work shape is the same.
+                    stack.push(Value::Int(1));
+                    // IntAdd
+                    let b = stack.pop().unwrap();
+                    let a = stack.pop().unwrap();
+                    let r = match (a, b) {
+                        (Value::Int(x), Value::Int(y)) => Value::Int(x + y),
+                        _ => unreachable!(),
+                    };
+                    stack.push(r);
+                    // StoreLocal(i)
+                    locals[i] = stack.pop().unwrap();
+                }
+                // Return locals[n]
+                black_box(locals[n].clone())
+            })
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_arith_loop,
     bench_record_field,
     bench_call_heavy,
-    bench_straight_arith
+    bench_straight_arith,
+    bench_straight_arith_no_dispatch
 );
 criterion_main!(benches);
