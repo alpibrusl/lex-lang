@@ -137,6 +137,34 @@ Set `LEX_TEST_NOW=<unix_seconds>` to pin the clock in tests (#350).
 
 `duration.seconds(d)` extracts total whole seconds from a `Duration`.
 
+### `std.time`
+`now` [time], `now_ms` [time], `now_str` [time], `mono_ns` [time],
+`sleep_ms` [time], `sleep` [time]
+
+`time.sleep(d :: Duration)` blocks the calling thread for `d`. Pair with
+`datetime.duration_seconds` / `duration_minutes` / `duration_days` to
+express the period in units. Inside a `net.serve` worker the sleep
+stalls the worker — same caveat as `LEX_NET_INLINE_VM=1`. Capped at 60s
+to bound runaway loops; use process-level scheduling for longer waits.
+
+### `std.conc`
+`spawn` [concurrent], `ask` [concurrent], `tell` [concurrent],
+`register` [concurrent], `lookup` [concurrent], `unregister` [concurrent],
+`registered` [concurrent]
+
+Actors hold per-process state across messages. `spawn(init, handler)`
+returns `Actor[S]`; `ask` / `tell` run `handler(state, msg)` on the
+caller's VM thread, serialised by the actor's internal mutex.
+
+`register(actor, name)` makes the actor reachable by name from anywhere
+in the process — for routing a request handler to the actor that owns
+the relevant agent state (vehicle / depot / etc.). Returns `Err(AlreadyRegistered(name))`
+if the name is taken. `lookup(name) :: Option[Actor[S]]` retrieves it;
+the `[S]` is parametrised at the call site and trusted to match the
+registration site (no runtime type check in v1). `unregister(name)`
+drops the name binding but existing `Actor[S]` handles held by callers
+keep working. `registered()` returns a sorted snapshot of names.
+
 ### `std.http`
 `get`, `post`, `put`, `delete`, `patch` — all require `[http.*]` effect.
 

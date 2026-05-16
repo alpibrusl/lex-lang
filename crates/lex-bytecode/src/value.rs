@@ -5,6 +5,7 @@ use arrow_array::RecordBatch;
 use indexmap::IndexMap;
 use smol_str::SmolStr;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 /// Internal state of a `conc.Actor`. Protected by a `Mutex` so that
@@ -72,6 +73,12 @@ pub enum Value {
     /// Two actor handles compare equal iff they point to the same cell
     /// (identity equality, not structural equality).
     Actor(Arc<Mutex<ActorCell>>),
+    /// A periodic-tick handle returned by `conc.every` (#445). The
+    /// `AtomicBool` is the cancel flag — `conc.cancel(t)` sets it and
+    /// the background scheduler thread observes it on its next iteration
+    /// and exits. Two ticker handles compare equal iff they point to the
+    /// same cancel flag.
+    Ticker(Arc<AtomicBool>),
     /// Apache Arrow `RecordBatch` — an unboxed columnar table. The
     /// "fast lane" representation for `lex-frame` and any future
     /// dataframe code: a `Value::ArrowTable` with one int64 column
@@ -119,6 +126,9 @@ impl PartialEq for Value {
             (Deque(a), Deque(b)) => a == b,
             // Actor identity: same if both handles point to the same cell.
             (Actor(a), Actor(b)) => Arc::ptr_eq(a, b),
+            // Ticker identity: same if both handles point to the same
+            // cancel flag (one ticker spawn → one flag).
+            (Ticker(a), Ticker(b)) => Arc::ptr_eq(a, b),
             // Arrow table equality: structural over schema + columns.
             // RecordBatch implements PartialEq directly.
             (ArrowTable(a), ArrowTable(b)) => a == b,
@@ -260,6 +270,7 @@ impl Value {
                 s.iter().map(|k| k.as_value().to_json()).collect()),
             Value::Deque(items) => J::Array(items.iter().map(Value::to_json).collect()),
             Value::Actor(_) => J::String("<actor>".into()),
+            Value::Ticker(_) => J::String("<ticker>".into()),
             Value::ArrowTable(t) => {
                 // Compact summary: schema + nrows. Full data is intentionally
                 // not emitted — Arrow tables can be GB-scale and a JSON dump

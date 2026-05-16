@@ -526,6 +526,12 @@ impl<'a> Vm<'a> {
         }
     }
 
+    // ---- Variant helpers used by conc.* registry ops (#444) ----
+    // Local helpers (avoid pulling in serde / public API). Lex's
+    // `Result`/`Option` are stdlib unions; their runtime shape is a
+    // `Value::Variant { name, args }` with the constructor name as
+    // declared (`Ok`/`Err`/`Some`/`None`).
+
     /// VM-level handler for `conc.*` effect ops (#381).
     ///
     /// * `conc.spawn(init, handler)` — creates an `Actor` wrapping the
@@ -583,6 +589,74 @@ impl<'a> Vm<'a> {
                     other => Err(format!(
                         "conc.{op}: handler must return a 2-tuple (new_state, reply), got {other:?}")),
                 }
+            }
+            "register" => {
+                // conc.register(actor, name) -> Result[Unit, ConcError]
+                // Returns Ok(Unit) on first register, Err(AlreadyRegistered(name))
+                // if the name is taken. v1 stores the actor opaquely —
+                // see crate::conc_registry for the type-tag note.
+                let mut it = args.into_iter();
+                let actor = it.next().unwrap_or(Value::Unit);
+                if !matches!(actor, Value::Actor(_)) {
+                    return Err(format!(
+                        "conc.register: first arg must be an Actor, got {actor:?}"));
+                }
+                let name = match it.next() {
+                    Some(Value::Str(s)) => s.to_string(),
+                    other => return Err(format!(
+                        "conc.register: name must be Str, got {other:?}")),
+                };
+                Ok(match crate::conc_registry::register(&name, actor) {
+                    Ok(()) => variant_ok(Value::Unit),
+                    Err(crate::conc_registry::RegError::AlreadyRegistered(n)) => {
+                        variant_err(variant("AlreadyRegistered", vec![Value::Str(n.into())]))
+                    }
+                    Err(crate::conc_registry::RegError::NotRegistered(_)) => {
+                        unreachable!("register cannot produce NotRegistered")
+                    }
+                })
+            }
+            "lookup" => {
+                // conc.lookup(name) -> Option[Actor[S, M]]
+                // Returns Some(actor) if registered, None otherwise. The
+                // [S, M] static parametrisation at the call site is not
+                // checked at runtime in v1 — caller's responsibility to
+                // match the registration site's type.
+                let mut it = args.into_iter();
+                let name = match it.next() {
+                    Some(Value::Str(s)) => s.to_string(),
+                    other => return Err(format!(
+                        "conc.lookup: name must be Str, got {other:?}")),
+                };
+                Ok(match crate::conc_registry::lookup(&name) {
+                    Some(actor) => variant("Some", vec![actor]),
+                    None => variant("None", vec![]),
+                })
+            }
+            "unregister" => {
+                // conc.unregister(name) -> Result[Unit, ConcError]
+                let mut it = args.into_iter();
+                let name = match it.next() {
+                    Some(Value::Str(s)) => s.to_string(),
+                    other => return Err(format!(
+                        "conc.unregister: name must be Str, got {other:?}")),
+                };
+                Ok(match crate::conc_registry::unregister(&name) {
+                    Ok(()) => variant_ok(Value::Unit),
+                    Err(crate::conc_registry::RegError::NotRegistered(n)) => {
+                        variant_err(variant("NotRegistered", vec![Value::Str(n.into())]))
+                    }
+                    Err(crate::conc_registry::RegError::AlreadyRegistered(_)) => {
+                        unreachable!("unregister cannot produce AlreadyRegistered")
+                    }
+                })
+            }
+            "registered" => {
+                // conc.registered() -> List[Str] — sorted snapshot.
+                let names = crate::conc_registry::registered();
+                Ok(Value::List(names.into_iter()
+                    .map(|n| Value::Str(n.into()))
+                    .collect()))
             }
             other => Err(format!("unknown conc.{other}")),
         }
@@ -1395,6 +1469,15 @@ impl<'a> Vm<'a> {
         Ok(())
     }
 }
+
+/// Construct a `Value::Variant` with the given name and args.
+/// Used by `conc.*` registry ops to return `Result`/`Option`/`ConcError`
+/// values without hand-writing the struct literal at every site.
+fn variant(name: &str, args: Vec<Value>) -> Value {
+    Value::Variant { name: name.to_string(), args }
+}
+fn variant_ok(payload: Value) -> Value { variant("Ok", vec![payload]) }
+fn variant_err(payload: Value) -> Value { variant("Err", vec![payload]) }
 
 fn const_to_value(c: &Const) -> Value {
     match c {

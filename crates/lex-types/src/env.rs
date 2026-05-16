@@ -297,6 +297,22 @@ impl TypeEnv {
             e.ctor_to_type.insert((*ctor).into(), "WsAction".into());
         }
 
+        // ConcError = AlreadyRegistered(Str) | NotRegistered(Str)
+        // Returned by `conc.register` / `conc.unregister` (#444). A
+        // third `TypeMismatch` variant is reserved for when the
+        // SigId-tagged registry lands — see `conc_registry.rs` in
+        // lex-bytecode for the deferred-design note.
+        let mut ce_variants = IndexMap::new();
+        ce_variants.insert("AlreadyRegistered".into(), Some(Ty::str()));
+        ce_variants.insert("NotRegistered".into(), Some(Ty::str()));
+        e.types.insert("ConcError".into(), TypeDef {
+            params: vec![],
+            kind: TypeDefKind::Union(ce_variants),
+        });
+        for ctor in &["AlreadyRegistered", "NotRegistered"] {
+            e.ctor_to_type.insert((*ctor).into(), "ConcError".into());
+        }
+
         e
     }
 
