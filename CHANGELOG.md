@@ -136,6 +136,22 @@ bumps may carry breaking changes when justified).
 
 ### Performance
 
+- **#431 (experimental): `LEX_NET_INLINE_VM=1` — skip `spawn_blocking`
+  on `net.serve` / `net.serve_fn`.** Per-request VM call runs directly on
+  the tokio worker instead of being dispatched to the blocking pool.
+  Measured on lex-web's TechEmpower-style bench (2-core `taskset`,
+  hyper 1.x + tokio default scheduler, 3 routes registered): **+33 % on
+  `/plaintext` (6 849 → 9 118 req/s), +28 % on `/json`, +17 % on routed
+  `/users/:id`.** Variance also tightens — baseline trials spread 25 %,
+  inline-vm trials spread 3 %.
+
+  **Tradeoff:** if a Lex handler does heavy CPU work (>1 ms of
+  bytecode) it now stalls the tokio worker it's on. For
+  microsecond-scale handlers (the common case for `net.serve_fn` apps)
+  this is the right tradeoff; for any handler doing real compute or
+  sync I/O, leave the flag unset and pay the `spawn_blocking` cost.
+  The default behaviour is unchanged unless the env var is set.
+
 - **#389 (slice 3): VM locals — stack-allocator arena.** Replaced the
   per-call-frame `Vec<Value>` for function locals with a shared slab
   (`Vm::locals_storage: Vec<Value>`) that acts as a stack allocator. Each
