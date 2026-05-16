@@ -50,7 +50,7 @@ postgres = "0.19"
 arrow-array = "55"
 arrow-schema = "55"
 arrow-select = "55"
-arrow-arith = "55"
+arrow-arith = "58"
 arrow-cast = "55"
 arrow-csv = "55"
 parquet = { version = "55", default-features = false, features = ["arrow", "snap"] }
