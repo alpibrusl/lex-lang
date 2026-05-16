@@ -8,11 +8,21 @@ use lex_ast::canonicalize_program;
 use lex_bytecode::{compile_program, conc_registry, vm::Vm, Value};
 use lex_runtime::{DefaultHandler, Policy};
 use lex_syntax::parse_source;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
-// Cargo's default test runner parallelises within a binary. The
-// registry is process-global, so tests in this file must run serially —
-// invoke with `cargo test --test conc_registry -- --test-threads=1`.
-// Each test calls `_reset_for_tests` at the top to be sure.
+// The registry is process-global. Cargo runs tests in this file in
+// parallel by default (CI invokes `cargo test --workspace` without
+// `--test-threads=1`), so each test serialises through `serial_lock`
+// before touching state. `_reset_for_tests` is called *after* taking
+// the lock so the slate is clean at the top of every body. The lock
+// recovers from a poisoned guard (a prior panic) — we only care about
+// mutual exclusion, not about preserving any state across the panic.
+fn serial_lock() -> MutexGuard<'static, ()> {
+    static M: OnceLock<Mutex<()>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
 
 fn run(src: &str, func: &str, args: Vec<Value>) -> Value {
     let prog = parse_source(src).expect("parse");
@@ -94,6 +104,7 @@ fn unwrap_some(v: Value) -> Value {
 
 #[test]
 fn register_first_time_returns_ok() {
+    let _guard = serial_lock();
     conc_registry::_reset_for_tests();
 
     let actor = run(SUM_ACTOR_SRC, "spawn_sum", vec![Value::Int(0)]);
@@ -106,6 +117,7 @@ fn register_first_time_returns_ok() {
 
 #[test]
 fn register_duplicate_name_returns_already_registered() {
+    let _guard = serial_lock();
     conc_registry::_reset_for_tests();
 
     let a = run(SUM_ACTOR_SRC, "spawn_sum", vec![Value::Int(0)]);
@@ -128,6 +140,7 @@ fn register_duplicate_name_returns_already_registered() {
 
 #[test]
 fn lookup_unregistered_returns_none() {
+    let _guard = serial_lock();
     conc_registry::_reset_for_tests();
 
     let r = run(SUM_ACTOR_SRC, "lk", vec![Value::Str("nope".into())]);
@@ -136,6 +149,7 @@ fn lookup_unregistered_returns_none() {
 
 #[test]
 fn lookup_after_register_returns_same_actor_identity() {
+    let _guard = serial_lock();
     conc_registry::_reset_for_tests();
 
     let actor = run(SUM_ACTOR_SRC, "spawn_sum", vec![Value::Int(10)]);
@@ -149,6 +163,7 @@ fn lookup_after_register_returns_same_actor_identity() {
 
 #[test]
 fn ask_via_lookup_drives_actor_state() {
+    let _guard = serial_lock();
     conc_registry::_reset_for_tests();
 
     let a = run(SUM_ACTOR_SRC, "spawn_sum", vec![Value::Int(0)]);
@@ -165,6 +180,7 @@ fn ask_via_lookup_drives_actor_state() {
 
 #[test]
 fn unregister_removes_name_but_existing_handles_still_work() {
+    let _guard = serial_lock();
     conc_registry::_reset_for_tests();
 
     let a = run(SUM_ACTOR_SRC, "spawn_sum", vec![Value::Int(0)]);
@@ -186,6 +202,7 @@ fn unregister_removes_name_but_existing_handles_still_work() {
 
 #[test]
 fn unregister_missing_name_returns_not_registered() {
+    let _guard = serial_lock();
     conc_registry::_reset_for_tests();
 
     let r = run(SUM_ACTOR_SRC, "unreg", vec![Value::Str("missing".into())]);
@@ -204,6 +221,7 @@ fn unregister_missing_name_returns_not_registered() {
 
 #[test]
 fn registered_lists_names_sorted() {
+    let _guard = serial_lock();
     conc_registry::_reset_for_tests();
 
     let a = run(SUM_ACTOR_SRC, "spawn_sum", vec![Value::Int(0)]);
