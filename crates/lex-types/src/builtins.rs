@@ -60,6 +60,17 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                     Ty::bool(),
                 ));
             }
+            // str.cmp :: (Str, Str) -> Int — -1 / 0 / 1, lex-byte order.
+            // Three-way comparator usable as a sort-by closure value;
+            // boolean comparisons stay on the `<`/`<=`/`>`/`>=` operators
+            // (which already work on Str via `bin_ord`), so `str.lt`
+            // etc. are deliberately not exposed — keep the surface
+            // minimal (#440).
+            fields.insert("cmp".into(), Ty::function(
+                vec![Ty::str(), Ty::str()],
+                EffectSet::empty(),
+                Ty::int(),
+            ));
             // -- transformers --
             fields.insert("replace".into(), Ty::function(
                 vec![Ty::str(), Ty::str(), Ty::str()],

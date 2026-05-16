@@ -121,6 +121,15 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let needle = expect_str(args.get(1))?;
             Ok(Value::Bool(s.contains(needle.as_str())))
         }
+        ("str", "cmp") => {
+            let a = expect_str(args.first())?;
+            let b = expect_str(args.get(1))?;
+            Ok(Value::Int(match a.as_str().cmp(b.as_str()) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            }))
+        }
         ("str", "replace") => {
             let s = expect_str(args.first())?;
             let from = expect_str(args.get(1))?;
