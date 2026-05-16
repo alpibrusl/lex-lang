@@ -85,22 +85,20 @@ fn main() -> [net, concurrent] Nil {{
 /// it. Returns the registered actor handle (still held by the global
 /// registry).
 fn tell_via_lex_program(name: &str, body: &str) -> bool {
-    let src = format!(
-        r#"
+    let src = r#"
 import "std.conc" as conc
 
-fn tell_if_present(name :: Str, body :: Str) -> [concurrent] Bool {{
-  match conc.lookup(name) {{
+fn tell_if_present(name :: Str, body :: Str) -> [concurrent] Bool {
+  match conc.lookup(name) {
     None        => false,
-    Some(actor) => {{
+    Some(actor) => {
       let _ := conc.tell(actor, body)
       true
-    }},
-  }}
-}}
-"#
-    );
-    let prog = parse_source(&src).expect("parse");
+    },
+  }
+}
+"#;
+    let prog = parse_source(src).expect("parse");
     let stages = canonicalize_program(&prog);
     if let Err(errs) = lex_types::check_program(&stages) {
         panic!("type errors in tell helper: {errs:#?}");
@@ -121,7 +119,7 @@ fn tell_if_present(name :: Str, body :: Str) -> [concurrent] Bool {{
 
 #[test]
 fn outbound_tell_reaches_the_socket() {
-    let _ = conc_registry::_reset_for_tests();
+    conc_registry::_reset_for_tests();
     let port = free_port();
     spawn_server(&server_src(port));
 
@@ -160,7 +158,7 @@ fn outbound_tell_reaches_the_socket() {
 
 #[test]
 fn name_of_empty_string_skips_registration() {
-    let _ = conc_registry::_reset_for_tests();
+    conc_registry::_reset_for_tests();
     let port = free_port();
     // name_of returns "" — the connection should not appear in
     // conc_registry, but on_message should still run.
@@ -213,7 +211,7 @@ fn main() -> [net, concurrent] Nil {{
 
 #[test]
 fn unregister_on_disconnect_clears_the_name() {
-    let _ = conc_registry::_reset_for_tests();
+    conc_registry::_reset_for_tests();
     let port = free_port();
     spawn_server(&server_src(port));
 
