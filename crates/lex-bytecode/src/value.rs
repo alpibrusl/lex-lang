@@ -9,11 +9,19 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 /// Internal state of a `conc.Actor`. Protected by a `Mutex` so that
-/// concurrent callers serialise on message delivery (the actor processes
-/// one message at a time). The `handler` is dispatched on the
-/// *calling* VM's thread — no extra OS thread required — which lets
-/// Lex handlers invoke arbitrary effects (sql, net, …) through the
-/// same handler chain.
+/// the `Lex` handler variant serialises on message delivery (one
+/// message processed at a time, state mutated under the lock). The
+/// `handler` is dispatched on the *calling* VM's thread — no extra
+/// OS thread required — which lets Lex handlers invoke arbitrary
+/// effects (sql, net, …) through the same handler chain.
+///
+/// Serialisation note: the `Native` variant releases the mutex
+/// *before* invoking its closure (`state` is unused for natives —
+/// the "state" is an external resource like a channel), so two
+/// concurrent `conc.tell`s on the same native bridge may invoke
+/// the closure on overlapping threads. Native bridges therefore
+/// need to be internally thread-safe; the `serve_ws_fn_actor`
+/// `mpsc::Sender` bridge is, because `Sender::send` is.
 #[derive(Debug, Clone)]
 pub struct ActorCell {
     pub state: Value,

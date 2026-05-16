@@ -764,7 +764,13 @@ fn handle_connection_fn_actor(
     let _ = ws.get_mut().set_read_timeout(Some(Duration::from_millis(50)));
 
     // Build the WsConn record and ask the user's name_of closure what
-    // name to register this connection under. Empty string → opt-out.
+    // name to register this connection under. Empty string is the
+    // documented opt-out (inbound still works, no outbound handle is
+    // exposed). Type mismatch or runtime error aborts the connection —
+    // the same "surface the bug at the source level" reasoning as a
+    // `conc.register` name collision below; silently degrading to an
+    // unregistered connection would have a non-WS caller's
+    // `conc.lookup` return None and conclude the session is offline.
     let ws_conn = build_ws_conn(conn_id, &path, &subprotocol);
     let registered_name: Option<String> = {
         let handler = crate::handler::DefaultHandler::new(policy.clone())
@@ -775,12 +781,18 @@ fn handle_connection_fn_actor(
             Ok(Value::Str(s)) if !s.is_empty() => Some(s.to_string()),
             Ok(Value::Str(_)) => None,
             Ok(other) => {
-                eprintln!("net.serve_ws_fn_actor: name_of must return Str, got {other:?}");
-                None
+                registry.unregister(conn_id);
+                let _ = ws.close(None);
+                return Err(format!(
+                    "net.serve_ws_fn_actor: name_of must return Str, got {other:?}"
+                ));
             }
             Err(e) => {
-                eprintln!("net.serve_ws_fn_actor: name_of error: {e:?}");
-                None
+                registry.unregister(conn_id);
+                let _ = ws.close(None);
+                return Err(format!(
+                    "net.serve_ws_fn_actor: name_of error: {e:?}"
+                ));
             }
         }
     };
