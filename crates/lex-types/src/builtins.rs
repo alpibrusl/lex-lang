@@ -611,6 +611,42 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::open_var(0).union(&EffectSet::singleton("net")),
                 Ty::Unit,
             ));
+            // serve_routed[Eff] :: (
+            //     Int,
+            //     List[(Str, Str, (Request) -> [Eff] Response)],
+            //     (Request) -> [Eff] Response
+            //   ) -> [net, Eff] Unit
+            //
+            // Pattern-matched dispatch over `serve_fn`. Each route is a
+            // (method, path-pattern, handler) triple — method is an
+            // HTTP verb (case-insensitive) or "*" for any; path-patterns
+            // use `:name` segments (e.g. "/users/:id") and matched values
+            // are stamped onto `req.path_params` before the handler runs.
+            // Routes are tried in registration order; the first match
+            // wins. `fallback` runs when no route matches — typically a
+            // 404 responder. Same `open_var(0)` effect-row trick as
+            // `serve_fn` so handler effects propagate to the call site.
+            fields.insert("serve_routed".into(), Ty::function(
+                vec![
+                    Ty::int(),
+                    Ty::List(Box::new(Ty::Tuple(vec![
+                        Ty::str(),
+                        Ty::str(),
+                        Ty::function(
+                            vec![Ty::Con("Request".into(), vec![])],
+                            EffectSet::open_var(0),
+                            Ty::Con("Response".into(), vec![]),
+                        ),
+                    ]))),
+                    Ty::function(
+                        vec![Ty::Con("Request".into(), vec![])],
+                        EffectSet::open_var(0),
+                        Ty::Con("Response".into(), vec![]),
+                    ),
+                ],
+                EffectSet::open_var(0).union(&EffectSet::singleton("net")),
+                Ty::Unit,
+            ));
             Some(Ty::Record(fields))
         }
         "chat" => {
