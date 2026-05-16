@@ -162,3 +162,171 @@ fn df_kernels_via_direct_dispatch() {
         panic!("expected ArrowTable, got {out:?}");
     }
 }
+
+// ===== #433 — string / float / null filter predicates =====
+
+/// Build a 6-row mixed-type Table programmatically for the new
+/// predicates. Columns: x: Int64 [1..6], y: Float64 [1.0..6.0], g:
+/// Utf8 ["a","b","a","b","a","b"]. Includes one null in `z` (Int64)
+/// at rows 1 and 3.
+fn make_mixed_batch() -> Value {
+    use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("x", DataType::Int64, false),
+        Field::new("y", DataType::Float64, false),
+        Field::new("g", DataType::Utf8, false),
+        Field::new("z", DataType::Int64, true),
+    ]));
+    let xs = Int64Array::from(vec![1_i64, 2, 3, 4, 5, 6]);
+    let ys = Float64Array::from(vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let gs = StringArray::from(vec!["a", "b", "a", "b", "a", "b"]);
+    let zs = Int64Array::from(vec![None, Some(20), None, Some(40), Some(50), Some(60)]);
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(xs), Arc::new(ys), Arc::new(gs), Arc::new(zs)],
+    ).unwrap();
+    Value::ArrowTable(Arc::new(batch))
+}
+
+fn nrows_of(v: Value) -> usize {
+    match v {
+        Value::ArrowTable(t) => t.num_rows(),
+        other => panic!("expected ArrowTable, got {other:?}"),
+    }
+}
+
+fn unwrap_err(v: Value) -> String {
+    match v {
+        Value::Variant { name, args } if name == "Err" && args.len() == 1 => {
+            match args.into_iter().next().unwrap() {
+                Value::Str(s) => s.to_string(),
+                other => panic!("Err payload not Str: {other:?}"),
+            }
+        }
+        other => panic!("expected Err(_), got {other:?}"),
+    }
+}
+
+#[test]
+fn df_filter_eq_str() {
+    let t = make_mixed_batch();
+    let r = lex_runtime::df::dispatch(
+        "filter_eq_str",
+        &[t, Value::Str("g".into()), Value::Str("a".into())],
+    ).unwrap().unwrap();
+    assert_eq!(nrows_of(unwrap_ok(r)), 3);
+}
+
+#[test]
+fn df_filter_in_str() {
+    let t = make_mixed_batch();
+    let needles = Value::List([Value::Str("a".into()), Value::Str("z".into())].into_iter().collect());
+    let r = lex_runtime::df::dispatch(
+        "filter_in_str",
+        &[t, Value::Str("g".into()), needles],
+    ).unwrap().unwrap();
+    // "z" doesn't exist; "a" matches 3 rows.
+    assert_eq!(nrows_of(unwrap_ok(r)), 3);
+}
+
+#[test]
+fn df_filter_in_str_empty_list_is_empty_result() {
+    let t = make_mixed_batch();
+    let needles = Value::List(std::collections::VecDeque::new());
+    let r = lex_runtime::df::dispatch(
+        "filter_in_str",
+        &[t, Value::Str("g".into()), needles],
+    ).unwrap().unwrap();
+    assert_eq!(nrows_of(unwrap_ok(r)), 0);
+}
+
+#[test]
+fn df_filter_eq_str_on_int_column_is_err() {
+    let t = make_mixed_batch();
+    let r = lex_runtime::df::dispatch(
+        "filter_eq_str",
+        &[t, Value::Str("x".into()), Value::Str("1".into())],
+    ).unwrap().unwrap();
+    let msg = unwrap_err(r);
+    assert!(msg.contains("expected") && msg.contains("Utf8"),
+        "expected type-mismatch with Utf8, got: {msg}");
+}
+
+#[test]
+fn df_filter_lt_float() {
+    let t = make_mixed_batch();
+    let r = lex_runtime::df::dispatch(
+        "filter_lt_float",
+        &[t, Value::Str("y".into()), Value::Float(3.5)],
+    ).unwrap().unwrap();
+    assert_eq!(nrows_of(unwrap_ok(r)), 3);
+}
+
+#[test]
+fn df_filter_gt_float() {
+    let t = make_mixed_batch();
+    let r = lex_runtime::df::dispatch(
+        "filter_gt_float",
+        &[t, Value::Str("y".into()), Value::Float(3.5)],
+    ).unwrap().unwrap();
+    assert_eq!(nrows_of(unwrap_ok(r)), 3);
+}
+
+#[test]
+fn df_filter_eq_float() {
+    let t = make_mixed_batch();
+    let r = lex_runtime::df::dispatch(
+        "filter_eq_float",
+        &[t, Value::Str("y".into()), Value::Float(4.0)],
+    ).unwrap().unwrap();
+    assert_eq!(nrows_of(unwrap_ok(r)), 1);
+}
+
+#[test]
+fn df_filter_isnull_and_notnull() {
+    let t = make_mixed_batch();
+
+    // z has nulls at rows 1 and 3 → filter_isnull → 2 rows.
+    let r = lex_runtime::df::dispatch(
+        "filter_isnull", &[t.clone(), Value::Str("z".into())],
+    ).unwrap().unwrap();
+    assert_eq!(nrows_of(unwrap_ok(r)), 2, "z has 2 nulls");
+
+    // filter_notnull → 4 rows.
+    let r = lex_runtime::df::dispatch(
+        "filter_notnull", &[t, Value::Str("z".into())],
+    ).unwrap().unwrap();
+    assert_eq!(nrows_of(unwrap_ok(r)), 4, "z has 4 non-null values");
+}
+
+#[test]
+fn df_filter_isnull_unknown_column_is_err() {
+    let t = make_mixed_batch();
+    let r = lex_runtime::df::dispatch(
+        "filter_isnull", &[t, Value::Str("nope".into())],
+    ).unwrap().unwrap();
+    let msg = unwrap_err(r);
+    assert!(msg.contains("nope"), "error should name missing column: {msg}");
+}
+
+#[test]
+fn df_drop_nulls() {
+    let t = make_mixed_batch();
+    let cols = Value::List([Value::Str("z".into())].into_iter().collect());
+    let r = lex_runtime::df::dispatch(
+        "drop_nulls", &[t, cols],
+    ).unwrap().unwrap();
+    assert_eq!(nrows_of(unwrap_ok(r)), 4, "drop_nulls on z removes 2 rows");
+}
+
+#[test]
+fn df_drop_nulls_empty_col_list_is_noop() {
+    let t = make_mixed_batch();
+    let empty_cols = Value::List(std::collections::VecDeque::new());
+    let r = lex_runtime::df::dispatch(
+        "drop_nulls", &[t, empty_cols],
+    ).unwrap().unwrap();
+    assert_eq!(nrows_of(unwrap_ok(r)), 6, "empty col list is a no-op");
+}

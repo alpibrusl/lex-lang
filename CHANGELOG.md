@@ -7,6 +7,46 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added
+
+- **#433: `std.df` string / float / null filter predicates.** Rounds
+  out the predicate surface (#428 only shipped int filters). Eight new
+  builtins:
+
+  - `df.filter_eq_str  :: (Table, Str, Str)       -> Result[Table, Str]`
+  - `df.filter_in_str  :: (Table, Str, List[Str]) -> Result[Table, Str]`
+  - `df.filter_eq_float / filter_lt_float / filter_gt_float :: (Table, Str, Float) -> Result[Table, Str]`
+  - `df.filter_isnull / filter_notnull :: (Table, Str) -> Result[Table, Str]`
+  - `df.drop_nulls     :: (Table, List[Str]) -> Result[Table, Str]`
+
+  Type-mismatch surfaces as `Err("expected Utf8 column, got Int64")`
+  — no silent coercion. `filter_in_str` with an empty needle list →
+  empty result (SQL `WHERE col IN ()` semantics). `drop_nulls` with
+  an empty column list is a no-op.
+
+- **`df.to_polars` / `df.from_polars` now preserve nulls.** The
+  arrow→polars conversion previously collapsed nulls to 0/0.0/"";
+  filter_isnull would never see them. Fixed by routing both directions
+  through `Vec<Option<T>>`, and emitting nullable=true fields on the
+  arrow side after a polars round-trip.
+
+- **#432: `std.arrow` Parquet + CSV-write I/O.** Three new effect-gated
+  builtins close the I/O matrix that `arrow.read_csv` opened:
+
+  - `arrow.read_parquet :: Str -> [fs_read] Result[Table, Str]`
+  - `arrow.read_parquet_cols :: (Str, List[Str]) -> [fs_read] Result[Table, Str]`
+  - `arrow.write_parquet :: (Table, Str) -> [fs_write] Result[Unit, Str]`
+  - `arrow.write_csv     :: (Table, Str) -> [fs_write] Result[Unit, Str]`
+
+  Path scope uses `--allow-fs-read` / `--allow-fs-write` (same gates
+  as `io.read` / `io.write`). `read_parquet_cols` pushes the projection
+  into the Parquet reader so unrequested columns are never decoded;
+  missing column names surface as `Err`, not silently dropped. Writes
+  default to Snappy compression / default page+row-group sizes; a
+  `write_parquet_opts` variant can ride a follow-up if knobs are
+  needed. Unblocks the H2O.ai db-benchmark workflow and any agent
+  reading commodity Parquet data.
+
 ## [0.9.4] — 2026-05-15
 
 ### Added

@@ -53,6 +53,7 @@ arrow-select = "55"
 arrow-arith = "55"
 arrow-cast = "55"
 arrow-csv = "55"
+parquet = { version = "55", default-features = false, features = ["arrow", "snap"] }
 polars = { version = "0.50", default-features = false, features = ["lazy", "is_in", "csv", "performant", "strings"] }
 lex-bytecode = { path = "../lex-bytecode", version = "0.9.4" }
 smol_str = { workspace = true }

@@ -823,6 +823,66 @@ impl EffectHandler for DefaultHandler {
                 Err(e) => Ok(err(Value::Str(e.into()))),
             };
         }
+        // `arrow.read_parquet` and `arrow.read_parquet_cols` are the
+        // Parquet siblings of `read_csv`. Same `[fs_read]` effect, same
+        // path-scope check. `_cols` takes an extra `List[Str]` argument.
+        if kind == "arrow" && (op == "read_parquet" || op == "read_parquet_cols") {
+            self.ensure_kind_allowed("fs_read")?;
+            let path = expect_str(args.first())?.to_string();
+            let resolved = self.resolve_read_path(&path);
+            if !self.policy.allow_fs_read.is_empty()
+                && !self.policy.allow_fs_read.iter().any(|a| resolved.starts_with(a))
+            {
+                return Err(format!("arrow.{op}: `{path}` outside --allow-fs-read"));
+            }
+            let r = if op == "read_parquet" {
+                crate::arrow::read_parquet_at(&resolved)
+            } else {
+                let cols = match args.get(1) {
+                    Some(Value::List(items)) => {
+                        let mut out = Vec::with_capacity(items.len());
+                        for v in items.iter() {
+                            match v {
+                                Value::Str(s) => out.push(s.to_string()),
+                                other => return Err(format!(
+                                    "arrow.read_parquet_cols: column name not Str: {other:?}")),
+                            }
+                        }
+                        out
+                    }
+                    other => return Err(format!(
+                        "arrow.read_parquet_cols: expected List[Str], got {other:?}")),
+                };
+                crate::arrow::read_parquet_cols_at(&resolved, &cols)
+            };
+            return match r {
+                Ok(v) => Ok(ok(v)),
+                Err(e) => Ok(err(Value::Str(e.into()))),
+            };
+        }
+        // `arrow.write_parquet` and `arrow.write_csv` declare `[fs_write]`.
+        // Path scope uses `--allow-fs-write` (symmetric with `io.write`).
+        if kind == "arrow" && (op == "write_parquet" || op == "write_csv") {
+            self.ensure_kind_allowed("fs_write")?;
+            let table_v = args.first().cloned().unwrap_or(Value::Unit);
+            let rb = match &table_v {
+                Value::ArrowTable(t) => Arc::clone(t),
+                other => return Err(format!("arrow.{op}: first arg must be arrow.Table, got {other:?}")),
+            };
+            let path = expect_str(args.get(1))?.to_string();
+            if let Err(e) = self.ensure_fs_write_path(&path) {
+                return Ok(err(Value::Str(format!("arrow.{op}: {e}").into())));
+            }
+            let r = if op == "write_parquet" {
+                crate::arrow::write_parquet_at(&rb, std::path::Path::new(&path))
+            } else {
+                crate::arrow::write_csv_at(&rb, std::path::Path::new(&path))
+            };
+            return match r {
+                Ok(_)  => Ok(ok(Value::Unit)),
+                Err(e) => Ok(err(Value::Str(e.into()))),
+            };
+        }
         self.ensure_kind_allowed(kind)?;
         match (kind, op) {
             ("io", "print") => {
