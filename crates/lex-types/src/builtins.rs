@@ -2334,6 +2334,21 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::empty(),
                 result_he(Ty::str()),
             ));
+            // stream_lines :: Str, Map[Str, Str], Str -> [net] Result[Iter[Str], Str]
+            // Streaming HTTP POST; yields the response body line-by-line for
+            // SSE / NDJSON endpoints. Connection errors surface as Err(Str).
+            fields.insert("stream_lines".into(), Ty::function(
+                vec![
+                    Ty::str(),
+                    Ty::Con("Map".into(), vec![Ty::str(), Ty::str()]),
+                    Ty::str(),
+                ],
+                EffectSet::singleton("net"),
+                Ty::Con("Result".into(), vec![
+                    Ty::Con("Iter".into(), vec![Ty::str()]),
+                    Ty::str(),
+                ]),
+            ));
             Some(Ty::Record(fields))
         }
         "yaml" => {
