@@ -55,11 +55,11 @@ arrow-cast = "55"
 arrow-csv = "55"
 parquet = { version = "55", default-features = false, features = ["arrow", "snap"] }
 polars = { version = "0.50", default-features = false, features = ["lazy", "is_in", "csv", "performant", "strings"] }
-lex-bytecode = { path = "../lex-bytecode", version = "0.9.4" }
+lex-bytecode = { path = "../lex-bytecode", version = "0.9.5" }
 smol_str = { workspace = true }
 
 [dev-dependencies]
-lex-syntax = { path = "../lex-syntax", version = "0.9.4" }
-lex-ast = { path = "../lex-ast", version = "0.9.4" }
-lex-types = { path = "../lex-types", version = "0.9.4" }
+lex-syntax = { path = "../lex-syntax", version = "0.9.5" }
+lex-ast = { path = "../lex-ast", version = "0.9.5" }
+lex-types = { path = "../lex-types", version = "0.9.5" }
 tempfile = "3"
