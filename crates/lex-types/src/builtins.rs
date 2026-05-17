@@ -693,6 +693,82 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::open_var(0).union(&EffectSet::singleton("net")),
                 Ty::Unit,
             ));
+
+            // ServeOpts is a structural record literal — callers build
+            // it with `{ http2: ..., inline_vm: ..., host: ... }`. Used
+            // by `serve_with` / `serve_fn_with` / `serve_routed_with`
+            // to replace the legacy LEX_NET_HTTP2 / LEX_NET_INLINE_VM
+            // env-var gates with a first-class, type-checked config.
+            // See lex-lang#497.
+            let serve_opts_t = || {
+                let mut fs = IndexMap::new();
+                fs.insert("http2".into(),     Ty::bool());
+                fs.insert("inline_vm".into(), Ty::bool());
+                fs.insert("host".into(),      Ty::str());
+                Ty::Record(fs)
+            };
+
+            // default_opts :: () -> ServeOpts
+            // Returns the same defaults the legacy serve* paths use —
+            // http2=false, inline_vm=false, host="0.0.0.0". Pure; the
+            // env-var fallback only applies on the legacy serve* path,
+            // not here.
+            fields.insert("default_opts".into(), Ty::function(
+                vec![],
+                EffectSet::empty(),
+                serve_opts_t(),
+            ));
+
+            // serve_with :: (Int, Str, ServeOpts) -> [net] Unit
+            fields.insert("serve_with".into(), Ty::function(
+                vec![Ty::int(), Ty::str(), serve_opts_t()],
+                EffectSet::singleton("net"),
+                Ty::Unit,
+            ));
+
+            // serve_fn_with[Eff] :: (Int, (Request) -> [Eff] Response, ServeOpts)
+            //                       -> [net, Eff] Unit
+            fields.insert("serve_fn_with".into(), Ty::function(
+                vec![
+                    Ty::int(),
+                    Ty::function(
+                        vec![Ty::Con("Request".into(), vec![])],
+                        EffectSet::open_var(0),
+                        Ty::Con("Response".into(), vec![]),
+                    ),
+                    serve_opts_t(),
+                ],
+                EffectSet::open_var(0).union(&EffectSet::singleton("net")),
+                Ty::Unit,
+            ));
+
+            // serve_routed_with[Eff] :: (
+            //   Int, List[(Str, Str, (Request) -> [Eff] Response)],
+            //   (Request) -> [Eff] Response, ServeOpts
+            // ) -> [net, Eff] Unit
+            fields.insert("serve_routed_with".into(), Ty::function(
+                vec![
+                    Ty::int(),
+                    Ty::List(Box::new(Ty::Tuple(vec![
+                        Ty::str(),
+                        Ty::str(),
+                        Ty::function(
+                            vec![Ty::Con("Request".into(), vec![])],
+                            EffectSet::open_var(0),
+                            Ty::Con("Response".into(), vec![]),
+                        ),
+                    ]))),
+                    Ty::function(
+                        vec![Ty::Con("Request".into(), vec![])],
+                        EffectSet::open_var(0),
+                        Ty::Con("Response".into(), vec![]),
+                    ),
+                    serve_opts_t(),
+                ],
+                EffectSet::open_var(0).union(&EffectSet::singleton("net")),
+                Ty::Unit,
+            ));
+
             Some(Ty::Record(fields))
         }
         "chat" => {

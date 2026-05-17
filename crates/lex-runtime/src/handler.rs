@@ -890,6 +890,13 @@ impl EffectHandler for DefaultHandler {
                 Err(e) => Ok(err(Value::Str(e.into()))),
             };
         }
+        // `net.default_opts()` is a pure record constructor — typed
+        // with `EffectSet::empty()` in builtins.rs. Bypass the generic
+        // `ensure_kind_allowed("net")` gate so callers don't need to
+        // declare `[net]` just to build a ServeOpts literal default.
+        if kind == "net" && op == "default_opts" {
+            return Ok(ServeOpts::lex_defaults().to_value());
+        }
         self.ensure_kind_allowed(kind)?;
         match (kind, op) {
             ("io", "print") => {
@@ -1055,7 +1062,7 @@ impl EffectHandler for DefaultHandler {
                 let program = self.program.clone()
                     .ok_or_else(|| "net.serve requires a Program reference; use DefaultHandler::with_program".to_string())?;
                 let policy = self.policy.clone();
-                serve_http(port, handler_name, program, policy, None)
+                serve_http(port, handler_name, program, policy, None, ServeOpts::from_env())
             }
             ("net", "serve_fn") => {
                 let port = match args.first() {
@@ -1069,7 +1076,7 @@ impl EffectHandler for DefaultHandler {
                 let program = self.program.clone()
                     .ok_or_else(|| "net.serve_fn requires a Program reference; use DefaultHandler::with_program".to_string())?;
                 let policy = self.policy.clone();
-                serve_http_fn(port, closure, program, policy)
+                serve_http_fn(port, closure, program, policy, ServeOpts::from_env())
             }
             ("net", "serve_routed") => {
                 let port = match args.first() {
@@ -1086,7 +1093,58 @@ impl EffectHandler for DefaultHandler {
                 let program = self.program.clone()
                     .ok_or_else(|| "net.serve_routed requires a Program reference; use DefaultHandler::with_program".to_string())?;
                 let policy = self.policy.clone();
-                serve_http_routed(port, routes, fallback, program, policy)
+                serve_http_routed(port, routes, fallback, program, policy, ServeOpts::from_env())
+            }
+            ("net", "serve_with") => {
+                // serve_with(port, handler_name, opts)
+                let port = match args.first() {
+                    Some(Value::Int(n)) if (0..=65535).contains(n) => *n as u16,
+                    _ => return Err("net.serve_with(port, handler, opts): port must be Int 0..=65535".into()),
+                };
+                let handler_name = expect_str(args.get(1))?.to_string();
+                let opts = decode_serve_opts(args.get(2)
+                    .ok_or_else(|| "net.serve_with(port, handler, opts): missing opts".to_string())?)?;
+                let program = self.program.clone()
+                    .ok_or_else(|| "net.serve_with requires a Program reference; use DefaultHandler::with_program".to_string())?;
+                let policy = self.policy.clone();
+                serve_http(port, handler_name, program, policy, None, opts)
+            }
+            ("net", "serve_fn_with") => {
+                // serve_fn_with(port, handler_closure, opts)
+                let port = match args.first() {
+                    Some(Value::Int(n)) if (0..=65535).contains(n) => *n as u16,
+                    _ => return Err("net.serve_fn_with(port, handler, opts): port must be Int 0..=65535".into()),
+                };
+                let opts = decode_serve_opts(args.get(2)
+                    .ok_or_else(|| "net.serve_fn_with(port, handler, opts): missing opts".to_string())?)?;
+                let closure = match args.into_iter().nth(1) {
+                    Some(c @ Value::Closure { .. }) => c,
+                    _ => return Err("net.serve_fn_with(port, handler, opts): handler must be a closure".into()),
+                };
+                let program = self.program.clone()
+                    .ok_or_else(|| "net.serve_fn_with requires a Program reference; use DefaultHandler::with_program".to_string())?;
+                let policy = self.policy.clone();
+                serve_http_fn(port, closure, program, policy, opts)
+            }
+            ("net", "serve_routed_with") => {
+                // serve_routed_with(port, routes, fallback, opts)
+                let port = match args.first() {
+                    Some(Value::Int(n)) if (0..=65535).contains(n) => *n as u16,
+                    _ => return Err("net.serve_routed_with(port, routes, fallback, opts): port must be Int 0..=65535".into()),
+                };
+                let routes_val = args.get(1).cloned()
+                    .ok_or_else(|| "net.serve_routed_with(port, routes, fallback, opts): missing routes".to_string())?;
+                let opts = decode_serve_opts(args.get(3)
+                    .ok_or_else(|| "net.serve_routed_with(port, routes, fallback, opts): missing opts".to_string())?)?;
+                let fallback = match args.into_iter().nth(2) {
+                    Some(c @ Value::Closure { .. }) => c,
+                    _ => return Err("net.serve_routed_with(port, routes, fallback, opts): fallback must be a closure".into()),
+                };
+                let routes = decode_routes_arg(routes_val)?;
+                let program = self.program.clone()
+                    .ok_or_else(|| "net.serve_routed_with requires a Program reference; use DefaultHandler::with_program".to_string())?;
+                let policy = self.policy.clone();
+                serve_http_routed(port, routes, fallback, program, policy, opts)
             }
             ("net", "serve_tls") => {
                 let port = match args.first() {
@@ -1103,7 +1161,7 @@ impl EffectHandler for DefaultHandler {
                     .map_err(|e| format!("net.serve_tls: read cert {cert_path}: {e}"))?;
                 let key = std::fs::read(&key_path)
                     .map_err(|e| format!("net.serve_tls: read key {key_path}: {e}"))?;
-                serve_http(port, handler_name, program, policy, Some(TlsConfig { cert, key }))
+                serve_http(port, handler_name, program, policy, Some(TlsConfig { cert, key }), ServeOpts::from_env())
             }
             ("net", "serve_ws") => {
                 let port = match args.first() {
@@ -1718,9 +1776,10 @@ fn serve_http(
     program: Arc<Program>,
     policy: Policy,
     tls: Option<TlsConfig>,
+    opts: ServeOpts,
 ) -> Result<Value, String> {
     match tls {
-        None => serve_http_plain(port, handler_name, program, policy),
+        None => serve_http_plain(port, handler_name, program, policy, opts),
         Some(cfg) => serve_http_tls_legacy(port, handler_name, program, policy, cfg),
     }
 }
@@ -1739,6 +1798,7 @@ fn serve_http_plain(
     handler_name: String,
     program: Arc<Program>,
     policy: Policy,
+    opts: ServeOpts,
 ) -> Result<Value, String> {
     use http_body_util::BodyExt as _;
     use hyper::server::conn::http1;
@@ -1747,18 +1807,19 @@ fn serve_http_plain(
     use hyper_util::server::conn::auto;
     use tokio::net::TcpListener as TokioTcpListener;
 
-    let inline_vm = env_inline_vm();
-    let http2 = env_http2();
+    let inline_vm = opts.inline_vm;
+    let http2 = opts.http2;
+    let host = opts.host.clone();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("net.serve: tokio runtime: {e}"))?;
     rt.block_on(async move {
-        let listener = TokioTcpListener::bind(("0.0.0.0", port))
+        let listener = TokioTcpListener::bind((host.as_str(), port))
             .await
-            .map_err(|e| format!("net.serve bind {port}: {e}"))?;
+            .map_err(|e| format!("net.serve bind {host}:{port}: {e}"))?;
         eprintln!(
-            "net.serve: listening on http://0.0.0.0:{port}{}{}",
+            "net.serve: listening on http://{host}:{port}{}{}",
             if inline_vm { " (inline-vm)" } else { "" },
             if http2 { " (http1+http2)" } else { "" }
         );
@@ -1886,6 +1947,7 @@ fn serve_http_fn(
     closure: Value,
     program: Arc<Program>,
     policy: Policy,
+    opts: ServeOpts,
 ) -> Result<Value, String> {
     use http_body_util::BodyExt as _;
     use hyper::server::conn::http1;
@@ -1894,18 +1956,19 @@ fn serve_http_fn(
     use hyper_util::server::conn::auto;
     use tokio::net::TcpListener as TokioTcpListener;
 
-    let inline_vm = env_inline_vm();
-    let http2 = env_http2();
+    let inline_vm = opts.inline_vm;
+    let http2 = opts.http2;
+    let host = opts.host.clone();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("net.serve_fn: tokio runtime: {e}"))?;
     rt.block_on(async move {
-        let listener = TokioTcpListener::bind(("0.0.0.0", port))
+        let listener = TokioTcpListener::bind((host.as_str(), port))
             .await
-            .map_err(|e| format!("net.serve_fn bind {port}: {e}"))?;
+            .map_err(|e| format!("net.serve_fn bind {host}:{port}: {e}"))?;
         eprintln!(
-            "net.serve_fn: listening on http://0.0.0.0:{port}{}{}",
+            "net.serve_fn: listening on http://{host}:{port}{}{}",
             if inline_vm { " (inline-vm)" } else { "" },
             if http2 { " (http1+http2)" } else { "" }
         );
@@ -2129,6 +2192,7 @@ fn serve_http_routed(
     fallback: Value,
     program: Arc<Program>,
     policy: Policy,
+    opts: ServeOpts,
 ) -> Result<Value, String> {
     use http_body_util::BodyExt as _;
     use hyper::server::conn::http1;
@@ -2137,19 +2201,20 @@ fn serve_http_routed(
     use hyper_util::server::conn::auto;
     use tokio::net::TcpListener as TokioTcpListener;
 
-    let inline_vm = env_inline_vm();
-    let http2 = env_http2();
+    let inline_vm = opts.inline_vm;
+    let http2 = opts.http2;
+    let host = opts.host.clone();
     let routes = Arc::new(routes);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("net.serve_routed: tokio runtime: {e}"))?;
     rt.block_on(async move {
-        let listener = TokioTcpListener::bind(("0.0.0.0", port))
+        let listener = TokioTcpListener::bind((host.as_str(), port))
             .await
-            .map_err(|e| format!("net.serve_routed bind {port}: {e}"))?;
+            .map_err(|e| format!("net.serve_routed bind {host}:{port}: {e}"))?;
         eprintln!(
-            "net.serve_routed: listening on http://0.0.0.0:{port} ({} routes{}{})",
+            "net.serve_routed: listening on http://{host}:{port} ({} routes{}{})",
             routes.len(),
             if inline_vm { ", inline-vm" } else { "" },
             if http2 { ", http1+http2" } else { "" }
@@ -2250,6 +2315,76 @@ fn env_inline_vm() -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// Server-config record threaded through `serve_http_plain` / `_fn` /
+/// `_routed`. Built from env vars on the legacy `net.serve*` paths
+/// (`ServeOpts::from_env`) or decoded from a user-supplied Lex record
+/// literal on the new `net.serve*_with` paths (`decode_serve_opts`).
+/// See lex-lang#497 for the design rationale.
+#[derive(Debug, Clone)]
+struct ServeOpts {
+    http2: bool,
+    inline_vm: bool,
+    host: String,
+}
+
+impl ServeOpts {
+    /// Default values that match the legacy behaviour with env vars
+    /// honoured. Use this when entering via `net.serve`, `net.serve_fn`,
+    /// or `net.serve_routed` — preserves backwards compatibility.
+    fn from_env() -> Self {
+        Self {
+            http2: env_http2(),
+            inline_vm: env_inline_vm(),
+            host: "0.0.0.0".to_string(),
+        }
+    }
+
+    /// Hard-coded defaults returned by `net.default_opts()`. Does NOT
+    /// consult env vars — the `*_with` paths read the opts record
+    /// literally, so the env-var escape hatch only applies to legacy
+    /// callers (`net.serve` et al).
+    fn lex_defaults() -> Self {
+        Self {
+            http2: false,
+            inline_vm: false,
+            host: "0.0.0.0".to_string(),
+        }
+    }
+
+    /// Convert to a Lex `Value::Record` for return from `default_opts()`.
+    fn to_value(&self) -> Value {
+        let mut rec = indexmap::IndexMap::new();
+        rec.insert("http2".to_string(),     Value::Bool(self.http2));
+        rec.insert("inline_vm".to_string(), Value::Bool(self.inline_vm));
+        rec.insert("host".to_string(),      Value::Str(self.host.clone().into()));
+        Value::Record(rec)
+    }
+}
+
+/// Decode a `ServeOpts` from a Lex record literal. Fields are
+/// required — the type-checker has already verified the shape, so
+/// here we just project them out. Any deviation from the expected
+/// shape is treated as an internal-consistency error.
+fn decode_serve_opts(v: &Value) -> Result<ServeOpts, String> {
+    let rec = match v {
+        Value::Record(r) => r,
+        other => return Err(format!("opts must be a Record, got {other:?}")),
+    };
+    let http2 = match rec.get("http2") {
+        Some(Value::Bool(b)) => *b,
+        _ => return Err("opts.http2 must be Bool".into()),
+    };
+    let inline_vm = match rec.get("inline_vm") {
+        Some(Value::Bool(b)) => *b,
+        _ => return Err("opts.inline_vm must be Bool".into()),
+    };
+    let host = match rec.get("host") {
+        Some(Value::Str(s)) => s.to_string(),
+        _ => return Err("opts.host must be Str".into()),
+    };
+    Ok(ServeOpts { http2, inline_vm, host })
 }
 
 /// Read `LEX_NET_HTTP2` and report whether the runtime should accept
