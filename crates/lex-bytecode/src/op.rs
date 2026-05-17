@@ -129,4 +129,17 @@ pub enum Op {
     /// time; the unchanged PushConst / IntAdd at the next two
     /// slots hash normally, so the total bytes match pre-fusion.
     LoadLocalAddIntConst { local_idx: u16, imm_const_idx: u32 },
+    /// Fused `LoadLocal(src) + PushConst(imm_const_idx) + IntAdd +
+    /// StoreLocal(dest)` (#461 superinstruction slice 2). Bypasses
+    /// the value stack entirely: reads `locals[src]`, adds the Int
+    /// constant, writes `locals[dest]`. Advances pc by 4. Stack
+    /// delta: 0.
+    ///
+    /// The peephole pass that emits this op runs *after* slice 1,
+    /// looking for `[LoadLocalAddIntConst, ., ., StoreLocal]` where
+    /// the middle two slots are slice-1 tombstones (the original
+    /// PushConst + IntAdd). The verifier and the body-hash decoder
+    /// both treat the 3 following slots as tombstones owned by
+    /// this op.
+    LoadLocalAddIntConstStoreLocal { src: u16, imm_const_idx: u32, dest: u16 },
 }

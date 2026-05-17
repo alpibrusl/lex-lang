@@ -152,7 +152,15 @@ pub fn compute_body_hash(
             // original `LoadLocal` makes the total body-hash bytes
             // match the pre-fusion form — closure identity (#222)
             // stays invariant across peephole rewrites.
-            Op::LoadLocalAddIntConst { local_idx, .. } => {
+            Op::LoadLocalAddIntConst { local_idx, .. }
+            | Op::LoadLocalAddIntConstStoreLocal { src: local_idx, .. } => {
+                // Slice 1: this slot was `LoadLocal(local_idx)`.
+                // Slice 2: this slot was *also* `LoadLocal(src)`
+                // — the fused op now owns 4 slots, but the very
+                // first one was originally `LoadLocal`. The other
+                // 3 (PushConst / IntAdd / StoreLocal) remain in
+                // the code stream as tombstones and hash normally,
+                // so the total byte stream matches pre-fusion.
                 serde_json::to_vec(&Op::LoadLocal(*local_idx))
                     .expect("Op serialization must succeed")
             }

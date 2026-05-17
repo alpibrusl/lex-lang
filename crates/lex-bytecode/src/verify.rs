@@ -99,6 +99,16 @@ pub fn verify_function(func: &Function, errors: &mut Vec<StackError>) {
             }
             // Terminators: no successors.
             Op::Return | Op::TailCall { .. } | Op::Panic(_) => {}
+            // Slice-2 superinstruction (#461) owns 4 slots: the fused
+            // op + 3 tombstones (original PushConst + IntAdd +
+            // StoreLocal). The trailing tombstones' deltas don't
+            // cancel (+1, -1, -1 = -1), so we can't let the verifier
+            // walk them as live — it'd drift the depth at pc+4 vs the
+            // pre-fusion form. Skip directly to pc+4 with the
+            // unfused-equivalent depth.
+            Op::LoadLocalAddIntConstStoreLocal { .. } => {
+                worklist.push((pc + 4, next_depth));
+            }
             // All other ops: single sequential successor.
             _ => {
                 worklist.push((pc + 1, next_depth));
@@ -200,6 +210,10 @@ fn stack_delta(op: &Op) -> i32 {
         // IntAdd) cancel, so the depth at pc+3 matches what the
         // unfused sequence would have produced.
         Op::LoadLocalAddIntConst { .. } => 1,
+        // Slice-2 fused op: src → dest with no net stack effect.
+        // Tombstones at the next 3 slots are *not* walked (see the
+        // control-flow successor logic in `verify_function`).
+        Op::LoadLocalAddIntConstStoreLocal { .. } => 0,
     }
 }
 
