@@ -897,6 +897,23 @@ impl EffectHandler for DefaultHandler {
         if kind == "net" && op == "default_opts" {
             return Ok(ServeOpts::lex_defaults().to_value());
         }
+        // `tls.*` (#496) — TlsConfig constructors map to different
+        // effect kinds than the namespace name suggests:
+        //   `tls.from_pem_files` :: [fs_read]   (reads cert + key PEM)
+        //   `tls.self_signed`    :: pure        (rcgen, in-memory)
+        // Intercept before the generic `ensure_kind_allowed("tls")`
+        // gate so policy can check the *real* effect. Same pattern
+        // as the `http.{send,get,post}` arms above.
+        if kind == "tls" {
+            return match op {
+                "from_pem_files" => {
+                    self.ensure_kind_allowed("fs_read")?;
+                    dispatch_tls_from_pem_files(self, args)
+                }
+                "self_signed" => dispatch_tls_self_signed(args),
+                other => Err(format!("unsupported tls.{other}")),
+            };
+        }
         self.ensure_kind_allowed(kind)?;
         match (kind, op) {
             ("io", "print") => {
@@ -1146,6 +1163,9 @@ impl EffectHandler for DefaultHandler {
                 let policy = self.policy.clone();
                 serve_http_routed(port, routes, fallback, program, policy, opts)
             }
+            ("net", "serve_quic") => self.dispatch_serve_quic_named(args),
+            ("net", "serve_quic_fn") => self.dispatch_serve_quic_fn(args),
+            ("net", "serve_quic_routed") => self.dispatch_serve_quic_routed(args),
             ("net", "serve_tls") => {
                 let port = match args.first() {
                     Some(Value::Int(n)) if (0..=65535).contains(n) => *n as u16,
@@ -2042,7 +2062,7 @@ fn serve_http_fn(
 /// once at registration time so the per-request match loop is just a
 /// length check + segment-by-segment compare.
 #[derive(Clone, Debug)]
-enum RouteSeg {
+pub(crate) enum RouteSeg {
     Literal(String),
     /// `:name` capture — binds the request segment under `name` in
     /// `req.path_params`.
@@ -2152,7 +2172,7 @@ fn decode_routes_arg(
 /// handler closure plus captured path-params. Method match is
 /// case-insensitive vs the request (already uppercased at decode
 /// time); `"*"` in a route matches any method.
-fn dispatch_route<'a>(
+pub(crate) fn dispatch_route<'a>(
     routes: &'a [(String, Vec<RouteSeg>, Value)],
     req_method: &str,
     req_path: &str,
@@ -2172,7 +2192,7 @@ fn dispatch_route<'a>(
 /// Overwrite the `path_params` field on a Request record with the
 /// captured map. Request records are always built with an empty
 /// `path_params` field, so this just updates the existing slot.
-fn stamp_path_params(
+pub(crate) fn stamp_path_params(
     req: &mut Value,
     params: std::collections::BTreeMap<lex_bytecode::MapKey, Value>,
 ) {
@@ -2323,10 +2343,10 @@ fn env_inline_vm() -> bool {
 /// literal on the new `net.serve*_with` paths (`decode_serve_opts`).
 /// See lex-lang#497 for the design rationale.
 #[derive(Debug, Clone)]
-struct ServeOpts {
-    http2: bool,
-    inline_vm: bool,
-    host: String,
+pub(crate) struct ServeOpts {
+    pub(crate) http2: bool,
+    pub(crate) inline_vm: bool,
+    pub(crate) host: String,
 }
 
 impl ServeOpts {
@@ -2387,6 +2407,158 @@ fn decode_serve_opts(v: &Value) -> Result<ServeOpts, String> {
     Ok(ServeOpts { http2, inline_vm, host })
 }
 
+// ── tls.* and net.serve_quic* dispatch helpers (#496) ──────────────
+//
+// `TlsConfig` is opaque in the type system (a `Ty::Con("TlsConfig",…)`)
+// but at runtime it's a `Value::Record({cert :: Bytes, key :: Bytes})`
+// carrying the PEM-encoded chain + private key. The opacity matters
+// because we may switch the in-runtime representation to a Resource
+// handle later (e.g. to keep the private key out of GC-visible
+// memory) without breaking source code.
+
+fn make_tls_config_value(cert_pem: Vec<u8>, key_pem: Vec<u8>) -> Value {
+    let mut rec = indexmap::IndexMap::new();
+    rec.insert("cert".into(), Value::Bytes(cert_pem));
+    rec.insert("key".into(),  Value::Bytes(key_pem));
+    Value::Record(rec)
+}
+
+#[cfg(feature = "quic")]
+fn decode_tls_config(v: &Value) -> Result<crate::quic::QuicTls, String> {
+    let rec = match v {
+        Value::Record(r) => r,
+        other => return Err(format!("TlsConfig: expected Record, got {other:?}")),
+    };
+    let cert = match rec.get("cert") {
+        Some(Value::Bytes(b)) => b.to_vec(),
+        _ => return Err("TlsConfig.cert: must be Bytes".into()),
+    };
+    let key = match rec.get("key") {
+        Some(Value::Bytes(b)) => b.to_vec(),
+        _ => return Err("TlsConfig.key: must be Bytes".into()),
+    };
+    Ok(crate::quic::QuicTls { cert_pem: cert, key_pem: key })
+}
+
+fn dispatch_tls_from_pem_files(
+    handler: &DefaultHandler,
+    args: Vec<Value>,
+) -> Result<Value, String> {
+    let cert_path = expect_str(args.first())?.to_string();
+    let key_path  = expect_str(args.get(1))?.to_string();
+    let cert_resolved = handler.resolve_read_path(&cert_path);
+    let key_resolved  = handler.resolve_read_path(&key_path);
+    if !handler.policy.allow_fs_read.is_empty() {
+        let allowed = |p: &std::path::Path| -> bool {
+            handler.policy.allow_fs_read.iter().any(|a| p.starts_with(a))
+        };
+        if !allowed(&cert_resolved) {
+            return Ok(err(Value::Str(
+                format!("tls.from_pem_files: cert `{cert_path}` outside --allow-fs-read").into(),
+            )));
+        }
+        if !allowed(&key_resolved) {
+            return Ok(err(Value::Str(
+                format!("tls.from_pem_files: key `{key_path}` outside --allow-fs-read").into(),
+            )));
+        }
+    }
+    let cert = match std::fs::read(&cert_resolved) {
+        Ok(b) => b,
+        Err(e) => return Ok(err(Value::Str(format!("read cert {cert_path}: {e}").into()))),
+    };
+    let key = match std::fs::read(&key_resolved) {
+        Ok(b) => b,
+        Err(e) => return Ok(err(Value::Str(format!("read key {key_path}: {e}").into()))),
+    };
+    Ok(ok(make_tls_config_value(cert, key)))
+}
+
+#[cfg(feature = "quic")]
+fn dispatch_tls_self_signed(args: Vec<Value>) -> Result<Value, String> {
+    let hostname = expect_str(args.first())?.to_string();
+    match crate::quic::self_signed_pem(&hostname) {
+        Ok((cert, key)) => Ok(ok(make_tls_config_value(cert, key))),
+        Err(e) => Ok(err(Value::Str(format!("tls.self_signed: {e}").into()))),
+    }
+}
+
+#[cfg(not(feature = "quic"))]
+fn dispatch_tls_self_signed(_args: Vec<Value>) -> Result<Value, String> {
+    Ok(err(Value::Str(
+        "tls.self_signed: lex-runtime was compiled without the `quic` feature (needed for rcgen)".into(),
+    )))
+}
+
+impl DefaultHandler {
+    #[cfg(feature = "quic")]
+    fn dispatch_serve_quic_named(&self, args: Vec<Value>) -> Result<Value, String> {
+        let port = match args.first() {
+            Some(Value::Int(n)) if (0..=65535).contains(n) => *n as u16,
+            _ => return Err("net.serve_quic(port, tls, handler): port must be Int 0..=65535".into()),
+        };
+        let tls = decode_tls_config(args.get(1)
+            .ok_or_else(|| "net.serve_quic(port, tls, handler): missing tls".to_string())?)?;
+        let handler_name = expect_str(args.get(2))?.to_string();
+        let program = self.program.clone()
+            .ok_or_else(|| "net.serve_quic requires a Program reference; use DefaultHandler::with_program".to_string())?;
+        let policy = self.policy.clone();
+        crate::quic::serve_http3_named(port, handler_name, tls, program, policy, ServeOpts::from_env())
+    }
+
+    #[cfg(feature = "quic")]
+    fn dispatch_serve_quic_fn(&self, args: Vec<Value>) -> Result<Value, String> {
+        let port = match args.first() {
+            Some(Value::Int(n)) if (0..=65535).contains(n) => *n as u16,
+            _ => return Err("net.serve_quic_fn(port, tls, handler): port must be Int 0..=65535".into()),
+        };
+        let tls = decode_tls_config(args.get(1)
+            .ok_or_else(|| "net.serve_quic_fn(port, tls, handler): missing tls".to_string())?)?;
+        let closure = match args.into_iter().nth(2) {
+            Some(c @ Value::Closure { .. }) => c,
+            _ => return Err("net.serve_quic_fn(port, tls, handler): handler must be a closure".into()),
+        };
+        let program = self.program.clone()
+            .ok_or_else(|| "net.serve_quic_fn requires a Program reference; use DefaultHandler::with_program".to_string())?;
+        let policy = self.policy.clone();
+        crate::quic::serve_http3_fn(port, closure, tls, program, policy, ServeOpts::from_env())
+    }
+
+    #[cfg(feature = "quic")]
+    fn dispatch_serve_quic_routed(&self, args: Vec<Value>) -> Result<Value, String> {
+        let port = match args.first() {
+            Some(Value::Int(n)) if (0..=65535).contains(n) => *n as u16,
+            _ => return Err("net.serve_quic_routed(port, tls, routes, fallback): port must be Int 0..=65535".into()),
+        };
+        let tls = decode_tls_config(args.get(1)
+            .ok_or_else(|| "net.serve_quic_routed(port, tls, routes, fallback): missing tls".to_string())?)?;
+        let routes_val = args.get(2).cloned()
+            .ok_or_else(|| "net.serve_quic_routed(port, tls, routes, fallback): missing routes".to_string())?;
+        let fallback = match args.into_iter().nth(3) {
+            Some(c @ Value::Closure { .. }) => c,
+            _ => return Err("net.serve_quic_routed(port, tls, routes, fallback): fallback must be a closure".into()),
+        };
+        let routes = decode_routes_arg(routes_val)?;
+        let program = self.program.clone()
+            .ok_or_else(|| "net.serve_quic_routed requires a Program reference; use DefaultHandler::with_program".to_string())?;
+        let policy = self.policy.clone();
+        crate::quic::serve_http3_routed(port, routes, fallback, tls, program, policy, ServeOpts::from_env())
+    }
+
+    #[cfg(not(feature = "quic"))]
+    fn dispatch_serve_quic_named(&self, _args: Vec<Value>) -> Result<Value, String> {
+        Err("net.serve_quic: lex-runtime was compiled without the `quic` feature (needed for quinn + h3)".into())
+    }
+    #[cfg(not(feature = "quic"))]
+    fn dispatch_serve_quic_fn(&self, _args: Vec<Value>) -> Result<Value, String> {
+        Err("net.serve_quic_fn: lex-runtime was compiled without the `quic` feature (needed for quinn + h3)".into())
+    }
+    #[cfg(not(feature = "quic"))]
+    fn dispatch_serve_quic_routed(&self, _args: Vec<Value>) -> Result<Value, String> {
+        Err("net.serve_quic_routed: lex-runtime was compiled without the `quic` feature (needed for quinn + h3)".into())
+    }
+}
+
 /// Read `LEX_NET_HTTP2` and report whether the runtime should accept
 /// HTTP/2 connections via hyper-util's auto builder (HTTP/1 ↔ HTTP/2
 /// preface detection). Accepts `1` / `true` (case-insensitive); anything
@@ -2407,16 +2579,20 @@ fn env_http2() -> bool {
 }
 
 /// Build a Lex request record from hyper request parts and pre-collected body bytes.
-fn build_request_value_parts(
+pub(crate) fn build_request_value_parts(
     parts: &hyper::http::request::Parts,
     body: &bytes::Bytes,
 ) -> Value {
     let method = parts.method.as_str().to_string();
-    let uri = parts.uri.to_string();
-    let (path, query) = match uri.split_once('?') {
-        Some((p, q)) => (p.to_string(), q.to_string()),
-        None => (uri, String::new()),
-    };
+    // `Uri::path()` returns just the origin-form path, regardless of
+    // whether the wire URI was relative (`/foo` — HTTP/1.1) or
+    // absolute (`https://host/foo` — HTTP/2 and HTTP/3 fold the
+    // `:scheme` + `:authority` pseudo-headers into the full URI).
+    // Reading `to_string()` would leak the scheme/authority into the
+    // Lex handler's `req.path`, which surprised handlers built for
+    // HTTP/1.1 (#496 surfaced this against `serve_quic`).
+    let path = parts.uri.path().to_string();
+    let query = parts.uri.query().map(str::to_string).unwrap_or_default();
     let mut headers_map = std::collections::BTreeMap::new();
     for (name, val) in &parts.headers {
         if let Ok(v) = val.to_str() {
@@ -2464,7 +2640,7 @@ fn build_request_value_tiny(req: &mut tiny_http::Request) -> Value {
     Value::Record(rec)
 }
 
-fn unpack_response(v: &Value) -> (u16, ResponseBodyOut, Vec<(String, String)>) {
+pub(crate) fn unpack_response(v: &Value) -> (u16, ResponseBodyOut, Vec<(String, String)>) {
     if let Value::Record(rec) = v {
         let status = rec.get("status").and_then(|s| match s {
             Value::Int(n) => Some(*n as u16),
@@ -2617,7 +2793,7 @@ fn respond_with_body_tls(
 /// different `tiny_http` path: a single `Response::from_string` for
 /// `Str`, and a chunked-encoding `Response::new` with a `Read`-backed
 /// chunk list for the streaming variants.
-enum ResponseBodyOut {
+pub(crate) enum ResponseBodyOut {
     Str(String),
     /// Pre-drained text chunks. v1 ships eager-iter only; lazy producers
     /// (#376 follow-up) will replace this with a Read adapter that pulls

@@ -192,6 +192,29 @@ fn main() -> [net, io] Nil { net.serve_fn(8080, my_handler) }
 ```
 
 `net.serve_with(port, handler_name, opts)` / `net.serve_fn_with(port, handler, opts)` / `net.serve_routed_with(port, routes, fallback, opts)` — same as the unsuffixed variants but accept a `ServeOpts` record literal (`{ http2: Bool, inline_vm: Bool, host: Str }`) instead of relying on `LEX_NET_HTTP2` / `LEX_NET_INLINE_VM` env vars. `net.default_opts()` returns the defaults (`http2: false, inline_vm: false, host: "0.0.0.0"`); construct your own literal to enable HTTP/2 or bind to a specific host. The legacy `serve` / `serve_fn` / `serve_routed` paths keep honouring the env vars for backwards compatibility — new code should prefer the `*_with` variants (#497).
+
+`net.serve_quic(port, tls, handler_name)` / `net.serve_quic_fn(port, tls, handler)` / `net.serve_quic_routed(port, tls, routes, fallback)` — HTTP/3 over QUIC (#496). TLS is mandatory; `tls` is a `TlsConfig` opaque value built via `std.tls` (see below). Requires the `quic` feature on lex-runtime: `cargo build --features quic` (off by default to keep the dep graph slim). HTTP/3 negotiates via the `h3` ALPN over UDP; existing HTTP/1.1+2 (TCP) listeners aren't affected. Effect row stays `[net]` — same gate as `serve` / `serve_fn`. 0-RTT is disabled by default (replay-attack risk on non-idempotent handlers); cert rotation requires a restart in v1.
+
+```lex
+import "std.net" as net
+import "std.tls" as tls
+
+fn handle(req :: Request) -> Response { ... }
+
+fn main() -> [net] Nil {
+  match tls.self_signed("localhost") {
+    Ok(t) => net.serve_quic(4433, t, "handle"),
+    Err(_) => (),
+  }
+}
+```
+
+### `std.tls`
+`tls.from_pem_files(cert_path, key_path) -> [fs_read] Result[TlsConfig, Str]` — load a PEM-encoded certificate chain + private key from disk. Both paths must be under `--allow-fs-read`.
+`tls.self_signed(hostname) -> Result[TlsConfig, Str]` — generate a self-signed certificate for the given hostname. Pure (no effects). Intended for local development and tests; production should use a CA-signed cert via `from_pem_files`.
+
+`TlsConfig` is opaque — the only ways to obtain one are these two constructors. Pass it to `net.serve_quic*` to set up an HTTP/3 listener.
+
 `net.serve_ws_fn(port, subprotocol, handler)` — WebSocket server:
 ```lex
 fn on_msg(conn :: WsConn, msg :: WsMessage) -> WsAction {
