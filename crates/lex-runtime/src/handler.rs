@@ -2823,9 +2823,15 @@ fn err(v: Value) -> Value {
     Value::Variant { name: "Err".into(), args: vec![v] }
 }
 
-/// Perform a streaming HTTP POST and return a lazy line iterator
-/// as `Ok(__StreamHandle)`. The caller drains the iterator via the
-/// normal `Iter[T]` protocol. Connection errors become `Err(Str)`.
+/// HTTP POST that buffers the full response body then yields it split into lines.
+/// Intended for LLM provider APIs (OpenAI, Anthropic, Google) that use SSE/NDJSON
+/// and close the connection after sending all events. Connection errors → `Err(Str)`.
+///
+/// CAUTION: ureq 3.3's `Body` does not implement `std::io::Read` and exposes no
+/// incremental read API. The entire response is buffered via `read_to_vec()` before
+/// splitting. This means the call blocks until the server closes the connection —
+/// endpoints that hold the connection open indefinitely will hang. True per-line
+/// streaming requires a future HTTP client upgrade.
 fn http_stream_lines_impl(handler: &DefaultHandler, url: &str, headers_val: &Value, body: &str) -> Value {
     let body_bytes = body.as_bytes().to_vec();
     let agent = http_agent(None);
