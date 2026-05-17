@@ -656,6 +656,198 @@ fn run_loop_fn(
     Ok(())
 }
 
+// ── serve_ws_fn_actor — outbound-bridge actor registration (#459) ────────────
+//
+// Variant of `serve_ws_fn` that registers each connection as a named
+// actor in `conc_registry`, so non-WS callers (HTTP webhooks, scheduled
+// tasks, broadcast loops) can push frames into the socket via
+// `conc.lookup(name) |> conc.tell(frame)`.
+//
+// Signature:
+//
+//   net.serve_ws_fn_actor(
+//     port        :: Int,
+//     subprotocol :: Str,
+//     name_of     :: (WsConn) -> Str,                       # per-connection name
+//     on_message  :: (WsConn, WsMessage) -> [E] WsAction    # same as serve_ws_fn
+//   ) -> [net, concurrent, io] Unit
+//
+// On each accepted connection, the runtime:
+//   1. Builds the WsConn record (same shape as serve_ws_fn) and calls
+//      `name_of(conn)`. An empty-string return means "don't register
+//      this connection" — the socket still accepts inbound frames and
+//      runs `on_message`, but no outbound handle is exposed.
+//   2. Builds an `ActorHandler::Native` bridge whose `send` closure
+//      writes the message body to the per-connection `mpsc::Sender<String>`
+//      that already exists for the broadcast path.
+//   3. Registers the bridge actor under the name. Name collisions
+//      (`AlreadyRegistered`) abort the connection — surface the bug at
+//      the source level rather than silently overwriting an existing
+//      session.
+//   4. On disconnect, unregisters the name and tears down the socket.
+//
+// The inbound half (read frame → call `on_message` → apply `WsAction`)
+// is identical to `serve_ws_fn`.
+//
+// Out-of-scope for v1: binary message dispatch from a non-WS task. The
+// native bridge only accepts `Value::Str`; binary frames need a tagged
+// message type (`WsOut::Text(Str) | WsOut::Binary(List[Int])`) that the
+// native handler can match on. Filed as a follow-up.
+pub fn serve_ws_fn_actor(
+    port: u16,
+    subprotocol: String,
+    name_of_closure: Value,
+    on_message_closure: Value,
+    program: Arc<Program>,
+    policy: Policy,
+    registry: Arc<ChatRegistry>,
+) -> Result<Value, String> {
+    if !subprotocol.is_empty() {
+        if let Err(e) =
+            tungstenite::http::HeaderValue::from_str(&subprotocol)
+        {
+            return Err(format!(
+                "net.serve_ws_fn_actor: subprotocol {subprotocol:?} is not a valid \
+                 HTTP header value: {e}"
+            ));
+        }
+    }
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .map_err(|e| format!("net.serve_ws_fn_actor bind {port}: {e}"))?;
+    eprintln!("net.serve_ws_fn_actor: listening on ws://127.0.0.1:{port}");
+    for stream in listener.incoming() {
+        let stream = match stream {
+            Ok(s) => s,
+            Err(e) => { eprintln!("net.serve_ws_fn_actor accept: {e}"); continue; }
+        };
+        let program = Arc::clone(&program);
+        let policy = policy.clone();
+        let name_of_closure = name_of_closure.clone();
+        let on_message_closure = on_message_closure.clone();
+        let subprotocol = subprotocol.clone();
+        let registry = Arc::clone(&registry);
+        thread::spawn(move || {
+            if let Err(e) = handle_connection_fn_actor(
+                stream, program, policy, name_of_closure, on_message_closure,
+                subprotocol, registry,
+            ) {
+                eprintln!("net.serve_ws_fn_actor connection error: {e}");
+            }
+        });
+    }
+    Ok(Value::Unit)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_connection_fn_actor(
+    stream: std::net::TcpStream,
+    program: Arc<Program>,
+    policy: Policy,
+    name_of_closure: Value,
+    on_message_closure: Value,
+    subprotocol: String,
+    registry: Arc<ChatRegistry>,
+) -> Result<(), String> {
+    use tungstenite::{accept_hdr, handshake::server::{Request, Response}};
+
+    let mut path = String::new();
+    let path_ref = &mut path;
+    let subproto_for_handshake = subprotocol.clone();
+    let mut ws = accept_hdr(stream, |req: &Request, mut resp: Response| {
+        *path_ref = req.uri().path().to_string();
+        maybe_echo_subprotocol(req, &mut resp, &subproto_for_handshake);
+        Ok(resp)
+    }).map_err(|e| format!("ws handshake: {e}"))?;
+
+    let (tx, rx) = mpsc::channel::<String>();
+    let conn_id = registry.register(path.trim_start_matches('/').to_string(), tx.clone());
+    let _ = ws.get_mut().set_read_timeout(Some(Duration::from_millis(50)));
+
+    // Build the WsConn record and ask the user's name_of closure what
+    // name to register this connection under. Empty string is the
+    // documented opt-out (inbound still works, no outbound handle is
+    // exposed). Type mismatch or runtime error aborts the connection —
+    // the same "surface the bug at the source level" reasoning as a
+    // `conc.register` name collision below; silently degrading to an
+    // unregistered connection would have a non-WS caller's
+    // `conc.lookup` return None and conclude the session is offline.
+    let ws_conn = build_ws_conn(conn_id, &path, &subprotocol);
+    let registered_name: Option<String> = {
+        let handler = crate::handler::DefaultHandler::new(policy.clone())
+            .with_program(Arc::clone(&program))
+            .with_chat_registry(Arc::clone(&registry));
+        let mut vm = Vm::with_handler(&program, Box::new(handler));
+        match vm.invoke_closure_value(name_of_closure.clone(), vec![ws_conn.clone()]) {
+            Ok(Value::Str(s)) if !s.is_empty() => Some(s.to_string()),
+            Ok(Value::Str(_)) => None,
+            Ok(other) => {
+                registry.unregister(conn_id);
+                let _ = ws.close(None);
+                return Err(format!(
+                    "net.serve_ws_fn_actor: name_of must return Str, got {other:?}"
+                ));
+            }
+            Err(e) => {
+                registry.unregister(conn_id);
+                let _ = ws.close(None);
+                return Err(format!(
+                    "net.serve_ws_fn_actor: name_of error: {e:?}"
+                ));
+            }
+        }
+    };
+
+    // Register the native bridge actor in the conc registry. The
+    // bridge captures `tx` and writes any inbound message body to the
+    // outbound channel, which the run loop drains into the socket.
+    if let Some(ref name) = registered_name {
+        let tx_for_bridge = tx.clone();
+        let bridge = lex_bytecode::value::NativeActorHandler {
+            send: Box::new(move |msg: Value| -> Result<Value, String> {
+                match msg {
+                    Value::Str(s) => {
+                        tx_for_bridge.send(s.to_string()).map_err(|e| {
+                            format!("net.serve_ws_fn_actor: outbound channel closed: {e}")
+                        })?;
+                        Ok(Value::Unit)
+                    }
+                    other => Err(format!(
+                        "net.serve_ws_fn_actor: native bridge accepts Str messages only, got {other:?}"
+                    )),
+                }
+            }),
+        };
+        let cell = Value::Actor(Arc::new(Mutex::new(lex_bytecode::value::ActorCell {
+            state: Value::Unit,
+            handler: lex_bytecode::value::ActorHandler::Native(Arc::new(bridge)),
+        })));
+        if let Err(e) = lex_bytecode::conc_registry::register(name, cell) {
+            // Name collision: abort the connection. Surfacing the
+            // duplicate immediately is more useful than silently
+            // overwriting whichever session was registered first.
+            registry.unregister(conn_id);
+            let _ = ws.close(None);
+            return Err(format!(
+                "net.serve_ws_fn_actor: conc.register({name:?}) failed: {e:?}"
+            ));
+        }
+    }
+
+    let result = run_loop_fn(
+        &mut ws, &rx, conn_id, &path, &subprotocol,
+        &program, &policy, &on_message_closure, &registry,
+    );
+
+    // Tear down: unregister from both the conc registry (so a subsequent
+    // `conc.lookup(name)` returns None) and the chat registry.
+    if let Some(ref name) = registered_name {
+        let _ = lex_bytecode::conc_registry::unregister(name);
+    }
+    registry.unregister(conn_id);
+    let _ = ws.close(None);
+    result
+}
+
 // ── Closure-based WebSocket client (#390) ────────────────────────────────────
 //
 // Inverse of `serve_ws_fn`: open a connection to a remote WS server and
