@@ -86,7 +86,21 @@ pub enum Value {
     Unit,
     List(VecDeque<Value>),
     Tuple(Vec<Value>),
-    Record(IndexMap<String, Value>),
+    /// Record literal. `shape_id` is the `Program::record_shapes`
+    /// index of the field-name vec the record was built from
+    /// (#462 slice 2), so the `Op::GetField` polymorphic IC can
+    /// match on a single u32 compare instead of walking the
+    /// `IndexMap` by name. Records constructed outside the bytecode
+    /// (JSON decode, SQL row → record, HTTP request mutators, test
+    /// fixtures) have no compile-time shape and carry `NO_SHAPE_ID`
+    /// — the IC unconditionally misses on them and falls through to
+    /// the existing name walk.
+    ///
+    /// `shape_id` is **not** part of structural equality (see
+    /// `PartialEq` below): two records with identical fields must
+    /// compare equal regardless of provenance, so a JSON-decoded
+    /// record equals a compile-time-built one with the same fields.
+    Record { shape_id: u32, fields: IndexMap<String, Value> },
     Variant { name: String, args: Vec<Value> },
     /// First-class function value (a lambda + its captured locals). The
     /// function's first `captures.len()` params bind to `captures`; the
@@ -166,7 +180,7 @@ impl PartialEq for Value {
             (Unit, Unit) => true,
             (List(a), List(b)) => a == b,
             (Tuple(a), Tuple(b)) => a == b,
-            (Record(a), Record(b)) => a == b,
+            (Record { fields: a, .. }, Record { fields: b, .. }) => a == b,
             (Variant { name: an, args: aa }, Variant { name: bn, args: ba }) =>
                 an == bn && aa == ba,
             (Closure { body_hash: ah, captures: ac, .. },
@@ -276,7 +290,7 @@ impl Value {
             Value::Unit => J::Null,
             Value::List(items) => J::Array(items.iter().map(Value::to_json).collect()),
             Value::Tuple(items) => J::Array(items.iter().map(Value::to_json).collect()),
-            Value::Record(fields) => {
+            Value::Record { fields, .. } => {
                 let mut m = serde_json::Map::new();
                 for (k, v) in fields { m.insert(k.clone(), v.to_json()); }
                 J::Object(m)
@@ -399,11 +413,31 @@ impl Value {
                 for (k, v) in map {
                     out.insert(k.clone(), Value::from_json(v));
                 }
-                Value::Record(out)
+                Value::record_dynamic(out)
             }
         }
     }
+
+    /// Build a `Value::Record` whose fields don't come from an
+    /// `Op::MakeRecord` site — JSON decode, SQL row → record, host
+    /// effect handlers, test fixtures, etc. The IC unconditionally
+    /// misses against `NO_SHAPE_ID`, which is the correct behavior
+    /// for records with no compile-time shape. Prefer this over
+    /// hand-rolling `Value::Record { shape_id: NO_SHAPE_ID, fields }`
+    /// so a future shape-interning slice has one place to retrofit.
+    pub fn record_dynamic(fields: IndexMap<String, Value>) -> Value {
+        Value::Record { shape_id: NO_SHAPE_ID, fields }
+    }
 }
+
+/// Sentinel `shape_id` for records constructed outside an
+/// `Op::MakeRecord` site (#462 slice 2). `Program::record_shapes`
+/// is bounded by `u32::MAX - 1` in practice (each compile-time
+/// record literal adds one entry), so reserving the top of the
+/// `u32` range as "no shape" keeps `Value::Record.shape_id` a flat
+/// `u32` — the `Op::GetField` IC's hot path is a single u32
+/// compare, no `Option` discriminant.
+pub const NO_SHAPE_ID: u32 = u32::MAX;
 
 /// Lowercase-hex → bytes. Returns `None` for odd length or non-hex chars
 /// (callers fall through to a record decode rather than erroring).

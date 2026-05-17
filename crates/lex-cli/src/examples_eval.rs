@@ -235,7 +235,7 @@ fn pretty_value(v: &Value) -> String {
             name,
             args.iter().map(pretty_value).collect::<Vec<_>>().join(", ")
         ),
-        Value::Record(fs) => format!(
+        Value::Record { fields: fs, .. } => format!(
             "{{ {} }}",
             fs.iter()
                 .map(|(k, v)| format!("{k}: {}", pretty_value(v)))

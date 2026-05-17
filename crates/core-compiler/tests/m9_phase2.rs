@@ -127,7 +127,7 @@ fn unwrap_matrix(v: &Value) -> (usize, usize, Vec<f64>) {
     if let Value::F64Array { rows, cols, data } = v {
         return (*rows as usize, *cols as usize, data.clone());
     }
-    let rec = match v { Value::Record(r) => r, _ => panic!("not a matrix") };
+    let rec = match v { Value::Record { fields, .. } => fields, _ => panic!("not a matrix") };
     let rows = match rec["rows"] { Value::Int(n) => n as usize, _ => panic!() };
     let cols = match rec["cols"] { Value::Int(n) => n as usize, _ => panic!() };
     let data = match &rec["data"] {

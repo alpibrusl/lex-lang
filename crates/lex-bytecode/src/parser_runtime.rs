@@ -37,7 +37,7 @@ pub fn run_parser(
     caller: &mut dyn ClosureCaller,
 ) -> Result<(Value, usize), (usize, String)> {
     let rec = match node {
-        Value::Record(r) => r,
+        Value::Record { fields, .. } => fields,
         _ => return Err((pos, "parser: expected Parser node".into())),
     };
     let kind = match rec.get("kind") {

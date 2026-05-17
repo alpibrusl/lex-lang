@@ -529,7 +529,7 @@ impl<'a> Vm<'a> {
                 e.insert("message".into(), Value::Str(msg.into()));
                 Ok(Value::Variant {
                     name: "Err".into(),
-                    args: vec![Value::Record(e)],
+                    args: vec![Value::record_dynamic(e)],
                 })
             }
         }
@@ -838,7 +838,7 @@ impl<'a> Vm<'a> {
                         };
                         rec.insert(name, val);
                     }
-                    self.stack.push(Value::Record(rec));
+                    self.stack.push(Value::Record { shape_id: shape_idx, fields: rec });
                 }
                 Op::MakeTuple(n) => {
                     let mut items: Vec<Value> = (0..n).map(|_| Value::Unit).collect();
@@ -862,7 +862,7 @@ impl<'a> Vm<'a> {
                 Op::GetField { name_idx, site_idx } => {
                     let v = self.pop()?;
                     match v {
-                        Value::Record(r) => {
+                        Value::Record { fields: r, .. } => {
                             // Inline cache keyed by (fn_id, site_idx) — #462
                             // slice 1. Direct array index instead of the
                             // pre-#462 `HashMap<(fn_id << 32 | pc), usize>`.

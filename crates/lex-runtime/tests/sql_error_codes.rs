@@ -35,7 +35,7 @@ fn run(src: &str, func: &str) -> Value {
 /// are `Option[Str]` so they come back as `Variant{Some|None}`.
 fn unpack_sql_error(v: &Value) -> (String, Option<String>, Option<String>) {
     let rec = match v {
-        Value::Record(r) => r,
+        Value::Record { fields: r, .. } => r,
         other => panic!("expected SqlError record, got {other:?}"),
     };
     let message = match rec.get("message") {

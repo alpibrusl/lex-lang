@@ -206,7 +206,7 @@ impl DefaultHandler {
                 }).collect();
                 let str_args = str_args?;
                 let opts = match args.get(2) {
-                    Some(Value::Record(r)) => r.clone(),
+                    Some(Value::Record { fields: r, .. }) => r.clone(),
                     _ => return Err("process.spawn: missing or invalid opts record".into()),
                 };
 
@@ -307,7 +307,7 @@ impl DefaultHandler {
                 {
                     rec.insert("signaled".into(), Value::Bool(false));
                 }
-                Ok(Value::Record(rec))
+                Ok(Value::record_dynamic(rec))
             }
             "kill" => {
                 let h = expect_process_handle(args.first())?;
@@ -355,7 +355,7 @@ impl DefaultHandler {
                             String::from_utf8_lossy(&o.stderr).into_owned().into()));
                         rec.insert("exit_code".into(), Value::Int(
                             o.status.code().unwrap_or(-1) as i64));
-                        Ok(ok(Value::Record(rec)))
+                        Ok(ok(Value::record_dynamic(rec)))
                     }
                     Err(e) => Ok(err(Value::Str(format!("process.run `{cmd}`: {e}").into()))),
                 }
@@ -438,7 +438,7 @@ impl DefaultHandler {
                         rec.insert("mtime".into(), Value::Int(mtime));
                         rec.insert("is_dir".into(), Value::Bool(md.is_dir()));
                         rec.insert("is_file".into(), Value::Bool(md.is_file()));
-                        Ok(ok(Value::Record(rec)))
+                        Ok(ok(Value::record_dynamic(rec)))
                     }
                     Err(e) => Ok(err(Value::Str(format!("fs.stat `{path}`: {e}").into()))),
                 }
@@ -1726,7 +1726,7 @@ impl EffectHandler for DefaultHandler {
                             String::from_utf8_lossy(&o.stderr).into_owned().into()));
                         rec.insert("exit_code".into(), Value::Int(
                             o.status.code().unwrap_or(-1) as i64));
-                        Ok(ok(Value::Record(rec)))
+                        Ok(ok(Value::record_dynamic(rec)))
                     }
                     Err(e) => Ok(err(Value::Str(format!("spawn `{cmd}`: {e}").into()))),
                 }
@@ -2196,7 +2196,7 @@ pub(crate) fn stamp_path_params(
     req: &mut Value,
     params: std::collections::BTreeMap<lex_bytecode::MapKey, Value>,
 ) {
-    if let Value::Record(rec) = req {
+    if let Value::Record { fields: rec, .. } = req {
         rec.insert("path_params".into(), Value::Map(params));
     }
 }
@@ -2379,7 +2379,7 @@ impl ServeOpts {
         rec.insert("http2".to_string(),     Value::Bool(self.http2));
         rec.insert("inline_vm".to_string(), Value::Bool(self.inline_vm));
         rec.insert("host".to_string(),      Value::Str(self.host.clone().into()));
-        Value::Record(rec)
+        Value::record_dynamic(rec)
     }
 }
 
@@ -2389,7 +2389,7 @@ impl ServeOpts {
 /// shape is treated as an internal-consistency error.
 fn decode_serve_opts(v: &Value) -> Result<ServeOpts, String> {
     let rec = match v {
-        Value::Record(r) => r,
+        Value::Record { fields: r, .. } => r,
         other => return Err(format!("opts must be a Record, got {other:?}")),
     };
     let http2 = match rec.get("http2") {
@@ -2420,13 +2420,13 @@ fn make_tls_config_value(cert_pem: Vec<u8>, key_pem: Vec<u8>) -> Value {
     let mut rec = indexmap::IndexMap::new();
     rec.insert("cert".into(), Value::Bytes(cert_pem));
     rec.insert("key".into(),  Value::Bytes(key_pem));
-    Value::Record(rec)
+    Value::record_dynamic(rec)
 }
 
 #[cfg(feature = "quic")]
 fn decode_tls_config(v: &Value) -> Result<crate::quic::QuicTls, String> {
     let rec = match v {
-        Value::Record(r) => r,
+        Value::Record { fields: r, .. } => r,
         other => return Err(format!("TlsConfig: expected Record, got {other:?}")),
     };
     let cert = match rec.get("cert") {
@@ -2610,7 +2610,7 @@ pub(crate) fn build_request_value_parts(
     rec.insert("body".into(), Value::Str(body_str.into()));
     rec.insert("headers".into(), Value::Map(headers_map));
     rec.insert("path_params".into(), Value::Map(std::collections::BTreeMap::new()));
-    Value::Record(rec)
+    Value::record_dynamic(rec)
 }
 
 /// Build a Lex request record from a tiny_http request (used by the TLS path).
@@ -2637,11 +2637,11 @@ fn build_request_value_tiny(req: &mut tiny_http::Request) -> Value {
     rec.insert("body".into(), Value::Str(body.into()));
     rec.insert("headers".into(), Value::Map(headers_map));
     rec.insert("path_params".into(), Value::Map(std::collections::BTreeMap::new()));
-    Value::Record(rec)
+    Value::record_dynamic(rec)
 }
 
 pub(crate) fn unpack_response(v: &Value) -> (u16, ResponseBodyOut, Vec<(String, String)>) {
-    if let Value::Record(rec) = v {
+    if let Value::Record { fields: rec, .. } = v {
         let status = rec.get("status").and_then(|s| match s {
             Value::Int(n) => Some(*n as u16),
             _ => None,
@@ -3072,7 +3072,7 @@ fn http_send_full(
             rec.insert("status".into(), Value::Int(status));
             rec.insert("headers".into(), Value::Map(headers_map));
             rec.insert("body".into(), Value::Bytes(body_bytes));
-            Value::Variant { name: "Ok".into(), args: vec![Value::Record(rec)] }
+            Value::Variant { name: "Ok".into(), args: vec![Value::record_dynamic(rec)] }
         }
         Err(e) => http_error_value(e),
     }
@@ -3134,7 +3134,7 @@ fn http_send_record(handler: &DefaultHandler, req: &indexmap::IndexMap<String, V
 
 fn expect_record(v: Option<&Value>) -> Result<&indexmap::IndexMap<String, Value>, String> {
     match v {
-        Some(Value::Record(r)) => Ok(r),
+        Some(Value::Record { fields: r, .. }) => Ok(r),
         Some(other) => Err(format!("expected Record, got {other:?}")),
         None => Err("missing Record argument".into()),
     }
@@ -3223,7 +3223,7 @@ fn sql_error(message: impl Into<String>, code: Option<String>, detail: Option<St
         Some(d) => some(d),
         None => none(),
     });
-    Value::Record(rec)
+    Value::record_dynamic(rec)
 }
 
 /// Convert a rusqlite error into a `SqlError`. The `code` is the
@@ -3624,7 +3624,7 @@ fn sql_run_query_sqlite(
             };
             rec.insert(name.clone(), cell);
         }
-        out.push(Value::Record(rec));
+        out.push(Value::record_dynamic(rec));
     }
     ok(Value::List(out.into()))
 }
@@ -3643,7 +3643,7 @@ fn sql_run_query_pg(
         Err(e) => return err(pg_err_to_sql_error(e, "sql.query")),
     };
     let out: std::collections::VecDeque<Value> = rows.iter().map(|row| {
-        Value::Record(pg_row_to_lex_record(row))
+        Value::record_dynamic(pg_row_to_lex_record(row))
     }).collect();
     ok(Value::List(out))
 }
@@ -3682,7 +3682,7 @@ where
         None => return Err("sql.get_*: missing column name argument".into()),
     };
     let cell = match row {
-        Value::Record(rec) => rec.get(col).cloned(),
+        Value::Record { fields: rec, .. } => rec.get(col).cloned(),
         other => return Err(format!("sql.get_*: row must be a Record, got {other:?}")),
     };
     Ok(match cell.and_then(|v| convert(&v)) {
@@ -4164,7 +4164,7 @@ fn sqlite_cursor_producer(
                     };
                     rec.insert(name.clone(), val);
                 }
-                if sender.send(Ok(Value::Record(rec))).is_err() {
+                if sender.send(Ok(Value::record_dynamic(rec))).is_err() {
                     break;
                 }
             }
@@ -4217,7 +4217,7 @@ fn pg_cursor_producer(
         }
         for row in batch.iter() {
             let rec = pg_row_to_lex_record(row);
-            if sender.send(Ok(Value::Record(rec))).is_err() {
+            if sender.send(Ok(Value::record_dynamic(rec))).is_err() {
                 break 'outer;
             }
         }
