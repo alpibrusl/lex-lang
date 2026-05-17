@@ -152,13 +152,22 @@ pub struct Vm<'a> {
     /// Diagnostic counters for `--trace` observability (#229).
     pub pure_memo_hits: u64,
     pub pure_memo_misses: u64,
-    /// Monomorphic inline caches for `Op::GetField` (#389 slice 2).
-    /// Key: `(fn_id as u64) << 32 | pc as u64` — one entry per
-    /// call site. Value: the IndexMap offset of the field at that
-    /// site. On a hit we verify the field name at the cached offset
-    /// in O(1) and skip the hash-table lookup entirely; on a miss we
-    /// fall back to `IndexMap::get_full` and populate the cache.
-    field_ics: std::collections::HashMap<u64, usize>,
+    /// Monomorphic inline caches for `Op::GetField` (#462 slice 1).
+    /// Indexed by `[fn_id as usize][site_idx as usize]` — one entry
+    /// per field-access site within each function. `site_idx` is
+    /// assigned at compile time by `FnCompiler::field_get_sites` so
+    /// every emit produces a stable identifier independent of pc.
+    /// The cache survives the planned dispatch rewrite (#461) and a
+    /// future JIT (#465). Replaces the pre-#462 monomorphic
+    /// `HashMap<(fn_id << 32 | pc), usize>`.
+    ///
+    /// Outer Vec is pre-sized to `program.functions.len()`; each inner
+    /// Vec is empty until the first GetField in that function runs,
+    /// at which point we one-shot allocate it to the compiler-recorded
+    /// `field_ic_sites` size and never resize again. Lazy on the inner
+    /// side so VMs created for short-lived scripts don't eagerly
+    /// allocate IC slots for functions they never enter.
+    field_ics: Vec<Vec<Option<usize>>>,
     /// Stack allocator for function locals (#389 slice 3).
     ///
     /// Every function frame claims `locals_count` contiguous slots from
@@ -472,7 +481,7 @@ impl<'a> Vm<'a> {
             pure_memo: std::collections::HashMap::new(),
             pure_memo_hits: 0,
             pure_memo_misses: 0,
-            field_ics: std::collections::HashMap::new(),
+            field_ics: vec![Vec::new(); program.functions.len()],
             // 256 slots handles ~32 frames × 8 locals; grows on demand and
             // retains capacity across consecutive vm.call() invocations.
             locals_storage: Vec::with_capacity(256),
@@ -850,17 +859,31 @@ impl<'a> Vm<'a> {
                     };
                     self.stack.push(Value::Variant { name, args });
                 }
-                Op::GetField(i) => {
-                    let name_idx = i;
+                Op::GetField { name_idx, site_idx } => {
                     let v = self.pop()?;
                     match v {
                         Value::Record(r) => {
-                            // Inline cache keyed by call site: (fn_id << 32 | pc).
-                            // On hit: verify field name at cached offset (O(1), no
-                            // string hash); on miss: walk by name + populate cache.
-                            let site = (fn_id as u64) << 32 | pc as u64;
+                            // Inline cache keyed by (fn_id, site_idx) — #462
+                            // slice 1. Direct array index instead of the
+                            // pre-#462 `HashMap<(fn_id << 32 | pc), usize>`.
+                            // The inner Vec is empty until first GetField in
+                            // this function runs; we one-shot allocate it to
+                            // the compiler-recorded site count and never
+                            // resize again. After init, the hot path is two
+                            // array dereferences. On hit: verify the cached
+                            // offset still points at the requested field
+                            // (name compare — shape_id propagation is the
+                            // next slice). On miss: walk the IndexMap by
+                            // name, populate.
+                            let fid = fn_id as usize;
+                            let sid = site_idx as usize;
+                            if self.field_ics[fid].is_empty() {
+                                let n = self.program.functions[fid].field_ic_sites as usize;
+                                self.field_ics[fid] = vec![None; n];
+                            }
+                            let cached = self.field_ics[fid][sid];
                             let value = 'ic: {
-                                if let Some(&off) = self.field_ics.get(&site) {
+                                if let Some(off) = cached {
                                     if let Some((k, val)) = r.get_index(off) {
                                         if let Const::FieldName(s) =
                                             &self.program.constants[name_idx as usize]
@@ -878,7 +901,7 @@ impl<'a> Vm<'a> {
                                 let (off, _, val) = r.get_full(name)
                                     .ok_or_else(|| VmError::TypeMismatch(
                                         format!("missing field `{name}`")))?;
-                                self.field_ics.insert(site, off);
+                                self.field_ics[fid][sid] = Some(off);
                                 val.clone()
                             };
                             self.stack.push(value);

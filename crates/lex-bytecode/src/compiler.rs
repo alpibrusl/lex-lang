@@ -142,6 +142,8 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
                         }),
                     _ => None,
                 }).collect(),
+                // Filled in below once the FnCompiler counts emit sites.
+                field_ic_sites: 0,
             });
         }
     }
@@ -163,6 +165,7 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
                 next_local: 0,
                 peak_local: 0,
                 local_types: IndexMap::new(),
+                field_get_sites: 0,
                 pool: &mut pool,
                 function_names: &function_names,
                 module_aliases: &module_aliases,
@@ -181,9 +184,11 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
             fc.code.push(Op::Return);
             let code = std::mem::take(&mut fc.code);
             let peak = fc.peak_local;
+            let field_sites = fc.field_get_sites as u16;
             drop(fc);
             let idx = function_names[&fd.name];
             p.functions[idx as usize].code = code;
+            p.functions[idx as usize].field_ic_sites = field_sites;
             p.functions[idx as usize].locals_count = peak;
         }
     }
@@ -198,6 +203,7 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
             next_local: 0,
             peak_local: 0,
             local_types: IndexMap::new(),
+            field_get_sites: 0,
             pool: &mut pool,
             function_names: &function_names,
             module_aliases: &module_aliases,
@@ -227,8 +233,10 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
         fc.code.push(Op::Return);
         let code = std::mem::take(&mut fc.code);
         let peak = fc.peak_local;
+        let field_sites = fc.field_get_sites as u16;
         drop(fc);
         p.functions[pl.fn_id as usize].code = code;
+        p.functions[pl.fn_id as usize].field_ic_sites = field_sites;
         p.functions[pl.fn_id as usize].locals_count = peak;
     }
 
@@ -398,6 +406,13 @@ struct FnCompiler<'a> {
     /// slot index so shadowed bindings are handled correctly via
     /// `IndexMap`'s insertion-order semantics.
     local_types: IndexMap<String, NumTy>,
+    /// Per-function counter for `Op::GetField` site indices (#462
+    /// slice 1). Each `Op::GetField` emit allocates the next index
+    /// here, giving every field-access site within this function a
+    /// stable identifier independent of pc. The VM uses
+    /// `(fn_id, site_idx)` as the inline-cache key, so the cache
+    /// survives the future dispatch rewrite (#461) and a JIT (#465).
+    field_get_sites: u32,
     pool: &'a mut ConstPool,
     function_names: &'a IndexMap<String, u32>,
     module_aliases: &'a IndexMap<String, String>,
@@ -512,8 +527,10 @@ impl<'a> FnCompiler<'a> {
             }
             a::CExpr::FieldAccess { value, field } => {
                 self.compile_expr(value, false);
-                let idx = self.pool.field(field);
-                self.emit(Op::GetField(idx));
+                let name_idx = self.pool.field(field);
+                let site_idx = self.field_get_sites;
+                self.field_get_sites += 1;
+                self.emit(Op::GetField { name_idx, site_idx });
             }
             a::CExpr::BinOp { op, lhs, rhs } => self.compile_binop(op, lhs, rhs),
             a::CExpr::UnaryOp { op, expr } => {
@@ -830,8 +847,10 @@ impl<'a> FnCompiler<'a> {
                 self.emit(Op::StoreLocal(slot));
                 for f in fields {
                     self.emit(Op::LoadLocal(slot));
-                    let fi = self.pool.field(&f.name);
-                    self.emit(Op::GetField(fi));
+                    let name_idx = self.pool.field(&f.name);
+                    let site_idx = self.field_get_sites;
+                    self.field_get_sites += 1;
+                    self.emit(Op::GetField { name_idx, site_idx });
                     let sub_fails = self.compile_pattern_test(&f.pattern, bindings);
                     fails.extend(sub_fails);
                 }
@@ -886,6 +905,9 @@ impl<'a> FnCompiler<'a> {
             // the parser). #209 stays focused on top-level fn decls;
             // closure-param refinements are a follow-up.
             refinements: Vec::new(),
+            // Lambda body hasn't been compiled yet; filled in by the
+            // deferred lambda-compile pass after FnCompiler walks it.
+            field_ic_sites: 0,
         });
 
         // Emit code at the lambda site: load each captured local, then MakeClosure.
@@ -2151,6 +2173,10 @@ impl<'a> FnCompiler<'a> {
             // Trampolines (flow.sequential / parallel / etc.) don't
             // surface refined params at this layer.
             refinements: Vec::new(),
+            // Trampolines never emit `Op::GetField` — they're pure
+            // scaffolding. Leaving this at 0 means the VM allocates
+            // an empty IC slot.
+            field_ic_sites: 0,
         });
         fn_id
     }

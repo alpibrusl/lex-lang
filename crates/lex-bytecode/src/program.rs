@@ -77,6 +77,13 @@ pub struct Function {
     /// as a runtime gate's `gate.verdict`.
     #[serde(default)]
     pub refinements: Vec<Option<Refinement>>,
+    /// Number of `Op::GetField` sites in this function (#462 slice 1).
+    /// Populated by the compiler so the VM can lazily one-shot
+    /// allocate the inline-cache `Vec<Option<usize>>` to its final
+    /// size on first GetField — no per-op resize bookkeeping.
+    /// `#[serde(default)]` because pre-#462 programs don't carry it.
+    #[serde(default)]
+    pub field_ic_sites: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -174,6 +181,19 @@ pub fn compute_body_hash(
             // guaranteed by the type checker — operand-type proofs the
             // compiler used to specialize are exactly what makes the
             // polymorphic op behave identically.
+            // #462 slice 1 — `GetField` carries a `site_idx` now,
+            // but the canonical body-hash form is the historical
+            // single-field tuple `GetField(name_idx)`. Lowering keeps
+            // closure identity (#222) bit-identical to pre-#462 builds.
+            // `site_idx` is a compile-time perf-side-channel; behavior
+            // doesn't depend on it (identical input → identical
+            // observable result).
+            Op::GetField { name_idx, .. } => {
+                #[derive(Serialize)]
+                enum LegacyOp { GetField(u32) }
+                serde_json::to_vec(&LegacyOp::GetField(*name_idx))
+                    .expect("Op serialization must succeed")
+            }
             Op::IntAdd   | Op::FloatAdd => serde_json::to_vec(&Op::NumAdd).unwrap(),
             Op::IntSub   | Op::FloatSub => serde_json::to_vec(&Op::NumSub).unwrap(),
             Op::IntMul   | Op::FloatMul => serde_json::to_vec(&Op::NumMul).unwrap(),
