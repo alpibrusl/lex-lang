@@ -978,7 +978,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(i));
         self.emit(Op::LoadLocal(xs));
         self.emit(Op::GetListLen);
-        self.emit(Op::NumLt);
+        self.emit(Op::IntLt);
         let j_exit = self.code.len();
         self.emit(Op::JumpIfNot(0));
 
@@ -997,7 +997,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(i));
         let one = self.pool.int(1);
         self.emit(Op::PushConst(one));
-        self.emit(Op::NumAdd);
+        self.emit(Op::IntAdd);
         self.emit(Op::StoreLocal(i));
 
         // jump back
@@ -1061,7 +1061,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(i));
         self.emit(Op::LoadLocal(xs));
         self.emit(Op::GetListLen);
-        self.emit(Op::NumLt);
+        self.emit(Op::IntLt);
         let j_exit = self.code.len();
         self.emit(Op::JumpIfNot(0));
 
@@ -1094,7 +1094,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(i));
         let one = self.pool.int(1);
         self.emit(Op::PushConst(one));
-        self.emit(Op::NumAdd);
+        self.emit(Op::IntAdd);
         self.emit(Op::StoreLocal(i));
 
         let jump_back = self.code.len();
@@ -1130,7 +1130,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(i));
         self.emit(Op::LoadLocal(xs));
         self.emit(Op::GetListLen);
-        self.emit(Op::NumLt);
+        self.emit(Op::IntLt);
         let j_exit = self.code.len();
         self.emit(Op::JumpIfNot(0));
 
@@ -1148,7 +1148,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(i));
         let one = self.pool.int(1);
         self.emit(Op::PushConst(one));
-        self.emit(Op::NumAdd);
+        self.emit(Op::IntAdd);
         self.emit(Op::StoreLocal(i));
 
         let jump_back = self.code.len();
@@ -1345,7 +1345,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(idx));
         self.emit(Op::LoadLocal(list));
         self.emit(Op::GetListLen);
-        self.emit(Op::NumLt);
+        self.emit(Op::IntLt);
         let j_eager_else = self.code.len();
         self.emit(Op::JumpIfNot(0));
 
@@ -1358,7 +1358,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(idx));
         let one = self.pool.int(1);
         self.emit(Op::PushConst(one));
-        self.emit(Op::NumAdd);
+        self.emit(Op::IntAdd);
         let eager_v = self.pool.variant("__IterEager");
         self.emit(Op::MakeVariant { name_idx: eager_v, arity: 2 });
         self.emit(Op::MakeTuple(2));
@@ -1418,7 +1418,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(it)); self.emit(Op::GetVariantArg(1)); // idx
         self.emit(Op::LoadLocal(it)); self.emit(Op::GetVariantArg(0)); // list
         self.emit(Op::GetListLen);                                     // len
-        self.emit(Op::NumLt);                                          // idx < len
+        self.emit(Op::IntLt);                                          // idx < len
         self.emit(Op::BoolNot);                                        // NOT(idx < len)
     }
 
@@ -1431,7 +1431,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(it)); self.emit(Op::GetVariantArg(0));
         self.emit(Op::GetListLen);                                     // len
         self.emit(Op::LoadLocal(it)); self.emit(Op::GetVariantArg(1)); // idx
-        self.emit(Op::NumSub);                                         // len - idx
+        self.emit(Op::IntSub);                                         // len - idx
     }
 
     /// `iter.take(it, n)` — collect up to n elements, return as new Iter.
@@ -1466,14 +1466,14 @@ impl<'a> FnCompiler<'a> {
         // while cnt < n
         self.emit(Op::LoadLocal(cnt));
         self.emit(Op::LoadLocal(n));
-        self.emit(Op::NumLt);
+        self.emit(Op::IntLt);
         let j_exit_n = self.code.len();
         self.emit(Op::JumpIfNot(0));
 
         // AND i < len(list)
         self.emit(Op::LoadLocal(i));
         self.emit(Op::LoadLocal(list)); self.emit(Op::GetListLen);
-        self.emit(Op::NumLt);
+        self.emit(Op::IntLt);
         let j_exit_l = self.code.len();
         self.emit(Op::JumpIfNot(0));
 
@@ -1489,12 +1489,12 @@ impl<'a> FnCompiler<'a> {
         // i = i + 1
         self.emit(Op::LoadLocal(i));
         self.emit(Op::PushConst(one));
-        self.emit(Op::NumAdd);
+        self.emit(Op::IntAdd);
         self.emit(Op::StoreLocal(i));
         // cnt = cnt + 1
         self.emit(Op::LoadLocal(cnt));
         self.emit(Op::PushConst(one));
-        self.emit(Op::NumAdd);
+        self.emit(Op::IntAdd);
         self.emit(Op::StoreLocal(cnt));
 
         let jback = self.code.len();
@@ -1532,14 +1532,14 @@ impl<'a> FnCompiler<'a> {
         // raw = idx + n
         self.emit(Op::LoadLocal(idx));
         self.emit(Op::LoadLocal(n));
-        self.emit(Op::NumAdd);
+        self.emit(Op::IntAdd);
         let raw  = self.alloc_local("__isk_raw");
         self.emit(Op::StoreLocal(raw));
 
         // new_idx = if raw < len then raw else len
         self.emit(Op::LoadLocal(raw));
         self.emit(Op::LoadLocal(list)); self.emit(Op::GetListLen);
-        self.emit(Op::NumLt);
+        self.emit(Op::IntLt);
         let j_use_raw = self.code.len();
         self.emit(Op::JumpIf(0));
 
@@ -1656,7 +1656,7 @@ impl<'a> FnCompiler<'a> {
         let loop_top = self.code.len();
         self.emit(Op::LoadLocal(i));
         self.emit(Op::LoadLocal(list)); self.emit(Op::GetListLen);
-        self.emit(Op::NumLt);
+        self.emit(Op::IntLt);
         let j_exit = self.code.len();
         self.emit(Op::JumpIfNot(0));
 
@@ -1670,7 +1670,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(i));
         let one = self.pool.int(1);
         self.emit(Op::PushConst(one));
-        self.emit(Op::NumAdd);
+        self.emit(Op::IntAdd);
         self.emit(Op::StoreLocal(i));
 
         let jback = self.code.len();
@@ -1714,7 +1714,7 @@ impl<'a> FnCompiler<'a> {
         let loop_top = self.code.len();
         self.emit(Op::LoadLocal(i));
         self.emit(Op::LoadLocal(list)); self.emit(Op::GetListLen);
-        self.emit(Op::NumLt);
+        self.emit(Op::IntLt);
         let j_exit = self.code.len();
         self.emit(Op::JumpIfNot(0));
 
@@ -1731,7 +1731,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(i));
         let one = self.pool.int(1);
         self.emit(Op::PushConst(one));
-        self.emit(Op::NumAdd);
+        self.emit(Op::IntAdd);
         self.emit(Op::StoreLocal(i));
 
         let jback = self.code.len();
@@ -1772,7 +1772,7 @@ impl<'a> FnCompiler<'a> {
         let loop_top = self.code.len();
         self.emit(Op::LoadLocal(i));
         self.emit(Op::LoadLocal(list)); self.emit(Op::GetListLen);
-        self.emit(Op::NumLt);
+        self.emit(Op::IntLt);
         let j_exit = self.code.len();
         self.emit(Op::JumpIfNot(0));
 
@@ -1801,7 +1801,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(i));
         let one = self.pool.int(1);
         self.emit(Op::PushConst(one));
-        self.emit(Op::NumAdd);
+        self.emit(Op::IntAdd);
         self.emit(Op::StoreLocal(i));
 
         let jback = self.code.len();
@@ -1842,7 +1842,7 @@ impl<'a> FnCompiler<'a> {
         let loop_top = self.code.len();
         self.emit(Op::LoadLocal(i));
         self.emit(Op::LoadLocal(list)); self.emit(Op::GetListLen);
-        self.emit(Op::NumLt);
+        self.emit(Op::IntLt);
         let j_exit = self.code.len();
         self.emit(Op::JumpIfNot(0));
 
@@ -1858,7 +1858,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(i));
         let one = self.pool.int(1);
         self.emit(Op::PushConst(one));
-        self.emit(Op::NumAdd);
+        self.emit(Op::IntAdd);
         self.emit(Op::StoreLocal(i));
 
         let jback = self.code.len();
@@ -1909,7 +1909,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(i));
         self.emit(Op::LoadLocal(xs));
         self.emit(Op::GetListLen);
-        self.emit(Op::NumLt);
+        self.emit(Op::IntLt);
         let j_exit = self.code.len();
         self.emit(Op::JumpIfNot(0));
 
@@ -1935,7 +1935,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(i));
         let one = self.pool.int(1);
         self.emit(Op::PushConst(one));
-        self.emit(Op::NumAdd);
+        self.emit(Op::IntAdd);
         self.emit(Op::StoreLocal(i));
 
         let jump_back = self.code.len();
@@ -2230,7 +2230,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(i));
         self.emit(Op::LoadLocal(xs));
         self.emit(Op::GetListLen);
-        self.emit(Op::NumLt);
+        self.emit(Op::IntLt);
         let j_exit = self.code.len();
         self.emit(Op::JumpIfNot(0));
 
@@ -2248,7 +2248,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(i));
         let one = self.pool.int(1);
         self.emit(Op::PushConst(one));
-        self.emit(Op::NumAdd);
+        self.emit(Op::IntAdd);
         self.emit(Op::StoreLocal(i));
 
         // jump back
@@ -2317,7 +2317,7 @@ impl<'a> FnCompiler<'a> {
         let loop_top = code.len() as i32;
         code.push(Op::LoadLocal(3));
         code.push(Op::LoadLocal(1));
-        code.push(Op::NumLt);
+        code.push(Op::IntLt);
         let j_done = code.len();
         code.push(Op::JumpIfNot(0));                       // patched
 
@@ -2342,7 +2342,7 @@ impl<'a> FnCompiler<'a> {
         }
         code.push(Op::LoadLocal(3));
         code.push(Op::PushConst(one_const));
-        code.push(Op::NumAdd);
+        code.push(Op::IntAdd);
         code.push(Op::StoreLocal(3));
         let pc_after_jump = code.len() as i32 + 1;
         code.push(Op::Jump(loop_top - pc_after_jump));
@@ -2397,14 +2397,14 @@ impl<'a> FnCompiler<'a> {
         // while i < max
         code.push(Op::LoadLocal(4));
         code.push(Op::LoadLocal(1));
-        code.push(Op::NumLt);
+        code.push(Op::IntLt);
         let j_done = code.len();
         code.push(Op::JumpIfNot(0)); // patched
 
         // if i > 0: time.sleep_ms(next_delay); next_delay := next_delay * 2
         code.push(Op::PushConst(zero_const));
         code.push(Op::LoadLocal(4));
-        code.push(Op::NumLt);                // 0 < i ?
+        code.push(Op::IntLt);                // 0 < i ?
         let j_no_sleep = code.len();
         code.push(Op::JumpIfNot(0));         // patched: skip the sleep block
         // Sleep
@@ -2445,7 +2445,7 @@ impl<'a> FnCompiler<'a> {
         }
         code.push(Op::LoadLocal(4));
         code.push(Op::PushConst(one_const));
-        code.push(Op::NumAdd);
+        code.push(Op::IntAdd);
         code.push(Op::StoreLocal(4));
         let pc_after_jump = code.len() as i32 + 1;
         code.push(Op::Jump(loop_top - pc_after_jump));
