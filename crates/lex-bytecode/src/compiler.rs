@@ -237,8 +237,12 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
     // computation, but `compute_body_hash` decomposes each fused op
     // back to its primitive form on hash — so closure identity (#222)
     // is invariant under this pass and the order doesn't matter.
+    //
+    // Slices run sequentially: slice 2 looks for slice-1 output
+    // followed by a StoreLocal, so it must follow slice 1.
     for f in p.functions.iter_mut() {
         apply_peephole(&mut f.code, &pool.pool);
+        apply_peephole_slice2(&mut f.code);
     }
 
     // Final pass: stamp every function with its content hash now that
@@ -275,19 +279,7 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
 /// skips fusion sites whose tombstones overlap one.
 fn apply_peephole(code: &mut [Op], constants: &[Const]) {
     if code.len() < 3 { return; }
-
-    // Collect jump targets so we don't fuse across them.
-    let mut jump_targets = std::collections::HashSet::new();
-    for (pc, op) in code.iter().enumerate() {
-        let off = match op {
-            Op::Jump(off) | Op::JumpIf(off) | Op::JumpIfNot(off) => Some(*off),
-            _ => None,
-        };
-        if let Some(off) = off {
-            let target = (pc as i32 + 1 + off) as usize;
-            jump_targets.insert(target);
-        }
-    }
+    let jump_targets = collect_jump_targets(code);
 
     let n = code.len();
     let mut k = 0;
@@ -313,6 +305,67 @@ fn apply_peephole(code: &mut [Op], constants: &[Const]) {
         }
         k += 1;
     }
+}
+
+/// Slice 2: fuse `[LoadLocalAddIntConst, _, _, StoreLocal(dest)]`
+/// into `LoadLocalAddIntConstStoreLocal { src, imm_const_idx, dest }`.
+/// The two `_` slots are slice-1 tombstones (the original PushConst
+/// and IntAdd) and stay in place as slice-2 tombstones too. The
+/// dispatch loop advances pc by 4 past all three trailing slots
+/// after executing the fused op.
+fn apply_peephole_slice2(code: &mut [Op]) {
+    if code.len() < 4 { return; }
+    let jump_targets = collect_jump_targets(code);
+
+    let n = code.len();
+    let mut k = 0;
+    while k + 3 < n {
+        if let (
+            Op::LoadLocalAddIntConst { local_idx: src, imm_const_idx },
+            _,
+            _,
+            Op::StoreLocal(dest),
+        ) = (code[k], code[k + 1], code[k + 2], code[k + 3])
+        {
+            // Slice-1 contract: code[k+1] is the original
+            // PushConst(imm_const_idx) and code[k+2] is the
+            // original IntAdd. We don't re-verify those — slice 1
+            // is the only producer of LoadLocalAddIntConst and
+            // always leaves the contract intact.
+            //
+            // Safety: tombstones at k+1..k+3 must not be reachable
+            // from any jump. k itself can be (it's still a live
+            // op carrying the same semantics).
+            let safe = !jump_targets.contains(&(k + 1))
+                && !jump_targets.contains(&(k + 2))
+                && !jump_targets.contains(&(k + 3));
+            if safe {
+                code[k] = Op::LoadLocalAddIntConstStoreLocal {
+                    src,
+                    imm_const_idx,
+                    dest,
+                };
+                k += 4;
+                continue;
+            }
+        }
+        k += 1;
+    }
+}
+
+fn collect_jump_targets(code: &[Op]) -> std::collections::HashSet<usize> {
+    let mut targets = std::collections::HashSet::new();
+    for (pc, op) in code.iter().enumerate() {
+        let off = match op {
+            Op::Jump(off) | Op::JumpIf(off) | Op::JumpIfNot(off) => Some(*off),
+            _ => None,
+        };
+        if let Some(off) = off {
+            let target = (pc as i32 + 1 + off) as usize;
+            targets.insert(target);
+        }
+    }
+    targets
 }
 
 #[derive(Debug, Clone)]

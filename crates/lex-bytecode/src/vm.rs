@@ -1452,6 +1452,20 @@ impl<'a> Vm<'a> {
                     // left in place for body-hash stability.
                     self.frames[frame_idx].pc = pc + 3;
                 }
+                Op::LoadLocalAddIntConstStoreLocal { src, imm_const_idx, dest } => {
+                    let base = self.frames[frame_idx].locals_start;
+                    let a = self.locals_storage[base + src as usize].as_int();
+                    let b = match &self.program.constants[imm_const_idx as usize] {
+                        Const::Int(n) => *n,
+                        c => return Err(VmError::TypeMismatch(
+                            format!("LoadLocalAddIntConstStoreLocal expected Int const, got {c:?}"))),
+                    };
+                    self.locals_storage[base + dest as usize] = Value::Int(a + b);
+                    // Skip past the 3 inert primitive ops we
+                    // absorbed (original PushConst + IntAdd +
+                    // StoreLocal).
+                    self.frames[frame_idx].pc = pc + 4;
+                }
             }
         }
     }
