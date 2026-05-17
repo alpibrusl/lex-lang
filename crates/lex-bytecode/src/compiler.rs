@@ -310,7 +310,7 @@ fn apply_peephole(code: &mut [Op], constants: &[Const]) {
 /// Slice 2: fuse `[LoadLocalAddIntConst, _, _, StoreLocal(dest)]`
 /// into `LoadLocalAddIntConstStoreLocal { src, imm_const_idx, dest }`.
 /// The two `_` slots are slice-1 tombstones (the original PushConst
-/// + IntAdd) and stay in place as slice-2 tombstones too — the
+/// and IntAdd) and stay in place as slice-2 tombstones too. The
 /// dispatch loop advances pc by 4 past all three trailing slots
 /// after executing the fused op.
 fn apply_peephole_slice2(code: &mut [Op]) {
