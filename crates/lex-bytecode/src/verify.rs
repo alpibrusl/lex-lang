@@ -139,7 +139,7 @@ fn stack_delta(op: &Op) -> i32 {
         Op::MakeVariant { arity, .. } => -(*arity as i32) + 1,
 
         // Field/element access: pop 1, push 1
-        Op::GetField(_)    => 0,
+        Op::GetField { .. } => 0,
         Op::GetElem(_)     => 0,
         Op::GetListElem(_) => 0,
         Op::GetListLen     => 0,
@@ -232,6 +232,7 @@ mod tests {
             effects: vec![],
             body_hash: crate::program::ZERO_BODY_HASH,
             refinements: vec![],
+            field_ic_sites: 0,
         }
     }
 

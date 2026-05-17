@@ -46,7 +46,16 @@ pub enum Op {
     MakeTuple(u16),
     MakeList(u32),
     MakeVariant { name_idx: u32, arity: u16 },
-    GetField(u32),         // field name const idx
+    /// Record field access. `name_idx` indexes a `Const::FieldName`
+    /// in the constant pool — the field to read. `site_idx` is a
+    /// stable per-function index assigned by the compiler at emit
+    /// time (#462 slice 1), keyed into the per-fn inline-cache table
+    /// in the VM. Replaces the pre-#462 `(fn_id << 32 | pc)` IC key
+    /// so the cache survives the future dispatch rewrite (#461) and
+    /// a JIT (#465). `body_hash` stability: the canonical encoding
+    /// drops `site_idx` and serializes as the historical `GetField(u32)`
+    /// tuple form, so closure identity (#222) is unchanged.
+    GetField { name_idx: u32, site_idx: u32 },
     GetElem(u16),          // tuple element index
     TestVariant(u32),      // pushes Bool: top-of-stack matches variant name?
     GetVariant(u32),       // extracts payload (replaces variant on stack with its args list)
