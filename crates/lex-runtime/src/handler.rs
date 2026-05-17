@@ -1736,10 +1736,12 @@ fn serve_http_plain(
     use http_body_util::BodyExt as _;
     use hyper::server::conn::http1;
     use hyper::service::service_fn;
-    use hyper_util::rt::TokioIo;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto;
     use tokio::net::TcpListener as TokioTcpListener;
 
     let inline_vm = env_inline_vm();
+    let http2 = env_http2();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -1749,8 +1751,9 @@ fn serve_http_plain(
             .await
             .map_err(|e| format!("net.serve bind {port}: {e}"))?;
         eprintln!(
-            "net.serve: listening on http://0.0.0.0:{port}{}",
-            if inline_vm { " (inline-vm)" } else { "" }
+            "net.serve: listening on http://0.0.0.0:{port}{}{}",
+            if inline_vm { " (inline-vm)" } else { "" },
+            if http2 { " (http1+http2)" } else { "" }
         );
         loop {
             let (stream, _) = listener
@@ -1802,7 +1805,18 @@ fn serve_http_plain(
                         })
                     }
                 });
-                if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+                let result = if http2 {
+                    auto::Builder::new(TokioExecutor::new())
+                        .serve_connection(io, svc)
+                        .await
+                        .map_err(|e| e.to_string())
+                } else {
+                    http1::Builder::new()
+                        .serve_connection(io, svc)
+                        .await
+                        .map_err(|e| e.to_string())
+                };
+                if let Err(e) = result {
                     eprintln!("net.serve: connection error: {e}");
                 }
             });
@@ -1869,10 +1883,12 @@ fn serve_http_fn(
     use http_body_util::BodyExt as _;
     use hyper::server::conn::http1;
     use hyper::service::service_fn;
-    use hyper_util::rt::TokioIo;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto;
     use tokio::net::TcpListener as TokioTcpListener;
 
     let inline_vm = env_inline_vm();
+    let http2 = env_http2();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -1882,8 +1898,9 @@ fn serve_http_fn(
             .await
             .map_err(|e| format!("net.serve_fn bind {port}: {e}"))?;
         eprintln!(
-            "net.serve_fn: listening on http://0.0.0.0:{port}{}",
-            if inline_vm { " (inline-vm)" } else { "" }
+            "net.serve_fn: listening on http://0.0.0.0:{port}{}{}",
+            if inline_vm { " (inline-vm)" } else { "" },
+            if http2 { " (http1+http2)" } else { "" }
         );
         loop {
             let (stream, _) = listener
@@ -1932,7 +1949,18 @@ fn serve_http_fn(
                         })
                     }
                 });
-                if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+                let result = if http2 {
+                    auto::Builder::new(TokioExecutor::new())
+                        .serve_connection(io, svc)
+                        .await
+                        .map_err(|e| e.to_string())
+                } else {
+                    http1::Builder::new()
+                        .serve_connection(io, svc)
+                        .await
+                        .map_err(|e| e.to_string())
+                };
+                if let Err(e) = result {
                     eprintln!("net.serve_fn: connection error: {e}");
                 }
             });
@@ -2098,10 +2126,12 @@ fn serve_http_routed(
     use http_body_util::BodyExt as _;
     use hyper::server::conn::http1;
     use hyper::service::service_fn;
-    use hyper_util::rt::TokioIo;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto;
     use tokio::net::TcpListener as TokioTcpListener;
 
     let inline_vm = env_inline_vm();
+    let http2 = env_http2();
     let routes = Arc::new(routes);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -2112,9 +2142,10 @@ fn serve_http_routed(
             .await
             .map_err(|e| format!("net.serve_routed bind {port}: {e}"))?;
         eprintln!(
-            "net.serve_routed: listening on http://0.0.0.0:{port} ({} routes{})",
+            "net.serve_routed: listening on http://0.0.0.0:{port} ({} routes{}{})",
             routes.len(),
-            if inline_vm { ", inline-vm" } else { "" }
+            if inline_vm { ", inline-vm" } else { "" },
+            if http2 { ", http1+http2" } else { "" }
         );
         loop {
             let (stream, _) = listener
@@ -2181,7 +2212,18 @@ fn serve_http_routed(
                         })
                     }
                 });
-                if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+                let result = if http2 {
+                    auto::Builder::new(TokioExecutor::new())
+                        .serve_connection(io, svc)
+                        .await
+                        .map_err(|e| e.to_string())
+                } else {
+                    http1::Builder::new()
+                        .serve_connection(io, svc)
+                        .await
+                        .map_err(|e| e.to_string())
+                };
+                if let Err(e) = result {
                     eprintln!("net.serve_routed: connection error: {e}");
                 }
             });
@@ -2195,6 +2237,25 @@ fn serve_http_routed(
 /// default `spawn_blocking` behaviour. See issue #431.
 fn env_inline_vm() -> bool {
     match std::env::var("LEX_NET_INLINE_VM") {
+        Ok(v) => {
+            let s = v.trim().to_ascii_lowercase();
+            s == "1" || s == "true"
+        }
+        Err(_) => false,
+    }
+}
+
+/// Read `LEX_NET_HTTP2` and report whether the runtime should accept
+/// HTTP/2 connections via hyper-util's auto builder (HTTP/1 ↔ HTTP/2
+/// preface detection). Accepts `1` / `true` (case-insensitive); anything
+/// else (including unset) keeps the HTTP/1-only default.
+///
+/// h2c (cleartext HTTP/2) needs prior-knowledge clients
+/// (`curl --http2-prior-knowledge`, wrk/h2load, gRPC). Browsers do not
+/// speak h2c — they require ALPN over TLS, which is a separate path.
+/// See lex-lang#488.
+fn env_http2() -> bool {
+    match std::env::var("LEX_NET_HTTP2") {
         Ok(v) => {
             let s = v.trim().to_ascii_lowercase();
             s == "1" || s == "true"
