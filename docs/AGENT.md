@@ -166,7 +166,20 @@ drops the name binding but existing `Actor[S]` handles held by callers
 keep working. `registered()` returns a sorted snapshot of names.
 
 ### `std.http`
-`get`, `post`, `put`, `delete`, `patch` — all require `[http.*]` effect.
+`get`, `post`, `put`, `delete`, `patch` — all require `[net]` effect.
+
+`stream_lines(url :: Str, headers :: Map[Str, Str], body :: Str) -> [net] Result[Iter[Str], Str]`
+— HTTP POST that reads the full response body and yields it split into lines as `Iter[Str]`.
+Designed for LLM provider APIs (OpenAI, Anthropic, Google) that use SSE or NDJSON and
+**close the connection** after sending all events. Requires `[net]` effect.
+
+**WARNING — eager buffer, not true streaming.** The current implementation (ureq 3.3) reads
+the entire response body into memory before splitting into lines. This means:
+- It blocks until the server closes the connection. Endpoints that hold connections open
+  indefinitely (traditional push-SSE feeds, infinite event streams) will hang forever.
+- The full response must fit in memory.
+
+Use only with endpoints that terminate the connection after sending all data.
 
 ### `std.net`
 `net.serve(port, handler_name)` — HTTP server, handler looked up by name string.
