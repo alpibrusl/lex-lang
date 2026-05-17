@@ -223,6 +223,15 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
         p.functions[pl.fn_id as usize].locals_count = peak;
     }
 
+    // Peephole pass (#461 superinstructions). Rewrites fusable opcode
+    // patterns into single dispatch steps. Runs before `body_hash`
+    // computation, but `compute_body_hash` decomposes each fused op
+    // back to its primitive form on hash — so closure identity (#222)
+    // is invariant under this pass and the order doesn't matter.
+    for f in p.functions.iter_mut() {
+        apply_peephole(&mut f.code, &pool.pool);
+    }
+
     // Final pass: stamp every function with its content hash now that
     // every body is finalized (#222). Trampolines installed via
     // `install_trampoline` already have it; recomputing is cheap and
@@ -237,6 +246,64 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
     p.constants = pool.pool;
     p.record_shapes = pool.record_shapes;
     p
+}
+
+/// Peephole pass: rewrite fusable opcode patterns into superinstructions
+/// (#461). Each fused op claims its own slot in the code stream; the
+/// trailing primitive ops it absorbs stay in place as inert
+/// "tombstones" — the dispatch loop overrides its default `pc += 1`
+/// to step past them. Leaving the tombstones in place keeps
+/// `code.len()` invariant and means we don't have to renumber jump
+/// offsets.
+///
+/// Pattern (slice 1): `LoadLocal(i), PushConst(c), IntAdd` where
+/// `constants[c]` is a `Const::Int`. Fused to
+/// `LoadLocalAddIntConst { local_idx: i, imm_const_idx: c }`.
+/// Safety: the second and third slots must not be reachable from
+/// any Jump / JumpIf / JumpIfNot — otherwise a jump would land on a
+/// tombstone instead of the live op the source intended. The
+/// pre-pass below collects every jump target in the function and
+/// skips fusion sites whose tombstones overlap one.
+fn apply_peephole(code: &mut [Op], constants: &[Const]) {
+    if code.len() < 3 { return; }
+
+    // Collect jump targets so we don't fuse across them.
+    let mut jump_targets = std::collections::HashSet::new();
+    for (pc, op) in code.iter().enumerate() {
+        let off = match op {
+            Op::Jump(off) | Op::JumpIf(off) | Op::JumpIfNot(off) => Some(*off),
+            _ => None,
+        };
+        if let Some(off) = off {
+            let target = (pc as i32 + 1 + off) as usize;
+            jump_targets.insert(target);
+        }
+    }
+
+    let n = code.len();
+    let mut k = 0;
+    while k + 2 < n {
+        if let (Op::LoadLocal(local_idx), Op::PushConst(imm_const_idx), Op::IntAdd)
+            = (code[k], code[k + 1], code[k + 2])
+        {
+            let imm_is_int = matches!(
+                constants.get(imm_const_idx as usize),
+                Some(Const::Int(_))
+            );
+            // Tombstones at k+1 and k+2 must not be jump targets;
+            // k itself can be a target (it stays a live op — the
+            // fused form executes the same semantics in one step).
+            let safe = imm_is_int
+                && !jump_targets.contains(&(k + 1))
+                && !jump_targets.contains(&(k + 2));
+            if safe {
+                code[k] = Op::LoadLocalAddIntConst { local_idx, imm_const_idx };
+                k += 3;
+                continue;
+            }
+        }
+        k += 1;
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -110,4 +110,23 @@ pub enum Op {
     // strings
     StrConcat, StrLen, StrEq,
     BytesLen, BytesEq,
+
+    // superinstructions (#461)
+    //
+    // Fused opcodes emitted by the compiler's peephole pass to skip
+    // dispatch on common multi-op patterns. The pass leaves the
+    // original primitive ops in place at the trailing slots — the
+    // dispatch loop overrides its default `pc += 1` to step past
+    // them. Keeping `code.len()` invariant means existing
+    // Jump/JumpIf offsets remain valid without a renumbering pass.
+    /// Fused `LoadLocal(local_idx) + PushConst(imm_const_idx) +
+    /// IntAdd`. `imm_const_idx` must point to a `Const::Int`. The
+    /// dispatch arm reads the local, adds the constant, pushes the
+    /// result, and advances pc by 3 (past this op and the two
+    /// inert PushConst + IntAdd slots that follow). For
+    /// `body_hash` stability (#222) the canonical encoding decomposes
+    /// this op back to a standalone `LoadLocal(local_idx)` at hash
+    /// time; the unchanged PushConst / IntAdd at the next two
+    /// slots hash normally, so the total bytes match pre-fusion.
+    LoadLocalAddIntConst { local_idx: u16, imm_const_idx: u32 },
 }
