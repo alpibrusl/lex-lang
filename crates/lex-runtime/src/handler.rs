@@ -782,7 +782,7 @@ impl EffectHandler for DefaultHandler {
                 other => Err(format!("unsupported stream.{other}")),
             };
         }
-        if kind == "http" && matches!(op, "send" | "get" | "post") {
+        if kind == "http" && matches!(op, "send" | "get" | "post" | "stream_lines") {
             self.ensure_kind_allowed("net")?;
             return match op {
                 "send" => {
@@ -800,6 +800,13 @@ impl EffectHandler for DefaultHandler {
                     let content_type = expect_str(args.get(2))?.to_string();
                     self.ensure_host_allowed(&url)?;
                     Ok(http_send_simple("POST", &url, Some(body), &content_type, None))
+                }
+                "stream_lines" => {
+                    let url = expect_str(args.first())?.to_string();
+                    let headers_val = args.get(1).cloned().unwrap_or(Value::Map(Default::default()));
+                    let body = expect_str(args.get(2))?.to_string();
+                    self.ensure_host_allowed(&url)?;
+                    Ok(http_stream_lines_impl(self, &url, &headers_val, &body))
                 }
                 _ => unreachable!(),
             };
@@ -2814,6 +2821,39 @@ fn ok(v: Value) -> Value {
 }
 fn err(v: Value) -> Value {
     Value::Variant { name: "Err".into(), args: vec![v] }
+}
+
+/// Perform a streaming HTTP POST and return a lazy line iterator
+/// as `Ok(__StreamHandle)`. The caller drains the iterator via the
+/// normal `Iter[T]` protocol. Connection errors become `Err(Str)`.
+fn http_stream_lines_impl(handler: &DefaultHandler, url: &str, headers_val: &Value, body: &str) -> Value {
+    let body_bytes = body.as_bytes().to_vec();
+    let agent = http_agent(None);
+    let mut req = agent.post(url);
+    if let Value::Map(headers) = headers_val {
+        for (k, v) in headers {
+            let key_str = match k {
+                lex_bytecode::MapKey::Str(s) => s.as_str(),
+                _ => continue,
+            };
+            if let Value::Str(val) = v {
+                req = req.header(key_str, val.as_str());
+            }
+        }
+    }
+    match req.send(&body_bytes[..]) {
+        Ok(resp) => {
+            let bytes = match resp.into_body().with_config().read_to_vec() {
+                Ok(b) => b,
+                Err(e) => return err(Value::Str(format!("http.stream_lines: body read: {e}").into())),
+            };
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            let lines: Vec<String> = text.lines().map(String::from).collect();
+            let handle = handler.register_stream(lines.into_iter());
+            ok(stream_handle_value(handle))
+        }
+        Err(e) => err(Value::Str(format!("http.stream_lines: {e}").into())),
+    }
 }
 
 /// Build a `SqlError = { message, code, detail }` Lex record (#380).
