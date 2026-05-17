@@ -190,6 +190,8 @@ fn my_handler(req :: Request) -> [io] Response {
 }
 fn main() -> [net, io] Nil { net.serve_fn(8080, my_handler) }
 ```
+
+`net.serve_with(port, handler_name, opts)` / `net.serve_fn_with(port, handler, opts)` / `net.serve_routed_with(port, routes, fallback, opts)` — same as the unsuffixed variants but accept a `ServeOpts` record literal (`{ http2: Bool, inline_vm: Bool, host: Str }`) instead of relying on `LEX_NET_HTTP2` / `LEX_NET_INLINE_VM` env vars. `net.default_opts()` returns the defaults (`http2: false, inline_vm: false, host: "0.0.0.0"`); construct your own literal to enable HTTP/2 or bind to a specific host. The legacy `serve` / `serve_fn` / `serve_routed` paths keep honouring the env vars for backwards compatibility — new code should prefer the `*_with` variants (#497).
 `net.serve_ws_fn(port, subprotocol, handler)` — WebSocket server:
 ```lex
 fn on_msg(conn :: WsConn, msg :: WsMessage) -> WsAction {
