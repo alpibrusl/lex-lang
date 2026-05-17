@@ -145,6 +145,17 @@ pub fn compute_body_hash(
                 }))
                 .expect("Op serialization must succeed")
             }
+            // Peephole-fused op (#461 superinstructions). The fused
+            // op occupies the slot where `LoadLocal(local_idx)` was;
+            // the next two slots in `code` still hold the unchanged
+            // `PushConst(imm_const_idx)` and `IntAdd`. Hashing as the
+            // original `LoadLocal` makes the total body-hash bytes
+            // match the pre-fusion form — closure identity (#222)
+            // stays invariant across peephole rewrites.
+            Op::LoadLocalAddIntConst { local_idx, .. } => {
+                serde_json::to_vec(&Op::LoadLocal(*local_idx))
+                    .expect("Op serialization must succeed")
+            }
             _ => serde_json::to_vec(op).expect("Op serialization must succeed"),
         };
         hasher.update((bytes.len() as u64).to_le_bytes());

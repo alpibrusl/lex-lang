@@ -1420,6 +1420,23 @@ impl<'a> Vm<'a> {
                     };
                     self.stack.push(Value::Bool(eq));
                 }
+
+                // Superinstructions (#461).
+                Op::LoadLocalAddIntConst { local_idx, imm_const_idx } => {
+                    let base = self.frames[frame_idx].locals_start;
+                    let a = self.locals_storage[base + local_idx as usize].as_int();
+                    let b = match &self.program.constants[imm_const_idx as usize] {
+                        Const::Int(n) => *n,
+                        c => return Err(VmError::TypeMismatch(
+                            format!("LoadLocalAddIntConst expected Int const, got {c:?}"))),
+                    };
+                    self.stack.push(Value::Int(a + b));
+                    // Override the default `pc + 1`: skip past the
+                    // two inert primitive ops (the original
+                    // PushConst + IntAdd) that the peephole pass
+                    // left in place for body-hash stability.
+                    self.frames[frame_idx].pc = pc + 3;
+                }
             }
         }
     }

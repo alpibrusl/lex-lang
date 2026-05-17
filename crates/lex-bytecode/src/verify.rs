@@ -192,6 +192,14 @@ fn stack_delta(op: &Op) -> i32 {
         Op::StrEq     => -1,
         Op::BytesLen  =>  0,
         Op::BytesEq   => -1,
+
+        // Superinstructions (#461). The fused op contributes its
+        // net delta (+1, same shape as a bare LoadLocal). The two
+        // inert primitive ops the peephole leaves at pc+1 / pc+2
+        // are walked as if live: their deltas (+1 PushConst, -1
+        // IntAdd) cancel, so the depth at pc+3 matches what the
+        // unfused sequence would have produced.
+        Op::LoadLocalAddIntConst { .. } => 1,
     }
 }
 
