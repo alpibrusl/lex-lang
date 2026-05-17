@@ -162,6 +162,7 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
                 locals: IndexMap::new(),
                 next_local: 0,
                 peak_local: 0,
+                local_types: IndexMap::new(),
                 pool: &mut pool,
                 function_names: &function_names,
                 module_aliases: &module_aliases,
@@ -172,6 +173,7 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
             for param in &fd.params {
                 let i = fc.next_local;
                 fc.locals.insert(param.name.clone(), i);
+                fc.local_types.insert(param.name.clone(), classify_type_expr(&param.ty));
                 fc.next_local += 1;
                 fc.peak_local = fc.next_local;
             }
@@ -195,6 +197,7 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
             locals: IndexMap::new(),
             next_local: 0,
             peak_local: 0,
+            local_types: IndexMap::new(),
             pool: &mut pool,
             function_names: &function_names,
             module_aliases: &module_aliases,
@@ -205,12 +208,18 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
         for name in &pl.capture_names {
             let i = fc.next_local;
             fc.locals.insert(name.clone(), i);
+            // Captures' static types aren't known at this layer
+            // — the closure's environment carries them dynamically.
+            // Conservative fallback; binop lowering stays correct
+            // because Unknown classifies through to NumAdd.
+            fc.local_types.insert(name.clone(), NumTy::Unknown);
             fc.next_local += 1;
             fc.peak_local = fc.next_local;
         }
         for p in &pl.params {
             let i = fc.next_local;
             fc.locals.insert(p.name.clone(), i);
+            fc.local_types.insert(p.name.clone(), classify_type_expr(&p.ty));
             fc.next_local += 1;
             fc.peak_local = fc.next_local;
         }
@@ -321,6 +330,21 @@ struct FnCompiler<'a> {
     next_local: u16,
     /// Peak local usage seen during compilation (for VM frame sizing).
     peak_local: u16,
+    /// Inferred numeric type of each local for typed numeric-op
+    /// lowering (#461). Populated when binding function parameters
+    /// (from their declared `TypeExpr::Named { name: "Int", .. }`
+    /// or `"Float"`) and when binding `let name := value` where
+    /// the RHS classifies statically. Used by `compile_binop` to
+    /// emit `Op::IntAdd` / `Op::FloatAdd` instead of the
+    /// polymorphic `Op::NumAdd` when both operands' types are
+    /// statically known. Conservative: falls back to `NumTy::Unknown`
+    /// (and the polymorphic op) whenever a type isn't locally
+    /// derivable.
+    ///
+    /// Keyed by local *name* (parallel to `locals`) rather than by
+    /// slot index so shadowed bindings are handled correctly via
+    /// `IndexMap`'s insertion-order semantics.
+    local_types: IndexMap<String, NumTy>,
     pool: &'a mut ConstPool,
     function_names: &'a IndexMap<String, u32>,
     module_aliases: &'a IndexMap<String, String>,
@@ -332,6 +356,28 @@ struct FnCompiler<'a> {
     /// Mutable view of the function table — used to allocate fn_ids for
     /// freshly-discovered lambdas.
     next_fn_id: &'a mut Vec<Function>,
+}
+
+/// Lightweight numeric-type classification used by `compile_binop`
+/// to decide whether to emit `IntAdd` / `FloatAdd` (specialized,
+/// fast) or `NumAdd` (polymorphic, runtime-typed dispatch). #461
+/// typed-lowering pass — conservative: anything not provably one
+/// of these returns `Unknown` and falls back to the polymorphic op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NumTy { Int, Float, Unknown }
+
+fn classify_type_expr(ty: &a::TypeExpr) -> NumTy {
+    match ty {
+        a::TypeExpr::Named { name, args } if args.is_empty() => match name.as_str() {
+            "Int" => NumTy::Int,
+            "Float" => NumTy::Float,
+            _ => NumTy::Unknown,
+        },
+        // `Refined { base, .. }` (#209) — classify by the base type;
+        // the refinement predicate doesn't change the value's primitive shape.
+        a::TypeExpr::Refined { base, .. } => classify_type_expr(base),
+        _ => NumTy::Unknown,
+    }
 }
 
 impl<'a> FnCompiler<'a> {
@@ -364,9 +410,18 @@ impl<'a> FnCompiler<'a> {
                     panic!("unknown var in compiler: {name}");
                 }
             }
-            a::CExpr::Let { name, ty: _, value, body } => {
+            a::CExpr::Let { name, ty, value, body } => {
+                // Classify the RHS for typed-op lowering (#461). Prefer
+                // the declared annotation when present (cheap O(1)
+                // lookup); fall back to classifying the value
+                // expression structurally.
+                let nty = match ty {
+                    Some(t) => classify_type_expr(t),
+                    None => self.classify_expr(value),
+                };
                 self.compile_expr(value, false);
                 let slot = self.alloc_local(name);
+                self.local_types.insert(name.clone(), nty);
                 self.emit(Op::StoreLocal(slot));
                 self.compile_expr(body, tail);
             }
@@ -505,23 +560,95 @@ impl<'a> FnCompiler<'a> {
     }
 
     fn compile_binop(&mut self, op: &str, lhs: &a::CExpr, rhs: &a::CExpr) {
+        // #461 typed lowering: if we can statically prove both
+        // operands are the same numeric type, emit the typed
+        // primitive (`IntAdd` / `FloatAdd`) instead of the
+        // polymorphic `NumAdd` that runtime-matches on operand
+        // shape. The fast path skips one match per arithmetic op
+        // *and* unblocks downstream peephole fusions (slice 1)
+        // that scan for typed primitives. Conservative fallback
+        // to the polymorphic op when either side classifies as
+        // `Unknown`, so correctness for `Float` / mixed code is
+        // unchanged.
+        let lhs_ty = self.classify_expr(lhs);
+        let rhs_ty = self.classify_expr(rhs);
+        let typed = match (lhs_ty, rhs_ty) {
+            (NumTy::Int, NumTy::Int) => NumTy::Int,
+            (NumTy::Float, NumTy::Float) => NumTy::Float,
+            _ => NumTy::Unknown,
+        };
         self.compile_expr(lhs, false);
         self.compile_expr(rhs, false);
-        match op {
-            "+" => self.emit(Op::NumAdd),
-            "-" => self.emit(Op::NumSub),
-            "*" => self.emit(Op::NumMul),
-            "/" => self.emit(Op::NumDiv),
-            "%" => self.emit(Op::NumMod),
-            "==" => self.emit(Op::NumEq),
-            "!=" => { self.emit(Op::NumEq); self.emit(Op::BoolNot); }
-            "<" => self.emit(Op::NumLt),
-            "<=" => self.emit(Op::NumLe),
-            ">" => { self.emit_swap_top2(); self.emit(Op::NumLt); }
-            ">=" => { self.emit_swap_top2(); self.emit(Op::NumLe); }
-            "and" => self.emit(Op::BoolAnd),
-            "or" => self.emit(Op::BoolOr),
-            other => panic!("unknown binop: {other:?}"),
+        match (op, typed) {
+            ("+",  NumTy::Int)     => self.emit(Op::IntAdd),
+            ("+",  NumTy::Float)   => self.emit(Op::FloatAdd),
+            ("+",  NumTy::Unknown) => self.emit(Op::NumAdd),
+            ("-",  NumTy::Int)     => self.emit(Op::IntSub),
+            ("-",  NumTy::Float)   => self.emit(Op::FloatSub),
+            ("-",  NumTy::Unknown) => self.emit(Op::NumSub),
+            ("*",  NumTy::Int)     => self.emit(Op::IntMul),
+            ("*",  NumTy::Float)   => self.emit(Op::FloatMul),
+            ("*",  NumTy::Unknown) => self.emit(Op::NumMul),
+            ("/",  NumTy::Int)     => self.emit(Op::IntDiv),
+            ("/",  NumTy::Float)   => self.emit(Op::FloatDiv),
+            ("/",  NumTy::Unknown) => self.emit(Op::NumDiv),
+            // Int has %; Float doesn't (NumMod will reject at runtime).
+            ("%",  NumTy::Int)     => self.emit(Op::IntMod),
+            ("%",  _)              => self.emit(Op::NumMod),
+            ("==", NumTy::Int)     => self.emit(Op::IntEq),
+            ("==", NumTy::Float)   => self.emit(Op::FloatEq),
+            ("==", NumTy::Unknown) => self.emit(Op::NumEq),
+            ("!=", NumTy::Int)     => { self.emit(Op::IntEq);   self.emit(Op::BoolNot); }
+            ("!=", NumTy::Float)   => { self.emit(Op::FloatEq); self.emit(Op::BoolNot); }
+            ("!=", NumTy::Unknown) => { self.emit(Op::NumEq);   self.emit(Op::BoolNot); }
+            ("<",  NumTy::Int)     => self.emit(Op::IntLt),
+            ("<",  NumTy::Float)   => self.emit(Op::FloatLt),
+            ("<",  NumTy::Unknown) => self.emit(Op::NumLt),
+            ("<=", NumTy::Int)     => self.emit(Op::IntLe),
+            ("<=", NumTy::Float)   => self.emit(Op::FloatLe),
+            ("<=", NumTy::Unknown) => self.emit(Op::NumLe),
+            (">",  NumTy::Int)     => { self.emit_swap_top2(); self.emit(Op::IntLt); }
+            (">",  NumTy::Float)   => { self.emit_swap_top2(); self.emit(Op::FloatLt); }
+            (">",  NumTy::Unknown) => { self.emit_swap_top2(); self.emit(Op::NumLt); }
+            (">=", NumTy::Int)     => { self.emit_swap_top2(); self.emit(Op::IntLe); }
+            (">=", NumTy::Float)   => { self.emit_swap_top2(); self.emit(Op::FloatLe); }
+            (">=", NumTy::Unknown) => { self.emit_swap_top2(); self.emit(Op::NumLe); }
+            ("and", _) => self.emit(Op::BoolAnd),
+            ("or",  _) => self.emit(Op::BoolOr),
+            (other, _) => panic!("unknown binop: {other:?}"),
+        }
+    }
+
+    /// Classify an expression's static numeric type for #461 typed
+    /// lowering. Strictly conservative: only returns `Int` / `Float`
+    /// when the type is locally derivable from a literal, an
+    /// already-classified local, or a binary op on two same-typed
+    /// operands. Everything else (function calls, field access,
+    /// match expressions, ...) falls back to `Unknown` and the
+    /// polymorphic NumAdd-family op.
+    fn classify_expr(&self, e: &a::CExpr) -> NumTy {
+        match e {
+            a::CExpr::Literal { value: a::CLit::Int { .. } } => NumTy::Int,
+            a::CExpr::Literal { value: a::CLit::Float { .. } } => NumTy::Float,
+            a::CExpr::Var { name } =>
+                self.local_types.get(name).copied().unwrap_or(NumTy::Unknown),
+            a::CExpr::BinOp { op, lhs, rhs } => {
+                // Numeric ops preserve the operand type (Int+Int=Int,
+                // Float+Float=Float). Comparison/logical ops yield
+                // Bool, not a numeric type — return Unknown.
+                let is_numeric = matches!(op.as_str(), "+" | "-" | "*" | "/" | "%");
+                if !is_numeric { return NumTy::Unknown; }
+                match (self.classify_expr(lhs), self.classify_expr(rhs)) {
+                    (NumTy::Int, NumTy::Int) => NumTy::Int,
+                    (NumTy::Float, NumTy::Float) => NumTy::Float,
+                    _ => NumTy::Unknown,
+                }
+            }
+            a::CExpr::UnaryOp { op, expr } if op == "-" => self.classify_expr(expr),
+            // Let-expressions: the let-binding mutates `local_types`
+            // *during* compile_expr; classifying ahead of time would
+            // require simulating that. Conservative fallback.
+            _ => NumTy::Unknown,
         }
     }
 

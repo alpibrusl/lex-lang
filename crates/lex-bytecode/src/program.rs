@@ -156,6 +156,25 @@ pub fn compute_body_hash(
                 serde_json::to_vec(&Op::LoadLocal(*local_idx))
                     .expect("Op serialization must succeed")
             }
+            // #461 typed-lowering compensation. The compiler now emits
+            // typed numeric primitives (`IntAdd` / `FloatAdd` / ...)
+            // wherever it can prove operand types, but the closure
+            // identity contract (#222) requires `body_hash` to remain
+            // bit-identical to the pre-lowering polymorphic form
+            // (`NumAdd` / ...). Lower the typed op to its polymorphic
+            // counterpart at hash time. Behavioral equivalence is
+            // guaranteed by the type checker — operand-type proofs the
+            // compiler used to specialize are exactly what makes the
+            // polymorphic op behave identically.
+            Op::IntAdd   | Op::FloatAdd => serde_json::to_vec(&Op::NumAdd).unwrap(),
+            Op::IntSub   | Op::FloatSub => serde_json::to_vec(&Op::NumSub).unwrap(),
+            Op::IntMul   | Op::FloatMul => serde_json::to_vec(&Op::NumMul).unwrap(),
+            Op::IntDiv   | Op::FloatDiv => serde_json::to_vec(&Op::NumDiv).unwrap(),
+            Op::IntMod                  => serde_json::to_vec(&Op::NumMod).unwrap(),
+            Op::IntNeg   | Op::FloatNeg => serde_json::to_vec(&Op::NumNeg).unwrap(),
+            Op::IntEq    | Op::FloatEq  => serde_json::to_vec(&Op::NumEq).unwrap(),
+            Op::IntLt    | Op::FloatLt  => serde_json::to_vec(&Op::NumLt).unwrap(),
+            Op::IntLe    | Op::FloatLe  => serde_json::to_vec(&Op::NumLe).unwrap(),
             _ => serde_json::to_vec(op).expect("Op serialization must succeed"),
         };
         hasher.update((bytes.len() as u64).to_le_bytes());
