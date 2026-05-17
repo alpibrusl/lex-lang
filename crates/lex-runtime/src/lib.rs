@@ -19,6 +19,8 @@ pub mod df;
 pub mod cli;
 pub mod policy;
 pub mod handler;
+#[cfg(feature = "quic")]
+pub mod quic;
 pub mod ws;
 pub mod mcp_client;
 pub mod llm;

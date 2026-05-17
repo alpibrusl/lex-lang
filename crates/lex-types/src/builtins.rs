@@ -769,6 +769,103 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 Ty::Unit,
             ));
 
+            // serve_quic / serve_quic_fn / serve_quic_routed (#496).
+            // HTTP/3 over QUIC. TlsConfig is an opaque value built by
+            // `tls.from_pem_files` or `tls.self_signed` — it carries the
+            // server certificate chain + private key needed for the
+            // QUIC handshake (TLS is mandatory for HTTP/3). Effect row
+            // stays `[net]` for symmetry with `serve` / `serve_fn`;
+            // policy gates don't distinguish HTTP/1.1+2 (TCP) from
+            // HTTP/3 (UDP) at the effect level.
+            //
+            // serve_quic :: (Int, TlsConfig, Str) -> [net] Unit
+            fields.insert("serve_quic".into(), Ty::function(
+                vec![Ty::int(), Ty::Con("TlsConfig".into(), vec![]), Ty::str()],
+                EffectSet::singleton("net"),
+                Ty::Unit,
+            ));
+
+            // serve_quic_fn[Eff] :: (Int, TlsConfig,
+            //                        (Request) -> [Eff] Response)
+            //                       -> [net, Eff] Unit
+            fields.insert("serve_quic_fn".into(), Ty::function(
+                vec![
+                    Ty::int(),
+                    Ty::Con("TlsConfig".into(), vec![]),
+                    Ty::function(
+                        vec![Ty::Con("Request".into(), vec![])],
+                        EffectSet::open_var(0),
+                        Ty::Con("Response".into(), vec![]),
+                    ),
+                ],
+                EffectSet::open_var(0).union(&EffectSet::singleton("net")),
+                Ty::Unit,
+            ));
+
+            // serve_quic_routed[Eff] :: (
+            //   Int, TlsConfig,
+            //   List[(Str, Str, (Request) -> [Eff] Response)],
+            //   (Request) -> [Eff] Response
+            // ) -> [net, Eff] Unit
+            fields.insert("serve_quic_routed".into(), Ty::function(
+                vec![
+                    Ty::int(),
+                    Ty::Con("TlsConfig".into(), vec![]),
+                    Ty::List(Box::new(Ty::Tuple(vec![
+                        Ty::str(),
+                        Ty::str(),
+                        Ty::function(
+                            vec![Ty::Con("Request".into(), vec![])],
+                            EffectSet::open_var(0),
+                            Ty::Con("Response".into(), vec![]),
+                        ),
+                    ]))),
+                    Ty::function(
+                        vec![Ty::Con("Request".into(), vec![])],
+                        EffectSet::open_var(0),
+                        Ty::Con("Response".into(), vec![]),
+                    ),
+                ],
+                EffectSet::open_var(0).union(&EffectSet::singleton("net")),
+                Ty::Unit,
+            ));
+
+            Some(Ty::Record(fields))
+        }
+        // `tls` — TLS certificate handling for `net.serve_quic` (#496).
+        // `TlsConfig` is opaque to user code; the only ways to obtain
+        // one are these constructors. The runtime keeps the certificate
+        // chain + private key behind that opaque type so we can change
+        // the internal representation (record-of-bytes today, possibly
+        // a Resource handle tomorrow) without breaking source code.
+        "tls" => {
+            let mut fields = IndexMap::new();
+            // from_pem_files :: (Str, Str) -> [fs_read] Result[TlsConfig, Str]
+            //                    cert  key
+            // Load a PEM-encoded certificate chain + private key from
+            // disk. Both paths are read with the `[fs_read]` effect so
+            // policy gates can restrict where certs may come from.
+            fields.insert("from_pem_files".into(), Ty::function(
+                vec![Ty::str(), Ty::str()],
+                EffectSet::singleton("fs_read"),
+                Ty::Con("Result".into(), vec![
+                    Ty::Con("TlsConfig".into(), vec![]),
+                    Ty::str(),
+                ]),
+            ));
+            // self_signed :: Str -> Result[TlsConfig, Str]
+            // Generate a self-signed certificate for the given hostname
+            // (or "localhost"). Pure — no effects needed. Intended for
+            // local development and integration tests only; real
+            // deployments should use a CA-signed cert via from_pem_files.
+            fields.insert("self_signed".into(), Ty::function(
+                vec![Ty::str()],
+                EffectSet::empty(),
+                Ty::Con("Result".into(), vec![
+                    Ty::Con("TlsConfig".into(), vec![]),
+                    Ty::str(),
+                ]),
+            ));
             Some(Ty::Record(fields))
         }
         "chat" => {
@@ -2654,6 +2751,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "env" => "env",
         "bytes" => "bytes",
         "net" => "net",
+        "tls" => "tls",
         "chat" => "chat",
         "math" => "math",
         "map" => "map",

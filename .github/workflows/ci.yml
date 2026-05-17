@@ -32,4 +32,12 @@ jobs:
       # `cargo test` already compiles every test target. Dropping the
       # standalone build step halves the peak debug-target footprint.
       - run: cargo test --workspace --no-fail-fast
+      # `quic` is an opt-in feature on lex-runtime (#496). Build +
+      # exercise the H/3 test separately so the default `cargo test`
+      # step stays cheap — pulling in quinn + h3 + rcgen + rustls is
+      # ~300 MB of additional dep-graph link cost we don't want to
+      # pay on every workspace test. Tests under the feature are
+      # all gated `#![cfg(feature = "quic")]`, so this single test
+      # binary is enough.
+      - run: cargo test -p lex-runtime --features quic --test net_serve_quic
       - run: cargo clippy --workspace --all-targets -- -D warnings
