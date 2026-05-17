@@ -689,6 +689,7 @@ impl<'a> FnCompiler<'a> {
             ("iter", "take")      => self.emit_iter_take(args),
             ("iter", "skip")      => self.emit_iter_skip(args),
             ("iter", "to_list")   => self.emit_iter_to_list(args),
+            ("iter", "collect")   => self.emit_iter_to_list(args),
             ("iter", "map")       => self.emit_iter_map(args),
             ("iter", "filter")    => self.emit_iter_filter(args),
             ("iter", "fold")      => self.emit_iter_fold(args),
