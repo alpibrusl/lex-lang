@@ -1,0 +1,12 @@
+[package]
+name    = "lex-jobs"
+version = "0.1.0"
+lex     = "0.9.5"
+
+# Incubator package — see README.md. Will extract to
+# alpibrusl/lex-jobs once the API surface firms up.
+#
+# Zero external Lex dependencies in v1 — uses only stdlib
+# (std.sql, std.time, std.int, std.list, std.str).
+
+[dependencies]
