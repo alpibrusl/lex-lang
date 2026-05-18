@@ -3006,24 +3006,57 @@ fn http_send_full(
     timeout_ms: Option<u64>,
 ) -> Value {
     let agent = http_agent(timeout_ms);
-    let resp = match method {
+    // Normalise method to uppercase before matching. Per RFC 7230, HTTP
+    // methods are case-sensitive, but lex callers naturally write
+    // `"put"` / `"PUT"` interchangeably; uppercasing here keeps the
+    // surface forgiving without compromising the wire format (ureq
+    // sends whatever method name we pass to the per-method builder).
+    let method_upper = method.to_ascii_uppercase();
+    let body_bytes: Vec<u8> = body.unwrap_or_default();
+    let resp = match method_upper.as_str() {
+        // Bodyless methods. PUT/PATCH/DELETE technically allow a body,
+        // but in practice (and per #503's OCPI flows) DELETE is most
+        // often bodyless; if a future caller needs DELETE-with-body
+        // we can split it via a different ureq builder.
         "GET" => {
             let mut req = agent.get(url);
             if !content_type.is_empty() { req = req.header("content-type", content_type); }
             for (k, v) in headers { req = req.header(k.as_str(), v.as_str()); }
             req.call()
         }
+        "HEAD" => {
+            let mut req = agent.head(url);
+            for (k, v) in headers { req = req.header(k.as_str(), v.as_str()); }
+            req.call()
+        }
+        "DELETE" => {
+            let mut req = agent.delete(url);
+            for (k, v) in headers { req = req.header(k.as_str(), v.as_str()); }
+            req.call()
+        }
+        // Methods that carry a request body. `body.unwrap_or_default()`
+        // means a missing body sends an empty payload, which is the
+        // correct default for POST `{}` style requests and matches
+        // curl's `-X POST` (no `-d`) behaviour.
         "POST" => {
-            let body = body.unwrap_or_default();
             let mut req = agent.post(url);
             if !content_type.is_empty() { req = req.header("content-type", content_type); }
             for (k, v) in headers { req = req.header(k.as_str(), v.as_str()); }
-            req.send(&body[..])
+            req.send(&body_bytes[..])
+        }
+        "PUT" => {
+            let mut req = agent.put(url);
+            if !content_type.is_empty() { req = req.header("content-type", content_type); }
+            for (k, v) in headers { req = req.header(k.as_str(), v.as_str()); }
+            req.send(&body_bytes[..])
+        }
+        "PATCH" => {
+            let mut req = agent.patch(url);
+            if !content_type.is_empty() { req = req.header("content-type", content_type); }
+            for (k, v) in headers { req = req.header(k.as_str(), v.as_str()); }
+            req.send(&body_bytes[..])
         }
         m => {
-            // Other methods (PUT, DELETE, PATCH, ...) fall through
-            // here in v1.5; for now surface a structured DecodeError
-            // so the caller can match it.
             return http_decode_err(format!("unsupported method: {m}"));
         }
     };
