@@ -2949,7 +2949,7 @@ fn materialize_lazy_iter(vm: &mut Vm, v: Value) -> Value {
 /// Called before `unpack_response` / `build_hyper_response` so the
 /// existing drain paths can consume the iter.
 fn materialize_response_body(vm: &mut Vm, v: &mut Value) {
-    if let Value::Record(rec) = v {
+    if let Value::Record { fields: rec, .. } = v {
         if let Some(Value::Variant { name, args }) = rec.get_mut("body") {
             if (name == "BodyStream" || name == "BodyBytes") && args.len() == 1 {
                 let inner = std::mem::replace(&mut args[0], Value::Unit);

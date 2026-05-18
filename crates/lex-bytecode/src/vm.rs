@@ -3,9 +3,56 @@
 use crate::op::*;
 use crate::program::*;
 use crate::value::{ActorCell, Value};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use indexmap::IndexMap;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+
+// ── IC polymorphism instrumentation (throwaway, env-gated) ─────────
+// Enable with LEX_IC_STATS=1. With LEX_IC_STATS_OUT=<path> writes a
+// TSV to <path>.<pid> on each Vm drop; otherwise dumps to stderr.
+
+#[derive(Default)]
+struct IcStats {
+    sites: HashMap<(u32, u32), HashMap<u32, u64>>,
+}
+
+static IC_STATS: OnceLock<Mutex<IcStats>> = OnceLock::new();
+static IC_STATS_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn ic_stats_enabled() -> bool {
+    *IC_STATS_ENABLED.get_or_init(|| {
+        std::env::var("LEX_IC_STATS").map(|v| v == "1").unwrap_or(false)
+    })
+}
+
+fn record_ic_hit(fn_id: u32, site_idx: u32, shape_id: u32) {
+    let stats = IC_STATS.get_or_init(|| Mutex::new(IcStats::default()));
+    let mut s = stats.lock().unwrap();
+    *s.sites.entry((fn_id, site_idx)).or_default().entry(shape_id).or_insert(0) += 1;
+}
+
+pub fn dump_ic_stats() {
+    let Some(stats) = IC_STATS.get() else { return; };
+    let s = stats.lock().unwrap();
+    if s.sites.is_empty() { return; }
+    let mut out = String::from("fn_id\tsite_idx\tshape_id\thits\n");
+    let mut entries: Vec<_> = s.sites.iter().collect();
+    entries.sort_by_key(|((f, si), _)| (*f, *si));
+    for ((f, site), shapes) in entries {
+        let mut shape_entries: Vec<_> = shapes.iter().collect();
+        shape_entries.sort_by_key(|(sid, _)| **sid);
+        for (sid, hits) in shape_entries {
+            out.push_str(&format!("{f}\t{site}\t{sid}\t{hits}\n"));
+        }
+    }
+    match std::env::var("LEX_IC_STATS_OUT").ok() {
+        Some(path) => {
+            let pid = std::process::id();
+            let _ = std::fs::write(format!("{path}.{pid}"), out);
+        }
+        None => { eprint!("{out}"); }
+    }
+}
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum VmError {
@@ -862,7 +909,10 @@ impl<'a> Vm<'a> {
                 Op::GetField { name_idx, site_idx } => {
                     let v = self.pop()?;
                     match v {
-                        Value::Record { fields: r, .. } => {
+                        Value::Record { fields: r, shape_id } => {
+                            if ic_stats_enabled() {
+                                record_ic_hit(fn_id, site_idx, shape_id);
+                            }
                             // Inline cache keyed by (fn_id, site_idx) — #462
                             // slice 1. Direct array index instead of the
                             // pre-#462 `HashMap<(fn_id << 32 | pc), usize>`.
@@ -1549,6 +1599,14 @@ impl<'a> Vm<'a> {
         let a = self.pop()?;
         self.stack.push(Value::Bool(a == b));
         Ok(())
+    }
+}
+
+impl Drop for Vm<'_> {
+    fn drop(&mut self) {
+        if ic_stats_enabled() {
+            dump_ic_stats();
+        }
     }
 }
 
