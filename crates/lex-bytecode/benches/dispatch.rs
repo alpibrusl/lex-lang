@@ -232,6 +232,69 @@ criterion_group!(
     bench_record_field,
     bench_call_heavy,
     bench_straight_arith,
-    bench_straight_arith_no_dispatch
+    bench_straight_arith_no_dispatch,
+    bench_pure_dispatch,
 );
 criterion_main!(benches);
+
+/// Pure-dispatch microbench: hand-built `Program` whose body is N
+/// `PushConst(Unit) + Pop` pairs followed by `PushConst(Int 0) +
+/// Return`. Each pair is two dispatches over the cheapest possible
+/// arm bodies (one `Vec::push(Value::Unit)`, one `Vec::pop()`). The
+/// reported `ns/elem` (with throughput = `2 * n`) bounds dispatch
+/// overhead from above — any real arm body does strictly more work
+/// per step. Compare against `straight_arith` (4.7 ns/elem with
+/// superinstructions) to estimate what fraction of `straight_arith`
+/// is dispatch vs arm work.
+fn bench_pure_dispatch(c: &mut Criterion) {
+    use lex_bytecode::op::{Const, Op};
+    use lex_bytecode::program::{Function, ZERO_BODY_HASH};
+    use indexmap::IndexMap;
+
+    let mut group = c.benchmark_group("dispatch/pure");
+    for n in [1_000usize, 10_000, 100_000] {
+        let mut code = Vec::with_capacity(2 * n + 2);
+        // Constants: [Unit, Int(0)]
+        let constants = vec![Const::Unit, Const::Int(0)];
+        for _ in 0..n {
+            code.push(Op::PushConst(0)); // push Unit
+            code.push(Op::Pop);
+        }
+        code.push(Op::PushConst(1)); // push Int(0)
+        code.push(Op::Return);
+
+        let func = Function {
+            name: "pure_dispatch".to_string(),
+            arity: 0,
+            locals_count: 0,
+            code,
+            effects: vec![],
+            body_hash: ZERO_BODY_HASH,
+            refinements: vec![],
+            field_ic_sites: 0,
+        };
+        let mut function_names = IndexMap::new();
+        function_names.insert("pure_dispatch".to_string(), 0);
+        let prog = Arc::new(Program {
+            constants,
+            functions: vec![func],
+            function_names,
+            module_aliases: IndexMap::new(),
+            entry: Some(0),
+            record_shapes: vec![],
+        });
+
+        group.throughput(Throughput::Elements((2 * n) as u64));
+        group.bench_function(format!("n={n}"), |b| {
+            b.iter(|| {
+                let mut vm = Vm::new(&prog);
+                vm.set_step_limit(u64::MAX);
+                black_box(
+                    vm.call("pure_dispatch", vec![])
+                        .expect("call pure_dispatch"),
+                )
+            })
+        });
+    }
+    group.finish();
+}
