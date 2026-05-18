@@ -8,6 +8,20 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      # Drop full DWARF debuginfo from test binaries on CI. Each
+      # lex-runtime test binary re-links arrow + polars + the whole
+      # stdlib runtime; with debuginfo=2 (cargo's default for the
+      # test profile) they land ~250 MB stripped / ~1 GB with full
+      # symbols. `line-tables-only` keeps enough info for `panic`
+      # backtraces to be useful (file:line) but drops the variable
+      # / type / lexical-scope DWARF that bloats the binary, giving
+      # roughly 50% reduction per test binary => 4-6 GB headroom
+      # across the ~30 lex-runtime test binaries. Complements the
+      # `free-disk-space` step below, which buys cleanup-side
+      # headroom but doesn't change the per-binary footprint. Local
+      # `cargo test` keeps full debuginfo (env var is CI-scoped).
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v6
       # std.arrow + std.df pull in arrow-rs + Polars, which roughly
