@@ -177,9 +177,9 @@ fn value_to_json(v: &Value) -> serde_json::Value {
         Value::Unit => J::Null,
         Value::List(items) => J::Array(items.iter().map(value_to_json).collect()),
         Value::Tuple(items) => J::Array(items.iter().map(value_to_json).collect()),
-        Value::Record(fields) => {
+        Value::Record { fields, .. } => {
             let mut m = serde_json::Map::new();
-            for (k, v) in fields { m.insert(k.clone(), value_to_json(v)); }
+            for (k, v) in fields.iter() { m.insert(k.clone(), value_to_json(v)); }
             J::Object(m)
         }
         Value::Variant { name, args } => {
@@ -266,7 +266,7 @@ pub(crate) fn json_to_value(v: &serde_json::Value) -> Value {
             }
             let mut out = indexmap::IndexMap::new();
             for (k, v) in map { out.insert(k.clone(), json_to_value(v)); }
-            Value::Record(out)
+            Value::record_dynamic(out)
         }
     }
 }

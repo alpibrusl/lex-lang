@@ -202,7 +202,7 @@ fn build_ws_event(conn_id: u64, room: &str, body: &str) -> Value {
     rec.insert("body".into(), Value::Str(body.into()));
     rec.insert("conn_id".into(), Value::Int(conn_id as i64));
     rec.insert("room".into(), Value::Str(room.into()));
-    Value::Record(rec)
+    Value::record_dynamic(rec)
 }
 
 // ── Closure-based WebSocket server (#359) ────────────────────────────────────
@@ -213,7 +213,7 @@ fn build_ws_conn(conn_id: u64, path: &str, subprotocol: &str) -> Value {
     rec.insert("id".into(), Value::Str(conn_id.to_string().into()));
     rec.insert("path".into(), Value::Str(path.into()));
     rec.insert("subprotocol".into(), Value::Str(subprotocol.into()));
-    Value::Record(rec)
+    Value::record_dynamic(rec)
 }
 
 /// Build a `WsMessage` variant value.
@@ -569,7 +569,7 @@ fn build_headers_value(req: &tungstenite::handshake::server::Request) -> Value {
         let mut rec = IndexMap::new();
         rec.insert("name".into(), Value::Str(name.as_str().into()));
         rec.insert("value".into(), Value::Str(v.into()));
-        items.push_back(Value::Record(rec));
+        items.push_back(Value::record_dynamic(rec));
     }
     Value::List(items)
 }

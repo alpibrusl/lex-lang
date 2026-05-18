@@ -66,7 +66,7 @@ fn toml_parse_strict_passes_when_all_fields_present() {
     let m = ok(&v);
     // Should be a Record with both fields.
     match m {
-        Value::Record(fields) => {
+        Value::Record { fields, .. } => {
             assert!(fields.contains_key("license"));
             assert!(fields.contains_key("version"));
         }

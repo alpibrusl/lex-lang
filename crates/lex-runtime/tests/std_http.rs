@@ -109,7 +109,7 @@ fn unwrap_ok_record(v: Value) -> indexmap::IndexMap<String, Value> {
         other => panic!("expected Ok, got {other:?}"),
     };
     match args.into_iter().next() {
-        Some(Value::Record(r)) => r,
+        Some(Value::Record { fields: r, .. }) => *r,
         other => panic!("expected Record inside Ok, got {other:?}"),
     }
 }

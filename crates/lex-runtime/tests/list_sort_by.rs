@@ -95,14 +95,14 @@ fn r(xs :: List[Order]) -> List[Order] {
         let mut fields = indexmap::IndexMap::new();
         fields.insert("name".into(), Value::Str(name.into()));
         fields.insert("qty".into(), Value::Int(qty));
-        Value::Record(fields)
+        Value::record_dynamic(fields)
     };
     let xs = Value::List(vec![mk("bob", 5), mk("alice", 2), mk("carl", 3)].into());
     let Value::List(out) = run(src, "r", vec![xs]) else { panic!() };
     let qtys: Vec<i64> = out
         .iter()
         .map(|v| match v {
-            Value::Record(f) => match f.get("qty") {
+            Value::Record { fields: f, .. } => match f.get("qty") {
                 Some(Value::Int(n)) => *n,
                 _ => panic!(),
             },
@@ -127,7 +127,7 @@ fn r(xs :: List[R]) -> List[R] {
         let mut fields = indexmap::IndexMap::new();
         fields.insert("k".into(), Value::Int(k));
         fields.insert("tag".into(), Value::Str(tag.into()));
-        Value::Record(fields)
+        Value::record_dynamic(fields)
     };
     let xs = Value::List(vec![
         mk(1, "a"), mk(2, "b"), mk(1, "c"), mk(2, "d"), mk(1, "e"),
@@ -136,7 +136,7 @@ fn r(xs :: List[R]) -> List[R] {
     let tags: Vec<String> = out
         .iter()
         .map(|v| match v {
-            Value::Record(f) => match f.get("tag") {
+            Value::Record { fields: f, .. } => match f.get("tag") {
                 Some(Value::Str(t)) => t.to_string(),
                 _ => panic!(),
             },

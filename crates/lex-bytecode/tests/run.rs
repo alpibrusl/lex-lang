@@ -69,7 +69,7 @@ fn example_d_shape() {
     let mut vm = Vm::new(&p);
     let circle = Value::Variant {
         name: "Circle".into(),
-        args: vec![Value::Record({
+        args: vec![Value::record_dynamic({
             let mut m = IndexMap::new();
             m.insert("radius".into(), Value::Float(1.0));
             m
@@ -84,7 +84,7 @@ fn example_d_shape() {
 
     let rect = Value::Variant {
         name: "Rect".into(),
-        args: vec![Value::Record({
+        args: vec![Value::record_dynamic({
             let mut m = IndexMap::new();
             m.insert("width".into(), Value::Float(2.0));
             m.insert("height".into(), Value::Float(3.0));
@@ -123,6 +123,6 @@ fn record_field_access() {
     let mut m = IndexMap::new();
     m.insert("x".into(), Value::Int(11));
     m.insert("y".into(), Value::Int(22));
-    let r = vm.call("xof", vec![Value::Record(m)]).unwrap();
+    let r = vm.call("xof", vec![Value::record_dynamic(m)]).unwrap();
     assert_eq!(r, Value::Int(11));
 }

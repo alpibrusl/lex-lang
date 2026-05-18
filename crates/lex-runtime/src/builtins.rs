@@ -1428,7 +1428,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         }
         ("datetime", "from_components") => {
             let rec = match args.first() {
-                Some(Value::Record(r)) => r.clone(),
+                Some(Value::Record { fields: r, .. }) => r.clone(),
                 _ => return Err("from_components: expected DateTime record".into()),
             };
             match instant_from_components(&rec) {
@@ -1495,14 +1495,14 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let req = expect_record_pure(args.first())?.clone();
             let k = expect_str(args.get(1))?;
             let v = expect_str(args.get(2))?;
-            Ok(Value::Record(http_set_header(req, &k, &v)))
+            Ok(Value::record_dynamic(http_set_header(req, &k, &v)))
         }
         ("http", "with_auth") => {
             let req = expect_record_pure(args.first())?.clone();
             let scheme = expect_str(args.get(1))?;
             let token = expect_str(args.get(2))?;
             let value = format!("{scheme} {token}");
-            Ok(Value::Record(http_set_header(req, "Authorization", &value)))
+            Ok(Value::record_dynamic(http_set_header(req, "Authorization", &value)))
         }
         ("http", "with_query") => {
             let req = expect_record_pure(args.first())?.clone();
@@ -1512,7 +1512,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                     "http.with_query: params must be Map[Str, Str], got {other:?}")),
                 None => return Err("http.with_query: missing params argument".into()),
             };
-            Ok(Value::Record(http_append_query(req, &params)))
+            Ok(Value::record_dynamic(http_append_query(req, &params)))
         }
         ("http", "with_timeout_ms") => {
             let req = expect_record_pure(args.first())?.clone();
@@ -1522,7 +1522,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                 name: "Some".into(),
                 args: vec![Value::Int(ms)],
             });
-            Ok(Value::Record(out))
+            Ok(Value::record_dynamic(out))
         }
         ("http", "json_body") => {
             let resp = expect_record_pure(args.first())?;
@@ -1684,7 +1684,7 @@ fn match_value(caps: &regex::Captures) -> Value {
         })
         .collect();
     rec.insert("groups".into(), Value::List(groups));
-    Value::Record(rec)
+    Value::record_dynamic(rec)
 }
 
 fn expect_map(v: Option<&Value>) -> Result<&BTreeMap<MapKey, Value>, String> {
@@ -1709,7 +1709,7 @@ fn unpack_matrix(v: &Value) -> Result<(usize, usize, Vec<f64>), String> {
         return Ok((*rows as usize, *cols as usize, data.clone()));
     }
     let rec = match v {
-        Value::Record(r) => r,
+        Value::Record { fields: r, .. } => r,
         other => return Err(format!("expected matrix, got {other:?}")),
     };
     let rows = match rec.get("rows") {
@@ -1826,7 +1826,7 @@ fn parser_node(kind: &str, fields: &[(&str, Value)]) -> Value {
     for (k, v) in fields {
         r.insert((*k).into(), v.clone());
     }
-    Value::Record(r)
+    Value::record_dynamic(r)
 }
 
 // `parser.run` interpretation lives in `lex-bytecode::parser_runtime`
@@ -1854,13 +1854,13 @@ fn splitmix64(state: u64) -> (u64, u64) {
 fn rng_value(state: u64) -> Value {
     let mut fields = indexmap::IndexMap::new();
     fields.insert("state".into(), Value::Int(state as i64));
-    Value::Record(fields)
+    Value::record_dynamic(fields)
 }
 
 /// Pull the SplitMix64 state out of a `Value::Record { state }`.
 fn rng_decode(v: Option<&Value>) -> Result<u64, String> {
     let rec = match v {
-        Some(Value::Record(r)) => r,
+        Some(Value::Record { fields: r, .. }) => r,
         Some(other) => return Err(format!("expected Rng, got {other:?}")),
         None => return Err("missing Rng arg".into()),
     };
@@ -1874,7 +1874,7 @@ fn rng_decode(v: Option<&Value>) -> Result<u64, String> {
 
 fn expect_record_pure(v: Option<&Value>) -> Result<&indexmap::IndexMap<String, Value>, String> {
     match v {
-        Some(Value::Record(r)) => Ok(r),
+        Some(Value::Record { fields: r, .. }) => Ok(r),
         Some(other) => Err(format!("expected Record, got {other:?}")),
         None => Err("missing Record argument".into()),
     }
@@ -2339,7 +2339,7 @@ fn resolve_tz_to_components(n: i64, tz: &TzArg) -> Result<Value, String> {
     rec.insert("nano".into(),    Value::Int(ns as i64));
     rec.insert("tz_offset_minutes".into(), Value::Int(off_min as i64));
     let _ = chrono::Utc.timestamp_opt(0, 0); // touch TimeZone to suppress unused-import lint paths
-    Ok(Value::Record(rec))
+    Ok(Value::record_dynamic(rec))
 }
 
 
@@ -2429,7 +2429,7 @@ fn aead_result(ciphertext: Vec<u8>, tag: Vec<u8>) -> Value {
     let mut rec = indexmap::IndexMap::new();
     rec.insert("ciphertext".into(), Value::Bytes(ciphertext));
     rec.insert("tag".into(), Value::Bytes(tag));
-    Value::Record(rec)
+    Value::record_dynamic(rec)
 }
 
 fn aead_err(msg: impl Into<String>) -> Value {

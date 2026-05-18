@@ -170,10 +170,10 @@ fn create_insert_query_round_trip() {
         other => panic!("expected List, got {other:?}"),
     };
     assert_eq!(rows.len(), 2);
-    let row0 = match &rows[0] { Value::Record(r) => r, other => panic!("{other:?}") };
+    let row0 = match &rows[0] { Value::Record { fields: r, .. } => r, other => panic!("{other:?}") };
     assert_eq!(row0.get("id"),   Some(&Value::Int(1)));
     assert_eq!(row0.get("name"), Some(&Value::Str("alice".into())));
-    let row1 = match &rows[1] { Value::Record(r) => r, other => panic!("{other:?}") };
+    let row1 = match &rows[1] { Value::Record { fields: r, .. } => r, other => panic!("{other:?}") };
     assert_eq!(row1.get("id"),   Some(&Value::Int(2)));
     assert_eq!(row1.get("name"), Some(&Value::Str("bob".into())));
 }

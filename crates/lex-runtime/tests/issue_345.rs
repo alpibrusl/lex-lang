@@ -40,10 +40,10 @@ fn flatten(parts :: List[Errors]) -> Errors {
   })
 }
 "#;
-    let e1 = Value::Record(indexmap::indexmap! {
+    let e1 = Value::record_dynamic(indexmap::indexmap! {
         "code".into() => Value::Str("e1".into())
     });
-    let e2 = Value::Record(indexmap::indexmap! {
+    let e2 = Value::record_dynamic(indexmap::indexmap! {
         "code".into() => Value::Str("e2".into())
     });
     let parts = Value::List(vec![
