@@ -13,11 +13,12 @@ jobs:
       # std.arrow + std.df pull in arrow-rs + Polars, which roughly
       # doubles target/ to ~16 GB in debug. ubuntu-latest ships with
       # ~14 GB free; reclaim the preinstalled stacks we don't use
-      # (.NET, Haskell, Android, Docker images) plus the hosted tool
-      # cache and large apt packages. Costs ~2-3 min of setup for
-      # ~10 GB extra headroom — needed so each new lex-runtime test
-      # binary (which re-links arrow + polars, ~250 MB stripped)
-      # doesn't push the linker over the disk ceiling.
+      # (.NET, Haskell, Android, Docker images), the hosted tool
+      # cache, large apt packages, *and* the runner's swap file —
+      # 4 GB extra headroom on top of the ~10 GB the other flags
+      # buy, needed because PR #509 (and any follow-on test binary)
+      # hits rust-lld SIGBUS during link when the margin runs out
+      # mid-cargo-test. Costs ~2-3 min of setup for ~14 GB total.
       - uses: jlumbroso/free-disk-space@main
         with:
           tool-cache: true
@@ -25,7 +26,7 @@ jobs:
           dotnet: true
           haskell: true
           large-packages: true
-          swap-storage: false
+          swap-storage: true
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # `cargo build --workspace --all-targets` would duplicate work —
