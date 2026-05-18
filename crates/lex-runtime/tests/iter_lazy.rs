@@ -25,6 +25,10 @@ fn from_list_to_list(xs :: List[Int]) -> List[Int] {
   iter.to_list(iter.from_list(xs))
 }
 
+fn from_list_collect(xs :: List[Int]) -> List[Int] {
+  iter.collect(iter.from_list(xs))
+}
+
 fn next_on_empty() -> Bool {
   let it := iter.from_list([])
   match iter.next(it) {
@@ -107,6 +111,13 @@ fn unfold_empty() -> List[Int] {
 fn from_list_and_to_list_roundtrip() {
     let xs = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)].into());
     let got = run(SRC, "from_list_to_list", vec![xs.clone()]);
+    assert_eq!(got, xs);
+}
+
+#[test]
+fn collect_is_alias_for_to_list() {
+    let xs = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)].into());
+    let got = run(SRC, "from_list_collect", vec![xs.clone()]);
     assert_eq!(got, xs);
 }
 

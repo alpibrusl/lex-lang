@@ -1523,6 +1523,12 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             fields.insert("to_list".into(), Ty::function(
                 vec![it(0)], EffectSet::empty(),
                 Ty::List(Box::new(Ty::Var(0)))));
+            // collect :: Iter[T] -> List[T] — alias for `to_list`
+            // (matches Rust / Python / Kotlin naming so call sites
+            // coming from those languages don't have to re-learn).
+            fields.insert("collect".into(), Ty::function(
+                vec![it(0)], EffectSet::empty(),
+                Ty::List(Box::new(Ty::Var(0)))));
             // map :: [E] Iter[T], (T) -> [E] U -> [E] Iter[U]
             fields.insert("map".into(), Ty::function(
                 vec![
