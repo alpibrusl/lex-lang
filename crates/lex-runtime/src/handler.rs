@@ -1759,14 +1759,18 @@ fn serve_http_plain(
                             let handler = DefaultHandler::new(policy)
                                 .with_program(Arc::clone(&program));
                             let mut vm = Vm::with_handler(&program, Box::new(handler));
-                            Ok(vm.call(&handler_name, vec![lex_req]))
+                            let r = vm.call(&handler_name, vec![lex_req]);
+                            // Drain any lazy iter in the response body
+                            // while the VM is still in scope — see #477.
+                            Ok(r.map(|mut v| { materialize_response_body(&mut vm, &mut v); v }))
                         } else {
                             tokio::task::spawn_blocking(move || {
                                 let lex_req = build_request_value_parts(&parts, &body_bytes);
                                 let handler = DefaultHandler::new(policy)
                                     .with_program(Arc::clone(&program));
                                 let mut vm = Vm::with_handler(&program, Box::new(handler));
-                                vm.call(&handler_name, vec![lex_req])
+                                let r = vm.call(&handler_name, vec![lex_req]);
+                                r.map(|mut v| { materialize_response_body(&mut vm, &mut v); v })
                             })
                             .await
                         };
@@ -1819,7 +1823,10 @@ fn handle_request_tls(
     let handler = DefaultHandler::new(policy).with_program(Arc::clone(&program));
     let mut vm = Vm::with_handler(&program, Box::new(handler));
     match vm.call(&handler_name, vec![lex_req]) {
-        Ok(resp) => {
+        Ok(mut resp) => {
+            // Drain any lazy iter in the response body while the VM is
+            // still in scope — see #477.
+            materialize_response_body(&mut vm, &mut resp);
             let (status, body, headers) = unpack_response(&resp);
             respond_with_body_tls(req, status, body, headers);
         }
@@ -1889,14 +1896,18 @@ fn serve_http_fn(
                             let handler = DefaultHandler::new(policy)
                                 .with_program(Arc::clone(&program));
                             let mut vm = Vm::with_handler(&program, Box::new(handler));
-                            Ok(vm.invoke_closure_value(closure, vec![lex_req]))
+                            let r = vm.invoke_closure_value(closure, vec![lex_req]);
+                            // Drain any lazy iter in the response body
+                            // while the VM is still in scope — see #477.
+                            Ok(r.map(|mut v| { materialize_response_body(&mut vm, &mut v); v }))
                         } else {
                             tokio::task::spawn_blocking(move || {
                                 let lex_req = build_request_value_parts(&parts, &body_bytes);
                                 let handler = DefaultHandler::new(policy)
                                     .with_program(Arc::clone(&program));
                                 let mut vm = Vm::with_handler(&program, Box::new(handler));
-                                vm.invoke_closure_value(closure, vec![lex_req])
+                                let r = vm.invoke_closure_value(closure, vec![lex_req]);
+                                r.map(|mut v| { materialize_response_body(&mut vm, &mut v); v })
                             })
                             .await
                         };
@@ -2133,7 +2144,10 @@ fn serve_http_routed(
                             let handler = DefaultHandler::new(policy)
                                 .with_program(Arc::clone(&program));
                             let mut vm = Vm::with_handler(&program, Box::new(handler));
-                            Ok(vm.invoke_closure_value(closure, vec![lex_req]))
+                            let r = vm.invoke_closure_value(closure, vec![lex_req]);
+                            // Drain any lazy iter in the response body
+                            // while the VM is still in scope — see #477.
+                            Ok(r.map(|mut v| { materialize_response_body(&mut vm, &mut v); v }))
                         } else {
                             tokio::task::spawn_blocking(move || {
                                 let mut lex_req = build_request_value_parts(&parts, &body_bytes);
@@ -2145,7 +2159,8 @@ fn serve_http_routed(
                                 let handler = DefaultHandler::new(policy)
                                     .with_program(Arc::clone(&program));
                                 let mut vm = Vm::with_handler(&program, Box::new(handler));
-                                vm.invoke_closure_value(closure, vec![lex_req])
+                                let r = vm.invoke_closure_value(closure, vec![lex_req]);
+                                r.map(|mut v| { materialize_response_body(&mut vm, &mut v); v })
                             })
                             .await
                         };
@@ -2453,6 +2468,90 @@ fn drain_iter_bytes(v: &Value) -> Vec<Vec<u8>> {
             }
         }
         _ => Vec::new(),
+    }
+}
+
+/// Drive an `__IterLazy(seed, step)` to exhaustion by invoking the step
+/// closure via `vm`, then return an equivalent `__IterEager(list, 0)` so
+/// the existing `drain_iter_*` paths can consume it.
+///
+/// Without this pre-pass, `BodyStream(iter.unfold(...))` produces empty
+/// response bodies because the drain helpers match only on the eager
+/// variant (#477). The step closure can carry effects; we ignore that
+/// here — the handler is already running on a tokio task with the same
+/// effect bindings, so any `[net]` / `[time]` calls inside the step
+/// re-enter the same handler context.
+///
+/// `__IterEager` is returned untouched. Unknown variants pass through.
+fn materialize_lazy_iter(vm: &mut Vm, v: Value) -> Value {
+    let mut current = v;
+    let mut items: Vec<Value> = Vec::new();
+    loop {
+        match current {
+            Value::Variant { name, args } if name == "__IterLazy" && args.len() == 2 => {
+                let seed = args[0].clone();
+                let step = args[1].clone();
+                match vm.invoke_closure_value(step.clone(), vec![seed]) {
+                    Ok(Value::Variant { name: opt, args: opt_args })
+                        if opt == "None" =>
+                    {
+                        let _ = opt_args;
+                        break;
+                    }
+                    Ok(Value::Variant { name: opt, args: opt_args })
+                        if opt == "Some" && opt_args.len() == 1 =>
+                    {
+                        if let Value::Tuple(pair) = &opt_args[0] {
+                            if pair.len() == 2 {
+                                items.push(pair[0].clone());
+                                current = Value::Variant {
+                                    name: "__IterLazy".to_string(),
+                                    args: vec![pair[1].clone(), step],
+                                };
+                                continue;
+                            }
+                        }
+                        // Malformed pair — bail to avoid infinite loop.
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+            // Already eager (or unknown) — return as-is, possibly with
+            // any items we collected from a partial drain.
+            other => {
+                if items.is_empty() {
+                    return other;
+                }
+                // Mixed shape shouldn't happen in practice; fall through
+                // to the eager builder below with the items we have.
+                let _ = other;
+                break;
+            }
+        }
+    }
+    Value::Variant {
+        name: "__IterEager".to_string(),
+        args: vec![
+            Value::List(items.into_iter().collect()),
+            Value::Int(0),
+        ],
+    }
+}
+
+/// Rewrite any `body: BodyStream(__IterLazy(...))` or
+/// `body: BodyBytes(__IterLazy(...))` on a response record in place,
+/// replacing the lazy iter with an eager-materialised equivalent.
+/// Called before `unpack_response` / `build_hyper_response` so the
+/// existing drain paths can consume the iter.
+fn materialize_response_body(vm: &mut Vm, v: &mut Value) {
+    if let Value::Record(rec) = v {
+        if let Some(Value::Variant { name, args }) = rec.get_mut("body") {
+            if (name == "BodyStream" || name == "BodyBytes") && args.len() == 1 {
+                let inner = std::mem::replace(&mut args[0], Value::Unit);
+                args[0] = materialize_lazy_iter(vm, inner);
+            }
+        }
     }
 }
 
