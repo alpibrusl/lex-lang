@@ -1525,6 +1525,17 @@ impl<'a> Vm<'a> {
                     // left in place for body-hash stability.
                     self.frames[frame_idx].pc = pc + 3;
                 }
+                Op::LoadLocalAddLocal { lhs_idx, rhs_idx } => {
+                    let base = self.frames[frame_idx].locals_start;
+                    let a = self.locals_storage[base + lhs_idx as usize].as_int();
+                    let b = self.locals_storage[base + rhs_idx as usize].as_int();
+                    self.stack.push(Value::Int(a + b));
+                    // Override the default `pc + 1`: skip past the
+                    // two inert primitive ops (the original
+                    // LoadLocal(rhs_idx) + IntAdd) that the peephole
+                    // pass left in place for body-hash stability.
+                    self.frames[frame_idx].pc = pc + 3;
+                }
                 Op::LoadLocalAddIntConstStoreLocal { src, imm_const_idx, dest } => {
                     let base = self.frames[frame_idx].locals_start;
                     let a = self.locals_storage[base + src as usize].as_int();

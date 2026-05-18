@@ -214,6 +214,11 @@ fn stack_delta(op: &Op) -> i32 {
         // Tombstones at the next 3 slots are *not* walked (see the
         // control-flow successor logic in `verify_function`).
         Op::LoadLocalAddIntConstStoreLocal { .. } => 0,
+        // Slice-3 fused op: LoadLocal(lhs) + LoadLocal(rhs) + IntAdd.
+        // Net delta +1 (pushes the sum). The trailing tombstones
+        // (LoadLocal + IntAdd) have deltas +1 and -1 — they cancel
+        // when walked as live, mirroring slice 1's shape.
+        Op::LoadLocalAddLocal { .. } => 1,
     }
 }
 
