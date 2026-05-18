@@ -131,6 +131,30 @@ fn handle(_req :: Request) -> Response {
 fn main() -> [net] Unit { net.serve_fn(18194, handle) }
 "#;
 
+// #477 regression: `BodyStream(iter.unfold(...))` previously returned
+// an empty body because the drain path only matched on `__IterEager`.
+// The runtime now materialises lazy iters into eager ones before the
+// drain runs, so unfold-based streams produce the same wire bytes as
+// the equivalent `iter.from_list` version.
+const UNFOLD_SRC: &str = r#"
+import "std.net" as net
+import "std.iter" as iter
+import "std.map" as map
+
+fn handle(_req :: Request) -> Response {
+  let f := iter.unfold(0, fn (i :: Int) -> Option[(Str, Int)] {
+    if i >= 3 { None } else { Some(("hello\n", i + 1)) }
+  })
+  {
+    status:  200,
+    body:    BodyStream(f),
+    headers: map.from_list([("content-type", "text/plain")]),
+  }
+}
+
+fn main() -> [net] Unit { net.serve_fn(18195, handle) }
+"#;
+
 #[test]
 fn body_stream_uses_chunked_transfer_encoding() {
     spawn_lex_server(SRC, "main");
@@ -177,6 +201,32 @@ fn body_bytes_emits_per_iter_item_chunks() {
     );
     let (payload, chunks) = decode_chunked(&raw);
     assert_eq!(payload, vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert!(
+        !chunks.is_empty(),
+        "expected at least one HTTP chunk in a chunked-encoded response"
+    );
+}
+
+#[test]
+fn body_stream_unfold_produces_body_bytes() {
+    // Regression for #477. Prior to the lazy-iter materialisation
+    // pass in handler.rs, this test would observe a zero-byte body
+    // because `drain_iter_str` matched only on `__IterEager`.
+    spawn_lex_server(UNFOLD_SRC, "main");
+    wait_for_bind(18195, Duration::from_secs(5));
+    let (status, headers, raw) = http_get(18195, "/sse");
+    assert!(status.starts_with("HTTP/1.1 200"), "status: {status}");
+    let headers_lower = headers.to_ascii_lowercase();
+    assert!(
+        headers_lower.contains("transfer-encoding: chunked"),
+        "expected chunked encoding; headers were:\n{headers}"
+    );
+    let (payload, chunks) = decode_chunked(&raw);
+    assert_eq!(
+        String::from_utf8_lossy(&payload),
+        "hello\nhello\nhello\n",
+        "unfold-based BodyStream must produce the same payload as the equivalent from_list version"
+    );
     assert!(
         !chunks.is_empty(),
         "expected at least one HTTP chunk in a chunked-encoded response"
