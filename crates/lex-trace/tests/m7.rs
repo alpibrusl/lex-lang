@@ -60,7 +60,7 @@ fn value_to_json(v: &Value) -> serde_json::Value {
         Value::Tuple(items) => J::Array(items.iter().map(value_to_json).collect()),
         Value::Record { fields, .. } => {
             let mut m = serde_json::Map::new();
-            for (k, v) in fields { m.insert(k.clone(), value_to_json(v)); }
+            for (k, v) in fields.iter() { m.insert(k.clone(), value_to_json(v)); }
             J::Object(m)
         }
         Value::Variant { name, args } => {

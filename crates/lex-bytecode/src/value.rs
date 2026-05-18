@@ -96,11 +96,21 @@ pub enum Value {
     /// — the IC unconditionally misses on them and falls through to
     /// the existing name walk.
     ///
+    /// `fields` is `Box<IndexMap>` rather than `IndexMap` inline
+    /// because the bare `IndexMap` is ~56B; inlining it plus
+    /// `shape_id` would push `Value`'s enum size from 64B → 72B,
+    /// which measurably regresses the VM stack push/pop loop
+    /// (`Value` is cloned/moved on every push/pop). Boxing keeps
+    /// `Value::Record` at 16B and `Value` at the pre-#462 64B.
+    /// The indirection on every `IndexMap` access costs a few ns
+    /// but the IC drops the field-name string compare on every
+    /// hit, which is the net win on `mono_chain`.
+    ///
     /// `shape_id` is **not** part of structural equality (see
     /// `PartialEq` below): two records with identical fields must
     /// compare equal regardless of provenance, so a JSON-decoded
     /// record equals a compile-time-built one with the same fields.
-    Record { shape_id: u32, fields: IndexMap<String, Value> },
+    Record { shape_id: u32, fields: Box<IndexMap<String, Value>> },
     Variant { name: String, args: Vec<Value> },
     /// First-class function value (a lambda + its captured locals). The
     /// function's first `captures.len()` params bind to `captures`; the
@@ -292,7 +302,7 @@ impl Value {
             Value::Tuple(items) => J::Array(items.iter().map(Value::to_json).collect()),
             Value::Record { fields, .. } => {
                 let mut m = serde_json::Map::new();
-                for (k, v) in fields { m.insert(k.clone(), v.to_json()); }
+                for (k, v) in fields.iter() { m.insert(k.clone(), v.to_json()); }
                 J::Object(m)
             }
             Value::Variant { name, args } => {
@@ -426,7 +436,7 @@ impl Value {
     /// hand-rolling `Value::Record { shape_id: NO_SHAPE_ID, fields }`
     /// so a future shape-interning slice has one place to retrofit.
     pub fn record_dynamic(fields: IndexMap<String, Value>) -> Value {
-        Value::Record { shape_id: NO_SHAPE_ID, fields }
+        Value::Record { shape_id: NO_SHAPE_ID, fields: Box::new(fields) }
     }
 }
 

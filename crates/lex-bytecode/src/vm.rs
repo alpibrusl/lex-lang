@@ -838,7 +838,7 @@ impl<'a> Vm<'a> {
                         };
                         rec.insert(name, val);
                     }
-                    self.stack.push(Value::Record { shape_id: shape_idx, fields: rec });
+                    self.stack.push(Value::Record { shape_id: shape_idx, fields: Box::new(rec) });
                 }
                 Op::MakeTuple(n) => {
                     let mut items: Vec<Value> = (0..n).map(|_| Value::Unit).collect();
