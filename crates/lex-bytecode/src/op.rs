@@ -166,4 +166,19 @@ pub enum Op {
     /// (+1 LoadLocal, -1 IntAdd) cancel, matching the unfused depth
     /// at pc+3.
     LoadLocalAddLocal { lhs_idx: u16, rhs_idx: u16 },
+    /// Fused `LoadLocal(lhs_idx) + LoadLocal(rhs_idx) + IntSub`
+    /// (#461 superinstruction slice 4). Sibling of `LoadLocalAddLocal`
+    /// for the typed `Int` subtraction binop — fires on any `a - b`
+    /// where both operands are `Int` locals. Reads `locals[lhs_idx]`
+    /// and `locals[rhs_idx]`, pushes `lhs - rhs`, advances pc by 3.
+    /// Stack delta: +1. Tombstone + body-hash story matches
+    /// `LoadLocalAddLocal` exactly.
+    LoadLocalSubLocal { lhs_idx: u16, rhs_idx: u16 },
+    /// Fused `LoadLocal(lhs_idx) + LoadLocal(rhs_idx) + IntMul`
+    /// (#461 superinstruction slice 4). Sibling of `LoadLocalAddLocal`
+    /// for the typed `Int` multiplication binop. Same shape: reads
+    /// the two Int locals, pushes `lhs * rhs`, advances pc by 3.
+    /// Stack delta: +1. Tombstone + body-hash story matches
+    /// `LoadLocalAddLocal` exactly.
+    LoadLocalMulLocal { lhs_idx: u16, rhs_idx: u16 },
 }

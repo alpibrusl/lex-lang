@@ -251,11 +251,15 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
     // (LoadLocal + LoadLocal + IntAdd) is disjoint from both — its
     // second slot is LoadLocal, not PushConst — so it can run in
     // either order. Run it last to keep the slice 1/2 contract
-    // (slice 2 expects to see slice-1 output) untouched.
+    // (slice 2 expects to see slice-1 output) untouched. Slice 4 is
+    // slice 3 for IntSub / IntMul (same pattern, different terminator);
+    // disjoint from every prior slice because the terminator op
+    // disambiguates, so order between slice 3 and slice 4 is free.
     for f in p.functions.iter_mut() {
         apply_peephole(&mut f.code, &pool.pool);
         apply_peephole_slice2(&mut f.code);
         apply_peephole_slice3(&mut f.code);
+        apply_peephole_slice4(&mut f.code);
     }
 
     // Final pass: stamp every function with its content hash now that
@@ -399,6 +403,46 @@ fn apply_peephole_slice3(code: &mut [Op]) {
                 code[k] = Op::LoadLocalAddLocal { lhs_idx, rhs_idx };
                 k += 3;
                 continue;
+            }
+        }
+        k += 1;
+    }
+}
+
+/// Slice 4: slice 3 for `IntSub` and `IntMul`. Fuses
+/// `[LoadLocal(lhs), LoadLocal(rhs), IntSub]` to
+/// `LoadLocalSubLocal { lhs_idx, rhs_idx }` and the `IntMul` shape
+/// to `LoadLocalMulLocal`. Same tombstone, jump-safety, and
+/// body-hash story as slice 3 — the trailing two slots stay as
+/// inert primitives with cancelling stack deltas.
+///
+/// Disjoint from every prior slice: slice 1/2 require a `PushConst`
+/// at slot 2 (here it's `LoadLocal`), and slice 3's terminator is
+/// `IntAdd` (here it's `IntSub` / `IntMul`). A given site matches at
+/// most one slice.
+fn apply_peephole_slice4(code: &mut [Op]) {
+    if code.len() < 3 { return; }
+    let jump_targets = collect_jump_targets(code);
+
+    let n = code.len();
+    let mut k = 0;
+    while k + 2 < n {
+        if let (Op::LoadLocal(lhs_idx), Op::LoadLocal(rhs_idx), terminator)
+            = (code[k], code[k + 1], code[k + 2])
+        {
+            let fused = match terminator {
+                Op::IntSub => Some(Op::LoadLocalSubLocal { lhs_idx, rhs_idx }),
+                Op::IntMul => Some(Op::LoadLocalMulLocal { lhs_idx, rhs_idx }),
+                _ => None,
+            };
+            if let Some(fused_op) = fused {
+                let safe = !jump_targets.contains(&(k + 1))
+                    && !jump_targets.contains(&(k + 2));
+                if safe {
+                    code[k] = fused_op;
+                    k += 3;
+                    continue;
+                }
             }
         }
         k += 1;
