@@ -31,6 +31,18 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::singleton("io"),
                 Ty::Con("Result".into(), vec![Ty::Unit, Ty::str()]),
             ));
+            // io.readline() -> [io] Option[Str]
+            fields.insert("readline".into(), Ty::function(
+                vec![],
+                EffectSet::singleton("io"),
+                Ty::Con("Option".into(), vec![Ty::str()]),
+            ));
+            // io.argv() -> [io] List[Str]
+            fields.insert("argv".into(), Ty::function(
+                vec![],
+                EffectSet::singleton("io"),
+                Ty::List(Box::new(Ty::str())),
+            ));
             Some(Ty::Record(fields))
         }
         "str" => {

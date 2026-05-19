@@ -1291,6 +1291,11 @@ impl Checker {
                 Ok(())
             }
             a::Pattern::PTuple { items } => {
+                // An empty-tuple pattern `()` is equivalent to Unit.
+                if items.is_empty() {
+                    return self.unify_with_record_coercion(&Ty::Unit, ty)
+                        .map_err(|e| mismatch_err(node_id, e, &self.u, vec!["in unit pattern".into()]));
+                }
                 let resolved = self.u.resolve(ty);
                 let tup = match resolved {
                     Ty::Tuple(t) => t,
@@ -1300,12 +1305,14 @@ impl Checker {
                         self.unify_with_record_coercion(&tup_ty, ty).map_err(|e| mismatch_err(node_id, e, &self.u, vec!["in tuple pattern".into()]))?;
                         fresh
                     }
-                    other => return Err(TypeError::TypeMismatch {
-                        at_node: node_id.into(),
-                        expected: "tuple".into(),
-                        got: other.pretty(),
-                        context: vec!["in tuple pattern".into()],
-                    }),
+                    other => {
+                        return Err(TypeError::TypeMismatch {
+                            at_node: node_id.into(),
+                            expected: "tuple".into(),
+                            got: other.pretty(),
+                            context: vec!["in tuple pattern".into()],
+                        });
+                    }
                 };
                 if tup.len() != items.len() {
                     return Err(TypeError::ArityMismatch {
