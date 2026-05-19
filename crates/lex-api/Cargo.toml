@@ -25,5 +25,8 @@ lex-store = { path = "../lex-store", version = "0.9.5" }
 lex-trace = { path = "../lex-trace", version = "0.9.5" }
 lex-vcs = { path = "../lex-vcs", version = "0.9.5" }
 
-[dev-dependencies]
+flate2 = "1"
+tar = "0.4"
 tempfile = "3"
+
+[dev-dependencies]

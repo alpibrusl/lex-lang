@@ -10,10 +10,11 @@ use lex_ast::canonicalize_program;
 use lex_bytecode::{compile_program, vm::Vm, Value};
 use lex_runtime::{check_program as check_policy, DefaultHandler, Policy};
 use lex_store::Store;
-use lex_syntax::load_program_from_str;
+use lex_syntax::{load_program, load_program_from_str, Manifest};
+use std::io::Read as _;
 use lex_vcs::{MergeSession, MergeSessionId};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -181,6 +182,14 @@ pub fn handle(state: Arc<State>, mut req: Request) -> std::io::Result<()> {
         .find(|h| h.field.equiv("x-lex-user"))
         .map(|h| h.value.as_str().to_string());
 
+    // POST /v1/pkg/publish sends a raw tar.gz body — read bytes before routing.
+    if matches!(method, Method::Post) && path == "/v1/pkg/publish" {
+        let mut body_bytes: Vec<u8> = Vec::new();
+        let _ = req.as_reader().read_to_end(&mut body_bytes);
+        let resp = pkg_publish_handler(&state, &body_bytes);
+        return req.respond(resp);
+    }
+
     let mut body = String::new();
     let _ = req.as_reader().read_to_string(&mut body);
 
@@ -298,6 +307,22 @@ fn route(
         // `branch.head_op` but not from `after`, oldest-first.
         (Method::Get, "/v1/ops/since") => ops_since_handler(state, query),
         (Method::Get, "/v1/attestations/since") => attestations_since_handler(state, query),
+        // ---- #4: package concept ----------------------------------
+        // POST /v1/pkg/publish is handled in handle() before route()
+        // (binary body), so it doesn't appear here.
+        (Method::Get, "/v1/pkg") => pkg_list_handler(state),
+        (Method::Get, p) if p.starts_with("/v1/pkg/") && p.ends_with("/head") => {
+            let name = &p["/v1/pkg/".len()..p.len() - "/head".len()];
+            pkg_head_handler(state, name)
+        }
+        (Method::Get, p) if p.starts_with("/v1/pkg/") => {
+            let name = &p["/v1/pkg/".len()..];
+            pkg_get_handler(state, name)
+        }
+        (Method::Delete, p) if p.starts_with("/v1/pkg/") => {
+            let name = &p["/v1/pkg/".len()..];
+            pkg_delete_handler(state, name)
+        }
         _ => error_response(404, format!("unknown route: {method:?} {path}")),
     }
 }
@@ -1374,4 +1399,294 @@ pub(crate) fn attestations_since_handler(state: &State, query: &str)
     }
 
     json_response(200, &serde_json::to_value(&filtered).unwrap_or_default())
+}
+
+// ── Package concept (#4) ────────────────────────────────────────────────────
+
+/// Persistent record for a published package stored in
+/// `{store_root}/packages/{name}.json`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PkgRecord {
+    name: String,
+    version: String,
+    head_op: Option<String>,
+    published_at: u64,
+    /// Function names introduced or updated by this package (for retract).
+    function_names: Vec<String>,
+    /// Raw op JSON from each file publish (for inspection via GET /v1/pkg/{name}).
+    ops: Vec<serde_json::Value>,
+}
+
+fn pkg_index_dir(root: &std::path::Path) -> PathBuf {
+    root.join("packages")
+}
+
+fn pkg_record_path(root: &std::path::Path, name: &str) -> PathBuf {
+    pkg_index_dir(root).join(format!("{}.json", name))
+}
+
+fn load_pkg_record(root: &std::path::Path, name: &str) -> Option<PkgRecord> {
+    let bytes = std::fs::read(pkg_record_path(root, name)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn save_pkg_record(root: &std::path::Path, record: &PkgRecord) -> std::io::Result<()> {
+    let dir = pkg_index_dir(root);
+    std::fs::create_dir_all(&dir)?;
+    let bytes = serde_json::to_vec_pretty(record).unwrap_or_default();
+    std::fs::write(pkg_record_path(root, &record.name), bytes)
+}
+
+fn list_pkg_records(root: &std::path::Path) -> Vec<PkgRecord> {
+    let dir = pkg_index_dir(root);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut records: Vec<PkgRecord> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
+        .filter_map(|e| {
+            let bytes = std::fs::read(e.path()).ok()?;
+            serde_json::from_slice(&bytes).ok()
+        })
+        .collect();
+    records.sort_by(|a, b| a.name.cmp(&b.name));
+    records
+}
+
+fn collect_lex_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+    entries.sort_by_key(|e| e.path());
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_lex_files(&path, out);
+        } else if path.extension().and_then(|x| x.to_str()) == Some("lex") {
+            out.push(path);
+        }
+    }
+}
+
+/// `POST /v1/pkg/publish` — publish a multi-file package from a `.tar.gz`
+/// archive containing `lex.toml` and `src/**/*.lex`.
+fn pkg_publish_handler(state: &State, body: &[u8]) -> Response<std::io::Cursor<Vec<u8>>> {
+    let tmp = match tempfile::TempDir::new() {
+        Ok(t) => t,
+        Err(e) => return error_response(500, format!("create temp dir: {e}")),
+    };
+    {
+        let gz = flate2::read::GzDecoder::new(std::io::Cursor::new(body));
+        let mut ar = tar::Archive::new(gz);
+        if let Err(e) = ar.unpack(tmp.path()) {
+            return error_response(400, format!("unpack archive: {e}"));
+        }
+    }
+
+    let toml_path = tmp.path().join("lex.toml");
+    if !toml_path.exists() {
+        return error_response(400, "archive must contain lex.toml at root");
+    }
+    let manifest = match Manifest::load(&toml_path) {
+        Ok(m) => m,
+        Err(e) => return error_response(400, format!("lex.toml: {e}")),
+    };
+    let (pkg_name, pkg_version) = match &manifest.package {
+        Some(m) => (m.name.clone(), m.version.clone()),
+        None => return error_response(400, "lex.toml must have a [package] section"),
+    };
+
+    let src_dir = tmp.path().join("src");
+    if !src_dir.exists() {
+        return error_response(400, "archive must contain a src/ directory");
+    }
+    let mut lex_files: Vec<PathBuf> = Vec::new();
+    collect_lex_files(&src_dir, &mut lex_files);
+    if lex_files.is_empty() {
+        return error_response(400, "no .lex files found in src/");
+    }
+
+    let store = state.store.lock().unwrap();
+    let branch = store.current_branch();
+
+    let mut all_ops: Vec<serde_json::Value> = Vec::new();
+    let mut final_head_op: Option<String> = None;
+    let mut all_function_names: Vec<String> = Vec::new();
+
+    for lex_path in &lex_files {
+        let prog = match load_program(lex_path) {
+            Ok(p) => p,
+            Err(e) => return error_response(400, format!("load {}: {e}", lex_path.display())),
+        };
+        let mut stages = canonicalize_program(&prog);
+        if let Err(errs) = lex_types::check_and_rewrite_program(&mut stages) {
+            return error_with_detail(
+                422,
+                format!("type errors in {}", lex_path.display()),
+                serde_json::to_value(&errs).unwrap(),
+            );
+        }
+
+        let old_head = match store.branch_head(&branch) {
+            Ok(h) => h,
+            Err(e) => return error_response(500, format!("branch_head: {e}")),
+        };
+        let old_fns: BTreeMap<String, lex_ast::FnDecl> = old_head.values()
+            .filter_map(|stg| store.get_ast(stg).ok())
+            .filter_map(|s| match s {
+                lex_ast::Stage::FnDecl(fd) => Some((fd.name.clone(), fd)),
+                _ => None,
+            })
+            .collect();
+        let new_fns: BTreeMap<String, lex_ast::FnDecl> = stages.iter()
+            .filter_map(|s| match s {
+                lex_ast::Stage::FnDecl(fd) => Some((fd.name.clone(), fd.clone())),
+                _ => None,
+            })
+            .collect();
+
+        for name in new_fns.keys() {
+            if !all_function_names.contains(name) {
+                all_function_names.push(name.clone());
+            }
+        }
+
+        let report = lex_vcs::compute_diff(&old_fns, &new_fns, false);
+
+        let file_key = lex_path
+            .strip_prefix(tmp.path())
+            .unwrap_or(lex_path)
+            .display()
+            .to_string();
+        let mut new_imports = lex_vcs::ImportMap::new();
+        {
+            let entry = new_imports.entry(file_key).or_default();
+            for s in &stages {
+                if let lex_ast::Stage::Import(im) = s {
+                    entry.insert(im.reference.clone());
+                }
+            }
+        }
+
+        match store.publish_program(&branch, &stages, &report, &new_imports, false) {
+            Ok(outcome) => {
+                let ops_json = serde_json::to_value(&outcome.ops).unwrap_or_default();
+                if let serde_json::Value::Array(arr) = ops_json {
+                    all_ops.extend(arr);
+                }
+                if let Some(h) = outcome.head_op {
+                    final_head_op = Some(h);
+                }
+            }
+            Err(lex_store::StoreError::TypeError(errs)) => {
+                return error_with_detail(422, "type errors", serde_json::to_value(&errs).unwrap());
+            }
+            Err(e) => return write_error_response("publish_program", e),
+        }
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let record = PkgRecord {
+        name: pkg_name.clone(),
+        version: pkg_version,
+        head_op: final_head_op.clone(),
+        published_at: now,
+        function_names: all_function_names,
+        ops: all_ops.clone(),
+    };
+    if let Err(e) = save_pkg_record(&state.root, &record) {
+        return error_response(500, format!("save package index: {e}"));
+    }
+
+    json_response(200, &serde_json::json!({
+        "package": pkg_name,
+        "ops": all_ops,
+        "head_op": final_head_op,
+    }))
+}
+
+/// `GET /v1/pkg` — list packages published by this tenant.
+fn pkg_list_handler(state: &State) -> Response<std::io::Cursor<Vec<u8>>> {
+    let records = list_pkg_records(&state.root);
+    let packages: Vec<serde_json::Value> = records.iter().map(|r| serde_json::json!({
+        "name": r.name,
+        "version": r.version,
+        "head_op": r.head_op,
+        "published_at": r.published_at,
+    })).collect();
+    json_response(200, &serde_json::json!({ "packages": packages }))
+}
+
+/// `GET /v1/pkg/{name}` — list stages belonging to a package.
+fn pkg_get_handler(state: &State, name: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    match load_pkg_record(&state.root, name) {
+        Some(r) => json_response(200, &serde_json::json!({
+            "name": r.name,
+            "version": r.version,
+            "head_op": r.head_op,
+            "published_at": r.published_at,
+            "function_names": r.function_names,
+            "ops": r.ops,
+        })),
+        None => error_response(404, format!("package {name:?} not found")),
+    }
+}
+
+/// `GET /v1/pkg/{name}/head` — head op for a package's branch.
+fn pkg_head_handler(state: &State, name: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    match load_pkg_record(&state.root, name) {
+        Some(r) => json_response(200, &serde_json::json!({
+            "name": r.name,
+            "head_op": r.head_op,
+        })),
+        None => error_response(404, format!("package {name:?} not found")),
+    }
+}
+
+/// `DELETE /v1/pkg/{name}` — retract all stages introduced by a package.
+fn pkg_delete_handler(state: &State, name: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    let record = match load_pkg_record(&state.root, name) {
+        Some(r) => r,
+        None => return error_response(404, format!("package {name:?} not found")),
+    };
+
+    let store = state.store.lock().unwrap();
+    let branch = store.current_branch();
+
+    let head = match store.branch_head(&branch) {
+        Ok(h) => h,
+        Err(e) => return error_response(500, format!("branch_head: {e}")),
+    };
+
+    // Build old_fns from this package's function names that are still on the branch.
+    let old_fns: BTreeMap<String, lex_ast::FnDecl> = head.values()
+        .filter_map(|stage_id| store.get_ast(stage_id).ok())
+        .filter_map(|s| match s {
+            lex_ast::Stage::FnDecl(fd)
+                if record.function_names.contains(&fd.name) => Some((fd.name.clone(), fd)),
+            _ => None,
+        })
+        .collect();
+
+    let new_fns: BTreeMap<String, lex_ast::FnDecl> = BTreeMap::new();
+    let report = lex_vcs::compute_diff(&old_fns, &new_fns, false);
+    let empty_imports = lex_vcs::ImportMap::new();
+
+    match store.publish_program(&branch, &[], &report, &empty_imports, false) {
+        Ok(outcome) => {
+            let _ = std::fs::remove_file(pkg_record_path(&state.root, name));
+            json_response(200, &serde_json::json!({
+                "deleted": name,
+                "ops": outcome.ops,
+                "head_op": outcome.head_op,
+            }))
+        }
+        Err(lex_store::StoreError::TypeError(errs)) => {
+            error_with_detail(422, "type errors", serde_json::to_value(&errs).unwrap())
+        }
+        Err(e) => write_error_response("retract package", e),
+    }
 }
