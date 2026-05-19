@@ -11,7 +11,6 @@ use lex_bytecode::{compile_program, vm::Vm, Value};
 use lex_runtime::{check_program as check_policy, DefaultHandler, Policy};
 use lex_store::Store;
 use lex_syntax::{load_program, load_program_from_str, Manifest};
-use std::io::Read as _;
 use lex_vcs::{MergeSession, MergeSessionId};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
