@@ -234,8 +234,62 @@ criterion_group!(
     bench_straight_arith,
     bench_straight_arith_no_dispatch,
     bench_pure_dispatch,
+    bench_two_local_arith,
 );
 criterion_main!(benches);
+
+/// Build a `two_local_arith` source: each let-binding sums two
+/// already-bound locals (no constant operand), so each compiles to
+/// `LoadLocal + LoadLocal + IntAdd + StoreLocal`. The first two slots
+/// are exactly slice 3's pattern (`LoadLocalAddLocal`) and the trailing
+/// `StoreLocal` would be slice 3's natural follow-on if it ever grew
+/// a `StoreLocal`-absorbing companion (mirroring slice 2's relation
+/// to slice 1). Sibling to `straight_arith` — same shape, but with a
+/// LoadLocal as the second operand instead of a PushConst, so slice 3
+/// is the only superinstruction that fires here.
+fn make_two_local_arith_source(n: usize) -> String {
+    // a0 = start, a1 = start, a{i} = a{i-1} + a{i-2}-equivalent
+    // pattern (the second-operand local cycles between the two
+    // seeds so we don't overflow into a useless big number — we
+    // just want consistent LoadLocal+LoadLocal+IntAdd dispatch shape).
+    let mut s = String::with_capacity(48 * n);
+    s.push_str("fn two_local_arith(start :: Int, step :: Int) -> Int {\n");
+    s.push_str("  let a0 := start\n");
+    for i in 1..=n {
+        // Always: a{i} := a{i-1} + step. Both operands are Int locals,
+        // so compile_binop emits IntAdd (typed lowering) and the
+        // peephole slice 3 fuses the LoadLocal+LoadLocal+IntAdd triple.
+        s.push_str(&format!("  let a{i} := a{} + step\n", i - 1));
+    }
+    s.push_str(&format!("  a{n}\n"));
+    s.push_str("}\n");
+    s
+}
+
+fn bench_two_local_arith(c: &mut Criterion) {
+    let mut group = c.benchmark_group("dispatch/two_local_arith");
+    for n in [100usize, 1_000, 5_000] {
+        let prog = compile(&make_two_local_arith_source(n));
+        // 4 dispatch steps per let-binding without superinstructions:
+        // LoadLocal + LoadLocal + IntAdd + StoreLocal. With slice 3 the
+        // first three collapse to one dispatched op (the trailing two
+        // are tombstones the VM steps past in one `pc + 3` update).
+        // Throughput count uses the unfused-equivalent step count so
+        // ns/elem numbers are comparable to `straight_arith`.
+        group.throughput(Throughput::Elements((4 * n) as u64));
+        group.bench_function(format!("n={n}"), |b| {
+            b.iter(|| {
+                let mut vm = Vm::new(&prog);
+                vm.set_step_limit(u64::MAX);
+                black_box(
+                    vm.call("two_local_arith", vec![Value::Int(0), Value::Int(1)])
+                        .expect("call two_local_arith"),
+                )
+            })
+        });
+    }
+    group.finish();
+}
 
 /// Pure-dispatch microbench: hand-built `Program` whose body is N
 /// `PushConst(Unit) + Pop` pairs followed by `PushConst(Int 0) +

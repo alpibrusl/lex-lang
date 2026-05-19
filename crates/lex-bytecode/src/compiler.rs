@@ -247,10 +247,15 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
     // is invariant under this pass and the order doesn't matter.
     //
     // Slices run sequentially: slice 2 looks for slice-1 output
-    // followed by a StoreLocal, so it must follow slice 1.
+    // followed by a StoreLocal, so it must follow slice 1. Slice 3
+    // (LoadLocal + LoadLocal + IntAdd) is disjoint from both — its
+    // second slot is LoadLocal, not PushConst — so it can run in
+    // either order. Run it last to keep the slice 1/2 contract
+    // (slice 2 expects to see slice-1 output) untouched.
     for f in p.functions.iter_mut() {
         apply_peephole(&mut f.code, &pool.pool);
         apply_peephole_slice2(&mut f.code);
+        apply_peephole_slice3(&mut f.code);
     }
 
     // Final pass: stamp every function with its content hash now that
@@ -354,6 +359,45 @@ fn apply_peephole_slice2(code: &mut [Op]) {
                     dest,
                 };
                 k += 4;
+                continue;
+            }
+        }
+        k += 1;
+    }
+}
+
+/// Slice 3: fuse `[LoadLocal(lhs), LoadLocal(rhs), IntAdd]` into
+/// `LoadLocalAddLocal { lhs_idx, rhs_idx }`. The binary-op-on-two-
+/// locals idiom: any `a + b` where both operands compile to a
+/// `LoadLocal` (typed `Int`). Mirrors slice 1's shape exactly — the
+/// trailing `LoadLocal` + `IntAdd` stay in place as inert tombstones
+/// with cancelling stack deltas (+1, -1), so the verifier and
+/// body-hash decoder both keep walking them as live.
+///
+/// Disjoint from slice 1: the second slot disambiguates (LoadLocal
+/// vs PushConst), so a site can match at most one of the two. Runs
+/// after slice 2 so we don't accidentally consume a `LoadLocal` slot
+/// that slice 2 was about to fuse into a `*StoreLocal` superop (and
+/// to keep slice 2's input contract — slice-1 output followed by
+/// StoreLocal — untouched).
+///
+/// Safety: like slice 1, the trailing two slots must not be jump
+/// targets. The first slot can be a target (it stays a live op).
+fn apply_peephole_slice3(code: &mut [Op]) {
+    if code.len() < 3 { return; }
+    let jump_targets = collect_jump_targets(code);
+
+    let n = code.len();
+    let mut k = 0;
+    while k + 2 < n {
+        if let (Op::LoadLocal(lhs_idx), Op::LoadLocal(rhs_idx), Op::IntAdd)
+            = (code[k], code[k + 1], code[k + 2])
+        {
+            let safe = !jump_targets.contains(&(k + 1))
+                && !jump_targets.contains(&(k + 2));
+            if safe {
+                code[k] = Op::LoadLocalAddLocal { lhs_idx, rhs_idx };
+                k += 3;
                 continue;
             }
         }

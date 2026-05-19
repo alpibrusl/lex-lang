@@ -151,4 +151,19 @@ pub enum Op {
     /// both treat the 3 following slots as tombstones owned by
     /// this op.
     LoadLocalAddIntConstStoreLocal { src: u16, imm_const_idx: u32, dest: u16 },
+    /// Fused `LoadLocal(lhs_idx) + LoadLocal(rhs_idx) + IntAdd`
+    /// (#461 superinstruction slice 3). The binary-op-on-two-locals
+    /// idiom — fires on any `a + b` where both operands are
+    /// statically-typed `Int` locals (e.g. `acc + n` in tail-recursive
+    /// accumulator loops). Reads `locals[lhs_idx]` and `locals[rhs_idx]`,
+    /// pushes the sum, advances pc by 3. Stack delta: +1.
+    ///
+    /// `body_hash` stability (#222): canonical encoding decomposes
+    /// back to a standalone `LoadLocal(lhs_idx)`. The unchanged
+    /// `LoadLocal(rhs_idx)` + `IntAdd` tombstones at pc+1 and pc+2
+    /// hash normally, so the total bytes match the pre-fusion form.
+    /// Verifier walks the tombstones as if live: their deltas
+    /// (+1 LoadLocal, -1 IntAdd) cancel, matching the unfused depth
+    /// at pc+3.
+    LoadLocalAddLocal { lhs_idx: u16, rhs_idx: u16 },
 }
