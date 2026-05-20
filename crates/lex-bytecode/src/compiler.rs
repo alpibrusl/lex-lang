@@ -152,6 +152,22 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
     let function_names = p.function_names.clone();
     let module_aliases = p.module_aliases.clone();
     let mut pending_lambdas: Vec<PendingLambda> = Vec::new();
+    // #461 slice 7: collect `type Foo = { ... }` aliases so
+    // `record_field_types` can resolve a parameter's named record
+    // type to its field layout. Without this, `r :: R` where
+    // `type R = { x :: Int, y :: Int }` falls through to Unknown
+    // and the typed-Add lowering misses on `r.x + r.y`.
+    let mut type_aliases: IndexMap<String, a::TypeExpr> = IndexMap::new();
+    for s in stages {
+        if let a::Stage::TypeDecl(td) = s {
+            // Parameterized type aliases (`type Box[T] = ...`) are
+            // out of scope for this slice — without monomorphization
+            // we can't know what T resolves to. Skip them.
+            if td.params.is_empty() {
+                type_aliases.insert(td.name.clone(), td.definition.clone());
+            }
+        }
+    }
 
     for s in stages {
         if let a::Stage::FnDecl(_) = s {
@@ -165,6 +181,7 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
                 next_local: 0,
                 peak_local: 0,
                 local_types: IndexMap::new(),
+                local_record_field_types: IndexMap::new(),
                 field_get_sites: 0,
                 pool: &mut pool,
                 function_names: &function_names,
@@ -177,6 +194,13 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
                 let i = fc.next_local;
                 fc.locals.insert(param.name.clone(), i);
                 fc.local_types.insert(param.name.clone(), classify_type_expr(&param.ty));
+                // #461 slice 7: inline-record parameter (`r ::
+                // { x :: Int, y :: Int }`) — populate the per-local
+                // field-type map so `r.x + r.y` classifies as
+                // Int+Int → IntAdd, which slice 7 then fuses.
+                if let Some(ftypes) = record_field_types(&param.ty, &type_aliases) {
+                    fc.local_record_field_types.insert(param.name.clone(), ftypes);
+                }
                 fc.next_local += 1;
                 fc.peak_local = fc.next_local;
             }
@@ -203,6 +227,7 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
             next_local: 0,
             peak_local: 0,
             local_types: IndexMap::new(),
+            local_record_field_types: IndexMap::new(),
             field_get_sites: 0,
             pool: &mut pool,
             function_names: &function_names,
@@ -300,6 +325,11 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
         // fused op that reads the just-stored local). Must run after
         // slice 5 since it matches on slice 5's output.
         apply_peephole_slice6(&mut f.code);
+        // Slice 7 — fuse `LoadLocal + GetField + IntAdd`, the
+        // accumulator-with-field-read idiom. Disjoint from every
+        // earlier slice (only this one matches a GetField at slot 1),
+        // so order is independent — placed at the end for chronology.
+        apply_peephole_slice7(&mut f.code);
     }
 
     // Final pass: stamp every function with its content hash now that
@@ -630,6 +660,52 @@ fn apply_peephole_slice6(code: &mut [Op]) {
     }
 }
 
+/// Slice 7: fuse `[LoadLocal(local_idx), GetField{name_idx, site_idx},
+/// IntAdd]` into `LoadLocalGetFieldAdd { local_idx, name_idx, site_idx }`.
+///
+/// Fires on the `acc + r.field` accumulator-with-field-read idiom —
+/// the bytecode the compiler emits for `prev_expr + record.field`
+/// once `prev_expr` is on the stack. Common in handler-shaped code
+/// like `r.x + r.y + r.z` (the LHS of each `+` after the first
+/// matches this pattern) and `acc + items[i].weight` reductions.
+///
+/// Disjoint from every prior slice: slice 1 wants `PushConst` at
+/// slot 1; slices 3-4 want `LoadLocal` at slot 1; slice 5 wants
+/// a 4-slot window with `IntEq + JumpIfNot` terminator. Only this
+/// slice matches a `GetField` at slot 1.
+///
+/// Order: must run after slice 4 (so the disjointness analysis
+/// holds — slice 3/4 patterns with a trailing IntAdd / IntSub /
+/// IntMul never carry a GetField at slot 1 and don't compete);
+/// must run before / independent of slice 5/6, which don't match
+/// any slot in this window.
+///
+/// Safety: trailing two slots (the original `GetField` and
+/// `IntAdd`) must not be jump targets. The first slot can be.
+fn apply_peephole_slice7(code: &mut [Op]) {
+    if code.len() < 3 { return; }
+    let jump_targets = collect_jump_targets(code);
+
+    let n = code.len();
+    let mut k = 0;
+    while k + 2 < n {
+        if let (
+            Op::LoadLocal(local_idx),
+            Op::GetField { name_idx, site_idx },
+            Op::IntAdd,
+        ) = (code[k], code[k + 1], code[k + 2]) {
+            let safe = !jump_targets.contains(&(k + 1))
+                && !jump_targets.contains(&(k + 2));
+            if safe {
+                code[k] = Op::LoadLocalGetFieldAdd { local_idx, name_idx, site_idx };
+                k += 3;
+                continue;
+            }
+        }
+        k += 1;
+    }
+}
+
 fn collect_jump_targets(code: &[Op]) -> std::collections::HashSet<usize> {
     let mut targets = std::collections::HashSet::new();
     for (pc, op) in code.iter().enumerate() {
@@ -675,6 +751,21 @@ struct FnCompiler<'a> {
     /// slot index so shadowed bindings are handled correctly via
     /// `IndexMap`'s insertion-order semantics.
     local_types: IndexMap<String, NumTy>,
+    /// Per-local map of statically-known field types (#461 slice 7).
+    /// Populated when a local is bound from a `RecordLit` whose
+    /// fields all classify to non-`Unknown` `NumTy`s. Lets
+    /// `classify_expr(FieldAccess { value: Var(name), field })`
+    /// return a precise `NumTy` instead of falling back to
+    /// `Unknown` — which in turn unlocks the typed-Add lowering
+    /// (`+` over two Ints → `IntAdd`) on `r.field + r.field`
+    /// chains, which slice 7 then fuses into
+    /// `LoadLocalGetFieldAdd`.
+    ///
+    /// Only the literal-binding case is tracked here; annotated
+    /// `let r :: R := ...` would require resolving the type alias
+    /// `R` to its field-type map, which the compiler doesn't yet
+    /// have. Future slice work.
+    local_record_field_types: IndexMap<String, IndexMap<String, NumTy>>,
     /// Per-function counter for `Op::GetField` site indices (#462
     /// slice 1). Each `Op::GetField` emit allocates the next index
     /// here, giving every field-access site within this function a
@@ -702,6 +793,33 @@ struct FnCompiler<'a> {
 /// of these returns `Unknown` and falls back to the polymorphic op.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NumTy { Int, Float, Unknown }
+
+/// #461 slice 7: extract a `field_name -> NumTy` map from a record
+/// type expression. Resolves named types (`r :: R`) via
+/// `type_aliases` and returns `None` if the type ultimately isn't
+/// a record literal.
+fn record_field_types(
+    ty: &a::TypeExpr,
+    type_aliases: &IndexMap<String, a::TypeExpr>,
+) -> Option<IndexMap<String, NumTy>> {
+    match ty {
+        a::TypeExpr::Record { fields } => {
+            let mut m = IndexMap::new();
+            for f in fields {
+                m.insert(f.name.clone(), classify_type_expr(&f.ty));
+            }
+            Some(m)
+        }
+        a::TypeExpr::Refined { base, .. } => record_field_types(base, type_aliases),
+        a::TypeExpr::Named { name, args } if args.is_empty() => {
+            // Resolve the alias and recurse. Cycle protection isn't
+            // needed here — a cyclic type alias would have been
+            // rejected by `lex-types::check_program` upstream.
+            type_aliases.get(name).and_then(|t| record_field_types(t, type_aliases))
+        }
+        _ => None,
+    }
+}
 
 fn classify_type_expr(ty: &a::TypeExpr) -> NumTy {
     match ty {
@@ -756,6 +874,19 @@ impl<'a> FnCompiler<'a> {
                     Some(t) => classify_type_expr(t),
                     None => self.classify_expr(value),
                 };
+                // #461 slice 7: when the RHS is a record literal,
+                // remember the field types so `name.field` accesses
+                // downstream can classify precisely. Without this,
+                // `r.x + r.y` falls through to `NumAdd`, blocking
+                // the slice-7 fusion.
+                if let a::CExpr::RecordLit { fields } = value.as_ref() {
+                    let mut ftypes = IndexMap::new();
+                    for f in fields {
+                        let fty = self.classify_expr(&f.value);
+                        ftypes.insert(f.name.clone(), fty);
+                    }
+                    self.local_record_field_types.insert(name.clone(), ftypes);
+                }
                 self.compile_expr(value, false);
                 let slot = self.alloc_local(name);
                 self.local_types.insert(name.clone(), nty);
@@ -984,6 +1115,20 @@ impl<'a> FnCompiler<'a> {
                 }
             }
             a::CExpr::UnaryOp { op, expr } if op == "-" => self.classify_expr(expr),
+            // #461 slice 7: `r.field` access where `r` is a local
+            // bound from a record literal. Reads the per-local
+            // field-type map populated at the let-binding site.
+            // Unknown otherwise (record argument with `:: R`
+            // annotation, helper-returned record, etc.) — those
+            // would need type-alias resolution to classify.
+            a::CExpr::FieldAccess { value, field } => {
+                if let a::CExpr::Var { name } = value.as_ref() {
+                    if let Some(ftypes) = self.local_record_field_types.get(name) {
+                        return ftypes.get(field).copied().unwrap_or(NumTy::Unknown);
+                    }
+                }
+                NumTy::Unknown
+            }
             // Let-expressions: the let-binding mutates `local_types`
             // *during* compile_expr; classifying ahead of time would
             // require simulating that. Conservative fallback.

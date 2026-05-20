@@ -248,4 +248,37 @@ pub enum Op {
     LoadLocalStoreEqIntConstJumpIfNot {
         src: u16, dst: u16, imm_const_idx: u32, jump_offset: i32,
     },
+    /// Fused `LoadLocal(local_idx) + GetField{name_idx, site_idx} +
+    /// IntAdd` (#461 superinstruction slice 7). Fires on the
+    /// `acc + r.field` accumulator-with-field-read idiom — the
+    /// shape any `expr + record.field` lowers to when the LHS is
+    /// already on the stack and the RHS is a same-frame record
+    /// field. After #464 step 2 dropped the IndexMap allocation
+    /// from hot-path records, this fusion is the next dispatch-
+    /// overhead bottleneck on the `response_build` profile.
+    ///
+    /// Dispatch: pops the prior stack top (an Int), reads
+    /// `locals[local_idx]`, performs the polymorphic-IC GetField
+    /// lookup keyed by `(fn_id, site_idx)` against `name_idx`,
+    /// adds the field value to the popped Int, pushes the result,
+    /// advances pc by 3.
+    ///
+    /// Stack delta: +1 (matches a bare `LoadLocal`). The trailing
+    /// `GetField` (delta 0) and `IntAdd` (delta -1) stay in the
+    /// code stream as inert tombstones; the verifier walks them as
+    /// live and their cancelling deltas leave depth at pc+3
+    /// matching the unfused form.
+    ///
+    /// `body_hash` stability (#222): canonical encoding decomposes
+    /// to a standalone `LoadLocal(local_idx)`; the unchanged
+    /// `GetField` and `IntAdd` at pc+1 and pc+2 hash normally, so
+    /// the total bytes match pre-fusion. The trailing `GetField`'s
+    /// own body-hash decoding (which strips `site_idx`) means the
+    /// hash is unchanged across recompiles where IC-site numbering
+    /// differs.
+    ///
+    /// Safety: the trailing two slots must not be jump targets
+    /// (standard tombstone rule). The first slot may be a target —
+    /// the fused op there is live.
+    LoadLocalGetFieldAdd { local_idx: u16, name_idx: u32, site_idx: u32 },
 }
