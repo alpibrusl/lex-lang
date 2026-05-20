@@ -273,6 +273,62 @@ fn classify(n :: Int) -> Int {
 }
 
 #[test]
+fn slice6_absorbs_match_scrutinee_dance() {
+    // #461 slice 6: `match n { 0 => acc; _ => recurse }` compiles to
+    // `LoadLocal(n) + StoreLocal(scrut) + slice5_fused{local_idx:
+    // scrut, ...}`. Slice 6 collapses the leading LoadLocal+StoreLocal
+    // into the fused arm-test, leaving them as tombstones. Verify
+    // both that the fusion fires and that the runtime semantics
+    // remain identical.
+    use lex_bytecode::op::Op;
+    let src = "
+fn sum_to(n :: Int, acc :: Int) -> Int {
+  match n {
+    0 => acc,
+    _ => sum_to(n - 1, acc + n),
+  }
+}";
+    let p = compile(src);
+    let fused = p.functions.iter().flat_map(|f| f.code.iter()).any(|op|
+        matches!(op, Op::LoadLocalStoreEqIntConstJumpIfNot { .. }));
+    assert!(fused, "slice 6 did not fire on sum_to");
+
+    let mut vm = Vm::new(&p);
+    // 1+2+3+4+5 = 15
+    let r = vm.call("sum_to", vec![Value::Int(5), Value::Int(0)]).unwrap();
+    assert_eq!(r, Value::Int(15));
+}
+
+#[test]
+fn slice6_writes_dst_so_subsequent_arms_see_scrutinee() {
+    // Critical correctness check for slice 6: the fused op MUST
+    // mirror the original `StoreLocal(dst)` because the SECOND and
+    // later arm tests in the same match still read `locals[dst]`.
+    // A multi-arm cascade catches this — if the StoreLocal mirror
+    // were dropped, every arm after the first would read garbage.
+    let src = "
+fn classify(n :: Int) -> Int {
+  match n {
+    0 => 100,
+    1 => 200,
+    2 => 300,
+    3 => 400,
+    _ => 999,
+  }
+}";
+    let p = compile(src);
+    let mut vm = Vm::new(&p);
+    // Every arm reads `locals[scrut]`; if slice 6 dropped the
+    // StoreLocal mirror, arms past the first would see undefined
+    // data and either return the wrong constant or hit the `_` arm.
+    assert_eq!(vm.call("classify", vec![Value::Int(0)]).unwrap(), Value::Int(100));
+    assert_eq!(vm.call("classify", vec![Value::Int(1)]).unwrap(), Value::Int(200));
+    assert_eq!(vm.call("classify", vec![Value::Int(2)]).unwrap(), Value::Int(300));
+    assert_eq!(vm.call("classify", vec![Value::Int(3)]).unwrap(), Value::Int(400));
+    assert_eq!(vm.call("classify", vec![Value::Int(99)]).unwrap(), Value::Int(999));
+}
+
+#[test]
 fn slice3_does_not_fire_across_a_jump_target() {
     // Safety check: if the second or third slot of the candidate
     // triple is a jump target, slice 3 must skip the fusion — a

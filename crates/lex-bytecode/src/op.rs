@@ -203,4 +203,27 @@ pub enum Op {
     /// the code stream as tombstones and hash normally — so
     /// closure identity (#222) stays invariant.
     LoadLocalEqIntConstJumpIfNot { local_idx: u16, imm_const_idx: u32, jump_offset: i32 },
+    /// Fused `LoadLocal(src) + StoreLocal(dst) +
+    /// LoadLocalEqIntConstJumpIfNot { local_idx: dst, ... }` (#461
+    /// superinstruction slice 6). Absorbs the match-scrutinee dance
+    /// — the `LoadLocal + StoreLocal` the compiler emits to bind the
+    /// match expression to a fresh local before each arm's pattern
+    /// test reads it back. Reads `locals[src]`, mirrors the original
+    /// `StoreLocal(dst)` by writing the same value into `locals[dst]`
+    /// (so the SECOND and later arm tests in the same match still
+    /// see the scrutinee at the expected slot), then compares against
+    /// the constant. Equal → advance pc by 6 (skip past the 5
+    /// tombstones — original StoreLocal + slice-5 fused op + slice-5's
+    /// 3 trailing tombstones). Not equal → jump to
+    /// `pc + 6 + jump_offset` (the original JumpIfNot's target;
+    /// `jump_offset` is copied unchanged from the slice-5 op).
+    /// Stack delta: 0.
+    ///
+    /// `body_hash` decodes back to a standalone `LoadLocal(src)`;
+    /// the trailing 5 ops (StoreLocal, the slice-5 fused op
+    /// decoded as LoadLocal(dst), PushConst, IntEq, JumpIfNot) stay
+    /// in the code stream as tombstones and hash normally.
+    LoadLocalStoreEqIntConstJumpIfNot {
+        src: u16, dst: u16, imm_const_idx: u32, jump_offset: i32,
+    },
 }
