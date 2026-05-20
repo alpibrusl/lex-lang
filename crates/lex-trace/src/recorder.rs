@@ -182,6 +182,11 @@ fn value_to_json(v: &Value) -> serde_json::Value {
             for (k, v) in fields.iter() { m.insert(k.clone(), value_to_json(v)); }
             J::Object(m)
         }
+        // #464 step 2: escape analysis prevents this variant from
+        // reaching a trace boundary (the tracer only records args
+        // on Call/EffectCall — both escape sinks the analysis
+        // rejects). If we ever do see one, that's an analysis bug.
+        Value::StackRecord { .. } => J::String("<stack-record-unreachable>".into()),
         Value::Variant { name, args } => {
             let mut m = serde_json::Map::new();
             m.insert("$variant".into(), J::String(name.clone()));

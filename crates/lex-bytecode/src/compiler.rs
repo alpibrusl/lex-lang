@@ -240,6 +240,23 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
         p.functions[pl.fn_id as usize].locals_count = peak;
     }
 
+    // #464 step 2: escape-analysis-driven lowering. Rewrites
+    // `MakeRecord` at non-escaping sites to `AllocStackRecord`, which
+    // the VM allocates in the frame's stack-record arena instead of
+    // on the heap. Runs on raw bytecode (before the peephole passes)
+    // so the escape analysis — which itself walks raw bytecode — sees
+    // exactly the program it was designed for.
+    //
+    // The peephole passes that follow do not match on MakeRecord /
+    // AllocStackRecord, so swapping one for the other doesn't disturb
+    // any pattern. `compute_body_hash` lowers AllocStackRecord back
+    // to the legacy MakeRecord form (#222), so closure identity is
+    // invariant under this lowering.
+    let escape_index = crate::escape::build_escape_index(&p.functions);
+    for f in p.functions.iter_mut() {
+        apply_escape_lowering(&mut f.code, &f.name, &escape_index);
+    }
+
     // Peephole pass (#461 superinstructions). Rewrites fusable opcode
     // patterns into single dispatch steps. Runs before `body_hash`
     // computation, but `compute_body_hash` decomposes each fused op
@@ -310,6 +327,35 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
 /// tombstone instead of the live op the source intended. The
 /// pre-pass below collects every jump target in the function and
 /// skips fusion sites whose tombstones overlap one.
+/// #464 step 2 — rewrite `MakeRecord` to `AllocStackRecord` at sites
+/// the escape analysis (`crate::escape::build_escape_index`) proved
+/// non-escaping. Each rewrite is a single-slot swap that preserves
+/// pc, stack delta, and shape semantics — jump targets, the peephole
+/// passes downstream, and the body-hash decoder all see the same
+/// program shape they would have seen for the unlowered code.
+///
+/// Sites that escape are left as-is and still incur the
+/// IndexMap-backed heap allocation. Step 3 of #464 carries the
+/// bench acceptance bars (≥1.5× speedup on `response_build`); this
+/// pass is the precondition.
+fn apply_escape_lowering(
+    code: &mut [Op],
+    fn_name: &str,
+    escape_index: &std::collections::HashMap<(String, u32), bool>,
+) {
+    for (pc, op) in code.iter_mut().enumerate() {
+        if let Op::MakeRecord { shape_idx, field_count } = *op {
+            // Look up this (fn, pc) in the escape index. Absent →
+            // analysis didn't observe the site (defensive: leave on
+            // heap path). Present and false → safe to stack-allocate.
+            let key = (fn_name.to_string(), pc as u32);
+            if matches!(escape_index.get(&key), Some(false)) {
+                *op = Op::AllocStackRecord { shape_idx, field_count };
+            }
+        }
+    }
+}
+
 fn apply_peephole(code: &mut [Op], constants: &[Const]) {
     if code.len() < 3 { return; }
     let jump_targets = collect_jump_targets(code);

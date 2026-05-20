@@ -43,6 +43,28 @@ pub enum Op {
     /// (`code[pc]` becomes a register-sized read instead of an
     /// every-step `Vec` clone).
     MakeRecord { shape_idx: u32, field_count: u16 },
+    /// Stack-allocated record (#464). Same shape semantics as
+    /// `MakeRecord` — pops `field_count` field values and pairs them
+    /// with `Program.record_shapes[shape_idx]` — but the field values
+    /// are stored in the current frame's slab inside the VM's
+    /// `stack_record_arena`, not in a heap-allocated `IndexMap`. The
+    /// stack pushes a `Value::StackRecord` whose `slab_start` indexes
+    /// into the arena.
+    ///
+    /// Emitted by the compiler in place of `MakeRecord` at sites that
+    /// `escape::build_escape_index` proves do not escape the frame
+    /// (returned, captured, stored into another aggregate, or passed
+    /// to a call). Runtime fallback: when the frame's
+    /// `stack_record_budget_remaining` is exhausted, the op silently
+    /// degrades to the heap path (identical observable effect to
+    /// `MakeRecord`), so a single function can mix stack and heap
+    /// records without compile-time partitioning.
+    ///
+    /// `body_hash` stability (#222): canonical encoding decodes this
+    /// op back to the historical `{"MakeRecord":{"field_name_indices":
+    /// [...]}}` form, so closure identity is invariant under the
+    /// step-2 lowering.
+    AllocStackRecord { shape_idx: u32, field_count: u16 },
     MakeTuple(u16),
     MakeList(u32),
     MakeVariant { name_idx: u32, arity: u16 },

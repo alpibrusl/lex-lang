@@ -137,7 +137,16 @@ pub fn compute_body_hash(
     // hash bytes stay bit-identical to pre-#461 builds.
     for op in code {
         let bytes = match op {
-            Op::MakeRecord { shape_idx, .. } => {
+            // Both `MakeRecord` and its #464 step-2 sibling
+            // `AllocStackRecord` hash as the historical inline
+            // `{"MakeRecord":{"field_name_indices":[...]}}` form so
+            // closure identity (#222) is bit-identical to pre-#464
+            // builds — the stack-vs-heap lowering is a performance
+            // detail that mustn't perturb body hashes (otherwise the
+            // same closure literal would hash differently after the
+            // escape pass fires).
+            Op::MakeRecord { shape_idx, .. }
+            | Op::AllocStackRecord { shape_idx, .. } => {
                 let shape = &record_shapes[*shape_idx as usize];
                 #[derive(Serialize)]
                 struct LegacyMakeRecord<'a> {
