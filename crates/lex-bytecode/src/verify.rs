@@ -157,6 +157,10 @@ fn stack_delta(op: &Op) -> i32 {
 
         // Record / tuple / list construction
         Op::MakeRecord { field_count, .. } => -(*field_count as i32) + 1,
+        // #464 step 2: same stack-effect shape as MakeRecord (pops
+        // field_count, pushes 1). The verifier doesn't need to know
+        // about the stack-record arena — it walks bytecode shape only.
+        Op::AllocStackRecord { field_count, .. } => -(*field_count as i32) + 1,
         Op::MakeTuple(n)  => -(*n as i32) + 1,
         Op::MakeList(n)   => -(*n as i32) + 1,
         Op::MakeVariant { arity, .. } => -(*arity as i32) + 1,

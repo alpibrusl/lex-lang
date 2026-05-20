@@ -91,6 +91,16 @@ pub enum VmError {
 /// the OS stack limit at any per-frame size we use.
 pub const MAX_CALL_DEPTH: u32 = 1024;
 
+/// Per-frame stack-record budget (#464 step 2). Counts the number of
+/// `Value` slots a frame may consume from `Vm::stack_record_arena`
+/// before further `Op::AllocStackRecord` requests fall back to the
+/// heap path. 64 slots at the current `size_of::<Value>() = 64B`
+/// gives ~4 KiB per frame, matching the design-doc proposal in
+/// `docs/design/escape-analysis.md`. A handler-shaped function
+/// (one outer record of ≤8 fields, plus a handful of small inner
+/// records) fits well inside this without growing.
+pub const STACK_RECORD_BUDGET_SLOTS: u32 = 64;
+
 /// Host-side effect dispatch. Implementors decide what `kind`/`op` mean
 /// and how arguments map to side effects.
 pub trait EffectHandler {
@@ -272,6 +282,19 @@ pub struct Vm<'a> {
     /// again but its capacity is retained, so the next request incurs
     /// zero allocations for locals up to the high-water mark.
     locals_storage: Vec<Value>,
+    /// Stack-record arena (#464 step 2). Each `Op::AllocStackRecord`
+    /// at a non-escaping site appends its `field_count` field values
+    /// here; the produced `Value::StackRecord` carries `slab_start =
+    /// arena.len() - field_count` so reads are an O(1) slab index.
+    /// On `Op::Return` the arena is truncated back to
+    /// `frame.stack_record_arena_start`, releasing every record the
+    /// frame allocated in O(1) — same lifetime story as
+    /// `locals_storage` for frame locals.
+    ///
+    /// LIFO frame discipline guarantees a frame's records always sit
+    /// at the top of the arena while the frame is live, so neither
+    /// inter-frame interleaving nor index churn can occur.
+    stack_record_arena: Vec<Value>,
 }
 
 struct Frame {
@@ -292,6 +315,18 @@ struct Frame {
     /// `None` means "don't memoize" — either the function isn't pure,
     /// the call wasn't through Op::Call, or memoization is disabled.
     memo_key: Option<(u32, [u8; 16])>,
+    /// #464 step 2: start index of this frame's records in
+    /// `Vm::stack_record_arena`. On `Op::Return`, the arena is
+    /// truncated back here. Identical lifetime discipline to
+    /// `locals_start`.
+    stack_record_arena_start: usize,
+    /// Remaining stack-record budget for this frame, in Value-slot
+    /// units (#464 step 2). Initial value: `STACK_RECORD_BUDGET_SLOTS`.
+    /// When an `Op::AllocStackRecord` would consume more slots than
+    /// remain, the VM falls back to the heap path silently (same
+    /// observable effect as `Op::MakeRecord`), so the budget never
+    /// surfaces as a user-visible error.
+    stack_record_budget_remaining: u32,
 }
 
 /// Sum of `[budget(N)]` declarations on a function's signature
@@ -575,6 +610,11 @@ impl<'a> Vm<'a> {
             // 256 slots handles ~32 frames × 8 locals; grows on demand and
             // retains capacity across consecutive vm.call() invocations.
             locals_storage: Vec::with_capacity(256),
+            // #464 step 2: zero capacity at construction — handlers that
+            // never AllocStackRecord (most code today, until the lowering
+            // pass kicks in) pay nothing. First allocation triggers Vec
+            // growth; capacity is retained across `vm.call` invocations.
+            stack_record_arena: Vec::new(),
         }
     }
 
@@ -870,6 +910,8 @@ impl<'a> Vm<'a> {
             stack_base: self.stack.len(),
             trace_kind: FrameKind::Entry,
             memo_key: None,
+            stack_record_arena_start: self.stack_record_arena.len(),
+            stack_record_budget_remaining: STACK_RECORD_BUDGET_SLOTS,
         })?;
         self.run_to(base_depth)
     }
@@ -952,6 +994,66 @@ impl<'a> Vm<'a> {
                     }
                     self.stack.push(Value::Record { shape_id: shape_idx, fields: Box::new(rec) });
                 }
+                Op::AllocStackRecord { shape_idx, field_count } => {
+                    // #464 step 2. Same value-stack contract as
+                    // MakeRecord (pop `field_count`, push 1), but the
+                    // fields live in the VM's stack-record arena
+                    // instead of a heap-allocated IndexMap.
+                    //
+                    // Budget check: if this frame's remaining
+                    // allocation budget can't cover `field_count`
+                    // slots, fall back to MakeRecord behavior. The
+                    // observable result is identical (a record
+                    // value) so the compiler doesn't need to know
+                    // ahead of time whether the budget will hold.
+                    let n = field_count as usize;
+                    let frame = &mut self.frames[frame_idx];
+                    if frame.stack_record_budget_remaining < field_count as u32 {
+                        // Heap fallback path — exact copy of
+                        // MakeRecord's body. Compiler emitted
+                        // AllocStackRecord because escape analysis
+                        // proved the record can stay frame-local;
+                        // the budget exhaustion is a runtime cost
+                        // ceiling, not a correctness issue.
+                        let shape = &self.program.record_shapes[shape_idx as usize];
+                        debug_assert_eq!(shape.len(), n,
+                            "AllocStackRecord field_count must match record_shapes[shape_idx].len()");
+                        let mut values: Vec<Value> = (0..n).map(|_| Value::Unit).collect();
+                        for i in (0..n).rev() {
+                            values[i] = self.pop()?;
+                        }
+                        let mut rec = IndexMap::new();
+                        for (i, val) in values.into_iter().enumerate() {
+                            let name = match &self.program.constants[shape[i] as usize] {
+                                Const::FieldName(s) => s.clone(),
+                                _ => return Err(VmError::TypeMismatch("expected FieldName const".into())),
+                            };
+                            rec.insert(name, val);
+                        }
+                        self.stack.push(Value::Record { shape_id: shape_idx, fields: Box::new(rec) });
+                    } else {
+                        // Stack path: append the popped field values
+                        // to the arena in shape order (matches the
+                        // IndexMap insertion order used by MakeRecord,
+                        // so the polymorphic GetField IC sees the same
+                        // offset for either variant).
+                        frame.stack_record_budget_remaining -= field_count as u32;
+                        let slab_start = self.stack_record_arena.len();
+                        // Reserve all slots upfront so we can write in
+                        // shape order while popping in reverse —
+                        // matches MakeRecord's idiom.
+                        self.stack_record_arena.resize(slab_start + n, Value::Unit);
+                        for i in (0..n).rev() {
+                            let v = self.pop()?;
+                            self.stack_record_arena[slab_start + i] = v;
+                        }
+                        self.stack.push(Value::StackRecord {
+                            shape_id: shape_idx,
+                            slab_start: slab_start as u32,
+                            field_count,
+                        });
+                    }
+                }
                 Op::MakeTuple(n) => {
                     let mut items: Vec<Value> = (0..n).map(|_| Value::Unit).collect();
                     for i in (0..n as usize).rev() { items[i] = self.pop()?; }
@@ -1031,6 +1133,71 @@ impl<'a> Vm<'a> {
                                         format!("missing field `{name}`")))?;
                                 self.field_ics[fid][sid] = Some((shape_id, off));
                                 val.clone()
+                            };
+                            self.stack.push(value);
+                        }
+                        Value::StackRecord { shape_id, slab_start, field_count } => {
+                            // #464 step 2: dispatch over a stack-allocated
+                            // record. The IC slot stored
+                            // (shape_id, offset_in_shape) is interoperable
+                            // with the heap path because MakeRecord builds
+                            // the IndexMap in shape order — offset N means
+                            // the same field in either representation. So
+                            // we share `field_ics` with the heap path; no
+                            // per-variant cache pollution.
+                            if ic_stats_enabled() {
+                                record_ic_hit(fn_id, site_idx, shape_id);
+                            }
+                            let fid = fn_id as usize;
+                            let sid = site_idx as usize;
+                            if self.field_ics[fid].is_empty() {
+                                let n = self.program.functions[fid].field_ic_sites as usize;
+                                self.field_ics[fid] = vec![None; n];
+                            }
+                            let cached = self.field_ics[fid][sid];
+                            let value = 'ic: {
+                                if let Some((cached_shape, off)) = cached {
+                                    if cached_shape == shape_id && (off as u16) < field_count {
+                                        // Shape-keyed verification is sound
+                                        // here for the same reason as the
+                                        // heap path — compile-time shape
+                                        // IDs are issued by
+                                        // `Program::record_shapes` and
+                                        // their field order is fixed.
+                                        // Stack records always carry a
+                                        // compile-time shape_id (NO_SHAPE_ID
+                                        // is impossible — AllocStackRecord
+                                        // is only emitted at compile time
+                                        // with a known shape_idx).
+                                        let idx = slab_start as usize + off;
+                                        break 'ic self.stack_record_arena[idx].clone();
+                                    }
+                                }
+                                // Cache miss: walk the shape's field-name
+                                // vec to find the slot for `name_idx`. The
+                                // miss path is O(field_count) like the
+                                // heap path, but the hot retrieval after
+                                // install is one array index — cheaper
+                                // than IndexMap::get_index.
+                                let shape =
+                                    &self.program.record_shapes[shape_id as usize];
+                                let target_name = match &self.program.constants[name_idx as usize] {
+                                    Const::FieldName(s) => s.as_str(),
+                                    _ => return Err(VmError::TypeMismatch(
+                                        "expected FieldName const".into())),
+                                };
+                                let mut found: Option<usize> = None;
+                                for (i, fn_const_idx) in shape.iter().enumerate() {
+                                    if let Const::FieldName(s) =
+                                        &self.program.constants[*fn_const_idx as usize]
+                                    {
+                                        if s == target_name { found = Some(i); break; }
+                                    }
+                                }
+                                let off = found.ok_or_else(|| VmError::TypeMismatch(
+                                    format!("missing field `{target_name}` on stack record")))?;
+                                self.field_ics[fid][sid] = Some((shape_id, off));
+                                self.stack_record_arena[slab_start as usize + off].clone()
                             };
                             self.stack.push(value);
                         }
@@ -1191,6 +1358,8 @@ impl<'a> Vm<'a> {
                         // hashing strategy that includes the captures.
                         // Direct Op::Call is the v1 surface.
                         memo_key: None,
+                        stack_record_arena_start: self.stack_record_arena.len(),
+                        stack_record_budget_remaining: STACK_RECORD_BUDGET_SLOTS,
                     })?;
                 }
                 Op::SortByKey { node_id_idx: _ } => {
@@ -1346,6 +1515,8 @@ impl<'a> Vm<'a> {
                         stack_base: self.stack.len(),
                         trace_kind: FrameKind::Call(node_id),
                         memo_key,
+                        stack_record_arena_start: self.stack_record_arena.len(),
+                        stack_record_budget_remaining: STACK_RECORD_BUDGET_SLOTS,
                     })?;
                 }
                 Op::TailCall { fn_id, arity, node_id_idx } => {
@@ -1402,11 +1573,20 @@ impl<'a> Vm<'a> {
                     for (i, v) in args.into_iter().enumerate() {
                         self.locals_storage[old_locals_start + i] = v;
                     }
+                    // #464 step 2: a tail-called function gets a fresh
+                    // stack-record arena view. Release any records the
+                    // pre-tail-call code allocated (they can't be live
+                    // — the args have already been popped off the
+                    // value stack) and refill the budget for the
+                    // callee.
+                    let arena_start = self.frames.last().unwrap().stack_record_arena_start;
+                    self.stack_record_arena.truncate(arena_start);
                     let frame = self.frames.last_mut().unwrap();
                     frame.fn_id = fn_id;
                     frame.pc = 0;
                     frame.locals_len = new_locals_len;
                     frame.trace_kind = FrameKind::Call(node_id);
+                    frame.stack_record_budget_remaining = STACK_RECORD_BUDGET_SLOTS;
                 }
                 Op::EffectCall { kind_idx, op_idx, arity, node_id_idx } => {
                     let mut args: Vec<Value> = (0..arity).map(|_| Value::Unit).collect();
@@ -1457,6 +1637,14 @@ impl<'a> Vm<'a> {
                     // Release this frame's locals back to the arena (#389 slice 3).
                     // LIFO frame ordering guarantees this frame's slots are at the top.
                     self.locals_storage.truncate(frame.locals_start);
+                    // #464 step 2: release this frame's stack-record
+                    // slab. LIFO frame discipline guarantees its
+                    // records sit at the top of the arena. The
+                    // returned value `v` is escape-proven not to be
+                    // one of them — the compiler only emits
+                    // AllocStackRecord at sites that don't reach
+                    // `Return`.
+                    self.stack_record_arena.truncate(frame.stack_record_arena_start);
                     if matches!(frame.trace_kind, FrameKind::Call(_)) {
                         self.tracer.exit_ok(&v);
                     }

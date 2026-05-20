@@ -184,24 +184,100 @@ EscapeSite}`. Step 2's compiler integration will call
 `build_escape_index` once per program and consult it at each
 `MakeRecord` emit site.
 
+## Step 2 — `AllocStackRecord` + polymorphic `GetField`
+
+The step-2 slice (this PR's sibling commits) lowers proven-local
+`MakeRecord` sites to a new opcode `Op::AllocStackRecord` and a
+new `Value` variant `Value::StackRecord { shape_id, slab_start,
+field_count }`. The slab lives in a VM-wide
+`stack_record_arena: Vec<Value>` truncated on every `Op::Return`,
+mirroring the `locals_storage` lifetime discipline from #389.
+
+### What we did NOT add (vs the future-work table)
+
+Initial design notes mentioned `GetStackField` / `SetStackField`
+opcodes. We dropped both:
+
+- **`SetStackField`**: Lex records are immutable — there is no
+  existing `SetField` op for either heap or stack records, and the
+  AST has no field-assignment syntax. The opcode would have nothing
+  to lower from.
+
+- **`GetStackField`**: `Op::GetField` already dispatches over the
+  `Value::Record` variant via an inline-cache slot keyed by
+  `(fn_id, site_idx)` and verified by `(shape_id, offset)`. Stack
+  records carry the same `shape_id` (issued from
+  `Program::record_shapes`) and store their fields in shape order
+  (matching `MakeRecord`'s IndexMap insertion order), so the
+  existing IC slot is interoperable — one new match arm in the
+  `GetField` handler replaces what would have been a whole new op.
+  A dedicated `GetStackField` is still on the table as a peephole
+  optimization once we have a static "this GetField receiver was
+  just stack-allocated" pass, but it would compete on dispatch
+  overhead at the µs scale and is deferred.
+
+### Budget
+
+Per-frame budget pinned at `STACK_RECORD_BUDGET_SLOTS = 64` Value
+cells (= 4 KiB at the current `size_of::<Value>() == 64`). The
+budget is tracked on `Frame::stack_record_budget_remaining` and
+checked inside the VM at every `AllocStackRecord`; on overflow
+the op falls back to the heap path (an exact MakeRecord) with no
+user-visible difference. A `TailCall` refills the budget — the
+tail-called function gets its own arena view.
+
+### What step 2 ships
+
+- `Op::AllocStackRecord { shape_idx, field_count }` (op.rs)
+- `Value::StackRecord { shape_id, slab_start, field_count }` (value.rs)
+- VM arena (`stack_record_arena`) with per-frame start markers and
+  budget (vm.rs)
+- Compiler pass `apply_escape_lowering` (compiler.rs) — consults
+  `escape::build_escape_index` and rewrites non-escaping
+  `MakeRecord` sites in place
+- Body-hash invariance: `AllocStackRecord` decodes as the legacy
+  `MakeRecord` form (#222), so closure identity survives the
+  lowering bit-identically
+
 ## Future work
 
 | Issue | Scope                                                | When              |
 |-------|------------------------------------------------------|-------------------|
-| #464 step 2 | `AllocStackRecord`, `GetStackField`, `SetStackField`; compiler integration; per-frame stack-record budget | Next slice |
-| #464 step 3 | `benches/response_build.rs`; 1.5× + 60% acceptance | After step 2 |
+| #464 step 3 | `benches/response_build.rs`; 1.5× + 60% acceptance | Next slice |
 | (new) | Per-path branch refinement (recover the `if/else` merge case) | If profiling shows it matters |
 | (new) | Inter-procedural escape via summaries on small leaf functions | After inlining (#465 phase 1) |
+| (new) | `GetStackField` peephole — drop the variant-match on receiver when the producer is a same-fn `AllocStackRecord` | If dispatch shows up in the response_build profile |
 
-## Acceptance for this slice (step 1)
+## Acceptance
+
+### Step 1 (#524 — merged)
 
 - [x] `analyze_program` returns one `EscapeReport` per function
   with at least one `MakeRecord` site.
 - [x] All 15 lattice unit tests pass.
-- [x] No regression on `cargo test -p lex-bytecode --tests` (70
-  passing).
+- [x] No regression on `cargo test -p lex-bytecode --tests`.
 - [x] `cargo clippy -p lex-bytecode --all-targets -- -D warnings`
   clean.
 
-Steps 2 and 3 carry the full #464 acceptance bars (≥1.5× speedup
-on `response_build`, ≥60% of `Response` allocations on the stack).
+### Step 2 (this PR)
+
+- [x] `Op::AllocStackRecord` round-trips through verifier,
+  body-hash, and serde (the latter via the existing `Op` derive).
+- [x] Compiler lowers exactly the non-escaping `MakeRecord` sites
+  per the per-PC escape index.
+- [x] Per-frame budget falls back to heap with identical observable
+  output when exhausted.
+- [x] Polymorphic `GetField` dispatches over both `Value::Record`
+  and `Value::StackRecord` with shared IC slot.
+- [x] 9 new integration tests in
+  `crates/lex-bytecode/tests/stack_records.rs` pass.
+- [x] `cargo test -p lex-bytecode` (75 tests), `-p lex-trace`,
+  `-p lex-runtime --lib` (46), `-p core-compiler --test m9/m9_phase2`
+  (19), and runtime integration `std_http` / `analytics_app` /
+  `closed_pydantic_issues` / `conc_registry` / `arena_lifecycle`
+  all pass.
+- [x] `cargo clippy -p lex-bytecode --all-targets -- -D warnings`
+  clean.
+
+Step 3 carries the #464 perf acceptance bars (≥1.5× speedup on
+`response_build`, ≥60% of `Response` allocations on the stack).

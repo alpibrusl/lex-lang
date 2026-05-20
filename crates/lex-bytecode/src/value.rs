@@ -111,6 +111,28 @@ pub enum Value {
     /// compare equal regardless of provenance, so a JSON-decoded
     /// record equals a compile-time-built one with the same fields.
     Record { shape_id: u32, fields: Box<IndexMap<String, Value>> },
+    /// Frame-local record (#464 step 2). Emitted by
+    /// `Op::AllocStackRecord` at sites the escape analysis proved
+    /// can't outlive the current call frame. `slab_start` indexes
+    /// into `Vm::stack_record_arena`; the `field_count` consecutive
+    /// values starting there are the record's fields, in
+    /// `Program.record_shapes[shape_id]` order (same insertion order
+    /// as `Op::MakeRecord` uses, so the polymorphic-IC offset is
+    /// interoperable with `Value::Record`).
+    ///
+    /// `Op::GetField` is the only consumer that knows how to read
+    /// these — every other observation point (`Op::Return`,
+    /// `Op::Call`, `Op::MakeRecord` as a field value, …) is an
+    /// escape op that the analysis prevents this variant from
+    /// reaching. If a `StackRecord` ever does reach an unexpected
+    /// site (escape-analysis bug), it surfaces as a panic at the
+    /// boundary, not undefined behavior — the arena is plain
+    /// `Vec<Value>` in safe Rust.
+    ///
+    /// Size: 4 (shape_id) + 4 (slab_start) + 2 (field_count) = 10
+    /// bytes payload + tag, comfortably inside the 64B `Value`
+    /// envelope.
+    StackRecord { shape_id: u32, slab_start: u32, field_count: u16 },
     Variant { name: String, args: Vec<Value> },
     /// First-class function value (a lambda + its captured locals). The
     /// function's first `captures.len()` params bind to `captures`; the
@@ -191,6 +213,17 @@ impl PartialEq for Value {
             (List(a), List(b)) => a == b,
             (Tuple(a), Tuple(b)) => a == b,
             (Record { fields: a, .. }, Record { fields: b, .. }) => a == b,
+            // #464 step 2: a `Value::StackRecord` can only reach
+            // generic equality if it crossed an escape boundary the
+            // analysis was supposed to reject. Treat as a soundness
+            // bug: panic rather than silently lie about equality (a
+            // wrong answer would cascade into mis-routed match arms).
+            // Well-typed Lex source never compares records with
+            // `==` via `bin_eq` — record equality, if added, will
+            // get its own opcode with arena-aware comparison.
+            (StackRecord { .. }, _) | (_, StackRecord { .. }) =>
+                panic!("BUG(#464): Value::StackRecord reached generic equality \
+                        — escape analysis should have flagged its allocation site"),
             (Variant { name: an, args: aa }, Variant { name: bn, args: ba }) =>
                 an == bn && aa == ba,
             (Closure { body_hash: ah, captures: ac, .. },
@@ -305,6 +338,10 @@ impl Value {
                 for (k, v) in fields.iter() { m.insert(k.clone(), v.to_json()); }
                 J::Object(m)
             }
+            // #464: should never reach JSON serialization. See PartialEq.
+            Value::StackRecord { .. } =>
+                panic!("BUG(#464): Value::StackRecord reached to_json — \
+                        escape analysis should have prevented escape to a host boundary"),
             Value::Variant { name, args } => {
                 let mut m = serde_json::Map::new();
                 m.insert("$variant".into(), J::String(name.clone()));

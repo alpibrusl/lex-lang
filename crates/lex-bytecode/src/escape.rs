@@ -318,6 +318,13 @@ fn step(pc: usize, op: &Op, mut s: State) -> (State, Vec<usize>, HashSet<u32>) {
             pop_n_leak(&mut s, *field_count as usize, &mut escapes);
             s.stack.push(Slot::Rec(pc as u32));
         }
+        // #464 step 2: post-lowering form of MakeRecord (escape
+        // proved). Re-running the analysis on already-lowered code
+        // must produce the same shape, so treat it identically.
+        Op::AllocStackRecord { field_count, .. } => {
+            pop_n_leak(&mut s, *field_count as usize, &mut escapes);
+            s.stack.push(Slot::Rec(pc as u32));
+        }
         // Other aggregate constructors are escape sinks for any Rec
         // operand. They don't create new tracked records (the
         // analysis is record-shape-driven; lists/tuples/variants
