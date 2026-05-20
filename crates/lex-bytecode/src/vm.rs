@@ -106,6 +106,33 @@ pub trait EffectHandler {
         Ok(())
     }
 
+    /// Enter a per-request allocation scope (#463 scaffolding).
+    /// Called by the runtime layer (e.g. `net.serve_fn`'s request
+    /// loop) immediately before invoking the user handler closure
+    /// for one request. Implementations push a fresh arena onto
+    /// their internal stack and return its identifier; the matching
+    /// `exit_request_scope` call drops it.
+    ///
+    /// Default impl is a no-op — handlers without arena support
+    /// return a sentinel scope id which they ignore on exit.
+    /// `DefaultHandler` in `lex-runtime` provides the real
+    /// implementation.
+    ///
+    /// Today the VM does NOT route any `Value` allocations through
+    /// the returned arena — see the scaffolding notes in
+    /// `crates/lex-runtime/src/arena.rs`. The hook exists so the
+    /// follow-on slice that adds Value-rep arena routing has a
+    /// stable trait surface to extend.
+    fn enter_request_scope(&mut self) -> u64 { 0 }
+
+    /// Exit a per-request allocation scope opened by
+    /// `enter_request_scope`. Implementations drop the arena
+    /// associated with `scope_id`. Calling exit with a scope_id
+    /// that wasn't returned by a prior enter is implementation-
+    /// defined behavior — DefaultHandler treats it as a no-op so
+    /// mismatched pairs don't panic.
+    fn exit_request_scope(&mut self, _scope_id: u64) {}
+
     /// `list.par_map` worker-handler factory (#305 slice 2).
     ///
     /// Each parallel worker thread runs its own `Vm` and therefore
@@ -766,6 +793,28 @@ impl<'a> Vm<'a> {
         let mut combined = captures;
         combined.extend(args);
         self.invoke(fn_id, combined)
+    }
+
+    /// Open a request-scoped arena via the underlying
+    /// `EffectHandler::enter_request_scope` (#463 scaffolding).
+    /// Runtime layers — `net.serve_fn`, `net.serve_ws`,
+    /// `net.serve_quic` — call this immediately before invoking the
+    /// user handler closure for a single request. Pair with
+    /// `exit_request_scope` once the response has been built and
+    /// any lazy iterators in it have been drained (#477).
+    ///
+    /// Returns the scope id the runtime should pass back to
+    /// `exit_request_scope`. The handler's default impl returns 0
+    /// and the matching `exit` is a no-op; `DefaultHandler`'s
+    /// implementation actually allocates an arena.
+    pub fn enter_request_scope(&mut self) -> u64 {
+        self.handler.enter_request_scope()
+    }
+
+    /// Close the request scope opened by `enter_request_scope`.
+    /// Drops the associated arena.
+    pub fn exit_request_scope(&mut self, scope_id: u64) {
+        self.handler.exit_request_scope(scope_id)
     }
 
     pub fn invoke(&mut self, fn_id: u32, args: Vec<Value>) -> Result<Value, VmError> {

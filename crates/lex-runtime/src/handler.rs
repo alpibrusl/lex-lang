@@ -80,6 +80,24 @@ pub struct DefaultHandler {
     pub streams: Arc<std::sync::Mutex<StreamRegistry>>,
     /// Monotonic counter for handing out fresh stream handle ids.
     pub next_stream_id: Arc<std::sync::atomic::AtomicU64>,
+    /// Stack of per-request arenas (#463 scaffolding). One entry
+    /// per active request scope; `net.serve_fn`'s request loop
+    /// pushes on entry, pops on exit. Today nothing reads from the
+    /// arenas — they're scaffolding for the Value-rep follow-on
+    /// that routes `MakeRecord` / `MakeList` allocations into the
+    /// active arena. See `crates/lex-runtime/src/arena.rs`.
+    ///
+    /// Held by value (not Arc) so worker-clone handlers
+    /// (`spawn_for_worker`) get a fresh empty stack rather than
+    /// sharing the parent's arenas — worker-thread allocations
+    /// have a different lifetime than the request that spawned
+    /// them.
+    arena_stack: Vec<(u64, crate::arena::Arena)>,
+    /// Monotonic counter for the scope ids handed out by
+    /// `enter_request_scope`. `enter` returns a fresh id; `exit`
+    /// finds and removes the matching entry. Plain `u64`, not
+    /// shared — each handler instance has its own counter.
+    next_scope_id: u64,
 }
 
 impl DefaultHandler {
@@ -100,7 +118,24 @@ impl DefaultHandler {
             mcp_clients: crate::mcp_client::McpClientCache::with_capacity(16),
             streams: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             next_stream_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            arena_stack: Vec::new(),
+            next_scope_id: 1,
         }
+    }
+
+    /// Read-only access to the currently-active request arena, if
+    /// any. `None` outside a request scope. The follow-on slice
+    /// that routes `Value` allocations consults this from the VM
+    /// path; today it has no callers in tree but is exercised in
+    /// tests.
+    pub fn active_arena(&self) -> Option<&crate::arena::Arena> {
+        self.arena_stack.last().map(|(_, a)| a)
+    }
+
+    /// Test-only: depth of the arena stack. Lets tests confirm the
+    /// `net.serve_fn` request loop pushes/pops symmetrically.
+    pub fn arena_stack_depth(&self) -> usize {
+        self.arena_stack.len()
     }
 
     pub fn with_program(mut self, program: Arc<Program>) -> Self {
@@ -610,6 +645,31 @@ fn extract_host(url: &str) -> Option<&str> {
 }
 
 impl EffectHandler for DefaultHandler {
+    /// Push a fresh per-request arena onto the stack (#463
+    /// scaffolding). Returns the scope id; pair with
+    /// `exit_request_scope(id)` to drop it.
+    fn enter_request_scope(&mut self) -> u64 {
+        let id = self.next_scope_id;
+        self.next_scope_id = self.next_scope_id.wrapping_add(1);
+        self.arena_stack.push((id, crate::arena::Arena::new()));
+        id
+    }
+
+    /// Drop the arena associated with `scope_id`. Mismatched pairs
+    /// (exit called with a scope id we don't recognize, or out-of-
+    /// order exit) are tolerated as no-ops rather than panicking —
+    /// runtime layer should pair them strictly but a stray exit
+    /// shouldn't crash a live server.
+    fn exit_request_scope(&mut self, scope_id: u64) {
+        if let Some(pos) = self.arena_stack.iter().position(|(id, _)| *id == scope_id) {
+            // Drop this entry and any later entries that escaped
+            // pairing (out-of-order exit). Order matters: pop in
+            // reverse so the most recent arena drops first, then
+            // its predecessor, etc.
+            self.arena_stack.truncate(pos);
+        }
+    }
+
     /// Per-call budget enforcement (#225). VM calls this before
     /// invoking any function whose signature declares `[budget(N)]`.
     /// The cost N is deducted atomically from the shared pool;
@@ -2028,18 +2088,30 @@ fn serve_http_fn(
                             let handler = DefaultHandler::new(policy)
                                 .with_program(Arc::clone(&program));
                             let mut vm = Vm::with_handler(&program, Box::new(handler));
+                            // #463 scaffolding — bracket the user
+                            // handler with a request scope so the
+                            // arena lifecycle is exercised. The
+                            // arena itself is unused today; this
+                            // proves the lifecycle is sound for the
+                            // follow-on Value-rep slice.
+                            let scope = vm.enter_request_scope();
                             let r = vm.invoke_closure_value(closure, vec![lex_req]);
                             // Drain any lazy iter in the response body
                             // while the VM is still in scope — see #477.
-                            Ok(r.map(|mut v| { materialize_response_body(&mut vm, &mut v); v }))
+                            let r = r.map(|mut v| { materialize_response_body(&mut vm, &mut v); v });
+                            vm.exit_request_scope(scope);
+                            Ok(r)
                         } else {
                             tokio::task::spawn_blocking(move || {
                                 let lex_req = build_request_value_parts(&parts, &body_bytes);
                                 let handler = DefaultHandler::new(policy)
                                     .with_program(Arc::clone(&program));
                                 let mut vm = Vm::with_handler(&program, Box::new(handler));
+                                let scope = vm.enter_request_scope();
                                 let r = vm.invoke_closure_value(closure, vec![lex_req]);
-                                r.map(|mut v| { materialize_response_body(&mut vm, &mut v); v })
+                                let r = r.map(|mut v| { materialize_response_body(&mut vm, &mut v); v });
+                                vm.exit_request_scope(scope);
+                                r
                             })
                             .await
                         };
