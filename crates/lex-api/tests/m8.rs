@@ -36,9 +36,34 @@ fn start_server() -> (Server, TempDir) {
     let join = thread::spawn(move || {
         lex_api::serve_on(server, state);
     });
-    // Give the OS a moment to actually start listening.
-    thread::sleep(Duration::from_millis(20));
+    // The kernel listener is already bound when `Server::http` returns,
+    // so `connect()` succeeds immediately — but the serve thread may
+    // not yet be inside its `recv()` loop. Under fresh-compile +
+    // parallel test launch the spawned thread can stay CPU-starved
+    // past the 5s client read timeout, leaving the test panicking at
+    // `s.read_to_string(&mut buf).unwrap()`. Sleeping a fixed 20ms
+    // didn't survive heavy CI load; poll `/v1/health` until it
+    // actually responds.
+    wait_until_serving(&addr);
     (Server { addr, _join: Some(join), _server_holder: Arc::new(()) }, tmp)
+}
+
+fn wait_until_serving(addr: &SocketAddr) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let probe = b"GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    while std::time::Instant::now() < deadline {
+        if let Ok(mut s) = TcpStream::connect_timeout(addr, Duration::from_millis(200)) {
+            s.set_read_timeout(Some(Duration::from_millis(200))).ok();
+            if s.write_all(probe).is_ok() {
+                let mut buf = [0u8; 16];
+                if s.read(&mut buf).is_ok() && buf.starts_with(b"HTTP/1.1 200") {
+                    return;
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("test server never became ready within 10s");
 }
 
 fn http(addr: &SocketAddr, method: &str, path: &str, body: &str) -> (u16, String) {

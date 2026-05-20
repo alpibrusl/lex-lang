@@ -54,7 +54,7 @@ version = "0.1.0"
 "#;
     let v = run(src, "parse", vec![Value::Str(toml_src.into())]);
     let r = match unwrap_ok(v) {
-        Value::Record(r) => r,
+        Value::Record { fields: r, .. } => r,
         other => panic!("expected Record, got {other:?}"),
     };
     assert_eq!(r.get("name"), Some(&Value::Str("lex".into())));
@@ -81,11 +81,11 @@ edition = "2024"
 "#;
     let v = run(src, "parse", vec![Value::Str(toml_src.into())]);
     let outer = match unwrap_ok(v) {
-        Value::Record(r) => r,
+        Value::Record { fields: r, .. } => r,
         other => panic!("expected outer Record, got {other:?}"),
     };
     let pkg = match outer.get("package") {
-        Some(Value::Record(r)) => r,
+        Some(Value::Record { fields: r, .. }) => r,
         other => panic!("expected nested Record, got {other:?}"),
     };
     assert_eq!(pkg.get("name"), Some(&Value::Str("demo".into())));
@@ -148,7 +148,7 @@ tags = ["alpha", "beta", "gamma"]
 "#;
     let v = run(src, "parse", vec![Value::Str(toml_src.into())]);
     let r = match unwrap_ok(v) {
-        Value::Record(r) => r,
+        Value::Record { fields: r, .. } => r,
         other => panic!("expected Record, got {other:?}"),
     };
     assert_eq!(r.get("count"), Some(&Value::Int(42)));
@@ -180,7 +180,7 @@ fn parse(s :: Str) -> Result[{ created :: Str }, Str] {
 "#;
     let v = run(src, "parse", vec![Value::Str(toml_src.into())]);
     let r = match unwrap_ok(v) {
-        Value::Record(r) => r,
+        Value::Record { fields: r, .. } => r,
         other => panic!("expected Record, got {other:?}"),
     };
     let created = match r.get("created") {

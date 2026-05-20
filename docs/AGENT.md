@@ -100,10 +100,12 @@ Import modules with `import "std.X" as X`:
 
 ### `std.str`
 `length`, `to_upper`, `to_lower`, `trim`, `split`, `contains`, `starts_with`,
-`ends_with`, `replace`, `concat`, `slice`, `index_of`
+`ends_with`, `replace`, `concat`, `slice`, `index_of`, `cmp`
 
 String comparison operators (`<`, `<=`, `>`, `>=`, `==`, `!=`) work on `Str`
-via lexicographic order.
+via lexicographic order. `str.cmp(a, b)` returns `-1` / `0` / `1` in the
+same order — use it when you need a three-way function value (e.g. as a
+sort-by closure); use the operators for boolean comparisons.
 
 `Str + Str` concatenates strings.
 
@@ -135,8 +137,49 @@ Set `LEX_TEST_NOW=<unix_seconds>` to pin the clock in tests (#350).
 
 `duration.seconds(d)` extracts total whole seconds from a `Duration`.
 
+### `std.time`
+`now` [time], `now_ms` [time], `now_str` [time], `mono_ns` [time],
+`sleep_ms` [time], `sleep` [time]
+
+`time.sleep(d :: Duration)` blocks the calling thread for `d`. Pair with
+`datetime.duration_seconds` / `duration_minutes` / `duration_days` to
+express the period in units. Inside a `net.serve` worker the sleep
+stalls the worker — same caveat as `LEX_NET_INLINE_VM=1`. Capped at 60s
+to bound runaway loops; use process-level scheduling for longer waits.
+
+### `std.conc`
+`spawn` [concurrent], `ask` [concurrent], `tell` [concurrent],
+`register` [concurrent], `lookup` [concurrent], `unregister` [concurrent],
+`registered` [concurrent]
+
+Actors hold per-process state across messages. `spawn(init, handler)`
+returns `Actor[S]`; `ask` / `tell` run `handler(state, msg)` on the
+caller's VM thread, serialised by the actor's internal mutex.
+
+`register(actor, name)` makes the actor reachable by name from anywhere
+in the process — for routing a request handler to the actor that owns
+the relevant agent state (vehicle / depot / etc.). Returns `Err(AlreadyRegistered(name))`
+if the name is taken. `lookup(name) :: Option[Actor[S]]` retrieves it;
+the `[S]` is parametrised at the call site and trusted to match the
+registration site (no runtime type check in v1). `unregister(name)`
+drops the name binding but existing `Actor[S]` handles held by callers
+keep working. `registered()` returns a sorted snapshot of names.
+
 ### `std.http`
-`get`, `post`, `put`, `delete`, `patch` — all require `[http.*]` effect.
+`get`, `post`, `put`, `delete`, `patch` — all require `[net]` effect.
+
+`stream_lines(url :: Str, headers :: Map[Str, Str], body :: Str) -> [net] Result[Iter[Str], Str]`
+— HTTP POST that reads the full response body and yields it split into lines as `Iter[Str]`.
+Designed for LLM provider APIs (OpenAI, Anthropic, Google) that use SSE or NDJSON and
+**close the connection** after sending all events. Requires `[net]` effect.
+
+**WARNING — eager buffer, not true streaming.** The current implementation (ureq 3.3) reads
+the entire response body into memory before splitting into lines. This means:
+- It blocks until the server closes the connection. Endpoints that hold connections open
+  indefinitely (traditional push-SSE feeds, infinite event streams) will hang forever.
+- The full response must fit in memory.
+
+Use only with endpoints that terminate the connection after sending all data.
 
 ### `std.net`
 `net.serve(port, handler_name)` — HTTP server, handler looked up by name string.
@@ -147,6 +190,31 @@ fn my_handler(req :: Request) -> [io] Response {
 }
 fn main() -> [net, io] Nil { net.serve_fn(8080, my_handler) }
 ```
+
+`net.serve_with(port, handler_name, opts)` / `net.serve_fn_with(port, handler, opts)` / `net.serve_routed_with(port, routes, fallback, opts)` — same as the unsuffixed variants but accept a `ServeOpts` record literal (`{ http2: Bool, inline_vm: Bool, host: Str }`) instead of relying on `LEX_NET_HTTP2` / `LEX_NET_INLINE_VM` env vars. `net.default_opts()` returns the defaults (`http2: false, inline_vm: false, host: "0.0.0.0"`); construct your own literal to enable HTTP/2 or bind to a specific host. The legacy `serve` / `serve_fn` / `serve_routed` paths keep honouring the env vars for backwards compatibility — new code should prefer the `*_with` variants (#497).
+
+`net.serve_quic(port, tls, handler_name)` / `net.serve_quic_fn(port, tls, handler)` / `net.serve_quic_routed(port, tls, routes, fallback)` — HTTP/3 over QUIC (#496). TLS is mandatory; `tls` is a `TlsConfig` opaque value built via `std.tls` (see below). Requires the `quic` feature on lex-runtime: `cargo build --features quic` (off by default to keep the dep graph slim). HTTP/3 negotiates via the `h3` ALPN over UDP; existing HTTP/1.1+2 (TCP) listeners aren't affected. Effect row stays `[net]` — same gate as `serve` / `serve_fn`. 0-RTT is disabled by default (replay-attack risk on non-idempotent handlers); cert rotation requires a restart in v1.
+
+```lex
+import "std.net" as net
+import "std.tls" as tls
+
+fn handle(req :: Request) -> Response { ... }
+
+fn main() -> [net] Nil {
+  match tls.self_signed("localhost") {
+    Ok(t) => net.serve_quic(4433, t, "handle"),
+    Err(_) => (),
+  }
+}
+```
+
+### `std.tls`
+`tls.from_pem_files(cert_path, key_path) -> [fs_read] Result[TlsConfig, Str]` — load a PEM-encoded certificate chain + private key from disk. Both paths must be under `--allow-fs-read`.
+`tls.self_signed(hostname) -> Result[TlsConfig, Str]` — generate a self-signed certificate for the given hostname. Pure (no effects). Intended for local development and tests; production should use a CA-signed cert via `from_pem_files`.
+
+`TlsConfig` is opaque — the only ways to obtain one are these two constructors. Pass it to `net.serve_quic*` to set up an HTTP/3 listener.
+
 `net.serve_ws_fn(port, subprotocol, handler)` — WebSocket server:
 ```lex
 fn on_msg(conn :: WsConn, msg :: WsMessage) -> WsAction {

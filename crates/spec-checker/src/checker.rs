@@ -190,7 +190,7 @@ fn sample(ty: &SpecType, rng: &mut DetRng) -> Value {
             for (name, fty) in fields {
                 out.insert(name.clone(), sample(fty, rng));
             }
-            Value::Record(out)
+            Value::record_dynamic(out)
         }
         // List sampling generates a length in [0, 8] and recurses on
         // each element. The cap matches the small-bounded discipline
@@ -268,7 +268,7 @@ fn eval(
             // also hold for randomly-sampled records of the same shape.
             let v = eval(value, bindings, bc, policy)?;
             match v {
-                Value::Record(fields) => fields.get(field).cloned().ok_or_else(|| {
+                Value::Record { fields, .. } => fields.get(field).cloned().ok_or_else(|| {
                     let known: Vec<&str> = fields.keys().map(String::as_str).collect();
                     format!("field `{field}` missing on record (have: {})", known.join(", "))
                 }),

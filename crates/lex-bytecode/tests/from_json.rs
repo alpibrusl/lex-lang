@@ -64,7 +64,7 @@ fn plain_object_without_variant_keys_stays_record() {
         let mut m = indexmap::IndexMap::new();
         m.insert("x".into(), Value::Int(1));
         m.insert("y".into(), Value::Int(2));
-        Value::Record(m)
+        Value::record_dynamic(m)
     };
     assert_eq!(v, expected);
 }
@@ -77,7 +77,7 @@ fn object_with_only_variant_key_stays_record() {
     let expected = {
         let mut m = indexmap::IndexMap::new();
         m.insert("$variant".into(), Value::Str("Red".into()));
-        Value::Record(m)
+        Value::record_dynamic(m)
     };
     assert_eq!(v, expected);
 }
@@ -103,7 +103,7 @@ fn record_round_trip() {
     let mut m = indexmap::IndexMap::new();
     m.insert("name".into(), Value::Str("alice".into()));
     m.insert("age".into(), Value::Int(30));
-    roundtrip(Value::Record(m));
+    roundtrip(Value::record_dynamic(m));
 }
 
 #[test]
@@ -116,7 +116,7 @@ fn nested_variant_in_record_round_trip() {
             args: vec![Value::Int(7)],
         },
     );
-    roundtrip(Value::Record(m));
+    roundtrip(Value::record_dynamic(m));
 }
 
 #[test]
@@ -187,7 +187,7 @@ fn dollar_bytes_with_invalid_hex_falls_through_to_record() {
     let expected = {
         let mut m = indexmap::IndexMap::new();
         m.insert("$bytes".into(), Value::Str("abc".into()));
-        Value::Record(m)
+        Value::record_dynamic(m)
     };
     assert_eq!(v, expected);
 }
@@ -201,7 +201,7 @@ fn dollar_bytes_with_extra_keys_stays_record() {
         let mut m = indexmap::IndexMap::new();
         m.insert("$bytes".into(), Value::Str("dead".into()));
         m.insert("note".into(), Value::Str("x".into()));
-        Value::Record(m)
+        Value::record_dynamic(m)
     };
     assert_eq!(v, expected);
 }

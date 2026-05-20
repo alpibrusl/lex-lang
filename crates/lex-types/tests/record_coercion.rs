@@ -144,3 +144,140 @@ fn main() -> Pt { id({ x: 1, y: "no" }) }
 "#;
     check(src).expect_err("should reject wrong-typed field");
 }
+
+// ===== #439 — parametric record aliases =====
+//
+// `type Foo[T] = { ... }` parametric aliases were previously rejected
+// from accepting an anonymous record literal at the use site: the
+// unfold rule walked the `Ty::Con(_, args)` head only when `args` was
+// empty, so `Box[Str]` never reached the structural record-coercion
+// case. The fix substitutes the actuals (`args`) for the formal
+// `Ty::Var(i)` slots in the alias body before unfolding.
+
+#[test]
+fn parametric_record_alias_coerces_at_function_return() {
+    // The minimal reproducer from #439.
+    let src = r#"
+type Box[T] = { value :: T }
+
+fn wrap_str(s :: Str) -> Box[Str] {
+  { value: s }
+}
+"#;
+    check(src).expect("should accept Box[Str] from record literal");
+}
+
+#[test]
+fn parametric_record_alias_coerces_at_argument_position() {
+    let src = r#"
+type Box[T] = { value :: T }
+
+fn unbox_int(b :: Box[Int]) -> Int { b.value }
+
+fn main() -> Int {
+  unbox_int({ value: 42 })
+}
+"#;
+    check(src).expect("should accept Box[Int] at argument position");
+}
+
+#[test]
+fn parametric_record_alias_field_access_substitutes_args() {
+    // `b.value` on `b :: Box[Str]` should resolve to `Str`, not the
+    // formal `T`. Pre-fix, this either failed to type-check or bound
+    // the inferred return to the formal param's index.
+    let src = r#"
+type Box[T] = { value :: T }
+
+fn unbox(b :: Box[Str]) -> Str { b.value }
+"#;
+    check(src).expect("Box[Str].value should type as Str");
+}
+
+#[test]
+fn parametric_record_alias_with_multiple_fields() {
+    // The pagination shape from the issue body.
+    let src = r#"
+type Page[T] = {
+  items  :: List[T],
+  offset :: Int,
+  limit  :: Int,
+  total  :: Int,
+}
+
+fn empty_page() -> Page[Int] {
+  { items: [], offset: 0, limit: 0, total: 0 }
+}
+"#;
+    check(src).expect("multi-field parametric record alias should coerce");
+}
+
+#[test]
+fn parametric_record_alias_nested_generic_field() {
+    // `Page[T]` with `items :: List[T]` — exercises substitution
+    // walking into a nested `List[Ty::Var(0)]`.
+    let src = r#"
+type Page[T] = { items :: List[T], total :: Int }
+
+fn one_int_page() -> Page[Int] {
+  { items: [1, 2, 3], total: 3 }
+}
+"#;
+    check(src).expect("nested List[T] should substitute to List[Int]");
+}
+
+#[test]
+fn parametric_record_alias_wrong_inner_type_still_rejects() {
+    // Substituting `T → Int` means `value :: Int`; a Str literal
+    // must still be rejected.
+    let src = r#"
+type Box[T] = { value :: T }
+
+fn bad() -> Box[Int] { { value: "not an int" } }
+"#;
+    check(src).expect_err("should reject Str where Box[Int] expected Int");
+}
+
+#[test]
+fn distinct_parametric_aliases_with_same_shape_still_reject() {
+    // Nominal distinction extends to parametric aliases: `Box[Int]`
+    // and `Crate[Int]` have the same unfolded shape but are not
+    // interchangeable.
+    let src = r#"
+type Box[T]   = { value :: T }
+type Crate[T] = { value :: T }
+
+fn ship(c :: Crate[Int]) -> Int { c.value }
+fn make_box() -> Box[Int] { { value: 7 } }
+
+fn main() -> Int { ship(make_box()) }
+"#;
+    let errs = check(src).expect_err("should reject Box where Crate expected");
+    let msg = format!("{errs:?}");
+    assert!(msg.contains("Box") || msg.contains("Crate"), "msg: {msg}");
+}
+
+#[test]
+fn parametric_record_alias_in_let_binding() {
+    let src = r#"
+type Box[T] = { value :: T }
+
+fn main() -> Int {
+  let b :: Box[Int] := { value: 9 }
+  b.value
+}
+"#;
+    check(src).expect("let-binding annotation should coerce parametric alias");
+}
+
+#[test]
+fn parametric_record_alias_as_list_element() {
+    let src = r#"
+type Box[T] = { value :: T }
+
+fn boxes() -> List[Box[Int]] {
+  [{ value: 1 }, { value: 2 }]
+}
+"#;
+    check(src).expect("list element should coerce to Box[Int]");
+}

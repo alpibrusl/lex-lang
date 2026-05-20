@@ -58,9 +58,9 @@ fn value_to_json(v: &Value) -> serde_json::Value {
         Value::Unit => J::Null,
         Value::List(items) => J::Array(items.iter().map(value_to_json).collect()),
         Value::Tuple(items) => J::Array(items.iter().map(value_to_json).collect()),
-        Value::Record(fields) => {
+        Value::Record { fields, .. } => {
             let mut m = serde_json::Map::new();
-            for (k, v) in fields { m.insert(k.clone(), value_to_json(v)); }
+            for (k, v) in fields.iter() { m.insert(k.clone(), value_to_json(v)); }
             J::Object(m)
         }
         Value::Variant { name, args } => {
@@ -83,7 +83,7 @@ fn value_to_json(v: &Value) -> serde_json::Value {
             J::Object(m)
         }
         Value::Map(_) | Value::Set(_) | Value::Deque(_) | Value::Actor(_)
-        | Value::ArrowTable(_) => {
+        | Value::Ticker(_) | Value::ArrowTable(_) => {
             // Tests in this file don't exercise these container values;
             // render as a placeholder so the match is exhaustive.
             J::String("<container>".into())

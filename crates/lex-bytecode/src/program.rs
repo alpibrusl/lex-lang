@@ -16,6 +16,13 @@ pub struct Program {
     /// Entry function (for `lex run`, set to whatever function the user
     /// chose to invoke). Optional.
     pub entry: Option<u32>,
+    /// Interned record field-name shapes (#461). Each entry is a list
+    /// of constant-pool indices (must point at `Const::FieldName`).
+    /// `Op::MakeRecord { shape_idx, .. }` indexes into this side-table.
+    /// Hoisting the field-name list out of the op stream is what
+    /// lets `Op` be `Copy`.
+    #[serde(default)]
+    pub record_shapes: Vec<Vec<u32>>,
 }
 
 impl Program {
@@ -70,6 +77,13 @@ pub struct Function {
     /// as a runtime gate's `gate.verdict`.
     #[serde(default)]
     pub refinements: Vec<Option<Refinement>>,
+    /// Number of `Op::GetField` sites in this function (#462 slice 1).
+    /// Populated by the compiler so the VM can lazily one-shot
+    /// allocate the inline-cache `Vec<Option<usize>>` to its final
+    /// size on first GetField — no per-op resize bookkeeping.
+    /// `#[serde(default)]` because pre-#462 programs don't carry it.
+    #[serde(default)]
+    pub field_ic_sites: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -103,21 +117,100 @@ fn zero_body_hash() -> BodyHash { ZERO_BODY_HASH }
 /// before hashing — within a single compile the pool is shared, so two
 /// equivalent literals produce identical `Op` sequences. Cross-compile
 /// canonicality is deliberately out of scope (#222).
-pub fn compute_body_hash(arity: u16, locals_count: u16, code: &[Op]) -> BodyHash {
+pub fn compute_body_hash(
+    arity: u16,
+    locals_count: u16,
+    code: &[Op],
+    record_shapes: &[Vec<u32>],
+) -> BodyHash {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(arity.to_le_bytes());
     hasher.update(locals_count.to_le_bytes());
     hasher.update((code.len() as u64).to_le_bytes());
-    // Serialize each Op deterministically. `serde_json` doesn't guarantee
-    // field ordering, so we route through bincode-like manual byte layout
-    // instead: we serialize via `serde_json::to_vec` only because Op's
-    // `Serialize` impl is auto-derived and stable across Rust versions
-    // for this enum shape. If determinism ever drifts we'll switch to a
-    // hand-rolled encoder.
+    // Serialize each Op deterministically. The serde-derived JSON form
+    // is the canonical wire shape — closures with the same body must
+    // hash identically across builds. `Op::MakeRecord` is special-cased:
+    // its on-disk representation (a `shape_idx` into the side-table
+    // plus a cached `field_count`) is rehydrated to the historical
+    // inline form `{"MakeRecord":{"field_name_indices":[...]}}` so the
+    // hash bytes stay bit-identical to pre-#461 builds.
     for op in code {
-        let bytes = serde_json::to_vec(op)
-            .expect("Op serialization must succeed");
+        let bytes = match op {
+            Op::MakeRecord { shape_idx, .. } => {
+                let shape = &record_shapes[*shape_idx as usize];
+                #[derive(Serialize)]
+                struct LegacyMakeRecord<'a> {
+                    field_name_indices: &'a [u32],
+                }
+                #[derive(Serialize)]
+                enum LegacyOp<'a> {
+                    MakeRecord(LegacyMakeRecord<'a>),
+                }
+                serde_json::to_vec(&LegacyOp::MakeRecord(LegacyMakeRecord {
+                    field_name_indices: shape,
+                }))
+                .expect("Op serialization must succeed")
+            }
+            // Peephole-fused op (#461 superinstructions). The fused
+            // op occupies the slot where `LoadLocal(local_idx)` was;
+            // the next two slots in `code` still hold the unchanged
+            // `PushConst(imm_const_idx)` and `IntAdd`. Hashing as the
+            // original `LoadLocal` makes the total body-hash bytes
+            // match the pre-fusion form — closure identity (#222)
+            // stays invariant across peephole rewrites.
+            Op::LoadLocalAddIntConst { local_idx, .. }
+            | Op::LoadLocalAddIntConstStoreLocal { src: local_idx, .. }
+            | Op::LoadLocalAddLocal { lhs_idx: local_idx, .. }
+            | Op::LoadLocalSubLocal { lhs_idx: local_idx, .. }
+            | Op::LoadLocalMulLocal { lhs_idx: local_idx, .. } => {
+                // Slice 1: this slot was `LoadLocal(local_idx)`.
+                // Slice 2: this slot was *also* `LoadLocal(src)`
+                // — the fused op now owns 4 slots, but the very
+                // first one was originally `LoadLocal`. Slice 3:
+                // ditto for `LoadLocal(lhs_idx)`. Slice 4: same
+                // shape as slice 3, just with IntSub / IntMul as
+                // terminator. The trailing primitive ops (PushConst
+                // / IntAdd / IntSub / IntMul / StoreLocal / LoadLocal)
+                // remain in the code stream as tombstones and hash
+                // normally, so the total byte stream matches pre-fusion.
+                serde_json::to_vec(&Op::LoadLocal(*local_idx))
+                    .expect("Op serialization must succeed")
+            }
+            // #461 typed-lowering compensation. The compiler now emits
+            // typed numeric primitives (`IntAdd` / `FloatAdd` / ...)
+            // wherever it can prove operand types, but the closure
+            // identity contract (#222) requires `body_hash` to remain
+            // bit-identical to the pre-lowering polymorphic form
+            // (`NumAdd` / ...). Lower the typed op to its polymorphic
+            // counterpart at hash time. Behavioral equivalence is
+            // guaranteed by the type checker — operand-type proofs the
+            // compiler used to specialize are exactly what makes the
+            // polymorphic op behave identically.
+            // #462 slice 1 — `GetField` carries a `site_idx` now,
+            // but the canonical body-hash form is the historical
+            // single-field tuple `GetField(name_idx)`. Lowering keeps
+            // closure identity (#222) bit-identical to pre-#462 builds.
+            // `site_idx` is a compile-time perf-side-channel; behavior
+            // doesn't depend on it (identical input → identical
+            // observable result).
+            Op::GetField { name_idx, .. } => {
+                #[derive(Serialize)]
+                enum LegacyOp { GetField(u32) }
+                serde_json::to_vec(&LegacyOp::GetField(*name_idx))
+                    .expect("Op serialization must succeed")
+            }
+            Op::IntAdd   | Op::FloatAdd => serde_json::to_vec(&Op::NumAdd).unwrap(),
+            Op::IntSub   | Op::FloatSub => serde_json::to_vec(&Op::NumSub).unwrap(),
+            Op::IntMul   | Op::FloatMul => serde_json::to_vec(&Op::NumMul).unwrap(),
+            Op::IntDiv   | Op::FloatDiv => serde_json::to_vec(&Op::NumDiv).unwrap(),
+            Op::IntMod                  => serde_json::to_vec(&Op::NumMod).unwrap(),
+            Op::IntNeg   | Op::FloatNeg => serde_json::to_vec(&Op::NumNeg).unwrap(),
+            Op::IntEq    | Op::FloatEq  => serde_json::to_vec(&Op::NumEq).unwrap(),
+            Op::IntLt    | Op::FloatLt  => serde_json::to_vec(&Op::NumLt).unwrap(),
+            Op::IntLe    | Op::FloatLe  => serde_json::to_vec(&Op::NumLe).unwrap(),
+            _ => serde_json::to_vec(op).expect("Op serialization must succeed"),
+        };
         hasher.update((bytes.len() as u64).to_le_bytes());
         hasher.update(&bytes);
     }

@@ -185,7 +185,7 @@ fn json_to_value(v: &serde_json::Value) -> Value {
             }
             let mut out = IndexMap::new();
             for (k, v) in map { out.insert(k.clone(), json_to_value(v)); }
-            Value::Record(out)
+            Value::record_dynamic(out)
         }
     }
 }

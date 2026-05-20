@@ -99,6 +99,16 @@ pub fn verify_function(func: &Function, errors: &mut Vec<StackError>) {
             }
             // Terminators: no successors.
             Op::Return | Op::TailCall { .. } | Op::Panic(_) => {}
+            // Slice-2 superinstruction (#461) owns 4 slots: the fused
+            // op + 3 tombstones (original PushConst + IntAdd +
+            // StoreLocal). The trailing tombstones' deltas don't
+            // cancel (+1, -1, -1 = -1), so we can't let the verifier
+            // walk them as live — it'd drift the depth at pc+4 vs the
+            // pre-fusion form. Skip directly to pc+4 with the
+            // unfused-equivalent depth.
+            Op::LoadLocalAddIntConstStoreLocal { .. } => {
+                worklist.push((pc + 4, next_depth));
+            }
             // All other ops: single sequential successor.
             _ => {
                 worklist.push((pc + 1, next_depth));
@@ -123,13 +133,13 @@ fn stack_delta(op: &Op) -> i32 {
         Op::StoreLocal(_) => -1,
 
         // Record / tuple / list construction
-        Op::MakeRecord { field_name_indices } => -(field_name_indices.len() as i32) + 1,
+        Op::MakeRecord { field_count, .. } => -(*field_count as i32) + 1,
         Op::MakeTuple(n)  => -(*n as i32) + 1,
         Op::MakeList(n)   => -(*n as i32) + 1,
         Op::MakeVariant { arity, .. } => -(*arity as i32) + 1,
 
         // Field/element access: pop 1, push 1
-        Op::GetField(_)    => 0,
+        Op::GetField { .. } => 0,
         Op::GetElem(_)     => 0,
         Op::GetListElem(_) => 0,
         Op::GetListLen     => 0,
@@ -192,6 +202,27 @@ fn stack_delta(op: &Op) -> i32 {
         Op::StrEq     => -1,
         Op::BytesLen  =>  0,
         Op::BytesEq   => -1,
+
+        // Superinstructions (#461). The fused op contributes its
+        // net delta (+1, same shape as a bare LoadLocal). The two
+        // inert primitive ops the peephole leaves at pc+1 / pc+2
+        // are walked as if live: their deltas (+1 PushConst, -1
+        // IntAdd) cancel, so the depth at pc+3 matches what the
+        // unfused sequence would have produced.
+        Op::LoadLocalAddIntConst { .. } => 1,
+        // Slice-2 fused op: src → dest with no net stack effect.
+        // Tombstones at the next 3 slots are *not* walked (see the
+        // control-flow successor logic in `verify_function`).
+        Op::LoadLocalAddIntConstStoreLocal { .. } => 0,
+        // Slice-3 fused op: LoadLocal(lhs) + LoadLocal(rhs) + IntAdd.
+        // Net delta +1 (pushes the sum). The trailing tombstones
+        // (LoadLocal + IntAdd) have deltas +1 and -1 — they cancel
+        // when walked as live, mirroring slice 1's shape.
+        Op::LoadLocalAddLocal { .. } => 1,
+        // Slice-4 fused ops: identical shape to slice 3, just with
+        // IntSub / IntMul as terminator. Net delta +1; trailing
+        // LoadLocal + IntSub|IntMul tombstones cancel when walked.
+        Op::LoadLocalSubLocal { .. } | Op::LoadLocalMulLocal { .. } => 1,
     }
 }
 
@@ -210,6 +241,7 @@ mod tests {
             effects: vec![],
             body_hash: crate::program::ZERO_BODY_HASH,
             refinements: vec![],
+            field_ic_sites: 0,
         }
     }
 
