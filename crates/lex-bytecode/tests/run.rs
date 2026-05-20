@@ -143,6 +143,68 @@ fn slice3_fuses_two_local_add_and_runs_correctly() {
 }
 
 #[test]
+fn slice4_fuses_two_local_sub_and_runs_correctly() {
+    // #461 slice 4: same shape as slice 3 but for `IntSub`. Must
+    // rewrite to `Op::LoadLocalSubLocal`, leave tombstones in place,
+    // and compute lhs - rhs.
+    use lex_bytecode::op::Op;
+    let src = "fn sub_them(a :: Int, b :: Int) -> Int { a - b }\n";
+    let p = compile(src);
+    let f = &p.functions[0];
+    assert!(
+        matches!(f.code[0], Op::LoadLocalSubLocal { lhs_idx: 0, rhs_idx: 1 }),
+        "slice 4 (sub) did not fire; got {:?}", f.code[0],
+    );
+    assert!(matches!(f.code[1], Op::LoadLocal(1)));
+    assert!(matches!(f.code[2], Op::IntSub));
+    assert!(matches!(f.code[3], Op::Return));
+
+    let mut vm = Vm::new(&p);
+    let r = vm.call("sub_them", vec![Value::Int(42), Value::Int(7)]).unwrap();
+    assert_eq!(r, Value::Int(35));
+}
+
+#[test]
+fn slice4_fuses_two_local_mul_and_runs_correctly() {
+    use lex_bytecode::op::Op;
+    let src = "fn mul_them(a :: Int, b :: Int) -> Int { a * b }\n";
+    let p = compile(src);
+    let f = &p.functions[0];
+    assert!(
+        matches!(f.code[0], Op::LoadLocalMulLocal { lhs_idx: 0, rhs_idx: 1 }),
+        "slice 4 (mul) did not fire; got {:?}", f.code[0],
+    );
+    assert!(matches!(f.code[1], Op::LoadLocal(1)));
+    assert!(matches!(f.code[2], Op::IntMul));
+    assert!(matches!(f.code[3], Op::Return));
+
+    let mut vm = Vm::new(&p);
+    let r = vm.call("mul_them", vec![Value::Int(6), Value::Int(7)]).unwrap();
+    assert_eq!(r, Value::Int(42));
+}
+
+#[test]
+fn slice4_does_not_fire_across_a_jump_target() {
+    // Mirror of `slice3_does_not_fire_across_a_jump_target` for sub/mul.
+    // A `match`-arm body straddles a JumpIfNot target, so if the
+    // jump-safety check ever regressed the call would panic or return
+    // junk.
+    let src = "
+fn pick(flag :: Int, a :: Int, b :: Int) -> Int {
+  match flag {
+    0 => a - b,
+    1 => a * b,
+    _ => a,
+  }
+}";
+    let p = compile(src);
+    let mut vm = Vm::new(&p);
+    assert_eq!(vm.call("pick", vec![Value::Int(0), Value::Int(10), Value::Int(3)]).unwrap(), Value::Int(7));
+    assert_eq!(vm.call("pick", vec![Value::Int(1), Value::Int(10), Value::Int(3)]).unwrap(), Value::Int(30));
+    assert_eq!(vm.call("pick", vec![Value::Int(9), Value::Int(10), Value::Int(3)]).unwrap(), Value::Int(10));
+}
+
+#[test]
 fn slice3_does_not_fire_across_a_jump_target() {
     // Safety check: if the second or third slot of the candidate
     // triple is a jump target, slice 3 must skip the fusion — a

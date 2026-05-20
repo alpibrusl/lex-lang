@@ -219,6 +219,10 @@ fn stack_delta(op: &Op) -> i32 {
         // (LoadLocal + IntAdd) have deltas +1 and -1 — they cancel
         // when walked as live, mirroring slice 1's shape.
         Op::LoadLocalAddLocal { .. } => 1,
+        // Slice-4 fused ops: identical shape to slice 3, just with
+        // IntSub / IntMul as terminator. Net delta +1; trailing
+        // LoadLocal + IntSub|IntMul tombstones cancel when walked.
+        Op::LoadLocalSubLocal { .. } | Op::LoadLocalMulLocal { .. } => 1,
     }
 }
 

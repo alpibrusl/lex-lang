@@ -235,6 +235,8 @@ criterion_group!(
     bench_straight_arith_no_dispatch,
     bench_pure_dispatch,
     bench_two_local_arith,
+    bench_two_local_sub_arith,
+    bench_two_local_mul_arith,
 );
 criterion_main!(benches);
 
@@ -289,6 +291,69 @@ fn bench_two_local_arith(c: &mut Criterion) {
         });
     }
     group.finish();
+}
+
+/// Sibling of `bench_two_local_arith` for the `IntSub` shape
+/// (#461 slice 4). Same source pattern but with `-` instead of `+`,
+/// so each let-binding compiles to `LoadLocal + LoadLocal + IntSub +
+/// StoreLocal`; slice 4 collapses the first three into
+/// `LoadLocalSubLocal`. Isolated bench so the slice-4 dispatch saving
+/// is the only superinstruction that fires.
+fn bench_two_local_sub_arith(c: &mut Criterion) {
+    let mut group = c.benchmark_group("dispatch/two_local_sub_arith");
+    for n in [100usize, 1_000, 5_000] {
+        let prog = compile(&make_two_local_binop_source(n, "-"));
+        group.throughput(Throughput::Elements((4 * n) as u64));
+        group.bench_function(format!("n={n}"), |b| {
+            b.iter(|| {
+                let mut vm = Vm::new(&prog);
+                vm.set_step_limit(u64::MAX);
+                black_box(
+                    vm.call("two_local_binop", vec![Value::Int(0), Value::Int(0)])
+                        .expect("call two_local_binop (-)"),
+                )
+            })
+        });
+    }
+    group.finish();
+}
+
+/// Sibling of `bench_two_local_arith` for the `IntMul` shape
+/// (#461 slice 4). Seeded with `1, 1` so the running product stays
+/// `1` and we don't overflow — the dispatch shape is the same
+/// regardless of the values, and that's what we're measuring.
+fn bench_two_local_mul_arith(c: &mut Criterion) {
+    let mut group = c.benchmark_group("dispatch/two_local_mul_arith");
+    for n in [100usize, 1_000, 5_000] {
+        let prog = compile(&make_two_local_binop_source(n, "*"));
+        group.throughput(Throughput::Elements((4 * n) as u64));
+        group.bench_function(format!("n={n}"), |b| {
+            b.iter(|| {
+                let mut vm = Vm::new(&prog);
+                vm.set_step_limit(u64::MAX);
+                black_box(
+                    vm.call("two_local_binop", vec![Value::Int(1), Value::Int(1)])
+                        .expect("call two_local_binop (*)"),
+                )
+            })
+        });
+    }
+    group.finish();
+}
+
+/// Generalised version of `make_two_local_arith_source` for slice 4
+/// — emits the same chain shape (each `a{i}` := previous-local OP
+/// step), parameterised on the binary operator string.
+fn make_two_local_binop_source(n: usize, op: &str) -> String {
+    let mut s = String::with_capacity(48 * n);
+    s.push_str("fn two_local_binop(start :: Int, step :: Int) -> Int {\n");
+    s.push_str("  let a0 := start\n");
+    for i in 1..=n {
+        s.push_str(&format!("  let a{i} := a{} {op} step\n", i - 1));
+    }
+    s.push_str(&format!("  a{n}\n"));
+    s.push_str("}\n");
+    s
 }
 
 /// Pure-dispatch microbench: hand-built `Program` whose body is N
