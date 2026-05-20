@@ -430,13 +430,25 @@ impl Value {
 
     /// Build a `Value::Record` whose fields don't come from an
     /// `Op::MakeRecord` site — JSON decode, SQL row → record, host
-    /// effect handlers, test fixtures, etc. The IC unconditionally
-    /// misses against `NO_SHAPE_ID`, which is the correct behavior
-    /// for records with no compile-time shape. Prefer this over
-    /// hand-rolling `Value::Record { shape_id: NO_SHAPE_ID, fields }`
-    /// so a future shape-interning slice has one place to retrofit.
+    /// effect handlers, test fixtures, etc. Interns the field-name
+    /// set in the process-global shape registry (#462 slice 3) so
+    /// records with the same set of field names share a stable
+    /// `shape_id` and hit the same IC slot. Two records with the
+    /// same fields in different insertion order share a `shape_id`
+    /// (the registry sorts the field-name vec before lookup),
+    /// matching the existing `Value::Record` structural-equality
+    /// semantics.
+    ///
+    /// Dynamic shape IDs live in the high half of the `u32` range
+    /// (see `crate::shape_registry::DYNAMIC_SHAPE_ID_BASE`) so they
+    /// can't collide with the per-program shape indices emitted by
+    /// `Op::MakeRecord`. Mixed-flavor IC sites (which the slice-2b
+    /// measurement found at exactly zero occurrences) would still
+    /// be correct under the IC's shape-keyed verifier — they'd just
+    /// churn the cache.
     pub fn record_dynamic(fields: IndexMap<String, Value>) -> Value {
-        Value::Record { shape_id: NO_SHAPE_ID, fields: Box::new(fields) }
+        let shape_id = crate::shape_registry::intern(fields.keys());
+        Value::Record { shape_id, fields: Box::new(fields) }
     }
 }
 

@@ -148,6 +148,64 @@ fn bench(n :: Int) -> Int {
     group.finish();
 }
 
+/// Slice-3 sibling of `bench_record_field_wide` (#462). Reads the
+/// same fields off a record built via `Value::record_dynamic`
+/// instead of an `Op::MakeRecord` site — i.e. the shape every
+/// HTTP / JSON / SQL record carries. Before slice 3 all such
+/// records aliased on `NO_SHAPE_ID` and the IC fell through to a
+/// per-hit name compare on every access. After slice 3 they share
+/// a real (registry-interned) `shape_id` and the IC fast path
+/// fires.
+fn bench_record_field_dynamic(c: &mut Criterion) {
+    use indexmap::IndexMap;
+    // Same hot loop as `_wide`, but `sum_wide` takes a parameter
+    // of opaque (untyped) `Record`-ish shape — the caller passes
+    // in the dynamic record directly so `Op::MakeRecord` doesn't
+    // run and the record's `shape_id` comes solely from the
+    // registry.
+    let src = r#"
+type Wide = { a :: Int, b :: Int, c :: Int, d :: Int, e :: Int,
+               f :: Int, g :: Int, h :: Int, i :: Int, j :: Int }
+
+fn sum_wide(w :: Wide, n :: Int, acc :: Int) -> Int {
+  match n {
+    0 => acc,
+    _ => sum_wide(w, n - 1, acc + w.a + w.b + w.c + w.d + w.e
+                                + w.f + w.g + w.h + w.i + w.j),
+  }
+}
+"#;
+    let prog = compile(src);
+    // Build the dynamic record once. The IC measures steady-state
+    // GetField cost on dynamic-flavored records; including registry
+    // interning + IndexMap alloc per iteration would swamp the IC
+    // delta.
+    let dyn_rec = {
+        let mut fields: IndexMap<String, Value> = IndexMap::new();
+        for (k, v) in [
+            ("a", 1i64), ("b", 2), ("c", 3), ("d", 4), ("e", 5),
+            ("f", 6), ("g", 7), ("h", 8), ("i", 9), ("j", 10),
+        ] {
+            fields.insert(k.into(), Value::Int(v));
+        }
+        Value::record_dynamic(fields)
+    };
+    let mut group = c.benchmark_group("dispatch/record_field_dynamic");
+    for n in [100i64, 1_000, 10_000] {
+        group.bench_function(format!("n={n}"), |b| {
+            b.iter(|| {
+                let mut vm = Vm::new(&prog);
+                vm.set_step_limit(u64::MAX);
+                black_box(
+                    vm.call("sum_wide", vec![dyn_rec.clone(), Value::Int(n), Value::Int(0)])
+                        .expect("call sum_wide"),
+                )
+            })
+        });
+    }
+    group.finish();
+}
+
 fn bench_call_heavy(c: &mut Criterion) {
     let prog = compile(CALL_HEAVY_SRC);
     let mut group = c.benchmark_group("dispatch/call_heavy");
@@ -281,6 +339,7 @@ criterion_group!(
     bench_two_local_sub_arith,
     bench_two_local_mul_arith,
     bench_record_field_wide,
+    bench_record_field_dynamic,
 );
 criterion_main!(benches);
 
