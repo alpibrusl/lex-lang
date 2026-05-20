@@ -205,6 +205,74 @@ fn pick(flag :: Int, a :: Int, b :: Int) -> Int {
 }
 
 #[test]
+fn slice5_fuses_pattern_match_arm_test() {
+    // #461 slice 5: every integer-literal pattern arm compiles to
+    // `LoadLocal(scrut) + PushConst(lit) + IntEq + JumpIfNot(next_arm)`
+    // after the compile_pattern_test typed-lowering (NumEq→IntEq for
+    // Int literal patterns). Slice 5 fuses that window into
+    // `Op::LoadLocalEqIntConstJumpIfNot`. Verify both that the fusion
+    // fires and that the runtime semantics — `n == 0` arm vs the
+    // recursive `_` arm — produce the same result as the unfused
+    // form.
+    use lex_bytecode::op::Op;
+    let src = "
+fn sum_to(n :: Int, acc :: Int) -> Int {
+  match n {
+    0 => acc,
+    _ => sum_to(n - 1, acc + n),
+  }
+}";
+    let p = compile(src);
+    let fused_in_body = p.functions.iter().flat_map(|f| f.code.iter()).any(|op|
+        matches!(op, Op::LoadLocalEqIntConstJumpIfNot { .. }));
+    assert!(fused_in_body, "slice 5 did not fire on sum_to's `0 =>` arm test");
+
+    let mut vm = Vm::new(&p);
+    // 1+2+3+4+5 = 15.
+    let r = vm.call("sum_to", vec![Value::Int(5), Value::Int(0)]).unwrap();
+    assert_eq!(r, Value::Int(15));
+}
+
+#[test]
+fn slice5_runs_correctly_through_branch_not_taken() {
+    // Edge: scrutinee matches the literal on the first arm → fused op
+    // falls through to pc+4 (the arm body). Sum_to(0) should hit the
+    // `0 => acc` arm immediately and return acc.
+    let src = "
+fn sum_to(n :: Int, acc :: Int) -> Int {
+  match n {
+    0 => acc,
+    _ => sum_to(n - 1, acc + n),
+  }
+}";
+    let p = compile(src);
+    let mut vm = Vm::new(&p);
+    let r = vm.call("sum_to", vec![Value::Int(0), Value::Int(42)]).unwrap();
+    assert_eq!(r, Value::Int(42));
+}
+
+#[test]
+fn slice5_multi_arm_cascade_runs_correctly() {
+    // Multiple Int-literal arms — each produces its own slice-5 fusion.
+    // The 4-arm cascade should pick the right branch for each input.
+    let src = "
+fn classify(n :: Int) -> Int {
+  match n {
+    0 => 100,
+    1 => 200,
+    2 => 300,
+    _ => 999,
+  }
+}";
+    let p = compile(src);
+    let mut vm = Vm::new(&p);
+    assert_eq!(vm.call("classify", vec![Value::Int(0)]).unwrap(), Value::Int(100));
+    assert_eq!(vm.call("classify", vec![Value::Int(1)]).unwrap(), Value::Int(200));
+    assert_eq!(vm.call("classify", vec![Value::Int(2)]).unwrap(), Value::Int(300));
+    assert_eq!(vm.call("classify", vec![Value::Int(99)]).unwrap(), Value::Int(999));
+}
+
+#[test]
 fn slice3_does_not_fire_across_a_jump_target() {
     // Safety check: if the second or third slot of the candidate
     // triple is a jump target, slice 3 must skip the fusion — a

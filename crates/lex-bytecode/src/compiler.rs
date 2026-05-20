@@ -260,6 +260,17 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
         apply_peephole_slice2(&mut f.code);
         apply_peephole_slice3(&mut f.code);
         apply_peephole_slice4(&mut f.code);
+        // Slice 5 — jump-aware fusion of the loop-condition idiom
+        // (LoadLocal + LoadLocal/PushConst + IntLt + JumpIfNot).
+        // Runs after slices 3/4 because their 3-slot windows
+        // overlap slice 5's 4-slot window at position 0 and 1; if
+        // slice 3 fired first and consumed `LoadLocal + LoadLocal +
+        // IntAdd`, the `IntLt + JumpIfNot` that follows would not
+        // be a fusion candidate. Since slice 3's terminator is
+        // `IntAdd` and slice 5's is `IntLt`, the two don't compete
+        // on the same site — order between them is technically free
+        // but conventionally slice N runs after slice N-1.
+        apply_peephole_slice5(&mut f.code, &pool.pool);
     }
 
     // Final pass: stamp every function with its content hash now that
@@ -443,6 +454,61 @@ fn apply_peephole_slice4(code: &mut [Op]) {
                     k += 3;
                     continue;
                 }
+            }
+        }
+        k += 1;
+    }
+}
+
+/// Slice 5: fuse the loop-condition idiom — 4-slot window
+/// `[LoadLocal, LoadLocal|PushConst, IntLt, JumpIfNot(offset)]` —
+/// into `LoadLocalLtLocalJumpIfNot` or `LoadLocalLtIntConstJumpIfNot`.
+/// First jump-aware peephole in this codebase: the fused op carries
+/// the JumpIfNot's offset and the VM dispatches directly to either
+/// `pc + 4` (condition true, fall through past tombstones) or
+/// `pc + 4 + offset` (condition false, original JumpIfNot target).
+///
+/// Safety conditions, on top of slice 1's "tombstones must not be
+/// jump targets":
+/// 1. Trailing 3 slots (k+1, k+2, k+3) must not be jump targets from
+///    elsewhere — same as slice 1/3/4, just three of them.
+/// 2. The slot at k+3 (JumpIfNot) is the one whose offset we copy
+///    into the fused op. The offset is relative to the JumpIfNot's
+///    `pc + 1` which equals `k + 4`, so the resolved target is
+///    `k + 4 + offset` — that target must be safe to land on (it
+///    already is, since JumpIfNot is operating as designed).
+/// 3. The const-int branch checks the PushConst points at a
+///    `Const::Int` — same as slice 1.
+fn apply_peephole_slice5(code: &mut [Op], constants: &[Const]) {
+    if code.len() < 4 { return; }
+    let jump_targets = collect_jump_targets(code);
+
+    let n = code.len();
+    let mut k = 0;
+    while k + 3 < n {
+        // Match the lhs slot — always a LoadLocal.
+        let lhs_idx = match code[k] {
+            Op::LoadLocal(i) => i,
+            _ => { k += 1; continue; }
+        };
+        // Match the rhs slot — either LoadLocal or PushConst(Int).
+        // The two flavors emit different fused ops.
+        let fused = match (code[k + 1], code[k + 2], code[k + 3]) {
+            (Op::PushConst(imm_const_idx), Op::IntEq, Op::JumpIfNot(jump_offset))
+                if matches!(constants.get(imm_const_idx as usize), Some(Const::Int(_))) =>
+                Some(Op::LoadLocalEqIntConstJumpIfNot {
+                    local_idx: lhs_idx, imm_const_idx, jump_offset,
+                }),
+            _ => None,
+        };
+        if let Some(fused_op) = fused {
+            let safe = !jump_targets.contains(&(k + 1))
+                && !jump_targets.contains(&(k + 2))
+                && !jump_targets.contains(&(k + 3));
+            if safe {
+                code[k] = fused_op;
+                k += 4;
+                continue;
             }
         }
         k += 1;
@@ -879,6 +945,18 @@ impl<'a> FnCompiler<'a> {
                 match value {
                     a::CLit::Str { .. } => self.emit(Op::StrEq),
                     a::CLit::Bytes { .. } => self.emit(Op::BytesEq),
+                    // Typed-lowering for numeric literal patterns
+                    // (#461 slice 5 prerequisite). The pattern only
+                    // reaches its test when the scrutinee has the
+                    // literal's type (the type checker rejects
+                    // mismatches), so emit the type-specific Eq.
+                    // The body_hash decoder lowers IntEq/FloatEq to
+                    // NumEq at hash time so closure identity (#222)
+                    // is unchanged. Enables slice 5's
+                    // `LoadLocal + PushConst + IntEq + JumpIfNot`
+                    // peephole to fire on pattern-match arm tests.
+                    a::CLit::Int { .. } => self.emit(Op::IntEq),
+                    a::CLit::Float { .. } => self.emit(Op::FloatEq),
                     _ => self.emit(Op::NumEq),
                 }
                 let j = self.code.len();
