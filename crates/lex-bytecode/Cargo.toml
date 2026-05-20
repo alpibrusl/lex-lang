@@ -33,3 +33,7 @@ harness = false
 [[bench]]
 name = "field_access"
 harness = false
+
+[[bench]]
+name = "response_build"
+harness = false

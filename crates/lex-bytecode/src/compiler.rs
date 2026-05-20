@@ -252,9 +252,16 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
     // any pattern. `compute_body_hash` lowers AllocStackRecord back
     // to the legacy MakeRecord form (#222), so closure identity is
     // invariant under this lowering.
-    let escape_index = crate::escape::build_escape_index(&p.functions);
-    for f in p.functions.iter_mut() {
-        apply_escape_lowering(&mut f.code, &f.name, &escape_index);
+    //
+    // Escape hatch: `LEX_NO_STACK_RECORDS=1` skips the lowering
+    // entirely (#464 step 3). The flag exists so the bench can A/B
+    // the same source under matched VM/peephole conditions; in
+    // production code the pass always runs.
+    if std::env::var_os("LEX_NO_STACK_RECORDS").is_none() {
+        let escape_index = crate::escape::build_escape_index(&p.functions);
+        for f in p.functions.iter_mut() {
+            apply_escape_lowering(&mut f.code, &f.name, &escape_index);
+        }
     }
 
     // Peephole pass (#461 superinstructions). Rewrites fusable opcode
