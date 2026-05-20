@@ -19,7 +19,7 @@ pub enum Const {
     NodeId(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum Op {
     // stack manipulation
     PushConst(u32),
@@ -31,16 +31,31 @@ pub enum Op {
     StoreLocal(u16),
 
     // constructors / pattern matching
-    /// Builds a record from `count` (name_const_idx, value) pairs on the stack.
-    /// Stack: [name_idx_n, val_n, ..., name_idx_1, val_1] but encoded as
-    /// alternating `<name_idx_const_u32> <value popped from stack>` — for
-    /// simplicity we instead push `count` values and `count` field name
-    /// constants in the same op as a `Vec<u32>` of name indices.
-    MakeRecord { field_name_indices: Vec<u32> },
+    /// Builds a record by interning its field-name shape in
+    /// `Program.record_shapes` (#461). `shape_idx` indexes that
+    /// side-table; `field_count` is `shape.len()` cached inline so the
+    /// stack-effect verifier can compute its delta without needing a
+    /// `Program` reference. The VM pops `field_count` values off the
+    /// stack and pairs them with `Program.record_shapes[shape_idx]`.
+    ///
+    /// Externalizing the field-name vec is what lets `Op` be `Copy`,
+    /// which is the precondition for direct-threaded dispatch
+    /// (`code[pc]` becomes a register-sized read instead of an
+    /// every-step `Vec` clone).
+    MakeRecord { shape_idx: u32, field_count: u16 },
     MakeTuple(u16),
     MakeList(u32),
     MakeVariant { name_idx: u32, arity: u16 },
-    GetField(u32),         // field name const idx
+    /// Record field access. `name_idx` indexes a `Const::FieldName`
+    /// in the constant pool — the field to read. `site_idx` is a
+    /// stable per-function index assigned by the compiler at emit
+    /// time (#462 slice 1), keyed into the per-fn inline-cache table
+    /// in the VM. Replaces the pre-#462 `(fn_id << 32 | pc)` IC key
+    /// so the cache survives the future dispatch rewrite (#461) and
+    /// a JIT (#465). `body_hash` stability: the canonical encoding
+    /// drops `site_idx` and serializes as the historical `GetField(u32)`
+    /// tuple form, so closure identity (#222) is unchanged.
+    GetField { name_idx: u32, site_idx: u32 },
     GetElem(u16),          // tuple element index
     TestVariant(u32),      // pushes Bool: top-of-stack matches variant name?
     GetVariant(u32),       // extracts payload (replaces variant on stack with its args list)
@@ -104,4 +119,66 @@ pub enum Op {
     // strings
     StrConcat, StrLen, StrEq,
     BytesLen, BytesEq,
+
+    // superinstructions (#461)
+    //
+    // Fused opcodes emitted by the compiler's peephole pass to skip
+    // dispatch on common multi-op patterns. The pass leaves the
+    // original primitive ops in place at the trailing slots — the
+    // dispatch loop overrides its default `pc += 1` to step past
+    // them. Keeping `code.len()` invariant means existing
+    // Jump/JumpIf offsets remain valid without a renumbering pass.
+    /// Fused `LoadLocal(local_idx) + PushConst(imm_const_idx) +
+    /// IntAdd`. `imm_const_idx` must point to a `Const::Int`. The
+    /// dispatch arm reads the local, adds the constant, pushes the
+    /// result, and advances pc by 3 (past this op and the two
+    /// inert PushConst + IntAdd slots that follow). For
+    /// `body_hash` stability (#222) the canonical encoding decomposes
+    /// this op back to a standalone `LoadLocal(local_idx)` at hash
+    /// time; the unchanged PushConst / IntAdd at the next two
+    /// slots hash normally, so the total bytes match pre-fusion.
+    LoadLocalAddIntConst { local_idx: u16, imm_const_idx: u32 },
+    /// Fused `LoadLocal(src) + PushConst(imm_const_idx) + IntAdd +
+    /// StoreLocal(dest)` (#461 superinstruction slice 2). Bypasses
+    /// the value stack entirely: reads `locals[src]`, adds the Int
+    /// constant, writes `locals[dest]`. Advances pc by 4. Stack
+    /// delta: 0.
+    ///
+    /// The peephole pass that emits this op runs *after* slice 1,
+    /// looking for `[LoadLocalAddIntConst, ., ., StoreLocal]` where
+    /// the middle two slots are slice-1 tombstones (the original
+    /// PushConst + IntAdd). The verifier and the body-hash decoder
+    /// both treat the 3 following slots as tombstones owned by
+    /// this op.
+    LoadLocalAddIntConstStoreLocal { src: u16, imm_const_idx: u32, dest: u16 },
+    /// Fused `LoadLocal(lhs_idx) + LoadLocal(rhs_idx) + IntAdd`
+    /// (#461 superinstruction slice 3). The binary-op-on-two-locals
+    /// idiom — fires on any `a + b` where both operands are
+    /// statically-typed `Int` locals (e.g. `acc + n` in tail-recursive
+    /// accumulator loops). Reads `locals[lhs_idx]` and `locals[rhs_idx]`,
+    /// pushes the sum, advances pc by 3. Stack delta: +1.
+    ///
+    /// `body_hash` stability (#222): canonical encoding decomposes
+    /// back to a standalone `LoadLocal(lhs_idx)`. The unchanged
+    /// `LoadLocal(rhs_idx)` + `IntAdd` tombstones at pc+1 and pc+2
+    /// hash normally, so the total bytes match the pre-fusion form.
+    /// Verifier walks the tombstones as if live: their deltas
+    /// (+1 LoadLocal, -1 IntAdd) cancel, matching the unfused depth
+    /// at pc+3.
+    LoadLocalAddLocal { lhs_idx: u16, rhs_idx: u16 },
+    /// Fused `LoadLocal(lhs_idx) + LoadLocal(rhs_idx) + IntSub`
+    /// (#461 superinstruction slice 4). Sibling of `LoadLocalAddLocal`
+    /// for the typed `Int` subtraction binop — fires on any `a - b`
+    /// where both operands are `Int` locals. Reads `locals[lhs_idx]`
+    /// and `locals[rhs_idx]`, pushes `lhs - rhs`, advances pc by 3.
+    /// Stack delta: +1. Tombstone + body-hash story matches
+    /// `LoadLocalAddLocal` exactly.
+    LoadLocalSubLocal { lhs_idx: u16, rhs_idx: u16 },
+    /// Fused `LoadLocal(lhs_idx) + LoadLocal(rhs_idx) + IntMul`
+    /// (#461 superinstruction slice 4). Sibling of `LoadLocalAddLocal`
+    /// for the typed `Int` multiplication binop. Same shape: reads
+    /// the two Int locals, pushes `lhs * rhs`, advances pc by 3.
+    /// Stack delta: +1. Tombstone + body-hash story matches
+    /// `LoadLocalAddLocal` exactly.
+    LoadLocalMulLocal { lhs_idx: u16, rhs_idx: u16 },
 }

@@ -5,17 +5,72 @@ use arrow_array::RecordBatch;
 use indexmap::IndexMap;
 use smol_str::SmolStr;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 /// Internal state of a `conc.Actor`. Protected by a `Mutex` so that
-/// concurrent callers serialise on message delivery (the actor processes
-/// one message at a time). The `handler` closure is called on the
-/// *calling* VM's thread — no extra OS thread required — which lets it
-/// invoke arbitrary effects (sql, net, …) through the same handler chain.
+/// the `Lex` handler variant serialises on message delivery (one
+/// message processed at a time, state mutated under the lock). The
+/// `handler` is dispatched on the *calling* VM's thread — no extra
+/// OS thread required — which lets Lex handlers invoke arbitrary
+/// effects (sql, net, …) through the same handler chain.
+///
+/// Serialisation note: the `Native` variant releases the mutex
+/// *before* invoking its closure (`state` is unused for natives —
+/// the "state" is an external resource like a channel), so two
+/// concurrent `conc.tell`s on the same native bridge may invoke
+/// the closure on overlapping threads. Native bridges therefore
+/// need to be internally thread-safe; the `serve_ws_fn_actor`
+/// `mpsc::Sender` bridge is, because `Sender::send` is.
 #[derive(Debug, Clone)]
 pub struct ActorCell {
     pub state: Value,
-    pub handler: Value,
+    pub handler: ActorHandler,
+}
+
+/// Two ways an actor's handler can be implemented.
+///
+/// * `Lex(Value::Closure)` is the user-spawned shape from
+///   `conc.spawn(state, fn (s, m) -> (s, r) { … })`. The VM calls
+///   the closure with `(state, msg)` and expects `(new_state, reply)`.
+///
+/// * `Native(...)` is a Rust-side bridge — the actor cell wraps a
+///   `Box<dyn Fn(Value) -> Result<Value, String>>` that lives outside
+///   the VM. The `state` is ignored; the bridge is fire-and-forget
+///   over an out-of-band channel (e.g. a `mpsc::Sender<String>` to
+///   a WebSocket connection — see `lex-runtime::ws::serve_ws_fn_actor`).
+///   `conc.ask` against a native actor returns whatever the bridge
+///   produces; `conc.tell` discards it. v1 is only used internally by
+///   the WS server's outbound-bridge registration; not exposed via the
+///   `conc` builtin surface.
+#[derive(Clone)]
+pub enum ActorHandler {
+    Lex(Value),
+    Native(Arc<NativeActorHandler>),
+}
+
+/// Erased Rust-side handler for `ActorHandler::Native`. Boxed so we
+/// can store any closure that captures (e.g. an `mpsc::Sender`).
+/// Wrapped in `Arc` so cloning an `ActorCell` (which the existing
+/// `conc.tell` flow does — `let handler = guard.handler.clone()`)
+/// is cheap and the closure isn't duplicated.
+pub struct NativeActorHandler {
+    pub send: Box<dyn Fn(Value) -> Result<Value, String> + Send + Sync>,
+}
+
+impl std::fmt::Debug for NativeActorHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<native actor handler>")
+    }
+}
+
+impl std::fmt::Debug for ActorHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ActorHandler::Lex(v) => f.debug_tuple("Lex").field(v).finish(),
+            ActorHandler::Native(n) => f.debug_tuple("Native").field(n).finish(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -31,7 +86,31 @@ pub enum Value {
     Unit,
     List(VecDeque<Value>),
     Tuple(Vec<Value>),
-    Record(IndexMap<String, Value>),
+    /// Record literal. `shape_id` is the `Program::record_shapes`
+    /// index of the field-name vec the record was built from
+    /// (#462 slice 2), so the `Op::GetField` polymorphic IC can
+    /// match on a single u32 compare instead of walking the
+    /// `IndexMap` by name. Records constructed outside the bytecode
+    /// (JSON decode, SQL row → record, HTTP request mutators, test
+    /// fixtures) have no compile-time shape and carry `NO_SHAPE_ID`
+    /// — the IC unconditionally misses on them and falls through to
+    /// the existing name walk.
+    ///
+    /// `fields` is `Box<IndexMap>` rather than `IndexMap` inline
+    /// because the bare `IndexMap` is ~56B; inlining it plus
+    /// `shape_id` would push `Value`'s enum size from 64B → 72B,
+    /// which measurably regresses the VM stack push/pop loop
+    /// (`Value` is cloned/moved on every push/pop). Boxing keeps
+    /// `Value::Record` at 16B and `Value` at the pre-#462 64B.
+    /// The indirection on every `IndexMap` access costs a few ns
+    /// but the IC drops the field-name string compare on every
+    /// hit, which is the net win on `mono_chain`.
+    ///
+    /// `shape_id` is **not** part of structural equality (see
+    /// `PartialEq` below): two records with identical fields must
+    /// compare equal regardless of provenance, so a JSON-decoded
+    /// record equals a compile-time-built one with the same fields.
+    Record { shape_id: u32, fields: Box<IndexMap<String, Value>> },
     Variant { name: String, args: Vec<Value> },
     /// First-class function value (a lambda + its captured locals). The
     /// function's first `captures.len()` params bind to `captures`; the
@@ -72,6 +151,12 @@ pub enum Value {
     /// Two actor handles compare equal iff they point to the same cell
     /// (identity equality, not structural equality).
     Actor(Arc<Mutex<ActorCell>>),
+    /// A periodic-tick handle returned by `conc.every` (#445). The
+    /// `AtomicBool` is the cancel flag — `conc.cancel(t)` sets it and
+    /// the background scheduler thread observes it on its next iteration
+    /// and exits. Two ticker handles compare equal iff they point to the
+    /// same cancel flag.
+    Ticker(Arc<AtomicBool>),
     /// Apache Arrow `RecordBatch` — an unboxed columnar table. The
     /// "fast lane" representation for `lex-frame` and any future
     /// dataframe code: a `Value::ArrowTable` with one int64 column
@@ -105,7 +190,7 @@ impl PartialEq for Value {
             (Unit, Unit) => true,
             (List(a), List(b)) => a == b,
             (Tuple(a), Tuple(b)) => a == b,
-            (Record(a), Record(b)) => a == b,
+            (Record { fields: a, .. }, Record { fields: b, .. }) => a == b,
             (Variant { name: an, args: aa }, Variant { name: bn, args: ba }) =>
                 an == bn && aa == ba,
             (Closure { body_hash: ah, captures: ac, .. },
@@ -119,6 +204,9 @@ impl PartialEq for Value {
             (Deque(a), Deque(b)) => a == b,
             // Actor identity: same if both handles point to the same cell.
             (Actor(a), Actor(b)) => Arc::ptr_eq(a, b),
+            // Ticker identity: same if both handles point to the same
+            // cancel flag (one ticker spawn → one flag).
+            (Ticker(a), Ticker(b)) => Arc::ptr_eq(a, b),
             // Arrow table equality: structural over schema + columns.
             // RecordBatch implements PartialEq directly.
             (ArrowTable(a), ArrowTable(b)) => a == b,
@@ -212,9 +300,9 @@ impl Value {
             Value::Unit => J::Null,
             Value::List(items) => J::Array(items.iter().map(Value::to_json).collect()),
             Value::Tuple(items) => J::Array(items.iter().map(Value::to_json).collect()),
-            Value::Record(fields) => {
+            Value::Record { fields, .. } => {
                 let mut m = serde_json::Map::new();
-                for (k, v) in fields { m.insert(k.clone(), v.to_json()); }
+                for (k, v) in fields.iter() { m.insert(k.clone(), v.to_json()); }
                 J::Object(m)
             }
             Value::Variant { name, args } => {
@@ -260,6 +348,7 @@ impl Value {
                 s.iter().map(|k| k.as_value().to_json()).collect()),
             Value::Deque(items) => J::Array(items.iter().map(Value::to_json).collect()),
             Value::Actor(_) => J::String("<actor>".into()),
+            Value::Ticker(_) => J::String("<ticker>".into()),
             Value::ArrowTable(t) => {
                 // Compact summary: schema + nrows. Full data is intentionally
                 // not emitted — Arrow tables can be GB-scale and a JSON dump
@@ -334,11 +423,31 @@ impl Value {
                 for (k, v) in map {
                     out.insert(k.clone(), Value::from_json(v));
                 }
-                Value::Record(out)
+                Value::record_dynamic(out)
             }
         }
     }
+
+    /// Build a `Value::Record` whose fields don't come from an
+    /// `Op::MakeRecord` site — JSON decode, SQL row → record, host
+    /// effect handlers, test fixtures, etc. The IC unconditionally
+    /// misses against `NO_SHAPE_ID`, which is the correct behavior
+    /// for records with no compile-time shape. Prefer this over
+    /// hand-rolling `Value::Record { shape_id: NO_SHAPE_ID, fields }`
+    /// so a future shape-interning slice has one place to retrofit.
+    pub fn record_dynamic(fields: IndexMap<String, Value>) -> Value {
+        Value::Record { shape_id: NO_SHAPE_ID, fields: Box::new(fields) }
+    }
 }
+
+/// Sentinel `shape_id` for records constructed outside an
+/// `Op::MakeRecord` site (#462 slice 2). `Program::record_shapes`
+/// is bounded by `u32::MAX - 1` in practice (each compile-time
+/// record literal adds one entry), so reserving the top of the
+/// `u32` range as "no shape" keeps `Value::Record.shape_id` a flat
+/// `u32` — the `Op::GetField` IC's hot path is a single u32
+/// compare, no `Option` discriminant.
+pub const NO_SHAPE_ID: u32 = u32::MAX;
 
 /// Lowercase-hex → bytes. Returns `None` for odd length or non-hex chars
 /// (callers fall through to a record decode rather than erroring).

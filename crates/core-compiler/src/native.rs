@@ -56,7 +56,7 @@ fn unpack_matrix(v: &Value) -> Result<(usize, usize, Vec<f64>), String> {
         return Ok((r, c, data.clone()));
     }
     let rec = match v {
-        Value::Record(r) => r,
+        Value::Record { fields, .. } => fields,
         other => return Err(format!("expected matrix (F64Array or Record), got {other:?}")),
     };
     let rows = rec.get("rows").ok_or("missing field rows")?;
@@ -103,7 +103,7 @@ pub fn pack_matrix_record(rows: usize, cols: usize, data: Vec<f64>) -> Value {
     rec.insert("rows".into(), Value::Int(rows as i64));
     rec.insert("cols".into(), Value::Int(cols as i64));
     rec.insert("data".into(), Value::List(data.into_iter().map(Value::Float).collect()));
-    Value::Record(rec)
+    Value::record_dynamic(rec)
 }
 
 /// Native matmul. C = A · B where A is M×K, B is K×N, C is M×N.

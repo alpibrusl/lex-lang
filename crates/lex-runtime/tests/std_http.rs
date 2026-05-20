@@ -109,7 +109,7 @@ fn unwrap_ok_record(v: Value) -> indexmap::IndexMap<String, Value> {
         other => panic!("expected Ok, got {other:?}"),
     };
     match args.into_iter().next() {
-        Some(Value::Record(r)) => r,
+        Some(Value::Record { fields: r, .. }) => *r,
         other => panic!("expected Record inside Ok, got {other:?}"),
     }
 }
@@ -515,3 +515,136 @@ fn fetch(u :: Str) -> [net] Result[HttpResponse, HttpError] { http.get(u) }
         "expected allow-net-host message, got {err}",
     );
 }
+
+// ---- #503 — methods beyond GET/POST ---------------------------------
+//
+// Pre-#503 lex-runtime rejected every method except GET and POST at
+// the `http_send_full` dispatch, returning a `DecodeError("unsupported
+// method: PUT")` before opening the socket. lex-ocpi worked around it
+// by shelling out to `curl` through `[proc]`. These tests pin the
+// fix: each method round-trips through the same `http.send(record)`
+// path, hits the loopback oneshot server, and gets a 200 back.
+//
+// The captured request line is asserted on the wire-level for
+// methods that carry a body, since PUT/PATCH bodies hitting the
+// server is the second half of "this works end-to-end".
+
+const SEND_VIA_RECORD_SRC: &str = r#"
+import "std.bytes" as bytes
+import "std.http"  as http
+import "std.map"   as map
+
+# Caller passes the wire-case method (`"PUT"` etc.) through to the
+# record. The runtime uppercases internally so lowercase also works,
+# but we keep this fixture canonical for the success-path assertions.
+fn send(method :: Str, u :: Str, b :: Str) -> [net] Result[HttpResponse, HttpError] {
+  let req := {
+    method:     method,
+    url:        u,
+    headers:    map.new(),
+    body:       Some(bytes.from_str(b)),
+    timeout_ms: Some(2000),
+  }
+  http.send(req)
+}
+"#;
+
+fn assert_method_round_trip(method: &str, body: &str, expect_body_on_wire: bool) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let port = spawn_oneshot(
+        "HTTP/1.0 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        Some(tx),
+    );
+    let url = format!("http://127.0.0.1:{port}/x");
+    let v = run(
+        SEND_VIA_RECORD_SRC,
+        "send",
+        vec![
+            Value::Str(method.into()),
+            Value::Str(url.into()),
+            Value::Str(body.into()),
+        ],
+        allow_net(),
+    );
+    let r = unwrap_ok_record(v);
+    assert_eq!(r.get("status"), Some(&Value::Int(200)), "{method}: expected 200");
+    let captured = rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap_or_else(|_| panic!("{method}: server did not observe a request"));
+    // The Lex surface accepts lowercase / mixed-case methods; ureq
+    // always emits uppercase on the wire (it routes through the
+    // typed per-method builder), so the captured request line is
+    // always the uppercase form.
+    let expected_line = format!("{} /x ", method.to_ascii_uppercase());
+    assert!(
+        captured.starts_with(&expected_line),
+        "{method}: unexpected request line in {captured:?}",
+    );
+    if expect_body_on_wire {
+        assert!(
+            captured.ends_with(body),
+            "{method}: expected body {body:?} at end of {captured:?}",
+        );
+    }
+}
+
+#[test]
+fn http_send_put_round_trips_with_body() {
+    assert_method_round_trip("PUT", r#"{"k":"v"}"#, true);
+}
+
+#[test]
+fn http_send_patch_round_trips_with_body() {
+    assert_method_round_trip("PATCH", r#"{"op":"replace"}"#, true);
+}
+
+#[test]
+fn http_send_delete_round_trips() {
+    // DELETE goes through ureq's WithoutBody builder; the request body
+    // field on the Lex record is ignored on the wire (RFC 7231 allows
+    // DELETE bodies but their semantics are undefined and most servers
+    // ignore them). We still pass a body to confirm the call doesn't
+    // error out on the bodyless path.
+    assert_method_round_trip("DELETE", "", false);
+}
+
+#[test]
+fn http_send_head_returns_200_with_empty_body() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let port = spawn_oneshot(
+        "HTTP/1.0 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nIGNORED",
+        Some(tx),
+    );
+    let url = format!("http://127.0.0.1:{port}/probe");
+    let v = run(
+        SEND_VIA_RECORD_SRC,
+        "send",
+        vec![
+            Value::Str("HEAD".into()),
+            Value::Str(url.into()),
+            Value::Str("".into()),
+        ],
+        allow_net(),
+    );
+    let r = unwrap_ok_record(v);
+    assert_eq!(r.get("status"), Some(&Value::Int(200)));
+    // RFC 7231 §4.3.2: HEAD responses MUST NOT include a body. ureq
+    // honours this — `r.body` is empty even though the server wrote
+    // 7 bytes after the headers.
+    if let Some(Value::Bytes(b)) = r.get("body") {
+        assert!(b.is_empty(), "HEAD: expected empty body, got {} bytes", b.len());
+    }
+    let captured = rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("HEAD: server should observe the request");
+    assert!(captured.starts_with("HEAD /probe "), "HEAD line: {captured:?}");
+}
+
+#[test]
+fn http_send_method_is_uppercased_before_dispatch() {
+    // #503 reporters typically write `"PUT"` etc., but the spec is
+    // case-sensitive only on the wire — the Lex surface should be
+    // forgiving. `"put"` MUST route to the same builder as `"PUT"`.
+    assert_method_round_trip("put", r#"{"normalised":true}"#, true);
+}
+

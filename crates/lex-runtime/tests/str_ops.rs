@@ -87,6 +87,70 @@ fn strip_suffix() {
     assert_eq!(run(src, "t", vec![s("hello.txt"), s(".lex")]), none());
 }
 
+// #440 — str.cmp three-way comparator.
+//
+// Boolean comparisons (`<`, `<=`, `>`, `>=`) already work on Str via the
+// VM's `bin_ord` path; the cmp(-1/0/1) shape is the new capability so
+// downstream code can pass it as a sort-by closure value once
+// `list.sort_by` lands.
+#[test]
+fn cmp_returns_neg_one_zero_one() {
+    let src = "import \"std.str\" as str\nfn t(a :: Str, b :: Str) -> Int { str.cmp(a, b) }\n";
+    let i = |n: i64| Value::Int(n);
+    assert_eq!(run(src, "t", vec![s("a"), s("b")]), i(-1));
+    assert_eq!(run(src, "t", vec![s("b"), s("a")]), i(1));
+    assert_eq!(run(src, "t", vec![s("abc"), s("abc")]), i(0));
+    // Length differences resolve before bytes run out.
+    assert_eq!(run(src, "t", vec![s("ab"), s("abc")]), i(-1));
+    assert_eq!(run(src, "t", vec![s("abc"), s("ab")]), i(1));
+    // Empty string sorts below everything else.
+    assert_eq!(run(src, "t", vec![s(""), s("a")]), i(-1));
+    assert_eq!(run(src, "t", vec![s(""), s("")]), i(0));
+}
+
+#[test]
+fn cmp_iso_8601_datetime_is_byte_order() {
+    // The OCPI date-range use case from the issue: ISO 8601 UTC
+    // strings sort lexicographically.
+    let src = "import \"std.str\" as str\nfn t(a :: Str, b :: Str) -> Int { str.cmp(a, b) }\n";
+    let i = |n: i64| Value::Int(n);
+    assert_eq!(
+        run(src, "t", vec![s("2026-05-15T10:00:00Z"), s("2026-05-15T10:00:01Z")]),
+        i(-1),
+    );
+    assert_eq!(
+        run(src, "t", vec![s("2026-05-16T00:00:00Z"), s("2026-05-15T23:59:59Z")]),
+        i(1),
+    );
+}
+
+#[test]
+fn cmp_total_order_sign_matches_lt_operator() {
+    // For all pairs the type checker accepts, the sign of str.cmp(a, b)
+    // must agree with the boolean operator: cmp < 0 ⇔ a < b. Anchors
+    // the cmp behaviour to the existing operator semantics so callers
+    // can mix the two without surprises.
+    let cmp_src = "import \"std.str\" as str\nfn t(a :: Str, b :: Str) -> Int { str.cmp(a, b) }\n";
+    let lt_src  = "fn t(a :: Str, b :: Str) -> Bool { a < b }\n";
+    let pairs: &[(&str, &str)] = &[
+        ("alpha", "beta"),
+        ("beta",  "alpha"),
+        ("",      "x"),
+        ("x",     ""),
+        ("foo",   "foo"),
+        ("foo",   "foobar"),
+    ];
+    for (a, b) in pairs {
+        let cmp = match run(cmp_src, "t", vec![s(a), s(b)]) {
+            Value::Int(n) => n,
+            other => panic!("cmp returned {other:?}"),
+        };
+        let lt = run(lt_src, "t", vec![s(a), s(b)]);
+        assert_eq!(lt, Value::Bool(cmp < 0),
+            "cmp({a:?}, {b:?}) = {cmp} but `a < b` = {lt:?}");
+    }
+}
+
 #[test]
 fn weather_app_still_typechecks_after_simplification() {
     // Sanity: the simplified weather app uses str.strip_prefix and

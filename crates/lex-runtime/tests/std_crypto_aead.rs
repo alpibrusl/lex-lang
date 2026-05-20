@@ -56,7 +56,7 @@ fn unwrap_err(v: Value) -> String {
 /// Unpack an AeadResult `{ ciphertext, tag }` record into Rust bytes.
 fn unwrap_aead_result(v: Value) -> (Vec<u8>, Vec<u8>) {
     let rec = match v {
-        Value::Record(r) => r,
+        Value::Record { fields: r, .. } => r,
         other => panic!("expected AeadResult record, got {other:?}"),
     };
     let ct = match rec.get("ciphertext") {

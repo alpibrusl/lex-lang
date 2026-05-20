@@ -60,6 +60,17 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                     Ty::bool(),
                 ));
             }
+            // str.cmp :: (Str, Str) -> Int — -1 / 0 / 1, lex-byte order.
+            // Three-way comparator usable as a sort-by closure value;
+            // boolean comparisons stay on the `<`/`<=`/`>`/`>=` operators
+            // (which already work on Str via `bin_ord`), so `str.lt`
+            // etc. are deliberately not exposed — keep the surface
+            // minimal (#440).
+            fields.insert("cmp".into(), Ty::function(
+                vec![Ty::str(), Ty::str()],
+                EffectSet::empty(),
+                Ty::int(),
+            ));
             // -- transformers --
             fields.insert("replace".into(), Ty::function(
                 vec![Ty::str(), Ty::str(), Ty::str()],
@@ -360,6 +371,21 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::singleton("time"),
                 Ty::Unit,
             ));
+            // sleep :: Duration -> [time] Unit (#445).
+            // Duration-typed sleep — pairs with the
+            // `datetime.duration_seconds` / `duration_minutes` /
+            // `duration_days` constructors so periodic-task code
+            // expresses the period in units of meaning rather than
+            // raw milliseconds. Backed by `std::thread::sleep` at
+            // runtime — blocks the calling thread, which is the right
+            // semantics for the agent-driven workloads this exists
+            // for. Inside a `net.serve` worker the same caveat as
+            // `LEX_NET_INLINE_VM=1` applies (worker is stalled for `d`).
+            fields.insert("sleep".into(), Ty::function(
+                vec![Ty::Con("Duration".into(), vec![])],
+                EffectSet::singleton("time"),
+                Ty::Unit,
+            ));
             Some(Ty::Record(fields))
         }
         "rand" => {
@@ -530,6 +556,52 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::open_var(0).union(&EffectSet::singleton("net")),
                 Ty::Unit,
             ));
+            // serve_ws_fn_actor[Eff] ::
+            //   (Int, Str,
+            //    (WsConn) -> Str,                        # name_of, registry name
+            //    (WsConn, WsMessage) -> [Eff] WsAction)  # on_message
+            //   -> [net, concurrent, Eff] Unit
+            //
+            // Variant of serve_ws_fn that registers each accepted
+            // connection as a named actor in conc_registry. Non-WS
+            // callers can then `conc.lookup(name) |> conc.tell(frame)`
+            // to push outbound frames into the socket from arbitrary
+            // [concurrent]-tagged code (HTTP webhooks, scheduled tasks,
+            // broadcast loops). Documented in #459.
+            //
+            // name_of is intentionally pure: it inspects the WsConn
+            // record (id / path / subprotocol) and decides what
+            // name to register the connection under. Empty string
+            // means "don't register this connection" — `on_message`
+            // still runs but no outbound handle is exposed.
+            //
+            // The result row carries `concurrent` because the runtime
+            // registers an `ActorHandler::Native` bridge in the conc
+            // registry; lookups from non-WS callers are themselves
+            // `[concurrent]` effects.
+            fields.insert("serve_ws_fn_actor".into(), Ty::function(
+                vec![
+                    Ty::int(),
+                    Ty::str(), // subprotocol
+                    Ty::function(
+                        vec![Ty::Con("WsConn".into(), vec![])],
+                        EffectSet::empty(),
+                        Ty::str(),
+                    ),
+                    Ty::function(
+                        vec![
+                            Ty::Con("WsConn".into(), vec![]),
+                            Ty::Con("WsMessage".into(), vec![]),
+                        ],
+                        EffectSet::open_var(0),
+                        Ty::Con("WsAction".into(), vec![]),
+                    ),
+                ],
+                EffectSet::open_var(0)
+                    .union(&EffectSet::singleton("net"))
+                    .union(&EffectSet::singleton("concurrent")),
+                Ty::Unit,
+            ));
             // dial_ws[Eff] :: (Str, Str, () -> [Eff] WsAction,
             //                  (WsMessage) -> [Eff] WsAction)
             //                  -> [net, Eff] Result[Unit, Str]
@@ -585,6 +657,215 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::open_var(0).union(&EffectSet::singleton("net")),
                 Ty::Unit,
             ));
+            // serve_routed[Eff] :: (
+            //     Int,
+            //     List[(Str, Str, (Request) -> [Eff] Response)],
+            //     (Request) -> [Eff] Response
+            //   ) -> [net, Eff] Unit
+            //
+            // Pattern-matched dispatch over `serve_fn`. Each route is a
+            // (method, path-pattern, handler) triple — method is an
+            // HTTP verb (case-insensitive) or "*" for any; path-patterns
+            // use `:name` segments (e.g. "/users/:id") and matched values
+            // are stamped onto `req.path_params` before the handler runs.
+            // Routes are tried in registration order; the first match
+            // wins. `fallback` runs when no route matches — typically a
+            // 404 responder. Same `open_var(0)` effect-row trick as
+            // `serve_fn` so handler effects propagate to the call site.
+            fields.insert("serve_routed".into(), Ty::function(
+                vec![
+                    Ty::int(),
+                    Ty::List(Box::new(Ty::Tuple(vec![
+                        Ty::str(),
+                        Ty::str(),
+                        Ty::function(
+                            vec![Ty::Con("Request".into(), vec![])],
+                            EffectSet::open_var(0),
+                            Ty::Con("Response".into(), vec![]),
+                        ),
+                    ]))),
+                    Ty::function(
+                        vec![Ty::Con("Request".into(), vec![])],
+                        EffectSet::open_var(0),
+                        Ty::Con("Response".into(), vec![]),
+                    ),
+                ],
+                EffectSet::open_var(0).union(&EffectSet::singleton("net")),
+                Ty::Unit,
+            ));
+
+            // ServeOpts is a structural record literal — callers build
+            // it with `{ http2: ..., inline_vm: ..., host: ... }`. Used
+            // by `serve_with` / `serve_fn_with` / `serve_routed_with`
+            // to replace the legacy LEX_NET_HTTP2 / LEX_NET_INLINE_VM
+            // env-var gates with a first-class, type-checked config.
+            // See lex-lang#497.
+            let serve_opts_t = || {
+                let mut fs = IndexMap::new();
+                fs.insert("http2".into(),     Ty::bool());
+                fs.insert("inline_vm".into(), Ty::bool());
+                fs.insert("host".into(),      Ty::str());
+                Ty::Record(fs)
+            };
+
+            // default_opts :: () -> ServeOpts
+            // Returns the same defaults the legacy serve* paths use —
+            // http2=false, inline_vm=false, host="0.0.0.0". Pure; the
+            // env-var fallback only applies on the legacy serve* path,
+            // not here.
+            fields.insert("default_opts".into(), Ty::function(
+                vec![],
+                EffectSet::empty(),
+                serve_opts_t(),
+            ));
+
+            // serve_with :: (Int, Str, ServeOpts) -> [net] Unit
+            fields.insert("serve_with".into(), Ty::function(
+                vec![Ty::int(), Ty::str(), serve_opts_t()],
+                EffectSet::singleton("net"),
+                Ty::Unit,
+            ));
+
+            // serve_fn_with[Eff] :: (Int, (Request) -> [Eff] Response, ServeOpts)
+            //                       -> [net, Eff] Unit
+            fields.insert("serve_fn_with".into(), Ty::function(
+                vec![
+                    Ty::int(),
+                    Ty::function(
+                        vec![Ty::Con("Request".into(), vec![])],
+                        EffectSet::open_var(0),
+                        Ty::Con("Response".into(), vec![]),
+                    ),
+                    serve_opts_t(),
+                ],
+                EffectSet::open_var(0).union(&EffectSet::singleton("net")),
+                Ty::Unit,
+            ));
+
+            // serve_routed_with[Eff] :: (
+            //   Int, List[(Str, Str, (Request) -> [Eff] Response)],
+            //   (Request) -> [Eff] Response, ServeOpts
+            // ) -> [net, Eff] Unit
+            fields.insert("serve_routed_with".into(), Ty::function(
+                vec![
+                    Ty::int(),
+                    Ty::List(Box::new(Ty::Tuple(vec![
+                        Ty::str(),
+                        Ty::str(),
+                        Ty::function(
+                            vec![Ty::Con("Request".into(), vec![])],
+                            EffectSet::open_var(0),
+                            Ty::Con("Response".into(), vec![]),
+                        ),
+                    ]))),
+                    Ty::function(
+                        vec![Ty::Con("Request".into(), vec![])],
+                        EffectSet::open_var(0),
+                        Ty::Con("Response".into(), vec![]),
+                    ),
+                    serve_opts_t(),
+                ],
+                EffectSet::open_var(0).union(&EffectSet::singleton("net")),
+                Ty::Unit,
+            ));
+
+            // serve_quic / serve_quic_fn / serve_quic_routed (#496).
+            // HTTP/3 over QUIC. TlsConfig is an opaque value built by
+            // `tls.from_pem_files` or `tls.self_signed` — it carries the
+            // server certificate chain + private key needed for the
+            // QUIC handshake (TLS is mandatory for HTTP/3). Effect row
+            // stays `[net]` for symmetry with `serve` / `serve_fn`;
+            // policy gates don't distinguish HTTP/1.1+2 (TCP) from
+            // HTTP/3 (UDP) at the effect level.
+            //
+            // serve_quic :: (Int, TlsConfig, Str) -> [net] Unit
+            fields.insert("serve_quic".into(), Ty::function(
+                vec![Ty::int(), Ty::Con("TlsConfig".into(), vec![]), Ty::str()],
+                EffectSet::singleton("net"),
+                Ty::Unit,
+            ));
+
+            // serve_quic_fn[Eff] :: (Int, TlsConfig,
+            //                        (Request) -> [Eff] Response)
+            //                       -> [net, Eff] Unit
+            fields.insert("serve_quic_fn".into(), Ty::function(
+                vec![
+                    Ty::int(),
+                    Ty::Con("TlsConfig".into(), vec![]),
+                    Ty::function(
+                        vec![Ty::Con("Request".into(), vec![])],
+                        EffectSet::open_var(0),
+                        Ty::Con("Response".into(), vec![]),
+                    ),
+                ],
+                EffectSet::open_var(0).union(&EffectSet::singleton("net")),
+                Ty::Unit,
+            ));
+
+            // serve_quic_routed[Eff] :: (
+            //   Int, TlsConfig,
+            //   List[(Str, Str, (Request) -> [Eff] Response)],
+            //   (Request) -> [Eff] Response
+            // ) -> [net, Eff] Unit
+            fields.insert("serve_quic_routed".into(), Ty::function(
+                vec![
+                    Ty::int(),
+                    Ty::Con("TlsConfig".into(), vec![]),
+                    Ty::List(Box::new(Ty::Tuple(vec![
+                        Ty::str(),
+                        Ty::str(),
+                        Ty::function(
+                            vec![Ty::Con("Request".into(), vec![])],
+                            EffectSet::open_var(0),
+                            Ty::Con("Response".into(), vec![]),
+                        ),
+                    ]))),
+                    Ty::function(
+                        vec![Ty::Con("Request".into(), vec![])],
+                        EffectSet::open_var(0),
+                        Ty::Con("Response".into(), vec![]),
+                    ),
+                ],
+                EffectSet::open_var(0).union(&EffectSet::singleton("net")),
+                Ty::Unit,
+            ));
+
+            Some(Ty::Record(fields))
+        }
+        // `tls` — TLS certificate handling for `net.serve_quic` (#496).
+        // `TlsConfig` is opaque to user code; the only ways to obtain
+        // one are these constructors. The runtime keeps the certificate
+        // chain + private key behind that opaque type so we can change
+        // the internal representation (record-of-bytes today, possibly
+        // a Resource handle tomorrow) without breaking source code.
+        "tls" => {
+            let mut fields = IndexMap::new();
+            // from_pem_files :: (Str, Str) -> [fs_read] Result[TlsConfig, Str]
+            //                    cert  key
+            // Load a PEM-encoded certificate chain + private key from
+            // disk. Both paths are read with the `[fs_read]` effect so
+            // policy gates can restrict where certs may come from.
+            fields.insert("from_pem_files".into(), Ty::function(
+                vec![Ty::str(), Ty::str()],
+                EffectSet::singleton("fs_read"),
+                Ty::Con("Result".into(), vec![
+                    Ty::Con("TlsConfig".into(), vec![]),
+                    Ty::str(),
+                ]),
+            ));
+            // self_signed :: Str -> Result[TlsConfig, Str]
+            // Generate a self-signed certificate for the given hostname
+            // (or "localhost"). Pure — no effects needed. Intended for
+            // local development and integration tests only; real
+            // deployments should use a CA-signed cert via from_pem_files.
+            fields.insert("self_signed".into(), Ty::function(
+                vec![Ty::str()],
+                EffectSet::empty(),
+                Ty::Con("Result".into(), vec![
+                    Ty::Con("TlsConfig".into(), vec![]),
+                    Ty::str(),
+                ]),
+            ));
             Some(Ty::Record(fields))
         }
         "chat" => {
@@ -636,6 +917,51 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 vec![actor_t(Ty::Var(0)), Ty::Var(1)],
                 EffectSet::singleton("concurrent"),
                 Ty::Unit,
+            ));
+            // #444 — named-actor discovery within a process.
+            //
+            // register :: Actor[S], Str -> [concurrent] Result[Unit, ConcError]
+            //   Returns Err(AlreadyRegistered(name)) if the name is
+            //   taken — registration is exclusive so name collisions
+            //   surface at the source level, not as silent overwrites.
+            //
+            // lookup :: Str -> [concurrent] Option[Actor[S]]
+            //   Returns Some(actor) if registered, None otherwise. The
+            //   static `[S]` parametrisation isn't checked at runtime in
+            //   v1; the caller is responsible for matching the
+            //   registration site's type. SigId-tagged variant deferred —
+            //   see `conc_registry.rs` in lex-bytecode.
+            //
+            // unregister :: Str -> [concurrent] Result[Unit, ConcError]
+            //   Returns Err(NotRegistered(name)) if absent. Existing
+            //   `Actor[S]` handles held by callers continue to work
+            //   after unregistration; the cell is reclaimed when the
+            //   last handle drops.
+            //
+            // registered :: () -> [concurrent] List[Str]
+            //   Sorted snapshot of currently registered names. Debug /
+            //   introspection — not part of the steady-state agent flow.
+            let conc_err = || Ty::Con("ConcError".into(), vec![]);
+            let result_ce = |ok: Ty| Ty::Con("Result".into(), vec![ok, conc_err()]);
+            fields.insert("register".into(), Ty::function(
+                vec![actor_t(Ty::Var(0)), Ty::str()],
+                EffectSet::singleton("concurrent"),
+                result_ce(Ty::Unit),
+            ));
+            fields.insert("lookup".into(), Ty::function(
+                vec![Ty::str()],
+                EffectSet::singleton("concurrent"),
+                Ty::Con("Option".into(), vec![actor_t(Ty::Var(0))]),
+            ));
+            fields.insert("unregister".into(), Ty::function(
+                vec![Ty::str()],
+                EffectSet::singleton("concurrent"),
+                result_ce(Ty::Unit),
+            ));
+            fields.insert("registered".into(), Ty::function(
+                vec![],
+                EffectSet::singleton("concurrent"),
+                Ty::List(Box::new(Ty::str())),
             ));
             Some(Ty::Record(fields))
         }
@@ -1195,6 +1521,12 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 vec![it(0), Ty::int()], EffectSet::empty(), it(0)));
             // to_list :: Iter[T] -> List[T]
             fields.insert("to_list".into(), Ty::function(
+                vec![it(0)], EffectSet::empty(),
+                Ty::List(Box::new(Ty::Var(0)))));
+            // collect :: Iter[T] -> List[T] — alias for `to_list`
+            // (matches Rust / Python / Kotlin naming so call sites
+            // coming from those languages don't have to re-learn).
+            fields.insert("collect".into(), Ty::function(
                 vec![it(0)], EffectSet::empty(),
                 Ty::List(Box::new(Ty::Var(0)))));
             // map :: [E] Iter[T], (T) -> [E] U -> [E] Iter[U]
@@ -2181,6 +2513,21 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::empty(),
                 result_he(Ty::str()),
             ));
+            // stream_lines :: Str, Map[Str, Str], Str -> [net] Result[Iter[Str], Str]
+            // Streaming HTTP POST; yields the response body line-by-line for
+            // SSE / NDJSON endpoints. Connection errors surface as Err(Str).
+            fields.insert("stream_lines".into(), Ty::function(
+                vec![
+                    Ty::str(),
+                    Ty::Con("Map".into(), vec![Ty::str(), Ty::str()]),
+                    Ty::str(),
+                ],
+                EffectSet::singleton("net"),
+                Ty::Con("Result".into(), vec![
+                    Ty::Con("Iter".into(), vec![Ty::str()]),
+                    Ty::str(),
+                ]),
+            ));
             Some(Ty::Record(fields))
         }
         "yaml" => {
@@ -2410,6 +2757,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "env" => "env",
         "bytes" => "bytes",
         "net" => "net",
+        "tls" => "tls",
         "chat" => "chat",
         "math" => "math",
         "map" => "map",

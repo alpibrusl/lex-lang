@@ -211,14 +211,17 @@ impl TypeEnv {
         });
 
         // Request = { method :: Str, path :: Str, query :: Str, body :: Str,
-        //             headers :: Map[Str, Str] }
+        //             headers :: Map[Str, Str], path_params :: Map[Str, Str] }
         // Inbound request shape used by net.serve_fn handlers.
+        // `path_params` is populated by `net.serve_routed` from `:name`
+        // segments in the route pattern; empty under `net.serve_fn`.
         let mut net_req_fields = IndexMap::new();
         net_req_fields.insert("method".into(), Ty::str());
         net_req_fields.insert("path".into(), Ty::str());
         net_req_fields.insert("query".into(), Ty::str());
         net_req_fields.insert("body".into(), Ty::str());
         net_req_fields.insert("headers".into(), Ty::Con("Map".into(), vec![Ty::str(), Ty::str()]));
+        net_req_fields.insert("path_params".into(), Ty::Con("Map".into(), vec![Ty::str(), Ty::str()]));
         e.types.insert("Request".into(), TypeDef {
             params: vec![],
             kind: TypeDefKind::Alias(Ty::Record(net_req_fields)),
@@ -295,6 +298,22 @@ impl TypeEnv {
         });
         for ctor in &["WsSend", "WsSendBinary", "WsNoOp"] {
             e.ctor_to_type.insert((*ctor).into(), "WsAction".into());
+        }
+
+        // ConcError = AlreadyRegistered(Str) | NotRegistered(Str)
+        // Returned by `conc.register` / `conc.unregister` (#444). A
+        // third `TypeMismatch` variant is reserved for when the
+        // SigId-tagged registry lands — see `conc_registry.rs` in
+        // lex-bytecode for the deferred-design note.
+        let mut ce_variants = IndexMap::new();
+        ce_variants.insert("AlreadyRegistered".into(), Some(Ty::str()));
+        ce_variants.insert("NotRegistered".into(), Some(Ty::str()));
+        e.types.insert("ConcError".into(), TypeDef {
+            params: vec![],
+            kind: TypeDefKind::Union(ce_variants),
+        });
+        for ctor in &["AlreadyRegistered", "NotRegistered"] {
+            e.ctor_to_type.insert((*ctor).into(), "ConcError".into());
         }
 
         e

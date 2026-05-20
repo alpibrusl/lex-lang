@@ -193,6 +193,17 @@ impl Embedder for HttpEmbedder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serialises every test in this module that reads or mutates
+    /// `LEX_EMBED_*`. Cargo runs `#[test]`s inside a binary in
+    /// parallel by default, and `set_var` / `remove_var` are
+    /// process-wide — without a guard, one test's mutation leaks
+    /// into another's `from_env()` and the assert fires
+    /// non-deterministically. Rust 2024 marks env mutation `unsafe`
+    /// for exactly this reason; this lock is what makes those
+    /// `unsafe` blocks actually sound.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn ollama_endpoint_is_built_from_base() {
@@ -217,19 +228,21 @@ mod tests {
 
     #[test]
     fn from_env_returns_none_without_url() {
-        // Test relies on the env var being unset; tests don't share
-        // global env so we explicitly remove it.
-        // SAFETY: tests in this module are single-threaded with
-        // respect to env; not the case for parallel tests in real
-        // Rust test runs but this single-process check is fine.
-        // (We'd use std::env::set_var via a mutex lock for shared
-        // env, but here we simply remove and re-check.)
-        unsafe { std::env::remove_var("LEX_EMBED_URL"); }
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: ENV_LOCK serialises every other env-touching test
+        // in this module, so no concurrent reader observes the
+        // mid-mutation state.
+        unsafe {
+            std::env::remove_var("LEX_EMBED_URL");
+            std::env::remove_var("LEX_EMBED_PROVIDER");
+        }
         assert!(HttpEmbedder::from_env().unwrap().is_none());
     }
 
     #[test]
     fn from_env_rejects_unknown_provider() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: see `from_env_returns_none_without_url`.
         unsafe {
             std::env::set_var("LEX_EMBED_URL", "http://example.com");
             std::env::set_var("LEX_EMBED_PROVIDER", "voyage");

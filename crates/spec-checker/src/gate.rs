@@ -270,7 +270,7 @@ fn eval_body(
             // wants to know about, not silently default.
             let v = eval_body(value, bindings, bc, policy, new_tracer)?;
             match v {
-                Value::Record(fields) => fields.get(field).cloned().ok_or_else(|| {
+                Value::Record { fields, .. } => fields.get(field).cloned().ok_or_else(|| {
                     let known: Vec<&str> = fields.keys().map(String::as_str).collect();
                     format!("field `{field}` missing on record (have: {})", known.join(", "))
                 }),
@@ -647,7 +647,7 @@ mod tests {
         for (k, v) in fields {
             m.insert((*k).into(), v.clone());
         }
-        Value::Record(m)
+        Value::record_dynamic(m)
     }
 
     #[test]
@@ -844,7 +844,7 @@ mod tests {
         session.insert("power".into(), Value::Int(50));
         session.insert("budget".into(), Value::Int(80));
         let allow = evaluate_gate(std::slice::from_ref(&spec), &b([
-            ("sessions", Value::List(vec![Value::Record(session.clone())].into())),
+            ("sessions", Value::List(vec![Value::record_dynamic(session.clone())].into())),
         ]), "");
         assert_eq!(allow, GateVerdict::Allow);
 
@@ -852,7 +852,7 @@ mod tests {
         over.insert("power".into(), Value::Int(120));
         over.insert("budget".into(), Value::Int(80));
         let deny = evaluate_gate(&[spec], &b([
-            ("sessions", Value::List(vec![Value::Record(over)].into())),
+            ("sessions", Value::List(vec![Value::record_dynamic(over)].into())),
         ]), "");
         assert!(matches!(deny, GateVerdict::Deny { .. }));
     }
@@ -1045,7 +1045,7 @@ mod tests {
         session.insert("power".into(), Value::Int(60));
         session.insert("budget".into(), Value::Int(100));
         let allow = evaluate_gate(std::slice::from_ref(&spec), &b([
-            ("msg", variant("Charge", vec![Value::Record(session)])),
+            ("msg", variant("Charge", vec![Value::record_dynamic(session)])),
         ]), "");
         assert_eq!(allow, GateVerdict::Allow);
 
@@ -1053,7 +1053,7 @@ mod tests {
         over.insert("power".into(), Value::Int(160));
         over.insert("budget".into(), Value::Int(100));
         let deny = evaluate_gate(&[spec], &b([
-            ("msg", variant("Charge", vec![Value::Record(over)])),
+            ("msg", variant("Charge", vec![Value::record_dynamic(over)])),
         ]), "");
         assert!(matches!(deny, GateVerdict::Deny { .. }));
     }

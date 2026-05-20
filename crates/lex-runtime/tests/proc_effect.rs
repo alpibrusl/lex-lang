@@ -31,7 +31,7 @@ fn run(src: &str, func: &str, args: Vec<Value>, policy: Policy) -> Result<Value,
 
 fn unwrap_record(v: &Value) -> &indexmap::IndexMap<String, Value> {
     match v {
-        Value::Record(r) => r,
+        Value::Record { fields: r, .. } => r,
         other => panic!("expected Record, got {other:?}"),
     }
 }

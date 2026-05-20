@@ -206,7 +206,7 @@ impl DefaultHandler {
                 }).collect();
                 let str_args = str_args?;
                 let opts = match args.get(2) {
-                    Some(Value::Record(r)) => r.clone(),
+                    Some(Value::Record { fields: r, .. }) => r.clone(),
                     _ => return Err("process.spawn: missing or invalid opts record".into()),
                 };
 
@@ -307,7 +307,7 @@ impl DefaultHandler {
                 {
                     rec.insert("signaled".into(), Value::Bool(false));
                 }
-                Ok(Value::Record(rec))
+                Ok(Value::record_dynamic(rec))
             }
             "kill" => {
                 let h = expect_process_handle(args.first())?;
@@ -355,7 +355,7 @@ impl DefaultHandler {
                             String::from_utf8_lossy(&o.stderr).into_owned().into()));
                         rec.insert("exit_code".into(), Value::Int(
                             o.status.code().unwrap_or(-1) as i64));
-                        Ok(ok(Value::Record(rec)))
+                        Ok(ok(Value::record_dynamic(rec)))
                     }
                     Err(e) => Ok(err(Value::Str(format!("process.run `{cmd}`: {e}").into()))),
                 }
@@ -438,7 +438,7 @@ impl DefaultHandler {
                         rec.insert("mtime".into(), Value::Int(mtime));
                         rec.insert("is_dir".into(), Value::Bool(md.is_dir()));
                         rec.insert("is_file".into(), Value::Bool(md.is_file()));
-                        Ok(ok(Value::Record(rec)))
+                        Ok(ok(Value::record_dynamic(rec)))
                     }
                     Err(e) => Ok(err(Value::Str(format!("fs.stat `{path}`: {e}").into()))),
                 }
@@ -782,7 +782,7 @@ impl EffectHandler for DefaultHandler {
                 other => Err(format!("unsupported stream.{other}")),
             };
         }
-        if kind == "http" && matches!(op, "send" | "get" | "post") {
+        if kind == "http" && matches!(op, "send" | "get" | "post" | "stream_lines") {
             self.ensure_kind_allowed("net")?;
             return match op {
                 "send" => {
@@ -800,6 +800,13 @@ impl EffectHandler for DefaultHandler {
                     let content_type = expect_str(args.get(2))?.to_string();
                     self.ensure_host_allowed(&url)?;
                     Ok(http_send_simple("POST", &url, Some(body), &content_type, None))
+                }
+                "stream_lines" => {
+                    let url = expect_str(args.first())?.to_string();
+                    let headers_val = args.get(1).cloned().unwrap_or(Value::Map(Default::default()));
+                    let body = expect_str(args.get(2))?.to_string();
+                    self.ensure_host_allowed(&url)?;
+                    Ok(http_stream_lines_impl(self, &url, &headers_val, &body))
                 }
                 _ => unreachable!(),
             };
@@ -881,6 +888,30 @@ impl EffectHandler for DefaultHandler {
             return match r {
                 Ok(_)  => Ok(ok(Value::Unit)),
                 Err(e) => Ok(err(Value::Str(e.into()))),
+            };
+        }
+        // `net.default_opts()` is a pure record constructor — typed
+        // with `EffectSet::empty()` in builtins.rs. Bypass the generic
+        // `ensure_kind_allowed("net")` gate so callers don't need to
+        // declare `[net]` just to build a ServeOpts literal default.
+        if kind == "net" && op == "default_opts" {
+            return Ok(ServeOpts::lex_defaults().to_value());
+        }
+        // `tls.*` (#496) — TlsConfig constructors map to different
+        // effect kinds than the namespace name suggests:
+        //   `tls.from_pem_files` :: [fs_read]   (reads cert + key PEM)
+        //   `tls.self_signed`    :: pure        (rcgen, in-memory)
+        // Intercept before the generic `ensure_kind_allowed("tls")`
+        // gate so policy can check the *real* effect. Same pattern
+        // as the `http.{send,get,post}` arms above.
+        if kind == "tls" {
+            return match op {
+                "from_pem_files" => {
+                    self.ensure_kind_allowed("fs_read")?;
+                    dispatch_tls_from_pem_files(self, args)
+                }
+                "self_signed" => dispatch_tls_self_signed(args),
+                other => Err(format!("unsupported tls.{other}")),
             };
         }
         self.ensure_kind_allowed(kind)?;
@@ -990,6 +1021,19 @@ impl EffectHandler for DefaultHandler {
                 }
                 Ok(Value::Unit)
             }
+            ("time", "sleep") => {
+                // Duration-typed sleep (#445). Duration values are
+                // backed by `Int` nanoseconds at runtime (see the
+                // `datetime.duration_*` constructors). Same 60s cap
+                // as `sleep_ms` — kept consistent so all blocking
+                // sleeps share one ceiling.
+                let nanos = expect_int(args.first())?;
+                if nanos > 0 {
+                    let bounded_nanos = (nanos as u64).min(60_000 * 1_000_000);
+                    std::thread::sleep(std::time::Duration::from_nanos(bounded_nanos));
+                }
+                Ok(Value::Unit)
+            }
             ("rand", "int_in") => {
                 // Deterministic stub: midpoint of [lo, hi].
                 let lo = expect_int(args.first())?;
@@ -1035,7 +1079,7 @@ impl EffectHandler for DefaultHandler {
                 let program = self.program.clone()
                     .ok_or_else(|| "net.serve requires a Program reference; use DefaultHandler::with_program".to_string())?;
                 let policy = self.policy.clone();
-                serve_http(port, handler_name, program, policy, None)
+                serve_http(port, handler_name, program, policy, None, ServeOpts::from_env())
             }
             ("net", "serve_fn") => {
                 let port = match args.first() {
@@ -1049,8 +1093,79 @@ impl EffectHandler for DefaultHandler {
                 let program = self.program.clone()
                     .ok_or_else(|| "net.serve_fn requires a Program reference; use DefaultHandler::with_program".to_string())?;
                 let policy = self.policy.clone();
-                serve_http_fn(port, closure, program, policy)
+                serve_http_fn(port, closure, program, policy, ServeOpts::from_env())
             }
+            ("net", "serve_routed") => {
+                let port = match args.first() {
+                    Some(Value::Int(n)) if (0..=65535).contains(n) => *n as u16,
+                    _ => return Err("net.serve_routed(port, routes, fallback): port must be Int 0..=65535".into()),
+                };
+                let routes_val = args.get(1).cloned()
+                    .ok_or_else(|| "net.serve_routed(port, routes, fallback): missing routes".to_string())?;
+                let fallback = match args.into_iter().nth(2) {
+                    Some(c @ Value::Closure { .. }) => c,
+                    _ => return Err("net.serve_routed(port, routes, fallback): fallback must be a closure".into()),
+                };
+                let routes = decode_routes_arg(routes_val)?;
+                let program = self.program.clone()
+                    .ok_or_else(|| "net.serve_routed requires a Program reference; use DefaultHandler::with_program".to_string())?;
+                let policy = self.policy.clone();
+                serve_http_routed(port, routes, fallback, program, policy, ServeOpts::from_env())
+            }
+            ("net", "serve_with") => {
+                // serve_with(port, handler_name, opts)
+                let port = match args.first() {
+                    Some(Value::Int(n)) if (0..=65535).contains(n) => *n as u16,
+                    _ => return Err("net.serve_with(port, handler, opts): port must be Int 0..=65535".into()),
+                };
+                let handler_name = expect_str(args.get(1))?.to_string();
+                let opts = decode_serve_opts(args.get(2)
+                    .ok_or_else(|| "net.serve_with(port, handler, opts): missing opts".to_string())?)?;
+                let program = self.program.clone()
+                    .ok_or_else(|| "net.serve_with requires a Program reference; use DefaultHandler::with_program".to_string())?;
+                let policy = self.policy.clone();
+                serve_http(port, handler_name, program, policy, None, opts)
+            }
+            ("net", "serve_fn_with") => {
+                // serve_fn_with(port, handler_closure, opts)
+                let port = match args.first() {
+                    Some(Value::Int(n)) if (0..=65535).contains(n) => *n as u16,
+                    _ => return Err("net.serve_fn_with(port, handler, opts): port must be Int 0..=65535".into()),
+                };
+                let opts = decode_serve_opts(args.get(2)
+                    .ok_or_else(|| "net.serve_fn_with(port, handler, opts): missing opts".to_string())?)?;
+                let closure = match args.into_iter().nth(1) {
+                    Some(c @ Value::Closure { .. }) => c,
+                    _ => return Err("net.serve_fn_with(port, handler, opts): handler must be a closure".into()),
+                };
+                let program = self.program.clone()
+                    .ok_or_else(|| "net.serve_fn_with requires a Program reference; use DefaultHandler::with_program".to_string())?;
+                let policy = self.policy.clone();
+                serve_http_fn(port, closure, program, policy, opts)
+            }
+            ("net", "serve_routed_with") => {
+                // serve_routed_with(port, routes, fallback, opts)
+                let port = match args.first() {
+                    Some(Value::Int(n)) if (0..=65535).contains(n) => *n as u16,
+                    _ => return Err("net.serve_routed_with(port, routes, fallback, opts): port must be Int 0..=65535".into()),
+                };
+                let routes_val = args.get(1).cloned()
+                    .ok_or_else(|| "net.serve_routed_with(port, routes, fallback, opts): missing routes".to_string())?;
+                let opts = decode_serve_opts(args.get(3)
+                    .ok_or_else(|| "net.serve_routed_with(port, routes, fallback, opts): missing opts".to_string())?)?;
+                let fallback = match args.into_iter().nth(2) {
+                    Some(c @ Value::Closure { .. }) => c,
+                    _ => return Err("net.serve_routed_with(port, routes, fallback, opts): fallback must be a closure".into()),
+                };
+                let routes = decode_routes_arg(routes_val)?;
+                let program = self.program.clone()
+                    .ok_or_else(|| "net.serve_routed_with requires a Program reference; use DefaultHandler::with_program".to_string())?;
+                let policy = self.policy.clone();
+                serve_http_routed(port, routes, fallback, program, policy, opts)
+            }
+            ("net", "serve_quic") => self.dispatch_serve_quic_named(args),
+            ("net", "serve_quic_fn") => self.dispatch_serve_quic_fn(args),
+            ("net", "serve_quic_routed") => self.dispatch_serve_quic_routed(args),
             ("net", "serve_tls") => {
                 let port = match args.first() {
                     Some(Value::Int(n)) if (0..=65535).contains(n) => *n as u16,
@@ -1066,7 +1181,7 @@ impl EffectHandler for DefaultHandler {
                     .map_err(|e| format!("net.serve_tls: read cert {cert_path}: {e}"))?;
                 let key = std::fs::read(&key_path)
                     .map_err(|e| format!("net.serve_tls: read key {key_path}: {e}"))?;
-                serve_http(port, handler_name, program, policy, Some(TlsConfig { cert, key }))
+                serve_http(port, handler_name, program, policy, Some(TlsConfig { cert, key }), ServeOpts::from_env())
             }
             ("net", "serve_ws") => {
                 let port = match args.first() {
@@ -1118,6 +1233,31 @@ impl EffectHandler for DefaultHandler {
                 let registry = Arc::new(crate::ws::ChatRegistry::default());
                 crate::ws::serve_ws_fn_auth(
                     port, subprotocol, auth_closure, handler_closure,
+                    program, policy, registry,
+                )
+            }
+            ("net", "serve_ws_fn_actor") => {
+                // serve_ws_fn_actor(port, subprotocol, name_of, on_message)
+                let port = match args.first() {
+                    Some(Value::Int(n)) if (0..=65535).contains(n) => *n as u16,
+                    _ => return Err("net.serve_ws_fn_actor(port, subprotocol, name_of, on_message): port must be Int 0..=65535".into()),
+                };
+                let subprotocol = expect_str(args.get(1))?.to_string();
+                let mut it = args.into_iter().skip(2);
+                let name_of_closure = match it.next() {
+                    Some(c @ Value::Closure { .. }) => c,
+                    _ => return Err("net.serve_ws_fn_actor(port, subprotocol, name_of, on_message): name_of must be a closure".into()),
+                };
+                let on_message_closure = match it.next() {
+                    Some(c @ Value::Closure { .. }) => c,
+                    _ => return Err("net.serve_ws_fn_actor(port, subprotocol, name_of, on_message): on_message must be a closure".into()),
+                };
+                let program = self.program.clone()
+                    .ok_or_else(|| "net.serve_ws_fn_actor requires a Program reference; use DefaultHandler::with_program".to_string())?;
+                let policy = self.policy.clone();
+                let registry = Arc::new(crate::ws::ChatRegistry::default());
+                crate::ws::serve_ws_fn_actor(
+                    port, subprotocol, name_of_closure, on_message_closure,
                     program, policy, registry,
                 )
             }
@@ -1586,7 +1726,7 @@ impl EffectHandler for DefaultHandler {
                             String::from_utf8_lossy(&o.stderr).into_owned().into()));
                         rec.insert("exit_code".into(), Value::Int(
                             o.status.code().unwrap_or(-1) as i64));
-                        Ok(ok(Value::Record(rec)))
+                        Ok(ok(Value::record_dynamic(rec)))
                     }
                     Err(e) => Ok(err(Value::Str(format!("spawn `{cmd}`: {e}").into()))),
                 }
@@ -1656,9 +1796,10 @@ fn serve_http(
     program: Arc<Program>,
     policy: Policy,
     tls: Option<TlsConfig>,
+    opts: ServeOpts,
 ) -> Result<Value, String> {
     match tls {
-        None => serve_http_plain(port, handler_name, program, policy),
+        None => serve_http_plain(port, handler_name, program, policy, opts),
         Some(cfg) => serve_http_tls_legacy(port, handler_name, program, policy, cfg),
     }
 }
@@ -1677,25 +1818,30 @@ fn serve_http_plain(
     handler_name: String,
     program: Arc<Program>,
     policy: Policy,
+    opts: ServeOpts,
 ) -> Result<Value, String> {
     use http_body_util::BodyExt as _;
     use hyper::server::conn::http1;
     use hyper::service::service_fn;
-    use hyper_util::rt::TokioIo;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto;
     use tokio::net::TcpListener as TokioTcpListener;
 
-    let inline_vm = env_inline_vm();
+    let inline_vm = opts.inline_vm;
+    let http2 = opts.http2;
+    let host = opts.host.clone();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("net.serve: tokio runtime: {e}"))?;
     rt.block_on(async move {
-        let listener = TokioTcpListener::bind(("0.0.0.0", port))
+        let listener = TokioTcpListener::bind((host.as_str(), port))
             .await
-            .map_err(|e| format!("net.serve bind {port}: {e}"))?;
+            .map_err(|e| format!("net.serve bind {host}:{port}: {e}"))?;
         eprintln!(
-            "net.serve: listening on http://0.0.0.0:{port}{}",
-            if inline_vm { " (inline-vm)" } else { "" }
+            "net.serve: listening on http://{host}:{port}{}{}",
+            if inline_vm { " (inline-vm)" } else { "" },
+            if http2 { " (http1+http2)" } else { "" }
         );
         loop {
             let (stream, _) = listener
@@ -1729,14 +1875,18 @@ fn serve_http_plain(
                             let handler = DefaultHandler::new(policy)
                                 .with_program(Arc::clone(&program));
                             let mut vm = Vm::with_handler(&program, Box::new(handler));
-                            Ok(vm.call(&handler_name, vec![lex_req]))
+                            let r = vm.call(&handler_name, vec![lex_req]);
+                            // Drain any lazy iter in the response body
+                            // while the VM is still in scope — see #477.
+                            Ok(r.map(|mut v| { materialize_response_body(&mut vm, &mut v); v }))
                         } else {
                             tokio::task::spawn_blocking(move || {
                                 let lex_req = build_request_value_parts(&parts, &body_bytes);
                                 let handler = DefaultHandler::new(policy)
                                     .with_program(Arc::clone(&program));
                                 let mut vm = Vm::with_handler(&program, Box::new(handler));
-                                vm.call(&handler_name, vec![lex_req])
+                                let r = vm.call(&handler_name, vec![lex_req]);
+                                r.map(|mut v| { materialize_response_body(&mut vm, &mut v); v })
                             })
                             .await
                         };
@@ -1747,7 +1897,18 @@ fn serve_http_plain(
                         })
                     }
                 });
-                if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+                let result = if http2 {
+                    auto::Builder::new(TokioExecutor::new())
+                        .serve_connection(io, svc)
+                        .await
+                        .map_err(|e| e.to_string())
+                } else {
+                    http1::Builder::new()
+                        .serve_connection(io, svc)
+                        .await
+                        .map_err(|e| e.to_string())
+                };
+                if let Err(e) = result {
                     eprintln!("net.serve: connection error: {e}");
                 }
             });
@@ -1789,7 +1950,10 @@ fn handle_request_tls(
     let handler = DefaultHandler::new(policy).with_program(Arc::clone(&program));
     let mut vm = Vm::with_handler(&program, Box::new(handler));
     match vm.call(&handler_name, vec![lex_req]) {
-        Ok(resp) => {
+        Ok(mut resp) => {
+            // Drain any lazy iter in the response body while the VM is
+            // still in scope — see #477.
+            materialize_response_body(&mut vm, &mut resp);
             let (status, body, headers) = unpack_response(&resp);
             respond_with_body_tls(req, status, body, headers);
         }
@@ -1810,25 +1974,30 @@ fn serve_http_fn(
     closure: Value,
     program: Arc<Program>,
     policy: Policy,
+    opts: ServeOpts,
 ) -> Result<Value, String> {
     use http_body_util::BodyExt as _;
     use hyper::server::conn::http1;
     use hyper::service::service_fn;
-    use hyper_util::rt::TokioIo;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto;
     use tokio::net::TcpListener as TokioTcpListener;
 
-    let inline_vm = env_inline_vm();
+    let inline_vm = opts.inline_vm;
+    let http2 = opts.http2;
+    let host = opts.host.clone();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("net.serve_fn: tokio runtime: {e}"))?;
     rt.block_on(async move {
-        let listener = TokioTcpListener::bind(("0.0.0.0", port))
+        let listener = TokioTcpListener::bind((host.as_str(), port))
             .await
-            .map_err(|e| format!("net.serve_fn bind {port}: {e}"))?;
+            .map_err(|e| format!("net.serve_fn bind {host}:{port}: {e}"))?;
         eprintln!(
-            "net.serve_fn: listening on http://0.0.0.0:{port}{}",
-            if inline_vm { " (inline-vm)" } else { "" }
+            "net.serve_fn: listening on http://{host}:{port}{}{}",
+            if inline_vm { " (inline-vm)" } else { "" },
+            if http2 { " (http1+http2)" } else { "" }
         );
         loop {
             let (stream, _) = listener
@@ -1859,14 +2028,18 @@ fn serve_http_fn(
                             let handler = DefaultHandler::new(policy)
                                 .with_program(Arc::clone(&program));
                             let mut vm = Vm::with_handler(&program, Box::new(handler));
-                            Ok(vm.invoke_closure_value(closure, vec![lex_req]))
+                            let r = vm.invoke_closure_value(closure, vec![lex_req]);
+                            // Drain any lazy iter in the response body
+                            // while the VM is still in scope — see #477.
+                            Ok(r.map(|mut v| { materialize_response_body(&mut vm, &mut v); v }))
                         } else {
                             tokio::task::spawn_blocking(move || {
                                 let lex_req = build_request_value_parts(&parts, &body_bytes);
                                 let handler = DefaultHandler::new(policy)
                                     .with_program(Arc::clone(&program));
                                 let mut vm = Vm::with_handler(&program, Box::new(handler));
-                                vm.invoke_closure_value(closure, vec![lex_req])
+                                let r = vm.invoke_closure_value(closure, vec![lex_req]);
+                                r.map(|mut v| { materialize_response_body(&mut vm, &mut v); v })
                             })
                             .await
                         };
@@ -1877,8 +2050,288 @@ fn serve_http_fn(
                         })
                     }
                 });
-                if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+                let result = if http2 {
+                    auto::Builder::new(TokioExecutor::new())
+                        .serve_connection(io, svc)
+                        .await
+                        .map_err(|e| e.to_string())
+                } else {
+                    http1::Builder::new()
+                        .serve_connection(io, svc)
+                        .await
+                        .map_err(|e| e.to_string())
+                };
+                if let Err(e) = result {
                     eprintln!("net.serve_fn: connection error: {e}");
+                }
+            });
+        }
+    })
+}
+
+/// Compiled segment of a route pattern. Patterns are split on `/`
+/// once at registration time so the per-request match loop is just a
+/// length check + segment-by-segment compare.
+#[derive(Clone, Debug)]
+pub(crate) enum RouteSeg {
+    Literal(String),
+    /// `:name` capture — binds the request segment under `name` in
+    /// `req.path_params`.
+    Param(String),
+}
+
+/// Compile a `:name`-style pattern (e.g. `"/users/:id/posts"`) into a
+/// segment list. Errors out at registration time so bad patterns
+/// surface before the server binds, not on the first matching request.
+fn compile_path_pattern(pat: &str) -> Result<Vec<RouteSeg>, String> {
+    if pat.is_empty() {
+        return Err("path pattern must be non-empty (use \"/\" for the root)".into());
+    }
+    if !pat.starts_with('/') {
+        return Err(format!("path pattern must start with '/' (got {pat:?})"));
+    }
+    let mut segs = Vec::new();
+    for raw in pat.split('/') {
+        if let Some(name) = raw.strip_prefix(':') {
+            if name.is_empty() {
+                return Err(format!(
+                    ":-segment in pattern {pat:?} must have a name (e.g. :id)"
+                ));
+            }
+            segs.push(RouteSeg::Param(name.to_string()));
+        } else {
+            segs.push(RouteSeg::Literal(raw.to_string()));
+        }
+    }
+    Ok(segs)
+}
+
+/// Attempt to match a request `path` against a compiled pattern. On
+/// success returns the captured `:name` segments as a Lex-shaped map
+/// keyed by `MapKey::Str(name)`; on mismatch returns `None`. Strict
+/// segment-count match: trailing slashes matter (caller registers
+/// both forms if both should match).
+fn match_path_pattern(
+    segs: &[RouteSeg],
+    path: &str,
+) -> Option<std::collections::BTreeMap<lex_bytecode::MapKey, Value>> {
+    let path_segs: Vec<&str> = path.split('/').collect();
+    if path_segs.len() != segs.len() {
+        return None;
+    }
+    let mut params = std::collections::BTreeMap::new();
+    for (pat, p) in segs.iter().zip(path_segs.iter()) {
+        match pat {
+            RouteSeg::Literal(lit) => {
+                if lit != p {
+                    return None;
+                }
+            }
+            RouteSeg::Param(name) => {
+                params.insert(
+                    lex_bytecode::MapKey::Str(name.clone()),
+                    Value::Str((*p).into()),
+                );
+            }
+        }
+    }
+    Some(params)
+}
+
+/// Decode the `routes` argument of `net.serve_routed` into a vector
+/// of `(uppercased-method-or-"*", compiled-pattern, handler-closure)`.
+/// Validates and pre-compiles up front so malformed routes fail before
+/// the server starts.
+fn decode_routes_arg(
+    v: Value,
+) -> Result<Vec<(String, Vec<RouteSeg>, Value)>, String> {
+    let list = match v {
+        Value::List(xs) => xs,
+        _ => return Err("net.serve_routed: routes must be a List".into()),
+    };
+    let mut out = Vec::with_capacity(list.len());
+    for (i, item) in list.into_iter().enumerate() {
+        let tup = match item {
+            Value::Tuple(xs) if xs.len() == 3 => xs,
+            other => return Err(format!(
+                "net.serve_routed: route #{i} must be a (method, pattern, handler) 3-tuple, got {other:?}"
+            )),
+        };
+        let mut it = tup.into_iter();
+        let method_raw = match it.next() {
+            Some(Value::Str(s)) => s.to_string(),
+            _ => return Err(format!("net.serve_routed: route #{i} method must be Str")),
+        };
+        // Normalise method to uppercase for matching. "*" stays as-is.
+        let method = if method_raw == "*" { method_raw } else { method_raw.to_uppercase() };
+        let pattern = match it.next() {
+            Some(Value::Str(s)) => s.to_string(),
+            _ => return Err(format!("net.serve_routed: route #{i} path-pattern must be Str")),
+        };
+        let segs = compile_path_pattern(&pattern)
+            .map_err(|e| format!("net.serve_routed: route #{i} ({pattern:?}): {e}"))?;
+        let closure = match it.next() {
+            Some(c @ Value::Closure { .. }) => c,
+            _ => return Err(format!("net.serve_routed: route #{i} handler must be a closure")),
+        };
+        out.push((method, segs, closure));
+    }
+    Ok(out)
+}
+
+/// Pick the first matching route for `(method, path)` and return its
+/// handler closure plus captured path-params. Method match is
+/// case-insensitive vs the request (already uppercased at decode
+/// time); `"*"` in a route matches any method.
+pub(crate) fn dispatch_route<'a>(
+    routes: &'a [(String, Vec<RouteSeg>, Value)],
+    req_method: &str,
+    req_path: &str,
+) -> Option<(&'a Value, std::collections::BTreeMap<lex_bytecode::MapKey, Value>)> {
+    let req_method_upper = req_method.to_ascii_uppercase();
+    for (m, segs, closure) in routes {
+        if m != "*" && m != &req_method_upper {
+            continue;
+        }
+        if let Some(params) = match_path_pattern(segs, req_path) {
+            return Some((closure, params));
+        }
+    }
+    None
+}
+
+/// Overwrite the `path_params` field on a Request record with the
+/// captured map. Request records are always built with an empty
+/// `path_params` field, so this just updates the existing slot.
+pub(crate) fn stamp_path_params(
+    req: &mut Value,
+    params: std::collections::BTreeMap<lex_bytecode::MapKey, Value>,
+) {
+    if let Value::Record { fields: rec, .. } = req {
+        rec.insert("path_params".into(), Value::Map(params));
+    }
+}
+
+/// Hyper 1.x + Tokio multi-thread HTTP/1.1 server for `net.serve_routed`.
+/// Mirrors `serve_http_fn` (#431 inline-vm gate also applies); the only
+/// difference is that route dispatch picks the closure per-request from
+/// the precompiled `routes` table, falling back to the `fallback`
+/// closure when no route matches.
+fn serve_http_routed(
+    port: u16,
+    routes: Vec<(String, Vec<RouteSeg>, Value)>,
+    fallback: Value,
+    program: Arc<Program>,
+    policy: Policy,
+    opts: ServeOpts,
+) -> Result<Value, String> {
+    use http_body_util::BodyExt as _;
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto;
+    use tokio::net::TcpListener as TokioTcpListener;
+
+    let inline_vm = opts.inline_vm;
+    let http2 = opts.http2;
+    let host = opts.host.clone();
+    let routes = Arc::new(routes);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("net.serve_routed: tokio runtime: {e}"))?;
+    rt.block_on(async move {
+        let listener = TokioTcpListener::bind((host.as_str(), port))
+            .await
+            .map_err(|e| format!("net.serve_routed bind {host}:{port}: {e}"))?;
+        eprintln!(
+            "net.serve_routed: listening on http://{host}:{port} ({} routes{}{})",
+            routes.len(),
+            if inline_vm { ", inline-vm" } else { "" },
+            if http2 { ", http1+http2" } else { "" }
+        );
+        loop {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .map_err(|e| format!("net.serve_routed accept: {e}"))?;
+            let io = TokioIo::new(stream);
+            let program = Arc::clone(&program);
+            let policy = policy.clone();
+            let routes = Arc::clone(&routes);
+            let fallback = fallback.clone();
+            tokio::spawn(async move {
+                let program2 = Arc::clone(&program);
+                let policy2 = policy.clone();
+                let routes2 = Arc::clone(&routes);
+                let fallback2 = fallback.clone();
+                let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                    let program = Arc::clone(&program2);
+                    let policy = policy2.clone();
+                    let routes = Arc::clone(&routes2);
+                    let fallback = fallback2.clone();
+                    async move {
+                        let (parts, body) = req.into_parts();
+                        let body_bytes = body
+                            .collect()
+                            .await
+                            .map(|c| c.to_bytes())
+                            .unwrap_or_default();
+                        let method = parts.method.as_str().to_string();
+                        let path = match parts.uri.path() {
+                            "" => "/".to_string(),
+                            p => p.to_string(),
+                        };
+                        let result = if inline_vm {
+                            let mut lex_req = build_request_value_parts(&parts, &body_bytes);
+                            let (closure, params) = match dispatch_route(&routes, &method, &path) {
+                                Some((c, p)) => (c.clone(), p),
+                                None => (fallback.clone(), std::collections::BTreeMap::new()),
+                            };
+                            stamp_path_params(&mut lex_req, params);
+                            let handler = DefaultHandler::new(policy)
+                                .with_program(Arc::clone(&program));
+                            let mut vm = Vm::with_handler(&program, Box::new(handler));
+                            let r = vm.invoke_closure_value(closure, vec![lex_req]);
+                            // Drain any lazy iter in the response body
+                            // while the VM is still in scope — see #477.
+                            Ok(r.map(|mut v| { materialize_response_body(&mut vm, &mut v); v }))
+                        } else {
+                            tokio::task::spawn_blocking(move || {
+                                let mut lex_req = build_request_value_parts(&parts, &body_bytes);
+                                let (closure, params) = match dispatch_route(&routes, &method, &path) {
+                                    Some((c, p)) => (c.clone(), p),
+                                    None => (fallback.clone(), std::collections::BTreeMap::new()),
+                                };
+                                stamp_path_params(&mut lex_req, params);
+                                let handler = DefaultHandler::new(policy)
+                                    .with_program(Arc::clone(&program));
+                                let mut vm = Vm::with_handler(&program, Box::new(handler));
+                                let r = vm.invoke_closure_value(closure, vec![lex_req]);
+                                r.map(|mut v| { materialize_response_body(&mut vm, &mut v); v })
+                            })
+                            .await
+                        };
+                        Ok::<_, std::convert::Infallible>(match result {
+                            Ok(Ok(resp)) => build_hyper_response(&resp),
+                            Ok(Err(e)) => error_response(500, &format!("internal error: {e}")),
+                            Err(e) => error_response(500, &format!("task panicked: {e}")),
+                        })
+                    }
+                });
+                let result = if http2 {
+                    auto::Builder::new(TokioExecutor::new())
+                        .serve_connection(io, svc)
+                        .await
+                        .map_err(|e| e.to_string())
+                } else {
+                    http1::Builder::new()
+                        .serve_connection(io, svc)
+                        .await
+                        .map_err(|e| e.to_string())
+                };
+                if let Err(e) = result {
+                    eprintln!("net.serve_routed: connection error: {e}");
                 }
             });
         }
@@ -1899,17 +2352,262 @@ fn env_inline_vm() -> bool {
     }
 }
 
+/// Server-config record threaded through `serve_http_plain` / `_fn` /
+/// `_routed`. Built from env vars on the legacy `net.serve*` paths
+/// (`ServeOpts::from_env`) or decoded from a user-supplied Lex record
+/// literal on the new `net.serve*_with` paths (`decode_serve_opts`).
+/// See lex-lang#497 for the design rationale.
+#[derive(Debug, Clone)]
+pub(crate) struct ServeOpts {
+    pub(crate) http2: bool,
+    pub(crate) inline_vm: bool,
+    pub(crate) host: String,
+}
+
+impl ServeOpts {
+    /// Default values that match the legacy behaviour with env vars
+    /// honoured. Use this when entering via `net.serve`, `net.serve_fn`,
+    /// or `net.serve_routed` — preserves backwards compatibility.
+    fn from_env() -> Self {
+        Self {
+            http2: env_http2(),
+            inline_vm: env_inline_vm(),
+            host: "0.0.0.0".to_string(),
+        }
+    }
+
+    /// Hard-coded defaults returned by `net.default_opts()`. Does NOT
+    /// consult env vars — the `*_with` paths read the opts record
+    /// literally, so the env-var escape hatch only applies to legacy
+    /// callers (`net.serve` et al).
+    fn lex_defaults() -> Self {
+        Self {
+            http2: false,
+            inline_vm: false,
+            host: "0.0.0.0".to_string(),
+        }
+    }
+
+    /// Convert to a Lex `Value::Record` for return from `default_opts()`.
+    fn to_value(&self) -> Value {
+        let mut rec = indexmap::IndexMap::new();
+        rec.insert("http2".to_string(),     Value::Bool(self.http2));
+        rec.insert("inline_vm".to_string(), Value::Bool(self.inline_vm));
+        rec.insert("host".to_string(),      Value::Str(self.host.clone().into()));
+        Value::record_dynamic(rec)
+    }
+}
+
+/// Decode a `ServeOpts` from a Lex record literal. Fields are
+/// required — the type-checker has already verified the shape, so
+/// here we just project them out. Any deviation from the expected
+/// shape is treated as an internal-consistency error.
+fn decode_serve_opts(v: &Value) -> Result<ServeOpts, String> {
+    let rec = match v {
+        Value::Record { fields: r, .. } => r,
+        other => return Err(format!("opts must be a Record, got {other:?}")),
+    };
+    let http2 = match rec.get("http2") {
+        Some(Value::Bool(b)) => *b,
+        _ => return Err("opts.http2 must be Bool".into()),
+    };
+    let inline_vm = match rec.get("inline_vm") {
+        Some(Value::Bool(b)) => *b,
+        _ => return Err("opts.inline_vm must be Bool".into()),
+    };
+    let host = match rec.get("host") {
+        Some(Value::Str(s)) => s.to_string(),
+        _ => return Err("opts.host must be Str".into()),
+    };
+    Ok(ServeOpts { http2, inline_vm, host })
+}
+
+// ── tls.* and net.serve_quic* dispatch helpers (#496) ──────────────
+//
+// `TlsConfig` is opaque in the type system (a `Ty::Con("TlsConfig",…)`)
+// but at runtime it's a `Value::Record({cert :: Bytes, key :: Bytes})`
+// carrying the PEM-encoded chain + private key. The opacity matters
+// because we may switch the in-runtime representation to a Resource
+// handle later (e.g. to keep the private key out of GC-visible
+// memory) without breaking source code.
+
+fn make_tls_config_value(cert_pem: Vec<u8>, key_pem: Vec<u8>) -> Value {
+    let mut rec = indexmap::IndexMap::new();
+    rec.insert("cert".into(), Value::Bytes(cert_pem));
+    rec.insert("key".into(),  Value::Bytes(key_pem));
+    Value::record_dynamic(rec)
+}
+
+#[cfg(feature = "quic")]
+fn decode_tls_config(v: &Value) -> Result<crate::quic::QuicTls, String> {
+    let rec = match v {
+        Value::Record { fields: r, .. } => r,
+        other => return Err(format!("TlsConfig: expected Record, got {other:?}")),
+    };
+    let cert = match rec.get("cert") {
+        Some(Value::Bytes(b)) => b.to_vec(),
+        _ => return Err("TlsConfig.cert: must be Bytes".into()),
+    };
+    let key = match rec.get("key") {
+        Some(Value::Bytes(b)) => b.to_vec(),
+        _ => return Err("TlsConfig.key: must be Bytes".into()),
+    };
+    Ok(crate::quic::QuicTls { cert_pem: cert, key_pem: key })
+}
+
+fn dispatch_tls_from_pem_files(
+    handler: &DefaultHandler,
+    args: Vec<Value>,
+) -> Result<Value, String> {
+    let cert_path = expect_str(args.first())?.to_string();
+    let key_path  = expect_str(args.get(1))?.to_string();
+    let cert_resolved = handler.resolve_read_path(&cert_path);
+    let key_resolved  = handler.resolve_read_path(&key_path);
+    if !handler.policy.allow_fs_read.is_empty() {
+        let allowed = |p: &std::path::Path| -> bool {
+            handler.policy.allow_fs_read.iter().any(|a| p.starts_with(a))
+        };
+        if !allowed(&cert_resolved) {
+            return Ok(err(Value::Str(
+                format!("tls.from_pem_files: cert `{cert_path}` outside --allow-fs-read").into(),
+            )));
+        }
+        if !allowed(&key_resolved) {
+            return Ok(err(Value::Str(
+                format!("tls.from_pem_files: key `{key_path}` outside --allow-fs-read").into(),
+            )));
+        }
+    }
+    let cert = match std::fs::read(&cert_resolved) {
+        Ok(b) => b,
+        Err(e) => return Ok(err(Value::Str(format!("read cert {cert_path}: {e}").into()))),
+    };
+    let key = match std::fs::read(&key_resolved) {
+        Ok(b) => b,
+        Err(e) => return Ok(err(Value::Str(format!("read key {key_path}: {e}").into()))),
+    };
+    Ok(ok(make_tls_config_value(cert, key)))
+}
+
+#[cfg(feature = "quic")]
+fn dispatch_tls_self_signed(args: Vec<Value>) -> Result<Value, String> {
+    let hostname = expect_str(args.first())?.to_string();
+    match crate::quic::self_signed_pem(&hostname) {
+        Ok((cert, key)) => Ok(ok(make_tls_config_value(cert, key))),
+        Err(e) => Ok(err(Value::Str(format!("tls.self_signed: {e}").into()))),
+    }
+}
+
+#[cfg(not(feature = "quic"))]
+fn dispatch_tls_self_signed(_args: Vec<Value>) -> Result<Value, String> {
+    Ok(err(Value::Str(
+        "tls.self_signed: lex-runtime was compiled without the `quic` feature (needed for rcgen)".into(),
+    )))
+}
+
+impl DefaultHandler {
+    #[cfg(feature = "quic")]
+    fn dispatch_serve_quic_named(&self, args: Vec<Value>) -> Result<Value, String> {
+        let port = match args.first() {
+            Some(Value::Int(n)) if (0..=65535).contains(n) => *n as u16,
+            _ => return Err("net.serve_quic(port, tls, handler): port must be Int 0..=65535".into()),
+        };
+        let tls = decode_tls_config(args.get(1)
+            .ok_or_else(|| "net.serve_quic(port, tls, handler): missing tls".to_string())?)?;
+        let handler_name = expect_str(args.get(2))?.to_string();
+        let program = self.program.clone()
+            .ok_or_else(|| "net.serve_quic requires a Program reference; use DefaultHandler::with_program".to_string())?;
+        let policy = self.policy.clone();
+        crate::quic::serve_http3_named(port, handler_name, tls, program, policy, ServeOpts::from_env())
+    }
+
+    #[cfg(feature = "quic")]
+    fn dispatch_serve_quic_fn(&self, args: Vec<Value>) -> Result<Value, String> {
+        let port = match args.first() {
+            Some(Value::Int(n)) if (0..=65535).contains(n) => *n as u16,
+            _ => return Err("net.serve_quic_fn(port, tls, handler): port must be Int 0..=65535".into()),
+        };
+        let tls = decode_tls_config(args.get(1)
+            .ok_or_else(|| "net.serve_quic_fn(port, tls, handler): missing tls".to_string())?)?;
+        let closure = match args.into_iter().nth(2) {
+            Some(c @ Value::Closure { .. }) => c,
+            _ => return Err("net.serve_quic_fn(port, tls, handler): handler must be a closure".into()),
+        };
+        let program = self.program.clone()
+            .ok_or_else(|| "net.serve_quic_fn requires a Program reference; use DefaultHandler::with_program".to_string())?;
+        let policy = self.policy.clone();
+        crate::quic::serve_http3_fn(port, closure, tls, program, policy, ServeOpts::from_env())
+    }
+
+    #[cfg(feature = "quic")]
+    fn dispatch_serve_quic_routed(&self, args: Vec<Value>) -> Result<Value, String> {
+        let port = match args.first() {
+            Some(Value::Int(n)) if (0..=65535).contains(n) => *n as u16,
+            _ => return Err("net.serve_quic_routed(port, tls, routes, fallback): port must be Int 0..=65535".into()),
+        };
+        let tls = decode_tls_config(args.get(1)
+            .ok_or_else(|| "net.serve_quic_routed(port, tls, routes, fallback): missing tls".to_string())?)?;
+        let routes_val = args.get(2).cloned()
+            .ok_or_else(|| "net.serve_quic_routed(port, tls, routes, fallback): missing routes".to_string())?;
+        let fallback = match args.into_iter().nth(3) {
+            Some(c @ Value::Closure { .. }) => c,
+            _ => return Err("net.serve_quic_routed(port, tls, routes, fallback): fallback must be a closure".into()),
+        };
+        let routes = decode_routes_arg(routes_val)?;
+        let program = self.program.clone()
+            .ok_or_else(|| "net.serve_quic_routed requires a Program reference; use DefaultHandler::with_program".to_string())?;
+        let policy = self.policy.clone();
+        crate::quic::serve_http3_routed(port, routes, fallback, tls, program, policy, ServeOpts::from_env())
+    }
+
+    #[cfg(not(feature = "quic"))]
+    fn dispatch_serve_quic_named(&self, _args: Vec<Value>) -> Result<Value, String> {
+        Err("net.serve_quic: lex-runtime was compiled without the `quic` feature (needed for quinn + h3)".into())
+    }
+    #[cfg(not(feature = "quic"))]
+    fn dispatch_serve_quic_fn(&self, _args: Vec<Value>) -> Result<Value, String> {
+        Err("net.serve_quic_fn: lex-runtime was compiled without the `quic` feature (needed for quinn + h3)".into())
+    }
+    #[cfg(not(feature = "quic"))]
+    fn dispatch_serve_quic_routed(&self, _args: Vec<Value>) -> Result<Value, String> {
+        Err("net.serve_quic_routed: lex-runtime was compiled without the `quic` feature (needed for quinn + h3)".into())
+    }
+}
+
+/// Read `LEX_NET_HTTP2` and report whether the runtime should accept
+/// HTTP/2 connections via hyper-util's auto builder (HTTP/1 ↔ HTTP/2
+/// preface detection). Accepts `1` / `true` (case-insensitive); anything
+/// else (including unset) keeps the HTTP/1-only default.
+///
+/// h2c (cleartext HTTP/2) needs prior-knowledge clients
+/// (`curl --http2-prior-knowledge`, wrk/h2load, gRPC). Browsers do not
+/// speak h2c — they require ALPN over TLS, which is a separate path.
+/// See lex-lang#488.
+fn env_http2() -> bool {
+    match std::env::var("LEX_NET_HTTP2") {
+        Ok(v) => {
+            let s = v.trim().to_ascii_lowercase();
+            s == "1" || s == "true"
+        }
+        Err(_) => false,
+    }
+}
+
 /// Build a Lex request record from hyper request parts and pre-collected body bytes.
-fn build_request_value_parts(
+pub(crate) fn build_request_value_parts(
     parts: &hyper::http::request::Parts,
     body: &bytes::Bytes,
 ) -> Value {
     let method = parts.method.as_str().to_string();
-    let uri = parts.uri.to_string();
-    let (path, query) = match uri.split_once('?') {
-        Some((p, q)) => (p.to_string(), q.to_string()),
-        None => (uri, String::new()),
-    };
+    // `Uri::path()` returns just the origin-form path, regardless of
+    // whether the wire URI was relative (`/foo` — HTTP/1.1) or
+    // absolute (`https://host/foo` — HTTP/2 and HTTP/3 fold the
+    // `:scheme` + `:authority` pseudo-headers into the full URI).
+    // Reading `to_string()` would leak the scheme/authority into the
+    // Lex handler's `req.path`, which surprised handlers built for
+    // HTTP/1.1 (#496 surfaced this against `serve_quic`).
+    let path = parts.uri.path().to_string();
+    let query = parts.uri.query().map(str::to_string).unwrap_or_default();
     let mut headers_map = std::collections::BTreeMap::new();
     for (name, val) in &parts.headers {
         if let Ok(v) = val.to_str() {
@@ -1926,7 +2624,8 @@ fn build_request_value_parts(
     rec.insert("query".into(), Value::Str(query.into()));
     rec.insert("body".into(), Value::Str(body_str.into()));
     rec.insert("headers".into(), Value::Map(headers_map));
-    Value::Record(rec)
+    rec.insert("path_params".into(), Value::Map(std::collections::BTreeMap::new()));
+    Value::record_dynamic(rec)
 }
 
 /// Build a Lex request record from a tiny_http request (used by the TLS path).
@@ -1952,11 +2651,12 @@ fn build_request_value_tiny(req: &mut tiny_http::Request) -> Value {
     rec.insert("query".into(), Value::Str(query.into()));
     rec.insert("body".into(), Value::Str(body.into()));
     rec.insert("headers".into(), Value::Map(headers_map));
-    Value::Record(rec)
+    rec.insert("path_params".into(), Value::Map(std::collections::BTreeMap::new()));
+    Value::record_dynamic(rec)
 }
 
-fn unpack_response(v: &Value) -> (u16, ResponseBodyOut, Vec<(String, String)>) {
-    if let Value::Record(rec) = v {
+pub(crate) fn unpack_response(v: &Value) -> (u16, ResponseBodyOut, Vec<(String, String)>) {
+    if let Value::Record { fields: rec, .. } = v {
         let status = rec.get("status").and_then(|s| match s {
             Value::Int(n) => Some(*n as u16),
             _ => None,
@@ -2108,7 +2808,7 @@ fn respond_with_body_tls(
 /// different `tiny_http` path: a single `Response::from_string` for
 /// `Str`, and a chunked-encoding `Response::new` with a `Read`-backed
 /// chunk list for the streaming variants.
-enum ResponseBodyOut {
+pub(crate) enum ResponseBodyOut {
     Str(String),
     /// Pre-drained text chunks. v1 ships eager-iter only; lazy producers
     /// (#376 follow-up) will replace this with a Read adapter that pulls
@@ -2172,6 +2872,90 @@ fn drain_iter_bytes(v: &Value) -> Vec<Vec<u8>> {
             }
         }
         _ => Vec::new(),
+    }
+}
+
+/// Drive an `__IterLazy(seed, step)` to exhaustion by invoking the step
+/// closure via `vm`, then return an equivalent `__IterEager(list, 0)` so
+/// the existing `drain_iter_*` paths can consume it.
+///
+/// Without this pre-pass, `BodyStream(iter.unfold(...))` produces empty
+/// response bodies because the drain helpers match only on the eager
+/// variant (#477). The step closure can carry effects; we ignore that
+/// here — the handler is already running on a tokio task with the same
+/// effect bindings, so any `[net]` / `[time]` calls inside the step
+/// re-enter the same handler context.
+///
+/// `__IterEager` is returned untouched. Unknown variants pass through.
+fn materialize_lazy_iter(vm: &mut Vm, v: Value) -> Value {
+    let mut current = v;
+    let mut items: Vec<Value> = Vec::new();
+    loop {
+        match current {
+            Value::Variant { name, args } if name == "__IterLazy" && args.len() == 2 => {
+                let seed = args[0].clone();
+                let step = args[1].clone();
+                match vm.invoke_closure_value(step.clone(), vec![seed]) {
+                    Ok(Value::Variant { name: opt, args: opt_args })
+                        if opt == "None" =>
+                    {
+                        let _ = opt_args;
+                        break;
+                    }
+                    Ok(Value::Variant { name: opt, args: opt_args })
+                        if opt == "Some" && opt_args.len() == 1 =>
+                    {
+                        if let Value::Tuple(pair) = &opt_args[0] {
+                            if pair.len() == 2 {
+                                items.push(pair[0].clone());
+                                current = Value::Variant {
+                                    name: "__IterLazy".to_string(),
+                                    args: vec![pair[1].clone(), step],
+                                };
+                                continue;
+                            }
+                        }
+                        // Malformed pair — bail to avoid infinite loop.
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+            // Already eager (or unknown) — return as-is, possibly with
+            // any items we collected from a partial drain.
+            other => {
+                if items.is_empty() {
+                    return other;
+                }
+                // Mixed shape shouldn't happen in practice; fall through
+                // to the eager builder below with the items we have.
+                let _ = other;
+                break;
+            }
+        }
+    }
+    Value::Variant {
+        name: "__IterEager".to_string(),
+        args: vec![
+            Value::List(items.into_iter().collect()),
+            Value::Int(0),
+        ],
+    }
+}
+
+/// Rewrite any `body: BodyStream(__IterLazy(...))` or
+/// `body: BodyBytes(__IterLazy(...))` on a response record in place,
+/// replacing the lazy iter with an eager-materialised equivalent.
+/// Called before `unpack_response` / `build_hyper_response` so the
+/// existing drain paths can consume the iter.
+fn materialize_response_body(vm: &mut Vm, v: &mut Value) {
+    if let Value::Record { fields: rec, .. } = v {
+        if let Some(Value::Variant { name, args }) = rec.get_mut("body") {
+            if (name == "BodyStream" || name == "BodyBytes") && args.len() == 1 {
+                let inner = std::mem::replace(&mut args[0], Value::Unit);
+                args[0] = materialize_lazy_iter(vm, inner);
+            }
+        }
     }
 }
 
@@ -2321,24 +3105,57 @@ fn http_send_full(
     timeout_ms: Option<u64>,
 ) -> Value {
     let agent = http_agent(timeout_ms);
-    let resp = match method {
+    // Normalise method to uppercase before matching. Per RFC 7230, HTTP
+    // methods are case-sensitive, but lex callers naturally write
+    // `"put"` / `"PUT"` interchangeably; uppercasing here keeps the
+    // surface forgiving without compromising the wire format (ureq
+    // sends whatever method name we pass to the per-method builder).
+    let method_upper = method.to_ascii_uppercase();
+    let body_bytes: Vec<u8> = body.unwrap_or_default();
+    let resp = match method_upper.as_str() {
+        // Bodyless methods. PUT/PATCH/DELETE technically allow a body,
+        // but in practice (and per #503's OCPI flows) DELETE is most
+        // often bodyless; if a future caller needs DELETE-with-body
+        // we can split it via a different ureq builder.
         "GET" => {
             let mut req = agent.get(url);
             if !content_type.is_empty() { req = req.header("content-type", content_type); }
             for (k, v) in headers { req = req.header(k.as_str(), v.as_str()); }
             req.call()
         }
+        "HEAD" => {
+            let mut req = agent.head(url);
+            for (k, v) in headers { req = req.header(k.as_str(), v.as_str()); }
+            req.call()
+        }
+        "DELETE" => {
+            let mut req = agent.delete(url);
+            for (k, v) in headers { req = req.header(k.as_str(), v.as_str()); }
+            req.call()
+        }
+        // Methods that carry a request body. `body.unwrap_or_default()`
+        // means a missing body sends an empty payload, which is the
+        // correct default for POST `{}` style requests and matches
+        // curl's `-X POST` (no `-d`) behaviour.
         "POST" => {
-            let body = body.unwrap_or_default();
             let mut req = agent.post(url);
             if !content_type.is_empty() { req = req.header("content-type", content_type); }
             for (k, v) in headers { req = req.header(k.as_str(), v.as_str()); }
-            req.send(&body[..])
+            req.send(&body_bytes[..])
+        }
+        "PUT" => {
+            let mut req = agent.put(url);
+            if !content_type.is_empty() { req = req.header("content-type", content_type); }
+            for (k, v) in headers { req = req.header(k.as_str(), v.as_str()); }
+            req.send(&body_bytes[..])
+        }
+        "PATCH" => {
+            let mut req = agent.patch(url);
+            if !content_type.is_empty() { req = req.header("content-type", content_type); }
+            for (k, v) in headers { req = req.header(k.as_str(), v.as_str()); }
+            req.send(&body_bytes[..])
         }
         m => {
-            // Other methods (PUT, DELETE, PATCH, ...) fall through
-            // here in v1.5; for now surface a structured DecodeError
-            // so the caller can match it.
             return http_decode_err(format!("unsupported method: {m}"));
         }
     };
@@ -2354,7 +3171,7 @@ fn http_send_full(
             rec.insert("status".into(), Value::Int(status));
             rec.insert("headers".into(), Value::Map(headers_map));
             rec.insert("body".into(), Value::Bytes(body_bytes));
-            Value::Variant { name: "Ok".into(), args: vec![Value::Record(rec)] }
+            Value::Variant { name: "Ok".into(), args: vec![Value::record_dynamic(rec)] }
         }
         Err(e) => http_error_value(e),
     }
@@ -2416,7 +3233,7 @@ fn http_send_record(handler: &DefaultHandler, req: &indexmap::IndexMap<String, V
 
 fn expect_record(v: Option<&Value>) -> Result<&indexmap::IndexMap<String, Value>, String> {
     match v {
-        Some(Value::Record(r)) => Ok(r),
+        Some(Value::Record { fields: r, .. }) => Ok(r),
         Some(other) => Err(format!("expected Record, got {other:?}")),
         None => Err("missing Record argument".into()),
     }
@@ -2449,6 +3266,45 @@ fn err(v: Value) -> Value {
     Value::Variant { name: "Err".into(), args: vec![v] }
 }
 
+/// HTTP POST that buffers the full response body then yields it split into lines.
+/// Intended for LLM provider APIs (OpenAI, Anthropic, Google) that use SSE/NDJSON
+/// and close the connection after sending all events. Connection errors → `Err(Str)`.
+///
+/// CAUTION: ureq 3.3's `Body` does not implement `std::io::Read` and exposes no
+/// incremental read API. The entire response is buffered via `read_to_vec()` before
+/// splitting. This means the call blocks until the server closes the connection —
+/// endpoints that hold the connection open indefinitely will hang. True per-line
+/// streaming requires a future HTTP client upgrade.
+fn http_stream_lines_impl(handler: &DefaultHandler, url: &str, headers_val: &Value, body: &str) -> Value {
+    let body_bytes = body.as_bytes().to_vec();
+    let agent = http_agent(None);
+    let mut req = agent.post(url);
+    if let Value::Map(headers) = headers_val {
+        for (k, v) in headers {
+            let key_str = match k {
+                lex_bytecode::MapKey::Str(s) => s.as_str(),
+                _ => continue,
+            };
+            if let Value::Str(val) = v {
+                req = req.header(key_str, val.as_str());
+            }
+        }
+    }
+    match req.send(&body_bytes[..]) {
+        Ok(resp) => {
+            let bytes = match resp.into_body().with_config().read_to_vec() {
+                Ok(b) => b,
+                Err(e) => return err(Value::Str(format!("http.stream_lines: body read: {e}").into())),
+            };
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            let lines: Vec<String> = text.lines().map(String::from).collect();
+            let handle = handler.register_stream(lines.into_iter());
+            ok(stream_handle_value(handle))
+        }
+        Err(e) => err(Value::Str(format!("http.stream_lines: {e}").into())),
+    }
+}
+
 /// Build a `SqlError = { message, code, detail }` Lex record (#380).
 /// `code` and `detail` are `None` by default; the driver-specific
 /// converters below populate them with real values.
@@ -2466,7 +3322,7 @@ fn sql_error(message: impl Into<String>, code: Option<String>, detail: Option<St
         Some(d) => some(d),
         None => none(),
     });
-    Value::Record(rec)
+    Value::record_dynamic(rec)
 }
 
 /// Convert a rusqlite error into a `SqlError`. The `code` is the
@@ -2867,7 +3723,7 @@ fn sql_run_query_sqlite(
             };
             rec.insert(name.clone(), cell);
         }
-        out.push(Value::Record(rec));
+        out.push(Value::record_dynamic(rec));
     }
     ok(Value::List(out.into()))
 }
@@ -2886,7 +3742,7 @@ fn sql_run_query_pg(
         Err(e) => return err(pg_err_to_sql_error(e, "sql.query")),
     };
     let out: std::collections::VecDeque<Value> = rows.iter().map(|row| {
-        Value::Record(pg_row_to_lex_record(row))
+        Value::record_dynamic(pg_row_to_lex_record(row))
     }).collect();
     ok(Value::List(out))
 }
@@ -2925,7 +3781,7 @@ where
         None => return Err("sql.get_*: missing column name argument".into()),
     };
     let cell = match row {
-        Value::Record(rec) => rec.get(col).cloned(),
+        Value::Record { fields: rec, .. } => rec.get(col).cloned(),
         other => return Err(format!("sql.get_*: row must be a Record, got {other:?}")),
     };
     Ok(match cell.and_then(|v| convert(&v)) {
@@ -3407,7 +4263,7 @@ fn sqlite_cursor_producer(
                     };
                     rec.insert(name.clone(), val);
                 }
-                if sender.send(Ok(Value::Record(rec))).is_err() {
+                if sender.send(Ok(Value::record_dynamic(rec))).is_err() {
                     break;
                 }
             }
@@ -3460,7 +4316,7 @@ fn pg_cursor_producer(
         }
         for row in batch.iter() {
             let rec = pg_row_to_lex_record(row);
-            if sender.send(Ok(Value::Record(rec))).is_err() {
+            if sender.send(Ok(Value::record_dynamic(rec))).is_err() {
                 break 'outer;
             }
         }
