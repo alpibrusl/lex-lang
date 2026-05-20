@@ -178,7 +178,7 @@ jobs:
         # invocation* — but we never actually run the arm64 binary
         # here, only COPY it into the image, so emulation cost is
         # negligible. Without QEMU, buildx refuses non-native arches.
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker buildx
         uses: docker/setup-buildx-action@v3
