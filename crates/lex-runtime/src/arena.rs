@@ -87,6 +87,15 @@ impl Arena {
     /// # Safety
     ///
     /// The returned slice is uninitialized.
+    ///
+    // `mut_from_ref` is the canonical bump-allocator shape (same as
+    // `bumpalo::Bump::alloc` and `typed_arena::Arena::alloc`): an
+    // immutable `&self` hands out a fresh mutable region per call.
+    // Soundness rests on (a) `UnsafeCell` for interior mutability,
+    // (b) `!Sync` so no two threads call this at once, and
+    // (c) the strict bump invariant — every returned slice starts
+    // past every prior slice's end, so references never alias.
+    #[allow(clippy::mut_from_ref)]
     pub fn alloc(&self, len: usize) -> &mut [u8] {
         assert!(len <= PAGE_BYTES, "arena alloc exceeds page size");
         // SAFETY: `Arena` is `!Sync` (UnsafeCell), so no concurrent
