@@ -271,6 +271,11 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
         // on the same site — order between them is technically free
         // but conventionally slice N runs after slice N-1.
         apply_peephole_slice5(&mut f.code, &pool.pool);
+        // Slice 6 — absorb the match-scrutinee dance
+        // (`LoadLocal + StoreLocal` immediately preceding a slice-5
+        // fused op that reads the just-stored local). Must run after
+        // slice 5 since it matches on slice 5's output.
+        apply_peephole_slice6(&mut f.code);
     }
 
     // Final pass: stamp every function with its content hash now that
@@ -509,6 +514,63 @@ fn apply_peephole_slice5(code: &mut [Op], constants: &[Const]) {
                 code[k] = fused_op;
                 k += 4;
                 continue;
+            }
+        }
+        k += 1;
+    }
+}
+
+/// Slice 6: fuse the match-scrutinee dance preceding a slice-5
+/// pattern-match arm test. 3-slot window
+/// `[LoadLocal(src), StoreLocal(dst),
+///   LoadLocalEqIntConstJumpIfNot { local_idx: dst, ... }]` —
+/// where the slice-5 op's `local_idx` matches the StoreLocal's
+/// destination — rewrites to
+/// `LoadLocalStoreEqIntConstJumpIfNot { src, dst, ... }` at slot k.
+/// The fused op carries `dst` so it can mirror the original
+/// StoreLocal (later arm tests in the same match keep reading
+/// `locals[dst]`).
+///
+/// Trailing tombstones: 5 slots (the original StoreLocal + the
+/// slice-5 fused op itself + slice 5's 3 primitive tombstones).
+/// VM dispatch skips them via `pc + 6`; verifier override pushes
+/// `(pc + 6, ...)` and the branch target `(pc + 6 + jump_offset, ...)`
+/// — the offset is identical to what slice 5 stored (still relative
+/// to the original JumpIfNot's `pc + 1`, now at `k + 5 + 1 = k + 6`).
+///
+/// Safety: slots k+1..=k+5 must not be jump targets — same window
+/// safety as the other slices. Slice 5 already verified k+3..=k+5
+/// weren't jump targets when it fused; slice 6 only needs to re-check
+/// k+1 (the StoreLocal) and k+2 (the slice-5 fused op).
+fn apply_peephole_slice6(code: &mut [Op]) {
+    if code.len() < 3 { return; }
+    let jump_targets = collect_jump_targets(code);
+
+    let n = code.len();
+    let mut k = 0;
+    while k + 2 < n {
+        if let (
+            Op::LoadLocal(src),
+            Op::StoreLocal(dst),
+            Op::LoadLocalEqIntConstJumpIfNot { local_idx, imm_const_idx, jump_offset },
+        ) = (code[k], code[k + 1], code[k + 2]) {
+            // The slice-5 op must read the very local the StoreLocal
+            // just wrote; if it reads some other local this isn't the
+            // match-scrutinee idiom (could be a coincidental sequence).
+            if local_idx == dst {
+                let safe = !jump_targets.contains(&(k + 1))
+                    && !jump_targets.contains(&(k + 2));
+                if safe {
+                    code[k] = Op::LoadLocalStoreEqIntConstJumpIfNot {
+                        src, dst, imm_const_idx, jump_offset,
+                    };
+                    // Skip past this slice-6 window. The slice-5
+                    // tombstones at k+3..=k+5 are already handled by
+                    // slice 5's earlier rewrite; we don't need to
+                    // touch them.
+                    k += 3;
+                    continue;
+                }
             }
         }
         k += 1;

@@ -164,7 +164,8 @@ pub fn compute_body_hash(
             | Op::LoadLocalAddLocal { lhs_idx: local_idx, .. }
             | Op::LoadLocalSubLocal { lhs_idx: local_idx, .. }
             | Op::LoadLocalMulLocal { lhs_idx: local_idx, .. }
-            | Op::LoadLocalEqIntConstJumpIfNot { local_idx, .. } => {
+            | Op::LoadLocalEqIntConstJumpIfNot { local_idx, .. }
+            | Op::LoadLocalStoreEqIntConstJumpIfNot { src: local_idx, .. } => {
                 // Slice 1: this slot was `LoadLocal(local_idx)`.
                 // Slice 2: this slot was *also* `LoadLocal(src)`
                 // — the fused op now owns 4 slots, but the very

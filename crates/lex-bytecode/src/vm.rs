@@ -1601,6 +1601,30 @@ impl<'a> Vm<'a> {
                     };
                     self.frames[frame_idx].pc = next_pc;
                 }
+                Op::LoadLocalStoreEqIntConstJumpIfNot { src, dst, imm_const_idx, jump_offset } => {
+                    // Slice 6: absorbs LoadLocal + StoreLocal + slice-5 op.
+                    // 6-slot window total (this op + 5 tombstones); fall-
+                    // through is `pc + 6`, branch target is `pc + 6 +
+                    // jump_offset` (the original JumpIfNot was at slot
+                    // pc+5, with offset relative to its own pc+1 = pc+6).
+                    let base = self.frames[frame_idx].locals_start;
+                    let a = self.locals_storage[base + src as usize].as_int();
+                    // Mirror the original `StoreLocal(dst)` — later
+                    // arm tests in the same `match` expect to find
+                    // the scrutinee at `locals[dst]`.
+                    self.locals_storage[base + dst as usize] = Value::Int(a);
+                    let b = match &self.program.constants[imm_const_idx as usize] {
+                        Const::Int(n) => *n,
+                        _ => return Err(VmError::TypeMismatch(
+                            "LoadLocalStoreEqIntConstJumpIfNot expects Const::Int".into())),
+                    };
+                    let next_pc = if a == b {
+                        pc + 6
+                    } else {
+                        ((pc as i32 + 6) + jump_offset) as usize
+                    };
+                    self.frames[frame_idx].pc = next_pc;
+                }
                 Op::LoadLocalAddIntConstStoreLocal { src, imm_const_idx, dest } => {
                     let base = self.frames[frame_idx].locals_start;
                     let a = self.locals_storage[base + src as usize].as_int();

@@ -123,6 +123,15 @@ pub fn verify_function(func: &Function, errors: &mut Vec<StackError>) {
                 worklist.push((pc + 4, next_depth));
                 worklist.push((target, next_depth));
             }
+            // Slice 6 owns a 6-slot window (this op + 5 tombstones).
+            // Same two-successor shape as slice 5 but with `pc + 6`
+            // arithmetic. Net stack delta is 0 — original was
+            // LoadLocal + StoreLocal + slice5 = +1 + -1 + 0.
+            Op::LoadLocalStoreEqIntConstJumpIfNot { jump_offset, .. } => {
+                let target = (pc as i32 + 6 + jump_offset) as usize;
+                worklist.push((pc + 6, next_depth));
+                worklist.push((target, next_depth));
+            }
             // All other ops: single sequential successor.
             _ => {
                 worklist.push((pc + 1, next_depth));
@@ -241,7 +250,8 @@ fn stack_delta(op: &Op) -> i32 {
         // (original sequence had +1, +1, -1, -1). Worklist override
         // above pushes both fall-through and branch successors with
         // this depth; tombstones are not walked as live.
-        Op::LoadLocalEqIntConstJumpIfNot { .. } => 0,
+        Op::LoadLocalEqIntConstJumpIfNot { .. }
+        | Op::LoadLocalStoreEqIntConstJumpIfNot { .. } => 0,
     }
 }
 
