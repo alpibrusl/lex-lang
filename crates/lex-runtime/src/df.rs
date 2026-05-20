@@ -117,7 +117,10 @@ fn to_polars(rb: &RecordBatch) -> Result<DataFrame, String> {
         };
         cols.push(s.into());
     }
-    DataFrame::new(cols).map_err(|e| format!("df: build DataFrame: {e}"))
+    // polars 0.53 switched `DataFrame::new(cols)` to take an explicit
+    // height as the first arg; `new_infer_height` does what the v0.50
+    // `new` did, deriving height from the first column.
+    DataFrame::new_infer_height(cols).map_err(|e| format!("df: build DataFrame: {e}"))
 }
 
 /// Build an arrow-rs `RecordBatch` from a Polars `DataFrame`. Inverse
@@ -128,7 +131,7 @@ fn to_polars(rb: &RecordBatch) -> Result<DataFrame, String> {
 fn from_polars(df: &DataFrame) -> Result<RecordBatch, String> {
     let mut fields: Vec<Field> = Vec::with_capacity(df.width());
     let mut arrays: Vec<arrow_array::ArrayRef> = Vec::with_capacity(df.width());
-    for column in df.get_columns() {
+    for column in df.columns() {
         let name = column.name().as_str();
         let s = column.as_materialized_series();
         let (field, array): (Field, arrow_array::ArrayRef) = match s.dtype() {
