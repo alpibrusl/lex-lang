@@ -69,7 +69,7 @@ fn example_d_shape() {
     let mut vm = Vm::new(&p);
     let circle = Value::Variant {
         name: "Circle".into(),
-        args: vec![Value::Record({
+        args: vec![Value::record_dynamic({
             let mut m = IndexMap::new();
             m.insert("radius".into(), Value::Float(1.0));
             m
@@ -84,7 +84,7 @@ fn example_d_shape() {
 
     let rect = Value::Variant {
         name: "Rect".into(),
-        args: vec![Value::Record({
+        args: vec![Value::record_dynamic({
             let mut m = IndexMap::new();
             m.insert("width".into(), Value::Float(2.0));
             m.insert("height".into(), Value::Float(3.0));
@@ -113,6 +113,125 @@ fn match_with_literal_int() {
 }
 
 #[test]
+fn slice3_fuses_two_local_add_and_runs_correctly() {
+    // #461 slice 3: `LoadLocal + LoadLocal + IntAdd` over two
+    // Int-typed locals must (a) be rewritten to
+    // `Op::LoadLocalAddLocal` by the peephole pass, (b) leave the
+    // trailing two slots as untouched primitive tombstones (so the
+    // body hash stays bit-identical to the unfused form), and
+    // (c) produce the same numeric result as the unfused triple.
+    use lex_bytecode::op::Op;
+    let src = "fn add_them(a :: Int, b :: Int) -> Int { a + b }\n";
+    let p = compile(src);
+    let f = &p.functions[0];
+
+    // The body should be exactly:
+    //   [LoadLocalAddLocal{a,b}, LoadLocal(b) tombstone, IntAdd tombstone, Return]
+    // — slice 3 rewrites slot 0; slots 1+2 stay live for body-hash
+    // stability and are skipped by the dispatch loop via pc+=3.
+    assert!(
+        matches!(f.code[0], Op::LoadLocalAddLocal { lhs_idx: 0, rhs_idx: 1 }),
+        "slice 3 did not fire; got {:?}", f.code[0],
+    );
+    assert!(matches!(f.code[1], Op::LoadLocal(1)));
+    assert!(matches!(f.code[2], Op::IntAdd));
+    assert!(matches!(f.code[3], Op::Return));
+
+    let mut vm = Vm::new(&p);
+    let r = vm.call("add_them", vec![Value::Int(40), Value::Int(2)]).unwrap();
+    assert_eq!(r, Value::Int(42));
+}
+
+#[test]
+fn slice4_fuses_two_local_sub_and_runs_correctly() {
+    // #461 slice 4: same shape as slice 3 but for `IntSub`. Must
+    // rewrite to `Op::LoadLocalSubLocal`, leave tombstones in place,
+    // and compute lhs - rhs.
+    use lex_bytecode::op::Op;
+    let src = "fn sub_them(a :: Int, b :: Int) -> Int { a - b }\n";
+    let p = compile(src);
+    let f = &p.functions[0];
+    assert!(
+        matches!(f.code[0], Op::LoadLocalSubLocal { lhs_idx: 0, rhs_idx: 1 }),
+        "slice 4 (sub) did not fire; got {:?}", f.code[0],
+    );
+    assert!(matches!(f.code[1], Op::LoadLocal(1)));
+    assert!(matches!(f.code[2], Op::IntSub));
+    assert!(matches!(f.code[3], Op::Return));
+
+    let mut vm = Vm::new(&p);
+    let r = vm.call("sub_them", vec![Value::Int(42), Value::Int(7)]).unwrap();
+    assert_eq!(r, Value::Int(35));
+}
+
+#[test]
+fn slice4_fuses_two_local_mul_and_runs_correctly() {
+    use lex_bytecode::op::Op;
+    let src = "fn mul_them(a :: Int, b :: Int) -> Int { a * b }\n";
+    let p = compile(src);
+    let f = &p.functions[0];
+    assert!(
+        matches!(f.code[0], Op::LoadLocalMulLocal { lhs_idx: 0, rhs_idx: 1 }),
+        "slice 4 (mul) did not fire; got {:?}", f.code[0],
+    );
+    assert!(matches!(f.code[1], Op::LoadLocal(1)));
+    assert!(matches!(f.code[2], Op::IntMul));
+    assert!(matches!(f.code[3], Op::Return));
+
+    let mut vm = Vm::new(&p);
+    let r = vm.call("mul_them", vec![Value::Int(6), Value::Int(7)]).unwrap();
+    assert_eq!(r, Value::Int(42));
+}
+
+#[test]
+fn slice4_does_not_fire_across_a_jump_target() {
+    // Mirror of `slice3_does_not_fire_across_a_jump_target` for sub/mul.
+    // A `match`-arm body straddles a JumpIfNot target, so if the
+    // jump-safety check ever regressed the call would panic or return
+    // junk.
+    let src = "
+fn pick(flag :: Int, a :: Int, b :: Int) -> Int {
+  match flag {
+    0 => a - b,
+    1 => a * b,
+    _ => a,
+  }
+}";
+    let p = compile(src);
+    let mut vm = Vm::new(&p);
+    assert_eq!(vm.call("pick", vec![Value::Int(0), Value::Int(10), Value::Int(3)]).unwrap(), Value::Int(7));
+    assert_eq!(vm.call("pick", vec![Value::Int(1), Value::Int(10), Value::Int(3)]).unwrap(), Value::Int(30));
+    assert_eq!(vm.call("pick", vec![Value::Int(9), Value::Int(10), Value::Int(3)]).unwrap(), Value::Int(10));
+}
+
+#[test]
+fn slice3_does_not_fire_across_a_jump_target() {
+    // Safety check: if the second or third slot of the candidate
+    // triple is a jump target, slice 3 must skip the fusion — a
+    // jump landing on what looks like a `LoadLocal` is in fact a
+    // live entry point, not an inert tombstone. `match` in the
+    // body forces a JumpIfNot whose target sits between operations,
+    // so we can construct a function where the LoadLocal+LoadLocal+
+    // IntAdd triple straddles the arm boundary and verify no
+    // fusion happens. Easier route: just check that running such
+    // a function still produces the right answer (defensive — if
+    // the safety check ever regressed, a wrong jump-target rewrite
+    // would corrupt the stack and the call would either panic or
+    // return junk).
+    let src = "
+fn pick(flag :: Int, a :: Int, b :: Int) -> Int {
+  match flag {
+    0 => a + b,
+    _ => a,
+  }
+}";
+    let p = compile(src);
+    let mut vm = Vm::new(&p);
+    assert_eq!(vm.call("pick", vec![Value::Int(0), Value::Int(10), Value::Int(5)]).unwrap(), Value::Int(15));
+    assert_eq!(vm.call("pick", vec![Value::Int(1), Value::Int(10), Value::Int(5)]).unwrap(), Value::Int(10));
+}
+
+#[test]
 fn record_field_access() {
     let src = "fn xof(r :: Record) -> Int { r.x }\n".replace(
         "Record",
@@ -123,6 +242,6 @@ fn record_field_access() {
     let mut m = IndexMap::new();
     m.insert("x".into(), Value::Int(11));
     m.insert("y".into(), Value::Int(22));
-    let r = vm.call("xof", vec![Value::Record(m)]).unwrap();
+    let r = vm.call("xof", vec![Value::record_dynamic(m)]).unwrap();
     assert_eq!(r, Value::Int(11));
 }

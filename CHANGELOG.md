@@ -5,9 +5,115 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
-## [Unreleased]
+## [0.9.5] — 2026-05-17
 
 ### Added
+
+- **#436: `std.net.serve_routed` — pattern-matched HTTP routing.**
+  `net.serve_routed(port, routes, fallback)` gives downstream HTTP
+  libraries (lex-ocpi, future lex-rest) path-matched dispatch without
+  pulling in lex-web's full framework. Routes are `(method, pattern,
+  handler)` triples; patterns use `:name` segments (`/users/:id`) and
+  matches are stamped onto `req.path_params :: Map[Str, Str]` before
+  the handler runs. `fallback` runs when nothing matches — typically
+  a 404 responder. Honours `LEX_NET_INLINE_VM` the same way
+  `serve_fn` does, and the handler effect row is open
+  (`open_var(0)`) so per-handler effects propagate to the call site.
+  Path-param compilation panics at registration time on bad `:`
+  segments rather than at request time. The CORS / body-limit /
+  request-id combinators from the original issue are deferred to
+  follow-up PRs per the "smaller scope" option. Tests live in
+  `crates/lex-runtime/tests/net_serve.rs` (folded in from a
+  standalone binary to keep CI under disk budget).
+
+- **#459: `net.serve_ws_fn_actor` — per-connection bridge actor for
+  outbound sends.** New entry point that registers each accepted
+  WebSocket connection as a named actor in the `conc` registry so
+  non-WS callers can push frames into the socket through the existing
+  `conc.lookup` + `conc.tell` surface — no new module, no parallel
+  `ws.send_to` API.
+
+  ```
+  net.serve_ws_fn_actor(
+    port        :: Int,
+    subprotocol :: Str,
+    name_of     :: (WsConn) -> Str,                       # pure
+    on_message  :: (WsConn, WsMessage) -> [E] WsAction
+  ) -> [net, concurrent, E] Unit
+  ```
+
+  `name_of` runs once per accepted connection and returns the
+  registry key (typically derived from URL path or subprotocol);
+  empty string opts the connection out of registration (inbound still
+  works, no outbound handle exposed). Outbound usage:
+
+  ```
+  match conc.lookup("charger:cp001") {
+    None        => Err("charger offline"),
+    Some(actor) => { let _ := conc.tell(actor, frame_str)  Ok(()) },
+  }
+  ```
+
+  Implementation extends `ActorCell`'s handler from a bare `Value` to
+  an `ActorHandler { Lex(Value) | Native(Arc<NativeActorHandler>) }`
+  enum. `Lex` is the existing user-spawned-actor path (unchanged for
+  every `conc.spawn` caller); `Native` is fire-and-forget over a
+  captured `mpsc::Sender` — used only for the internal WS bridge, no
+  public construction surface. Name collisions on register abort the
+  connection rather than silently overwriting an existing session; on
+  disconnect the run-loop tear-down unregisters the name so a
+  subsequent `conc.lookup` returns `None`. Unblocks lex-web#4
+  (lex-ocpm CSMS→CP flow). Binary frame dispatch from non-WS callers
+  and compile-time type-tagging at register/lookup are out of scope
+  for v1 — they're filed inline as follow-ups (the same v1
+  type-opacity gap that `#444`'s `ConcError::TypeMismatch` is
+  reserved for).
+
+- **#444 + #445 slice 1: named-actor registry + `time.sleep`.** Lands
+  the discovery half of `#444` in full and the sleep half of `#445`.
+  `std.conc` gains:
+
+  ```
+  conc.register   :: (Actor[S], Str) -> [concurrent] Result[Unit, ConcError]
+  conc.lookup     :: Str             -> [concurrent] Option[Actor[S]]
+  conc.unregister :: Str             -> [concurrent] Result[Unit, ConcError]
+  conc.registered :: ()              -> [concurrent] List[Str]
+  ```
+
+  Registry is a process-global `Mutex<HashMap<String, Value::Actor>>`
+  in `crates/lex-bytecode/src/conc_registry.rs`. Flat namespace —
+  collisions are caller-prefixed (`"acme.vehicle"` vs
+  `"depot.vehicle"`), matching the DNS / env-var idiom and avoiding
+  the extra concept of module-scoped registries. `ConcError` is
+  registered as a built-in union in `TypeEnv` with two variants
+  (`AlreadyRegistered`, `NotRegistered`) plus a reserved
+  `TypeMismatch` for the future compile-time `Actor[S]` bridge.
+
+  `time.sleep :: Float -> [concurrent] Unit` blocks the calling
+  thread for the given seconds; zero / negative duration is a no-op
+  that returns immediately. Routes through `std::thread::sleep` —
+  not `tokio::time::sleep` — so it composes with the synchronous
+  actor model `#381` shipped without forcing a runtime.
+
+  **Deferred:** `conc.every` / `conc.cancel` (#445 second half). The
+  ticker thread needs an `Arc<Program>` reachable from inside
+  `run_conc_op` so a worker VM can be constructed for the
+  background scheduler; the current architecture exposes only a
+  borrowed `&Program`, and `list.par_map`'s `thread::scope` workaround
+  doesn't fit a detached thread that outlives the caller. Needs its
+  own design step (likely an `EffectHandler::shared_program() ->
+  Option<Arc<Program>>` seam).
+
+- **#440: `str.cmp` three-way comparator.** Adds
+  `str.cmp :: (Str, Str) -> Int` returning -1 / 0 / 1 in lex-byte
+  order — the function-value shape `list.sort_by` and similar
+  order-driven APIs need. Deliberately skips the four boolean
+  wrappers (`str.lt` / `le` / `gt` / `ge`) the issue requested: the
+  `<` / `<=` / `>` / `>=` operators already work end-to-end on `Str`
+  through the VM's `bin_ord` arm, so named function forms would be
+  pure sugar — at odds with the agent-first / minimal-core principle.
+  `cmp` is the only genuine capability gap (it returns the three-way
+  Int rather than a Bool, which is what sort-by callers need).
 
 - **#433: `std.df` string / float / null filter predicates.** Rounds
   out the predicate surface (#428 only shipped int filters). Eight new
@@ -46,6 +152,139 @@ bumps may carry breaking changes when justified).
   `write_parquet_opts` variant can ride a follow-up if knobs are
   needed. Unblocks the H2O.ai db-benchmark workflow and any agent
   reading commodity Parquet data.
+
+### Performance
+
+The first round of `#461` (VM dispatch overhead) lands here as a
+measurement-and-foundations slice: a criterion harness, two structural
+prerequisites for a function-table rewrite, and one initial fusion.
+
+- **#461 slice 1: superinstructions — fuse `LoadLocal + PushConst(Int)
+  + IntAdd`.** Adds `Op::LoadLocalAddIntConst { local_idx,
+  imm_const_idx }`, a single-step replacement for the
+  three-op increment pattern. A peephole pass after each function is
+  compiled scans for the triple, verifies the const slot is `Int` and
+  the second/third positions aren't reachable from any jump, then
+  rewrites the first slot. The original `PushConst`/`IntAdd` stay in
+  place as inert tombstones — the dispatch loop overrides its default
+  `pc += 1` to step past them — which keeps `code.len()` invariant
+  and means existing jump offsets remain valid without a renumbering
+  pass.
+
+  Body-hash stability (`#222` closure identity): `compute_body_hash`
+  decomposes `LoadLocalAddIntConst` back to `LoadLocal(local_idx)` at
+  hash time and the tombstones hash normally as `PushConst` /
+  `IntAdd`. Total hash bytes match the pre-fusion form; existing
+  closures hash to bit-identical bytes. Verifier walks the tombstones
+  as live (their deltas cancel) so depth at `pc+3` matches the
+  unfused form.
+
+  Bench (`dispatch/straight_arith`, n=5000): 305 µs → 225 µs,
+  **+27 % / 1.37×**. The dispatch gap to the inline-Rust
+  `straight_arith_no_dispatch` floor (181 µs from `#473`) closed from
+  124 µs to 44 µs — about **64 % of the addressable dispatch
+  overhead absorbed in this one fusion**.
+
+- **#461: make `Op` `Copy` by externalizing `MakeRecord` shape.**
+  Hoists the inline `Vec<u32>` field-name list out of
+  `Op::MakeRecord` into a `Program.record_shapes` side-table. With
+  every variant now using primitive payloads only, `Op` derives
+  `Copy` — the VM dispatch loop's per-step `code[pc].clone()` drops
+  to a register-sized `code[pc]`. This is the structural precondition
+  for the function-table / direct-threaded dispatch rewrite that the
+  rest of `#461` wants to land. Body-hash stability is preserved via
+  a rehydration step in `compute_body_hash` that reconstructs the
+  historical inline JSON shape. Bench delta in isolation is modest
+  (~17 → ~16 ns/step, 7–9 %); the win is unblocking the next slice.
+
+- **#461: drop redundant refinement `Vec` clones in call paths.**
+  `Vm::invoke`, `Op::Call`, and `Op::TailCall` each cloned the
+  callee's `refinements: Vec<Option<Refinement>>` before iterating;
+  the loop only reads from `self.program` and locals, never mutates
+  `self`, so the clone was unnecessary. Delta is within criterion's
+  noise floor (the Vec is small — 1–3 mostly-`None` slots) but
+  removes redundant work on the call hot path and narrows the cost
+  model for the dispatch-loop rewrite to come.
+
+- **#461: dispatch microbench harness + no-dispatch floor +
+  isolated `straight_arith`.** Measurement infrastructure under
+  `crates/lex-bytecode/benches/dispatch.rs`. The four workloads:
+
+  - `arith_loop` — tail-recursive `sum_to`; dense mix of PushConst,
+    IntAdd/Sub, LoadLocal/StoreLocal, Call/Return, match-arm jumps.
+  - `record_field` — repeated `GetField` over a `Point`; exercises
+    the inline-cache hot path.
+  - `call_heavy` — recursive factorial; isolates Call/Return
+    overhead.
+  - `straight_arith` — non-recursive flat `let aN := a_{N-1} + 1`
+    chain that converges on ~10.3 ns/dispatch step, the isolated
+    dispatch cost without per-call setup noise.
+  - `straight_arith_no_dispatch` — the same work as inline Rust
+    over `Vec<Value>` stack + locals, no bytecode dispatch at all.
+    Gap to `straight_arith` is the dispatch ceiling: **6.3 ns/step
+    ≈ 41 % of total cycles**. Stripping every byte of dispatch
+    infrastructure cannot make this workload more than ~1.7×
+    faster — the remaining 59 % is `Value` push/pop/clone + the
+    `(Int, Int)` destructure on each `IntAdd` that the VM must do
+    regardless of dispatch architecture. Implication for `#461`:
+    function-table / computed-goto dispatch captures only the 41 %
+    slice; the 2× speedup acceptance criterion will need
+    Value-side wins too.
+
+  Run with `cargo bench -p lex-bytecode --bench dispatch`.
+
+### Fixed
+
+- **#439: substitute formal params when unfolding parametric record
+  aliases.** `type Foo[T] = { ... }` aliases rejected anonymous record
+  literals at the use site because the record-coercion unfold rule
+  only walked the `Ty::Con(_, args)` head when `args.is_empty()`. So
+  `Box[Str]` never reached the structural unify-record case below —
+  the body-side `{ value: s }` literal mismatched against the
+  still-nominal `Con`. Generalize `unfold_record_alias` and
+  `unfold_record_alias_static` to handle parametric aliases: when
+  arity matches, substitute the actuals into the alias body (formal
+  `Ty::Var(i)` → `args[i]`) using the existing `subst_vars` helper.
+  Same substitution applies to `is_alias_con`, so the
+  nominal-vs-nominal distinction (e.g. `Box[T]` vs `Crate[T]`
+  declared with identical shapes) is preserved. The `FieldAccess`
+  site that inlined the 0-arg unfold logic now calls the helper too,
+  so `b.value` on `b :: Box[Str]` types as `Str` instead of the
+  formal `T`. 9 new tests in `record_coercion.rs` covering the
+  minimal reproducer, argument / let / list positions, multi-field
+  generics (`Page[T]` from the OCPI pagination example), nested
+  generic fields, nominal distinction, and the inverse-rejection
+  paths.
+
+### Docs
+
+- **#468: `INVARIANTS.md` — index existing stability contracts and
+  surface the gaps.** Lex's stability story (SigId, StageId, OpId,
+  body_hash, canonical AST, canonical JSON) is well-covered today but
+  scattered across `docs/design/canonicalization.md`, several module
+  headers, and a handful of `//!` doc-comments. Anyone reasoning
+  about replay portability, content-addressed identity, or trace
+  stability had to assemble the mental model from a dozen sources.
+  The new doc is an **index**, not a duplicate: each stability
+  primitive gets a one-line summary, an authoritative file:line ref,
+  known gotchas — and explicit callouts for the gaps that are **not**
+  yet contracts (bytecode has no version tag and currently relies on
+  auto-derived serde determinism; trace bytes are stable in practice
+  but not specified as such). Referenced from `CLAUDE.md` as the
+  mandatory read before writing code that depends on a hash being
+  stable or that persists bytecode / traces / NodeIds across
+  processes.
+
+### CI
+
+- **#457: split `time.sleep` tests back into their own binary.**
+  Flips `tool-cache: true` and `large-packages: true` on the
+  `free-disk-space` step in the workspace-test workflow — ~10 GB
+  extra headroom for ~2–3 min of setup. With the headroom in place,
+  moves the three `time.sleep` smoke tests out of `conc_registry.rs`
+  and into a fresh `time_sleep.rs` so the registry file no longer
+  carries unrelated sleep coverage. Pure CI-housekeeping; no
+  runtime-visible change.
 
 ## [0.9.4] — 2026-05-15
 

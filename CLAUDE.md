@@ -87,6 +87,12 @@ version locally, install the pinned one from
 - **`docs/AGENT_GUIDELINES.md` is the source of truth.** Don't fork
   the content into other docs; downstream repos should copy this
   file as `AGENTS.md`, not maintain a parallel one.
+- **Stability contracts — `docs/INVARIANTS.md`.** Before writing code
+  that depends on a hash being stable (SigId, OpId, body_hash) or
+  that persists bytecode / traces / NodeIds across processes, read
+  the index there. The authoritative spec is
+  `docs/design/canonicalization.md`; `INVARIANTS.md` points at it
+  and calls out the parts that are *not* yet contracts.
 - **Release tags pin downstream CI.** Every downstream repo
   references a fixed `lex` version; bumping `Cargo.toml` here is a
   coordinated release, not a free edit.

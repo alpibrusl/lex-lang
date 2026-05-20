@@ -3,9 +3,56 @@
 use crate::op::*;
 use crate::program::*;
 use crate::value::{ActorCell, Value};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use indexmap::IndexMap;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+
+// ── IC polymorphism instrumentation (throwaway, env-gated) ─────────
+// Enable with LEX_IC_STATS=1. With LEX_IC_STATS_OUT=<path> writes a
+// TSV to <path>.<pid> on each Vm drop; otherwise dumps to stderr.
+
+#[derive(Default)]
+struct IcStats {
+    sites: HashMap<(u32, u32), HashMap<u32, u64>>,
+}
+
+static IC_STATS: OnceLock<Mutex<IcStats>> = OnceLock::new();
+static IC_STATS_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn ic_stats_enabled() -> bool {
+    *IC_STATS_ENABLED.get_or_init(|| {
+        std::env::var("LEX_IC_STATS").map(|v| v == "1").unwrap_or(false)
+    })
+}
+
+fn record_ic_hit(fn_id: u32, site_idx: u32, shape_id: u32) {
+    let stats = IC_STATS.get_or_init(|| Mutex::new(IcStats::default()));
+    let mut s = stats.lock().unwrap();
+    *s.sites.entry((fn_id, site_idx)).or_default().entry(shape_id).or_insert(0) += 1;
+}
+
+pub fn dump_ic_stats() {
+    let Some(stats) = IC_STATS.get() else { return; };
+    let s = stats.lock().unwrap();
+    if s.sites.is_empty() { return; }
+    let mut out = String::from("fn_id\tsite_idx\tshape_id\thits\n");
+    let mut entries: Vec<_> = s.sites.iter().collect();
+    entries.sort_by_key(|((f, si), _)| (*f, *si));
+    for ((f, site), shapes) in entries {
+        let mut shape_entries: Vec<_> = shapes.iter().collect();
+        shape_entries.sort_by_key(|(sid, _)| **sid);
+        for (sid, hits) in shape_entries {
+            out.push_str(&format!("{f}\t{site}\t{sid}\t{hits}\n"));
+        }
+    }
+    match std::env::var("LEX_IC_STATS_OUT").ok() {
+        Some(path) => {
+            let pid = std::process::id();
+            let _ = std::fs::write(format!("{path}.{pid}"), out);
+        }
+        None => { eprint!("{out}"); }
+    }
+}
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum VmError {
@@ -152,13 +199,22 @@ pub struct Vm<'a> {
     /// Diagnostic counters for `--trace` observability (#229).
     pub pure_memo_hits: u64,
     pub pure_memo_misses: u64,
-    /// Monomorphic inline caches for `Op::GetField` (#389 slice 2).
-    /// Key: `(fn_id as u64) << 32 | pc as u64` — one entry per
-    /// call site. Value: the IndexMap offset of the field at that
-    /// site. On a hit we verify the field name at the cached offset
-    /// in O(1) and skip the hash-table lookup entirely; on a miss we
-    /// fall back to `IndexMap::get_full` and populate the cache.
-    field_ics: std::collections::HashMap<u64, usize>,
+    /// Monomorphic inline caches for `Op::GetField` (#462 slice 1).
+    /// Indexed by `[fn_id as usize][site_idx as usize]` — one entry
+    /// per field-access site within each function. `site_idx` is
+    /// assigned at compile time by `FnCompiler::field_get_sites` so
+    /// every emit produces a stable identifier independent of pc.
+    /// The cache survives the planned dispatch rewrite (#461) and a
+    /// future JIT (#465). Replaces the pre-#462 monomorphic
+    /// `HashMap<(fn_id << 32 | pc), usize>`.
+    ///
+    /// Outer Vec is pre-sized to `program.functions.len()`; each inner
+    /// Vec is empty until the first GetField in that function runs,
+    /// at which point we one-shot allocate it to the compiler-recorded
+    /// `field_ic_sites` size and never resize again. Lazy on the inner
+    /// side so VMs created for short-lived scripts don't eagerly
+    /// allocate IC slots for functions they never enter.
+    field_ics: Vec<Vec<Option<usize>>>,
     /// Stack allocator for function locals (#389 slice 3).
     ///
     /// Every function frame claims `locals_count` contiguous slots from
@@ -472,7 +528,7 @@ impl<'a> Vm<'a> {
             pure_memo: std::collections::HashMap::new(),
             pure_memo_hits: 0,
             pure_memo_misses: 0,
-            field_ics: std::collections::HashMap::new(),
+            field_ics: vec![Vec::new(); program.functions.len()],
             // 256 slots handles ~32 frames × 8 locals; grows on demand and
             // retains capacity across consecutive vm.call() invocations.
             locals_storage: Vec::with_capacity(256),
@@ -520,11 +576,17 @@ impl<'a> Vm<'a> {
                 e.insert("message".into(), Value::Str(msg.into()));
                 Ok(Value::Variant {
                     name: "Err".into(),
-                    args: vec![Value::Record(e)],
+                    args: vec![Value::record_dynamic(e)],
                 })
             }
         }
     }
+
+    // ---- Variant helpers used by conc.* registry ops (#444) ----
+    // Local helpers (avoid pulling in serde / public API). Lex's
+    // `Result`/`Option` are stdlib unions; their runtime shape is a
+    // `Value::Variant { name, args }` with the constructor name as
+    // declared (`Ok`/`Err`/`Some`/`None`).
 
     /// VM-level handler for `conc.*` effect ops (#381).
     ///
@@ -552,7 +614,7 @@ impl<'a> Vm<'a> {
                 }
                 Ok(Value::Actor(Arc::new(Mutex::new(ActorCell {
                     state: init,
-                    handler,
+                    handler: crate::value::ActorHandler::Lex(handler),
                 }))))
             }
             "ask" | "tell" => {
@@ -568,21 +630,104 @@ impl<'a> Vm<'a> {
                 let mut guard = cell.lock().map_err(|e| format!("conc.{op}: actor mutex poisoned: {e}"))?;
                 let handler = guard.handler.clone();
                 let state = guard.state.clone();
-                // Call handler(state, msg) on this VM — full effect access.
-                let result = self.invoke_closure_value(handler, vec![state, msg])
-                    .map_err(|e| format!("conc.{op}: handler error: {e:?}"))?;
-                // Expect (new_state, reply) tuple.
-                match result {
-                    Value::Tuple(mut parts) if parts.len() == 2 => {
-                        let reply = parts.pop().unwrap();
-                        let new_state = parts.pop().unwrap();
-                        guard.state = new_state;
-                        drop(guard);
-                        if op == "ask" { Ok(reply) } else { Ok(Value::Unit) }
+                match handler {
+                    crate::value::ActorHandler::Lex(closure_val) => {
+                        // Call handler(state, msg) on this VM — full effect access.
+                        let result = self.invoke_closure_value(closure_val, vec![state, msg])
+                            .map_err(|e| format!("conc.{op}: handler error: {e:?}"))?;
+                        // Expect (new_state, reply) tuple.
+                        match result {
+                            Value::Tuple(mut parts) if parts.len() == 2 => {
+                                let reply = parts.pop().unwrap();
+                                let new_state = parts.pop().unwrap();
+                                guard.state = new_state;
+                                drop(guard);
+                                if op == "ask" { Ok(reply) } else { Ok(Value::Unit) }
+                            }
+                            other => Err(format!(
+                                "conc.{op}: handler must return a 2-tuple (new_state, reply), got {other:?}")),
+                        }
                     }
-                    other => Err(format!(
-                        "conc.{op}: handler must return a 2-tuple (new_state, reply), got {other:?}")),
+                    crate::value::ActorHandler::Native(native) => {
+                        // Native bridge: fire-and-forget; `state` is unused
+                        // (the bridge's "state" is the external resource, e.g.
+                        // a WebSocket connection). The closure receives `msg`
+                        // directly. `ask` returns whatever the bridge produces;
+                        // `tell` discards it. State stays untouched.
+                        drop(guard);
+                        let result = (native.send)(msg)
+                            .map_err(|e| format!("conc.{op}: native handler error: {e}"))?;
+                        if op == "ask" { Ok(result) } else { Ok(Value::Unit) }
+                    }
                 }
+            }
+            "register" => {
+                // conc.register(actor, name) -> Result[Unit, ConcError]
+                // Returns Ok(Unit) on first register, Err(AlreadyRegistered(name))
+                // if the name is taken. v1 stores the actor opaquely —
+                // see crate::conc_registry for the type-tag note.
+                let mut it = args.into_iter();
+                let actor = it.next().unwrap_or(Value::Unit);
+                if !matches!(actor, Value::Actor(_)) {
+                    return Err(format!(
+                        "conc.register: first arg must be an Actor, got {actor:?}"));
+                }
+                let name = match it.next() {
+                    Some(Value::Str(s)) => s.to_string(),
+                    other => return Err(format!(
+                        "conc.register: name must be Str, got {other:?}")),
+                };
+                Ok(match crate::conc_registry::register(&name, actor) {
+                    Ok(()) => variant_ok(Value::Unit),
+                    Err(crate::conc_registry::RegError::AlreadyRegistered(n)) => {
+                        variant_err(variant("AlreadyRegistered", vec![Value::Str(n.into())]))
+                    }
+                    Err(crate::conc_registry::RegError::NotRegistered(_)) => {
+                        unreachable!("register cannot produce NotRegistered")
+                    }
+                })
+            }
+            "lookup" => {
+                // conc.lookup(name) -> Option[Actor[S, M]]
+                // Returns Some(actor) if registered, None otherwise. The
+                // [S, M] static parametrisation at the call site is not
+                // checked at runtime in v1 — caller's responsibility to
+                // match the registration site's type.
+                let mut it = args.into_iter();
+                let name = match it.next() {
+                    Some(Value::Str(s)) => s.to_string(),
+                    other => return Err(format!(
+                        "conc.lookup: name must be Str, got {other:?}")),
+                };
+                Ok(match crate::conc_registry::lookup(&name) {
+                    Some(actor) => variant("Some", vec![actor]),
+                    None => variant("None", vec![]),
+                })
+            }
+            "unregister" => {
+                // conc.unregister(name) -> Result[Unit, ConcError]
+                let mut it = args.into_iter();
+                let name = match it.next() {
+                    Some(Value::Str(s)) => s.to_string(),
+                    other => return Err(format!(
+                        "conc.unregister: name must be Str, got {other:?}")),
+                };
+                Ok(match crate::conc_registry::unregister(&name) {
+                    Ok(()) => variant_ok(Value::Unit),
+                    Err(crate::conc_registry::RegError::NotRegistered(n)) => {
+                        variant_err(variant("NotRegistered", vec![Value::Str(n.into())]))
+                    }
+                    Err(crate::conc_registry::RegError::AlreadyRegistered(_)) => {
+                        unreachable!("unregister cannot produce AlreadyRegistered")
+                    }
+                })
+            }
+            "registered" => {
+                // conc.registered() -> List[Str] — sorted snapshot.
+                let names = crate::conc_registry::registered();
+                Ok(Value::List(names.into_iter()
+                    .map(|n| Value::Str(n.into()))
+                    .collect()))
             }
             other => Err(format!("unknown conc.{other}")),
         }
@@ -618,8 +763,12 @@ impl<'a> Vm<'a> {
         // and the reentrant `invoke_closure_value` path. Same
         // semantics, same error shape.
         let f_name = f.name.clone();
-        let refinements = f.refinements.clone();
-        for (i, refinement) in refinements.iter().enumerate() {
+        // Iterate `f.refinements` by reference — the loop body
+        // only reads from `self.program` (via `r`) and from locals,
+        // so we don't need to clone the Vec to detach it from
+        // `&self`. Removing this clone saves an allocation per
+        // call on the hot path (#461).
+        for (i, refinement) in f.refinements.iter().enumerate() {
             if let Some(r) = refinement {
                 let arg = args.get(i).cloned().unwrap_or(Value::Unit);
                 match eval_refinement(&r.predicate, &r.binding, &arg) {
@@ -696,7 +845,7 @@ impl<'a> Vm<'a> {
                 let fn_name = &self.program.functions[fn_id as usize].name;
                 return Err(VmError::Panic(format!("ran past end of code in `{fn_name}`")));
             }
-            let op = code[pc].clone();
+            let op = code[pc];
             self.frames[frame_idx].pc = pc + 1;
 
             match op {
@@ -719,21 +868,24 @@ impl<'a> Vm<'a> {
                     let base = self.frames[frame_idx].locals_start;
                     self.locals_storage[base + i as usize] = v;
                 }
-                Op::MakeRecord { field_name_indices } => {
-                    let n = field_name_indices.len();
+                Op::MakeRecord { shape_idx, field_count } => {
+                    let shape = &self.program.record_shapes[shape_idx as usize];
+                    let n = field_count as usize;
+                    debug_assert_eq!(shape.len(), n,
+                        "MakeRecord field_count must match record_shapes[shape_idx].len()");
                     let mut values: Vec<Value> = (0..n).map(|_| Value::Unit).collect();
                     for i in (0..n).rev() {
                         values[i] = self.pop()?;
                     }
                     let mut rec = IndexMap::new();
                     for (i, val) in values.into_iter().enumerate() {
-                        let name = match &self.program.constants[field_name_indices[i] as usize] {
+                        let name = match &self.program.constants[shape[i] as usize] {
                             Const::FieldName(s) => s.clone(),
                             _ => return Err(VmError::TypeMismatch("expected FieldName const".into())),
                         };
                         rec.insert(name, val);
                     }
-                    self.stack.push(Value::Record(rec));
+                    self.stack.push(Value::Record { shape_id: shape_idx, fields: Box::new(rec) });
                 }
                 Op::MakeTuple(n) => {
                     let mut items: Vec<Value> = (0..n).map(|_| Value::Unit).collect();
@@ -754,17 +906,34 @@ impl<'a> Vm<'a> {
                     };
                     self.stack.push(Value::Variant { name, args });
                 }
-                Op::GetField(i) => {
-                    let name_idx = i;
+                Op::GetField { name_idx, site_idx } => {
                     let v = self.pop()?;
                     match v {
-                        Value::Record(r) => {
-                            // Inline cache keyed by call site: (fn_id << 32 | pc).
-                            // On hit: verify field name at cached offset (O(1), no
-                            // string hash); on miss: walk by name + populate cache.
-                            let site = (fn_id as u64) << 32 | pc as u64;
+                        Value::Record { fields: r, shape_id } => {
+                            if ic_stats_enabled() {
+                                record_ic_hit(fn_id, site_idx, shape_id);
+                            }
+                            // Inline cache keyed by (fn_id, site_idx) — #462
+                            // slice 1. Direct array index instead of the
+                            // pre-#462 `HashMap<(fn_id << 32 | pc), usize>`.
+                            // The inner Vec is empty until first GetField in
+                            // this function runs; we one-shot allocate it to
+                            // the compiler-recorded site count and never
+                            // resize again. After init, the hot path is two
+                            // array dereferences. On hit: verify the cached
+                            // offset still points at the requested field
+                            // (name compare — shape_id propagation is the
+                            // next slice). On miss: walk the IndexMap by
+                            // name, populate.
+                            let fid = fn_id as usize;
+                            let sid = site_idx as usize;
+                            if self.field_ics[fid].is_empty() {
+                                let n = self.program.functions[fid].field_ic_sites as usize;
+                                self.field_ics[fid] = vec![None; n];
+                            }
+                            let cached = self.field_ics[fid][sid];
                             let value = 'ic: {
-                                if let Some(&off) = self.field_ics.get(&site) {
+                                if let Some(off) = cached {
                                     if let Some((k, val)) = r.get_index(off) {
                                         if let Const::FieldName(s) =
                                             &self.program.constants[name_idx as usize]
@@ -782,7 +951,7 @@ impl<'a> Vm<'a> {
                                 let (off, _, val) = r.get_full(name)
                                     .ok_or_else(|| VmError::TypeMismatch(
                                         format!("missing field `{name}`")))?;
-                                self.field_ics.insert(site, off);
+                                self.field_ics[fid][sid] = Some(off);
                                 val.clone()
                             };
                             self.stack.push(value);
@@ -1033,8 +1202,13 @@ impl<'a> Vm<'a> {
                     // starts, which means an erroring trace shows the
                     // call as enter+exit_err with the verdict reason
                     // (same shape as `gate.verdict`).
-                    let refinements = self.program.functions[fn_id as usize]
-                        .refinements.clone();
+                    //
+                    // Iterate by reference — the loop body reads only
+                    // through `r` (borrowed from `self.program`) and
+                    // locals; we don't mutate `self` in here, so the
+                    // borrow is fine and we avoid one Vec allocation
+                    // per call on the hot path (#461).
+                    let refinements = &self.program.functions[fn_id as usize].refinements;
                     for (i, refinement) in refinements.iter().enumerate() {
                         if let Some(r) = refinement {
                             let arg = args.get(i).cloned().unwrap_or(Value::Unit);
@@ -1107,9 +1281,10 @@ impl<'a> Vm<'a> {
                             .map_err(VmError::Effect)?;
                     }
                     // Refinement runtime check on tail calls too
-                    // (#209 slice 3). Same shape as Op::Call.
-                    let refinements = self.program.functions[fn_id as usize]
-                        .refinements.clone();
+                    // (#209 slice 3). Same shape as Op::Call —
+                    // iterate by reference to avoid a per-call Vec
+                    // allocation (#461).
+                    let refinements = &self.program.functions[fn_id as usize].refinements;
                     for (i, refinement) in refinements.iter().enumerate() {
                         if let Some(r) = refinement {
                             let arg = args.get(i).cloned().unwrap_or(Value::Unit);
@@ -1333,6 +1508,62 @@ impl<'a> Vm<'a> {
                     };
                     self.stack.push(Value::Bool(eq));
                 }
+
+                // Superinstructions (#461).
+                Op::LoadLocalAddIntConst { local_idx, imm_const_idx } => {
+                    let base = self.frames[frame_idx].locals_start;
+                    let a = self.locals_storage[base + local_idx as usize].as_int();
+                    let b = match &self.program.constants[imm_const_idx as usize] {
+                        Const::Int(n) => *n,
+                        c => return Err(VmError::TypeMismatch(
+                            format!("LoadLocalAddIntConst expected Int const, got {c:?}"))),
+                    };
+                    self.stack.push(Value::Int(a + b));
+                    // Override the default `pc + 1`: skip past the
+                    // two inert primitive ops (the original
+                    // PushConst + IntAdd) that the peephole pass
+                    // left in place for body-hash stability.
+                    self.frames[frame_idx].pc = pc + 3;
+                }
+                Op::LoadLocalAddLocal { lhs_idx, rhs_idx } => {
+                    let base = self.frames[frame_idx].locals_start;
+                    let a = self.locals_storage[base + lhs_idx as usize].as_int();
+                    let b = self.locals_storage[base + rhs_idx as usize].as_int();
+                    self.stack.push(Value::Int(a + b));
+                    // Override the default `pc + 1`: skip past the
+                    // two inert primitive ops (the original
+                    // LoadLocal(rhs_idx) + IntAdd) that the peephole
+                    // pass left in place for body-hash stability.
+                    self.frames[frame_idx].pc = pc + 3;
+                }
+                Op::LoadLocalSubLocal { lhs_idx, rhs_idx } => {
+                    let base = self.frames[frame_idx].locals_start;
+                    let a = self.locals_storage[base + lhs_idx as usize].as_int();
+                    let b = self.locals_storage[base + rhs_idx as usize].as_int();
+                    self.stack.push(Value::Int(a - b));
+                    self.frames[frame_idx].pc = pc + 3;
+                }
+                Op::LoadLocalMulLocal { lhs_idx, rhs_idx } => {
+                    let base = self.frames[frame_idx].locals_start;
+                    let a = self.locals_storage[base + lhs_idx as usize].as_int();
+                    let b = self.locals_storage[base + rhs_idx as usize].as_int();
+                    self.stack.push(Value::Int(a * b));
+                    self.frames[frame_idx].pc = pc + 3;
+                }
+                Op::LoadLocalAddIntConstStoreLocal { src, imm_const_idx, dest } => {
+                    let base = self.frames[frame_idx].locals_start;
+                    let a = self.locals_storage[base + src as usize].as_int();
+                    let b = match &self.program.constants[imm_const_idx as usize] {
+                        Const::Int(n) => *n,
+                        c => return Err(VmError::TypeMismatch(
+                            format!("LoadLocalAddIntConstStoreLocal expected Int const, got {c:?}"))),
+                    };
+                    self.locals_storage[base + dest as usize] = Value::Int(a + b);
+                    // Skip past the 3 inert primitive ops we
+                    // absorbed (original PushConst + IntAdd +
+                    // StoreLocal).
+                    self.frames[frame_idx].pc = pc + 4;
+                }
             }
         }
     }
@@ -1395,6 +1626,23 @@ impl<'a> Vm<'a> {
         Ok(())
     }
 }
+
+impl Drop for Vm<'_> {
+    fn drop(&mut self) {
+        if ic_stats_enabled() {
+            dump_ic_stats();
+        }
+    }
+}
+
+/// Construct a `Value::Variant` with the given name and args.
+/// Used by `conc.*` registry ops to return `Result`/`Option`/`ConcError`
+/// values without hand-writing the struct literal at every site.
+fn variant(name: &str, args: Vec<Value>) -> Value {
+    Value::Variant { name: name.to_string(), args }
+}
+fn variant_ok(payload: Value) -> Value { variant("Ok", vec![payload]) }
+fn variant_err(payload: Value) -> Value { variant("Err", vec![payload]) }
 
 fn const_to_value(c: &Const) -> Value {
     match c {

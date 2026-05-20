@@ -14,6 +14,12 @@ struct ConstPool {
     ints: IndexMap<i64, u32>,
     bools: IndexMap<u8, u32>,
     strs: IndexMap<String, u32>,
+    /// Interned record field-name shapes (#461). Deduplicated by content
+    /// so a record literal with the same field-name layout reuses the
+    /// same `shape_idx` across the whole program — keeps the side-table
+    /// small even when the same struct is constructed in many places.
+    record_shapes: Vec<Vec<u32>>,
+    record_shape_dedup: IndexMap<Vec<u32>, u32>,
 }
 
 impl ConstPool {
@@ -71,6 +77,19 @@ impl ConstPool {
         self.pool.push(Const::Unit);
         i
     }
+
+    /// Intern a record field-name shape (#461). Returns the index into
+    /// `record_shapes`; identical shapes (same field-name-index vec)
+    /// always return the same index.
+    fn record_shape(&mut self, idxs: Vec<u32>) -> u32 {
+        if let Some(i) = self.record_shape_dedup.get(&idxs) {
+            return *i;
+        }
+        let i = self.record_shapes.len() as u32;
+        self.record_shape_dedup.insert(idxs.clone(), i);
+        self.record_shapes.push(idxs);
+        i
+    }
 }
 
 pub fn compile_program(stages: &[a::Stage]) -> Program {
@@ -80,6 +99,7 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
         function_names: IndexMap::new(),
         module_aliases: IndexMap::new(),
         entry: None,
+        record_shapes: Vec::new(),
     };
 
     // Collect imports as alias → module-name. The module name is the part
@@ -122,6 +142,8 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
                         }),
                     _ => None,
                 }).collect(),
+                // Filled in below once the FnCompiler counts emit sites.
+                field_ic_sites: 0,
             });
         }
     }
@@ -142,6 +164,8 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
                 locals: IndexMap::new(),
                 next_local: 0,
                 peak_local: 0,
+                local_types: IndexMap::new(),
+                field_get_sites: 0,
                 pool: &mut pool,
                 function_names: &function_names,
                 module_aliases: &module_aliases,
@@ -152,6 +176,7 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
             for param in &fd.params {
                 let i = fc.next_local;
                 fc.locals.insert(param.name.clone(), i);
+                fc.local_types.insert(param.name.clone(), classify_type_expr(&param.ty));
                 fc.next_local += 1;
                 fc.peak_local = fc.next_local;
             }
@@ -159,9 +184,11 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
             fc.code.push(Op::Return);
             let code = std::mem::take(&mut fc.code);
             let peak = fc.peak_local;
+            let field_sites = fc.field_get_sites as u16;
             drop(fc);
             let idx = function_names[&fd.name];
             p.functions[idx as usize].code = code;
+            p.functions[idx as usize].field_ic_sites = field_sites;
             p.functions[idx as usize].locals_count = peak;
         }
     }
@@ -175,6 +202,8 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
             locals: IndexMap::new(),
             next_local: 0,
             peak_local: 0,
+            local_types: IndexMap::new(),
+            field_get_sites: 0,
             pool: &mut pool,
             function_names: &function_names,
             module_aliases: &module_aliases,
@@ -185,12 +214,18 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
         for name in &pl.capture_names {
             let i = fc.next_local;
             fc.locals.insert(name.clone(), i);
+            // Captures' static types aren't known at this layer
+            // — the closure's environment carries them dynamically.
+            // Conservative fallback; binop lowering stays correct
+            // because Unknown classifies through to NumAdd.
+            fc.local_types.insert(name.clone(), NumTy::Unknown);
             fc.next_local += 1;
             fc.peak_local = fc.next_local;
         }
         for p in &pl.params {
             let i = fc.next_local;
             fc.locals.insert(p.name.clone(), i);
+            fc.local_types.insert(p.name.clone(), classify_type_expr(&p.ty));
             fc.next_local += 1;
             fc.peak_local = fc.next_local;
         }
@@ -198,9 +233,33 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
         fc.code.push(Op::Return);
         let code = std::mem::take(&mut fc.code);
         let peak = fc.peak_local;
+        let field_sites = fc.field_get_sites as u16;
         drop(fc);
         p.functions[pl.fn_id as usize].code = code;
+        p.functions[pl.fn_id as usize].field_ic_sites = field_sites;
         p.functions[pl.fn_id as usize].locals_count = peak;
+    }
+
+    // Peephole pass (#461 superinstructions). Rewrites fusable opcode
+    // patterns into single dispatch steps. Runs before `body_hash`
+    // computation, but `compute_body_hash` decomposes each fused op
+    // back to its primitive form on hash — so closure identity (#222)
+    // is invariant under this pass and the order doesn't matter.
+    //
+    // Slices run sequentially: slice 2 looks for slice-1 output
+    // followed by a StoreLocal, so it must follow slice 1. Slice 3
+    // (LoadLocal + LoadLocal + IntAdd) is disjoint from both — its
+    // second slot is LoadLocal, not PushConst — so it can run in
+    // either order. Run it last to keep the slice 1/2 contract
+    // (slice 2 expects to see slice-1 output) untouched. Slice 4 is
+    // slice 3 for IntSub / IntMul (same pattern, different terminator);
+    // disjoint from every prior slice because the terminator op
+    // disambiguates, so order between slice 3 and slice 4 is free.
+    for f in p.functions.iter_mut() {
+        apply_peephole(&mut f.code, &pool.pool);
+        apply_peephole_slice2(&mut f.code);
+        apply_peephole_slice3(&mut f.code);
+        apply_peephole_slice4(&mut f.code);
     }
 
     // Final pass: stamp every function with its content hash now that
@@ -210,12 +269,199 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
     for f in p.functions.iter_mut() {
         if f.body_hash == crate::program::ZERO_BODY_HASH {
             f.body_hash = crate::program::compute_body_hash(
-                f.arity, f.locals_count, &f.code);
+                f.arity, f.locals_count, &f.code, &pool.record_shapes);
         }
     }
 
     p.constants = pool.pool;
+    p.record_shapes = pool.record_shapes;
     p
+}
+
+/// Peephole pass: rewrite fusable opcode patterns into superinstructions
+/// (#461). Each fused op claims its own slot in the code stream; the
+/// trailing primitive ops it absorbs stay in place as inert
+/// "tombstones" — the dispatch loop overrides its default `pc += 1`
+/// to step past them. Leaving the tombstones in place keeps
+/// `code.len()` invariant and means we don't have to renumber jump
+/// offsets.
+///
+/// Pattern (slice 1): `LoadLocal(i), PushConst(c), IntAdd` where
+/// `constants[c]` is a `Const::Int`. Fused to
+/// `LoadLocalAddIntConst { local_idx: i, imm_const_idx: c }`.
+/// Safety: the second and third slots must not be reachable from
+/// any Jump / JumpIf / JumpIfNot — otherwise a jump would land on a
+/// tombstone instead of the live op the source intended. The
+/// pre-pass below collects every jump target in the function and
+/// skips fusion sites whose tombstones overlap one.
+fn apply_peephole(code: &mut [Op], constants: &[Const]) {
+    if code.len() < 3 { return; }
+    let jump_targets = collect_jump_targets(code);
+
+    let n = code.len();
+    let mut k = 0;
+    while k + 2 < n {
+        if let (Op::LoadLocal(local_idx), Op::PushConst(imm_const_idx), Op::IntAdd)
+            = (code[k], code[k + 1], code[k + 2])
+        {
+            let imm_is_int = matches!(
+                constants.get(imm_const_idx as usize),
+                Some(Const::Int(_))
+            );
+            // Tombstones at k+1 and k+2 must not be jump targets;
+            // k itself can be a target (it stays a live op — the
+            // fused form executes the same semantics in one step).
+            let safe = imm_is_int
+                && !jump_targets.contains(&(k + 1))
+                && !jump_targets.contains(&(k + 2));
+            if safe {
+                code[k] = Op::LoadLocalAddIntConst { local_idx, imm_const_idx };
+                k += 3;
+                continue;
+            }
+        }
+        k += 1;
+    }
+}
+
+/// Slice 2: fuse `[LoadLocalAddIntConst, _, _, StoreLocal(dest)]`
+/// into `LoadLocalAddIntConstStoreLocal { src, imm_const_idx, dest }`.
+/// The two `_` slots are slice-1 tombstones (the original PushConst
+/// and IntAdd) and stay in place as slice-2 tombstones too. The
+/// dispatch loop advances pc by 4 past all three trailing slots
+/// after executing the fused op.
+fn apply_peephole_slice2(code: &mut [Op]) {
+    if code.len() < 4 { return; }
+    let jump_targets = collect_jump_targets(code);
+
+    let n = code.len();
+    let mut k = 0;
+    while k + 3 < n {
+        if let (
+            Op::LoadLocalAddIntConst { local_idx: src, imm_const_idx },
+            _,
+            _,
+            Op::StoreLocal(dest),
+        ) = (code[k], code[k + 1], code[k + 2], code[k + 3])
+        {
+            // Slice-1 contract: code[k+1] is the original
+            // PushConst(imm_const_idx) and code[k+2] is the
+            // original IntAdd. We don't re-verify those — slice 1
+            // is the only producer of LoadLocalAddIntConst and
+            // always leaves the contract intact.
+            //
+            // Safety: tombstones at k+1..k+3 must not be reachable
+            // from any jump. k itself can be (it's still a live
+            // op carrying the same semantics).
+            let safe = !jump_targets.contains(&(k + 1))
+                && !jump_targets.contains(&(k + 2))
+                && !jump_targets.contains(&(k + 3));
+            if safe {
+                code[k] = Op::LoadLocalAddIntConstStoreLocal {
+                    src,
+                    imm_const_idx,
+                    dest,
+                };
+                k += 4;
+                continue;
+            }
+        }
+        k += 1;
+    }
+}
+
+/// Slice 3: fuse `[LoadLocal(lhs), LoadLocal(rhs), IntAdd]` into
+/// `LoadLocalAddLocal { lhs_idx, rhs_idx }`. The binary-op-on-two-
+/// locals idiom: any `a + b` where both operands compile to a
+/// `LoadLocal` (typed `Int`). Mirrors slice 1's shape exactly — the
+/// trailing `LoadLocal` + `IntAdd` stay in place as inert tombstones
+/// with cancelling stack deltas (+1, -1), so the verifier and
+/// body-hash decoder both keep walking them as live.
+///
+/// Disjoint from slice 1: the second slot disambiguates (LoadLocal
+/// vs PushConst), so a site can match at most one of the two. Runs
+/// after slice 2 so we don't accidentally consume a `LoadLocal` slot
+/// that slice 2 was about to fuse into a `*StoreLocal` superop (and
+/// to keep slice 2's input contract — slice-1 output followed by
+/// StoreLocal — untouched).
+///
+/// Safety: like slice 1, the trailing two slots must not be jump
+/// targets. The first slot can be a target (it stays a live op).
+fn apply_peephole_slice3(code: &mut [Op]) {
+    if code.len() < 3 { return; }
+    let jump_targets = collect_jump_targets(code);
+
+    let n = code.len();
+    let mut k = 0;
+    while k + 2 < n {
+        if let (Op::LoadLocal(lhs_idx), Op::LoadLocal(rhs_idx), Op::IntAdd)
+            = (code[k], code[k + 1], code[k + 2])
+        {
+            let safe = !jump_targets.contains(&(k + 1))
+                && !jump_targets.contains(&(k + 2));
+            if safe {
+                code[k] = Op::LoadLocalAddLocal { lhs_idx, rhs_idx };
+                k += 3;
+                continue;
+            }
+        }
+        k += 1;
+    }
+}
+
+/// Slice 4: slice 3 for `IntSub` and `IntMul`. Fuses
+/// `[LoadLocal(lhs), LoadLocal(rhs), IntSub]` to
+/// `LoadLocalSubLocal { lhs_idx, rhs_idx }` and the `IntMul` shape
+/// to `LoadLocalMulLocal`. Same tombstone, jump-safety, and
+/// body-hash story as slice 3 — the trailing two slots stay as
+/// inert primitives with cancelling stack deltas.
+///
+/// Disjoint from every prior slice: slice 1/2 require a `PushConst`
+/// at slot 2 (here it's `LoadLocal`), and slice 3's terminator is
+/// `IntAdd` (here it's `IntSub` / `IntMul`). A given site matches at
+/// most one slice.
+fn apply_peephole_slice4(code: &mut [Op]) {
+    if code.len() < 3 { return; }
+    let jump_targets = collect_jump_targets(code);
+
+    let n = code.len();
+    let mut k = 0;
+    while k + 2 < n {
+        if let (Op::LoadLocal(lhs_idx), Op::LoadLocal(rhs_idx), terminator)
+            = (code[k], code[k + 1], code[k + 2])
+        {
+            let fused = match terminator {
+                Op::IntSub => Some(Op::LoadLocalSubLocal { lhs_idx, rhs_idx }),
+                Op::IntMul => Some(Op::LoadLocalMulLocal { lhs_idx, rhs_idx }),
+                _ => None,
+            };
+            if let Some(fused_op) = fused {
+                let safe = !jump_targets.contains(&(k + 1))
+                    && !jump_targets.contains(&(k + 2));
+                if safe {
+                    code[k] = fused_op;
+                    k += 3;
+                    continue;
+                }
+            }
+        }
+        k += 1;
+    }
+}
+
+fn collect_jump_targets(code: &[Op]) -> std::collections::HashSet<usize> {
+    let mut targets = std::collections::HashSet::new();
+    for (pc, op) in code.iter().enumerate() {
+        let off = match op {
+            Op::Jump(off) | Op::JumpIf(off) | Op::JumpIfNot(off) => Some(*off),
+            _ => None,
+        };
+        if let Some(off) = off {
+            let target = (pc as i32 + 1 + off) as usize;
+            targets.insert(target);
+        }
+    }
+    targets
 }
 
 #[derive(Debug, Clone)]
@@ -233,6 +479,28 @@ struct FnCompiler<'a> {
     next_local: u16,
     /// Peak local usage seen during compilation (for VM frame sizing).
     peak_local: u16,
+    /// Inferred numeric type of each local for typed numeric-op
+    /// lowering (#461). Populated when binding function parameters
+    /// (from their declared `TypeExpr::Named { name: "Int", .. }`
+    /// or `"Float"`) and when binding `let name := value` where
+    /// the RHS classifies statically. Used by `compile_binop` to
+    /// emit `Op::IntAdd` / `Op::FloatAdd` instead of the
+    /// polymorphic `Op::NumAdd` when both operands' types are
+    /// statically known. Conservative: falls back to `NumTy::Unknown`
+    /// (and the polymorphic op) whenever a type isn't locally
+    /// derivable.
+    ///
+    /// Keyed by local *name* (parallel to `locals`) rather than by
+    /// slot index so shadowed bindings are handled correctly via
+    /// `IndexMap`'s insertion-order semantics.
+    local_types: IndexMap<String, NumTy>,
+    /// Per-function counter for `Op::GetField` site indices (#462
+    /// slice 1). Each `Op::GetField` emit allocates the next index
+    /// here, giving every field-access site within this function a
+    /// stable identifier independent of pc. The VM uses
+    /// `(fn_id, site_idx)` as the inline-cache key, so the cache
+    /// survives the future dispatch rewrite (#461) and a JIT (#465).
+    field_get_sites: u32,
     pool: &'a mut ConstPool,
     function_names: &'a IndexMap<String, u32>,
     module_aliases: &'a IndexMap<String, String>,
@@ -244,6 +512,28 @@ struct FnCompiler<'a> {
     /// Mutable view of the function table — used to allocate fn_ids for
     /// freshly-discovered lambdas.
     next_fn_id: &'a mut Vec<Function>,
+}
+
+/// Lightweight numeric-type classification used by `compile_binop`
+/// to decide whether to emit `IntAdd` / `FloatAdd` (specialized,
+/// fast) or `NumAdd` (polymorphic, runtime-typed dispatch). #461
+/// typed-lowering pass — conservative: anything not provably one
+/// of these returns `Unknown` and falls back to the polymorphic op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NumTy { Int, Float, Unknown }
+
+fn classify_type_expr(ty: &a::TypeExpr) -> NumTy {
+    match ty {
+        a::TypeExpr::Named { name, args } if args.is_empty() => match name.as_str() {
+            "Int" => NumTy::Int,
+            "Float" => NumTy::Float,
+            _ => NumTy::Unknown,
+        },
+        // `Refined { base, .. }` (#209) — classify by the base type;
+        // the refinement predicate doesn't change the value's primitive shape.
+        a::TypeExpr::Refined { base, .. } => classify_type_expr(base),
+        _ => NumTy::Unknown,
+    }
 }
 
 impl<'a> FnCompiler<'a> {
@@ -276,9 +566,18 @@ impl<'a> FnCompiler<'a> {
                     panic!("unknown var in compiler: {name}");
                 }
             }
-            a::CExpr::Let { name, ty: _, value, body } => {
+            a::CExpr::Let { name, ty, value, body } => {
+                // Classify the RHS for typed-op lowering (#461). Prefer
+                // the declared annotation when present (cheap O(1)
+                // lookup); fall back to classifying the value
+                // expression structurally.
+                let nty = match ty {
+                    Some(t) => classify_type_expr(t),
+                    None => self.classify_expr(value),
+                };
                 self.compile_expr(value, false);
                 let slot = self.alloc_local(name);
+                self.local_types.insert(name.clone(), nty);
                 self.emit(Op::StoreLocal(slot));
                 self.compile_expr(body, tail);
             }
@@ -302,7 +601,9 @@ impl<'a> FnCompiler<'a> {
                     self.compile_expr(&f.value, false);
                     idxs.push(self.pool.field(&f.name));
                 }
-                self.emit(Op::MakeRecord { field_name_indices: idxs });
+                let field_count = idxs.len() as u16;
+                let shape_idx = self.pool.record_shape(idxs);
+                self.emit(Op::MakeRecord { shape_idx, field_count });
             }
             a::CExpr::TupleLit { items } => {
                 for it in items { self.compile_expr(it, false); }
@@ -314,8 +615,10 @@ impl<'a> FnCompiler<'a> {
             }
             a::CExpr::FieldAccess { value, field } => {
                 self.compile_expr(value, false);
-                let idx = self.pool.field(field);
-                self.emit(Op::GetField(idx));
+                let name_idx = self.pool.field(field);
+                let site_idx = self.field_get_sites;
+                self.field_get_sites += 1;
+                self.emit(Op::GetField { name_idx, site_idx });
             }
             a::CExpr::BinOp { op, lhs, rhs } => self.compile_binop(op, lhs, rhs),
             a::CExpr::UnaryOp { op, expr } => {
@@ -415,23 +718,95 @@ impl<'a> FnCompiler<'a> {
     }
 
     fn compile_binop(&mut self, op: &str, lhs: &a::CExpr, rhs: &a::CExpr) {
+        // #461 typed lowering: if we can statically prove both
+        // operands are the same numeric type, emit the typed
+        // primitive (`IntAdd` / `FloatAdd`) instead of the
+        // polymorphic `NumAdd` that runtime-matches on operand
+        // shape. The fast path skips one match per arithmetic op
+        // *and* unblocks downstream peephole fusions (slice 1)
+        // that scan for typed primitives. Conservative fallback
+        // to the polymorphic op when either side classifies as
+        // `Unknown`, so correctness for `Float` / mixed code is
+        // unchanged.
+        let lhs_ty = self.classify_expr(lhs);
+        let rhs_ty = self.classify_expr(rhs);
+        let typed = match (lhs_ty, rhs_ty) {
+            (NumTy::Int, NumTy::Int) => NumTy::Int,
+            (NumTy::Float, NumTy::Float) => NumTy::Float,
+            _ => NumTy::Unknown,
+        };
         self.compile_expr(lhs, false);
         self.compile_expr(rhs, false);
-        match op {
-            "+" => self.emit(Op::NumAdd),
-            "-" => self.emit(Op::NumSub),
-            "*" => self.emit(Op::NumMul),
-            "/" => self.emit(Op::NumDiv),
-            "%" => self.emit(Op::NumMod),
-            "==" => self.emit(Op::NumEq),
-            "!=" => { self.emit(Op::NumEq); self.emit(Op::BoolNot); }
-            "<" => self.emit(Op::NumLt),
-            "<=" => self.emit(Op::NumLe),
-            ">" => { self.emit_swap_top2(); self.emit(Op::NumLt); }
-            ">=" => { self.emit_swap_top2(); self.emit(Op::NumLe); }
-            "and" => self.emit(Op::BoolAnd),
-            "or" => self.emit(Op::BoolOr),
-            other => panic!("unknown binop: {other:?}"),
+        match (op, typed) {
+            ("+",  NumTy::Int)     => self.emit(Op::IntAdd),
+            ("+",  NumTy::Float)   => self.emit(Op::FloatAdd),
+            ("+",  NumTy::Unknown) => self.emit(Op::NumAdd),
+            ("-",  NumTy::Int)     => self.emit(Op::IntSub),
+            ("-",  NumTy::Float)   => self.emit(Op::FloatSub),
+            ("-",  NumTy::Unknown) => self.emit(Op::NumSub),
+            ("*",  NumTy::Int)     => self.emit(Op::IntMul),
+            ("*",  NumTy::Float)   => self.emit(Op::FloatMul),
+            ("*",  NumTy::Unknown) => self.emit(Op::NumMul),
+            ("/",  NumTy::Int)     => self.emit(Op::IntDiv),
+            ("/",  NumTy::Float)   => self.emit(Op::FloatDiv),
+            ("/",  NumTy::Unknown) => self.emit(Op::NumDiv),
+            // Int has %; Float doesn't (NumMod will reject at runtime).
+            ("%",  NumTy::Int)     => self.emit(Op::IntMod),
+            ("%",  _)              => self.emit(Op::NumMod),
+            ("==", NumTy::Int)     => self.emit(Op::IntEq),
+            ("==", NumTy::Float)   => self.emit(Op::FloatEq),
+            ("==", NumTy::Unknown) => self.emit(Op::NumEq),
+            ("!=", NumTy::Int)     => { self.emit(Op::IntEq);   self.emit(Op::BoolNot); }
+            ("!=", NumTy::Float)   => { self.emit(Op::FloatEq); self.emit(Op::BoolNot); }
+            ("!=", NumTy::Unknown) => { self.emit(Op::NumEq);   self.emit(Op::BoolNot); }
+            ("<",  NumTy::Int)     => self.emit(Op::IntLt),
+            ("<",  NumTy::Float)   => self.emit(Op::FloatLt),
+            ("<",  NumTy::Unknown) => self.emit(Op::NumLt),
+            ("<=", NumTy::Int)     => self.emit(Op::IntLe),
+            ("<=", NumTy::Float)   => self.emit(Op::FloatLe),
+            ("<=", NumTy::Unknown) => self.emit(Op::NumLe),
+            (">",  NumTy::Int)     => { self.emit_swap_top2(); self.emit(Op::IntLt); }
+            (">",  NumTy::Float)   => { self.emit_swap_top2(); self.emit(Op::FloatLt); }
+            (">",  NumTy::Unknown) => { self.emit_swap_top2(); self.emit(Op::NumLt); }
+            (">=", NumTy::Int)     => { self.emit_swap_top2(); self.emit(Op::IntLe); }
+            (">=", NumTy::Float)   => { self.emit_swap_top2(); self.emit(Op::FloatLe); }
+            (">=", NumTy::Unknown) => { self.emit_swap_top2(); self.emit(Op::NumLe); }
+            ("and", _) => self.emit(Op::BoolAnd),
+            ("or",  _) => self.emit(Op::BoolOr),
+            (other, _) => panic!("unknown binop: {other:?}"),
+        }
+    }
+
+    /// Classify an expression's static numeric type for #461 typed
+    /// lowering. Strictly conservative: only returns `Int` / `Float`
+    /// when the type is locally derivable from a literal, an
+    /// already-classified local, or a binary op on two same-typed
+    /// operands. Everything else (function calls, field access,
+    /// match expressions, ...) falls back to `Unknown` and the
+    /// polymorphic NumAdd-family op.
+    fn classify_expr(&self, e: &a::CExpr) -> NumTy {
+        match e {
+            a::CExpr::Literal { value: a::CLit::Int { .. } } => NumTy::Int,
+            a::CExpr::Literal { value: a::CLit::Float { .. } } => NumTy::Float,
+            a::CExpr::Var { name } =>
+                self.local_types.get(name).copied().unwrap_or(NumTy::Unknown),
+            a::CExpr::BinOp { op, lhs, rhs } => {
+                // Numeric ops preserve the operand type (Int+Int=Int,
+                // Float+Float=Float). Comparison/logical ops yield
+                // Bool, not a numeric type — return Unknown.
+                let is_numeric = matches!(op.as_str(), "+" | "-" | "*" | "/" | "%");
+                if !is_numeric { return NumTy::Unknown; }
+                match (self.classify_expr(lhs), self.classify_expr(rhs)) {
+                    (NumTy::Int, NumTy::Int) => NumTy::Int,
+                    (NumTy::Float, NumTy::Float) => NumTy::Float,
+                    _ => NumTy::Unknown,
+                }
+            }
+            a::CExpr::UnaryOp { op, expr } if op == "-" => self.classify_expr(expr),
+            // Let-expressions: the let-binding mutates `local_types`
+            // *during* compile_expr; classifying ahead of time would
+            // require simulating that. Conservative fallback.
+            _ => NumTy::Unknown,
         }
     }
 
@@ -560,8 +935,10 @@ impl<'a> FnCompiler<'a> {
                 self.emit(Op::StoreLocal(slot));
                 for f in fields {
                     self.emit(Op::LoadLocal(slot));
-                    let fi = self.pool.field(&f.name);
-                    self.emit(Op::GetField(fi));
+                    let name_idx = self.pool.field(&f.name);
+                    let site_idx = self.field_get_sites;
+                    self.field_get_sites += 1;
+                    self.emit(Op::GetField { name_idx, site_idx });
                     let sub_fails = self.compile_pattern_test(&f.pattern, bindings);
                     fails.extend(sub_fails);
                 }
@@ -616,6 +993,9 @@ impl<'a> FnCompiler<'a> {
             // the parser). #209 stays focused on top-level fn decls;
             // closure-param refinements are a follow-up.
             refinements: Vec::new(),
+            // Lambda body hasn't been compiled yet; filled in by the
+            // deferred lambda-compile pass after FnCompiler walks it.
+            field_ic_sites: 0,
         });
 
         // Emit code at the lambda site: load each captured local, then MakeClosure.
@@ -666,6 +1046,7 @@ impl<'a> FnCompiler<'a> {
             ("iter", "take")      => self.emit_iter_take(args),
             ("iter", "skip")      => self.emit_iter_skip(args),
             ("iter", "to_list")   => self.emit_iter_to_list(args),
+            ("iter", "collect")   => self.emit_iter_to_list(args),
             ("iter", "map")       => self.emit_iter_map(args),
             ("iter", "filter")    => self.emit_iter_filter(args),
             ("iter", "fold")      => self.emit_iter_fold(args),
@@ -708,7 +1089,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(i));
         self.emit(Op::LoadLocal(xs));
         self.emit(Op::GetListLen);
-        self.emit(Op::NumLt);
+        self.emit(Op::IntLt);
         let j_exit = self.code.len();
         self.emit(Op::JumpIfNot(0));
 
@@ -727,7 +1108,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(i));
         let one = self.pool.int(1);
         self.emit(Op::PushConst(one));
-        self.emit(Op::NumAdd);
+        self.emit(Op::IntAdd);
         self.emit(Op::StoreLocal(i));
 
         // jump back
@@ -791,7 +1172,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(i));
         self.emit(Op::LoadLocal(xs));
         self.emit(Op::GetListLen);
-        self.emit(Op::NumLt);
+        self.emit(Op::IntLt);
         let j_exit = self.code.len();
         self.emit(Op::JumpIfNot(0));
 
@@ -824,7 +1205,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(i));
         let one = self.pool.int(1);
         self.emit(Op::PushConst(one));
-        self.emit(Op::NumAdd);
+        self.emit(Op::IntAdd);
         self.emit(Op::StoreLocal(i));
 
         let jump_back = self.code.len();
@@ -860,7 +1241,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(i));
         self.emit(Op::LoadLocal(xs));
         self.emit(Op::GetListLen);
-        self.emit(Op::NumLt);
+        self.emit(Op::IntLt);
         let j_exit = self.code.len();
         self.emit(Op::JumpIfNot(0));
 
@@ -878,7 +1259,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(i));
         let one = self.pool.int(1);
         self.emit(Op::PushConst(one));
-        self.emit(Op::NumAdd);
+        self.emit(Op::IntAdd);
         self.emit(Op::StoreLocal(i));
 
         let jump_back = self.code.len();
@@ -1075,7 +1456,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(idx));
         self.emit(Op::LoadLocal(list));
         self.emit(Op::GetListLen);
-        self.emit(Op::NumLt);
+        self.emit(Op::IntLt);
         let j_eager_else = self.code.len();
         self.emit(Op::JumpIfNot(0));
 
@@ -1088,7 +1469,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(idx));
         let one = self.pool.int(1);
         self.emit(Op::PushConst(one));
-        self.emit(Op::NumAdd);
+        self.emit(Op::IntAdd);
         let eager_v = self.pool.variant("__IterEager");
         self.emit(Op::MakeVariant { name_idx: eager_v, arity: 2 });
         self.emit(Op::MakeTuple(2));
@@ -1148,7 +1529,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(it)); self.emit(Op::GetVariantArg(1)); // idx
         self.emit(Op::LoadLocal(it)); self.emit(Op::GetVariantArg(0)); // list
         self.emit(Op::GetListLen);                                     // len
-        self.emit(Op::NumLt);                                          // idx < len
+        self.emit(Op::IntLt);                                          // idx < len
         self.emit(Op::BoolNot);                                        // NOT(idx < len)
     }
 
@@ -1161,7 +1542,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(it)); self.emit(Op::GetVariantArg(0));
         self.emit(Op::GetListLen);                                     // len
         self.emit(Op::LoadLocal(it)); self.emit(Op::GetVariantArg(1)); // idx
-        self.emit(Op::NumSub);                                         // len - idx
+        self.emit(Op::IntSub);                                         // len - idx
     }
 
     /// `iter.take(it, n)` — collect up to n elements, return as new Iter.
@@ -1196,14 +1577,14 @@ impl<'a> FnCompiler<'a> {
         // while cnt < n
         self.emit(Op::LoadLocal(cnt));
         self.emit(Op::LoadLocal(n));
-        self.emit(Op::NumLt);
+        self.emit(Op::IntLt);
         let j_exit_n = self.code.len();
         self.emit(Op::JumpIfNot(0));
 
         // AND i < len(list)
         self.emit(Op::LoadLocal(i));
         self.emit(Op::LoadLocal(list)); self.emit(Op::GetListLen);
-        self.emit(Op::NumLt);
+        self.emit(Op::IntLt);
         let j_exit_l = self.code.len();
         self.emit(Op::JumpIfNot(0));
 
@@ -1219,12 +1600,12 @@ impl<'a> FnCompiler<'a> {
         // i = i + 1
         self.emit(Op::LoadLocal(i));
         self.emit(Op::PushConst(one));
-        self.emit(Op::NumAdd);
+        self.emit(Op::IntAdd);
         self.emit(Op::StoreLocal(i));
         // cnt = cnt + 1
         self.emit(Op::LoadLocal(cnt));
         self.emit(Op::PushConst(one));
-        self.emit(Op::NumAdd);
+        self.emit(Op::IntAdd);
         self.emit(Op::StoreLocal(cnt));
 
         let jback = self.code.len();
@@ -1262,14 +1643,14 @@ impl<'a> FnCompiler<'a> {
         // raw = idx + n
         self.emit(Op::LoadLocal(idx));
         self.emit(Op::LoadLocal(n));
-        self.emit(Op::NumAdd);
+        self.emit(Op::IntAdd);
         let raw  = self.alloc_local("__isk_raw");
         self.emit(Op::StoreLocal(raw));
 
         // new_idx = if raw < len then raw else len
         self.emit(Op::LoadLocal(raw));
         self.emit(Op::LoadLocal(list)); self.emit(Op::GetListLen);
-        self.emit(Op::NumLt);
+        self.emit(Op::IntLt);
         let j_use_raw = self.code.len();
         self.emit(Op::JumpIf(0));
 
@@ -1386,7 +1767,7 @@ impl<'a> FnCompiler<'a> {
         let loop_top = self.code.len();
         self.emit(Op::LoadLocal(i));
         self.emit(Op::LoadLocal(list)); self.emit(Op::GetListLen);
-        self.emit(Op::NumLt);
+        self.emit(Op::IntLt);
         let j_exit = self.code.len();
         self.emit(Op::JumpIfNot(0));
 
@@ -1400,7 +1781,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(i));
         let one = self.pool.int(1);
         self.emit(Op::PushConst(one));
-        self.emit(Op::NumAdd);
+        self.emit(Op::IntAdd);
         self.emit(Op::StoreLocal(i));
 
         let jback = self.code.len();
@@ -1444,7 +1825,7 @@ impl<'a> FnCompiler<'a> {
         let loop_top = self.code.len();
         self.emit(Op::LoadLocal(i));
         self.emit(Op::LoadLocal(list)); self.emit(Op::GetListLen);
-        self.emit(Op::NumLt);
+        self.emit(Op::IntLt);
         let j_exit = self.code.len();
         self.emit(Op::JumpIfNot(0));
 
@@ -1461,7 +1842,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(i));
         let one = self.pool.int(1);
         self.emit(Op::PushConst(one));
-        self.emit(Op::NumAdd);
+        self.emit(Op::IntAdd);
         self.emit(Op::StoreLocal(i));
 
         let jback = self.code.len();
@@ -1502,7 +1883,7 @@ impl<'a> FnCompiler<'a> {
         let loop_top = self.code.len();
         self.emit(Op::LoadLocal(i));
         self.emit(Op::LoadLocal(list)); self.emit(Op::GetListLen);
-        self.emit(Op::NumLt);
+        self.emit(Op::IntLt);
         let j_exit = self.code.len();
         self.emit(Op::JumpIfNot(0));
 
@@ -1531,7 +1912,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(i));
         let one = self.pool.int(1);
         self.emit(Op::PushConst(one));
-        self.emit(Op::NumAdd);
+        self.emit(Op::IntAdd);
         self.emit(Op::StoreLocal(i));
 
         let jback = self.code.len();
@@ -1572,7 +1953,7 @@ impl<'a> FnCompiler<'a> {
         let loop_top = self.code.len();
         self.emit(Op::LoadLocal(i));
         self.emit(Op::LoadLocal(list)); self.emit(Op::GetListLen);
-        self.emit(Op::NumLt);
+        self.emit(Op::IntLt);
         let j_exit = self.code.len();
         self.emit(Op::JumpIfNot(0));
 
@@ -1588,7 +1969,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(i));
         let one = self.pool.int(1);
         self.emit(Op::PushConst(one));
-        self.emit(Op::NumAdd);
+        self.emit(Op::IntAdd);
         self.emit(Op::StoreLocal(i));
 
         let jback = self.code.len();
@@ -1639,7 +2020,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(i));
         self.emit(Op::LoadLocal(xs));
         self.emit(Op::GetListLen);
-        self.emit(Op::NumLt);
+        self.emit(Op::IntLt);
         let j_exit = self.code.len();
         self.emit(Op::JumpIfNot(0));
 
@@ -1665,7 +2046,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(i));
         let one = self.pool.int(1);
         self.emit(Op::PushConst(one));
-        self.emit(Op::NumAdd);
+        self.emit(Op::IntAdd);
         self.emit(Op::StoreLocal(i));
 
         let jump_back = self.code.len();
@@ -1869,7 +2250,8 @@ impl<'a> FnCompiler<'a> {
     /// final hash pass at the end of `compile_program` is a no-op here.
     fn install_trampoline(&mut self, name: &str, arity: u16, locals_count: u16, code: Vec<Op>) -> u32 {
         let fn_id = self.next_fn_id.len() as u32;
-        let body_hash = crate::program::compute_body_hash(arity, locals_count, &code);
+        let body_hash = crate::program::compute_body_hash(
+            arity, locals_count, &code, &self.pool.record_shapes);
         self.next_fn_id.push(Function {
             name: name.into(),
             arity,
@@ -1880,6 +2262,10 @@ impl<'a> FnCompiler<'a> {
             // Trampolines (flow.sequential / parallel / etc.) don't
             // surface refined params at this layer.
             refinements: Vec::new(),
+            // Trampolines never emit `Op::GetField` — they're pure
+            // scaffolding. Leaving this at 0 means the VM allocates
+            // an empty IC slot.
+            field_ic_sites: 0,
         });
         fn_id
     }
@@ -1959,7 +2345,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(i));
         self.emit(Op::LoadLocal(xs));
         self.emit(Op::GetListLen);
-        self.emit(Op::NumLt);
+        self.emit(Op::IntLt);
         let j_exit = self.code.len();
         self.emit(Op::JumpIfNot(0));
 
@@ -1977,7 +2363,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::LoadLocal(i));
         let one = self.pool.int(1);
         self.emit(Op::PushConst(one));
-        self.emit(Op::NumAdd);
+        self.emit(Op::IntAdd);
         self.emit(Op::StoreLocal(i));
 
         // jump back
@@ -2046,7 +2432,7 @@ impl<'a> FnCompiler<'a> {
         let loop_top = code.len() as i32;
         code.push(Op::LoadLocal(3));
         code.push(Op::LoadLocal(1));
-        code.push(Op::NumLt);
+        code.push(Op::IntLt);
         let j_done = code.len();
         code.push(Op::JumpIfNot(0));                       // patched
 
@@ -2071,7 +2457,7 @@ impl<'a> FnCompiler<'a> {
         }
         code.push(Op::LoadLocal(3));
         code.push(Op::PushConst(one_const));
-        code.push(Op::NumAdd);
+        code.push(Op::IntAdd);
         code.push(Op::StoreLocal(3));
         let pc_after_jump = code.len() as i32 + 1;
         code.push(Op::Jump(loop_top - pc_after_jump));
@@ -2126,14 +2512,14 @@ impl<'a> FnCompiler<'a> {
         // while i < max
         code.push(Op::LoadLocal(4));
         code.push(Op::LoadLocal(1));
-        code.push(Op::NumLt);
+        code.push(Op::IntLt);
         let j_done = code.len();
         code.push(Op::JumpIfNot(0)); // patched
 
         // if i > 0: time.sleep_ms(next_delay); next_delay := next_delay * 2
         code.push(Op::PushConst(zero_const));
         code.push(Op::LoadLocal(4));
-        code.push(Op::NumLt);                // 0 < i ?
+        code.push(Op::IntLt);                // 0 < i ?
         let j_no_sleep = code.len();
         code.push(Op::JumpIfNot(0));         // patched: skip the sleep block
         // Sleep
@@ -2174,7 +2560,7 @@ impl<'a> FnCompiler<'a> {
         }
         code.push(Op::LoadLocal(4));
         code.push(Op::PushConst(one_const));
-        code.push(Op::NumAdd);
+        code.push(Op::IntAdd);
         code.push(Op::StoreLocal(4));
         let pc_after_jump = code.len() as i32 + 1;
         code.push(Op::Jump(loop_top - pc_after_jump));

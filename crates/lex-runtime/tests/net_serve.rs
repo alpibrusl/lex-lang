@@ -263,3 +263,114 @@ fn main() -> [net] Nil {{ net.serve_tls(18099, "{cert_path}", "{key_path}", "han
     // init) — generous timeout to accommodate cold starts on CI.
     wait_for_bind(18099, Duration::from_secs(10));
 }
+
+// ---- net.serve_routed (#436) ----
+//
+// Tests live in this file (not a sibling) on purpose: every
+// `lex-runtime` integration test compiles into its own binary, each
+// statically linked against the full runtime (hyper + tokio + sled +
+// polars + rusqlite, …). Each binary is hundreds of MB on disk; the
+// CI runner's expanded budget (#457/#458) has ~headroom for the
+// current set but not for one more. Reusing `spawn_lex_server`,
+// `wait_for_bind`, and `http` from this file keeps the new coverage
+// inside the existing binary.
+
+/// Single source serves all five `serve_routed` tests below: one
+/// bind, three handlers, multiple route shapes. The Lex code shadows
+/// no globals — `Request` is the stdlib alias (now carrying
+/// `path_params`).
+const ROUTED_SRC: &str = r#"
+import "std.net" as net
+import "std.map" as map
+
+fn health(_req :: Request) -> Response {
+  { status: 200, body: BodyStr("ok"), headers: map.from_list([]) }
+}
+
+fn show_user(req :: Request) -> Response {
+  let id := match map.get(req.path_params, "id") {
+    Some(s) => s,
+    None    => "MISSING",
+  }
+  { status: 200, body: BodyStr("user=" + id), headers: map.from_list([]) }
+}
+
+fn nested(req :: Request) -> Response {
+  let uid := match map.get(req.path_params, "uid") {
+    Some(s) => s, None => "?",
+  }
+  let pid := match map.get(req.path_params, "pid") {
+    Some(s) => s, None => "?",
+  }
+  { status: 200, body: BodyStr("u=" + uid + ";p=" + pid), headers: map.from_list([]) }
+}
+
+fn not_found(req :: Request) -> Response {
+  { status: 404, body: BodyStr("nope " + req.method + " " + req.path),
+    headers: map.from_list([]) }
+}
+
+fn main() -> [net] Unit {
+  net.serve_routed(18200, [
+    ("GET",  "/health",                       health),
+    ("GET",  "/users/:id",                    show_user),
+    ("GET",  "/users/:uid/posts/:pid",        nested),
+  ], not_found)
+}
+"#;
+
+/// `Once`-guarded bring-up so the five tests below share a single
+/// `net.serve_routed` bind on :18200. Each test spawns its own client
+/// connection; the server is detached and dies with the test process.
+fn ensure_routed_started() {
+    use std::sync::Once;
+    static START: Once = Once::new();
+    START.call_once(|| {
+        spawn_lex_server(ROUTED_SRC, "main");
+        wait_for_bind(18200, Duration::from_secs(5));
+    });
+}
+
+#[test]
+fn serve_routed_static_path_dispatches_to_matching_handler() {
+    ensure_routed_started();
+    let (status, body) = http(18200, "GET", "/health", "");
+    assert_eq!(status, 200, "GET /health should hit the health route");
+    assert_eq!(body, "ok");
+}
+
+#[test]
+fn serve_routed_colon_segment_captures_into_path_params() {
+    ensure_routed_started();
+    let (status, body) = http(18200, "GET", "/users/42", "");
+    assert_eq!(status, 200, "GET /users/42 should match /users/:id");
+    assert_eq!(body, "user=42", "show_user should see id=42 in path_params");
+}
+
+#[test]
+fn serve_routed_multiple_colon_segments_all_captured() {
+    ensure_routed_started();
+    let (status, body) = http(18200, "GET", "/users/alice/posts/7", "");
+    assert_eq!(status, 200);
+    assert_eq!(body, "u=alice;p=7",
+        "nested should see both :uid and :pid in path_params");
+}
+
+#[test]
+fn serve_routed_unmatched_path_falls_back() {
+    ensure_routed_started();
+    let (status, body) = http(18200, "GET", "/something/else", "");
+    assert_eq!(status, 404, "fallback should run when no route matches");
+    assert_eq!(body, "nope GET /something/else");
+}
+
+#[test]
+fn serve_routed_wrong_method_on_known_path_falls_back() {
+    ensure_routed_started();
+    // /health is registered as GET only; POST should miss every route
+    // (no method-match) and land on the fallback.
+    let (status, body) = http(18200, "POST", "/health", "");
+    assert_eq!(status, 404,
+        "POST /health should fall back: route is GET-only");
+    assert_eq!(body, "nope POST /health");
+}

@@ -36,12 +36,21 @@ subtle = "2.6"
 rand = { version = "0.10", features = ["sys_rng"] }
 tiny_http = { version = "0.12", features = ["ssl-rustls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net"] }
-hyper = { version = "1", features = ["http1", "server"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2"] }
 http-body-util = "0.1"
 bytes = "1"
 tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 ureq = { version = "3.3", default-features = false, features = ["rustls", "platform-verifier"] }
+# HTTP/3 (#496). `quic` feature gates the heavy quinn+h3+rcgen deps so
+# the default build stays slim. Without the feature the serve_quic
+# dispatch arms return a "compiled without quic feature" error.
+quinn  = { version = "0.11", optional = true, default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
+h3     = { version = "0.0.8", optional = true }
+h3-quinn = { version = "0.0.10", optional = true }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
+rustls-pemfile = { version = "2", optional = true }
+rcgen  = { version = "0.13", optional = true, default-features = false, features = ["ring", "pem"] }
 toml = "1.1"
 serde_yaml = "0.9"
 csv = "1"
@@ -55,11 +64,18 @@ arrow-cast = "55"
 arrow-csv = "55"
 parquet = { version = "55", default-features = false, features = ["arrow", "snap"] }
 polars = { version = "0.50", default-features = false, features = ["lazy", "is_in", "csv", "performant", "strings"] }
-lex-bytecode = { path = "../lex-bytecode", version = "0.9.4" }
+lex-bytecode = { path = "../lex-bytecode", version = "0.9.5" }
 smol_str = { workspace = true }
 
+[features]
+default = []
+# `quic` brings in quinn / h3 / rcgen / rustls + rustls-pemfile. Off
+# by default to keep `cargo build` slim; enable with `--features quic`
+# to use `net.serve_quic`, `tls.from_pem_files`, or `tls.self_signed`.
+quic = ["dep:quinn", "dep:h3", "dep:h3-quinn", "dep:rustls", "dep:rustls-pemfile", "dep:rcgen"]
+
 [dev-dependencies]
-lex-syntax = { path = "../lex-syntax", version = "0.9.4" }
-lex-ast = { path = "../lex-ast", version = "0.9.4" }
-lex-types = { path = "../lex-types", version = "0.9.4" }
+lex-syntax = { path = "../lex-syntax", version = "0.9.5" }
+lex-ast = { path = "../lex-ast", version = "0.9.5" }
+lex-types = { path = "../lex-types", version = "0.9.5" }
 tempfile = "3"

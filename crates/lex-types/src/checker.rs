@@ -340,11 +340,19 @@ fn ty_to_tag(u: &Unifier, ty: &Ty) -> String {
 /// moved/destructured.
 fn unfold_record_alias_static(env: &TypeEnv, ty: Ty) -> Ty {
     if let Ty::Con(ref n, ref args) = ty {
-        if args.is_empty() {
-            if let Some(td) = env.types.get(n) {
-                if let TypeDefKind::Alias(inner) = &td.kind {
+        if let Some(td) = env.types.get(n) {
+            if let TypeDefKind::Alias(inner) = &td.kind {
+                if td.params.len() != args.len() {
+                    return ty;
+                }
+                if td.params.is_empty() {
                     return inner.clone();
                 }
+                let mut subst = IndexMap::new();
+                for (i, a) in args.iter().enumerate() {
+                    subst.insert(i as u32, a.clone());
+                }
+                return subst_vars(inner, &subst, &IndexMap::new());
             }
         }
     }
@@ -462,31 +470,49 @@ impl Checker {
         }
     }
 
-    /// If `ty` is a `Ty::Con(name, [])` whose definition is a type
-    /// alias (record or otherwise), return the aliased type.
-    /// Otherwise return `ty` unchanged.
+    /// If `ty` is a `Ty::Con(name, args)` whose definition is a type
+    /// alias (record or otherwise), return the aliased type with the
+    /// alias's formal parameters substituted by `args`. For zero-arg
+    /// aliases this is the identity substitution. For parametric
+    /// aliases (#439, e.g. `type Box[T] = { value :: T }`), the
+    /// formal `Ty::Var(i)` for the i-th param is replaced by `args[i]`
+    /// so `Box[Str]` unfolds to `{ value :: Str }` rather than to the
+    /// unsubstituted body. Returns `ty` unchanged when arity doesn't
+    /// match or the name doesn't resolve to an alias.
     fn unfold_record_alias(&self, ty: Ty) -> Ty {
         if let Ty::Con(ref n, ref args) = ty {
-            if args.is_empty() {
-                if let Some(td) = self.type_env.types.get(n) {
-                    if let TypeDefKind::Alias(inner) = &td.kind {
+            if let Some(td) = self.type_env.types.get(n) {
+                if let TypeDefKind::Alias(inner) = &td.kind {
+                    if td.params.len() != args.len() {
+                        return ty;
+                    }
+                    if td.params.is_empty() {
                         return inner.clone();
                     }
+                    let mut subst = IndexMap::new();
+                    for (i, a) in args.iter().enumerate() {
+                        subst.insert(i as u32, a.clone());
+                    }
+                    return subst_vars(inner, &subst, &IndexMap::new());
                 }
             }
         }
         ty
     }
 
-    /// True iff `ty` is a 0-arg `Ty::Con(name, [])` whose definition
-    /// is a `TypeDefKind::Alias`. Used by `unify_coerce_inner` to
-    /// detect the case where both sides are nominal aliases and
-    /// unfolding would collapse the nominal distinction (#323).
+    /// True iff `ty` is a `Ty::Con(name, args)` whose definition is a
+    /// `TypeDefKind::Alias` and whose arity matches. Used by
+    /// `unify_coerce_inner` to detect the case where both sides are
+    /// nominal aliases and unfolding would collapse the nominal
+    /// distinction (#323 / #439). For parametric aliases the arity
+    /// match guards against `Box[Str]` vs an inconsistent `Box[Str, Int]`.
     fn is_alias_con(&self, ty: &Ty) -> bool {
         if let Ty::Con(name, args) = ty {
-            if args.is_empty() {
-                if let Some(td) = self.type_env.types.get(name) {
-                    return matches!(td.kind, TypeDefKind::Alias(_));
+            if let Some(td) = self.type_env.types.get(name) {
+                if matches!(td.kind, TypeDefKind::Alias(_))
+                    && td.params.len() == args.len()
+                {
+                    return true;
                 }
             }
         }
@@ -827,16 +853,22 @@ impl Checker {
             a::CExpr::FieldAccess { value, field } => {
                 let vt = self.check_expr(value, node_id, locals, effs)?;
                 let resolved = self.u.resolve(&vt);
-                // Unfold a Record-aliased Con (e.g. `type Request = { ... }`).
-                let resolved = match resolved {
-                    Ty::Con(ref n, _) => match self.type_env.types.get(n) {
-                        Some(td) => match &td.kind {
-                            TypeDefKind::Alias(inner @ Ty::Record(_)) => inner.clone(),
-                            _ => resolved,
-                        },
-                        None => resolved,
-                    },
-                    other => other,
+                // Unfold a Record-aliased Con (e.g. `type Request = { ... }`
+                // or `type Box[T] = { value :: T }`). For parametric aliases
+                // the helper substitutes the actual args for the formal
+                // params; the post-unfold shape is only a Record when the
+                // alias body was a record, so non-record aliases (e.g.
+                // `type UserId = Int`) fall through to the
+                // "expected record" error below.
+                let resolved = if let Ty::Con(_, _) = &resolved {
+                    let unfolded = self.unfold_record_alias(resolved.clone());
+                    if matches!(unfolded, Ty::Record(_)) {
+                        unfolded
+                    } else {
+                        resolved
+                    }
+                } else {
+                    resolved
                 };
                 match resolved {
                     Ty::Record(fields) => fields.get(field).cloned()

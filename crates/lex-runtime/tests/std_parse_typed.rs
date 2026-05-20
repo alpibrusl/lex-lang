@@ -75,7 +75,7 @@ fn toml_parse_t_passes_when_all_fields_present() {
     let v = run_with_rewrite(TOML_SRC, "extract", vec![Value::Str(src.into())]);
     let m = ok(&v);
     match m {
-        Value::Record(fields) => {
+        Value::Record { fields, .. } => {
             assert!(fields.contains_key("license"));
             assert!(fields.contains_key("version"));
         }

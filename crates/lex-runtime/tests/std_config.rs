@@ -48,7 +48,7 @@ fn yaml_parse_typed_record() {
     match v {
         Value::Variant { name, args } if name == "Ok" => {
             match &args[0] {
-                Value::Record(fields) => {
+                Value::Record { fields, .. } => {
                     let mut m: std::collections::BTreeMap<&str, &Value> = fields.iter()
                         .map(|(k, v)| (k.as_str(), v)).collect();
                     assert_eq!(m.remove("name"), Some(&Value::Str("lex".into())));
