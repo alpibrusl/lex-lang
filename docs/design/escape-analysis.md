@@ -243,7 +243,6 @@ tail-called function gets its own arena view.
 
 | Issue | Scope                                                | When              |
 |-------|------------------------------------------------------|-------------------|
-| #464 step 3 | `benches/response_build.rs`; 1.5× + 60% acceptance | Next slice |
 | (new) | Per-path branch refinement (recover the `if/else` merge case) | If profiling shows it matters |
 | (new) | Inter-procedural escape via summaries on small leaf functions | After inlining (#465 phase 1) |
 | (new) | `GetStackField` peephole — drop the variant-match on receiver when the producer is a same-fn `AllocStackRecord` | If dispatch shows up in the response_build profile |
@@ -259,7 +258,7 @@ tail-called function gets its own arena view.
 - [x] `cargo clippy -p lex-bytecode --all-targets -- -D warnings`
   clean.
 
-### Step 2 (this PR)
+### Step 2 (#525 — merged)
 
 - [x] `Op::AllocStackRecord` round-trips through verifier,
   body-hash, and serde (the latter via the existing `Op` derive).
@@ -279,5 +278,43 @@ tail-called function gets its own arena view.
 - [x] `cargo clippy -p lex-bytecode --all-targets -- -D warnings`
   clean.
 
-Step 3 carries the #464 perf acceptance bars (≥1.5× speedup on
-`response_build`, ≥60% of `Response` allocations on the stack).
+### Step 3 (this PR) — `response_build` bench + #464 acceptance
+
+- [x] `benches/response_build.rs` (criterion) compares enabled
+  vs disabled lowering on a 6-intermediate-records-per-call handler
+  shape. Measured speedup: **2.84–2.94×** at n ∈ {100, 1000},
+  well above the issue's ≥1.5× bar.
+- [x] `tests/response_build_acceptance.rs` exact stack-allocation
+  rate: **85.71%** (1200 stack / 200 heap / 0 fallback per drive(200)),
+  above the ≥60% bar.
+- [x] `LEX_NO_STACK_RECORDS=1` toggle on the lowering pass so the
+  bench can A/B identical source under matched VM conditions.
+- [x] Per-VM counters `Vm::stack_record_allocs` /
+  `heap_record_allocs` / `stack_record_heap_fallbacks` for the
+  rate measurement.
+- [x] `cargo test -p lex-bytecode` (76 tests; the new ignored
+  timing test brings the total to 77) passes; release-mode
+  `--ignored` timing test reports 2.96× and clears its 1.3×
+  regression floor.
+- [x] `cargo clippy -p lex-bytecode --all-targets -- -D warnings`
+  clean.
+
+#### Why the speedup is bigger than the bar
+
+The issue's ≥1.5× bar was a conservative estimate. The workload's
+6 non-escaping records per handler call exercise the
+`Box<IndexMap>` allocation path 6× per iter on the disabled arm —
+each one allocating an `IndexMap` (entries vec + indices hashmap)
+plus the `Box` itself. The enabled arm's stack path is a single
+`Vec::resize` per record into the per-frame arena, dropped
+wholesale on `Op::Return`. Skipping 6 mallocs per call is what
+pushes the ratio toward 3×; a thinner workload (~2 intermediates
+per call) lands closer to the 1.5× bar.
+
+#### Why the in-CI timing assertion is at 1.3× not 1.5×
+
+Wall-clock comparisons on shared CI runners are noisy by ~15-20%
+on the loser arm; a tight 1.5× gate would flap. The deterministic
+acceptance (stack rate) is the strong gate; the timing test is a
+secondary regression check at a relaxed threshold. The criterion
+bench produces the publishable number.

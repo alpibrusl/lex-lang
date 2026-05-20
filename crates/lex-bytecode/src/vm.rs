@@ -295,6 +295,14 @@ pub struct Vm<'a> {
     /// at the top of the arena while the frame is live, so neither
     /// inter-frame interleaving nor index churn can occur.
     stack_record_arena: Vec<Value>,
+    /// Per-Vm counters for #464 acceptance measurement. Incremented
+    /// on every `Op::MakeRecord` / `Op::AllocStackRecord` dispatch.
+    /// The bench reads these to compute the stack-allocation rate
+    /// (≥ 60% of records on the stack is the acceptance bar). Cheap
+    /// in the hot path — two unconditional u64 increments per record.
+    pub stack_record_allocs: u64,
+    pub stack_record_heap_fallbacks: u64,
+    pub heap_record_allocs: u64,
 }
 
 struct Frame {
@@ -615,6 +623,9 @@ impl<'a> Vm<'a> {
             // pass kicks in) pay nothing. First allocation triggers Vec
             // growth; capacity is retained across `vm.call` invocations.
             stack_record_arena: Vec::new(),
+            stack_record_allocs: 0,
+            stack_record_heap_fallbacks: 0,
+            heap_record_allocs: 0,
         }
     }
 
@@ -976,6 +987,7 @@ impl<'a> Vm<'a> {
                     self.locals_storage[base + i as usize] = v;
                 }
                 Op::MakeRecord { shape_idx, field_count } => {
+                    self.heap_record_allocs += 1;
                     let shape = &self.program.record_shapes[shape_idx as usize];
                     let n = field_count as usize;
                     debug_assert_eq!(shape.len(), n,
@@ -1009,6 +1021,7 @@ impl<'a> Vm<'a> {
                     let n = field_count as usize;
                     let frame = &mut self.frames[frame_idx];
                     if frame.stack_record_budget_remaining < field_count as u32 {
+                        self.stack_record_heap_fallbacks += 1;
                         // Heap fallback path — exact copy of
                         // MakeRecord's body. Compiler emitted
                         // AllocStackRecord because escape analysis
@@ -1032,6 +1045,7 @@ impl<'a> Vm<'a> {
                         }
                         self.stack.push(Value::Record { shape_id: shape_idx, fields: Box::new(rec) });
                     } else {
+                        self.stack_record_allocs += 1;
                         // Stack path: append the popped field values
                         // to the arena in shape order (matches the
                         // IndexMap insertion order used by MakeRecord,
