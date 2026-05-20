@@ -199,14 +199,30 @@ pub struct Vm<'a> {
     /// Diagnostic counters for `--trace` observability (#229).
     pub pure_memo_hits: u64,
     pub pure_memo_misses: u64,
-    /// Monomorphic inline caches for `Op::GetField` (#462 slice 1).
-    /// Indexed by `[fn_id as usize][site_idx as usize]` — one entry
-    /// per field-access site within each function. `site_idx` is
-    /// assigned at compile time by `FnCompiler::field_get_sites` so
-    /// every emit produces a stable identifier independent of pc.
-    /// The cache survives the planned dispatch rewrite (#461) and a
-    /// future JIT (#465). Replaces the pre-#462 monomorphic
-    /// `HashMap<(fn_id << 32 | pc), usize>`.
+    /// Monomorphic inline caches for `Op::GetField` (#462 slice 1 +
+    /// shape-keyed verification slice). Indexed by
+    /// `[fn_id as usize][site_idx as usize]` — one entry per
+    /// field-access site within each function. `site_idx` is assigned
+    /// at compile time by `FnCompiler::field_get_sites` so every emit
+    /// produces a stable identifier independent of pc. The cache
+    /// survives the planned dispatch rewrite (#461) and a future
+    /// JIT (#465).
+    ///
+    /// Slot shape: `(shape_id, offset)`. The pre-shape-keyed slice
+    /// stored only the offset and re-verified each hit by walking
+    /// `IndexMap::get_index(off)` and string-comparing the field name
+    /// against the requested `name_idx`. After this slice, hits
+    /// against compile-time records (real `shape_id`) verify with a
+    /// single `u32` compare and skip the string compare entirely —
+    /// per the #462 slice-2b measurement that observed 0% polymorphism
+    /// and 86% of hits going to records with a real shape_id.
+    ///
+    /// `NO_SHAPE_ID` records (JSON / SQL / HTTP-built — 14% of measured
+    /// hits, 100% of inbox/gateway traffic) fall through to the
+    /// pre-slice name-compare verification. Distinct dynamic shapes
+    /// both carry `NO_SHAPE_ID` and would otherwise alias on a
+    /// pure-shape-keyed IC; keeping the name compare on that path
+    /// preserves correctness without a separate cache for them.
     ///
     /// Outer Vec is pre-sized to `program.functions.len()`; each inner
     /// Vec is empty until the first GetField in that function runs,
@@ -214,7 +230,7 @@ pub struct Vm<'a> {
     /// `field_ic_sites` size and never resize again. Lazy on the inner
     /// side so VMs created for short-lived scripts don't eagerly
     /// allocate IC slots for functions they never enter.
-    field_ics: Vec<Vec<Option<usize>>>,
+    field_ics: Vec<Vec<Option<(u32, usize)>>>,
     /// Stack allocator for function locals (#389 slice 3).
     ///
     /// Every function frame claims `locals_count` contiguous slots from
@@ -913,18 +929,22 @@ impl<'a> Vm<'a> {
                             if ic_stats_enabled() {
                                 record_ic_hit(fn_id, site_idx, shape_id);
                             }
-                            // Inline cache keyed by (fn_id, site_idx) — #462
-                            // slice 1. Direct array index instead of the
-                            // pre-#462 `HashMap<(fn_id << 32 | pc), usize>`.
-                            // The inner Vec is empty until first GetField in
-                            // this function runs; we one-shot allocate it to
-                            // the compiler-recorded site count and never
-                            // resize again. After init, the hot path is two
-                            // array dereferences. On hit: verify the cached
-                            // offset still points at the requested field
-                            // (name compare — shape_id propagation is the
-                            // next slice). On miss: walk the IndexMap by
-                            // name, populate.
+                            // Inline cache keyed by (fn_id, site_idx) with
+                            // shape_id-keyed verification (#462). Slot stores
+                            // (shape_id_at_install, offset). Hit verification:
+                            // - real shape_id (!= NO_SHAPE_ID) matches: offset
+                            //   is guaranteed valid (records with the same
+                            //   shape_id share the same field-name ordering
+                            //   from the compile-time `record_shapes` table).
+                            //   One u32 compare; no string work.
+                            // - NO_SHAPE_ID matches NO_SHAPE_ID: distinct
+                            //   dynamic shapes both carry this sentinel and
+                            //   would otherwise alias, so we fall back to
+                            //   verifying via name compare against the field
+                            //   at the cached offset — the pre-slice
+                            //   correctness path.
+                            // On any mismatch we walk by name and reinstall
+                            // (shape_id, offset).
                             let fid = fn_id as usize;
                             let sid = site_idx as usize;
                             if self.field_ics[fid].is_empty() {
@@ -933,16 +953,25 @@ impl<'a> Vm<'a> {
                             }
                             let cached = self.field_ics[fid][sid];
                             let value = 'ic: {
-                                if let Some(off) = cached {
-                                    if let Some((k, val)) = r.get_index(off) {
-                                        if let Const::FieldName(s) =
-                                            &self.program.constants[name_idx as usize]
-                                        {
-                                            if s == k { break 'ic val.clone(); } // cache hit
+                                if let Some((cached_shape, off)) = cached {
+                                    if cached_shape == shape_id {
+                                        if shape_id != crate::value::NO_SHAPE_ID {
+                                            // Real shape match: offset is sound.
+                                            if let Some((_, val)) = r.get_index(off) {
+                                                break 'ic val.clone();
+                                            }
+                                        } else if let Some((k, val)) = r.get_index(off) {
+                                            // Dynamic shape: verify by name.
+                                            if let Const::FieldName(s) =
+                                                &self.program.constants[name_idx as usize]
+                                            {
+                                                if s == k { break 'ic val.clone(); }
+                                            }
                                         }
                                     }
                                 }
-                                // Cache miss: resolve by name, populate IC.
+                                // Cache miss: resolve by name, install
+                                // (shape_id, offset).
                                 let name = match &self.program.constants[name_idx as usize] {
                                     Const::FieldName(s) => s.as_str(),
                                     _ => return Err(VmError::TypeMismatch(
@@ -951,7 +980,7 @@ impl<'a> Vm<'a> {
                                 let (off, _, val) = r.get_full(name)
                                     .ok_or_else(|| VmError::TypeMismatch(
                                         format!("missing field `{name}`")))?;
-                                self.field_ics[fid][sid] = Some(off);
+                                self.field_ics[fid][sid] = Some((shape_id, off));
                                 val.clone()
                             };
                             self.stack.push(value);

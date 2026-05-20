@@ -105,6 +105,49 @@ fn bench_record_field(c: &mut Criterion) {
     group.finish();
 }
 
+/// Wider sibling of `bench_record_field` (#462). 10 GetFields per
+/// iteration instead of 3, on a 10-field record — amplifies the
+/// IC's per-hit verification cost relative to the iteration's
+/// TailCall frame setup. With shape_id-keyed verification the hot
+/// path is `cached_shape == record.shape_id` (single u32 compare)
+/// instead of `field_name_at(offset) == requested_name_const`
+/// (IndexMap lookup + Const::FieldName unwrap + SmolStr cmp).
+fn bench_record_field_wide(c: &mut Criterion) {
+    let src = r#"
+type Wide = { a :: Int, b :: Int, c :: Int, d :: Int, e :: Int,
+               f :: Int, g :: Int, h :: Int, i :: Int, j :: Int }
+
+fn sum_wide(w :: Wide, n :: Int, acc :: Int) -> Int {
+  match n {
+    0 => acc,
+    _ => sum_wide(w, n - 1, acc + w.a + w.b + w.c + w.d + w.e
+                                + w.f + w.g + w.h + w.i + w.j),
+  }
+}
+
+fn bench(n :: Int) -> Int {
+  let w :: Wide := { a: 1, b: 2, c: 3, d: 4, e: 5,
+                     f: 6, g: 7, h: 8, i: 9, j: 10 }
+  sum_wide(w, n, 0)
+}
+"#;
+    let prog = compile(src);
+    let mut group = c.benchmark_group("dispatch/record_field_wide");
+    for n in [100i64, 1_000, 10_000] {
+        group.bench_function(format!("n={n}"), |b| {
+            b.iter(|| {
+                let mut vm = Vm::new(&prog);
+                vm.set_step_limit(u64::MAX);
+                black_box(
+                    vm.call("bench", vec![Value::Int(n)])
+                        .expect("call bench"),
+                )
+            })
+        });
+    }
+    group.finish();
+}
+
 fn bench_call_heavy(c: &mut Criterion) {
     let prog = compile(CALL_HEAVY_SRC);
     let mut group = c.benchmark_group("dispatch/call_heavy");
@@ -237,6 +280,7 @@ criterion_group!(
     bench_two_local_arith,
     bench_two_local_sub_arith,
     bench_two_local_mul_arith,
+    bench_record_field_wide,
 );
 criterion_main!(benches);
 
