@@ -1579,6 +1579,28 @@ impl<'a> Vm<'a> {
                     self.stack.push(Value::Int(a * b));
                     self.frames[frame_idx].pc = pc + 3;
                 }
+                Op::LoadLocalEqIntConstJumpIfNot { local_idx, imm_const_idx, jump_offset } => {
+                    // First jump-aware fusion (#461 slice 5). The
+                    // JumpIfNot's offset is relative to its own
+                    // pc + 1 = (pc + 3) + 1 = pc + 4, so the branch
+                    // target is `pc + 4 + jump_offset`. Fall-through
+                    // (equal → JumpIfNot doesn't jump) is `pc + 4`
+                    // (skip past the 3 tombstones — PushConst +
+                    // IntEq + JumpIfNot).
+                    let base = self.frames[frame_idx].locals_start;
+                    let a = self.locals_storage[base + local_idx as usize].as_int();
+                    let b = match &self.program.constants[imm_const_idx as usize] {
+                        Const::Int(n) => *n,
+                        _ => return Err(VmError::TypeMismatch(
+                            "LoadLocalEqIntConstJumpIfNot expects Const::Int".into())),
+                    };
+                    let next_pc = if a == b {
+                        pc + 4
+                    } else {
+                        ((pc as i32 + 4) + jump_offset) as usize
+                    };
+                    self.frames[frame_idx].pc = next_pc;
+                }
                 Op::LoadLocalAddIntConstStoreLocal { src, imm_const_idx, dest } => {
                     let base = self.frames[frame_idx].locals_start;
                     let a = self.locals_storage[base + src as usize].as_int();

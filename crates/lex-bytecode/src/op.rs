@@ -181,4 +181,26 @@ pub enum Op {
     /// Stack delta: +1. Tombstone + body-hash story matches
     /// `LoadLocalAddLocal` exactly.
     LoadLocalMulLocal { lhs_idx: u16, rhs_idx: u16 },
+    /// Fused `LoadLocal(local_idx) + PushConst(imm_const_idx) +
+    /// IntEq + JumpIfNot(offset)` (#461 superinstruction slice 5,
+    /// pattern-match arm-test idiom). Fires on every numeric
+    /// pattern arm test — `match n { 0 => acc; _ => recurse }` and
+    /// the cascade of integer-literal arms in any pattern match —
+    /// after `compile_pattern_test` lowers the historical NumEq to
+    /// IntEq for Int-literal patterns. Reads the local, compares
+    /// against the Int constant; if equal, advances pc by 4 (past
+    /// the 3 tombstones, into the arm body); if not equal, jumps
+    /// to `pc + 4 + jump_offset` (the JumpIfNot's original target —
+    /// the next arm test or the panic-no-match block). Stack
+    /// delta: 0 (original sequence had +1, +1, -1, -1).
+    ///
+    /// Jump-aware peephole — slice 5 is the first fusion that
+    /// absorbs a control-flow op. The verifier walks the fused op
+    /// with both fall-through and branch successors, skipping past
+    /// the trailing three tombstones (mirroring slice 2's 4-slot
+    /// pattern). `body_hash` decodes back to a standalone
+    /// `LoadLocal(local_idx)`; the trailing primitive ops stay in
+    /// the code stream as tombstones and hash normally — so
+    /// closure identity (#222) stays invariant.
+    LoadLocalEqIntConstJumpIfNot { local_idx: u16, imm_const_idx: u32, jump_offset: i32 },
 }

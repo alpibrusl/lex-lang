@@ -109,6 +109,20 @@ pub fn verify_function(func: &Function, errors: &mut Vec<StackError>) {
             Op::LoadLocalAddIntConstStoreLocal { .. } => {
                 worklist.push((pc + 4, next_depth));
             }
+            // Slice-5 superinstructions (#461) — jump-aware fusion of
+            // `LoadLocal + LoadLocal|PushConst + IntLt + JumpIfNot`.
+            // 4-slot window like slice 2 but with TWO successors
+            // (fall-through and branch target). Tombstones' deltas
+            // (+1 LoadLocal/PushConst, -1 IntLt, -1 JumpIfNot = -1
+            // total) don't cancel — skip past in the same shape as
+            // slice 2's worklist override. The branch target's
+            // offset is relative to the JumpIfNot's `pc + 1`, which
+            // in the fused position is `pc + 4`.
+            Op::LoadLocalEqIntConstJumpIfNot { jump_offset, .. } => {
+                let target = (pc as i32 + 4 + jump_offset) as usize;
+                worklist.push((pc + 4, next_depth));
+                worklist.push((target, next_depth));
+            }
             // All other ops: single sequential successor.
             _ => {
                 worklist.push((pc + 1, next_depth));
@@ -223,6 +237,11 @@ fn stack_delta(op: &Op) -> i32 {
         // IntSub / IntMul as terminator. Net delta +1; trailing
         // LoadLocal + IntSub|IntMul tombstones cancel when walked.
         Op::LoadLocalSubLocal { .. } | Op::LoadLocalMulLocal { .. } => 1,
+        // Slice-5 fused ops: 4-slot window with net stack delta 0
+        // (original sequence had +1, +1, -1, -1). Worklist override
+        // above pushes both fall-through and branch successors with
+        // this depth; tombstones are not walked as live.
+        Op::LoadLocalEqIntConstJumpIfNot { .. } => 0,
     }
 }
 
