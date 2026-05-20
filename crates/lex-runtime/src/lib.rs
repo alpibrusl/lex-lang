@@ -13,6 +13,7 @@
 //!   only. We ship the policy/dispatch layer, which is the user-visible
 //!   half of §7.4 and what the §7.6 acceptance tests exercise.
 
+pub mod arena;
 pub mod arrow;
 pub mod builtins;
 pub mod df;
