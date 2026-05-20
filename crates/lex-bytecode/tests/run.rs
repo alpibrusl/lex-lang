@@ -356,6 +356,94 @@ fn pick(flag :: Int, a :: Int, b :: Int) -> Int {
 }
 
 #[test]
+fn slice7_fuses_load_local_get_field_add() {
+    // Pattern: a chain of `expr + r.field` reads. The first term
+    // is a bare LoadLocal+GetField, the second-and-onward terms
+    // each form a `[LoadLocal(r), GetField(field, ic_site),
+    // IntAdd]` triple that slice 7 fuses. Verify at least one
+    // fusion fires in the chain.
+    use lex_bytecode::op::Op;
+    let src = "
+type R = { x :: Int, y :: Int, z :: Int }
+fn sum_fields(r :: R) -> Int { r.x + r.y + r.z }
+";
+    let p = compile(src);
+    let f = &p.functions[0];
+    let fused_count = f.code.iter()
+        .filter(|op| matches!(op, Op::LoadLocalGetFieldAdd { .. }))
+        .count();
+    assert!(fused_count >= 2,
+        "expected ≥2 slice-7 fusions in y+z chain, got {fused_count}: {:?}",
+        f.code);
+
+    let mut vm = Vm::new(&p);
+    let r = vm.call("sum_fields",
+        vec![Value::record_dynamic({
+            let mut m = IndexMap::new();
+            m.insert("x".into(), Value::Int(10));
+            m.insert("y".into(), Value::Int(20));
+            m.insert("z".into(), Value::Int(30));
+            m
+        })]).unwrap();
+    assert_eq!(r, Value::Int(60));
+}
+
+#[test]
+fn slice7_works_on_stack_records_too() {
+    // The slice-7 dispatch handler is polymorphic over Value::Record
+    // and Value::StackRecord — the same path GetField uses. A
+    // non-escaping record (lowered to AllocStackRecord by #464
+    // step 2) chained through field-add should produce the right
+    // answer.
+    let src = r#"
+        fn inline_sum() -> Int {
+          let r := { a: 5, b: 11, c: 13 }
+          r.a + r.b + r.c
+        }
+    "#;
+    let p = compile(src);
+    // Sanity: both lowerings should have fired in this function.
+    use lex_bytecode::op::Op;
+    let f = &p.functions[0];
+    assert!(f.code.iter().any(|op| matches!(op, Op::AllocStackRecord { .. })),
+        "expected escape lowering to fire");
+    assert!(f.code.iter().any(|op| matches!(op, Op::LoadLocalGetFieldAdd { .. })),
+        "expected slice 7 fusion to fire");
+
+    let mut vm = Vm::new(&p);
+    assert_eq!(vm.call("inline_sum", vec![]).unwrap(), Value::Int(29));
+}
+
+#[test]
+fn slice7_does_not_fire_across_a_jump_target() {
+    // Same safety story as slice 3/4: a `match`-arm body whose
+    // entry point straddles the candidate triple's second or
+    // third slot must skip the fusion. A regression would corrupt
+    // the stack on the jump-into path. Check by running both arms
+    // of a function shaped to put a GetField+IntAdd at an arm
+    // boundary.
+    let src = r#"
+type R = { v :: Int }
+fn pick(flag :: Int, r :: R) -> Int {
+  match flag {
+    0 => 100 + r.v,
+    _ => r.v,
+  }
+}
+"#;
+    let p = compile(src);
+    let mut vm = Vm::new(&p);
+    let r1 = vm.call("pick", vec![Value::Int(0), Value::record_dynamic({
+        let mut m = IndexMap::new(); m.insert("v".into(), Value::Int(7)); m
+    })]).unwrap();
+    assert_eq!(r1, Value::Int(107));
+    let r2 = vm.call("pick", vec![Value::Int(1), Value::record_dynamic({
+        let mut m = IndexMap::new(); m.insert("v".into(), Value::Int(7)); m
+    })]).unwrap();
+    assert_eq!(r2, Value::Int(7));
+}
+
+#[test]
 fn record_field_access() {
     let src = "fn xof(r :: Record) -> Int { r.x }\n".replace(
         "Record",
@@ -369,3 +457,4 @@ fn record_field_access() {
     let r = vm.call("xof", vec![Value::record_dynamic(m)]).unwrap();
     assert_eq!(r, Value::Int(11));
 }
+
