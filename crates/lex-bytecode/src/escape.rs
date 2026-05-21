@@ -455,15 +455,29 @@ fn step(pc: usize, op: &Op, mut s: State) -> (State, Vec<usize>, HashSet<u32>) {
             s.stack.push(Slot::Other);
             return (s, vec![pc + 3], escapes);
         }
-        Op::LoadLocalGetFieldAdd { .. } => {
-            // #461 slice 7: net delta on the value stack is 0 (pops
-            // prior Int top, pushes Int sum). The receiver is read
+        Op::LoadLocalGetField { .. } => {
+            // #461 slice 9: equivalent to LoadLocal + GetField —
+            // reads a field out of a local record (which does NOT
+            // escape the receiver, matching plain GetField) and
+            // pushes the field value (Other). Net delta +1; skip the
+            // single tombstone (pc+2). (Escape analysis runs before
+            // peephole, so this arm is exercised only if the analysis
+            // is ever re-run on fused code; it's here for exhaustive
+            // matching and forward-correctness.)
+            s.stack.push(Slot::Other);
+            return (s, vec![pc + 2], escapes);
+        }
+        Op::LoadLocalGetFieldAdd { .. }
+        | Op::LoadLocalGetFieldSub { .. }
+        | Op::LoadLocalGetFieldMul { .. } => {
+            // #461 slice 7/8: net delta on the value stack is 0 (pops
+            // prior Int top, pushes Int result). The receiver is read
             // from a local — the analysis tracks locals separately,
             // and reading a local doesn't escape its Rec slot (the
             // round-trip-through-local rule from StoreLocal applies
             // here too: the value stays referenced). We pop the
             // existing top (the accumulator) and push a fresh Other
-            // (the sum). Skip past the two tombstones.
+            // (the result). Skip past the two tombstones.
             s.stack.pop();
             s.stack.push(Slot::Other);
             return (s, vec![pc + 3], escapes);

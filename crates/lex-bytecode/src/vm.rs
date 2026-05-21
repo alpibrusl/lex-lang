@@ -2056,111 +2056,54 @@ impl<'a> Vm<'a> {
                     self.stack.push(Value::Int(a * b));
                     self.frames[frame_idx].pc = pc + 3;
                 }
+                Op::LoadLocalGetField { local_idx, name_idx, site_idx } => {
+                    // #461 slice 9: fused `LoadLocal + GetField`. Reads
+                    // the field directly out of the local record by
+                    // reference and pushes it, advancing pc by 2 (one
+                    // tombstone — the original GetField). Avoids the
+                    // unfused pair's whole-record clone onto the value
+                    // stack: the dominant heap-record churn on the
+                    // `response_build` profile (`r.total` field reads).
+                    let base = self.frames[frame_idx].locals_start;
+                    let v = self.read_local_record_field(
+                        base, local_idx, fn_id, name_idx, site_idx, "LoadLocalGetField")?;
+                    self.stack.push(v);
+                    self.frames[frame_idx].pc = pc + 2;
+                }
                 Op::LoadLocalGetFieldAdd { local_idx, name_idx, site_idx } => {
                     // #461 slice 7: fused `LoadLocal + GetField + IntAdd`.
-                    // Pop the prior stack top (the accumulator), read
-                    // `locals[local_idx]`, do the IC-cached field read,
-                    // push the sum, advance pc by 3 (skip the two
-                    // tombstones — the original GetField and IntAdd).
-                    //
-                    // The IC slot is shared with the unfused Op::GetField
-                    // path: same `(fn_id, site_idx)` key, same
-                    // `(shape_id, offset)` value. A function with both
-                    // fused and unfused GetFields against the same site
-                    // would observe a consistent cache — though in
-                    // practice the peephole pass either fires at a
-                    // site or not, so the slot only ever sees one
-                    // dispatch path.
+                    // Pop the prior stack top (the accumulator), read the
+                    // field by reference (shared IC via
+                    // `read_local_record_field`), push the sum, advance
+                    // pc by 3 (skip the GetField and IntAdd tombstones).
                     let acc = self.pop()?.as_int();
                     let base = self.frames[frame_idx].locals_start;
-                    let rec = self.locals_storage[base + local_idx as usize].clone();
-                    let field_val = match rec {
-                        Value::Record { fields: r, shape_id } => {
-                            if ic_stats_enabled() {
-                                record_ic_hit(fn_id, site_idx, shape_id);
-                            }
-                            let fid = fn_id as usize;
-                            let sid = site_idx as usize;
-                            if self.field_ics[fid].is_empty() {
-                                let n = self.program.functions[fid].field_ic_sites as usize;
-                                self.field_ics[fid] = vec![None; n];
-                            }
-                            let cached = self.field_ics[fid][sid];
-                            'ic: {
-                                if let Some((cached_shape, off)) = cached {
-                                    if cached_shape == shape_id {
-                                        if shape_id != crate::value::NO_SHAPE_ID {
-                                            if let Some((_, val)) = r.get_index(off) {
-                                                break 'ic val.clone();
-                                            }
-                                        } else if let Some((k, val)) = r.get_index(off) {
-                                            if let Const::FieldName(s) =
-                                                &self.program.constants[name_idx as usize]
-                                            {
-                                                if s == k { break 'ic val.clone(); }
-                                            }
-                                        }
-                                    }
-                                }
-                                let name = match &self.program.constants[name_idx as usize] {
-                                    Const::FieldName(s) => s.as_str(),
-                                    _ => return Err(VmError::TypeMismatch(
-                                        "expected FieldName const".into())),
-                                };
-                                let (off, _, val) = r.get_full(name)
-                                    .ok_or_else(|| VmError::TypeMismatch(
-                                        format!("missing field `{name}`")))?;
-                                self.field_ics[fid][sid] = Some((shape_id, off));
-                                val.clone()
-                            }
-                        }
-                        Value::StackRecord { shape_id, slab_start, field_count } => {
-                            // Same polymorphic path as Op::GetField for
-                            // stack records — shared IC, shape gives
-                            // the field-name vec.
-                            if ic_stats_enabled() {
-                                record_ic_hit(fn_id, site_idx, shape_id);
-                            }
-                            let fid = fn_id as usize;
-                            let sid = site_idx as usize;
-                            if self.field_ics[fid].is_empty() {
-                                let n = self.program.functions[fid].field_ic_sites as usize;
-                                self.field_ics[fid] = vec![None; n];
-                            }
-                            let cached = self.field_ics[fid][sid];
-                            'ic: {
-                                if let Some((cached_shape, off)) = cached {
-                                    if cached_shape == shape_id && (off as u16) < field_count {
-                                        let idx = slab_start as usize + off;
-                                        break 'ic self.stack_record_arena[idx].clone();
-                                    }
-                                }
-                                let shape =
-                                    &self.program.record_shapes[shape_id as usize];
-                                let target_name = match &self.program.constants[name_idx as usize] {
-                                    Const::FieldName(s) => s.as_str(),
-                                    _ => return Err(VmError::TypeMismatch(
-                                        "expected FieldName const".into())),
-                                };
-                                let mut found: Option<usize> = None;
-                                for (i, fn_const_idx) in shape.iter().enumerate() {
-                                    if let Const::FieldName(s) =
-                                        &self.program.constants[*fn_const_idx as usize]
-                                    {
-                                        if s == target_name { found = Some(i); break; }
-                                    }
-                                }
-                                let off = found.ok_or_else(|| VmError::TypeMismatch(
-                                    format!("missing field `{target_name}` on stack record")))?;
-                                self.field_ics[fid][sid] = Some((shape_id, off));
-                                self.stack_record_arena[slab_start as usize + off].clone()
-                            }
-                        }
-                        other => return Err(VmError::TypeMismatch(
-                            format!("LoadLocalGetFieldAdd on non-record: {other:?}"))),
-                    };
-                    let b = field_val.as_int();
+                    let b = self.read_local_record_field(
+                        base, local_idx, fn_id, name_idx, site_idx, "LoadLocalGetFieldAdd")?.as_int();
                     self.stack.push(Value::Int(acc + b));
+                    self.frames[frame_idx].pc = pc + 3;
+                }
+                Op::LoadLocalGetFieldSub { local_idx, name_idx, site_idx } => {
+                    // #461 slice 8: `LoadLocal + GetField + IntSub`. The
+                    // `acc - r.field` idiom. IntSub computes
+                    // deeper-minus-top; the field was on top in the
+                    // unfused form, so the result is `acc - field`.
+                    let acc = self.pop()?.as_int();
+                    let base = self.frames[frame_idx].locals_start;
+                    let b = self.read_local_record_field(
+                        base, local_idx, fn_id, name_idx, site_idx, "LoadLocalGetFieldSub")?.as_int();
+                    self.stack.push(Value::Int(acc - b));
+                    self.frames[frame_idx].pc = pc + 3;
+                }
+                Op::LoadLocalGetFieldMul { local_idx, name_idx, site_idx } => {
+                    // #461 slice 8: `LoadLocal + GetField + IntMul`. The
+                    // `acc * r.field` idiom (mul is commutative, so
+                    // operand order doesn't matter).
+                    let acc = self.pop()?.as_int();
+                    let base = self.frames[frame_idx].locals_start;
+                    let b = self.read_local_record_field(
+                        base, local_idx, fn_id, name_idx, site_idx, "LoadLocalGetFieldMul")?.as_int();
+                    self.stack.push(Value::Int(acc * b));
                     self.frames[frame_idx].pc = pc + 3;
                 }
                 Op::LoadLocalEqIntConstJumpIfNot { local_idx, imm_const_idx, jump_offset } => {
@@ -2232,6 +2175,130 @@ impl<'a> Vm<'a> {
     }
     fn peek(&self) -> Result<&Value, VmError> {
         self.stack.last().ok_or(VmError::StackUnderflow)
+    }
+
+    /// IC-cached field read of `locals[local_idx]`, shared by the
+    /// field-read fusions: slice 9's `LoadLocalGetField` and slice
+    /// 7/8's `LoadLocalGetField{Add,Sub,Mul}`. Uses the same
+    /// `(fn_id, site_idx)` inline-cache slot as the unfused
+    /// `Op::GetField`, so the paths stay cache-consistent.
+    /// `op_name` only appears in the non-record error message.
+    ///
+    /// Reads the record **by reference** and clones out only the
+    /// selected field — it does *not* clone the whole record. The
+    /// unfused `[LoadLocal, GetField]` pair clones the entire record
+    /// (`Box<IndexMap>` for a heap record) onto the value stack just
+    /// to read one field and drop the rest; on the `response_build`
+    /// profile that whole-record clone+drop of the returned `Response`
+    /// dominated the malloc traffic. Borrowing in place removes it.
+    ///
+    /// Borrow discipline: the inline-cache slot can't be written while
+    /// the record (a borrow of `self.locals_storage`) is live, so the
+    /// match yields `(value, install)` and the `field_ics` write
+    /// happens after the borrow ends.
+    ///
+    /// `#[inline(always)]`: hot dispatch path, called from four tight
+    /// `run_to` arms; leaving it out-of-line showed up as a standalone
+    /// call frame on the profile.
+    #[inline(always)]
+    fn read_local_record_field(
+        &mut self,
+        base: usize,
+        local_idx: u16,
+        fn_id: u32,
+        name_idx: u32,
+        site_idx: u32,
+        op_name: &str,
+    ) -> Result<Value, VmError> {
+        let fid = fn_id as usize;
+        let sid = site_idx as usize;
+        if self.field_ics[fid].is_empty() {
+            let n = self.program.functions[fid].field_ic_sites as usize;
+            self.field_ics[fid] = vec![None; n];
+        }
+        let cached = self.field_ics[fid][sid];
+        let li = base + local_idx as usize;
+
+        let (value, install): (Value, Option<(u32, usize)>) =
+            match &self.locals_storage[li] {
+                Value::Record { fields: r, shape_id } => {
+                    let shape_id = *shape_id;
+                    if ic_stats_enabled() {
+                        record_ic_hit(fn_id, site_idx, shape_id);
+                    }
+                    let hit = if let Some((cached_shape, off)) = cached {
+                        if cached_shape == shape_id {
+                            if shape_id != crate::value::NO_SHAPE_ID {
+                                r.get_index(off).map(|(_, val)| val.clone())
+                            } else if let Some((k, val)) = r.get_index(off) {
+                                match &self.program.constants[name_idx as usize] {
+                                    Const::FieldName(s) if s == k => Some(val.clone()),
+                                    _ => None,
+                                }
+                            } else { None }
+                        } else { None }
+                    } else { None };
+                    match hit {
+                        Some(v) => (v, None),
+                        None => {
+                            let name = match &self.program.constants[name_idx as usize] {
+                                Const::FieldName(s) => s.as_str(),
+                                _ => return Err(VmError::TypeMismatch(
+                                    "expected FieldName const".into())),
+                            };
+                            let (off, _, val) = r.get_full(name)
+                                .ok_or_else(|| VmError::TypeMismatch(
+                                    format!("missing field `{name}`")))?;
+                            (val.clone(), Some((shape_id, off)))
+                        }
+                    }
+                }
+                &Value::StackRecord { shape_id, slab_start, field_count } => {
+                    if ic_stats_enabled() {
+                        record_ic_hit(fn_id, site_idx, shape_id);
+                    }
+                    if let Some((cached_shape, off)) = cached {
+                        if cached_shape == shape_id && (off as u16) < field_count {
+                            let idx = slab_start as usize + off;
+                            (self.stack_record_arena[idx].clone(), None)
+                        } else {
+                            let off = self.resolve_stack_field(shape_id, name_idx)?;
+                            (self.stack_record_arena[slab_start as usize + off].clone(),
+                             Some((shape_id, off)))
+                        }
+                    } else {
+                        let off = self.resolve_stack_field(shape_id, name_idx)?;
+                        (self.stack_record_arena[slab_start as usize + off].clone(),
+                         Some((shape_id, off)))
+                    }
+                }
+                other => return Err(VmError::TypeMismatch(
+                    format!("{op_name} on non-record: {other:?}"))),
+            };
+        if let Some(entry) = install {
+            self.field_ics[fid][sid] = Some(entry);
+        }
+        Ok(value)
+    }
+
+    /// Resolve a field offset within a stack-record shape by name
+    /// (the slow path when the inline cache misses). Factored out so
+    /// `read_local_record_field` doesn't hold the `locals_storage`
+    /// borrow across the `record_shapes` / `constants` walk.
+    #[inline]
+    fn resolve_stack_field(&self, shape_id: u32, name_idx: u32) -> Result<usize, VmError> {
+        let shape = &self.program.record_shapes[shape_id as usize];
+        let target_name = match &self.program.constants[name_idx as usize] {
+            Const::FieldName(s) => s.as_str(),
+            _ => return Err(VmError::TypeMismatch("expected FieldName const".into())),
+        };
+        for (i, fn_const_idx) in shape.iter().enumerate() {
+            if let Const::FieldName(s) = &self.program.constants[*fn_const_idx as usize] {
+                if s == target_name { return Ok(i); }
+            }
+        }
+        Err(VmError::TypeMismatch(
+            format!("missing field `{target_name}` on stack record")))
     }
 
     fn bin_int(&mut self, f: impl Fn(i64, i64) -> Value) -> Result<(), VmError> {

@@ -325,11 +325,21 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
         // fused op that reads the just-stored local). Must run after
         // slice 5 since it matches on slice 5's output.
         apply_peephole_slice6(&mut f.code);
-        // Slice 7 — fuse `LoadLocal + GetField + IntAdd`, the
-        // accumulator-with-field-read idiom. Disjoint from every
+        // Slice 7/8 — fuse `LoadLocal + GetField + IntAdd|IntSub|IntMul`,
+        // the accumulator-with-field-read idiom. Disjoint from every
         // earlier slice (only this one matches a GetField at slot 1),
-        // so order is independent — placed at the end for chronology.
+        // so order is independent — placed near the end for chronology.
         apply_peephole_slice7(&mut f.code);
+        // Slice 9 — fuse the *remaining* bare `LoadLocal + GetField`
+        // pairs (those slice 7/8 didn't consume): chain-head field
+        // reads (`r.x` in `r.x + r.y`), standalone `r.field` reads
+        // (`r.total`), and field reads feeding non-add/sub/mul ops.
+        // MUST run after slice 7/8 — otherwise it would greedily eat
+        // the `LoadLocal + GetField` prefix of an `acc OP r.field`
+        // triple and prevent the 3-op fusion. Slice 7/8's tombstone
+        // GetFields are preceded by their fused op (not a bare
+        // LoadLocal), so slice 9 never matches them.
+        apply_peephole_slice9(&mut f.code);
     }
 
     // Final pass: stamp every function with its content hash now that
@@ -660,14 +670,17 @@ fn apply_peephole_slice6(code: &mut [Op]) {
     }
 }
 
-/// Slice 7: fuse `[LoadLocal(local_idx), GetField{name_idx, site_idx},
-/// IntAdd]` into `LoadLocalGetFieldAdd { local_idx, name_idx, site_idx }`.
+/// Slice 7/8: fuse `[LoadLocal(local_idx), GetField{name_idx,
+/// site_idx}, IntAdd|IntSub|IntMul]` into the matching
+/// `LoadLocalGetField{Add,Sub,Mul} { local_idx, name_idx, site_idx }`.
 ///
-/// Fires on the `acc + r.field` accumulator-with-field-read idiom —
-/// the bytecode the compiler emits for `prev_expr + record.field`
+/// Fires on the `acc OP r.field` accumulator-with-field-read idiom —
+/// the bytecode the compiler emits for `prev_expr OP record.field`
 /// once `prev_expr` is on the stack. Common in handler-shaped code
-/// like `r.x + r.y + r.z` (the LHS of each `+` after the first
-/// matches this pattern) and `acc + items[i].weight` reductions.
+/// like `r.x + r.y + r.z` (the LHS of each operator after the first
+/// matches this pattern), `acc + items[i].weight` reductions, and
+/// the `v.l - v.m` / `v.h * v.k` mixes the `response_build` profile
+/// exercises.
 ///
 /// Disjoint from every prior slice: slice 1 wants `PushConst` at
 /// slot 1; slices 3-4 want `LoadLocal` at slot 1; slice 5 wants
@@ -680,8 +693,8 @@ fn apply_peephole_slice6(code: &mut [Op]) {
 /// must run before / independent of slice 5/6, which don't match
 /// any slot in this window.
 ///
-/// Safety: trailing two slots (the original `GetField` and
-/// `IntAdd`) must not be jump targets. The first slot can be.
+/// Safety: trailing two slots (the original `GetField` and the
+/// arithmetic op) must not be jump targets. The first slot can be.
 fn apply_peephole_slice7(code: &mut [Op]) {
     if code.len() < 3 { return; }
     let jump_targets = collect_jump_targets(code);
@@ -689,16 +702,65 @@ fn apply_peephole_slice7(code: &mut [Op]) {
     let n = code.len();
     let mut k = 0;
     while k + 2 < n {
-        if let (
-            Op::LoadLocal(local_idx),
-            Op::GetField { name_idx, site_idx },
-            Op::IntAdd,
-        ) = (code[k], code[k + 1], code[k + 2]) {
-            let safe = !jump_targets.contains(&(k + 1))
-                && !jump_targets.contains(&(k + 2));
-            if safe {
-                code[k] = Op::LoadLocalGetFieldAdd { local_idx, name_idx, site_idx };
-                k += 3;
+        if let (Op::LoadLocal(local_idx), Op::GetField { name_idx, site_idx })
+            = (code[k], code[k + 1])
+        {
+            let fused = match code[k + 2] {
+                Op::IntAdd => Some(Op::LoadLocalGetFieldAdd { local_idx, name_idx, site_idx }),
+                Op::IntSub => Some(Op::LoadLocalGetFieldSub { local_idx, name_idx, site_idx }),
+                Op::IntMul => Some(Op::LoadLocalGetFieldMul { local_idx, name_idx, site_idx }),
+                _ => None,
+            };
+            if let Some(op) = fused {
+                let safe = !jump_targets.contains(&(k + 1))
+                    && !jump_targets.contains(&(k + 2));
+                if safe {
+                    code[k] = op;
+                    k += 3;
+                    continue;
+                }
+            }
+        }
+        k += 1;
+    }
+}
+
+/// Slice 9: fuse the bare `[LoadLocal(local_idx), GetField{name_idx,
+/// site_idx}]` pair into `LoadLocalGetField { local_idx, name_idx,
+/// site_idx }` — the plain `record.field` read, the most common
+/// field-access shape.
+///
+/// The win is allocation, not just one fewer dispatch: the unfused
+/// pair clones the entire record onto the value stack (a
+/// `Box<IndexMap>` for a heap record) only to read one field; the
+/// fused op reads the field out of the local by reference and clones
+/// only that value. On `response_build` the whole-record clone of the
+/// returned `Response` (`r.total`) was the dominant malloc source.
+///
+/// Order: MUST run after slice 7/8. Those fuse `[LoadLocal, GetField,
+/// IntAdd|IntSub|IntMul]`; if slice 9 ran first it would consume the
+/// `LoadLocal + GetField` prefix and block the 3-op fusion. After
+/// slice 7/8, the only remaining `[LoadLocal, GetField]` pairs are
+/// the ones they didn't want (chain heads, standalone reads, field
+/// reads feeding other ops). Slice 7/8's tombstone GetFields sit
+/// after their fused op, never after a bare `LoadLocal`, so slice 9
+/// won't touch them.
+///
+/// Safety: the trailing slot (the original `GetField`) must not be a
+/// jump target. The first slot can be.
+fn apply_peephole_slice9(code: &mut [Op]) {
+    if code.len() < 2 { return; }
+    let jump_targets = collect_jump_targets(code);
+
+    let n = code.len();
+    let mut k = 0;
+    while k + 1 < n {
+        if let (Op::LoadLocal(local_idx), Op::GetField { name_idx, site_idx })
+            = (code[k], code[k + 1])
+        {
+            if !jump_targets.contains(&(k + 1)) {
+                code[k] = Op::LoadLocalGetField { local_idx, name_idx, site_idx };
+                k += 2;
                 continue;
             }
         }

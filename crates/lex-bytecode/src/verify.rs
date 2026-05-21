@@ -256,12 +256,19 @@ fn stack_delta(op: &Op) -> i32 {
         // this depth; tombstones are not walked as live.
         Op::LoadLocalEqIntConstJumpIfNot { .. }
         | Op::LoadLocalStoreEqIntConstJumpIfNot { .. } => 0,
-        // Slice-7 fused op (#461): net +1, same as bare LoadLocal.
-        // Trailing GetField (delta 0) + IntAdd (delta -1) tombstones
-        // cancel to -1 when walked, leaving depth at pc+3 matching
-        // the unfused [LoadLocal, GetField, IntAdd] sequence's
-        // overall delta of 0.
-        Op::LoadLocalGetFieldAdd { .. } => 1,
+        // Slice-7/8 fused ops (#461): net +1, same as bare LoadLocal.
+        // Trailing GetField (delta 0) + IntAdd/IntSub/IntMul (delta
+        // -1) tombstones cancel to -1 when walked, leaving depth at
+        // pc+3 matching the unfused [LoadLocal, GetField, <op>]
+        // sequence's overall delta of 0.
+        Op::LoadLocalGetFieldAdd { .. }
+        | Op::LoadLocalGetFieldSub { .. }
+        | Op::LoadLocalGetFieldMul { .. } => 1,
+        // Slice-9 fused op (#461): net +1 (LoadLocal +1, GetField 0),
+        // same as bare LoadLocal. The single trailing GetField
+        // tombstone (delta 0) leaves depth at pc+2 matching the
+        // unfused [LoadLocal, GetField] pair.
+        Op::LoadLocalGetField { .. } => 1,
     }
 }
 

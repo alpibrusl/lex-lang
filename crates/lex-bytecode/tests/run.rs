@@ -458,3 +458,213 @@ fn record_field_access() {
     assert_eq!(r, Value::Int(11));
 }
 
+
+#[test]
+fn slice8_fuses_field_sub_and_computes_left_to_right() {
+    // #461 slice 8: `acc - r.field` fuses to LoadLocalGetFieldSub.
+    // The non-commutativity matters: `r.a - r.b - r.c` must be
+    // (a - b) - c, not a - (b - c). With a=10, b=3, c=2 the correct
+    // left-associated answer is 5.
+    use lex_bytecode::op::Op;
+    let src = "
+type R = { a :: Int, b :: Int, c :: Int }
+fn diff(r :: R) -> Int { r.a - r.b - r.c }
+";
+    let p = compile(src);
+    let n = p.functions[0].code.iter()
+        .filter(|op| matches!(op, Op::LoadLocalGetFieldSub { .. })).count();
+    assert!(n >= 2, "expected ≥2 slice-8 sub fusions, got {n}: {:?}",
+        p.functions[0].code);
+
+    let mut vm = Vm::new(&p);
+    let r = vm.call("diff", vec![Value::record_dynamic({
+        let mut m = IndexMap::new();
+        m.insert("a".into(), Value::Int(10));
+        m.insert("b".into(), Value::Int(3));
+        m.insert("c".into(), Value::Int(2));
+        m
+    })]).unwrap();
+    assert_eq!(r, Value::Int(5));
+}
+
+#[test]
+fn slice8_fuses_field_mul() {
+    use lex_bytecode::op::Op;
+    let src = "
+type R = { a :: Int, b :: Int, c :: Int }
+fn prod(r :: R) -> Int { r.a * r.b * r.c }
+";
+    let p = compile(src);
+    let n = p.functions[0].code.iter()
+        .filter(|op| matches!(op, Op::LoadLocalGetFieldMul { .. })).count();
+    assert!(n >= 2, "expected ≥2 slice-8 mul fusions, got {n}: {:?}",
+        p.functions[0].code);
+
+    let mut vm = Vm::new(&p);
+    let r = vm.call("prod", vec![Value::record_dynamic({
+        let mut m = IndexMap::new();
+        m.insert("a".into(), Value::Int(2));
+        m.insert("b".into(), Value::Int(3));
+        m.insert("c".into(), Value::Int(5));
+        m
+    })]).unwrap();
+    assert_eq!(r, Value::Int(30));
+}
+
+#[test]
+fn slice8_mixed_arith_chain() {
+    // A chain mixing +, -, * over fields — exercises all three
+    // slice-7/8 fused ops in one function and checks the combined
+    // result. ((a + b) - c) gives 11+0... compute: a=4,b=6,c=3:
+    // 4 + 6 = 10; 10 - 3 = 7; 7 * 2(=d) = 14.
+    let src = "
+type R = { a :: Int, b :: Int, c :: Int, d :: Int }
+fn mix(r :: R) -> Int { r.a + r.b - r.c * r.d }
+";
+    // Note: Lex precedence — `*` binds tighter, so this is
+    // r.a + r.b - (r.c * r.d). With a=4,b=6,c=3,d=2: 4+6-(6)=4.
+    let p = compile(src);
+    let mut vm = Vm::new(&p);
+    let r = vm.call("mix", vec![Value::record_dynamic({
+        let mut m = IndexMap::new();
+        m.insert("a".into(), Value::Int(4));
+        m.insert("b".into(), Value::Int(6));
+        m.insert("c".into(), Value::Int(3));
+        m.insert("d".into(), Value::Int(2));
+        m
+    })]).unwrap();
+    assert_eq!(r, Value::Int(4));
+}
+
+#[test]
+fn slice8_sub_does_not_fire_across_a_jump_target() {
+    // Jump-safety: same story as slice 3/4/7. A match-arm body whose
+    // entry straddles the candidate triple must skip fusion.
+    let src = "
+type R = { v :: Int }
+fn pick(flag :: Int, r :: R) -> Int {
+  match flag {
+    0 => 100 - r.v,
+    _ => r.v,
+  }
+}
+";
+    let p = compile(src);
+    let mut vm = Vm::new(&p);
+    let mk = || Value::record_dynamic({
+        let mut m = IndexMap::new(); m.insert("v".into(), Value::Int(7)); m
+    });
+    assert_eq!(vm.call("pick", vec![Value::Int(0), mk()]).unwrap(), Value::Int(93));
+    assert_eq!(vm.call("pick", vec![Value::Int(1), mk()]).unwrap(), Value::Int(7));
+}
+
+#[test]
+fn slice9_fuses_bare_field_read() {
+    // #461 slice 9: a standalone `r.field` read fuses to
+    // LoadLocalGetField (no whole-record clone).
+    use lex_bytecode::op::Op;
+    let src = "
+type R = { x :: Int, y :: Int }
+fn getx(r :: R) -> Int { r.x }
+";
+    let p = compile(src);
+    let f = &p.functions[0];
+    assert!(matches!(f.code[0], Op::LoadLocalGetField { local_idx: 0, .. }),
+        "slice 9 did not fire; got {:?}", f.code);
+    // The trailing GetField stays as a tombstone (body-hash stability).
+    assert!(matches!(f.code[1], Op::GetField { .. }));
+
+    let mut vm = Vm::new(&p);
+    let r = vm.call("getx", vec![Value::record_dynamic({
+        let mut m = IndexMap::new();
+        m.insert("x".into(), Value::Int(11));
+        m.insert("y".into(), Value::Int(22));
+        m
+    })]).unwrap();
+    assert_eq!(r, Value::Int(11));
+}
+
+#[test]
+fn slice9_fuses_chain_head_alongside_slice7() {
+    // In `r.x + r.y`, slice 7 fuses the `+ r.y` triple and slice 9
+    // fuses the chain-head `r.x` pair — both fire in one function.
+    use lex_bytecode::op::Op;
+    let src = "
+type R = { x :: Int, y :: Int }
+fn add(r :: R) -> Int { r.x + r.y }
+";
+    let p = compile(src);
+    let f = &p.functions[0];
+    let n9 = f.code.iter().filter(|o| matches!(o, Op::LoadLocalGetField { .. })).count();
+    let n7 = f.code.iter().filter(|o| matches!(o, Op::LoadLocalGetFieldAdd { .. })).count();
+    assert_eq!(n9, 1, "expected chain-head fused by slice 9: {:?}", f.code);
+    assert_eq!(n7, 1, "expected `+ r.y` fused by slice 7: {:?}", f.code);
+
+    let mut vm = Vm::new(&p);
+    let r = vm.call("add", vec![Value::record_dynamic({
+        let mut m = IndexMap::new();
+        m.insert("x".into(), Value::Int(30));
+        m.insert("y".into(), Value::Int(12));
+        m
+    })]).unwrap();
+    assert_eq!(r, Value::Int(42));
+}
+
+#[test]
+fn slice9_reads_field_from_returned_heap_record() {
+    // The motivating case: a function returns a record (escapes to
+    // the heap), the caller reads one field. The by-reference read
+    // must produce the right value without cloning the whole record.
+    let src = "
+type Resp = { status :: Int, total :: Int }
+fn handle(n :: Int) -> Resp { { status: 200, total: n } }
+fn drive(n :: Int) -> Int { let r := handle(n) r.total }
+";
+    let p = compile(src);
+    let mut vm = Vm::new(&p);
+    assert_eq!(vm.call("drive", vec![Value::Int(99)]).unwrap(), Value::Int(99));
+}
+
+#[test]
+fn slice9_reads_field_from_stack_record() {
+    // Slice 9 over a stack-allocated record (the by-ref read's
+    // StackRecord branch + resolve_stack_field slow path).
+    let src = r#"
+        fn f() -> Int {
+          let r := { a: 7, b: 9 }
+          r.b
+        }
+    "#;
+    let p = compile(src);
+    use lex_bytecode::op::Op;
+    let f = &p.functions[0];
+    assert!(f.code.iter().any(|o| matches!(o, Op::AllocStackRecord { .. })),
+        "expected stack record");
+    assert!(f.code.iter().any(|o| matches!(o, Op::LoadLocalGetField { .. })),
+        "expected slice 9 fusion");
+    let mut vm = Vm::new(&p);
+    assert_eq!(vm.call("f", vec![]).unwrap(), Value::Int(9));
+}
+
+#[test]
+fn slice9_does_not_fire_across_a_jump_target() {
+    // The trailing GetField must not be a jump target. A match whose
+    // arm entry lands between LoadLocal and GetField would corrupt
+    // the read; verify both arms still produce correct values.
+    let src = "
+type R = { v :: Int }
+fn pick(flag :: Int, r :: R) -> Int {
+  match flag {
+    0 => r.v,
+    _ => 0,
+  }
+}
+";
+    let p = compile(src);
+    let mut vm = Vm::new(&p);
+    let mk = || Value::record_dynamic({
+        let mut m = IndexMap::new(); m.insert("v".into(), Value::Int(5)); m
+    });
+    assert_eq!(vm.call("pick", vec![Value::Int(0), mk()]).unwrap(), Value::Int(5));
+    assert_eq!(vm.call("pick", vec![Value::Int(1), mk()]).unwrap(), Value::Int(0));
+}
