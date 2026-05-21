@@ -264,6 +264,11 @@ fn stack_delta(op: &Op) -> i32 {
         Op::LoadLocalGetFieldAdd { .. }
         | Op::LoadLocalGetFieldSub { .. }
         | Op::LoadLocalGetFieldMul { .. } => 1,
+        // Slice-9 fused op (#461): net +1 (LoadLocal +1, GetField 0),
+        // same as bare LoadLocal. The single trailing GetField
+        // tombstone (delta 0) leaves depth at pc+2 matching the
+        // unfused [LoadLocal, GetField] pair.
+        Op::LoadLocalGetField { .. } => 1,
     }
 }
 

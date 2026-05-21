@@ -557,3 +557,114 @@ fn pick(flag :: Int, r :: R) -> Int {
     assert_eq!(vm.call("pick", vec![Value::Int(0), mk()]).unwrap(), Value::Int(93));
     assert_eq!(vm.call("pick", vec![Value::Int(1), mk()]).unwrap(), Value::Int(7));
 }
+
+#[test]
+fn slice9_fuses_bare_field_read() {
+    // #461 slice 9: a standalone `r.field` read fuses to
+    // LoadLocalGetField (no whole-record clone).
+    use lex_bytecode::op::Op;
+    let src = "
+type R = { x :: Int, y :: Int }
+fn getx(r :: R) -> Int { r.x }
+";
+    let p = compile(src);
+    let f = &p.functions[0];
+    assert!(matches!(f.code[0], Op::LoadLocalGetField { local_idx: 0, .. }),
+        "slice 9 did not fire; got {:?}", f.code);
+    // The trailing GetField stays as a tombstone (body-hash stability).
+    assert!(matches!(f.code[1], Op::GetField { .. }));
+
+    let mut vm = Vm::new(&p);
+    let r = vm.call("getx", vec![Value::record_dynamic({
+        let mut m = IndexMap::new();
+        m.insert("x".into(), Value::Int(11));
+        m.insert("y".into(), Value::Int(22));
+        m
+    })]).unwrap();
+    assert_eq!(r, Value::Int(11));
+}
+
+#[test]
+fn slice9_fuses_chain_head_alongside_slice7() {
+    // In `r.x + r.y`, slice 7 fuses the `+ r.y` triple and slice 9
+    // fuses the chain-head `r.x` pair — both fire in one function.
+    use lex_bytecode::op::Op;
+    let src = "
+type R = { x :: Int, y :: Int }
+fn add(r :: R) -> Int { r.x + r.y }
+";
+    let p = compile(src);
+    let f = &p.functions[0];
+    let n9 = f.code.iter().filter(|o| matches!(o, Op::LoadLocalGetField { .. })).count();
+    let n7 = f.code.iter().filter(|o| matches!(o, Op::LoadLocalGetFieldAdd { .. })).count();
+    assert_eq!(n9, 1, "expected chain-head fused by slice 9: {:?}", f.code);
+    assert_eq!(n7, 1, "expected `+ r.y` fused by slice 7: {:?}", f.code);
+
+    let mut vm = Vm::new(&p);
+    let r = vm.call("add", vec![Value::record_dynamic({
+        let mut m = IndexMap::new();
+        m.insert("x".into(), Value::Int(30));
+        m.insert("y".into(), Value::Int(12));
+        m
+    })]).unwrap();
+    assert_eq!(r, Value::Int(42));
+}
+
+#[test]
+fn slice9_reads_field_from_returned_heap_record() {
+    // The motivating case: a function returns a record (escapes to
+    // the heap), the caller reads one field. The by-reference read
+    // must produce the right value without cloning the whole record.
+    let src = "
+type Resp = { status :: Int, total :: Int }
+fn handle(n :: Int) -> Resp { { status: 200, total: n } }
+fn drive(n :: Int) -> Int { let r := handle(n) r.total }
+";
+    let p = compile(src);
+    let mut vm = Vm::new(&p);
+    assert_eq!(vm.call("drive", vec![Value::Int(99)]).unwrap(), Value::Int(99));
+}
+
+#[test]
+fn slice9_reads_field_from_stack_record() {
+    // Slice 9 over a stack-allocated record (the by-ref read's
+    // StackRecord branch + resolve_stack_field slow path).
+    let src = r#"
+        fn f() -> Int {
+          let r := { a: 7, b: 9 }
+          r.b
+        }
+    "#;
+    let p = compile(src);
+    use lex_bytecode::op::Op;
+    let f = &p.functions[0];
+    assert!(f.code.iter().any(|o| matches!(o, Op::AllocStackRecord { .. })),
+        "expected stack record");
+    assert!(f.code.iter().any(|o| matches!(o, Op::LoadLocalGetField { .. })),
+        "expected slice 9 fusion");
+    let mut vm = Vm::new(&p);
+    assert_eq!(vm.call("f", vec![]).unwrap(), Value::Int(9));
+}
+
+#[test]
+fn slice9_does_not_fire_across_a_jump_target() {
+    // The trailing GetField must not be a jump target. A match whose
+    // arm entry lands between LoadLocal and GetField would corrupt
+    // the read; verify both arms still produce correct values.
+    let src = "
+type R = { v :: Int }
+fn pick(flag :: Int, r :: R) -> Int {
+  match flag {
+    0 => r.v,
+    _ => 0,
+  }
+}
+";
+    let p = compile(src);
+    let mut vm = Vm::new(&p);
+    let mk = || Value::record_dynamic({
+        let mut m = IndexMap::new(); m.insert("v".into(), Value::Int(5)); m
+    });
+    assert_eq!(vm.call("pick", vec![Value::Int(0), mk()]).unwrap(), Value::Int(5));
+    assert_eq!(vm.call("pick", vec![Value::Int(1), mk()]).unwrap(), Value::Int(0));
+}
