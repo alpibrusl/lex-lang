@@ -284,6 +284,40 @@ fn fetch_json(url :: Str) -> [net] Result[HttpResponse, HttpError] {
 Always pair with `--allow-net-host` at the policy gate. Never construct
 raw sockets.
 
+### 3.7 Redis: `std.redis` for pub/sub and key-value (MUST for Redis)
+
+```lex
+import "std.redis" as redis
+
+# Key-value
+fn cache_set(url :: Str, key :: Str, val :: Str) -> [net] Unit {
+  match redis.connect(url) {
+    Ok(conn) => redis.set(conn, key, val),
+    Err(_)   => Unit,
+  }
+}
+
+# Pub/Sub fan-out (blocking loop; use in a dedicated actor or thread)
+fn listen(url :: Str, channel :: Str) -> [net] Nil {
+  match redis.connect(url) {
+    Ok(conn) => redis.subscribe(conn, channel, fn(ch :: Str, msg :: Str) -> Unit {
+      io.print(msg)
+    }),
+    Err(e) => io.print(e),
+  }
+}
+```
+
+All `std.redis` ops carry `[net]`; `--allow-effects net` is the only
+policy grant required. `subscribe` and `psubscribe` block the calling
+thread indefinitely (they return `Nil`) and open a dedicated connection
+internally — Redis forbids non-Pub/Sub commands on a subscribed connection.
+`brpop` with `timeout_secs = 0` blocks until an item is available; the
+runtime does not treat this as a hung effect.
+
+For connection pooling, pub/sub fan-out helpers, and work-queue retry
+logic use `lex-queue`, which builds on top of `std.redis`.
+
 ---
 
 ## 4. The repair-not-regenerate rule

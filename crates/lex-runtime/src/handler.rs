@@ -633,7 +633,13 @@ impl DefaultHandler {
 }
 
 fn extract_host(url: &str) -> Option<&str> {
-    let rest = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://"))?;
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .or_else(|| url.strip_prefix("redis://"))
+        .or_else(|| url.strip_prefix("rediss://"))
+        // `@user:pass@host:port` — strip auth prefix if present
+        .map(|r| r.split_once('@').map(|(_, after)| after).unwrap_or(r))?;
     let host_port = match rest.find('/') {
         Some(i) => &rest[..i],
         None => rest,
@@ -974,7 +980,14 @@ impl EffectHandler for DefaultHandler {
                 other => Err(format!("unsupported tls.{other}")),
             };
         }
-        self.ensure_kind_allowed(kind)?;
+        // `std.redis` ops all carry `[net]` in their declared effect sets,
+        // not `[redis]`. Gate on `net` here and skip the generic kind-check
+        // below, matching the `std.http` precedent.
+        if kind == "redis" {
+            self.ensure_kind_allowed("net")?;
+        } else {
+            self.ensure_kind_allowed(kind)?;
+        }
         match (kind, op) {
             ("io", "print") => {
                 let line = expect_str(args.first())?;
@@ -1721,6 +1734,308 @@ impl EffectHandler for DefaultHandler {
                 Value::Int(n)   => Some(Value::Bool(*n != 0)),
                 _ => None,
             })?),
+
+            // ── std.redis (#533) ─────────────────────────────────────────
+            //
+            // ConnRedis is an opaque Int handle into the global RedisRegistry.
+            // All ops carry [net] — Redis is a TCP service.
+            //
+            // subscribe/psubscribe open a *dedicated* connection so they don't
+            // interfere with the handle's regular connection. Redis disallows
+            // non-Pub/Sub commands on a subscribed connection.
+            ("redis", "connect") => {
+                let url = expect_str(args.first())?.to_string();
+                self.ensure_host_allowed(&url)?;
+                match redis::Client::open(url.as_str()) {
+                    Ok(client) => match client.get_connection() {
+                        Ok(conn) => {
+                            let handle = next_redis_handle();
+                            redis_registry().lock().unwrap().insert(handle, RedisEntry { url, conn });
+                            Ok(ok(Value::Int(handle as i64)))
+                        }
+                        Err(e) => Ok(err(Value::Str(format!("redis.connect: {e}").into()))),
+                    },
+                    Err(e) => Ok(err(Value::Str(format!("redis.connect: {e}").into()))),
+                }
+            }
+            ("redis", "close") => {
+                let h = expect_redis_handle(args.first())?;
+                redis_registry().lock().unwrap().remove(h);
+                Ok(Value::Unit)
+            }
+            ("redis", "get") => {
+                let h = expect_redis_handle(args.first())?;
+                let key = expect_str(args.get(1))?.to_string();
+                let mut reg = redis_registry().lock().unwrap();
+                let entry = reg.touch_get_mut(h)
+                    .ok_or_else(|| "redis.get: closed or unknown ConnRedis handle".to_string())?;
+                use redis::Commands;
+                match entry.conn.get::<_, Option<String>>(&key) {
+                    Ok(Some(v)) => Ok(some(Value::Str(v.into()))),
+                    Ok(None)    => Ok(none()),
+                    Err(e)      => Err(format!("redis.get: {e}")),
+                }
+            }
+            ("redis", "set") => {
+                let h = expect_redis_handle(args.first())?;
+                let key = expect_str(args.get(1))?.to_string();
+                let val = expect_str(args.get(2))?.to_string();
+                let mut reg = redis_registry().lock().unwrap();
+                let entry = reg.touch_get_mut(h)
+                    .ok_or_else(|| "redis.set: closed or unknown ConnRedis handle".to_string())?;
+                use redis::Commands;
+                entry.conn.set::<_, _, ()>(&key, &val)
+                    .map_err(|e| format!("redis.set: {e}"))?;
+                Ok(Value::Unit)
+            }
+            ("redis", "set_ex") => {
+                let h = expect_redis_handle(args.first())?;
+                let key = expect_str(args.get(1))?.to_string();
+                let val = expect_str(args.get(2))?.to_string();
+                let ttl = expect_int(args.get(3))?;
+                let mut reg = redis_registry().lock().unwrap();
+                let entry = reg.touch_get_mut(h)
+                    .ok_or_else(|| "redis.set_ex: closed or unknown ConnRedis handle".to_string())?;
+                use redis::Commands;
+                entry.conn.set_ex::<_, _, ()>(&key, &val, ttl as u64)
+                    .map_err(|e| format!("redis.set_ex: {e}"))?;
+                Ok(Value::Unit)
+            }
+            ("redis", "del") => {
+                let h = expect_redis_handle(args.first())?;
+                let key = expect_str(args.get(1))?.to_string();
+                let mut reg = redis_registry().lock().unwrap();
+                let entry = reg.touch_get_mut(h)
+                    .ok_or_else(|| "redis.del: closed or unknown ConnRedis handle".to_string())?;
+                use redis::Commands;
+                entry.conn.del::<_, ()>(&key)
+                    .map_err(|e| format!("redis.del: {e}"))?;
+                Ok(Value::Unit)
+            }
+            ("redis", "exists") => {
+                let h = expect_redis_handle(args.first())?;
+                let key = expect_str(args.get(1))?.to_string();
+                let mut reg = redis_registry().lock().unwrap();
+                let entry = reg.touch_get_mut(h)
+                    .ok_or_else(|| "redis.exists: closed or unknown ConnRedis handle".to_string())?;
+                use redis::Commands;
+                let present: bool = entry.conn.exists(&key)
+                    .map_err(|e| format!("redis.exists: {e}"))?;
+                Ok(Value::Bool(present))
+            }
+            ("redis", "expire") => {
+                let h = expect_redis_handle(args.first())?;
+                let key = expect_str(args.get(1))?.to_string();
+                let ttl = expect_int(args.get(2))?;
+                let mut reg = redis_registry().lock().unwrap();
+                let entry = reg.touch_get_mut(h)
+                    .ok_or_else(|| "redis.expire: closed or unknown ConnRedis handle".to_string())?;
+                use redis::Commands;
+                entry.conn.expire::<_, ()>(&key, ttl)
+                    .map_err(|e| format!("redis.expire: {e}"))?;
+                Ok(Value::Unit)
+            }
+            ("redis", "publish") => {
+                let h = expect_redis_handle(args.first())?;
+                let channel = expect_str(args.get(1))?.to_string();
+                let msg = expect_str(args.get(2))?.to_string();
+                let mut reg = redis_registry().lock().unwrap();
+                let entry = reg.touch_get_mut(h)
+                    .ok_or_else(|| "redis.publish: closed or unknown ConnRedis handle".to_string())?;
+                use redis::Commands;
+                let n: i64 = entry.conn.publish(&channel, &msg)
+                    .map_err(|e| format!("redis.publish: {e}"))?;
+                Ok(Value::Int(n))
+            }
+            // subscribe / psubscribe: blocking loops on dedicated connections.
+            // Each inbound message calls the Lex closure in a fresh VM built
+            // from `self.program` — same pattern as net.serve_fn's per-request
+            // dispatch. Returns Unit (Nil) only if the connection drops.
+            ("redis", "subscribe") => {
+                let h = expect_redis_handle(args.first())?;
+                let channel = expect_str(args.get(1))?.to_string();
+                let closure = match args.into_iter().nth(2) {
+                    Some(c @ Value::Closure { .. }) => c,
+                    _ => return Err("redis.subscribe: handler must be a Closure".into()),
+                };
+                let program = self.program.clone()
+                    .ok_or("redis.subscribe: no program; call DefaultHandler::with_program")?;
+                let policy = self.policy.clone();
+                let url = redis_registry().lock().unwrap()
+                    .get_url(h)
+                    .ok_or("redis.subscribe: closed or unknown ConnRedis handle")?;
+                let client = redis::Client::open(url.as_str())
+                    .map_err(|e| format!("redis.subscribe: {e}"))?;
+                let mut conn = client.get_connection()
+                    .map_err(|e| format!("redis.subscribe: {e}"))?;
+                let mut pubsub = conn.as_pubsub();
+                pubsub.subscribe(&channel)
+                    .map_err(|e| format!("redis.subscribe: {e}"))?;
+                loop {
+                    let msg = pubsub.get_message()
+                        .map_err(|e| format!("redis.subscribe: {e}"))?;
+                    let ch: String = msg.get_channel_name().to_string();
+                    let payload: String = msg.get_payload()
+                        .map_err(|e| format!("redis.subscribe: payload: {e}"))?;
+                    let handler = DefaultHandler::new(policy.clone())
+                        .with_program(Arc::clone(&program));
+                    let mut vm = Vm::with_handler(&program, Box::new(handler));
+                    vm.invoke_closure_value(closure.clone(), vec![
+                        Value::Str(ch.into()),
+                        Value::Str(payload.into()),
+                    ]).map_err(|e| format!("redis.subscribe: handler: {e:?}"))?;
+                }
+            }
+            ("redis", "psubscribe") => {
+                let h = expect_redis_handle(args.first())?;
+                let pattern = expect_str(args.get(1))?.to_string();
+                let closure = match args.into_iter().nth(2) {
+                    Some(c @ Value::Closure { .. }) => c,
+                    _ => return Err("redis.psubscribe: handler must be a Closure".into()),
+                };
+                let program = self.program.clone()
+                    .ok_or("redis.psubscribe: no program; call DefaultHandler::with_program")?;
+                let policy = self.policy.clone();
+                let url = redis_registry().lock().unwrap()
+                    .get_url(h)
+                    .ok_or("redis.psubscribe: closed or unknown ConnRedis handle")?;
+                let client = redis::Client::open(url.as_str())
+                    .map_err(|e| format!("redis.psubscribe: {e}"))?;
+                let mut conn = client.get_connection()
+                    .map_err(|e| format!("redis.psubscribe: {e}"))?;
+                let mut pubsub = conn.as_pubsub();
+                pubsub.psubscribe(&pattern)
+                    .map_err(|e| format!("redis.psubscribe: {e}"))?;
+                loop {
+                    let msg = pubsub.get_message()
+                        .map_err(|e| format!("redis.psubscribe: {e}"))?;
+                    let pat: String = msg.get_pattern()
+                        .ok()
+                        .and_then(|v: Option<String>| v)
+                        .unwrap_or_else(|| pattern.clone());
+                    let ch: String = msg.get_channel_name().to_string();
+                    let payload: String = msg.get_payload()
+                        .map_err(|e| format!("redis.psubscribe: payload: {e}"))?;
+                    let handler = DefaultHandler::new(policy.clone())
+                        .with_program(Arc::clone(&program));
+                    let mut vm = Vm::with_handler(&program, Box::new(handler));
+                    vm.invoke_closure_value(closure.clone(), vec![
+                        Value::Str(pat.into()),
+                        Value::Str(ch.into()),
+                        Value::Str(payload.into()),
+                    ]).map_err(|e| format!("redis.psubscribe: handler: {e:?}"))?;
+                }
+            }
+            ("redis", "lpush") => {
+                let h = expect_redis_handle(args.first())?;
+                let key = expect_str(args.get(1))?.to_string();
+                let val = expect_str(args.get(2))?.to_string();
+                let mut reg = redis_registry().lock().unwrap();
+                let entry = reg.touch_get_mut(h)
+                    .ok_or_else(|| "redis.lpush: closed or unknown ConnRedis handle".to_string())?;
+                use redis::Commands;
+                let n: i64 = entry.conn.lpush(&key, &val)
+                    .map_err(|e| format!("redis.lpush: {e}"))?;
+                Ok(Value::Int(n))
+            }
+            ("redis", "rpush") => {
+                let h = expect_redis_handle(args.first())?;
+                let key = expect_str(args.get(1))?.to_string();
+                let val = expect_str(args.get(2))?.to_string();
+                let mut reg = redis_registry().lock().unwrap();
+                let entry = reg.touch_get_mut(h)
+                    .ok_or_else(|| "redis.rpush: closed or unknown ConnRedis handle".to_string())?;
+                use redis::Commands;
+                let n: i64 = entry.conn.rpush(&key, &val)
+                    .map_err(|e| format!("redis.rpush: {e}"))?;
+                Ok(Value::Int(n))
+            }
+            ("redis", "brpop") => {
+                // timeout=0 means block indefinitely; the Lex runtime does not
+                // treat this as a hung effect — it is the caller's intent.
+                let h = expect_redis_handle(args.first())?;
+                let key = expect_str(args.get(1))?.to_string();
+                let timeout = expect_int(args.get(2))?;
+                let mut reg = redis_registry().lock().unwrap();
+                let entry = reg.touch_get_mut(h)
+                    .ok_or_else(|| "redis.brpop: closed or unknown ConnRedis handle".to_string())?;
+                use redis::Commands;
+                // brpop returns Option<(String, String)>: (key, value).
+                // We surface only the value to the Lex caller.
+                let result: Option<(String, String)> = entry.conn
+                    .brpop(&key, timeout as f64)
+                    .map_err(|e| format!("redis.brpop: {e}"))?;
+                match result {
+                    Some((_, v)) => Ok(some(Value::Str(v.into()))),
+                    None         => Ok(none()),
+                }
+            }
+            ("redis", "llen") => {
+                let h = expect_redis_handle(args.first())?;
+                let key = expect_str(args.get(1))?.to_string();
+                let mut reg = redis_registry().lock().unwrap();
+                let entry = reg.touch_get_mut(h)
+                    .ok_or_else(|| "redis.llen: closed or unknown ConnRedis handle".to_string())?;
+                use redis::Commands;
+                let n: i64 = entry.conn.llen(&key)
+                    .map_err(|e| format!("redis.llen: {e}"))?;
+                Ok(Value::Int(n))
+            }
+            ("redis", "hset") => {
+                let h = expect_redis_handle(args.first())?;
+                let key   = expect_str(args.get(1))?.to_string();
+                let field = expect_str(args.get(2))?.to_string();
+                let val   = expect_str(args.get(3))?.to_string();
+                let mut reg = redis_registry().lock().unwrap();
+                let entry = reg.touch_get_mut(h)
+                    .ok_or_else(|| "redis.hset: closed or unknown ConnRedis handle".to_string())?;
+                use redis::Commands;
+                entry.conn.hset::<_, _, _, ()>(&key, &field, &val)
+                    .map_err(|e| format!("redis.hset: {e}"))?;
+                Ok(Value::Unit)
+            }
+            ("redis", "hget") => {
+                let h = expect_redis_handle(args.first())?;
+                let key   = expect_str(args.get(1))?.to_string();
+                let field = expect_str(args.get(2))?.to_string();
+                let mut reg = redis_registry().lock().unwrap();
+                let entry = reg.touch_get_mut(h)
+                    .ok_or_else(|| "redis.hget: closed or unknown ConnRedis handle".to_string())?;
+                use redis::Commands;
+                match entry.conn.hget::<_, _, Option<String>>(&key, &field) {
+                    Ok(Some(v)) => Ok(some(Value::Str(v.into()))),
+                    Ok(None)    => Ok(none()),
+                    Err(e)      => Err(format!("redis.hget: {e}")),
+                }
+            }
+            ("redis", "hdel") => {
+                let h = expect_redis_handle(args.first())?;
+                let key   = expect_str(args.get(1))?.to_string();
+                let field = expect_str(args.get(2))?.to_string();
+                let mut reg = redis_registry().lock().unwrap();
+                let entry = reg.touch_get_mut(h)
+                    .ok_or_else(|| "redis.hdel: closed or unknown ConnRedis handle".to_string())?;
+                use redis::Commands;
+                entry.conn.hdel::<_, _, ()>(&key, &field)
+                    .map_err(|e| format!("redis.hdel: {e}"))?;
+                Ok(Value::Unit)
+            }
+            ("redis", "hgetall") => {
+                let h = expect_redis_handle(args.first())?;
+                let key = expect_str(args.get(1))?.to_string();
+                let mut reg = redis_registry().lock().unwrap();
+                let entry = reg.touch_get_mut(h)
+                    .ok_or_else(|| "redis.hgetall: closed or unknown ConnRedis handle".to_string())?;
+                use redis::Commands;
+                let map: std::collections::HashMap<String, String> = entry.conn
+                    .hgetall(&key)
+                    .map_err(|e| format!("redis.hgetall: {e}"))?;
+                let pairs: Vec<Value> = map.into_iter()
+                    .map(|(k, v)| Value::Tuple(vec![Value::Str(k.into()), Value::Str(v.into())]))
+                    .collect();
+                Ok(Value::List(pairs.into()))
+            }
+
             ("proc", "spawn") => {
                 // The escape hatch effect. Spawns a child process,
                 // collects its stdout/stderr, returns a structured
@@ -4201,6 +4516,79 @@ impl KvRegistry {
 fn next_kv_handle() -> u64 {
     static COUNTER: AtomicU64 = AtomicU64::new(1);
     COUNTER.fetch_add(1, Ordering::SeqCst)
+}
+
+// ── std.redis registry (#533) ────────────────────────────────────────
+//
+// `ConnRedis` is an opaque Int handle into `RedisRegistry`. Each
+// `redis.connect` allocates a new handle via `next_redis_handle` and
+// stores the open `redis::Connection` plus the original URL (needed to
+// open dedicated pub/sub connections for `subscribe`/`psubscribe`).
+//
+// LRU-bounded at MAX_REDIS_HANDLES to avoid leaks from programs that
+// open many short-lived connections without calling `redis.close`.
+
+/// Per-handle state: the live synchronous connection and the URL it
+/// was opened from. The URL is kept so `subscribe`/`psubscribe` can
+/// open a fresh dedicated connection (Redis forbids non-Pub/Sub
+/// commands on a subscribed connection).
+struct RedisEntry {
+    url: String,
+    conn: redis::Connection,
+}
+
+struct RedisRegistry {
+    entries: indexmap::IndexMap<u64, RedisEntry>,
+    cap: usize,
+}
+
+impl RedisRegistry {
+    fn with_capacity(cap: usize) -> Self {
+        Self { entries: indexmap::IndexMap::new(), cap }
+    }
+
+    fn insert(&mut self, handle: u64, entry: RedisEntry) {
+        if self.entries.len() >= self.cap {
+            self.entries.shift_remove_index(0);
+        }
+        self.entries.insert(handle, entry);
+    }
+
+    fn touch_get_mut(&mut self, handle: u64) -> Option<&mut RedisEntry> {
+        let idx = self.entries.get_index_of(&handle)?;
+        self.entries.move_index(idx, self.entries.len() - 1);
+        self.entries.get_mut(&handle)
+    }
+
+    /// Return the URL for a handle without touching LRU order. Used by
+    /// `subscribe`/`psubscribe` to open a dedicated connection.
+    fn get_url(&self, handle: u64) -> Option<String> {
+        self.entries.get(&handle).map(|e| e.url.clone())
+    }
+
+    fn remove(&mut self, handle: u64) {
+        self.entries.shift_remove(&handle);
+    }
+}
+
+fn redis_registry() -> &'static Mutex<RedisRegistry> {
+    static REGISTRY: OnceLock<Mutex<RedisRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(RedisRegistry::with_capacity(MAX_REDIS_HANDLES)))
+}
+
+const MAX_REDIS_HANDLES: usize = 256;
+
+fn next_redis_handle() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    COUNTER.fetch_add(1, Ordering::SeqCst)
+}
+
+fn expect_redis_handle(v: Option<&Value>) -> Result<u64, String> {
+    match v {
+        Some(Value::Int(n)) if *n >= 0 => Ok(*n as u64),
+        Some(other) => Err(format!("expected ConnRedis (Int), got {other:?}")),
+        None => Err("missing ConnRedis argument".into()),
+    }
 }
 
 /// Process-wide registry of open `Db` handles. Same shape as the kv

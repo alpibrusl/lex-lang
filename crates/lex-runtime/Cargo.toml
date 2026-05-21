@@ -56,6 +56,7 @@ serde_yaml = "0.9"
 csv = "1"
 rusqlite = { version = "0.39", features = ["bundled"] }
 postgres = "0.19"
+redis = "0.27"
 arrow-array = "58"
 arrow-schema = "58"
 arrow-select = "58"

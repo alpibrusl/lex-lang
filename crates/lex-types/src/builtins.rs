@@ -2232,6 +2232,159 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
 
             Some(Ty::Record(fields))
         }
+        "redis" => {
+            // Thin Redis client (#533). ConnRedis is an opaque handle backed by a
+            // process-wide registry (same pattern as Db in std.sql). All ops carry
+            // [net] — Redis is a TCP service; no separate [redis] effect.
+            //
+            // subscribe / psubscribe return Nil (= Unit) because they are blocking
+            // infinite loops, consistent with net.serve_fn and ws.serve.
+            //
+            // subscribe/psubscribe open a *dedicated* connection internally —
+            // Redis disallows non-Pub/Sub commands on a subscribed connection.
+            let conn_t = || Ty::Con("ConnRedis".into(), vec![]);
+            let mut fields = IndexMap::new();
+
+            // connect :: Str -> [net] Result[ConnRedis, Str]
+            // url: "redis://host:6379" or "rediss://host:6380" (TLS)
+            fields.insert("connect".into(), Ty::function(
+                vec![Ty::str()],
+                EffectSet::singleton("net"),
+                Ty::Con("Result".into(), vec![conn_t(), Ty::str()])));
+
+            // close :: ConnRedis -> [net] Unit
+            fields.insert("close".into(), Ty::function(
+                vec![conn_t()],
+                EffectSet::singleton("net"),
+                Ty::Unit));
+
+            // ---- Key-value -----------------------------------------------
+
+            // get :: ConnRedis, Str -> [net] Option[Str]
+            fields.insert("get".into(), Ty::function(
+                vec![conn_t(), Ty::str()],
+                EffectSet::singleton("net"),
+                Ty::Con("Option".into(), vec![Ty::str()])));
+
+            // set :: ConnRedis, Str, Str -> [net] Unit
+            fields.insert("set".into(), Ty::function(
+                vec![conn_t(), Ty::str(), Ty::str()],
+                EffectSet::singleton("net"),
+                Ty::Unit));
+
+            // set_ex :: ConnRedis, Str, Str, Int -> [net] Unit
+            fields.insert("set_ex".into(), Ty::function(
+                vec![conn_t(), Ty::str(), Ty::str(), Ty::int()],
+                EffectSet::singleton("net"),
+                Ty::Unit));
+
+            // del :: ConnRedis, Str -> [net] Unit
+            fields.insert("del".into(), Ty::function(
+                vec![conn_t(), Ty::str()],
+                EffectSet::singleton("net"),
+                Ty::Unit));
+
+            // exists :: ConnRedis, Str -> [net] Bool
+            fields.insert("exists".into(), Ty::function(
+                vec![conn_t(), Ty::str()],
+                EffectSet::singleton("net"),
+                Ty::bool()));
+
+            // expire :: ConnRedis, Str, Int -> [net] Unit
+            fields.insert("expire".into(), Ty::function(
+                vec![conn_t(), Ty::str(), Ty::int()],
+                EffectSet::singleton("net"),
+                Ty::Unit));
+
+            // ---- Pub/Sub -------------------------------------------------
+
+            // publish :: ConnRedis, Str, Str -> [net] Int
+            // Returns the number of subscribers that received the message.
+            fields.insert("publish".into(), Ty::function(
+                vec![conn_t(), Ty::str(), Ty::str()],
+                EffectSet::singleton("net"),
+                Ty::int()));
+
+            // subscribe :: ConnRedis, Str, (Str, Str) -> Unit -> [net] Nil
+            // Blocking loop; handler receives (channel, message) on each message.
+            // Uses a dedicated connection — Redis disallows non-Pub/Sub commands
+            // on a subscribed connection.
+            let handler2 = Ty::function(
+                vec![Ty::str(), Ty::str()],
+                EffectSet::empty(),
+                Ty::Unit);
+            fields.insert("subscribe".into(), Ty::function(
+                vec![conn_t(), Ty::str(), handler2],
+                EffectSet::singleton("net"),
+                Ty::Unit));  // Nil = Unit
+
+            // psubscribe :: ConnRedis, Str, (Str, Str, Str) -> Unit -> [net] Nil
+            // Pattern-subscribe; handler receives (pattern, channel, message).
+            let handler3 = Ty::function(
+                vec![Ty::str(), Ty::str(), Ty::str()],
+                EffectSet::empty(),
+                Ty::Unit);
+            fields.insert("psubscribe".into(), Ty::function(
+                vec![conn_t(), Ty::str(), handler3],
+                EffectSet::singleton("net"),
+                Ty::Unit));  // Nil = Unit
+
+            // ---- List ----------------------------------------------------
+
+            // lpush :: ConnRedis, Str, Str -> [net] Int
+            fields.insert("lpush".into(), Ty::function(
+                vec![conn_t(), Ty::str(), Ty::str()],
+                EffectSet::singleton("net"),
+                Ty::int()));
+
+            // rpush :: ConnRedis, Str, Str -> [net] Int
+            fields.insert("rpush".into(), Ty::function(
+                vec![conn_t(), Ty::str(), Ty::str()],
+                EffectSet::singleton("net"),
+                Ty::int()));
+
+            // brpop :: ConnRedis, Str, Int -> [net] Option[Str]
+            // Blocking right-pop; returns None on timeout. timeout=0 blocks
+            // indefinitely (the runtime does not treat this as a hung effect).
+            fields.insert("brpop".into(), Ty::function(
+                vec![conn_t(), Ty::str(), Ty::int()],
+                EffectSet::singleton("net"),
+                Ty::Con("Option".into(), vec![Ty::str()])));
+
+            // llen :: ConnRedis, Str -> [net] Int
+            fields.insert("llen".into(), Ty::function(
+                vec![conn_t(), Ty::str()],
+                EffectSet::singleton("net"),
+                Ty::int()));
+
+            // ---- Hash ----------------------------------------------------
+
+            // hset :: ConnRedis, Str, Str, Str -> [net] Unit
+            fields.insert("hset".into(), Ty::function(
+                vec![conn_t(), Ty::str(), Ty::str(), Ty::str()],
+                EffectSet::singleton("net"),
+                Ty::Unit));
+
+            // hget :: ConnRedis, Str, Str -> [net] Option[Str]
+            fields.insert("hget".into(), Ty::function(
+                vec![conn_t(), Ty::str(), Ty::str()],
+                EffectSet::singleton("net"),
+                Ty::Con("Option".into(), vec![Ty::str()])));
+
+            // hdel :: ConnRedis, Str, Str -> [net] Unit
+            fields.insert("hdel".into(), Ty::function(
+                vec![conn_t(), Ty::str(), Ty::str()],
+                EffectSet::singleton("net"),
+                Ty::Unit));
+
+            // hgetall :: ConnRedis, Str -> [net] List[(Str, Str)]
+            fields.insert("hgetall".into(), Ty::function(
+                vec![conn_t(), Ty::str()],
+                EffectSet::singleton("net"),
+                Ty::List(Box::new(Ty::Tuple(vec![Ty::str(), Ty::str()])))));
+
+            Some(Ty::Record(fields))
+        }
         "parser" => {
             // #217: structured parser combinators. Parser values are
             // tagged Records at runtime (`{ kind, ... }`), opaque at
@@ -2787,6 +2940,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "conc" => "conc",
         "arrow" => "arrow",
         "df" => "df",
+        "redis" => "redis",
         _ => return None,
     })
 }
