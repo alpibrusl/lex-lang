@@ -29,7 +29,7 @@ fn run(src: &str, func: &str, args: Vec<Value>, policy: Policy) -> Result<Value,
     vm.call(func, args).map_err(|e| format!("{e}"))
 }
 
-fn unwrap_record(v: &Value) -> &indexmap::IndexMap<String, Value> {
+fn unwrap_record(v: &Value) -> &indexmap::IndexMap<smol_str::SmolStr, Value> {
     match v {
         Value::Record { fields: r, .. } => r,
         other => panic!("expected Record, got {other:?}"),
