@@ -3578,7 +3578,7 @@ fn collect_response_headers(
 /// Pull the standard `HttpRequest` shape out of a `Value::Record`
 /// and dispatch through `http_send_full`. The handler verifies
 /// `--allow-net-host` for the URL before sending.
-fn http_send_record(handler: &DefaultHandler, req: &indexmap::IndexMap<String, Value>) -> Value {
+fn http_send_record(handler: &DefaultHandler, req: &indexmap::IndexMap<smol_str::SmolStr, Value>) -> Value {
     let method = match req.get("method") {
         Some(Value::Str(s)) => s.to_string(),
         _ => return http_decode_err("HttpRequest.method must be Str".into()),
@@ -3618,7 +3618,7 @@ fn http_send_record(handler: &DefaultHandler, req: &indexmap::IndexMap<String, V
     http_send_full(&method, &url, body, "", &headers, timeout_ms)
 }
 
-fn expect_record(v: Option<&Value>) -> Result<&indexmap::IndexMap<String, Value>, String> {
+fn expect_record(v: Option<&Value>) -> Result<&indexmap::IndexMap<smol_str::SmolStr, Value>, String> {
     match v {
         Some(Value::Record { fields: r, .. }) => Ok(r),
         Some(other) => Err(format!("expected Record, got {other:?}")),

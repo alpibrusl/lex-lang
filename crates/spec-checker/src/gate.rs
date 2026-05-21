@@ -270,8 +270,8 @@ fn eval_body(
             // wants to know about, not silently default.
             let v = eval_body(value, bindings, bc, policy, new_tracer)?;
             match v {
-                Value::Record { fields, .. } => fields.get(field).cloned().ok_or_else(|| {
-                    let known: Vec<&str> = fields.keys().map(String::as_str).collect();
+                Value::Record { fields, .. } => fields.get(field.as_str()).cloned().ok_or_else(|| {
+                    let known: Vec<&str> = fields.keys().map(|k| k.as_str()).collect();
                     format!("field `{field}` missing on record (have: {})", known.join(", "))
                 }),
                 other => Err(format!(

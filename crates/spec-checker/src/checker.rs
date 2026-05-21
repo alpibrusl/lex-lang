@@ -268,8 +268,8 @@ fn eval(
             // also hold for randomly-sampled records of the same shape.
             let v = eval(value, bindings, bc, policy)?;
             match v {
-                Value::Record { fields, .. } => fields.get(field).cloned().ok_or_else(|| {
-                    let known: Vec<&str> = fields.keys().map(String::as_str).collect();
+                Value::Record { fields, .. } => fields.get(field.as_str()).cloned().ok_or_else(|| {
+                    let known: Vec<&str> = fields.keys().map(|k| k.as_str()).collect();
                     format!("field `{field}` missing on record (have: {})", known.join(", "))
                 }),
                 other => Err(format!("field access `.{field}` on non-record: {other:?}")),

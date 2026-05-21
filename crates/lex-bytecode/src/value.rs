@@ -110,7 +110,7 @@ pub enum Value {
     /// `PartialEq` below): two records with identical fields must
     /// compare equal regardless of provenance, so a JSON-decoded
     /// record equals a compile-time-built one with the same fields.
-    Record { shape_id: u32, fields: Box<IndexMap<String, Value>> },
+    Record { shape_id: u32, fields: Box<IndexMap<SmolStr, Value>> },
     /// Frame-local record (#464 step 2). Emitted by
     /// `Op::AllocStackRecord` at sites the escape analysis proved
     /// can't outlive the current call frame. `slab_start` indexes
@@ -335,7 +335,7 @@ impl Value {
             Value::Tuple(items) => J::Array(items.iter().map(Value::to_json).collect()),
             Value::Record { fields, .. } => {
                 let mut m = serde_json::Map::new();
-                for (k, v) in fields.iter() { m.insert(k.clone(), v.to_json()); }
+                for (k, v) in fields.iter() { m.insert(k.to_string(), v.to_json()); }
                 J::Object(m)
             }
             // #464: should never reach JSON serialization. See PartialEq.
@@ -483,7 +483,24 @@ impl Value {
     /// measurement found at exactly zero occurrences) would still
     /// be correct under the IC's shape-keyed verifier — they'd just
     /// churn the cache.
+    /// Build a `Record` from a String-keyed host map (JSON decode, SQL
+    /// rows, builtins). Keys are re-collected into interned `SmolStr`
+    /// (#461 field-name interning). The hot bytecode `MakeRecord` path
+    /// builds `SmolStr`-keyed maps directly and never routes through
+    /// here; callers that already hold an interned map use
+    /// `record_interned`.
     pub fn record_dynamic(fields: IndexMap<String, Value>) -> Value {
+        let shape_id = crate::shape_registry::intern(fields.keys());
+        let fields: IndexMap<SmolStr, Value> =
+            fields.into_iter().map(|(k, v)| (SmolStr::from(k), v)).collect();
+        Value::Record { shape_id, fields: Box::new(fields) }
+    }
+
+    /// Build a `Record` from an already-interned `SmolStr`-keyed map —
+    /// used by the http builder chain, which threads `SmolStr` keys
+    /// through `with_header`/`with_query`/… without round-tripping back
+    /// to `String` (#461).
+    pub fn record_interned(fields: IndexMap<SmolStr, Value>) -> Value {
         let shape_id = crate::shape_registry::intern(fields.keys());
         Value::Record { shape_id, fields: Box::new(fields) }
     }

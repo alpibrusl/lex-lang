@@ -1495,14 +1495,14 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let req = expect_record_pure(args.first())?.clone();
             let k = expect_str(args.get(1))?;
             let v = expect_str(args.get(2))?;
-            Ok(Value::record_dynamic(http_set_header(req, &k, &v)))
+            Ok(Value::record_interned(http_set_header(req, &k, &v)))
         }
         ("http", "with_auth") => {
             let req = expect_record_pure(args.first())?.clone();
             let scheme = expect_str(args.get(1))?;
             let token = expect_str(args.get(2))?;
             let value = format!("{scheme} {token}");
-            Ok(Value::record_dynamic(http_set_header(req, "Authorization", &value)))
+            Ok(Value::record_interned(http_set_header(req, "Authorization", &value)))
         }
         ("http", "with_query") => {
             let req = expect_record_pure(args.first())?.clone();
@@ -1512,7 +1512,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                     "http.with_query: params must be Map[Str, Str], got {other:?}")),
                 None => return Err("http.with_query: missing params argument".into()),
             };
-            Ok(Value::record_dynamic(http_append_query(req, &params)))
+            Ok(Value::record_interned(http_append_query(req, &params)))
         }
         ("http", "with_timeout_ms") => {
             let req = expect_record_pure(args.first())?.clone();
@@ -1522,7 +1522,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                 name: "Some".into(),
                 args: vec![Value::Int(ms)],
             });
-            Ok(Value::record_dynamic(out))
+            Ok(Value::record_interned(out))
         }
         ("http", "json_body") => {
             let resp = expect_record_pure(args.first())?;
@@ -1872,7 +1872,7 @@ fn rng_decode(v: Option<&Value>) -> Result<u64, String> {
 
 // -- helpers for `std.http` builders / decoders --
 
-fn expect_record_pure(v: Option<&Value>) -> Result<&indexmap::IndexMap<String, Value>, String> {
+fn expect_record_pure(v: Option<&Value>) -> Result<&indexmap::IndexMap<smol_str::SmolStr, Value>, String> {
     match v {
         Some(Value::Record { fields: r, .. }) => Ok(r),
         Some(other) => Err(format!("expected Record, got {other:?}")),
@@ -1893,10 +1893,10 @@ fn http_decode_err_pure(msg: String) -> Value {
 /// case-insensitivity; an existing entry under any casing is
 /// overwritten by the new value.
 fn http_set_header(
-    mut req: indexmap::IndexMap<String, Value>,
+    mut req: indexmap::IndexMap<smol_str::SmolStr, Value>,
     name: &str,
     value: &str,
-) -> indexmap::IndexMap<String, Value> {
+) -> indexmap::IndexMap<smol_str::SmolStr, Value> {
     use lex_bytecode::MapKey;
     let mut headers = match req.shift_remove("headers") {
         Some(Value::Map(m)) => m,
@@ -1921,9 +1921,9 @@ fn http_set_header(
 /// order (`BTreeMap` → sorted by key) so the produced URL is
 /// deterministic.
 fn http_append_query(
-    mut req: indexmap::IndexMap<String, Value>,
+    mut req: indexmap::IndexMap<smol_str::SmolStr, Value>,
     params: &std::collections::BTreeMap<lex_bytecode::MapKey, Value>,
-) -> indexmap::IndexMap<String, Value> {
+) -> indexmap::IndexMap<smol_str::SmolStr, Value> {
     use lex_bytecode::MapKey;
     let url = match req.get("url") {
         Some(Value::Str(s)) => s.clone(),
@@ -2343,9 +2343,9 @@ fn resolve_tz_to_components(n: i64, tz: &TzArg) -> Result<Value, String> {
 }
 
 
-fn instant_from_components(rec: &indexmap::IndexMap<String, Value>) -> Result<i64, String> {
+fn instant_from_components(rec: &indexmap::IndexMap<smol_str::SmolStr, Value>) -> Result<i64, String> {
     use chrono::TimeZone;
-    fn get_int(rec: &indexmap::IndexMap<String, Value>, k: &str) -> Result<i64, String> {
+    fn get_int(rec: &indexmap::IndexMap<smol_str::SmolStr, Value>, k: &str) -> Result<i64, String> {
         match rec.get(k) {
             Some(Value::Int(n)) => Ok(*n),
             other => Err(format!("from_components: missing or non-int field `{k}`: {other:?}")),

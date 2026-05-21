@@ -5,6 +5,7 @@ use crate::program::*;
 use crate::value::{ActorCell, Value};
 use std::sync::{Arc, Mutex, OnceLock};
 use indexmap::IndexMap;
+use smol_str::SmolStr;
 use std::collections::{HashMap, VecDeque};
 
 // ── IC polymorphism instrumentation (throwaway, env-gated) ─────────
@@ -873,7 +874,7 @@ impl<'a> Vm<'a> {
                 args: vec![value],
             }),
             Err((pos, msg)) => {
-                let mut e = indexmap::IndexMap::new();
+                let mut e: IndexMap<String, Value> = IndexMap::new();
                 e.insert("pos".into(), Value::Int(pos as i64));
                 e.insert("message".into(), Value::Str(msg.into()));
                 Ok(Value::Variant {
@@ -1204,10 +1205,10 @@ impl<'a> Vm<'a> {
                     for i in (0..n).rev() {
                         values[i] = self.pop()?;
                     }
-                    let mut rec = IndexMap::new();
+                    let mut rec: IndexMap<SmolStr, Value> = IndexMap::with_capacity(n);
                     for (i, val) in values.into_iter().enumerate() {
-                        let name = match &self.program.constants[shape[i] as usize] {
-                            Const::FieldName(s) => s.clone(),
+                        let name: SmolStr = match &self.program.constants[shape[i] as usize] {
+                            Const::FieldName(s) => s.as_str().into(),
                             _ => return Err(VmError::TypeMismatch("expected FieldName const".into())),
                         };
                         rec.insert(name, val);
@@ -1243,10 +1244,10 @@ impl<'a> Vm<'a> {
                         for i in (0..n).rev() {
                             values[i] = self.pop()?;
                         }
-                        let mut rec = IndexMap::new();
+                        let mut rec: IndexMap<SmolStr, Value> = IndexMap::with_capacity(n);
                         for (i, val) in values.into_iter().enumerate() {
-                            let name = match &self.program.constants[shape[i] as usize] {
-                                Const::FieldName(s) => s.clone(),
+                            let name: SmolStr = match &self.program.constants[shape[i] as usize] {
+                                Const::FieldName(s) => s.as_str().into(),
                                 _ => return Err(VmError::TypeMismatch("expected FieldName const".into())),
                             };
                             rec.insert(name, val);
@@ -2394,8 +2395,8 @@ mod memo_hash_tests {
     use indexmap::IndexMap;
 
     fn rec(pairs: &[(&str, Value)]) -> Value {
-        let mut m = IndexMap::new();
-        for (k, v) in pairs { m.insert((*k).to_string(), v.clone()); }
+        let mut m: IndexMap<SmolStr, Value> = IndexMap::new();
+        for (k, v) in pairs { m.insert((*k).into(), v.clone()); }
         Value::Record { shape_id: crate::value::NO_SHAPE_ID, fields: Box::new(m) }
     }
 
@@ -2450,8 +2451,8 @@ mod memo_hash_tests {
     #[test]
     fn shape_id_does_not_affect_record_key() {
         // PartialEq ignores shape_id; the key must too.
-        let mut m = IndexMap::new();
-        m.insert("a".to_string(), Value::Int(1));
+        let mut m: IndexMap<SmolStr, Value> = IndexMap::new();
+        m.insert("a".into(), Value::Int(1));
         let r_no_shape = Value::Record { shape_id: crate::value::NO_SHAPE_ID, fields: Box::new(m.clone()) };
         let r_shaped = Value::Record { shape_id: 3, fields: Box::new(m) };
         assert_eq!(r_no_shape, r_shaped);
