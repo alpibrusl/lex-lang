@@ -316,6 +316,11 @@ impl TypeEnv {
             e.ctor_to_type.insert((*ctor).into(), "ConcError".into());
         }
 
+        // ConnRedis: opaque handle for std.redis connections (#533).
+        // Backed at runtime by an Int into a process-wide registry,
+        // same pattern as Db (std.sql) and Kv (std.kv).
+        e.types.insert("ConnRedis".into(), TypeDef { params: vec![], kind: TypeDefKind::Opaque });
+
         e
     }
 
