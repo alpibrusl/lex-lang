@@ -51,6 +51,7 @@ fn unwrap_err_str(v: Value) -> String {
 
 const TYPE_CHECK_SRC: &str = r#"
 import "std.redis" as redis
+import "std.io" as io
 
 fn check_connect(url :: Str) -> [net] Result[ConnRedis, Str] {
   redis.connect(url)
@@ -118,6 +119,20 @@ fn check_hdel(conn :: ConnRedis, key :: Str, field :: Str) -> [net] Unit {
 
 fn check_hgetall(conn :: ConnRedis, key :: Str) -> [net] List[(Str, Str)] {
   redis.hgetall(conn, key)
+}
+
+# subscribe handler carries an open effect row: io.print must type-check here.
+fn check_subscribe(conn :: ConnRedis, ch :: Str) -> [net] Unit {
+  redis.subscribe(conn, ch, fn(channel :: Str, msg :: Str) -> [io] Unit {
+    io.print(msg)
+  })
+}
+
+# psubscribe handler carries an open effect row: io.print must type-check here.
+fn check_psubscribe(conn :: ConnRedis, pat :: Str) -> [net] Unit {
+  redis.psubscribe(conn, pat, fn(pattern :: Str, channel :: Str, msg :: Str) -> [io] Unit {
+    io.print(msg)
+  })
 }
 "#;
 
