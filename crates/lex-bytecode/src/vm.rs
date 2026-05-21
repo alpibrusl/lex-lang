@@ -101,6 +101,33 @@ pub const MAX_CALL_DEPTH: u32 = 1024;
 /// records) fits well inside this without growing.
 pub const STACK_RECORD_BUDGET_SLOTS: u32 = 64;
 
+/// Adaptive-memoization warmup window (#229 adaptive). A pure
+/// function is given this many cache-probing calls to demonstrate a
+/// hit; if it reaches the window with zero hits, memoization is
+/// disabled for it (its calls stop hashing args). A function that
+/// genuinely benefits — e.g. naive recursive `fib`, where each call
+/// immediately reuses sub-results — accumulates hits well before the
+/// window closes and stays enabled. 64 balances "give real reuse a
+/// chance" against "don't pay the hash forever on always-miss code".
+const MEMO_WARMUP_CALLS: u32 = 64;
+
+/// Per-function adaptive-memoization state (#229 adaptive). `enabled`
+/// starts true; once a function reaches `MEMO_WARMUP_CALLS` cache
+/// probes with `hits == 0`, it flips to false and that function's
+/// calls skip the args hash entirely for the rest of the Vm's life.
+#[derive(Clone, Copy)]
+struct MemoFnState {
+    calls: u32,
+    hits: u32,
+    enabled: bool,
+}
+
+impl Default for MemoFnState {
+    fn default() -> Self {
+        MemoFnState { calls: 0, hits: 0, enabled: true }
+    }
+}
+
 /// Host-side effect dispatch. Implementors decide what `kind`/`op` mean
 /// and how arguments map to side effects.
 pub trait EffectHandler {
@@ -237,6 +264,21 @@ pub struct Vm<'a> {
     /// Diagnostic counters for `--trace` observability (#229).
     pub pure_memo_hits: u64,
     pub pure_memo_misses: u64,
+    /// Number of effect-free calls that skipped the cache entirely
+    /// because adaptive memoization disabled their function (#229
+    /// adaptive). Observability only.
+    pub pure_memo_skips: u64,
+    /// Adaptive-memoization state, one entry per function (indexed by
+    /// `fn_id`), parallel to `field_ics` (#229 adaptive). Memoization
+    /// only pays when a function is called repeatedly with equal args;
+    /// the unconditional `hash_call_args` on every effect-free call is
+    /// pure overhead otherwise (the `response_build` profile: 0 hits /
+    /// 3600 misses, ~12% of instructions). After a warmup window with
+    /// zero hits we stop hashing that function's calls — always safe,
+    /// since the callee is pure and recomputing yields the same value.
+    /// Sticky for the Vm's lifetime: a function that hasn't hit in
+    /// `MEMO_WARMUP_CALLS` calls won't amortize later.
+    memo_fn_state: Vec<MemoFnState>,
     /// Monomorphic inline caches for `Op::GetField` (#462 slice 1 +
     /// shape-keyed verification slice). Indexed by
     /// `[fn_id as usize][site_idx as usize]` — one entry per
@@ -778,6 +820,8 @@ impl<'a> Vm<'a> {
             pure_memo: std::collections::HashMap::new(),
             pure_memo_hits: 0,
             pure_memo_misses: 0,
+            pure_memo_skips: 0,
+            memo_fn_state: vec![MemoFnState::default(); program.functions.len()],
             field_ics: vec![Vec::new(); program.functions.len()],
             // 256 slots handles ~32 frames × 8 locals; grows on demand and
             // retains capacity across consecutive vm.call() invocations.
@@ -1665,14 +1709,25 @@ impl<'a> Vm<'a> {
                     // On hit, push the cached value, emit synthetic
                     // enter+exit trace events (so the trace still shows
                     // the call), and skip the frame push entirely.
+                    //
+                    // Adaptive gate (#229 adaptive): only hash if this
+                    // function still has memoization enabled. A pure
+                    // function whose args never repeat pays the hash for
+                    // nothing; after a warmup window with zero hits we
+                    // disable it and its calls take the plain path below.
                     let f = &self.program.functions[fn_id as usize];
-                    let memo_key: Option<(u32, [u8; 16])> = if f.effects.is_empty() {
-                        Some((fn_id, hash_call_args(&args)))
-                    } else {
-                        None
-                    };
+                    let fid = fn_id as usize;
+                    let memo_key: Option<(u32, [u8; 16])> =
+                        if f.effects.is_empty() && self.memo_fn_state[fid].enabled {
+                            Some((fn_id, hash_call_args(&args)))
+                        } else {
+                            if f.effects.is_empty() { self.pure_memo_skips += 1; }
+                            None
+                        };
                     if let Some(key) = memo_key {
+                        self.memo_fn_state[fid].calls += 1;
                         if let Some(cached) = self.pure_memo.get(&key).cloned() {
+                            self.memo_fn_state[fid].hits += 1;
                             self.pure_memo_hits += 1;
                             self.tracer.enter_call(&node_id, &callee_name, &args);
                             self.tracer.exit_ok(&cached);
@@ -1680,6 +1735,13 @@ impl<'a> Vm<'a> {
                             continue;
                         }
                         self.pure_memo_misses += 1;
+                        // Disable on a cold function: warmup elapsed with
+                        // no hit. Always safe — the callee is pure, so the
+                        // plain path recomputes the identical result.
+                        let st = &mut self.memo_fn_state[fid];
+                        if st.calls >= MEMO_WARMUP_CALLS && st.hits == 0 {
+                            st.enabled = false;
+                        }
                     }
                     self.tracer.enter_call(&node_id, &callee_name, &args);
                     let locals_start = self.locals_storage.len();
