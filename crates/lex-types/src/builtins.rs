@@ -2305,24 +2305,26 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::singleton("net"),
                 Ty::int()));
 
-            // subscribe :: ConnRedis, Str, (Str, Str) -> Unit -> [net] Nil
+            // subscribe :: ConnRedis, Str, (Str, Str ->[E] Unit) -> [net] Nil
             // Blocking loop; handler receives (channel, message) on each message.
             // Uses a dedicated connection — Redis disallows non-Pub/Sub commands
-            // on a subscribed connection.
+            // on a subscribed connection. Handler carries an open effect row so
+            // callers can use io, net, sql, etc. inside the closure.
             let handler2 = Ty::function(
                 vec![Ty::str(), Ty::str()],
-                EffectSet::empty(),
+                EffectSet::open_var(0),
                 Ty::Unit);
             fields.insert("subscribe".into(), Ty::function(
                 vec![conn_t(), Ty::str(), handler2],
                 EffectSet::singleton("net"),
                 Ty::Unit));  // Nil = Unit
 
-            // psubscribe :: ConnRedis, Str, (Str, Str, Str) -> Unit -> [net] Nil
+            // psubscribe :: ConnRedis, Str, (Str, Str, Str ->[E] Unit) -> [net] Nil
             // Pattern-subscribe; handler receives (pattern, channel, message).
+            // Handler carries an open effect row (same rationale as subscribe).
             let handler3 = Ty::function(
                 vec![Ty::str(), Ty::str(), Ty::str()],
-                EffectSet::empty(),
+                EffectSet::open_var(1),
                 Ty::Unit);
             fields.insert("psubscribe".into(), Ty::function(
                 vec![conn_t(), Ty::str(), handler3],
