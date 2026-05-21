@@ -455,15 +455,17 @@ fn step(pc: usize, op: &Op, mut s: State) -> (State, Vec<usize>, HashSet<u32>) {
             s.stack.push(Slot::Other);
             return (s, vec![pc + 3], escapes);
         }
-        Op::LoadLocalGetFieldAdd { .. } => {
-            // #461 slice 7: net delta on the value stack is 0 (pops
-            // prior Int top, pushes Int sum). The receiver is read
+        Op::LoadLocalGetFieldAdd { .. }
+        | Op::LoadLocalGetFieldSub { .. }
+        | Op::LoadLocalGetFieldMul { .. } => {
+            // #461 slice 7/8: net delta on the value stack is 0 (pops
+            // prior Int top, pushes Int result). The receiver is read
             // from a local — the analysis tracks locals separately,
             // and reading a local doesn't escape its Rec slot (the
             // round-trip-through-local rule from StoreLocal applies
             // here too: the value stays referenced). We pop the
             // existing top (the accumulator) and push a fresh Other
-            // (the sum). Skip past the two tombstones.
+            // (the result). Skip past the two tombstones.
             s.stack.pop();
             s.stack.push(Slot::Other);
             return (s, vec![pc + 3], escapes);

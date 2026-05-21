@@ -660,14 +660,17 @@ fn apply_peephole_slice6(code: &mut [Op]) {
     }
 }
 
-/// Slice 7: fuse `[LoadLocal(local_idx), GetField{name_idx, site_idx},
-/// IntAdd]` into `LoadLocalGetFieldAdd { local_idx, name_idx, site_idx }`.
+/// Slice 7/8: fuse `[LoadLocal(local_idx), GetField{name_idx,
+/// site_idx}, IntAdd|IntSub|IntMul]` into the matching
+/// `LoadLocalGetField{Add,Sub,Mul} { local_idx, name_idx, site_idx }`.
 ///
-/// Fires on the `acc + r.field` accumulator-with-field-read idiom —
-/// the bytecode the compiler emits for `prev_expr + record.field`
+/// Fires on the `acc OP r.field` accumulator-with-field-read idiom —
+/// the bytecode the compiler emits for `prev_expr OP record.field`
 /// once `prev_expr` is on the stack. Common in handler-shaped code
-/// like `r.x + r.y + r.z` (the LHS of each `+` after the first
-/// matches this pattern) and `acc + items[i].weight` reductions.
+/// like `r.x + r.y + r.z` (the LHS of each operator after the first
+/// matches this pattern), `acc + items[i].weight` reductions, and
+/// the `v.l - v.m` / `v.h * v.k` mixes the `response_build` profile
+/// exercises.
 ///
 /// Disjoint from every prior slice: slice 1 wants `PushConst` at
 /// slot 1; slices 3-4 want `LoadLocal` at slot 1; slice 5 wants
@@ -680,8 +683,8 @@ fn apply_peephole_slice6(code: &mut [Op]) {
 /// must run before / independent of slice 5/6, which don't match
 /// any slot in this window.
 ///
-/// Safety: trailing two slots (the original `GetField` and
-/// `IntAdd`) must not be jump targets. The first slot can be.
+/// Safety: trailing two slots (the original `GetField` and the
+/// arithmetic op) must not be jump targets. The first slot can be.
 fn apply_peephole_slice7(code: &mut [Op]) {
     if code.len() < 3 { return; }
     let jump_targets = collect_jump_targets(code);
@@ -689,17 +692,23 @@ fn apply_peephole_slice7(code: &mut [Op]) {
     let n = code.len();
     let mut k = 0;
     while k + 2 < n {
-        if let (
-            Op::LoadLocal(local_idx),
-            Op::GetField { name_idx, site_idx },
-            Op::IntAdd,
-        ) = (code[k], code[k + 1], code[k + 2]) {
-            let safe = !jump_targets.contains(&(k + 1))
-                && !jump_targets.contains(&(k + 2));
-            if safe {
-                code[k] = Op::LoadLocalGetFieldAdd { local_idx, name_idx, site_idx };
-                k += 3;
-                continue;
+        if let (Op::LoadLocal(local_idx), Op::GetField { name_idx, site_idx })
+            = (code[k], code[k + 1])
+        {
+            let fused = match code[k + 2] {
+                Op::IntAdd => Some(Op::LoadLocalGetFieldAdd { local_idx, name_idx, site_idx }),
+                Op::IntSub => Some(Op::LoadLocalGetFieldSub { local_idx, name_idx, site_idx }),
+                Op::IntMul => Some(Op::LoadLocalGetFieldMul { local_idx, name_idx, site_idx }),
+                _ => None,
+            };
+            if let Some(op) = fused {
+                let safe = !jump_targets.contains(&(k + 1))
+                    && !jump_targets.contains(&(k + 2));
+                if safe {
+                    code[k] = op;
+                    k += 3;
+                    continue;
+                }
             }
         }
         k += 1;

@@ -281,4 +281,16 @@ pub enum Op {
     /// (standard tombstone rule). The first slot may be a target —
     /// the fused op there is live.
     LoadLocalGetFieldAdd { local_idx: u16, name_idx: u32, site_idx: u32 },
+    /// Slice 8 of #461: `IntSub` / `IntMul` siblings of slice 7's
+    /// `LoadLocalGetFieldAdd`. Fuse `LoadLocal + GetField + IntSub`
+    /// and `LoadLocal + GetField + IntMul` respectively — the
+    /// `acc - r.field` and `acc * r.field` idioms. Same tombstone,
+    /// jump-safety, body-hash (decode to `LoadLocal(local_idx)`),
+    /// and verifier (+1 delta) story as slice 7.
+    ///
+    /// `IntSub` is not commutative: the unfused sequence leaves the
+    /// field value on top, so `IntSub`'s deeper-minus-top semantics
+    /// give `acc - field`. The fused dispatch preserves that order.
+    LoadLocalGetFieldSub { local_idx: u16, name_idx: u32, site_idx: u32 },
+    LoadLocalGetFieldMul { local_idx: u16, name_idx: u32, site_idx: u32 },
 }

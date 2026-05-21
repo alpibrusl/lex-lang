@@ -458,3 +458,102 @@ fn record_field_access() {
     assert_eq!(r, Value::Int(11));
 }
 
+
+#[test]
+fn slice8_fuses_field_sub_and_computes_left_to_right() {
+    // #461 slice 8: `acc - r.field` fuses to LoadLocalGetFieldSub.
+    // The non-commutativity matters: `r.a - r.b - r.c` must be
+    // (a - b) - c, not a - (b - c). With a=10, b=3, c=2 the correct
+    // left-associated answer is 5.
+    use lex_bytecode::op::Op;
+    let src = "
+type R = { a :: Int, b :: Int, c :: Int }
+fn diff(r :: R) -> Int { r.a - r.b - r.c }
+";
+    let p = compile(src);
+    let n = p.functions[0].code.iter()
+        .filter(|op| matches!(op, Op::LoadLocalGetFieldSub { .. })).count();
+    assert!(n >= 2, "expected ≥2 slice-8 sub fusions, got {n}: {:?}",
+        p.functions[0].code);
+
+    let mut vm = Vm::new(&p);
+    let r = vm.call("diff", vec![Value::record_dynamic({
+        let mut m = IndexMap::new();
+        m.insert("a".into(), Value::Int(10));
+        m.insert("b".into(), Value::Int(3));
+        m.insert("c".into(), Value::Int(2));
+        m
+    })]).unwrap();
+    assert_eq!(r, Value::Int(5));
+}
+
+#[test]
+fn slice8_fuses_field_mul() {
+    use lex_bytecode::op::Op;
+    let src = "
+type R = { a :: Int, b :: Int, c :: Int }
+fn prod(r :: R) -> Int { r.a * r.b * r.c }
+";
+    let p = compile(src);
+    let n = p.functions[0].code.iter()
+        .filter(|op| matches!(op, Op::LoadLocalGetFieldMul { .. })).count();
+    assert!(n >= 2, "expected ≥2 slice-8 mul fusions, got {n}: {:?}",
+        p.functions[0].code);
+
+    let mut vm = Vm::new(&p);
+    let r = vm.call("prod", vec![Value::record_dynamic({
+        let mut m = IndexMap::new();
+        m.insert("a".into(), Value::Int(2));
+        m.insert("b".into(), Value::Int(3));
+        m.insert("c".into(), Value::Int(5));
+        m
+    })]).unwrap();
+    assert_eq!(r, Value::Int(30));
+}
+
+#[test]
+fn slice8_mixed_arith_chain() {
+    // A chain mixing +, -, * over fields — exercises all three
+    // slice-7/8 fused ops in one function and checks the combined
+    // result. ((a + b) - c) gives 11+0... compute: a=4,b=6,c=3:
+    // 4 + 6 = 10; 10 - 3 = 7; 7 * 2(=d) = 14.
+    let src = "
+type R = { a :: Int, b :: Int, c :: Int, d :: Int }
+fn mix(r :: R) -> Int { r.a + r.b - r.c * r.d }
+";
+    // Note: Lex precedence — `*` binds tighter, so this is
+    // r.a + r.b - (r.c * r.d). With a=4,b=6,c=3,d=2: 4+6-(6)=4.
+    let p = compile(src);
+    let mut vm = Vm::new(&p);
+    let r = vm.call("mix", vec![Value::record_dynamic({
+        let mut m = IndexMap::new();
+        m.insert("a".into(), Value::Int(4));
+        m.insert("b".into(), Value::Int(6));
+        m.insert("c".into(), Value::Int(3));
+        m.insert("d".into(), Value::Int(2));
+        m
+    })]).unwrap();
+    assert_eq!(r, Value::Int(4));
+}
+
+#[test]
+fn slice8_sub_does_not_fire_across_a_jump_target() {
+    // Jump-safety: same story as slice 3/4/7. A match-arm body whose
+    // entry straddles the candidate triple must skip fusion.
+    let src = "
+type R = { v :: Int }
+fn pick(flag :: Int, r :: R) -> Int {
+  match flag {
+    0 => 100 - r.v,
+    _ => r.v,
+  }
+}
+";
+    let p = compile(src);
+    let mut vm = Vm::new(&p);
+    let mk = || Value::record_dynamic({
+        let mut m = IndexMap::new(); m.insert("v".into(), Value::Int(7)); m
+    });
+    assert_eq!(vm.call("pick", vec![Value::Int(0), mk()]).unwrap(), Value::Int(93));
+    assert_eq!(vm.call("pick", vec![Value::Int(1), mk()]).unwrap(), Value::Int(7));
+}
