@@ -34,13 +34,6 @@ fn redis_url() -> Option<String> {
     std::env::var("REDIS_TEST_URL").ok()
 }
 
-fn unwrap_ok(v: Value) -> Value {
-    match v {
-        Value::Variant { name, args } if name == "Ok" => args.into_iter().next().expect("Ok payload"),
-        other => panic!("expected Ok, got {other:?}"),
-    }
-}
-
 fn unwrap_err_str(v: Value) -> String {
     match v {
         Value::Variant { name, args } if name == "Err" => match args.into_iter().next() {
