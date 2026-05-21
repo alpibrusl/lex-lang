@@ -56,7 +56,7 @@ fn main() {
     let p = Arc::new(compile_program(&stages));
 
     let mut acc = 0i64;
-    let (mut hits, mut misses) = (0u64, 0u64);
+    let (mut hits, mut misses, mut skips) = (0u64, 0u64, 0u64);
     for _ in 0..iters {
         let mut vm = Vm::new(&p);
         vm.set_step_limit(u64::MAX);
@@ -65,8 +65,9 @@ fn main() {
         }
         hits += vm.pure_memo_hits;
         misses += vm.pure_memo_misses;
+        skips += vm.pure_memo_skips;
     }
-    eprintln!("pure_memo: hits={hits} misses={misses}");
+    eprintln!("pure_memo: hits={hits} misses={misses} skips={skips}");
     // Keep the result observable so the optimizer can't elide the loop.
     std::process::exit((acc & 0x7f) as i32);
 }
