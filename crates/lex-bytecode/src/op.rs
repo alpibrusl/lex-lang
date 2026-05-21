@@ -293,4 +293,28 @@ pub enum Op {
     /// give `acc - field`. The fused dispatch preserves that order.
     LoadLocalGetFieldSub { local_idx: u16, name_idx: u32, site_idx: u32 },
     LoadLocalGetFieldMul { local_idx: u16, name_idx: u32, site_idx: u32 },
+    /// Slice 9 of #461: fuse `LoadLocal(local_idx) + GetField{name_idx,
+    /// site_idx}` — the bare `record.field` read, the single most
+    /// common field-access shape. Unlike slices 7/8 there's no
+    /// arithmetic terminator; this is a 2-op window.
+    ///
+    /// The win is allocation, not just dispatch: the unfused pair
+    /// `LoadLocal` clones the entire record onto the value stack
+    /// (a `Box<IndexMap>` for a heap record), `GetField` pops it,
+    /// reads one field, and drops the rest. The fused op reads the
+    /// field out of the local by reference (`read_local_record_field`)
+    /// and clones only that one value. On the `response_build`
+    /// profile the whole-record clone+drop of the returned `Response`
+    /// (`r.total`) was the dominant malloc source.
+    ///
+    /// Stack delta: +1 (LoadLocal +1, GetField 0). The trailing
+    /// `GetField` stays as a single inert tombstone (delta 0); the
+    /// verifier walks it, leaving depth at pc+2 matching the unfused
+    /// `[LoadLocal, GetField]` pair. `body_hash` decodes to a
+    /// standalone `LoadLocal(local_idx)`; the trailing `GetField`
+    /// hashes normally.
+    ///
+    /// Safety: the trailing slot (the original `GetField`) must not
+    /// be a jump target. The first slot may be.
+    LoadLocalGetField { local_idx: u16, name_idx: u32, site_idx: u32 },
 }

@@ -177,7 +177,8 @@ pub fn compute_body_hash(
             | Op::LoadLocalStoreEqIntConstJumpIfNot { src: local_idx, .. }
             | Op::LoadLocalGetFieldAdd { local_idx, .. }
             | Op::LoadLocalGetFieldSub { local_idx, .. }
-            | Op::LoadLocalGetFieldMul { local_idx, .. } => {
+            | Op::LoadLocalGetFieldMul { local_idx, .. }
+            | Op::LoadLocalGetField { local_idx, .. } => {
                 // Slice 1: this slot was `LoadLocal(local_idx)`.
                 // Slice 2: this slot was *also* `LoadLocal(src)`
                 // — the fused op now owns 4 slots, but the very

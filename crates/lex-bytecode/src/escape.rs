@@ -455,6 +455,18 @@ fn step(pc: usize, op: &Op, mut s: State) -> (State, Vec<usize>, HashSet<u32>) {
             s.stack.push(Slot::Other);
             return (s, vec![pc + 3], escapes);
         }
+        Op::LoadLocalGetField { .. } => {
+            // #461 slice 9: equivalent to LoadLocal + GetField —
+            // reads a field out of a local record (which does NOT
+            // escape the receiver, matching plain GetField) and
+            // pushes the field value (Other). Net delta +1; skip the
+            // single tombstone (pc+2). (Escape analysis runs before
+            // peephole, so this arm is exercised only if the analysis
+            // is ever re-run on fused code; it's here for exhaustive
+            // matching and forward-correctness.)
+            s.stack.push(Slot::Other);
+            return (s, vec![pc + 2], escapes);
+        }
         Op::LoadLocalGetFieldAdd { .. }
         | Op::LoadLocalGetFieldSub { .. }
         | Op::LoadLocalGetFieldMul { .. } => {
