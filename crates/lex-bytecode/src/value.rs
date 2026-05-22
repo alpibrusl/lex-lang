@@ -133,6 +133,22 @@ pub enum Value {
     /// bytes payload + tag, comfortably inside the 64B `Value`
     /// envelope.
     StackRecord { shape_id: u32, slab_start: u32, field_count: u16 },
+    /// Frame-local tuple (#464 tuple codegen). The stack-alloc
+    /// analogue of `Value::Tuple`, emitted by `Op::AllocStackTuple` at
+    /// sites the escape analysis proved can't outlive the current
+    /// frame. `slab_start` indexes into `Vm::stack_record_arena` (the
+    /// arena is shared with `StackRecord` — both are flat `Value`
+    /// slabs released together on `Op::Return`); the `arity`
+    /// consecutive values starting there are the tuple elements in
+    /// positional order.
+    ///
+    /// Like `StackRecord`, the only consumer that knows how to read
+    /// these is `Op::GetElem` — every other observation point
+    /// (`Return`, `Call`, a `MakeTuple`/`MakeRecord` field value,
+    /// equality, JSON) is an escape op the analysis prevents this
+    /// variant from reaching. An unexpected arrival surfaces as a
+    /// panic at the boundary, not UB (the arena is safe `Vec<Value>`).
+    StackTuple { slab_start: u32, arity: u16 },
     Variant { name: String, args: Vec<Value> },
     /// First-class function value (a lambda + its captured locals). The
     /// function's first `captures.len()` params bind to `captures`; the
@@ -223,6 +239,10 @@ impl PartialEq for Value {
             // get its own opcode with arena-aware comparison.
             (StackRecord { .. }, _) | (_, StackRecord { .. }) =>
                 panic!("BUG(#464): Value::StackRecord reached generic equality \
+                        — escape analysis should have flagged its allocation site"),
+            // Same soundness contract as StackRecord above.
+            (StackTuple { .. }, _) | (_, StackTuple { .. }) =>
+                panic!("BUG(#464): Value::StackTuple reached generic equality \
                         — escape analysis should have flagged its allocation site"),
             (Variant { name: an, args: aa }, Variant { name: bn, args: ba }) =>
                 an == bn && aa == ba,
@@ -341,6 +361,9 @@ impl Value {
             // #464: should never reach JSON serialization. See PartialEq.
             Value::StackRecord { .. } =>
                 panic!("BUG(#464): Value::StackRecord reached to_json — \
+                        escape analysis should have prevented escape to a host boundary"),
+            Value::StackTuple { .. } =>
+                panic!("BUG(#464): Value::StackTuple reached to_json — \
                         escape analysis should have prevented escape to a host boundary"),
             Value::Variant { name, args } => {
                 let mut m = serde_json::Map::new();

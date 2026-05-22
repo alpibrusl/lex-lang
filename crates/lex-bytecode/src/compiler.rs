@@ -391,14 +391,25 @@ fn apply_escape_lowering(
     escape_index: &std::collections::HashMap<(String, u32), bool>,
 ) {
     for (pc, op) in code.iter_mut().enumerate() {
-        if let Op::MakeRecord { shape_idx, field_count } = *op {
-            // Look up this (fn, pc) in the escape index. Absent →
-            // analysis didn't observe the site (defensive: leave on
-            // heap path). Present and false → safe to stack-allocate.
-            let key = (fn_name.to_string(), pc as u32);
-            if matches!(escape_index.get(&key), Some(false)) {
+        // Look up this (fn, pc) in the escape index. Absent → analysis
+        // didn't observe the site (defensive: leave on heap path).
+        // Present and false → safe to stack-allocate. Each rewrite is a
+        // single-slot swap preserving pc / stack delta, so jump
+        // targets, downstream peephole passes, and the body-hash
+        // decoder all see the same program shape.
+        let key = (fn_name.to_string(), pc as u32);
+        if !matches!(escape_index.get(&key), Some(false)) {
+            continue;
+        }
+        match *op {
+            Op::MakeRecord { shape_idx, field_count } => {
                 *op = Op::AllocStackRecord { shape_idx, field_count };
             }
+            // #464 tuple codegen: same single-slot swap as records.
+            Op::MakeTuple(arity) => {
+                *op = Op::AllocStackTuple { arity };
+            }
+            _ => {}
         }
     }
 }

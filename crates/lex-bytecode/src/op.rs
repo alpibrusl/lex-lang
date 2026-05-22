@@ -66,6 +66,18 @@ pub enum Op {
     /// step-2 lowering.
     AllocStackRecord { shape_idx: u32, field_count: u16 },
     MakeTuple(u16),
+    /// Frame-local tuple (#464 tuple codegen). Stack-alloc analogue of
+    /// `MakeTuple`: pops `arity` values into the VM's stack-record
+    /// arena and pushes a `Value::StackTuple` whose `slab_start`
+    /// indexes the arena. Emitted by the compiler in place of
+    /// `MakeTuple` at sites `escape::build_escape_index` proves do not
+    /// escape the frame. Runtime fallback to the heap `Value::Tuple`
+    /// path when the frame's stack-record budget is exhausted —
+    /// identical observable effect, so stack and heap tuples can mix
+    /// within one function. `body_hash` stability (#222): canonical
+    /// encoding decodes this op back to `MakeTuple(arity)`, so closure
+    /// identity is invariant under the lowering.
+    AllocStackTuple { arity: u16 },
     MakeList(u32),
     MakeVariant { name_idx: u32, arity: u16 },
     /// Record field access. `name_idx` indexes a `Const::FieldName`

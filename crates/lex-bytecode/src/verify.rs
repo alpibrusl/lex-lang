@@ -162,6 +162,8 @@ fn stack_delta(op: &Op) -> i32 {
         // about the stack-record arena — it walks bytecode shape only.
         Op::AllocStackRecord { field_count, .. } => -(*field_count as i32) + 1,
         Op::MakeTuple(n)  => -(*n as i32) + 1,
+        // #464 tuple codegen: same stack-effect shape as MakeTuple.
+        Op::AllocStackTuple { arity } => -(*arity as i32) + 1,
         Op::MakeList(n)   => -(*n as i32) + 1,
         Op::MakeVariant { arity, .. } => -(*arity as i32) + 1,
 

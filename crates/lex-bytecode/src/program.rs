@@ -215,6 +215,11 @@ pub fn compute_body_hash(
                 serde_json::to_vec(&LegacyOp::GetField(*name_idx))
                     .expect("Op serialization must succeed")
             }
+            // #464 tuple codegen: AllocStackTuple hashes as MakeTuple
+            // so the stack-vs-heap lowering leaves closure identity
+            // (#222) bit-identical, mirroring AllocStackRecord above.
+            Op::AllocStackTuple { arity } =>
+                serde_json::to_vec(&Op::MakeTuple(*arity)).expect("Op serialization must succeed"),
             Op::IntAdd   | Op::FloatAdd => serde_json::to_vec(&Op::NumAdd).unwrap(),
             Op::IntSub   | Op::FloatSub => serde_json::to_vec(&Op::NumSub).unwrap(),
             Op::IntMul   | Op::FloatMul => serde_json::to_vec(&Op::NumMul).unwrap(),
