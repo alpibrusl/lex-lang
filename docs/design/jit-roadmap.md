@@ -4,6 +4,15 @@
 **Status:** Design doc — closes the architectural-decisions
 acceptance criterion of #465. No implementation yet.
 
+> **Re-scope 2026-05-22 — see [Status update](#status-update-2026-05-22--re-scope)
+> at the bottom.** Two measurements that landed after this doc was
+> written change the phase-0 priority order: (1) the dispatch-loop
+> rewrite (#461) is promoted from "deferred" to *next development*,
+> and (2) the value-rep / NaN-boxing rework is demoted off the JIT
+> critical path pending a JIT-specific measurement. The original
+> analysis below is left intact; the re-scope section records what
+> changed and why.
+
 ## Why this doc
 
 #465 is the long-horizon JIT tracking issue. It explicitly lists
@@ -280,3 +289,78 @@ the audit in #465 already confirmed JIT-safe:
 
 No Lex concept needs to be sacrificed. The cost is engineering,
 not language design.
+
+## Status update (2026-05-22) — re-scope
+
+Per #465's "scope re-evaluation triggers" (above), the prereq order
+is revised based on two measurements that landed *after* this doc.
+
+### Phase-0 prereq scorecard
+
+| Prereq | Issue | State (2026-05-22) |
+|--------|-------|--------------------|
+| Dispatch | #461 | **Partial** — superinstruction slices 1–9 + typed lowering + field-name interning landed; the **function-table / computed-goto dispatch-loop rewrite itself is not done**. |
+| Inline caches | #462 | **Effectively done** — `(fn_id, site_idx)` key, `shape_id` IC, dynamic-shape interning. Polymorphic slice 2b **skipped**: measured 0% polymorphism (`ic-polymorphism-measurement.md`). |
+| Per-request arena | #463 | **Scaffolding only** — `lex-runtime/src/arena.rs` exists but is not plumbed into the VM. |
+| Stack-alloc records | #464 | **Done / closed.** `AllocStackRecord` + escape-driven lowering. |
+| Value-rep (NaN-boxing) | new | **Not started — and de-prioritized, see below.** |
+
+### What changed since 2026-05-20
+
+**1. Dispatch is the dominant cost again on real workloads.** The
+2026-05-18 go/no-go (`dispatch-overhead-measurement.md`) recommended
+*skipping* the function-table rewrite — but that call was made on
+*arithmetic* microbenches, where superinstructions already beat the
+no-dispatch floor. The 2026-05-21 callgrind profile of
+`response_build` (a *record-heavy* workload, representative of real
+HTTP/SQL handlers) puts `Vm::run_to` back at **~48% of I-refs** after
+all recent perf work landed. On the workloads that matter, dispatch
+is once again the single largest cost — and it is a hard JIT prereq.
+The earlier "skip it" decision is therefore **stale**; the rewrite is
+promoted to next.
+
+**2. Value-rep's interpreter-throughput ROI is ~3%, not the enabler
+of 3–5×.** This doc (and #465/#480) treated NaN-boxing as the hidden
+make-or-break prereq. A throwaway prototype (recorded in #461's
+2026-05-21 comment) measured the cheapest version — `Arc`-wrapping
+`Record.fields` — at **−2.8%**, with `drop_in_place<Value>`
+*unchanged*. The churn is **linear-use** value trees: built, read
+once, dropped, so refcount stays 1 and NaN-boxing only shrinks the
+move/envelope cost, not the build/teardown of the underlying maps.
+Estimated NaN-boxing upside on record-heavy interpreter throughput:
+**~3%.**
+
+This does **not** mean value-rep is worthless for the JIT — the
+original §"value-rep rework" argument is about the JIT inlining
+`as_int()` to a mask and unboxing arithmetic into native registers,
+which is a *different* win than interpreter throughput. But that
+JIT-specific ROI is **unmeasured**, and the interpreter-throughput
+case that this doc leaned on is now falsified. So: NaN-boxing comes
+**off the critical path** until its JIT-specific win is measured
+(prototype: a hand-lowered unboxed arith loop vs the boxed one). Do
+not start the 2–3 month rework on the strength of the old assumption.
+
+### Revised next-development order
+
+1. **#461 — function-table / computed-goto dispatch-loop rewrite.**
+   Highest value on three independent axes: biggest single
+   interpreter win (~48% of time; ~5 ns/op pure dispatch overhead),
+   a hard JIT prereq, and no preconditions of its own. Caveat for
+   implementers: a naïve `fn(&mut Vm)` table can *regress* in Rust
+   (indirect call + non-inlined arms vs. the current `match`, which
+   already lowers to a jump table). The genuine levers are (a)
+   hoisting per-op loop invariants out of the prologue
+   (`code`-slice refetch, `frame_idx` recompute, bounds checks that
+   the verifier already discharges) and (b) threaded dispatch
+   (computed-goto / tail-call `become`), the latter behind a
+   feature flag. **Re-confirm with the dispatch bench before and
+   after each slice** — same discipline as slices 1–9.
+2. **#463 — plumb the per-request arena + widen #464 escape
+   analysis** (lists/tuples/deeper nesting). Targets the ~15% in
+   `drop_in_place` + libc `free` directly. Bigger, riskier change
+   (lifetime tied to effect scope), so it follows the dispatch work.
+3. **Value-rep / NaN-boxing — measure first, then decide.** Blocked
+   on a JIT-specific micro-measurement (see above), not scheduled.
+
+What explicitly should **not** be next: NaN-boxing (de-motivated),
+or #462 slice 2b polymorphic ICs (0% measured polymorphism).
