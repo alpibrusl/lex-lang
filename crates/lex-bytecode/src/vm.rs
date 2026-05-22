@@ -1153,11 +1153,26 @@ impl<'a> Vm<'a> {
     /// already-running `run()` must return when *its* frame returns,
     /// not when the entire frame stack empties (#221).
     fn run_to(&mut self, base_depth: usize) -> Result<Value, VmError> {
+        // #461 slice A: cache the executing function's code slice across
+        // ops instead of re-deriving `program.functions[fn_id].code` on
+        // every iteration. The program is borrowed (`&'a Program`) and is
+        // never mutated during a run, so the slice reference is valid for
+        // the whole run and — crucially — is independent of the `&mut self`
+        // borrow the op handlers take: it points into the caller-owned
+        // `Program`, not into `*self`. Re-resolve only when `fn_id`
+        // changes, which is exactly the frame-transition set (Call /
+        // CallClosure / TailCall / Return); recursion into the same
+        // `fn_id` correctly keeps the cached slice. `frame_idx` / `fn_id`
+        // stay recomputed per op (cheap field reads), so the op handlers
+        // are untouched and their `fn_id` bindings shadow as before.
+        let program: &'a Program = self.program;
+        let mut code: &'a [Op] = &[];
+        let mut code_fn_id: u32 = u32::MAX;
         loop {
             if self.steps > self.step_limit {
                 let frame_idx = self.frames.len() - 1;
                 let fn_id = self.frames[frame_idx].fn_id;
-                let fn_name = &self.program.functions[fn_id as usize].name;
+                let fn_name = &program.functions[fn_id as usize].name;
                 return Err(VmError::Panic(format!(
                     "step limit exceeded in `{fn_name}` ({} > {})",
                     self.steps, self.step_limit,
@@ -1167,9 +1182,12 @@ impl<'a> Vm<'a> {
             let frame_idx = self.frames.len() - 1;
             let pc = self.frames[frame_idx].pc;
             let fn_id = self.frames[frame_idx].fn_id;
-            let code = &self.program.functions[fn_id as usize].code;
+            if fn_id != code_fn_id {
+                code = &program.functions[fn_id as usize].code;
+                code_fn_id = fn_id;
+            }
             if pc >= code.len() {
-                let fn_name = &self.program.functions[fn_id as usize].name;
+                let fn_name = &program.functions[fn_id as usize].name;
                 return Err(VmError::Panic(format!("ran past end of code in `{fn_name}`")));
             }
             let op = code[pc];

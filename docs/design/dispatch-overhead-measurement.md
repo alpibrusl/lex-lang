@@ -193,3 +193,37 @@ Each slice re-runs `cargo bench -p lex-bytecode --bench dispatch`
 --workspace` must stay green — same discipline as superinstruction
 slices 1–9. Slice A is the one with the measured 48% behind it;
 B and C are follow-ons.
+
+### Slice A landed — measured result (2026-05-22)
+
+First increment of slice A: cache the executing function's code
+slice (`program.functions[fn_id].code`) across ops, re-resolving
+only when `fn_id` changes (the frame-transition set). Works because
+`program` is a borrowed `&'a Program` — the slice reference is
+independent of the `&mut self` the op handlers take, so it can live
+across the dispatch arms with no `unsafe`, no `Arc`, no serialization
+change. `frame_idx` / `fn_id` stay recomputed per op, so the 70+ op
+handlers are untouched.
+
+Measured with the deterministic tool, not wall-clock: criterion on
+this shared VM has a ~4–5% run-to-run noise floor (the
+`straight_arith_no_dispatch` control — native Rust that never enters
+`run_to` — drifts that much between back-to-back runs), which swamps
+a slice-A-sized effect. callgrind I-refs are drift-immune, so they
+are the gate for changes this small. `profile_response_build 120 3`:
+
+| | I-refs | `run_to` I-refs |
+|---|---|---|
+| before | 11,073,057 | 4,344,448 (39.2%) |
+| after  | 10,946,101 | 4,206,062 (38.4%) |
+| Δ | **−1.15%** total | **−3.2%** in `run_to` |
+
+A modest, real reduction in the dominant VM function, in the
+single-digit range the table above predicted. The larger win still
+lives in slice C (threaded dispatch); slice A's lasting value is
+that the cached code slice is the structural precondition for it.
+`cargo test -p lex-bytecode` is green; `--workspace` could not be
+run to completion in the dev container (disk: each lex-runtime
+integration binary statically links the full polars/arrow/tokio
+graph and the set overflows the volume), but the reentrant-path
+coverage (`list_sort_by`) and the full bytecode suite pass.
