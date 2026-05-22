@@ -1186,10 +1186,22 @@ impl<'a> Vm<'a> {
                 code = &program.functions[fn_id as usize].code;
                 code_fn_id = fn_id;
             }
-            if pc >= code.len() {
-                let fn_name = &program.functions[fn_id as usize].name;
-                return Err(VmError::Panic(format!("ran past end of code in `{fn_name}`")));
-            }
+            // #461 slice B: the bytecode verifier (#366) proves pc stays
+            // in bounds for every reachable op — every path through a
+            // function ends in Return / Jump / TailCall, so execution
+            // never falls off the end of `code`. The per-op
+            // `pc >= code.len()` guard is therefore redundant for verified
+            // programs; demote it to a debug-only assertion. The `code[pc]`
+            // index below stays bounds-checked, so a malformed program in
+            // a release build still panics (loudly, just without the
+            // bespoke message) rather than reading out of bounds — no
+            // `unsafe`, no UB, only the cold error-return path leaves the
+            // hot loop.
+            debug_assert!(
+                pc < code.len(),
+                "ran past end of code in `{}`",
+                program.functions[fn_id as usize].name,
+            );
             let op = code[pc];
             self.frames[frame_idx].pc = pc + 1;
 

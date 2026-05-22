@@ -227,3 +227,34 @@ run to completion in the dev container (disk: each lex-runtime
 integration binary statically links the full polars/arrow/tokio
 graph and the set overflows the volume), but the reentrant-path
 coverage (`list_sort_by`) and the full bytecode suite pass.
+
+### Slice B landed — measured result (2026-05-22)
+
+Demote the per-op `pc >= code.len()` guard to a `debug_assert!`. The
+verifier (#366) proves pc stays in bounds for every reachable op
+(every path ends in Return / Jump / TailCall), so the explicit guard
+is redundant for verified programs. The `code[pc]` index stays
+bounds-checked, so a malformed program in release still panics rather
+than reading out of bounds — **no `unsafe`, no UB**; only the cold
+error-return path (and its `format!`) leaves the hot loop.
+
+Deterministic callgrind, `profile_response_build 120 3`, baseline =
+main post-slice-A:
+
+| | I-refs | `run_to` I-refs |
+|---|---|---|
+| before (slice A) | 10,934,935 | 4,206,062 |
+| after  (slice B) | 10,875,216 | 4,196,378 |
+| Δ | **−0.55%** total | **−0.23%** in `run_to` |
+
+Marginal, as expected — the explicit guard was nearly redundant with
+the index check LLVM keeps. The honest read: slice B is safe cleanup
+that shaves a cold path, not a real lever. The remaining dispatch
+win lives in slice C (threaded dispatch), which is **blocked on
+stable Rust** (computed-goto / tail-call `become` are nightly-only)
+and is an architectural decision given the project's stable-toolchain
+pin (INVARIANTS.md), not a free slice. Cumulative slice A + B:
+`run_to` 4,344,448 → 4,196,378 (**−3.4%**). The higher-ROI next
+lever per the #461 profile is the ~15% alloc churn (`drop_in_place`
++ `free`), i.e. arena (#463) / wider escape analysis (#464), not
+more dispatch micro-slices.
