@@ -570,6 +570,9 @@ fn hash_value_into<H: std::hash::Hasher>(v: &Value, h: &mut H) {
         Value::StackRecord { .. } =>
             panic!("BUG(#464): Value::StackRecord reached memo hashing — \
                     escape analysis should have prevented escape to a call boundary"),
+        Value::StackTuple { .. } =>
+            panic!("BUG(#464): Value::StackTuple reached memo hashing — \
+                    escape analysis should have prevented escape to a call boundary"),
     }
 }
 
@@ -1312,6 +1315,34 @@ impl<'a> Vm<'a> {
                     for i in (0..n as usize).rev() { items[i] = self.pop()?; }
                     self.stack.push(Value::Tuple(items));
                 }
+                Op::AllocStackTuple { arity } => {
+                    // #464 tuple codegen. Same value-stack contract as
+                    // MakeTuple (pop `arity`, push 1), but the elements
+                    // live in the shared stack-record arena instead of
+                    // a heap Vec. Budget exhaustion falls back to the
+                    // MakeTuple heap path — identical observable result.
+                    let n = arity as usize;
+                    let frame = &mut self.frames[frame_idx];
+                    if frame.stack_record_budget_remaining < arity as u32 {
+                        self.stack_record_heap_fallbacks += 1;
+                        let mut items: Vec<Value> = (0..n).map(|_| Value::Unit).collect();
+                        for i in (0..n).rev() { items[i] = self.pop()?; }
+                        self.stack.push(Value::Tuple(items));
+                    } else {
+                        self.stack_record_allocs += 1;
+                        frame.stack_record_budget_remaining -= arity as u32;
+                        let slab_start = self.stack_record_arena.len();
+                        self.stack_record_arena.resize(slab_start + n, Value::Unit);
+                        for i in (0..n).rev() {
+                            let v = self.pop()?;
+                            self.stack_record_arena[slab_start + i] = v;
+                        }
+                        self.stack.push(Value::StackTuple {
+                            slab_start: slab_start as u32,
+                            arity,
+                        });
+                    }
+                }
                 Op::MakeList(n) => {
                     let mut items: Vec<Value> = (0..n).map(|_| Value::Unit).collect();
                     for i in (0..n as usize).rev() { items[i] = self.pop()?; }
@@ -1464,6 +1495,17 @@ impl<'a> Vm<'a> {
                         Value::Tuple(items) => {
                             let v = items.into_iter().nth(i as usize)
                                 .ok_or_else(|| VmError::TypeMismatch(format!("tuple index {i} out of range")))?;
+                            self.stack.push(v);
+                        }
+                        // #464 tuple codegen: positional read out of a
+                        // frame-local tuple. The arena slot is an O(1)
+                        // index, mirroring the heap path's nth().
+                        Value::StackTuple { slab_start, arity } => {
+                            if i >= arity {
+                                return Err(VmError::TypeMismatch(
+                                    format!("tuple index {i} out of range")));
+                            }
+                            let v = self.stack_record_arena[slab_start as usize + i as usize].clone();
                             self.stack.push(v);
                         }
                         other => return Err(VmError::TypeMismatch(format!("GetElem on non-tuple: {other:?}"))),

@@ -187,6 +187,10 @@ fn value_to_json(v: &Value) -> serde_json::Value {
         // on Call/EffectCall — both escape sinks the analysis
         // rejects). If we ever do see one, that's an analysis bug.
         Value::StackRecord { .. } => J::String("<stack-record-unreachable>".into()),
+        // #464 tuple codegen: same reasoning as StackRecord above —
+        // the tracer only records args at escape sinks the analysis
+        // rejects, so a frame-local tuple can't reach here.
+        Value::StackTuple { .. } => J::String("<stack-tuple-unreachable>".into()),
         Value::Variant { name, args } => {
             let mut m = serde_json::Map::new();
             m.insert("$variant".into(), J::String(name.clone()));

@@ -327,16 +327,20 @@ fn step(pc: usize, op: &Op, mut s: State) -> (State, Vec<usize>, HashSet<u32>) {
             if let Some(top) = s.stack.pop() {
                 let i = *i as usize;
                 if i >= s.locals.len() { s.locals.resize(i + 1, Slot::Other); }
-                // Round-tripping a Rec through a local is fine; we
-                // keep it tracked. If the local previously held a
-                // different Rec, that one is being overwritten — it
-                // escapes (no remaining reference to it via the
-                // local, but it may still be on the stack elsewhere
-                // — conservatively flag).
-                let prev = s.locals[i];
-                if let Slot::Agg(p_prev) = prev {
-                    if prev != top { escapes.insert(p_prev); }
-                }
+                // Round-tripping an aggregate through a local keeps it
+                // tracked. Overwriting a local that held a *different*
+                // tracked aggregate does NOT make the old one escape:
+                // Lex `let` bindings are immutable, so the compiler
+                // only reuses a slot once its previous occupant is out
+                // of scope (dead). Any real escape of that occupant —
+                // returned, passed to a call, stored into another
+                // aggregate — flows through a `Load → {Return, Call,
+                // MakeRecord/MakeTuple/...}` chain those ops already
+                // leak. Flagging it here was a pure false-positive
+                // that defeated stack-alloc for the common
+                // destructure-then-bind pattern (`compile_match`
+                // rewinds its `__scrut`/`__tuple` temp slots, so the
+                // enclosing `let` reuses them — see #464 tuple codegen).
                 s.locals[i] = top;
             }
         }
@@ -364,6 +368,13 @@ fn step(pc: usize, op: &Op, mut s: State) -> (State, Vec<usize>, HashSet<u32>) {
         // `GetField` does for records.
         Op::MakeTuple(n) => {
             pop_n_leak(&mut s, *n as usize, &mut escapes);
+            s.stack.push(Slot::Agg(pc as u32));
+        }
+        // Post-lowering form of MakeTuple (escape proved). Re-running
+        // the analysis on already-lowered code must classify it the
+        // same way, so treat it identically — mirrors AllocStackRecord.
+        Op::AllocStackTuple { arity } => {
+            pop_n_leak(&mut s, *arity as usize, &mut escapes);
             s.stack.push(Slot::Agg(pc as u32));
         }
         // Lists and variants remain escape sinks for any tracked
@@ -476,12 +487,13 @@ fn step(pc: usize, op: &Op, mut s: State) -> (State, Vec<usize>, HashSet<u32>) {
             s.stack.push(Slot::Other);
         }
         Op::LoadLocalAddIntConstStoreLocal { dest, .. } => {
-            // delta 0; updates a local with an Int.
+            // delta 0; updates a local with an Int. Overwriting a
+            // local doesn't escape its prior aggregate — same rule as
+            // plain StoreLocal above (the dest is Int-typed by this
+            // superinstruction's contract, so prev is never an
+            // aggregate in practice; relaxed for consistency).
             let i = *dest as usize;
             if i >= s.locals.len() { s.locals.resize(i + 1, Slot::Other); }
-            // The local previously may have held a Rec; same logic
-            // as StoreLocal — overwriting it is an escape signal.
-            if let Slot::Agg(p_prev) = s.locals[i] { escapes.insert(p_prev); }
             s.locals[i] = Slot::Other;
             return (s, vec![pc + 4], escapes);
         }
@@ -532,7 +544,8 @@ fn step(pc: usize, op: &Op, mut s: State) -> (State, Vec<usize>, HashSet<u32>) {
             // Other (the scrutinee is an Int per slice-6's contract).
             let i = *dst as usize;
             if i >= s.locals.len() { s.locals.resize(i + 1, Slot::Other); }
-            if let Slot::Agg(p_prev) = s.locals[i] { escapes.insert(p_prev); }
+            // Overwriting a local doesn't escape its prior aggregate
+            // (same rule as plain StoreLocal); dst is Int-typed here.
             s.locals[i] = Slot::Other;
             let target = (pc as i32 + 6 + jump_offset) as usize;
             return (s, vec![pc + 6, target], escapes);
@@ -917,6 +930,43 @@ mod tests {
         assert_eq!((r.sites[0].pc, r.sites[0].kind, r.sites[0].shape_idx), (1, SiteKind::Record, 7));
         assert_eq!((r.sites[1].pc, r.sites[1].kind, r.sites[1].field_count), (5, SiteKind::Tuple, 2));
         assert!(!r.sites[0].escapes && !r.sites[1].escapes);
+    }
+
+    #[test]
+    fn aggregate_overwritten_in_dead_slot_does_not_escape() {
+        // rec1 is stored into local 0, then local 0 is overwritten
+        // with an Int and rec1 is never otherwise used. Lex's
+        // immutable `let` bindings mean a slot is only reused once its
+        // prior occupant is dead, so the overwrite must NOT flag rec1
+        // as escaping (the relaxed StoreLocal rule — #464 tuple
+        // codegen). Pre-relaxation this returned `true`.
+        let f = func("overwrite", 1, 0, vec![
+            Op::PushConst(0),
+            Op::MakeRecord { shape_idx: 0, field_count: 1 }, // rec1 @ pc=1
+            Op::StoreLocal(0),
+            Op::PushConst(0),
+            Op::StoreLocal(0), // overwrite local 0 with an Int
+            Op::PushConst(0),
+            Op::Return,
+        ]);
+        let r = analyze_function(&f);
+        assert_escapes(&r, &[(1, false)]);
+    }
+
+    #[test]
+    fn aggregate_loaded_then_returned_still_escapes() {
+        // Soundness guard for the relaxed overwrite rule: an aggregate
+        // stored in a local, then LOADED and returned, still escapes —
+        // the `Return` leak catches it independent of any overwrite.
+        let f = func("load_then_return", 1, 0, vec![
+            Op::PushConst(0),
+            Op::MakeRecord { shape_idx: 0, field_count: 1 }, // rec1 @ pc=1
+            Op::StoreLocal(0),
+            Op::LoadLocal(0),
+            Op::Return, // returns rec1 → escapes
+        ]);
+        let r = analyze_function(&f);
+        assert_escapes(&r, &[(1, true)]);
     }
 
     #[test]
