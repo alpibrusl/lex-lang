@@ -1,55 +1,61 @@
-//! Escape analysis for `MakeRecord` allocation sites (#464 step 1).
+//! Escape analysis for stack-allocatable aggregate sites —
+//! `Op::MakeRecord` and `Op::MakeTuple` (#464 + tuple widening).
 //!
-//! Walks every function's bytecode to classify each `Op::MakeRecord`
-//! site as either **stack-allocatable** (the record value never
+//! Walks every function's bytecode to classify each aggregate
+//! allocation site as either **stack-allocatable** (the value never
 //! leaves the function frame) or **escapes** (used as a closure
-//! capture, returned, stored in another record, passed to a call,
-//! sent on a channel, etc.). The output is consumed by a follow-on
-//! slice that emits `AllocStackRecord` for the safe sites.
+//! capture, returned, stored in another aggregate, passed to a call,
+//! sent on a channel, etc.). The escape rules are identical for
+//! records and tuples — only the eventual codegen opcode differs —
+//! so a single `Slot::Agg(pc)` lattice value tracks both.
 //!
-//! ## Status: analysis only (step 1 of 3)
+//! ## Status
 //!
-//! This module produces an `EscapeReport` per function but does
-//! NOT yet change codegen — `Op::MakeRecord` is still emitted
-//! everywhere. Steps 2 and 3 introduce `AllocStackRecord` /
-//! `GetStackField` / `SetStackField` and the response-build
-//! micro-bench respectively. See #464.
+//! - **Records** (`MakeRecord`): analysis + codegen complete (#464).
+//!   `compiler::apply_escape_lowering` rewrites non-escaping
+//!   `MakeRecord` to `AllocStackRecord`.
+//! - **Tuples** (`MakeTuple`): analysis only, this slice. Sites are
+//!   classified and reported with `SiteKind::Tuple`, but no codegen
+//!   consumes them yet — `apply_escape_lowering` only rewrites
+//!   `MakeRecord`, so reporting tuple sites is inert until a tuple
+//!   stack-alloc opcode lands. Mirrors how #464 sequenced records
+//!   (analysis → codegen → bench).
 //!
 //! ## Approach
 //!
 //! Abstract interpretation over the bytecode CFG. Each abstract
 //! state tracks:
-//! - per-stack-slot: `Slot::Rec(pc)` (the record allocated at
+//! - per-stack-slot: `Slot::Agg(pc)` (the aggregate allocated at
 //!   `pc`, still local) or `Slot::Other` (anything else — int,
-//!   string, captured value, record we've stopped tracking)
+//!   string, captured value, aggregate we've stopped tracking)
 //! - per-local: same `Slot` lattice, indexed by `locals[i]`
 //!
 //! At each op we update the abstract state and union any newly-
 //! observed escapes into a `HashSet<u32>` keyed by allocation pc.
 //! Worklist fixpoint iterates until no state changes — joins use a
-//! pointwise merge that downgrades `Rec(a) ⊔ Rec(b)` (a ≠ b) and
-//! `Rec(a) ⊔ Other` to `Other`, marking the involved sites as
+//! pointwise merge that downgrades `Agg(a) ⊔ Agg(b)` (a ≠ b) and
+//! `Agg(a) ⊔ Other` to `Other`, marking the involved sites as
 //! escaped (we can no longer prove they stay local from this
 //! merge point forward).
 //!
 //! ## Intra-procedural limit
 //!
 //! Calls (`Call`, `TailCall`, `CallClosure`) escape all argument
-//! records — we can't see the callee's body from here. Inlining
+//! aggregates — we can't see the callee's body from here. Inlining
 //! could recover the cross-fn case but is deliberately out of
-//! scope for #464; the issue's wording ("function frame") matches
+//! scope; the issue's wording ("function frame") matches
 //! intra-procedural.
 //!
 //! ## Conservative defaults
 //!
-//! Whenever the analysis can't prove a record stays local, it
+//! Whenever the analysis can't prove an aggregate stays local, it
 //! defaults to *escaped*. False positives (sites flagged as
 //! escaping when they actually don't) cost a heap allocation per
 //! request — the existing baseline. False negatives (a flagged-
 //! local site that actually escapes) would corrupt memory under
-//! the future stack-alloc codegen, so step 2 will treat the
-//! analysis output as a *necessary* but not sufficient precondition
-//! and pair it with an unconditional runtime fallback.
+//! stack-alloc codegen, so the codegen step treats the analysis
+//! output as a *necessary* but not sufficient precondition and
+//! pairs it with an unconditional runtime fallback.
 
 use std::collections::{HashMap, HashSet};
 
@@ -59,14 +65,18 @@ use crate::program::Function;
 /// Abstract value at a stack or local slot during the analysis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Slot {
-    /// Holds the record allocated by `Op::MakeRecord` at this pc.
-    /// As long as every consumer reads this slot via `GetField`,
-    /// `Pop`, or a `StoreLocal`/`LoadLocal` round-trip, the site
-    /// stays a stack-alloc candidate.
-    Rec(u32),
-    /// Anything else — primitives, already-escaped records,
+    /// Holds the stack-allocatable aggregate (a record from
+    /// `Op::MakeRecord` or a tuple from `Op::MakeTuple`) allocated at
+    /// this pc. As long as every consumer reads this slot via a field
+    /// / element read (`GetField` / `GetElem`), `Pop`, or a
+    /// `StoreLocal`/`LoadLocal` round-trip, the site stays a
+    /// stack-alloc candidate. The escape rules are identical for both
+    /// aggregate kinds — only the codegen opcode differs — so the
+    /// analysis tracks them with one variant keyed on the alloc pc.
+    Agg(u32),
+    /// Anything else — primitives, already-escaped aggregates,
     /// values produced by ops we don't model precisely. Treated
-    /// as not-a-tracked-record for escape purposes.
+    /// as not-a-tracked-aggregate for escape purposes.
     Other,
 }
 
@@ -77,7 +87,7 @@ impl Slot {
     /// escape set — we lose track of those sites past this merge.
     fn merge(self, other: Slot) -> Slot {
         match (self, other) {
-            (Slot::Rec(a), Slot::Rec(b)) if a == b => Slot::Rec(a),
+            (Slot::Agg(a), Slot::Agg(b)) if a == b => Slot::Agg(a),
             _ => Slot::Other,
         }
     }
@@ -120,14 +130,14 @@ impl State {
             // If a Rec was merged-away (either path had Rec, the
             // result is Other), the corresponding site escapes.
             if merged == Slot::Other {
-                if let Slot::Rec(p) = self.stack[i]  { escaped.insert(p); }
-                if let Slot::Rec(p) = other.stack[i] { escaped.insert(p); }
+                if let Slot::Agg(p) = self.stack[i]  { escaped.insert(p); }
+                if let Slot::Agg(p) = other.stack[i] { escaped.insert(p); }
             }
             stack.push(merged);
         }
         // The dropped tail of the longer stack also leaks any Rec.
         for tail in self.stack.iter().skip(stack_len).chain(other.stack.iter().skip(stack_len)) {
-            if let Slot::Rec(p) = tail { escaped.insert(*p); }
+            if let Slot::Agg(p) = tail { escaped.insert(*p); }
         }
         let local_len = self.locals.len().max(other.locals.len());
         let mut locals = Vec::with_capacity(local_len);
@@ -136,8 +146,8 @@ impl State {
             let b = other.locals.get(i).copied().unwrap_or(Slot::Other);
             let merged = a.merge(b);
             if merged == Slot::Other {
-                if let Slot::Rec(p) = a { escaped.insert(p); }
-                if let Slot::Rec(p) = b { escaped.insert(p); }
+                if let Slot::Agg(p) = a { escaped.insert(p); }
+                if let Slot::Agg(p) = b { escaped.insert(p); }
             }
             locals.push(merged);
         }
@@ -145,25 +155,42 @@ impl State {
     }
 }
 
-/// Per-function escape report — the artifact step 2 will consume
-/// to decide where to emit `AllocStackRecord` vs `MakeRecord`.
+/// Per-function escape report — the artifact codegen consumes to
+/// decide where to emit a stack-alloc opcode vs the heap constructor.
 ///
-/// Each entry is keyed by the allocation pc (the `Op::MakeRecord`
-/// site's index in the function's `code` vec). `escapes = false`
-/// means: across every reachable path through the function, the
-/// record allocated here is only ever read locally (GetField,
-/// dropped via Pop, round-tripped through locals) — never returned,
-/// captured, stored in another aggregate, or passed to a call.
+/// Each entry is keyed by the allocation pc (the `Op::MakeRecord` or
+/// `Op::MakeTuple` site's index in the function's `code` vec) and
+/// tagged with its `SiteKind`. `escapes = false` means: across every
+/// reachable path through the function, the aggregate allocated here
+/// is only ever read locally (`GetField` / `GetElem`, dropped via
+/// `Pop`, round-tripped through locals) — never returned, captured,
+/// stored in another aggregate, or passed to a call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EscapeReport {
     pub fn_name: String,
-    /// One entry per `MakeRecord` site in the function, in pc order.
+    /// One entry per stack-allocatable aggregate (`MakeRecord` /
+    /// `MakeTuple`) site in the function, in pc order.
     pub sites: Vec<EscapeSite>,
+}
+
+/// Which aggregate constructor an escape site is — determines which
+/// stack-alloc opcode a future codegen slice would emit for it
+/// (`AllocStackRecord` for records; tuple stack-alloc is not yet
+/// implemented, so `Tuple` sites are reported but not lowered).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SiteKind {
+    /// `Op::MakeRecord`: `shape_idx` is meaningful, `field_count` is
+    /// the record's field count.
+    Record,
+    /// `Op::MakeTuple`: `shape_idx` is unused (`0`), `field_count` is
+    /// the tuple arity.
+    Tuple,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EscapeSite {
     pub pc: u32,
+    pub kind: SiteKind,
     pub shape_idx: u32,
     pub field_count: u16,
     pub escapes: bool,
@@ -189,13 +216,16 @@ pub fn analyze_function(func: &Function) -> EscapeReport {
     // Inventory the MakeRecord sites first. If there are none,
     // skip the whole fixpoint — the function can't benefit from
     // stack allocation anyway.
-    let sites: Vec<(u32, u32, u16)> = func
+    let sites: Vec<(u32, SiteKind, u32, u16)> = func
         .code
         .iter()
         .enumerate()
         .filter_map(|(pc, op)| match op {
             Op::MakeRecord { shape_idx, field_count } => {
-                Some((pc as u32, *shape_idx, *field_count))
+                Some((pc as u32, SiteKind::Record, *shape_idx, *field_count))
+            }
+            Op::MakeTuple(arity) => {
+                Some((pc as u32, SiteKind::Tuple, 0, *arity))
             }
             _ => None,
         })
@@ -244,8 +274,9 @@ pub fn analyze_function(func: &Function) -> EscapeReport {
 
     let report_sites = sites
         .into_iter()
-        .map(|(pc, shape_idx, field_count)| EscapeSite {
+        .map(|(pc, kind, shape_idx, field_count)| EscapeSite {
             pc,
+            kind,
             shape_idx,
             field_count,
             escapes: escaped.contains(&pc),
@@ -264,7 +295,7 @@ fn step(pc: usize, op: &Op, mut s: State) -> (State, Vec<usize>, HashSet<u32>) {
 
     // Helper closures for the common pop-n / push patterns.
     let leak = |slot: Slot, into: &mut HashSet<u32>| {
-        if let Slot::Rec(p) = slot { into.insert(p); }
+        if let Slot::Agg(p) = slot { into.insert(p); }
     };
     let pop_n_leak = |state: &mut State, n: usize, esc: &mut HashSet<u32>| {
         for _ in 0..n {
@@ -303,7 +334,7 @@ fn step(pc: usize, op: &Op, mut s: State) -> (State, Vec<usize>, HashSet<u32>) {
                 // local, but it may still be on the stack elsewhere
                 // — conservatively flag).
                 let prev = s.locals[i];
-                if let Slot::Rec(p_prev) = prev {
+                if let Slot::Agg(p_prev) = prev {
                     if prev != top { escapes.insert(p_prev); }
                 }
                 s.locals[i] = top;
@@ -316,24 +347,30 @@ fn step(pc: usize, op: &Op, mut s: State) -> (State, Vec<usize>, HashSet<u32>) {
             // any of them is itself a tracked Rec, it escapes (now
             // referenced from inside the parent).
             pop_n_leak(&mut s, *field_count as usize, &mut escapes);
-            s.stack.push(Slot::Rec(pc as u32));
+            s.stack.push(Slot::Agg(pc as u32));
         }
         // #464 step 2: post-lowering form of MakeRecord (escape
         // proved). Re-running the analysis on already-lowered code
         // must produce the same shape, so treat it identically.
         Op::AllocStackRecord { field_count, .. } => {
             pop_n_leak(&mut s, *field_count as usize, &mut escapes);
-            s.stack.push(Slot::Rec(pc as u32));
+            s.stack.push(Slot::Agg(pc as u32));
         }
-        // Other aggregate constructors are escape sinks for any Rec
-        // operand. They don't create new tracked records (the
-        // analysis is record-shape-driven; lists/tuples/variants
-        // would need their own machinery, out of scope for #464).
-        Op::MakeList(n) => {
-            pop_n_leak(&mut s, *n as usize, &mut escapes);
-            s.stack.push(Slot::Other);
-        }
+        // A tuple is a stack-allocatable aggregate, tracked the same
+        // way as a record: its field operands leak (any tracked
+        // aggregate stored inside it escapes), and the tuple itself
+        // becomes a tracked candidate keyed on this pc. `GetElem`
+        // reads an element without escaping the tuple, exactly as
+        // `GetField` does for records.
         Op::MakeTuple(n) => {
+            pop_n_leak(&mut s, *n as usize, &mut escapes);
+            s.stack.push(Slot::Agg(pc as u32));
+        }
+        // Lists and variants remain escape sinks for any tracked
+        // aggregate operand and don't create new tracked candidates —
+        // list stack-allocation needs variable-length arena handling
+        // (a later slice), and variants aren't a stack-alloc target.
+        Op::MakeList(n) => {
             pop_n_leak(&mut s, *n as usize, &mut escapes);
             s.stack.push(Slot::Other);
         }
@@ -444,7 +481,7 @@ fn step(pc: usize, op: &Op, mut s: State) -> (State, Vec<usize>, HashSet<u32>) {
             if i >= s.locals.len() { s.locals.resize(i + 1, Slot::Other); }
             // The local previously may have held a Rec; same logic
             // as StoreLocal — overwriting it is an escape signal.
-            if let Slot::Rec(p_prev) = s.locals[i] { escapes.insert(p_prev); }
+            if let Slot::Agg(p_prev) = s.locals[i] { escapes.insert(p_prev); }
             s.locals[i] = Slot::Other;
             return (s, vec![pc + 4], escapes);
         }
@@ -495,7 +532,7 @@ fn step(pc: usize, op: &Op, mut s: State) -> (State, Vec<usize>, HashSet<u32>) {
             // Other (the scrutinee is an Int per slice-6's contract).
             let i = *dst as usize;
             if i >= s.locals.len() { s.locals.resize(i + 1, Slot::Other); }
-            if let Slot::Rec(p_prev) = s.locals[i] { escapes.insert(p_prev); }
+            if let Slot::Agg(p_prev) = s.locals[i] { escapes.insert(p_prev); }
             s.locals[i] = Slot::Other;
             let target = (pc as i32 + 6 + jump_offset) as usize;
             return (s, vec![pc + 6, target], escapes);
@@ -758,5 +795,145 @@ mod tests {
         ]);
         let idx = build_escape_index(&[f]);
         assert_eq!(idx.get(&("idx_test".into(), 1)), Some(&false));
+    }
+
+    // ---- tuple widening (#464 tuple analysis slice) ----
+
+    #[test]
+    fn tuple_built_and_dropped_does_not_escape() {
+        let f = func("tup_drop", 0, 0, vec![
+            Op::PushConst(0),
+            Op::PushConst(1),
+            Op::MakeTuple(2), // pc=2
+            Op::Pop,
+            Op::PushConst(0),
+            Op::Return,
+        ]);
+        let r = analyze_function(&f);
+        assert_escapes(&r, &[(2, false)]);
+        assert_eq!(r.sites[0].kind, SiteKind::Tuple);
+        assert_eq!(r.sites[0].field_count, 2);
+    }
+
+    #[test]
+    fn tuple_returned_escapes() {
+        let f = func("tup_ret", 0, 0, vec![
+            Op::PushConst(0),
+            Op::PushConst(1),
+            Op::MakeTuple(2), // pc=2
+            Op::Return,
+        ]);
+        let r = analyze_function(&f);
+        assert_escapes(&r, &[(2, true)]);
+    }
+
+    #[test]
+    fn tuple_elem_read_only_does_not_escape() {
+        // Reading an element (GetElem) consumes the tuple locally,
+        // mirroring GetField on a record — the tuple stays a candidate.
+        let f = func("tup_read", 0, 0, vec![
+            Op::PushConst(0),
+            Op::PushConst(1),
+            Op::MakeTuple(2), // pc=2
+            Op::GetElem(0),
+            Op::Return,
+        ]);
+        let r = analyze_function(&f);
+        assert_escapes(&r, &[(2, false)]);
+    }
+
+    #[test]
+    fn tuple_round_tripped_through_local_does_not_escape() {
+        let f = func("tup_rt", 1, 0, vec![
+            Op::PushConst(0),
+            Op::PushConst(1),
+            Op::MakeTuple(2), // pc=2
+            Op::StoreLocal(0),
+            Op::LoadLocal(0),
+            Op::GetElem(1),
+            Op::Return,
+        ]);
+        let r = analyze_function(&f);
+        assert_escapes(&r, &[(2, false)]);
+    }
+
+    #[test]
+    fn tuple_passed_to_call_escapes() {
+        let f = func("tup_call", 0, 0, vec![
+            Op::PushConst(0),
+            Op::PushConst(1),
+            Op::MakeTuple(2), // pc=2
+            Op::Call { fn_id: 1, arity: 1, node_id_idx: 0 },
+            Op::Return,
+        ]);
+        let r = analyze_function(&f);
+        assert_escapes(&r, &[(2, true)]);
+    }
+
+    #[test]
+    fn record_stored_into_tuple_escapes_tuple_stays_local() {
+        // Build a record, wrap it in a tuple, drop the tuple. The
+        // record escapes into the tuple; the tuple itself is local.
+        let f = func("rec_in_tup", 0, 0, vec![
+            Op::PushConst(0),
+            Op::MakeRecord { shape_idx: 0, field_count: 1 }, // rec @ pc=1
+            Op::MakeTuple(1),                                // tup @ pc=2 holds rec
+            Op::Pop,
+            Op::PushConst(0),
+            Op::Return,
+        ]);
+        let r = analyze_function(&f);
+        assert_escapes(&r, &[(1, true), (2, false)]);
+    }
+
+    #[test]
+    fn tuple_stored_into_record_escapes() {
+        let f = func("tup_in_rec", 0, 0, vec![
+            Op::PushConst(0),
+            Op::PushConst(1),
+            Op::MakeTuple(2),                                // tup @ pc=2
+            Op::MakeRecord { shape_idx: 0, field_count: 1 }, // rec @ pc=3 holds tup
+            Op::Return,
+        ]);
+        let r = analyze_function(&f);
+        assert_escapes(&r, &[(2, true), (3, true)]);
+    }
+
+    #[test]
+    fn tuple_and_record_sites_carry_distinct_kinds() {
+        let f = func("mixed_kinds", 0, 0, vec![
+            Op::PushConst(0),
+            Op::MakeRecord { shape_idx: 7, field_count: 1 }, // pc=1 record
+            Op::Pop,
+            Op::PushConst(0),
+            Op::PushConst(1),
+            Op::MakeTuple(2), // pc=5 tuple
+            Op::Pop,
+            Op::PushConst(0),
+            Op::Return,
+        ]);
+        let r = analyze_function(&f);
+        assert_eq!(r.sites.len(), 2);
+        assert_eq!((r.sites[0].pc, r.sites[0].kind, r.sites[0].shape_idx), (1, SiteKind::Record, 7));
+        assert_eq!((r.sites[1].pc, r.sites[1].kind, r.sites[1].field_count), (5, SiteKind::Tuple, 2));
+        assert!(!r.sites[0].escapes && !r.sites[1].escapes);
+    }
+
+    #[test]
+    fn tuple_only_function_now_produces_report() {
+        // Pre-widening this function had no tracked sites and was
+        // omitted from analyze_program; now its tuple site is reported.
+        let f = func("tuponly", 0, 0, vec![
+            Op::PushConst(0),
+            Op::PushConst(1),
+            Op::MakeTuple(2),
+            Op::Pop,
+            Op::PushConst(0),
+            Op::Return,
+        ]);
+        let reports = analyze_program(&[f]);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].sites.len(), 1);
+        assert_eq!(reports[0].sites[0].kind, SiteKind::Tuple);
     }
 }
