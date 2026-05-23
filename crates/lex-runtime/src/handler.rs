@@ -1047,12 +1047,26 @@ impl EffectHandler for DefaultHandler {
                 let path = expect_str(args.first())?.to_string();
                 let contents = expect_str(args.get(1))?.to_string();
                 // Honor write-allowlist if any.
+                // Canonicalize both sides so macOS /tmp → /private/tmp symlinks
+                // and other platform-specific path aliases compare correctly.
                 if !self.policy.allow_fs_write.is_empty() {
-                    let abs = std::env::current_dir()
+                    let raw = std::env::current_dir()
                         .map(|cwd| cwd.join(&path))
                         .unwrap_or_else(|_| std::path::PathBuf::from(&path));
-                    let p = abs.as_path();
-                    if !self.policy.allow_fs_write.iter().any(|a| p.starts_with(a)) {
+                    // canonicalize fails if the file doesn't exist yet (new writes).
+                    // Fall back to canonicalizing the parent so macOS /tmp → /private/tmp
+                    // symlinks still compare correctly against the allowlist.
+                    let p = std::fs::canonicalize(&raw).unwrap_or_else(|_| {
+                        raw.parent()
+                            .and_then(|par| std::fs::canonicalize(par).ok())
+                            .map(|par| par.join(raw.file_name().unwrap_or_default()))
+                            .unwrap_or(raw)
+                    });
+                    let allowed = self.policy.allow_fs_write.iter().any(|a| {
+                        let ca = std::fs::canonicalize(a).unwrap_or_else(|_| a.clone().into());
+                        p.starts_with(&ca)
+                    });
+                    if !allowed {
                         return Err(format!("write to `{path}` outside --allow-fs-write"));
                     }
                 }
@@ -1388,6 +1402,29 @@ impl EffectHandler for DefaultHandler {
                 })?;
                 let policy = self.policy.clone();
                 crate::ws::dial_ws(url, subprotocol, on_open, on_message, program, policy)
+            }
+            ("net", "dial_ws_actor") => {
+                // dial_ws_actor(url, subprotocol, name, on_open, on_message)
+                let url = expect_str(args.first())?.to_string();
+                let subprotocol = expect_str(args.get(1))?.to_string();
+                let name = expect_str(args.get(2))?.to_string();
+                let on_open = match args.get(3).cloned() {
+                    Some(c @ Value::Closure { .. }) => c,
+                    _ => return Err(
+                        "net.dial_ws_actor(url, subprotocol, name, on_open, on_message): on_open must be a closure".into(),
+                    ),
+                };
+                let on_message = match args.into_iter().nth(4) {
+                    Some(c @ Value::Closure { .. }) => c,
+                    _ => return Err(
+                        "net.dial_ws_actor(url, subprotocol, name, on_open, on_message): on_message must be a closure".into(),
+                    ),
+                };
+                let program = self.program.clone().ok_or_else(|| {
+                    "net.dial_ws_actor requires a Program reference; use DefaultHandler::with_program".to_string()
+                })?;
+                let policy = self.policy.clone();
+                crate::ws::dial_ws_actor(url, subprotocol, name, on_open, on_message, program, policy)
             }
             ("chat", "broadcast") => {
                 let registry = self.chat_registry.as_ref()
@@ -3461,15 +3498,16 @@ fn http_request(method: &str, url: &str, body: Option<&str>) -> Value {
     }
 }
 
-/// Build a ureq agent for `http.stream_lines` with a long body-read timeout.
-/// Local models (Ollama, vLLM) can spend several minutes on thinking traces
-/// before closing the stream, so the default 30-second timeout is too short.
+/// Build a ureq agent for `http.stream_lines` with a long timeout.
+/// Local models (Ollama, vLLM) can take minutes to load before they start
+/// responding, and thinking-heavy models can take minutes to finish.
+/// Use timeout_global so the limit applies to the entire operation
+/// (connect + send + recv) rather than individual phases, avoiding the
+/// 10-second default that with_config().read_to_vec() uses for body reads.
 fn http_stream_agent() -> ureq::Agent {
     use std::time::Duration;
     ureq::Agent::config_builder()
-        .timeout_connect(Some(Duration::from_secs(10)))
-        .timeout_recv_body(Some(Duration::from_secs(600)))
-        .timeout_send_body(Some(Duration::from_secs(10)))
+        .timeout_global(Some(Duration::from_secs(600)))
         .http_status_as_error(false)
         .build()
         .into()

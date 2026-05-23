@@ -652,6 +652,35 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::open_var(0).union(&EffectSet::singleton("net")),
                 Ty::Con("Result".into(), vec![Ty::Unit, Ty::str()]),
             ));
+            // dial_ws_actor[Eff] :: (Str, Str, Str,
+            //                        () -> [Eff] WsAction,
+            //                        (WsMessage) -> [Eff] WsAction)
+            //                        -> [net, Eff] Result[Unit, Str]
+            //
+            // Variant of dial_ws that registers the outgoing connection in the
+            // conc registry under `name`. conc.tell(actor, frame_str) enqueues
+            // a frame for delivery, enabling proactive sends (heartbeats,
+            // meter values) from any other actor without changing the
+            // reactive on_message signature.
+            fields.insert("dial_ws_actor".into(), Ty::function(
+                vec![
+                    Ty::str(), // url
+                    Ty::str(), // subprotocol ("" for none)
+                    Ty::str(), // conc registry name ("" to skip registration)
+                    Ty::function(
+                        vec![],
+                        EffectSet::open_var(0),
+                        Ty::Con("WsAction".into(), vec![]),
+                    ),
+                    Ty::function(
+                        vec![Ty::Con("WsMessage".into(), vec![])],
+                        EffectSet::open_var(0),
+                        Ty::Con("WsAction".into(), vec![]),
+                    ),
+                ],
+                EffectSet::open_var(0).union(&EffectSet::singleton("net")),
+                Ty::Con("Result".into(), vec![Ty::Unit, Ty::str()]),
+            ));
             // serve_fn[Eff] :: (Int, (Request) -> [Eff] Response) -> [net, Eff] Unit
             // Effect-polymorphic variant of serve that accepts a first-class closure
             // instead of a handler name. open_var(0) captures the handler's effect row

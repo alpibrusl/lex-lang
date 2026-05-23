@@ -318,6 +318,26 @@ runtime does not treat this as a hung effect.
 For connection pooling, pub/sub fan-out helpers, and work-queue retry
 logic use `lex-queue`, which builds on top of `std.redis`.
 
+### 3.8 WebSocket clients: `net.dial_ws` / `net.dial_ws_actor` (SHOULD)
+
+Both functions block for the lifetime of the connection — call them from
+`conc.spawn`.
+
+`net.dial_ws(url, subprotocol, on_open, on_message)` — reactive client.
+Each callback returns exactly one `WsAction` (`ws.send(frame)` or
+`ws.noop()`). No proactive sends beyond that one return value.
+
+`net.dial_ws_actor(url, subprotocol, name, on_open, on_message)` — same
+reactive interface, plus the connection is registered in the `conc`
+registry under `name`. Other actors (heartbeat loops, meter-value timers)
+can push frames at any time via `conc.tell(conc.lookup(name), frame_str)`;
+the runtime delivers them on the next 50 ms read-timeout tick.
+Unregisters automatically on disconnect.
+
+Use `dial_ws_actor` whenever the client must send unsolicited frames
+(OCPP Heartbeat, OCPP MeterValues, keep-alives). Use `dial_ws` for
+purely request/response clients.
+
 ---
 
 ## 4. The repair-not-regenerate rule

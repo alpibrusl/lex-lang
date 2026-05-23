@@ -987,6 +987,191 @@ fn stream_for(
     }
 }
 
+// ── dial_ws_actor — outbound-bridge actor for WS clients (#dial-actor) ──────
+//
+// Variant of `dial_ws` that registers the outgoing connection as a named
+// actor in the conc registry, enabling `conc.tell(actor, frame_str)` to push
+// frames into the socket from any other Lex actor (heartbeat timers,
+// meter-value loops, etc.).
+//
+//   net.dial_ws_actor(
+//     url         :: Str,
+//     subprotocol :: Str,
+//     name        :: Str,               — conc registry key ("" to skip)
+//     on_open     :: () -> [E] WsAction,
+//     on_message  :: (WsMessage) -> [E] WsAction
+//   ) -> [net, E] Result[Unit, Str]
+pub fn dial_ws_actor(
+    url: String,
+    subprotocol: String,
+    name: String,
+    on_open: Value,
+    on_message: Value,
+    program: Arc<Program>,
+    policy: Policy,
+) -> Result<Value, String> {
+    use tungstenite::client::IntoClientRequest;
+    use tungstenite::http::HeaderValue;
+
+    let mut req = match url.as_str().into_client_request() {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(build_dial_result(Err(format!(
+                "net.dial_ws_actor: bad URL `{url}`: {e}"
+            ))));
+        }
+    };
+    if !subprotocol.is_empty() {
+        let header = match HeaderValue::from_str(&subprotocol) {
+            Ok(h) => h,
+            Err(e) => {
+                return Ok(build_dial_result(Err(format!(
+                    "net.dial_ws_actor: invalid subprotocol `{subprotocol}`: {e}"
+                ))));
+            }
+        };
+        req.headers_mut().insert("Sec-WebSocket-Protocol", header);
+    }
+
+    let (mut ws, _resp) = match tungstenite::connect(req) {
+        Ok(pair) => pair,
+        Err(e) => {
+            return Ok(build_dial_result(Err(format!(
+                "net.dial_ws_actor: connect to `{url}`: {e}"
+            ))));
+        }
+    };
+    if let Some(stream) = stream_for(&mut ws) {
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+    }
+
+    // Set up the actor bridge — mpsc channel whose Sender end is wrapped in a
+    // native actor cell registered in the conc registry.
+    let (tx, rx) = mpsc::channel::<String>();
+    if !name.is_empty() {
+        let tx_for_bridge = tx.clone();
+        let bridge = lex_bytecode::value::NativeActorHandler {
+            send: Box::new(move |msg: Value| -> Result<Value, String> {
+                match msg {
+                    Value::Str(s) => tx_for_bridge
+                        .send(s.to_string())
+                        .map(|_| Value::Unit)
+                        .map_err(|e| format!("net.dial_ws_actor: outbound channel closed: {e}")),
+                    other => Err(format!(
+                        "net.dial_ws_actor: native bridge accepts Str only, got {other:?}"
+                    )),
+                }
+            }),
+        };
+        let cell = Value::Actor(Arc::new(Mutex::new(lex_bytecode::value::ActorCell {
+            state: Value::Unit,
+            handler: lex_bytecode::value::ActorHandler::Native(Arc::new(bridge)),
+        })));
+        if let Err(e) = lex_bytecode::conc_registry::register(&name, cell) {
+            return Ok(build_dial_result(Err(format!(
+                "net.dial_ws_actor: conc.register({name:?}) failed: {e:?}"
+            ))));
+        }
+    }
+
+    // Fire on_open once, apply its WsAction to the socket.
+    {
+        let handler = crate::handler::DefaultHandler::new(policy.clone())
+            .with_program(Arc::clone(&program));
+        let mut vm = Vm::with_handler(&program, Box::new(handler));
+        match vm.invoke_closure_value(on_open.clone(), vec![]) {
+            Ok(action) => {
+                if let Err(e) = apply_ws_action(&action, &mut ws) {
+                    if !name.is_empty() {
+                        let _ = lex_bytecode::conc_registry::unregister(&name);
+                    }
+                    return Ok(build_dial_result(Err(format!(
+                        "net.dial_ws_actor: on_open action: {e}"
+                    ))));
+                }
+            }
+            Err(e) => {
+                if !name.is_empty() {
+                    let _ = lex_bytecode::conc_registry::unregister(&name);
+                }
+                return Ok(build_dial_result(Err(format!(
+                    "net.dial_ws_actor: on_open: {e}"
+                ))));
+            }
+        }
+    }
+
+    let loop_result = dial_actor_run_loop(&mut ws, &rx, &on_message, &program, &policy);
+    if !name.is_empty() {
+        let _ = lex_bytecode::conc_registry::unregister(&name);
+    }
+    let _ = ws.close(None);
+    Ok(build_dial_result(loop_result))
+}
+
+fn dial_actor_run_loop(
+    ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+    rx: &mpsc::Receiver<String>,
+    on_message: &Value,
+    program: &Arc<Program>,
+    policy: &Policy,
+) -> Result<(), String> {
+    use std::io::ErrorKind;
+    use tungstenite::Message;
+
+    loop {
+        let ws_msg = match ws.read() {
+            Ok(Message::Text(body)) => Some(build_ws_message_text(&body)),
+            Ok(Message::Binary(payload)) => Some(build_ws_message_binary(&payload)),
+            Ok(Message::Ping(_)) => Some(build_ws_message_ping()),
+            Ok(Message::Close(_)) | Err(tungstenite::Error::ConnectionClosed) => {
+                let handler = crate::handler::DefaultHandler::new(policy.clone())
+                    .with_program(Arc::clone(program));
+                let mut vm = Vm::with_handler(program, Box::new(handler));
+                let _ = vm.invoke_closure_value(
+                    on_message.clone(),
+                    vec![build_ws_message_close()],
+                );
+                return Ok(());
+            }
+            Ok(_) => None,
+            Err(tungstenite::Error::Io(ref e))
+                if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
+            {
+                None
+            }
+            Err(e) => return Err(format!("net.dial_ws_actor: read: {e}")),
+        };
+
+        if let Some(msg) = ws_msg {
+            let handler = crate::handler::DefaultHandler::new(policy.clone())
+                .with_program(Arc::clone(program));
+            let mut vm = Vm::with_handler(program, Box::new(handler));
+            match vm.invoke_closure_value(on_message.clone(), vec![msg]) {
+                Ok(action) => {
+                    if let Err(e) = apply_ws_action(&action, ws) {
+                        return Err(format!("net.dial_ws_actor: action: {e}"));
+                    }
+                }
+                Err(e) => return Err(format!("net.dial_ws_actor: on_message: {e}")),
+            }
+        }
+
+        // Drain the actor mailbox — frames enqueued by conc.tell(actor, frame).
+        loop {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    if let Err(e) = ws.send(Message::Text(msg.into())) {
+                        return Err(format!("net.dial_ws_actor: send: {e}"));
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
+            }
+        }
+    }
+}
+
 fn dial_run_loop(
     ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
     on_message: &Value,
