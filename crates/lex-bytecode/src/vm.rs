@@ -1825,10 +1825,19 @@ impl<'a> Vm<'a> {
                     self.stack.push(acc);
                 }
                 Op::Call { fn_id, arity, node_id_idx } => {
-                    let mut args: Vec<Value> = (0..arity).map(|_| Value::Unit).collect();
-                    for i in (0..arity as usize).rev() { args[i] = self.pop()?; }
+                    let arity = arity as usize;
+                    let fid = fn_id as usize;
+                    // Args sit on the value stack at [args_base..]. We
+                    // read them in place for the refinement / memo /
+                    // trace checks and only move them into the locals
+                    // slot-allocator at the very end — avoiding a
+                    // per-call args Vec (#464 call-overhead). The stack
+                    // naturally holds the args until consumed, so the
+                    // only early-exit cleanup is truncating them off on
+                    // a memo hit; a refinement error aborts the VM.
+                    let args_base = self.stack.len() - arity;
                     let node_id = const_str(&self.program.constants, node_id_idx);
-                    let budget_cost = call_budget_cost(&self.program.functions[fn_id as usize]);
+                    let budget_cost = call_budget_cost(&self.program.functions[fid]);
                     if budget_cost > 0 {
                         self.handler.note_call_budget(budget_cost)
                             .map_err(VmError::Effect)?;
@@ -1843,19 +1852,18 @@ impl<'a> Vm<'a> {
                     // (same shape as `gate.verdict`).
                     //
                     // Iterate by reference — the loop body reads only
-                    // through `r` (borrowed from `self.program`) and
-                    // locals; we don't mutate `self` in here, so the
-                    // borrow is fine and we avoid one Vec allocation
-                    // per call on the hot path (#461).
-                    let refinements = &self.program.functions[fn_id as usize].refinements;
+                    // through `r` (borrowed from `self.program`) and the
+                    // arg slots on the stack; we don't mutate `self`, so
+                    // the borrows are disjoint.
+                    let refinements = &self.program.functions[fid].refinements;
                     for (i, refinement) in refinements.iter().enumerate() {
                         if let Some(r) = refinement {
-                            let arg = args.get(i).cloned().unwrap_or(Value::Unit);
+                            let arg = self.stack[args_base + i].clone();
                             match eval_refinement(&r.predicate, &r.binding, &arg) {
                                 Ok(true) => { /* satisfied, continue */ }
                                 Ok(false) => {
                                     return Err(VmError::RefinementFailed {
-                                        fn_name: self.program.functions[fn_id as usize].name.clone(),
+                                        fn_name: self.program.functions[fid].name.clone(),
                                         param_index: i,
                                         binding: r.binding.clone(),
                                         reason: format!(
@@ -1865,7 +1873,7 @@ impl<'a> Vm<'a> {
                                 }
                                 Err(reason) => {
                                     return Err(VmError::RefinementFailed {
-                                        fn_name: self.program.functions[fn_id as usize].name.clone(),
+                                        fn_name: self.program.functions[fid].name.clone(),
                                         param_index: i,
                                         binding: r.binding.clone(),
                                         reason,
@@ -1885,13 +1893,15 @@ impl<'a> Vm<'a> {
                     // function whose args never repeat pays the hash for
                     // nothing; after a warmup window with zero hits we
                     // disable it and its calls take the plain path below.
-                    let f = &self.program.functions[fn_id as usize];
-                    let fid = fn_id as usize;
                     let memo_key: Option<(u32, [u8; 16])> =
-                        if f.effects.is_empty() && self.memo_fn_state[fid].enabled {
-                            Some((fn_id, hash_call_args(&args)))
+                        if self.program.functions[fid].effects.is_empty()
+                            && self.memo_fn_state[fid].enabled
+                        {
+                            Some((fn_id, hash_call_args(&self.stack[args_base..])))
                         } else {
-                            if f.effects.is_empty() { self.pure_memo_skips += 1; }
+                            if self.program.functions[fid].effects.is_empty() {
+                                self.pure_memo_skips += 1;
+                            }
                             None
                         };
                     if let Some(key) = memo_key {
@@ -1899,8 +1909,9 @@ impl<'a> Vm<'a> {
                         if let Some(cached) = self.pure_memo.get(&key).cloned() {
                             self.memo_fn_state[fid].hits += 1;
                             self.pure_memo_hits += 1;
-                            self.tracer.enter_call(&node_id, &self.program.functions[fn_id as usize].name, &args);
+                            self.tracer.enter_call(&node_id, &self.program.functions[fid].name, &self.stack[args_base..]);
                             self.tracer.exit_ok(&cached);
+                            self.stack.truncate(args_base);
                             self.stack.push(cached);
                             continue;
                         }
@@ -1913,12 +1924,15 @@ impl<'a> Vm<'a> {
                             st.enabled = false;
                         }
                     }
-                    self.tracer.enter_call(&node_id, &self.program.functions[fn_id as usize].name, &args);
+                    self.tracer.enter_call(&node_id, &self.program.functions[fid].name, &self.stack[args_base..]);
+                    let locals_len = self.program.functions[fid].locals_count
+                        .max(self.program.functions[fid].arity) as usize;
                     let locals_start = self.locals_storage.len();
-                    let locals_len = f.locals_count.max(f.arity) as usize;
                     self.locals_storage.resize(locals_start + locals_len, Value::Unit);
-                    for (i, v) in args.into_iter().enumerate() {
-                        self.locals_storage[locals_start + i] = v;
+                    // Move the args off the stack into the callee's
+                    // locals (popping leaves the stack at `args_base`).
+                    for i in (0..arity).rev() {
+                        self.locals_storage[locals_start + i] = self.pop()?;
                     }
                     self.push_frame(Frame {
                         fn_id, pc: 0, locals_start, locals_len,
