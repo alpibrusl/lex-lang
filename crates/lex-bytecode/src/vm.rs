@@ -1660,7 +1660,6 @@ impl<'a> Vm<'a> {
                         other => return Err(VmError::TypeMismatch(format!("CallClosure on non-closure: {other:?}"))),
                     };
                     let node_id = const_str(&self.program.constants, node_id_idx);
-                    let callee_name = self.program.functions[fn_id as usize].name.clone();
                     let budget_cost = call_budget_cost(&self.program.functions[fn_id as usize]);
                     if budget_cost > 0 {
                         self.handler.note_call_budget(budget_cost)
@@ -1668,7 +1667,7 @@ impl<'a> Vm<'a> {
                     }
                     let mut combined = captures;
                     combined.extend(args);
-                    self.tracer.enter_call(&node_id, &callee_name, &combined);
+                    self.tracer.enter_call(&node_id, &self.program.functions[fn_id as usize].name, &combined);
                     let f = &self.program.functions[fn_id as usize];
                     let locals_start = self.locals_storage.len();
                     let locals_len = f.locals_count.max(f.arity) as usize;
@@ -1829,7 +1828,6 @@ impl<'a> Vm<'a> {
                     let mut args: Vec<Value> = (0..arity).map(|_| Value::Unit).collect();
                     for i in (0..arity as usize).rev() { args[i] = self.pop()?; }
                     let node_id = const_str(&self.program.constants, node_id_idx);
-                    let callee_name = self.program.functions[fn_id as usize].name.clone();
                     let budget_cost = call_budget_cost(&self.program.functions[fn_id as usize]);
                     if budget_cost > 0 {
                         self.handler.note_call_budget(budget_cost)
@@ -1857,7 +1855,7 @@ impl<'a> Vm<'a> {
                                 Ok(true) => { /* satisfied, continue */ }
                                 Ok(false) => {
                                     return Err(VmError::RefinementFailed {
-                                        fn_name: callee_name.clone(),
+                                        fn_name: self.program.functions[fn_id as usize].name.clone(),
                                         param_index: i,
                                         binding: r.binding.clone(),
                                         reason: format!(
@@ -1867,7 +1865,7 @@ impl<'a> Vm<'a> {
                                 }
                                 Err(reason) => {
                                     return Err(VmError::RefinementFailed {
-                                        fn_name: callee_name.clone(),
+                                        fn_name: self.program.functions[fn_id as usize].name.clone(),
                                         param_index: i,
                                         binding: r.binding.clone(),
                                         reason,
@@ -1901,7 +1899,7 @@ impl<'a> Vm<'a> {
                         if let Some(cached) = self.pure_memo.get(&key).cloned() {
                             self.memo_fn_state[fid].hits += 1;
                             self.pure_memo_hits += 1;
-                            self.tracer.enter_call(&node_id, &callee_name, &args);
+                            self.tracer.enter_call(&node_id, &self.program.functions[fn_id as usize].name, &args);
                             self.tracer.exit_ok(&cached);
                             self.stack.push(cached);
                             continue;
@@ -1915,7 +1913,7 @@ impl<'a> Vm<'a> {
                             st.enabled = false;
                         }
                     }
-                    self.tracer.enter_call(&node_id, &callee_name, &args);
+                    self.tracer.enter_call(&node_id, &self.program.functions[fn_id as usize].name, &args);
                     let locals_start = self.locals_storage.len();
                     let locals_len = f.locals_count.max(f.arity) as usize;
                     self.locals_storage.resize(locals_start + locals_len, Value::Unit);
@@ -1935,7 +1933,6 @@ impl<'a> Vm<'a> {
                     let mut args: Vec<Value> = (0..arity).map(|_| Value::Unit).collect();
                     for i in (0..arity as usize).rev() { args[i] = self.pop()?; }
                     let node_id = const_str(&self.program.constants, node_id_idx);
-                    let callee_name = self.program.functions[fn_id as usize].name.clone();
                     let budget_cost = call_budget_cost(&self.program.functions[fn_id as usize]);
                     if budget_cost > 0 {
                         self.handler.note_call_budget(budget_cost)
@@ -1952,7 +1949,7 @@ impl<'a> Vm<'a> {
                             match eval_refinement(&r.predicate, &r.binding, &arg) {
                                 Ok(true) => {}
                                 Ok(false) => return Err(VmError::RefinementFailed {
-                                    fn_name: callee_name.clone(),
+                                    fn_name: self.program.functions[fn_id as usize].name.clone(),
                                     param_index: i,
                                     binding: r.binding.clone(),
                                     reason: format!(
@@ -1960,7 +1957,7 @@ impl<'a> Vm<'a> {
                                         r.binding),
                                 }),
                                 Err(reason) => return Err(VmError::RefinementFailed {
-                                    fn_name: callee_name.clone(),
+                                    fn_name: self.program.functions[fn_id as usize].name.clone(),
                                     param_index: i,
                                     binding: r.binding.clone(),
                                     reason,
@@ -1972,7 +1969,7 @@ impl<'a> Vm<'a> {
                     // opens a new one in its place — preserves the caller's
                     // tree depth in the trace.
                     self.tracer.exit_call_tail();
-                    self.tracer.enter_call(&node_id, &callee_name, &args);
+                    self.tracer.enter_call(&node_id, &self.program.functions[fn_id as usize].name, &args);
                     let f = &self.program.functions[fn_id as usize];
                     // Reuse the current frame's locals_start position:
                     // truncate to release old locals then extend for the
