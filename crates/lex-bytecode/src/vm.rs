@@ -1726,6 +1726,73 @@ impl<'a> Vm<'a> {
                     let results = par_map_run(self.program, f, items.into_iter().collect(), worker_handlers)?;
                     self.stack.push(Value::List(results.into()));
                 }
+                Op::ListMap { node_id_idx: _ } => {
+                    // #464: native map. Owns `xs` (no per-iteration
+                    // clone of the input or accumulator that the old
+                    // inlined `LoadLocal`-based loop incurred) and
+                    // builds the output with one pre-sized allocation.
+                    let f = self.pop()?;
+                    let xs = self.pop()?;
+                    let items = match xs {
+                        Value::List(v) => v,
+                        other => return Err(VmError::TypeMismatch(
+                            format!("ListMap requires a List, got: {other:?}"))),
+                    };
+                    if !matches!(f, Value::Closure { .. }) {
+                        return Err(VmError::TypeMismatch(
+                            format!("ListMap requires a closure, got: {f:?}")));
+                    }
+                    let mut out: VecDeque<Value> = VecDeque::with_capacity(items.len());
+                    for item in items {
+                        out.push_back(self.invoke_closure_value(f.clone(), vec![item])?);
+                    }
+                    self.stack.push(Value::List(out));
+                }
+                Op::ListFilter { node_id_idx: _ } => {
+                    // #464: native filter. Pred is applied to a clone
+                    // of each element; the original element is kept on
+                    // a true result.
+                    let f = self.pop()?;
+                    let xs = self.pop()?;
+                    let items = match xs {
+                        Value::List(v) => v,
+                        other => return Err(VmError::TypeMismatch(
+                            format!("ListFilter requires a List, got: {other:?}"))),
+                    };
+                    if !matches!(f, Value::Closure { .. }) {
+                        return Err(VmError::TypeMismatch(
+                            format!("ListFilter requires a closure, got: {f:?}")));
+                    }
+                    let mut out: VecDeque<Value> = VecDeque::new();
+                    for item in items {
+                        let keep = self.invoke_closure_value(f.clone(), vec![item.clone()])?;
+                        if keep.as_bool() {
+                            out.push_back(item);
+                        }
+                    }
+                    self.stack.push(Value::List(out));
+                }
+                Op::ListFold { node_id_idx: _ } => {
+                    // #464: native left-fold. `acc` is threaded by
+                    // value; each element is moved into the combiner.
+                    let f = self.pop()?;
+                    let init = self.pop()?;
+                    let xs = self.pop()?;
+                    let items = match xs {
+                        Value::List(v) => v,
+                        other => return Err(VmError::TypeMismatch(
+                            format!("ListFold requires a List, got: {other:?}"))),
+                    };
+                    if !matches!(f, Value::Closure { .. }) {
+                        return Err(VmError::TypeMismatch(
+                            format!("ListFold requires a closure, got: {f:?}")));
+                    }
+                    let mut acc = init;
+                    for item in items {
+                        acc = self.invoke_closure_value(f.clone(), vec![acc, item])?;
+                    }
+                    self.stack.push(acc);
+                }
                 Op::Call { fn_id, arity, node_id_idx } => {
                     let mut args: Vec<Value> = (0..arity).map(|_| Value::Unit).collect();
                     for i in (0..arity as usize).rev() { args[i] = self.pop()?; }

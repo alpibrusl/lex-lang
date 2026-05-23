@@ -445,9 +445,15 @@ fn step(pc: usize, op: &Op, mut s: State) -> (State, Vec<usize>, HashSet<u32>) {
             pop_n_leak(&mut s, *arity as usize + 1, &mut escapes);
             s.stack.push(Slot::Other);
         }
-        Op::SortByKey { .. } | Op::ParallelMap { .. } => {
+        Op::SortByKey { .. } | Op::ParallelMap { .. }
+        | Op::ListMap { .. } | Op::ListFilter { .. } => {
             // pop [xs, f]; both escape
             pop_n_leak(&mut s, 2, &mut escapes);
+            s.stack.push(Slot::Other);
+        }
+        Op::ListFold { .. } => {
+            // pop [xs, init, f]; all escape into the native op
+            pop_n_leak(&mut s, 3, &mut escapes);
             s.stack.push(Slot::Other);
         }
         Op::EffectCall { arity, .. } => {
