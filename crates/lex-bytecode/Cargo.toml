@@ -37,3 +37,7 @@ harness = false
 [[bench]]
 name = "response_build"
 harness = false
+
+[[bench]]
+name = "tuple_build"
+harness = false
