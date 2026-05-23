@@ -1058,6 +1058,36 @@ impl<'a> Vm<'a> {
         self.invoke(fn_id, combined)
     }
 
+    /// Invoke a 1-arg closure without allocating a separate args
+    /// `Vec` (#464 call-overhead). The closure's own `captures` Vec
+    /// is reused as the combined `captures ++ [arg]` argument buffer,
+    /// so the per-element call in `ListMap`/`ListFilter`/`SortByKey`
+    /// allocates at most once (the `push`) instead of twice (a fresh
+    /// `vec![arg]` plus the `extend`). Semantically identical to
+    /// `invoke_closure_value(closure, vec![arg])`.
+    pub fn invoke_closure_1(&mut self, closure: Value, arg: Value) -> Result<Value, VmError> {
+        let (fn_id, mut combined) = match closure {
+            Value::Closure { fn_id, captures, .. } => (fn_id, captures),
+            other => return Err(VmError::TypeMismatch(
+                format!("invoke_closure_1: not a closure: {other:?}"))),
+        };
+        combined.push(arg);
+        self.invoke(fn_id, combined)
+    }
+
+    /// Invoke a 2-arg closure without a separate args `Vec` — the
+    /// `ListFold` combiner path. See `invoke_closure_1`.
+    pub fn invoke_closure_2(&mut self, closure: Value, a: Value, b: Value) -> Result<Value, VmError> {
+        let (fn_id, mut combined) = match closure {
+            Value::Closure { fn_id, captures, .. } => (fn_id, captures),
+            other => return Err(VmError::TypeMismatch(
+                format!("invoke_closure_2: not a closure: {other:?}"))),
+        };
+        combined.push(a);
+        combined.push(b);
+        self.invoke(fn_id, combined)
+    }
+
     /// Open a request-scoped arena via the underlying
     /// `EffectHandler::enter_request_scope` (#463 scaffolding).
     /// Runtime layers — `net.serve_fn`, `net.serve_ws`,
@@ -1090,25 +1120,27 @@ impl<'a> Vm<'a> {
         // this branch covers `vm.call("entry", ...)` from the host
         // and the reentrant `invoke_closure_value` path. Same
         // semantics, same error shape.
-        let f_name = f.name.clone();
+        //
         // Iterate `f.refinements` by reference — the loop body
         // only reads from `self.program` (via `r`) and from locals,
         // so we don't need to clone the Vec to detach it from
-        // `&self`. Removing this clone saves an allocation per
-        // call on the hot path (#461).
+        // `&self`. The function name is cloned **lazily**, only on
+        // the failure path: functions with no refinements (the common
+        // case) never enter the loop, so the per-call `f.name.clone()`
+        // was pure waste on the hot path (#464 call-overhead).
         for (i, refinement) in f.refinements.iter().enumerate() {
             if let Some(r) = refinement {
                 let arg = args.get(i).cloned().unwrap_or(Value::Unit);
                 match eval_refinement(&r.predicate, &r.binding, &arg) {
                     Ok(true) => {}
                     Ok(false) => return Err(VmError::RefinementFailed {
-                        fn_name: f_name,
+                        fn_name: f.name.clone(),
                         param_index: i,
                         binding: r.binding.clone(),
                         reason: format!("predicate failed for {} = {arg:?}", r.binding),
                     }),
                     Err(reason) => return Err(VmError::RefinementFailed {
-                        fn_name: f_name,
+                        fn_name: f.name.clone(),
                         param_index: i,
                         binding: r.binding.clone(),
                         reason,
@@ -1678,7 +1710,7 @@ impl<'a> Vm<'a> {
                     }
                     let mut keyed: Vec<(Value, Value)> = Vec::with_capacity(items.len());
                     for item in items {
-                        let key = self.invoke_closure_value(f.clone(), vec![item.clone()])?;
+                        let key = self.invoke_closure_1(f.clone(), item.clone())?;
                         keyed.push((key, item));
                     }
                     keyed.sort_by(|(ka, _), (kb, _)| compare_sort_keys(ka, kb));
@@ -1744,7 +1776,7 @@ impl<'a> Vm<'a> {
                     }
                     let mut out: VecDeque<Value> = VecDeque::with_capacity(items.len());
                     for item in items {
-                        out.push_back(self.invoke_closure_value(f.clone(), vec![item])?);
+                        out.push_back(self.invoke_closure_1(f.clone(), item)?);
                     }
                     self.stack.push(Value::List(out));
                 }
@@ -1765,7 +1797,7 @@ impl<'a> Vm<'a> {
                     }
                     let mut out: VecDeque<Value> = VecDeque::new();
                     for item in items {
-                        let keep = self.invoke_closure_value(f.clone(), vec![item.clone()])?;
+                        let keep = self.invoke_closure_1(f.clone(), item.clone())?;
                         if keep.as_bool() {
                             out.push_back(item);
                         }
@@ -1789,7 +1821,7 @@ impl<'a> Vm<'a> {
                     }
                     let mut acc = init;
                     for item in items {
-                        acc = self.invoke_closure_value(f.clone(), vec![acc, item])?;
+                        acc = self.invoke_closure_2(f.clone(), acc, item)?;
                     }
                     self.stack.push(acc);
                 }
