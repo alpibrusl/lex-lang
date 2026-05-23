@@ -132,6 +132,23 @@ pub enum Op {
     /// runtime with `VmError::Effect`. The per-thread effect handler
     /// split is queued as slice 2.
     ParallelMap { node_id_idx: u32 },
+    /// Map a list (#464 list-builder fast path). Stack: `[xs, f]` (xs
+    /// underneath). Pops the closure `f` and list `xs`, applies `f` to
+    /// each element, pushes the result list. Native opcode (mirrors
+    /// `SortByKey`/`ParallelMap`) rather than an inlined bytecode loop:
+    /// the loop form re-`LoadLocal`'d (cloned) the whole input and
+    /// accumulator lists each iteration — O(n²) — whereas the VM here
+    /// owns `xs` and builds the output with one pre-sized allocation.
+    ListMap { node_id_idx: u32 },
+    /// Filter a list (#464). Stack: `[xs, pred]`. Pops `pred` and `xs`,
+    /// keeps the elements for which `pred(x)` is true. Native, same
+    /// rationale as `ListMap`.
+    ListFilter { node_id_idx: u32 },
+    /// Left-fold a list (#464). Stack: `[xs, init, f]` (xs deepest).
+    /// Pops `f`, `init`, `xs`; threads `acc = f(acc, x)` from `init`
+    /// over the elements; pushes the final `acc`. Native, same
+    /// rationale as `ListMap`.
+    ListFold { node_id_idx: u32 },
     /// EFFECT_CALL `<effect_kind_const_idx>` `<op_name_const_idx>` `<arity>`.
     /// Pops `arity` args, dispatches to a host effect handler, pushes result.
     /// `node_id_idx` points to a `Const::NodeId` for trace keying.

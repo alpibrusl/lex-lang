@@ -205,6 +205,11 @@ fn stack_delta(op: &Op) -> i32 {
         // Higher-order ops: pop list + fn, push result list
         Op::SortByKey { .. }  => -1,
         Op::ParallelMap { .. }=> -1,
+        // #464 native list builders. map/filter pop [xs, f] push 1;
+        // fold pops [xs, init, f] push 1.
+        Op::ListMap { .. }    => -1,
+        Op::ListFilter { .. } => -1,
+        Op::ListFold { .. }   => -2,
 
         // Terminators
         Op::Return  => -1,  // pop return value
