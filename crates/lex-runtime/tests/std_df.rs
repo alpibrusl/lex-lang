@@ -1,6 +1,10 @@
 //! Integration tests for `std.df` (#427). Each test builds an
 //! `arrow.Table` via `std.arrow`, runs a Polars-backed kernel, and
 //! checks the resulting Table shape / values.
+//!
+//! Gated on the `df` feature (Polars). With `--no-default-features`
+//! the `std.df` ops aren't compiled in, so these tests are skipped.
+#![cfg(feature = "df")]
 
 use lex_ast::canonicalize_program;
 use lex_bytecode::{compile_program, vm::Vm, Value};
