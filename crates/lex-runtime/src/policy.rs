@@ -13,11 +13,27 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-/// Policy a program is run under. Empty allowlist = pure-only execution.
+/// Policy a program is run under. Empty `allow_effects` = pure-only
+/// execution.
+///
+/// **Wildcard scopes (read before embedding):** the scope lists
+/// (`allow_fs_read`, `allow_fs_write`, `allow_net_host`, `allow_proc`)
+/// follow an **empty = allow ANY** convention, *not* empty = deny.
+/// Granting a scoped effect in `allow_effects` while leaving its scope
+/// list empty therefore opens the *unrestricted* form (any path / host
+/// / binary). That's intentional for trusted local use (`lex run`),
+/// but it's a footgun for embedders that build a `Policy` from
+/// untrusted input. Such embedders should populate the scope list for
+/// every kind they grant, or call [`Policy::wildcard_scoped_grants`]
+/// to detect the wide-open ones and refuse them. (#552)
 #[derive(Debug, Clone, Default)]
 pub struct Policy {
     pub allow_effects: BTreeSet<String>,
+    /// Path scope for the `[fs_read]` effect. **Empty = any path**
+    /// (wildcard), not deny — see the type-level note above (#552).
     pub allow_fs_read: Vec<PathBuf>,
+    /// Path scope for the `[fs_write]` effect. **Empty = any path**
+    /// (wildcard), not deny — see the type-level note above (#552).
     pub allow_fs_write: Vec<PathBuf>,
     /// Per-host scope on the [net] effect. Empty = any host (when
     /// [net] is in `allow_effects`); non-empty = only requests to
@@ -39,6 +55,33 @@ pub struct Policy {
 
 impl Policy {
     pub fn pure() -> Self { Self::default() }
+
+    /// Report the granted *scoped* effects whose scope list is empty —
+    /// i.e. the ones the runtime treats as unrestricted ("any"):
+    /// `proc` (any binary), `net` (any host), `fs_read` / `fs_write`
+    /// (any path). Returns an empty vec when no granted kind is left
+    /// wide open.
+    ///
+    /// Intended for embedders that expose execution to untrusted
+    /// callers: build the effective `Policy`, then refuse to run (or
+    /// loudly log) if this returns non-empty. Pure / `time` / `rand`
+    /// grants never appear here — they have no scope. (#552)
+    pub fn wildcard_scoped_grants(&self) -> Vec<&'static str> {
+        let mut open = Vec::new();
+        if self.allow_effects.contains("proc") && self.allow_proc.is_empty() {
+            open.push("proc");
+        }
+        if self.allow_effects.contains("net") && self.allow_net_host.is_empty() {
+            open.push("net");
+        }
+        if self.allow_effects.contains("fs_read") && self.allow_fs_read.is_empty() {
+            open.push("fs_read");
+        }
+        if self.allow_effects.contains("fs_write") && self.allow_fs_write.is_empty() {
+            open.push("fs_write");
+        }
+        open
+    }
 
     pub fn permissive() -> Self {
         let mut s = BTreeSet::new();
@@ -250,4 +293,48 @@ fn parse_grant(s: &str) -> (&str, Option<&str>) {
         return (name, Some(arg));
     }
     (s, None)
+}
+
+#[cfg(test)]
+mod wildcard_tests {
+    use super::*;
+
+    fn effects(kinds: &[&str]) -> BTreeSet<String> {
+        kinds.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn flags_scoped_grants_left_open() {
+        let p = Policy {
+            allow_effects: effects(&["proc", "fs_read", "time"]),
+            ..Policy::default()
+        };
+        let open = p.wildcard_scoped_grants();
+        assert!(open.contains(&"proc"), "empty allow_proc + [proc] is wide open");
+        assert!(open.contains(&"fs_read"), "empty allow_fs_read + [fs_read] is wide open");
+        // `time` has no scope and `net` wasn't granted.
+        assert!(!open.contains(&"time"));
+        assert!(!open.contains(&"net"));
+    }
+
+    #[test]
+    fn populated_scope_is_not_flagged() {
+        let p = Policy {
+            allow_effects: effects(&["fs_read", "net"]),
+            allow_fs_read: vec![PathBuf::from("/srv/data")],
+            allow_net_host: vec!["api.example.com".into()],
+            ..Policy::default()
+        };
+        assert!(p.wildcard_scoped_grants().is_empty());
+    }
+
+    #[test]
+    fn pure_and_unscoped_effects_are_clean() {
+        assert!(Policy::pure().wildcard_scoped_grants().is_empty());
+        let p = Policy {
+            allow_effects: effects(&["time", "rand", "panic"]),
+            ..Policy::default()
+        };
+        assert!(p.wildcard_scoped_grants().is_empty());
+    }
 }
