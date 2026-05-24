@@ -36,6 +36,10 @@ pub mod handlers;
 mod web;
 pub mod mcp;
 
+/// Re-exported so embedders can build a [`handlers::State::policy_ceiling`]
+/// without taking a direct dependency on `lex-runtime`.
+pub use lex_runtime::Policy;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
