@@ -68,12 +68,20 @@ parquet = { version = "58", default-features = false, features = ["arrow", "snap
 # `strings`; add `temporal` explicitly so `strings`'s string ops still
 # compile. Found the hard way during the arrow-55→58 / polars-0.50→0.53
 # coordinated bump.
-polars = { version = "0.53", default-features = false, features = ["lazy", "is_in", "csv", "performant", "strings", "temporal"] }
+polars = { version = "0.53", optional = true, default-features = false, features = ["lazy", "is_in", "csv", "performant", "strings", "temporal"] }
 lex-bytecode = { path = "../lex-bytecode", version = "0.9.5" }
 smol_str = { workspace = true }
 
 [features]
-default = []
+default = ["df"]
+# `df` gates the Polars-backed `std.df` query ops (filter / sort /
+# group_by / join). Polars pulls a heavy dep tree (polars-arrow, …)
+# that embedders like lex-hub don't need and that has conflicted on
+# `chrono`'s `std` feature in the past. On by default for the `lex`
+# toolchain; API/embedder consumers drop it with
+# `default-features = false`. `std.arrow` (arrow-rs) stays available
+# regardless — only the polars-backed query layer is gated.
+df = ["dep:polars"]
 # `quic` brings in quinn / h3 / rcgen / rustls + rustls-pemfile. Off
 # by default to keep `cargo build` slim; enable with `--features quic`
 # to use `net.serve_quic`, `tls.from_pem_files`, or `tls.self_signed`.

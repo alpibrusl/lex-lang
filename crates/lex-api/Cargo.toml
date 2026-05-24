@@ -20,7 +20,12 @@ lex-syntax = { path = "../lex-syntax", version = "0.9.5" }
 lex-ast = { path = "../lex-ast", version = "0.9.5" }
 lex-types = { path = "../lex-types", version = "0.9.5" }
 lex-bytecode = { path = "../lex-bytecode", version = "0.9.5" }
-lex-runtime = { path = "../lex-runtime", version = "0.9.5" }
+# `default-features = false` drops the `df` (Polars) feature: lex-api
+# and its embedders (lex-hub) never call `std.df`, and polars pulls a
+# heavy dep tree that has conflicted on `chrono`. `std.arrow` is
+# unaffected. Workspace builds that include lex-cli still get `df` via
+# feature unification, so the toolchain is unchanged.
+lex-runtime = { path = "../lex-runtime", version = "0.9.5", default-features = false }
 lex-store = { path = "../lex-store", version = "0.9.5" }
 lex-trace = { path = "../lex-trace", version = "0.9.5" }
 lex-vcs = { path = "../lex-vcs", version = "0.9.5" }

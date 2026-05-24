@@ -1614,11 +1614,19 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             Some(r) => r,
             None => Err(format!("unknown pure builtin: arrow.{op}")),
         },
-        // -- df -- Polars-backed query ops (#427)
+        // -- df -- Polars-backed query ops (#427), gated behind the
+        // `df` feature so embedders that don't need dataframes avoid
+        // the polars dep tree.
+        #[cfg(feature = "df")]
         ("df", op) => match crate::df::dispatch(op, args) {
             Some(r) => r,
             None => Err(format!("unknown pure builtin: df.{op}")),
         },
+        #[cfg(not(feature = "df"))]
+        ("df", op) => Err(format!(
+            "df.{op}: this build was compiled without the `df` feature; \
+             Polars-backed dataframe query ops are unavailable"
+        )),
 
         _ => Err(format!("unknown pure builtin: {kind}.{op}")),
     }
