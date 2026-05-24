@@ -1652,29 +1652,45 @@ impl<'a> Vm<'a> {
                     self.stack.push(Value::Closure { fn_id, body_hash, captures });
                 }
                 Op::CallClosure { arity, node_id_idx } => {
-                    let mut args: Vec<Value> = (0..arity).map(|_| Value::Unit).collect();
-                    for i in (0..arity as usize).rev() { args[i] = self.pop()?; }
-                    let closure = self.pop()?;
+                    let arity = arity as usize;
+                    // Args sit on the value stack at [args_base..]; the
+                    // closure sits just below them at args_base - 1. Take
+                    // the closure out (leaving a Unit placeholder), then
+                    // write its captures and pop the args directly into
+                    // the callee's locals — no per-call args Vec and no
+                    // `captures.extend(args)` realloc (#464). The combined
+                    // [captures, args] view the tracer wants is exactly
+                    // the contiguous locals slice we just filled.
+                    let args_base = self.stack.len() - arity;
+                    let closure = std::mem::replace(&mut self.stack[args_base - 1], Value::Unit);
                     let (fn_id, captures) = match closure {
                         Value::Closure { fn_id, captures, .. } => (fn_id, captures),
                         other => return Err(VmError::TypeMismatch(format!("CallClosure on non-closure: {other:?}"))),
                     };
+                    let fid = fn_id as usize;
                     let node_id = const_str(&self.program.constants, node_id_idx);
-                    let budget_cost = call_budget_cost(&self.program.functions[fn_id as usize]);
+                    let budget_cost = call_budget_cost(&self.program.functions[fid]);
                     if budget_cost > 0 {
                         self.handler.note_call_budget(budget_cost)
                             .map_err(VmError::Effect)?;
                     }
-                    let mut combined = captures;
-                    combined.extend(args);
-                    self.tracer.enter_call(&node_id, &self.program.functions[fn_id as usize].name, &combined);
-                    let f = &self.program.functions[fn_id as usize];
+                    let cap_n = captures.len();
                     let locals_start = self.locals_storage.len();
-                    let locals_len = f.locals_count.max(f.arity) as usize;
+                    let locals_len = self.program.functions[fid].locals_count
+                        .max(self.program.functions[fid].arity) as usize;
                     self.locals_storage.resize(locals_start + locals_len, Value::Unit);
-                    for (i, v) in combined.into_iter().enumerate() {
+                    for (i, v) in captures.into_iter().enumerate() {
                         self.locals_storage[locals_start + i] = v;
                     }
+                    // Move the args off the value stack into the locals
+                    // following the captures (popping leaves the args off
+                    // the stack; the closure's Unit placeholder is then
+                    // the top, so truncate it away).
+                    for i in (0..arity).rev() {
+                        self.locals_storage[locals_start + cap_n + i] = self.pop()?;
+                    }
+                    self.stack.truncate(args_base - 1);
+                    self.tracer.enter_call(&node_id, &self.program.functions[fid].name, &self.locals_storage[locals_start..locals_start + cap_n + arity]);
                     self.push_frame(Frame {
                         fn_id, pc: 0, locals_start, locals_len,
                         stack_base: self.stack.len(),
