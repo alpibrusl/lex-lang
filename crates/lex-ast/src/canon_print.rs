@@ -16,6 +16,15 @@ pub fn print_stages(stages: &[Stage]) -> String {
     p.out
 }
 
+/// Render a single `examples {}` case as canonical `name(args...) => expected`.
+/// Exposed so tooling (e.g. `lex docs --output json`) can surface examples as
+/// human-readable strings without re-implementing the expression printer.
+pub fn print_example(fn_name: &str, ex: &Example) -> String {
+    let mut p = Printer::new();
+    p.example_call(fn_name, ex);
+    p.out
+}
+
 struct Printer { out: String, indent: usize }
 
 impl Printer {
@@ -65,16 +74,7 @@ impl Printer {
             for (i, ex) in fd.examples.iter().enumerate() {
                 self.nl();
                 self.pad();
-                // Render as `name(args...) => expected`. Since canonical
-                // form doesn't carry the call expression, we synthesize
-                // a Call(Var name, args) for the printer.
-                write!(self.out, "{}(", fd.name).unwrap();
-                for (j, a) in ex.args.iter().enumerate() {
-                    if j > 0 { write!(self.out, ", ").unwrap(); }
-                    self.expr(a);
-                }
-                write!(self.out, ") => ").unwrap();
-                self.expr(&ex.expected);
+                self.example_call(&fd.name, ex);
                 if i + 1 < fd.examples.len() { write!(self.out, ",").unwrap(); }
             }
             self.indent -= 1;
@@ -85,6 +85,19 @@ impl Printer {
         write!(self.out, " ").unwrap();
         self.expr_as_block(&fd.body);
         self.nl();
+    }
+
+    /// Render one example case as `name(args...) => expected`. Canonical
+    /// form doesn't carry the call expression, so we synthesize the call
+    /// from the fn name and the case's argument list.
+    fn example_call(&mut self, fn_name: &str, ex: &Example) {
+        write!(self.out, "{}(", fn_name).unwrap();
+        for (j, a) in ex.args.iter().enumerate() {
+            if j > 0 { write!(self.out, ", ").unwrap(); }
+            self.expr(a);
+        }
+        write!(self.out, ") => ").unwrap();
+        self.expr(&ex.expected);
     }
 
     fn effects(&mut self, effects: &[Effect]) {
