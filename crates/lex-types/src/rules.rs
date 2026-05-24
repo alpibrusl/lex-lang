@@ -28,6 +28,7 @@ impl TypeError {
     pub fn rule_tag(&self) -> &'static str {
         match self {
             TypeError::TypeMismatch { .. } => "type-mismatch",
+            TypeError::EffectRowMismatch { .. } => "effect-row-mismatch",
             TypeError::UnknownIdentifier { .. } => "unknown-identifier",
             TypeError::ArityMismatch { .. } => "arity-mismatch",
             TypeError::NonExhaustiveMatch { .. } => "non-exhaustive-match",
@@ -59,6 +60,7 @@ fn explanation_for_tag(tag: &str) -> &'static str {
 (return type, let-binding annotation, function argument, operator operand, etc.). Fix by changing \
 the expression to produce the expected type, or by adjusting the declared/inferred expected type \
 to match.",
+        "effect-row-mismatch" => EFFECT_ROW_MISMATCH,
         "unknown-identifier" => "A name referenced in scope is not declared. Either the binding is missing, \
 the name is misspelled, or an `import` is missing. Check for typos first; then verify the relevant \
 `let`, parameter, or top-level `fn` is in scope.",
@@ -106,6 +108,7 @@ update the example to match the new behavior, or fix the body to produce the dec
 pub fn all_rules() -> &'static [RuleInfo] {
     &[
         RuleInfo { tag: "type-mismatch", explanation: TYPE_MISMATCH },
+        RuleInfo { tag: "effect-row-mismatch", explanation: EFFECT_ROW_MISMATCH },
         RuleInfo { tag: "unknown-identifier", explanation: UNKNOWN_IDENT },
         RuleInfo { tag: "arity-mismatch", explanation: ARITY_MISMATCH },
         RuleInfo { tag: "non-exhaustive-match", explanation: NON_EXHAUSTIVE },
@@ -173,6 +176,15 @@ otherwise add one explicit arm per missing variant so the audit trail records th
 the effect to the signature via `ChangeEffectSig` (preferred — the effect is genuinely needed) or \
 remove the call that produces it via `ModifyBody` (preferred when the effect was unintentional).",
         ),
+        "effect-row-mismatch" => (
+            "ModifyBody",
+            "Narrow the closure body to use only the effects in the declared row; do NOT broaden the row.",
+            "Effect rows are invariant: the declared row must match exactly, so the intuitive repair \
+(adding the missing effect to the declared row) is wrong when that row is fixed by a record field or \
+other annotation — e.g. `Skill.handle`, `Tool.execute`. Use `ModifyBody` to remove or replace the \
+calls whose effects fall outside the declared row. Reach for `ChangeEffectSig` only when you own the \
+annotation and the extra effect is genuinely required.",
+        ),
         "arity-mismatch" => (
             "ModifyBody",
             "Match the call site's argument count to the function's declared arity.",
@@ -219,6 +231,11 @@ const TYPE_MISMATCH: &str = "An expression's inferred type doesn't match what th
 (return type, let-binding annotation, function argument, operator operand, etc.). Fix by changing \
 the expression to produce the expected type, or by adjusting the declared/inferred expected type \
 to match.";
+const EFFECT_ROW_MISMATCH: &str = "Two function types failed to unify because their effect rows differ. \
+Effect rows unify by equality, not subtyping: a concrete row must match exactly — a superset or subset \
+is rejected. This most often surfaces on record-field closures (e.g. `Skill.handle`, `Tool.execute`), \
+whose declared effect row is fixed by the record type. Fix by narrowing the function body so it uses \
+only the effects in the declared row — do NOT broaden the declared row to match the body.";
 const UNKNOWN_IDENT: &str = "A name referenced in scope is not declared. Either the binding is missing, \
 the name is misspelled, or an `import` is missing. Check for typos first; then verify the relevant \
 `let`, parameter, or top-level `fn` is in scope.";
@@ -291,6 +308,12 @@ mod tests {
                 at_node: "n_0".into(),
                 expected: "Int".into(),
                 got: "Str".into(),
+                context: vec![],
+            },
+            TypeError::EffectRowMismatch {
+                at_node: "n_0".into(),
+                expected: "[io]".into(),
+                got: "[net]".into(),
                 context: vec![],
             },
             TypeError::UnknownIdentifier { at_node: "n_0".into(), name: "x".into() },

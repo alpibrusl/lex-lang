@@ -641,7 +641,11 @@ impl Checker {
                 for (x, y) in pa.clone().into_iter().zip(pb.clone()) {
                     self.unify_coerce_inner(x, y)?;
                 }
-                self.u.unify_effects(ea, eb).map_err(|_| UnifyError::Mismatch { a: a.clone(), b: b.clone() })?;
+                // Propagate the EffectMismatch verbatim (rather than
+                // collapsing it into a whole-type Mismatch) so the
+                // invariant-effect-row case surfaces as its own
+                // rule_tag with the narrow-the-body fix (#565).
+                self.u.unify_effects(ea, eb)?;
                 self.unify_coerce_inner((**ra).clone(), (**rb).clone())
             }
             _ => self.u.unify(&a, &b),
@@ -1390,16 +1394,17 @@ fn mismatch_err(node_id: &str, e: UnifyError, u: &Unifier, context: Vec<String>)
         },
         UnifyError::Infinite { .. } => TypeError::InfiniteType { at_node: node_id.into() },
         UnifyError::EffectMismatch { a, b } => {
-            // Render effect mismatches as a type-mismatch in compact
-            // form, e.g. `[net]` vs `[]`. Avoids inventing a new
-            // TypeError variant + wire format right now.
+            // Render the two rows in compact form, e.g. `[net]` vs `[]`.
+            // Effect rows are invariant, so this is its own rule_tag
+            // (#565) rather than a generic type-mismatch — the
+            // explanation steers the fix toward narrowing the body.
             let render = |e: &EffectSet| -> String {
                 let mut parts: Vec<String> = e.concrete.iter()
                     .map(crate::types::EffectKind::pretty).collect();
                 if let Some(v) = e.var { parts.push(format!("?e{}", v)); }
                 if parts.is_empty() { "[]".into() } else { format!("[{}]", parts.join(", ")) }
             };
-            TypeError::TypeMismatch {
+            TypeError::EffectRowMismatch {
                 at_node: node_id.into(),
                 expected: render(&b),
                 got: render(&a),
