@@ -276,7 +276,7 @@ impl<'a> Parser<'a> {
             );
             if last_was_rparen {
                 if let TypeExpr::Named { ref name, .. } = first {
-                    let unqual = name.split('.').last().unwrap_or(name.as_str());
+                    let unqual = name.split('.').next_back().unwrap_or(name.as_str());
                     if unqual.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false) {
                         return Ok(TypeExpr::Union(vec![type_to_variant(first)?]));
                     }

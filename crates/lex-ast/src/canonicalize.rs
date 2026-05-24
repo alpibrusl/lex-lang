@@ -184,7 +184,7 @@ fn canonicalize_expr(e: &s::Expr) -> CExpr {
         s::Expr::Var(name) => {
             // A mangled qualified name like `module_hash.Constructor` is a
             // constructor reference if its last component is uppercase.
-            let unqualified = name.split('.').last().unwrap_or(name);
+            let unqualified = name.split('.').next_back().unwrap_or(name);
             if is_constructor_name(unqualified) {
                 CExpr::Constructor { name: unqualified.to_string(), args: Vec::new() }
             } else {
@@ -196,7 +196,7 @@ fn canonicalize_expr(e: &s::Expr) -> CExpr {
             // Special case: a Call whose callee is an uppercase-named Var is a constructor.
             // Also handles mangled qualified names like `module_hash.Constructor`.
             if let s::Expr::Var(name) = callee.as_ref() {
-                let unqualified = name.split('.').last().unwrap_or(name);
+                let unqualified = name.split('.').next_back().unwrap_or(name);
                 if is_constructor_name(unqualified) {
                     return CExpr::Constructor {
                         name: unqualified.to_string(),
