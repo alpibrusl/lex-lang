@@ -33,6 +33,27 @@ pub struct State {
     /// process restarts. For now an agent that gets unlucky with a
     /// restart re-runs `merge/start` and gets a fresh session.
     pub sessions: Mutex<HashMap<MergeSessionId, ApiMergeSession>>,
+    /// Optional server-imposed ceiling on the effect policy honored
+    /// by `/v1/run` and `/v1/replay`. `None` (the default, used by
+    /// single-tenant `lex serve`) runs the caller's request policy
+    /// as-is — the operator *is* the caller there, so that's
+    /// intended. When `Some`, the request policy is clamped via
+    /// [`clamp_policy`] so it can only *narrow* the ceiling, never
+    /// widen it.
+    ///
+    /// Any embedder that exposes this API to untrusted callers — a
+    /// hosted, multi-tenant gateway like lex-hub — MUST set this.
+    /// Without it the request body can grant itself `[proc]`
+    /// (arbitrary subprocess spawn), `[fs_*]` over `/`, and
+    /// unrestricted `[net]`: arbitrary code execution as the server
+    /// process. See lex-hub#6.
+    ///
+    /// NOTE: an empty scope list means "any path/host" in the
+    /// runtime, so a ceiling that puts `fs_read`/`fs_write`/`net` in
+    /// `allow_effects` MUST also populate the matching scope list
+    /// (`allow_fs_read`, …) or it re-opens the wildcard. Granting
+    /// none of those kinds is the safe default.
+    pub policy_ceiling: Option<Policy>,
 }
 
 /// Server-side wrapper around [`MergeSession`] carrying the
@@ -49,10 +70,22 @@ pub struct ApiMergeSession {
 
 impl State {
     pub fn open(root: PathBuf) -> anyhow::Result<Self> {
+        Self::open_with_ceiling(root, None)
+    }
+
+    /// Like [`State::open`] but installs a [`policy_ceiling`](State::policy_ceiling)
+    /// that `/v1/run` and `/v1/replay` clamp the caller's request
+    /// policy against. Embedders exposing this API to untrusted
+    /// callers must use this constructor (or set the field directly).
+    pub fn open_with_ceiling(
+        root: PathBuf,
+        policy_ceiling: Option<Policy>,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
             store: Mutex::new(Store::open(&root)?),
             root,
             sessions: Mutex::new(HashMap::new()),
+            policy_ceiling,
         })
     }
 
@@ -68,6 +101,56 @@ impl State {
     pub fn new_with_tenant(tenant_id: &str, store_root: PathBuf) -> anyhow::Result<Self> {
         validate_tenant_id(tenant_id)?;
         Self::open(store_root.join(tenant_id))
+    }
+
+    /// Multi-tenant constructor that also installs a policy ceiling
+    /// for `/v1/run` / `/v1/replay`. The path-traversal guard from
+    /// [`new_with_tenant`](State::new_with_tenant) and the effect
+    /// ceiling are the two halves a hosted gateway needs.
+    pub fn new_with_tenant_and_ceiling(
+        tenant_id: &str,
+        store_root: PathBuf,
+        policy_ceiling: Option<Policy>,
+    ) -> anyhow::Result<Self> {
+        validate_tenant_id(tenant_id)?;
+        Self::open_with_ceiling(store_root.join(tenant_id), policy_ceiling)
+    }
+}
+
+/// Clamp a caller-supplied [`Policy`] to a server-imposed `ceiling`
+/// so it can only *narrow* the granted capabilities, never widen
+/// them. Used by [`run_handler`] when [`State::policy_ceiling`] is
+/// set — i.e. when an embedder exposes `/v1/run` to untrusted
+/// callers and must not let the request body grant itself `[proc]`,
+/// arbitrary `[fs_*]` paths, or unrestricted `[net]`.
+///
+/// - **Effects**: set-intersection of request and ceiling. The
+///   caller may drop effects but never add one the ceiling withheld.
+/// - **Scopes** (fs paths, proc binaries, net hosts): taken from the
+///   ceiling outright. The caller cannot widen them, and — because an
+///   empty scope list means "any" in the runtime — we must not let a
+///   caller's empty list collapse the ceiling's restriction back to a
+///   wildcard.
+/// - **Budget**: the more restrictive (smaller) of the two.
+fn clamp_policy(requested: Policy, ceiling: &Policy) -> Policy {
+    let allow_effects: BTreeSet<String> = requested
+        .allow_effects
+        .intersection(&ceiling.allow_effects)
+        .cloned()
+        .collect();
+    let budget = match (requested.budget, ceiling.budget) {
+        (Some(r), Some(c)) => Some(r.min(c)),
+        (None, Some(c)) => Some(c),
+        (Some(r), None) => Some(r),
+        (None, None) => None,
+    };
+    Policy {
+        allow_effects,
+        allow_fs_read: ceiling.allow_fs_read.clone(),
+        allow_fs_write: ceiling.allow_fs_write.clone(),
+        allow_net_host: ceiling.allow_net_host.clone(),
+        allow_proc: ceiling.allow_proc.clone(),
+        budget,
     }
 }
 
@@ -630,7 +713,15 @@ pub(crate) fn run_handler(state: &State, body: &str, with_overrides: bool) -> Re
         return error_with_detail(422, "type errors", serde_json::to_value(&errs).unwrap());
     }
     let bc = compile_program(&stages);
-    let policy = req.policy.into_policy();
+    let mut policy = req.policy.into_policy();
+    // When a server-imposed ceiling is present (multi-tenant
+    // embedders like lex-hub), the request policy can only narrow
+    // it — never grant itself proc/fs/net beyond what the operator
+    // allowed. Single-tenant `lex serve` leaves the ceiling unset
+    // and runs the caller's policy verbatim.
+    if let Some(ceiling) = &state.policy_ceiling {
+        policy = clamp_policy(policy, ceiling);
+    }
     if let Err(violations) = check_policy(&bc, &policy) {
         return error_with_detail(403, "policy violation", serde_json::to_value(&violations).unwrap());
     }
@@ -1687,5 +1778,83 @@ fn pkg_delete_handler(state: &State, name: &str) -> Response<std::io::Cursor<Vec
             error_with_detail(422, "type errors", serde_json::to_value(&errs).unwrap())
         }
         Err(e) => write_error_response("retract package", e),
+    }
+}
+
+#[cfg(test)]
+mod policy_ceiling_tests {
+    use super::*;
+    use lex_runtime::Policy;
+    use std::path::PathBuf;
+
+    /// A maximally-permissive policy of the kind a malicious caller
+    /// would put in a `/v1/run` body: every dangerous effect plus
+    /// fs over `/`.
+    fn permissive_request() -> Policy {
+        Policy {
+            allow_effects: ["io", "fs_read", "fs_write", "net", "proc"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            allow_fs_read: vec![PathBuf::from("/")],
+            allow_fs_write: vec![PathBuf::from("/")],
+            allow_net_host: Vec::new(),
+            allow_proc: Vec::new(),
+            budget: None,
+        }
+    }
+
+    #[test]
+    fn ceiling_drops_effects_the_caller_was_not_granted() {
+        let ceiling = Policy {
+            allow_effects: ["io", "time"].iter().map(|s| s.to_string()).collect(),
+            ..Policy::default()
+        };
+        let got = clamp_policy(permissive_request(), &ceiling);
+        assert!(got.allow_effects.contains("io"));
+        assert!(!got.allow_effects.contains("proc"), "proc must not survive a ceiling without it");
+        assert!(!got.allow_effects.contains("fs_write"));
+        assert!(!got.allow_effects.contains("net"));
+        // `time` is in the ceiling but not the request → intersection drops it.
+        assert!(!got.allow_effects.contains("time"));
+    }
+
+    #[test]
+    fn ceiling_scopes_override_caller_scopes() {
+        let ceiling = Policy {
+            allow_effects: ["fs_read"].iter().map(|s| s.to_string()).collect(),
+            allow_fs_read: vec![PathBuf::from("/srv/tenant")],
+            ..Policy::default()
+        };
+        let got = clamp_policy(permissive_request(), &ceiling);
+        // Caller asked for "/" but only the ceiling's scope survives —
+        // an empty/wider caller list can never widen the ceiling.
+        assert_eq!(got.allow_fs_read, vec![PathBuf::from("/srv/tenant")]);
+        assert!(got.allow_fs_write.is_empty());
+        assert!(got.allow_proc.is_empty());
+        assert!(got.allow_net_host.is_empty());
+    }
+
+    #[test]
+    fn ceiling_caps_budget_and_prefers_the_smaller() {
+        // Caller wants unlimited; ceiling caps it.
+        let mut req = permissive_request();
+        req.budget = None;
+        let ceiling = Policy { budget: Some(1_000), ..Policy::default() };
+        assert_eq!(clamp_policy(req, &ceiling).budget, Some(1_000));
+
+        // Caller asks for less than the ceiling → keep the caller's.
+        let mut req2 = permissive_request();
+        req2.budget = Some(50);
+        let ceiling2 = Policy { budget: Some(1_000), ..Policy::default() };
+        assert_eq!(clamp_policy(req2, &ceiling2).budget, Some(50));
+    }
+
+    #[test]
+    fn empty_ceiling_is_pure_only() {
+        let got = clamp_policy(permissive_request(), &Policy::default());
+        assert!(got.allow_effects.is_empty(), "an empty ceiling grants nothing");
+        assert!(got.allow_proc.is_empty());
+        assert!(got.allow_fs_write.is_empty());
     }
 }
