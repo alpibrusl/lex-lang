@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+fail=0
+
+staged_rs=$(git diff --cached --name-only --diff-filter=ACM | grep '\.rs$' || true)
+
+if [ -n "$staged_rs" ]; then
+  count=$(echo "$staged_rs" | wc -l | tr -d ' ')
+  echo "[pre-commit] checking $count staged .rs file(s)"
+
+  if ! cargo fmt --check 2>/dev/null; then
+    echo "format: FAILED — run \`cargo fmt\` and re-stage"
+    fail=1
+  else
+    echo "format: ok"
+  fi
+
+  if ! cargo clippy --all-targets --all-features -- -D warnings 2>/dev/null; then
+    echo "clippy: FAILED"
+    fail=1
+  else
+    echo "clippy: ok"
+  fi
+fi
+
+conflict_files=$(git diff --cached --name-only --diff-filter=ACM | xargs grep -l "^<<<<<<< \|^=======$\|^>>>>>>> " 2>/dev/null || true)
+if [ -n "$conflict_files" ]; then
+  echo "conflict markers found — resolve before committing:"
+  echo "$conflict_files" | sed 's/^/  /'
+  fail=1
+fi
+
+exit $fail
