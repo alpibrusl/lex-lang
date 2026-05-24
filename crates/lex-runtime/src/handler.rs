@@ -1063,7 +1063,7 @@ impl EffectHandler for DefaultHandler {
                             .unwrap_or(raw)
                     });
                     let allowed = self.policy.allow_fs_write.iter().any(|a| {
-                        let ca = std::fs::canonicalize(a).unwrap_or_else(|_| a.clone().into());
+                        let ca = std::fs::canonicalize(a).unwrap_or_else(|_| a.clone());
                         p.starts_with(&ca)
                     });
                     if !allowed {
