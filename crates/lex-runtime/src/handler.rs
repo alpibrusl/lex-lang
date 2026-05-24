@@ -25,7 +25,9 @@ pub trait IoSink: Send {
 pub struct StdoutSink;
 impl IoSink for StdoutSink {
     fn print_line(&mut self, s: &str) {
-        println!("{s}");
+        use std::io::Write;
+        print!("{s}");
+        let _ = std::io::stdout().flush();
     }
 }
 
@@ -98,6 +100,9 @@ pub struct DefaultHandler {
     /// finds and removes the matching entry. Plain `u64`, not
     /// shared — each handler instance has its own counter.
     next_scope_id: u64,
+    /// Arguments passed after `--` in `lex run <file> -- [args...]`.
+    /// Returned by `io.argv()` so Lex `main` functions can read CLI flags.
+    pub program_args: Vec<String>,
 }
 
 impl DefaultHandler {
@@ -120,6 +125,7 @@ impl DefaultHandler {
             next_stream_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             arena_stack: Vec::new(),
             next_scope_id: 1,
+            program_args: Vec::new(),
         }
     }
 
@@ -152,6 +158,10 @@ impl DefaultHandler {
 
     pub fn with_read_root(mut self, root: PathBuf) -> Self {
         self.read_root = Some(root); self
+    }
+
+    pub fn with_program_args(mut self, args: Vec<String>) -> Self {
+        self.program_args = args; self
     }
 
     fn ensure_kind_allowed(&self, kind: &str) -> Result<(), String> {
@@ -1013,13 +1023,50 @@ impl EffectHandler for DefaultHandler {
                     Err(e) => Ok(err(Value::Str(format!("{e}").into()))),
                 }
             }
+            ("io", "readline") => {
+                use std::io::BufRead;
+                let stdin = std::io::stdin();
+                let mut line = String::new();
+                match stdin.lock().read_line(&mut line) {
+                    Ok(0) => Ok(Value::Variant { name: "None".into(), args: vec![] }),
+                    Ok(_) => {
+                        if line.ends_with('\n') { line.pop(); }
+                        if line.ends_with('\r') { line.pop(); }
+                        Ok(Value::Variant { name: "Some".into(), args: vec![Value::Str(line.into())] })
+                    }
+                    Err(_) => Ok(Value::Variant { name: "None".into(), args: vec![] }),
+                }
+            }
+            ("io", "argv") => {
+                let list: Vec<Value> = self.program_args.iter()
+                    .map(|s| Value::Str(s.as_str().into()))
+                    .collect();
+                Ok(Value::List(list.into()))
+            }
             ("io", "write") => {
                 let path = expect_str(args.first())?.to_string();
                 let contents = expect_str(args.get(1))?.to_string();
                 // Honor write-allowlist if any.
+                // Canonicalize both sides so macOS /tmp → /private/tmp symlinks
+                // and other platform-specific path aliases compare correctly.
                 if !self.policy.allow_fs_write.is_empty() {
-                    let p = std::path::Path::new(&path);
-                    if !self.policy.allow_fs_write.iter().any(|a| p.starts_with(a)) {
+                    let raw = std::env::current_dir()
+                        .map(|cwd| cwd.join(&path))
+                        .unwrap_or_else(|_| std::path::PathBuf::from(&path));
+                    // canonicalize fails if the file doesn't exist yet (new writes).
+                    // Fall back to canonicalizing the parent so macOS /tmp → /private/tmp
+                    // symlinks still compare correctly against the allowlist.
+                    let p = std::fs::canonicalize(&raw).unwrap_or_else(|_| {
+                        raw.parent()
+                            .and_then(|par| std::fs::canonicalize(par).ok())
+                            .map(|par| par.join(raw.file_name().unwrap_or_default()))
+                            .unwrap_or(raw)
+                    });
+                    let allowed = self.policy.allow_fs_write.iter().any(|a| {
+                        let ca = std::fs::canonicalize(a).unwrap_or_else(|_| a.clone());
+                        p.starts_with(&ca)
+                    });
+                    if !allowed {
                         return Err(format!("write to `{path}` outside --allow-fs-write"));
                     }
                 }
@@ -1355,6 +1402,29 @@ impl EffectHandler for DefaultHandler {
                 })?;
                 let policy = self.policy.clone();
                 crate::ws::dial_ws(url, subprotocol, on_open, on_message, program, policy)
+            }
+            ("net", "dial_ws_actor") => {
+                // dial_ws_actor(url, subprotocol, name, on_open, on_message)
+                let url = expect_str(args.first())?.to_string();
+                let subprotocol = expect_str(args.get(1))?.to_string();
+                let name = expect_str(args.get(2))?.to_string();
+                let on_open = match args.get(3).cloned() {
+                    Some(c @ Value::Closure { .. }) => c,
+                    _ => return Err(
+                        "net.dial_ws_actor(url, subprotocol, name, on_open, on_message): on_open must be a closure".into(),
+                    ),
+                };
+                let on_message = match args.into_iter().nth(4) {
+                    Some(c @ Value::Closure { .. }) => c,
+                    _ => return Err(
+                        "net.dial_ws_actor(url, subprotocol, name, on_open, on_message): on_message must be a closure".into(),
+                    ),
+                };
+                let program = self.program.clone().ok_or_else(|| {
+                    "net.dial_ws_actor requires a Program reference; use DefaultHandler::with_program".to_string()
+                })?;
+                let policy = self.policy.clone();
+                crate::ws::dial_ws_actor(url, subprotocol, name, on_open, on_message, program, policy)
             }
             ("chat", "broadcast") => {
                 let registry = self.chat_registry.as_ref()
@@ -2147,6 +2217,7 @@ impl EffectHandler for DefaultHandler {
         // `Arc<Mutex<…>>` so concurrent access is safe.
         fresh.streams = std::sync::Arc::clone(&self.streams);
         fresh.next_stream_id = std::sync::Arc::clone(&self.next_stream_id);
+        fresh.program_args = self.program_args.clone();
         Some(Box::new(fresh))
     }
 }
@@ -3427,6 +3498,21 @@ fn http_request(method: &str, url: &str, body: Option<&str>) -> Value {
     }
 }
 
+/// Build a ureq agent for `http.stream_lines` with a long timeout.
+/// Local models (Ollama, vLLM) can take minutes to load before they start
+/// responding, and thinking-heavy models can take minutes to finish.
+/// Use timeout_global so the limit applies to the entire operation
+/// (connect + send + recv) rather than individual phases, avoiding the
+/// 10-second default that with_config().read_to_vec() uses for body reads.
+fn http_stream_agent() -> ureq::Agent {
+    use std::time::Duration;
+    ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(600)))
+        .http_status_as_error(false)
+        .build()
+        .into()
+}
+
 /// Build a ureq agent for `std.http.{send,get,post}` with the given
 /// timeout (None → use the same defaults as the legacy `net.{get,post}`
 /// path). Separate from `http_request` so the rich `http.send` flow
@@ -3662,9 +3748,11 @@ fn err(v: Value) -> Value {
 /// splitting. This means the call blocks until the server closes the connection —
 /// endpoints that hold the connection open indefinitely will hang. True per-line
 /// streaming requires a future HTTP client upgrade.
-fn http_stream_lines_impl(handler: &DefaultHandler, url: &str, headers_val: &Value, body: &str) -> Value {
+fn http_stream_lines_impl(_handler: &DefaultHandler, url: &str, headers_val: &Value, body: &str) -> Value {
     let body_bytes = body.as_bytes().to_vec();
-    let agent = http_agent(None);
+    // Use a 10-minute body-read timeout — local models (Ollama, vLLM) can take
+    // several minutes to generate long thinking traces before closing the stream.
+    let agent = http_stream_agent();
     let mut req = agent.post(url);
     if let Value::Map(headers) = headers_val {
         for (k, v) in headers {
@@ -3683,13 +3771,49 @@ fn http_stream_lines_impl(handler: &DefaultHandler, url: &str, headers_val: &Val
                 Ok(b) => b,
                 Err(e) => return err(Value::Str(format!("http.stream_lines: body read: {e}").into())),
             };
-            let text = String::from_utf8_lossy(&bytes).into_owned();
-            let lines: Vec<String> = text.lines().map(String::from).collect();
-            let handle = handler.register_stream(lines.into_iter());
-            ok(stream_handle_value(handle))
+            let raw_text = String::from_utf8_lossy(&bytes).into_owned();
+            let text = decode_unicode_escapes(&raw_text);
+            let items: std::collections::VecDeque<Value> = text.lines()
+                .map(|l| Value::Str(l.to_string().into()))
+                .collect();
+            let iter_val = Value::Variant {
+                name: "__IterEager".into(),
+                args: vec![Value::List(items), Value::Int(0)],
+            };
+            ok(iter_val)
         }
         Err(e) => err(Value::Str(format!("http.stream_lines: {e}").into())),
     }
+}
+
+fn decode_unicode_escapes(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            result.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('u') => {
+                chars.next();
+                let hex: String = (0..4).filter_map(|_| chars.next()).collect();
+                if hex.len() == 4 {
+                    if let Ok(n) = u32::from_str_radix(&hex, 16) {
+                        if let Some(ch) = char::from_u32(n) {
+                            result.push(ch);
+                            continue;
+                        }
+                    }
+                }
+                result.push('\\');
+                result.push('u');
+                result.push_str(&hex);
+            }
+            _ => result.push(c),
+        }
+    }
+    result
 }
 
 /// Build a `SqlError = { message, code, detail }` Lex record (#380).

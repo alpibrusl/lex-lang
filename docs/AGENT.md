@@ -227,6 +227,22 @@ fn main() -> [net] Nil { net.serve_ws_fn(9000, "", on_msg) }
 ```
 Types: `Request`, `Response`, `WsConn`, `WsMessage`, `WsAction` are global (no import needed).
 
+`net.dial_ws(url, subprotocol, on_open, on_message)` — reactive WebSocket client. `on_open` is called once after the handshake; `on_message` is called for each inbound frame. Both return a `WsAction` (`ws.send(frame)` / `ws.noop()`). Blocks for the lifetime of the connection; call from `conc.spawn`.
+
+`net.dial_ws_actor(url, subprotocol, name, on_open, on_message)` — like `dial_ws` but also registers the live connection in the `conc` registry under `name`. Any actor can push frames proactively via `conc.tell(conc.lookup(name), frame_str)` — the runtime forwards them to the socket on the next read-timeout tick (50 ms). Use for CP simulators, heartbeat loops, and any client that needs to send unsolicited frames without changing the `on_message` signature. Unregisters automatically on disconnect.
+```lex
+import "std.conc" as conc
+import "lex-web/ws" as ws
+
+fn run(url :: Str) -> [net, time, concurrent] Result[Unit, Str] {
+  net.dial_ws_actor(url, "ocpp1.6", "cp:001",
+    fn () -> [time, concurrent] WsAction { ws.send("[2,\"1\",\"BootNotification\",{}]") },
+    fn (m :: WsMessage) -> [time, concurrent] WsAction {
+      match m { WsText(_) => ws.noop(), _ => ws.noop() }
+    })
+}
+```
+
 ### `std.crypto`
 `hash`, `random` — `random` requires `[random]` effect.
 

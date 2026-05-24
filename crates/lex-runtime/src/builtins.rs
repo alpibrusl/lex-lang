@@ -19,6 +19,7 @@ pub fn is_pure_call(kind: &str, op: &str) -> bool {
         | ("http", "send")
         | ("http", "get")
         | ("http", "post")
+        | ("http", "stream_lines")
         // arrow.read_csv reads from disk → effect-handler path (#426 I/O slice).
         | ("arrow", "read_csv")
         // arrow.{read,write}_parquet + arrow.write_csv — effect-gated I/O (#432).

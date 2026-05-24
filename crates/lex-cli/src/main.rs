@@ -565,9 +565,11 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         )
     } else {
         let path = f.positional.first().ok_or_else(|| anyhow!(
-            "usage: lex run [policy] [--from-canonical] <file> <fn> [args]"))?;
-        let func = f.positional.get(1).ok_or_else(|| anyhow!("missing function name"))?;
-        (path.clone(), func.clone(), 2)
+            "usage: lex run [policy] [--from-canonical] <file> [fn] [args] or <file> -- [program args]"))?;
+        // When `--` was the separator, positional has only the file path;
+        // default to calling `main` with empty vargs and program_args in io.argv().
+        let func = f.positional.get(1).cloned().unwrap_or_else(|| "main".to_string());
+        (path.clone(), func, 2)
     };
     let policy = &f.policy;
     if f.dry_run {
@@ -625,7 +627,9 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     }
 
     let bc = std::sync::Arc::new(bc);
-    let handler = DefaultHandler::new(f.policy.clone()).with_program(std::sync::Arc::clone(&bc));
+    let handler = DefaultHandler::new(f.policy.clone())
+        .with_program(std::sync::Arc::clone(&bc))
+        .with_program_args(f.program_args.clone());
     let mut vm = Vm::with_handler(&bc, Box::new(handler));
     if let Some(n) = f.max_steps { vm.set_step_limit(n); }
     let recorder = lex_trace::Recorder::new();
@@ -646,14 +650,19 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         None
     };
 
-    let vargs: Vec<Value> = f.positional[arg_positional_start..]
-        .iter()
-        .map(|a| {
-            let v: serde_json::Value = serde_json::from_str(a)
-                .with_context(|| format!("arg `{a}` must be JSON"))?;
-            Ok(json_to_value(&v))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    // When `--` separator was used, program_args holds the argv and vargs is empty.
+    let vargs: Vec<Value> = if !f.program_args.is_empty() {
+        Vec::new()
+    } else {
+        f.positional[arg_positional_start..]
+            .iter()
+            .map(|a| {
+                let v: serde_json::Value = serde_json::from_str(a)
+                    .with_context(|| format!("arg `{a}` must be JSON"))?;
+                Ok(json_to_value(&v))
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
     let started = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     let result = vm.call(&func, vargs);
@@ -753,6 +762,8 @@ struct RunFlags {
     require_signed: bool,
     /// Hex Ed25519 public key the stage must be signed by.
     trusted_key: Option<String>,
+    /// Args after `--` separator, passed to `io.argv()` in the program.
+    program_args: Vec<String>,
 }
 
 fn parse_run_flags(args: &[String]) -> Result<RunFlags> {
@@ -822,6 +833,12 @@ fn parse_run_flags(args: &[String]) -> Result<RunFlags> {
                 f.trusted_key = Some(val.clone());
                 f.require_signed = true;
                 i += 2;
+            }
+            "--" => {
+                // Everything after `--` is passed to io.argv() in the program.
+                // `lex run <file> -- [program args]` calls `main()`.
+                f.program_args = args[i + 1..].to_vec();
+                break;
             }
             _ => { f.positional.push(a.clone()); i += 1; }
         }

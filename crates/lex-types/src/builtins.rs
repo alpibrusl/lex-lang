@@ -31,6 +31,18 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::singleton("io"),
                 Ty::Con("Result".into(), vec![Ty::Unit, Ty::str()]),
             ));
+            // io.readline() -> [io] Option[Str]
+            fields.insert("readline".into(), Ty::function(
+                vec![],
+                EffectSet::singleton("io"),
+                Ty::Con("Option".into(), vec![Ty::str()]),
+            ));
+            // io.argv() -> [io] List[Str]
+            fields.insert("argv".into(), Ty::function(
+                vec![],
+                EffectSet::singleton("io"),
+                Ty::List(Box::new(Ty::str())),
+            ));
             Some(Ty::Record(fields))
         }
         "str" => {
@@ -626,6 +638,35 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 vec![
                     Ty::str(), // url (ws:// or wss://)
                     Ty::str(), // subprotocol (Sec-WebSocket-Protocol)
+                    Ty::function(
+                        vec![],
+                        EffectSet::open_var(0),
+                        Ty::Con("WsAction".into(), vec![]),
+                    ),
+                    Ty::function(
+                        vec![Ty::Con("WsMessage".into(), vec![])],
+                        EffectSet::open_var(0),
+                        Ty::Con("WsAction".into(), vec![]),
+                    ),
+                ],
+                EffectSet::open_var(0).union(&EffectSet::singleton("net")),
+                Ty::Con("Result".into(), vec![Ty::Unit, Ty::str()]),
+            ));
+            // dial_ws_actor[Eff] :: (Str, Str, Str,
+            //                        () -> [Eff] WsAction,
+            //                        (WsMessage) -> [Eff] WsAction)
+            //                        -> [net, Eff] Result[Unit, Str]
+            //
+            // Variant of dial_ws that registers the outgoing connection in the
+            // conc registry under `name`. conc.tell(actor, frame_str) enqueues
+            // a frame for delivery, enabling proactive sends (heartbeats,
+            // meter values) from any other actor without changing the
+            // reactive on_message signature.
+            fields.insert("dial_ws_actor".into(), Ty::function(
+                vec![
+                    Ty::str(), // url
+                    Ty::str(), // subprotocol ("" for none)
+                    Ty::str(), // conc registry name ("" to skip registration)
                     Ty::function(
                         vec![],
                         EffectSet::open_var(0),

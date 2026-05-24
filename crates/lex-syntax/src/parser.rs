@@ -265,6 +265,23 @@ impl<'a> Parser<'a> {
             }
             Ok(TypeExpr::Union(variants))
         } else {
+            // Single-variant union without `|`: `type Msg = Execute(Str)`.
+            // The `(...)` constructor-payload syntax is distinguishable from
+            // `[...]` type-application by checking the last consumed token.
+            // `Execute(Str)` ends with `)`, `List[Int]` ends with `]`,
+            // `AnotherType` ends with the ident token.
+            let last_was_rparen = self.idx > 0 && matches!(
+                self.tokens.get(self.idx - 1).map(|t| &t.kind),
+                Some(TokenKind::RParen)
+            );
+            if last_was_rparen {
+                if let TypeExpr::Named { ref name, .. } = first {
+                    let unqual = name.split('.').next_back().unwrap_or(name.as_str());
+                    if unqual.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false) {
+                        return Ok(TypeExpr::Union(vec![type_to_variant(first)?]));
+                    }
+                }
+            }
             Ok(first)
         }
     }
@@ -923,7 +940,14 @@ impl<'a> Parser<'a> {
             Some(TokenKind::LBrace) => self.parse_record_pattern(),
             Some(TokenKind::LParen) => self.parse_tuple_pattern(),
             Some(TokenKind::Ident(_)) => {
-                let name = self.expect_ident("")?;
+                let mut name = self.expect_ident("")?;
+                // Handle module-qualified constructor patterns: `module.Constructor(args)`.
+                // Strip the qualifier and keep only the final name, matching how the
+                // compiler emits MakeVariant with the unqualified constructor name.
+                while matches!(self.peek(), Some(TokenKind::Dot)) {
+                    self.bump();
+                    name = self.expect_ident("after `.` in qualified pattern")?;
+                }
                 if matches!(self.peek(), Some(TokenKind::LParen)) {
                     self.bump();
                     let mut args = Vec::new();
