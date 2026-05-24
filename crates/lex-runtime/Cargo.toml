@@ -50,7 +50,7 @@ h3     = { version = "0.0.8", optional = true }
 h3-quinn = { version = "0.0.10", optional = true }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
 rustls-pemfile = { version = "2", optional = true }
-rcgen  = { version = "0.13", optional = true, default-features = false, features = ["ring", "pem"] }
+rcgen  = { version = "0.14", optional = true, default-features = false, features = ["ring", "pem"] }
 toml = "1.1"
 serde_yaml = "0.9"
 csv = "1"
