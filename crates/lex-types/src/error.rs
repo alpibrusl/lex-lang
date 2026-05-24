@@ -12,6 +12,22 @@ pub enum TypeError {
         got: String,
         context: Vec<String>,
     },
+    /// Two function types failed to unify specifically because their
+    /// effect rows differ (#565). Effect rows unify by *equality*, not
+    /// subtyping — a concrete row must match exactly, not merely be a
+    /// superset or subset. This most often surfaces on record-field
+    /// closures (e.g. `Skill.handle`, `Tool.execute`) whose declared
+    /// row is fixed by the record type. Split out from `TypeMismatch`
+    /// so the `rule_tag` names the invariance and the suggested fix
+    /// steers toward narrowing the body rather than broadening the row.
+    EffectRowMismatch {
+        at_node: String,
+        /// Pretty-printed expected effect row, e.g. `[io, net]`.
+        expected: String,
+        /// Pretty-printed actual effect row found.
+        got: String,
+        context: Vec<String>,
+    },
     UnknownIdentifier {
         at_node: String,
         name: String,
@@ -101,6 +117,7 @@ impl TypeError {
     pub fn node(&self) -> &str {
         match self {
             TypeError::TypeMismatch { at_node, .. }
+            | TypeError::EffectRowMismatch { at_node, .. }
             | TypeError::UnknownIdentifier { at_node, .. }
             | TypeError::ArityMismatch { at_node, .. }
             | TypeError::NonExhaustiveMatch { at_node, .. }
@@ -124,6 +141,11 @@ impl std::fmt::Display for TypeError {
         match self {
             TypeError::TypeMismatch { at_node, expected, got, context } => {
                 write!(f, "type mismatch at {at_node}: expected {expected}, got {got}")?;
+                if !context.is_empty() { write!(f, " ({})", context.join(" / "))?; }
+                Ok(())
+            }
+            TypeError::EffectRowMismatch { at_node, expected, got, context } => {
+                write!(f, "effect-row mismatch at {at_node}: declared row is invariant — expected {expected}, got {got}; narrow the body, don't broaden the row")?;
                 if !context.is_empty() { write!(f, " ({})", context.join(" / "))?; }
                 Ok(())
             }

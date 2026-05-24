@@ -101,6 +101,33 @@ effects in their inferred row, and `lex check` propagates them. If the
 checker complains, the fix is to narrow the *body*, not to widen the
 outer signature.
 
+### 1.6 Record-field closures have invariant effect rows (MUST)
+
+When a function type appears as a record field (e.g. `Skill.handle`,
+`Tool.execute`), its declared effect row is **invariant** — the closure
+you supply must match it *exactly*, not merely be a superset or subset.
+Effect rows unify by equality, not subtyping, so the polymorphism that
+makes `list.map` accept any effectful closure does **not** apply when
+the row is pinned by a record type.
+
+```lex
+# Skill.handle is declared as:
+#   handle :: (Message) -> [io, time, crypto, random, sql,
+#                           fs_read, fs_write, net, concurrent] HandlerOutcome
+#
+# AVOID — adding `env` (or dropping `crypto`) makes the row a superset/
+# subset, which is rejected even though it "looks" safe.
+# GOOD — the closure declares the row verbatim and the body uses only
+# those effects.
+```
+
+The checker surfaces this as `rule_tag: "effect-row-mismatch"` with a
+`rule_explanation` that names the invariance. The fix is the same as
+§1.2: **narrow the body** so it uses only the declared effects. Do
+**not** broaden the declared row to match the body — for a record-field
+closure you usually can't (the row is fixed by the record type), and
+where you can, broadening defeats the audit value of the annotation.
+
 ---
 
 ## 2. Authoring style

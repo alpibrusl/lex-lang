@@ -72,6 +72,29 @@ fn bad() -> Str {
 }
 
 #[test]
+fn effect_row_mismatch_is_its_own_variant() {
+    // A closure whose concrete effect row differs from the declared
+    // row of the callback parameter must surface as the dedicated
+    // EffectRowMismatch (#565), not a generic TypeMismatch. Effect
+    // rows are invariant: [io] is neither a superset nor subset of
+    // the expected [net], so unification rejects it.
+    let src = "\
+fn apply(f :: (Int) -> [net] Int) -> [net] Int { f(1) }
+fn bad() -> [net] Int { apply(fn (x :: Int) -> [io] Int { x }) }
+";
+    let errs = check(src).unwrap_err();
+    assert!(
+        errs.iter().any(|e| matches!(e, TypeError::EffectRowMismatch { .. })),
+        "expected EffectRowMismatch, got {errs:#?}"
+    );
+    let tagged = errs
+        .iter()
+        .find(|e| matches!(e, TypeError::EffectRowMismatch { .. }))
+        .unwrap();
+    assert_eq!(tagged.rule_tag(), "effect-row-mismatch");
+}
+
+#[test]
 fn detects_unknown_field() {
     let src = "fn bad() -> Int { let r := { x: 1 }\n r.y }\n";
     let errs = check(src).unwrap_err();
