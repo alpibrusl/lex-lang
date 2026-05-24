@@ -79,6 +79,11 @@ fn html_response(status: u16, body: String) -> Response<Cursor<Vec<u8>>> {
 /// highlighted (one of "/", "/web/branches", "/web/trust",
 /// "/web/attention"); for detail pages pass `""`.
 fn page(title: &str, current: &str, body: &str) -> String {
+    // `title` is interpolated into the <title> element below; it can
+    // carry store-derived text (fn names, branch names), so escape it.
+    // `body` is already-rendered HTML built by the callers (each
+    // escapes its own dynamic fields), so it is intentionally raw.
+    let title = esc(title);
     let nav_link = |href: &str, label: &str| -> String {
         let class = if current == href { "current" } else { "" };
         format!(r#"<a href="{href}" class="{class}">{label}</a>"#)
@@ -873,5 +878,26 @@ fn result_short(r: &AttestationResult) -> (&'static str, &'static str) {
         AttestationResult::Passed => ("passed", "ok"),
         AttestationResult::Failed { .. } => ("failed", "fail"),
         AttestationResult::Inconclusive { .. } => ("inconclusive", "inc"),
+    }
+}
+
+#[cfg(test)]
+mod xss_tests {
+    use super::*;
+
+    #[test]
+    fn page_escapes_title() {
+        // A store-derived title (fn/branch name) must not be able to
+        // break out of the <title> element.
+        let html = page("</title><script>alert(1)</script>", "/", "<p>body</p>");
+        assert!(!html.contains("<script>"), "title must not inject a raw <script>");
+        assert!(html.contains("&lt;script&gt;"), "title angle brackets must be escaped");
+        // The caller-built body is intentionally raw HTML and untouched.
+        assert!(html.contains("<p>body</p>"));
+    }
+
+    #[test]
+    fn esc_covers_html_metacharacters() {
+        assert_eq!(esc(r#"<a href="x">&y"#), "&lt;a href=&quot;x&quot;&gt;&amp;y");
     }
 }
