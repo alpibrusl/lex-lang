@@ -1944,26 +1944,34 @@ impl<'a> Vm<'a> {
                     })?;
                 }
                 Op::TailCall { fn_id, arity, node_id_idx } => {
-                    let mut args: Vec<Value> = (0..arity).map(|_| Value::Unit).collect();
-                    for i in (0..arity as usize).rev() { args[i] = self.pop()?; }
+                    let arity = arity as usize;
+                    let fid = fn_id as usize;
+                    // Args sit on the value stack at [args_base..]. Read
+                    // them in place for the refinement / trace checks and
+                    // move them into the reused frame's locals at the end
+                    // — no per-call args Vec (#464). Tail calls have no
+                    // memoization, so the consumers are refinement, trace,
+                    // then the locals move. The args live on `self.stack`
+                    // while locals live on `self.locals_storage`, so the
+                    // `truncate(old_locals_start)` below (which releases
+                    // the *old* frame's locals) doesn't touch them.
+                    let args_base = self.stack.len() - arity;
                     let node_id = const_str(&self.program.constants, node_id_idx);
-                    let budget_cost = call_budget_cost(&self.program.functions[fn_id as usize]);
+                    let budget_cost = call_budget_cost(&self.program.functions[fid]);
                     if budget_cost > 0 {
                         self.handler.note_call_budget(budget_cost)
                             .map_err(VmError::Effect)?;
                     }
                     // Refinement runtime check on tail calls too
-                    // (#209 slice 3). Same shape as Op::Call —
-                    // iterate by reference to avoid a per-call Vec
-                    // allocation (#461).
-                    let refinements = &self.program.functions[fn_id as usize].refinements;
+                    // (#209 slice 3). Same shape as Op::Call.
+                    let refinements = &self.program.functions[fid].refinements;
                     for (i, refinement) in refinements.iter().enumerate() {
                         if let Some(r) = refinement {
-                            let arg = args.get(i).cloned().unwrap_or(Value::Unit);
+                            let arg = self.stack[args_base + i].clone();
                             match eval_refinement(&r.predicate, &r.binding, &arg) {
                                 Ok(true) => {}
                                 Ok(false) => return Err(VmError::RefinementFailed {
-                                    fn_name: self.program.functions[fn_id as usize].name.clone(),
+                                    fn_name: self.program.functions[fid].name.clone(),
                                     param_index: i,
                                     binding: r.binding.clone(),
                                     reason: format!(
@@ -1971,7 +1979,7 @@ impl<'a> Vm<'a> {
                                         r.binding),
                                 }),
                                 Err(reason) => return Err(VmError::RefinementFailed {
-                                    fn_name: self.program.functions[fn_id as usize].name.clone(),
+                                    fn_name: self.program.functions[fid].name.clone(),
                                     param_index: i,
                                     binding: r.binding.clone(),
                                     reason,
@@ -1983,18 +1991,20 @@ impl<'a> Vm<'a> {
                     // opens a new one in its place — preserves the caller's
                     // tree depth in the trace.
                     self.tracer.exit_call_tail();
-                    self.tracer.enter_call(&node_id, &self.program.functions[fn_id as usize].name, &args);
-                    let f = &self.program.functions[fn_id as usize];
+                    self.tracer.enter_call(&node_id, &self.program.functions[fid].name, &self.stack[args_base..]);
                     // Reuse the current frame's locals_start position:
                     // truncate to release old locals then extend for the
                     // new function (#389 slice 3, same as Op::Return but
                     // without popping the frame).
                     let old_locals_start = self.frames.last().unwrap().locals_start;
                     self.locals_storage.truncate(old_locals_start);
-                    let new_locals_len = f.locals_count.max(f.arity) as usize;
+                    let new_locals_len = self.program.functions[fid].locals_count
+                        .max(self.program.functions[fid].arity) as usize;
                     self.locals_storage.resize(old_locals_start + new_locals_len, Value::Unit);
-                    for (i, v) in args.into_iter().enumerate() {
-                        self.locals_storage[old_locals_start + i] = v;
+                    // Move the args off the value stack into the callee's
+                    // locals (popping leaves the stack at `args_base`).
+                    for i in (0..arity).rev() {
+                        self.locals_storage[old_locals_start + i] = self.pop()?;
                     }
                     // #464 step 2: a tail-called function gets a fresh
                     // stack-record arena view. Release any records the
