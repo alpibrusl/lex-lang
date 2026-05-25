@@ -1,0 +1,78 @@
+name: docs
+
+# Generate machine-readable API docs (`lex docs --output json`, #564) for
+# this repo's example Lex sources and publish them as a build artifact.
+#
+# This is the non-deploying half of #567: it produces the JSON that a
+# static-site renderer or a doc-gen agent consumes. Wiring the artifact to
+# a published site (GitHub Pages vs. the existing Caddy-served `docs/`) is a
+# separate deployment decision and is intentionally left out here.
+#
+# Requires a `lex` that supports `lex docs --output json <path>` (#564). The
+# job builds `lex` from this checkout, so the docs always track the current
+# toolchain. Merge order matters: this can only run green once #564 is on
+# `main`.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'examples/**.lex'
+      - 'crates/lex-cli/src/docs.rs'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+    inputs:
+      source-path:
+        description: 'Directory of .lex sources to document'
+        default: 'examples'
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  api-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      # The lex-cli dep graph (lex-runtime → arrow-rs/Polars) inflates
+      # target/; reclaim runner space the same way ci.yml does so the
+      # debug build doesn't exhaust the disk.
+      - uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Debug build: doc generation is parse-only, so the release
+      # optimizer buys nothing here. Build just the `lex` bin.
+      - name: Build lex
+        run: cargo build --bin lex
+      - name: Generate API docs JSON
+        env:
+          SRC: ${{ github.event.inputs.source-path || 'examples' }}
+        run: |
+          mkdir -p site
+          ./target/debug/lex --output json docs "$SRC" > site/api-docs.json
+          # Human-readable render to the job log for a quick eyeball.
+          ./target/debug/lex docs "$SRC"
+      - name: Validate output
+        run: |
+          python3 - <<'PY'
+          import json
+          d = json.load(open("site/api-docs.json"))
+          assert d["ok"], "lex docs reported failure"
+          mods = d["data"]["modules"]
+          fns = sum(len(m["functions"]) for m in mods)
+          print(f"documented {len(mods)} module(s), {fns} function(s)")
+          assert mods, "no modules documented"
+          PY
+      - uses: actions/upload-artifact@v7
+        with:
+          name: api-docs
+          path: site/api-docs.json
+          if-no-files-found: error
