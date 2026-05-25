@@ -14,7 +14,7 @@ pub mod transforms;
 
 pub use canonical::*;
 pub use canonicalize::{canonicalize_program, canonicalize_item};
-pub use canon_print::print_stages;
+pub use canon_print::{print_example, print_stages};
 pub use ids::{collect_ids, expr_ids, NodeId, NodeRef};
 pub use patch::{apply_patch, Patch, PatchError};
 pub use transforms::{

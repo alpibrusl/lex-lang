@@ -12,9 +12,11 @@
 //! on-disk state; no new persistence.
 
 use crate::acli;
+use crate::fmt::collect_lex_files;
 use ::acli::OutputFormat;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use lex_store::{Store, DEFAULT_BRANCH};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// Schema version of the emitted JSON. Bump when fields are
@@ -24,7 +26,8 @@ const LEX_DOCS_VERSION: u32 = 1;
 
 pub fn cmd_docs(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let sub = args.first().ok_or_else(|| anyhow!(
-        "usage: lex docs --for-agent [--branch B] [--limit-recent N] [--store DIR]\n\
+        "usage: lex docs <path>...        # API docs for source files/dirs\n\
+         usage: lex docs --for-agent [--branch B] [--limit-recent N] [--store DIR]\n\
          usage: lex docs --rules"))?;
     if sub == "--rules" {
         // #306 slice 2: enumerate every type-error rule with its
@@ -48,12 +51,15 @@ pub fn cmd_docs(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         });
         return Ok(());
     }
-    if sub != "--for-agent" {
-        // Future subcommands (`lex docs serve`, `lex docs sig X`, …)
-        // can land here. For 0.5.0's slice, only `--for-agent`.
+    if sub.starts_with("--") && sub != "--for-agent" {
         anyhow::bail!(
-            "unknown `lex docs` subcommand `{sub}`. only `--for-agent` and `--rules` are supported today"
+            "unknown `lex docs` flag `{sub}`. supported: `lex docs <path>...`, `--for-agent`, `--rules`"
         );
+    }
+    if sub != "--for-agent" {
+        // No recognized flag → treat every arg as a source file/dir and
+        // emit API docs (#564).
+        return cmd_docs_source(fmt, args);
     }
     let mut branch: Option<String> = None;
     let mut limit_recent: usize = 50;
@@ -426,6 +432,188 @@ fn render_text(env: &DocsEnvelope) {
         println!("Attention queue: {} item(s)", env.attention.len());
         for a in &env.attention {
             println!("  {} {} — {}", a.sig_id, a.stage_id, a.reason);
+        }
+    }
+}
+
+// --- #564: `lex docs <path>` — API docs from source ----------------
+
+/// Schema version of the `lex docs <path>` API-docs JSON. Bump on a
+/// breaking reshape; adding optional fields is schema-additive.
+const LEX_API_DOCS_VERSION: u32 = 1;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct ApiDocs {
+    pub lex_docs_version: u32,
+    /// Package name from the nearest `lex.toml`, if one is found.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package: Option<String>,
+    /// Package version from the nearest `lex.toml` (empty when absent).
+    pub version: String,
+    pub modules: Vec<ModuleDoc>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct ModuleDoc {
+    /// Path to the source file, as supplied on the command line.
+    pub file: String,
+    /// Module-level doc: the `#` comment block at the top of the file
+    /// (before the first item). The parser attributes top-of-file
+    /// comments to the module rather than to the first declaration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc: Option<String>,
+    pub functions: Vec<FnDoc>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct FnDoc {
+    pub name: String,
+    /// Stable SigId (canonical-AST hash). Absent only if the stage
+    /// can't produce one (e.g. malformed signature).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sig_id: Option<String>,
+    /// Human-readable `(params) -> ret [effects]` render.
+    pub signature: String,
+    pub effects: Vec<String>,
+    /// `examples {}` cases rendered as `name(args) => expected`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub examples: Vec<String>,
+    /// Doc comment (the `#` lines immediately preceding the fn), with
+    /// the leading `#` stripped and lines joined by newlines.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc: Option<String>,
+}
+
+fn cmd_docs_source(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let paths: Vec<PathBuf> = args.iter().map(PathBuf::from).collect();
+    let files = collect_lex_files(&paths)?;
+    if files.is_empty() {
+        anyhow::bail!("no .lex files found under {:?}", args);
+    }
+
+    let (package, version) = package_meta(&paths);
+
+    let mut modules = Vec::with_capacity(files.len());
+    for file in &files {
+        let src = std::fs::read_to_string(file)
+            .with_context(|| format!("reading {}", file.display()))?;
+        let prog = lex_syntax::parse_source(&src)
+            .map_err(|e| anyhow!("parse error in {}: {e:?}", file.display()))?;
+
+        // Doc comments live on the syntax tree (the canonicalizer strips
+        // them so they never enter the SigId). Map fn name → doc here,
+        // then look them up while walking the canonical stages.
+        let mut docs_by_name: BTreeMap<String, String> = BTreeMap::new();
+        for item in &prog.items {
+            if let lex_syntax::Item::FnDecl(fd) = item {
+                if let Some(doc) = clean_doc(&fd.leading_comments) {
+                    docs_by_name.insert(fd.name.clone(), doc);
+                }
+            }
+        }
+
+        let stages = lex_ast::canonicalize_program(&prog);
+        let mut functions = Vec::new();
+        for stage in &stages {
+            let lex_ast::Stage::FnDecl(fd) = stage else { continue };
+            let examples = fd.examples.iter()
+                .map(|ex| lex_ast::print_example(&fd.name, ex))
+                .collect();
+            functions.push(FnDoc {
+                name: fd.name.clone(),
+                sig_id: lex_ast::sig_id(stage),
+                signature: render_signature(fd),
+                effects: effect_strings(fd),
+                examples,
+                doc: docs_by_name.get(&fd.name).cloned(),
+            });
+        }
+
+        modules.push(ModuleDoc {
+            file: file.display().to_string(),
+            doc: clean_doc(&prog.leading_comments),
+            functions,
+        });
+    }
+
+    let docs = ApiDocs {
+        lex_docs_version: LEX_API_DOCS_VERSION,
+        package,
+        version,
+        modules,
+    };
+    let data = serde_json::to_value(&docs)?;
+    acli::emit_or_text("docs", data, fmt, || render_api_text(&docs));
+    Ok(())
+}
+
+/// Resolve `(package_name, package_version)` from the nearest `lex.toml`
+/// above the first supplied path. Missing manifest or `[package]` table
+/// yields `(None, "")` — docs generation doesn't require a manifest.
+fn package_meta(paths: &[PathBuf]) -> (Option<String>, String) {
+    let start = paths.first().cloned().unwrap_or_else(|| PathBuf::from("."));
+    let Some((toml_path, _)) = lex_syntax::find_manifest(&start) else {
+        return (None, String::new());
+    };
+    match lex_syntax::Manifest::load(&toml_path) {
+        Ok(m) => match m.package {
+            Some(p) => (Some(p.name), p.version),
+            None => (None, String::new()),
+        },
+        Err(_) => (None, String::new()),
+    }
+}
+
+/// Strip the leading `#` (and one optional space) from each comment line
+/// and join them. Returns `None` when there are no comment lines.
+fn clean_doc(lines: &[String]) -> Option<String> {
+    if lines.is_empty() {
+        return None;
+    }
+    let cleaned: Vec<String> = lines.iter()
+        .map(|l| {
+            let s = l.trim_start().trim_start_matches('#');
+            s.strip_prefix(' ').unwrap_or(s).to_string()
+        })
+        .collect();
+    Some(cleaned.join("\n"))
+}
+
+/// Render a canonical fn's effect row as a list of strings, mirroring the
+/// parameterized-effect rendering used by the `--for-agent` envelope.
+fn effect_strings(fd: &lex_ast::FnDecl) -> Vec<String> {
+    fd.effects.iter()
+        .map(|e| match &e.arg {
+            Some(lex_ast::EffectArg::Int { value }) => format!("{}({})", e.name, value),
+            Some(lex_ast::EffectArg::Str { value }) => format!("{}({:?})", e.name, value),
+            Some(lex_ast::EffectArg::Ident { value }) => format!("{}({})", e.name, value),
+            None => e.name.clone(),
+        })
+        .collect()
+}
+
+fn render_api_text(docs: &ApiDocs) {
+    let pkg = docs.package.as_deref().unwrap_or("(no package)");
+    println!("API docs for {pkg} {} (schema v{})", docs.version, docs.lex_docs_version);
+    for m in &docs.modules {
+        println!();
+        println!("{} ({} fn):", m.file, m.functions.len());
+        if let Some(doc) = &m.doc {
+            for line in doc.lines() {
+                println!("  # {line}");
+            }
+        }
+        for f in &m.functions {
+            let sid = f.sig_id.as_deref().map(|s| &s[..12.min(s.len())]).unwrap_or("-");
+            println!("  {}{}  [{}]", f.name, f.signature, sid);
+            if let Some(doc) = &f.doc {
+                for line in doc.lines() {
+                    println!("    {line}");
+                }
+            }
+            for ex in &f.examples {
+                println!("    e.g. {ex}");
+            }
         }
     }
 }

@@ -104,7 +104,7 @@ fn fmt_file(path: &Path) -> Result<Option<String>> {
 }
 
 /// Expand a list of file/directory paths to a sorted list of .lex files.
-fn collect_lex_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
+pub(crate) fn collect_lex_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut files: Vec<PathBuf> = Vec::new();
     for path in paths {
         if path.is_dir() {
