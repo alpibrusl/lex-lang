@@ -7,6 +7,67 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.9.6] — 2026-05-25
+
+### Added
+
+- **#564: `lex docs <path> --output json` — structured API-docs JSON.**
+  Walks the `.lex` files under a path and emits a machine-readable doc
+  tree: package + version (from the nearest `lex.toml`), per-module
+  docs, and per-function `name` / `sig_id` / `signature` / `effects` /
+  `examples` / `doc`. The `sig_id` is the canonical-AST SigId, so docs
+  survive renames and reformats.
+- **#567: `docs` CI workflow.** Generates the API-docs JSON as a build
+  artifact (`lex docs --output json examples`), validates it (`ok:
+  true`, ≥1 module), and uploads it. Path-filtered + `workflow_dispatch`.
+- **#533/#534: `std.redis` — thin Redis client.** Key/value + pub/sub;
+  every op carries `[net]`. Pairs with `lex-queue` for pooling and
+  work-queue retry.
+- **#496/#501: `net.serve_quic` — HTTP/3 over QUIC + `std.tls`.** Behind
+  the opt-in `quic` cargo feature so the default dep graph stays lean.
+- **#497/#499: `net.serve_with(opts)` — first-class `ServeOpts` record**
+  for HTTP server configuration.
+- **#500/#504: `iter.collect`** — alias for `iter.to_list`.
+- **#503/#505: `http.send` supports PUT / PATCH / DELETE / HEAD.**
+- **#513: package endpoints — `POST /v1/pkg/publish` + index.**
+
+### Changed
+
+- **#565/#568: effect-row invariance is now its own
+  `effect-row-mismatch` error.** Record-field closures (e.g.
+  `Skill.handle`, `Tool.execute`) unify effect rows by equality, not
+  subtyping — a concrete row must match exactly. The checker reports
+  this with a dedicated `rule_tag` + `rule_explanation` instead of a
+  generic unification failure, and points at narrowing the body.
+- **#555: `std.df` (Polars) gated behind an optional `df` feature.**
+  Keeps the default build and `target/` footprint down.
+- **#519/#547: coordinated dependency bumps** — arrow 55→58, polars
+  0.50→0.53, redis 0.27→1.2.
+
+### Fixed
+
+- **#514: Ollama local-model integration** — unicode escapes, `io.argv`,
+  fs-write path.
+- **#477/#506: `net` — drain lazy iter bodies before `unpack_response`.**
+- **#536: `std.redis` — open handler effect row for
+  `subscribe`/`psubscribe`.**
+
+### Security
+
+- **#554: server-imposed policy ceiling for `/v1/run`.** Caps the
+  effects a submitted program may request, closing an RCE enabler
+  (lex-hub#6).
+
+### Performance
+
+- Major interpreter-throughput work (**#461 / #462 / #464 / #229**):
+  bytecode superinstructions (`LoadLocal`+`GetField`+arith fusion,
+  match-arm fusion), escape-analysis stack allocation of non-escaping
+  tuples and records, native `list.map`/`filter`/`fold` ops (kills the
+  O(n²) clone), adaptive memoization (stop hashing cold pure functions;
+  fast structural hash in place of SHA-256), inline-cache shape
+  interning keyed on `shape_id`, and dispatch-loop code-slice caching.
+
 ### Removed
 
 - **Dropped the empty `core-syntax` and `lex-stdlib` placeholder
