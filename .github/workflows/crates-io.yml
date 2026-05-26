@@ -3,8 +3,8 @@ name: crates.io publish
 # Triggered by the same `v*` tags as release.yml. Walks the
 # 10 publishable crates in topological dependency order and
 # runs `cargo publish` on each. The internal-only crates
-# (core-syntax, core-compiler, lex-stdlib, lex-cli,
-# conformance) carry `publish = false` so they're skipped by
+# (core-compiler, lex-cli, conformance) carry
+# `publish = false` so they're skipped by
 # `cargo publish --workspace` semantics if anyone ever tries
 # that path.
 #

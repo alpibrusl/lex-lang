@@ -15,7 +15,6 @@ crates/
   lex-types/       type checker + builtin signatures
   lex-bytecode/    compiler + stack-machine VM
   lex-runtime/     effect handler, DefaultHandler, Policy
-  lex-stdlib/      (reserved; builtins are currently inline in lex-types/lex-runtime)
   lex-cli/         `lex` binary — all subcommands
 docs/              this file + design docs
 ```
