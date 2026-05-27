@@ -551,10 +551,8 @@ lex/
 │   ├── lex-trace/         # Trace tree + replay + diff
 │   ├── lex-lsp/           # Language server (VS Code via generic-LSP)
 │   ├── lex-search/        # Structural code search (`lex audit` backend)
-│   ├── lex-stdlib/        # Reserved for stdlib stages-as-store-entries (pure stdlib lives in lex-runtime)
 │   ├── lex-cli/           # CLI; also hosts agent-tool, tool-registry, audit, ast-diff, ast-merge, repair, plan
 │   ├── lex-api/           # Agent HTTP/JSON server + lex-tea web UI
-│   ├── core-syntax/       # Core lexer/parser (stub; reuses lex-syntax)
 │   ├── core-compiler/     # Core type system (shape solver, sized numerics, native matmul)
 │   ├── spec-checker/      # Spec proof checker (randomized + SMT-LIB export)
 │   └── conformance/       # Conformance harness + property tests

@@ -5,6 +5,17 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [Unreleased]
+
+### Removed
+
+- **Dropped the empty `core-syntax` and `lex-stdlib` placeholder
+  crates.** Both were one-line stubs with no implementation and no
+  dependents — the lexer/parser lives in `lex-syntax`, and stdlib
+  builtins are inline in `lex-types`/`lex-runtime`. Removed the crates
+  and their workspace-member entries; the reserved milestone names can
+  be reintroduced if/when that work begins.
+
 ## [0.9.5] — 2026-05-17
 
 ### Added
