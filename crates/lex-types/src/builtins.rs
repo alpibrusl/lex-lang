@@ -2929,6 +2929,79 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             ));
             Some(Ty::Record(fields))
         }
+        // -- std.decimal (#574): exact decimal arithmetic with explicit rounding.
+        // `Decimal = { coefficient :: Int, exponent :: Int }` where the value
+        // is `coefficient × 10^exponent`.  All arithmetic is exact (no IEEE 754
+        // approximation); rounding only happens at `round_to`, which demands an
+        // explicit mode string ("HalfUp" | "HalfDown" | "HalfEven" |
+        // "Down" | "Up" | "Ceiling" | "Floor").
+        "decimal" => {
+            // Local helper: the Decimal record type.
+            let decimal_ty = || {
+                let mut f = IndexMap::new();
+                f.insert("coefficient".into(), Ty::int());
+                f.insert("exponent".into(), Ty::int());
+                Ty::Record(f)
+            };
+            let mut fields = IndexMap::new();
+            // Constructors
+            // decimal :: (Int, Int) -> Decimal — coefficient, exponent
+            fields.insert("decimal".into(), Ty::function(
+                vec![Ty::int(), Ty::int()], EffectSet::empty(), decimal_ty()));
+            // zero :: () -> Decimal — 0 × 10^0
+            fields.insert("zero".into(), Ty::function(
+                vec![], EffectSet::empty(), decimal_ty()));
+            // one :: () -> Decimal — 1 × 10^0
+            fields.insert("one".into(), Ty::function(
+                vec![], EffectSet::empty(), decimal_ty()));
+            // from_int :: Int -> Decimal — lift integer, exponent=0
+            fields.insert("from_int".into(), Ty::function(
+                vec![Ty::int()], EffectSet::empty(), decimal_ty()));
+            // Arithmetic — all exact, no rounding
+            // add :: (Decimal, Decimal) -> Decimal
+            fields.insert("add".into(), Ty::function(
+                vec![decimal_ty(), decimal_ty()], EffectSet::empty(), decimal_ty()));
+            // sub :: (Decimal, Decimal) -> Decimal
+            fields.insert("sub".into(), Ty::function(
+                vec![decimal_ty(), decimal_ty()], EffectSet::empty(), decimal_ty()));
+            // mul :: (Decimal, Decimal) -> Decimal — exponents add
+            fields.insert("mul".into(), Ty::function(
+                vec![decimal_ty(), decimal_ty()], EffectSet::empty(), decimal_ty()));
+            // Comparison — three-way: -1 / 0 / 1
+            // compare :: (Decimal, Decimal) -> Int
+            fields.insert("compare".into(), Ty::function(
+                vec![decimal_ty(), decimal_ty()], EffectSet::empty(), Ty::int()));
+            // Predicates
+            fields.insert("is_zero".into(), Ty::function(
+                vec![decimal_ty()], EffectSet::empty(), Ty::bool()));
+            fields.insert("is_positive".into(), Ty::function(
+                vec![decimal_ty()], EffectSet::empty(), Ty::bool()));
+            fields.insert("is_negative".into(), Ty::function(
+                vec![decimal_ty()], EffectSet::empty(), Ty::bool()));
+            // Transformers
+            // normalize :: Decimal -> Decimal — remove trailing zeros
+            fields.insert("normalize".into(), Ty::function(
+                vec![decimal_ty()], EffectSet::empty(), decimal_ty()));
+            // negate :: Decimal -> Decimal
+            fields.insert("negate".into(), Ty::function(
+                vec![decimal_ty()], EffectSet::empty(), decimal_ty()));
+            // abs :: Decimal -> Decimal
+            fields.insert("abs".into(), Ty::function(
+                vec![decimal_ty()], EffectSet::empty(), decimal_ty()));
+            // round_to :: (Decimal, Int, Str) -> Decimal
+            //   target_exp: the exponent to round to (e.g. -2 → 2 decimal places)
+            //   mode: "HalfUp" | "HalfDown" | "HalfEven" | "Down" | "Up" | "Ceiling" | "Floor"
+            fields.insert("round_to".into(), Ty::function(
+                vec![decimal_ty(), Ty::int(), Ty::str()],
+                EffectSet::empty(), decimal_ty()));
+            // to_str :: Decimal -> Str — decimal notation, e.g. "123.45"
+            fields.insert("to_str".into(), Ty::function(
+                vec![decimal_ty()], EffectSet::empty(), Ty::str()));
+            // pow10 :: Int -> Int — 10^n; n must be in [0, 18]
+            fields.insert("pow10".into(), Ty::function(
+                vec![Ty::int()], EffectSet::empty(), Ty::int()));
+            Some(Ty::Record(fields))
+        }
         _ => None,
     }
 }
@@ -2984,6 +3057,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "arrow" => "arrow",
         "df" => "df",
         "redis" => "redis",
+        "decimal" => "decimal",
         _ => return None,
     })
 }

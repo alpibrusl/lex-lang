@@ -112,6 +112,32 @@ sort-by closure); use the operators for boolean comparisons.
 ### `std.int`
 `to_str`, `parse`, `abs`, `min`, `max`, `clamp`
 
+### `std.decimal` (#574)
+Exact scaled-integer decimal arithmetic. Values are `{ coefficient :: Int, exponent :: Int }`
+records representing `coefficient × 10^exponent` — no IEEE 754 approximation.
+
+**Constructors:** `decimal(coef, exp)`, `zero()`, `one()`, `from_int(n)`, `pow10(n)`
+
+**Arithmetic (exact):** `add`, `sub`, `mul`
+
+**Comparison:** `compare(a, b) -> Int` (-1 / 0 / 1); `is_zero`, `is_positive`, `is_negative`
+
+**Transformers:** `negate`, `abs`, `normalize` (removes trailing zeros)
+
+**Rounding:** `round_to(d, target_exp, mode) -> Decimal`
+Rounds `d` to `target_exp` (e.g. `-2` → 2 decimal places). Mode must be one of:
+`"HalfUp"` `"HalfDown"` `"HalfEven"` `"Down"` `"Up"` `"Ceiling"` `"Floor"`
+
+**Display:** `to_str(d) -> Str` — decimal notation (e.g. `"123.45"`)
+
+```lex
+import "std.decimal" as d
+let notional := d.decimal(125000, -2)   # 1250.00
+let rate     := d.decimal(5, -4)        # 0.0005
+let fee      := d.mul(notional, rate)   # 0.625000
+let rounded  := d.round_to(fee, -2, "HalfUp")  # 0.63
+```
+
 ### `std.list`
 `map`, `filter`, `fold`, `length`, `head`, `tail`, `reverse`, `append`,
 `zip`, `flatten`, `any`, `all`, `find`, `cons`, `par_map`

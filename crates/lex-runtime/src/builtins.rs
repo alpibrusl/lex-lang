@@ -69,7 +69,7 @@ pub fn is_pure_module(kind: &str) -> bool {
         | "option" | "result" | "tuple" | "json" | "bytes" | "flow" | "math"
         | "map" | "set" | "crypto" | "regex" | "deque" | "datetime" | "duration" | "http"
         | "toml" | "yaml" | "dotenv" | "csv" | "test" | "random" | "parser"
-        | "cli" | "arrow" | "df")
+        | "cli" | "arrow" | "df" | "decimal")
 }
 
 fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
@@ -1629,8 +1629,218 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
              Polars-backed dataframe query ops are unavailable"
         )),
 
+        // -- std.decimal (#574): exact scaled-integer decimal arithmetic.
+        // Decimal values are `{ coefficient :: Int, exponent :: Int }` records
+        // representing `coefficient × 10^exponent`. All arithmetic is exact
+        // (no IEEE 754 rounding); precision loss happens only at `round_to`,
+        // which requires an explicit rounding mode string.
+
+        ("decimal", "decimal") => {
+            let coef = expect_int(args.first())?;
+            let exp  = expect_int(args.get(1))?;
+            Ok(make_decimal(coef, exp))
+        }
+        ("decimal", "zero") => Ok(make_decimal(0, 0)),
+        ("decimal", "one")  => Ok(make_decimal(1, 0)),
+        ("decimal", "from_int") => {
+            Ok(make_decimal(expect_int(args.first())?, 0))
+        }
+        ("decimal", "pow10") => {
+            Ok(Value::Int(decimal_pow10(expect_int(args.first())?)?))
+        }
+        ("decimal", "add") => {
+            let (ca, ea) = expect_decimal(args.first())?;
+            let (cb, eb) = expect_decimal(args.get(1))?;
+            let (a2, b2, e) = decimal_align(ca, ea, cb, eb)?;
+            Ok(make_decimal(
+                a2.checked_add(b2).ok_or("decimal.add: overflow")?, e))
+        }
+        ("decimal", "sub") => {
+            let (ca, ea) = expect_decimal(args.first())?;
+            let (cb, eb) = expect_decimal(args.get(1))?;
+            let (a2, b2, e) = decimal_align(ca, ea, cb, eb)?;
+            Ok(make_decimal(
+                a2.checked_sub(b2).ok_or("decimal.sub: overflow")?, e))
+        }
+        ("decimal", "mul") => {
+            let (ca, ea) = expect_decimal(args.first())?;
+            let (cb, eb) = expect_decimal(args.get(1))?;
+            Ok(make_decimal(
+                ca.checked_mul(cb).ok_or("decimal.mul: overflow")?,
+                ea.checked_add(eb).ok_or("decimal.mul: exponent overflow")?,
+            ))
+        }
+        ("decimal", "compare") => {
+            let (ca, ea) = expect_decimal(args.first())?;
+            let (cb, eb) = expect_decimal(args.get(1))?;
+            let (a2, b2, _) = decimal_align(ca, ea, cb, eb)?;
+            Ok(Value::Int(if a2 < b2 { -1 } else if a2 > b2 { 1 } else { 0 }))
+        }
+        ("decimal", "is_zero")     => {
+            let (c, _) = expect_decimal(args.first())?;
+            Ok(Value::Bool(c == 0))
+        }
+        ("decimal", "is_positive") => {
+            let (c, _) = expect_decimal(args.first())?;
+            Ok(Value::Bool(c > 0))
+        }
+        ("decimal", "is_negative") => {
+            let (c, _) = expect_decimal(args.first())?;
+            Ok(Value::Bool(c < 0))
+        }
+        ("decimal", "negate") => {
+            let (c, e) = expect_decimal(args.first())?;
+            Ok(make_decimal(-c, e))
+        }
+        ("decimal", "abs") => {
+            let (c, e) = expect_decimal(args.first())?;
+            Ok(make_decimal(c.abs(), e))
+        }
+        ("decimal", "normalize") => {
+            let (mut c, mut e) = expect_decimal(args.first())?;
+            if c == 0 { return Ok(make_decimal(0, 0)); }
+            while c % 10 == 0 { c /= 10; e += 1; }
+            Ok(make_decimal(c, e))
+        }
+        ("decimal", "round_to") => {
+            let (c, e)   = expect_decimal(args.first())?;
+            let target_e = expect_int(args.get(1))?;
+            let mode     = expect_str(args.get(2))?;
+            Ok(make_decimal(decimal_round(c, e, target_e, &mode)?, target_e))
+        }
+        ("decimal", "to_str") => {
+            let (c, e) = expect_decimal(args.first())?;
+            Ok(Value::Str(decimal_to_str(c, e)?.into()))
+        }
+
         _ => Err(format!("unknown pure builtin: {kind}.{op}")),
     }
+}
+
+// -- std.decimal helpers (#574) ------------------------------------------
+
+/// Extract `(coefficient, exponent)` from a `Decimal` record value.
+fn expect_decimal(v: Option<&Value>) -> Result<(i64, i64), String> {
+    match v {
+        Some(Value::Record { fields, .. }) => {
+            let coef = match fields.get("coefficient") {
+                Some(Value::Int(n)) => *n,
+                _ => return Err("decimal: missing or invalid 'coefficient' field".into()),
+            };
+            let exp = match fields.get("exponent") {
+                Some(Value::Int(n)) => *n,
+                _ => return Err("decimal: missing or invalid 'exponent' field".into()),
+            };
+            Ok((coef, exp))
+        }
+        Some(other) => Err(format!("decimal: expected {{ coefficient, exponent }} record, got {other:?}")),
+        None => Err("decimal: missing argument".into()),
+    }
+}
+
+/// Build a `Decimal` `Value::Record`.
+fn make_decimal(coefficient: i64, exponent: i64) -> Value {
+    let mut fields = indexmap::IndexMap::new();
+    fields.insert("coefficient".into(), Value::Int(coefficient));
+    fields.insert("exponent".into(), Value::Int(exponent));
+    Value::record_interned(fields)
+}
+
+/// 10^n for n in [0, 18]. Returns an error outside that range.
+fn decimal_pow10(n: i64) -> Result<i64, String> {
+    if n < 0  { return Err(format!("decimal.pow10: negative exponent {n}")); }
+    if n > 18 { return Err(format!("decimal.pow10: exponent {n} exceeds max (18)")); }
+    Ok(10i64.pow(n as u32))
+}
+
+/// Bring two Decimals to the same exponent.
+/// Returns `(coef_a_aligned, coef_b_aligned, common_exponent)`.
+fn decimal_align(ca: i64, ea: i64, cb: i64, eb: i64) -> Result<(i64, i64, i64), String> {
+    if ea == eb { return Ok((ca, cb, ea)); }
+    if ea > eb {
+        let scale = decimal_pow10(ea - eb)?;
+        let ca2 = ca.checked_mul(scale)
+            .ok_or_else(|| format!("decimal: overflow aligning (shift {})", ea - eb))?;
+        Ok((ca2, cb, eb))
+    } else {
+        let scale = decimal_pow10(eb - ea)?;
+        let cb2 = cb.checked_mul(scale)
+            .ok_or_else(|| format!("decimal: overflow aligning (shift {})", eb - ea))?;
+        Ok((ca, cb2, ea))
+    }
+}
+
+/// Compute the rounded coefficient when scaling `c × 10^e` to `target_e`.
+/// `target_e > e` (we're reducing precision): divides by `10^(target_e - e)`
+/// and applies `mode`. When `target_e <= e` (gaining precision) multiplies
+/// exactly — no rounding needed.
+fn decimal_round(c: i64, e: i64, target_e: i64, mode: &str) -> Result<i64, String> {
+    if e >= target_e {
+        // Gaining precision (or staying equal) — exact, no rounding.
+        let shift = e - target_e;
+        let scale = decimal_pow10(shift)?;
+        return c.checked_mul(scale)
+            .ok_or_else(|| format!("decimal.round_to: overflow scaling (shift {shift})"));
+    }
+    // Losing precision — divide and round.
+    let shift   = target_e - e;
+    let divisor = decimal_pow10(shift)?;
+    let q = c / divisor;
+    let r = c % divisor;  // same sign as c (Rust truncation toward zero)
+
+    if r == 0 { return Ok(q); }
+
+    let abs_r   = r.abs();
+    let positive = r > 0; // sign of the original value when q is near zero
+
+    let rounded = match mode {
+        "Down"     => q,
+        "Up"       => if positive { q + 1 } else { q - 1 },
+        "Floor"    => if positive { q }     else { q - 1 },
+        "Ceiling"  => if positive { q + 1 } else { q },
+        "HalfUp"   => {
+            if abs_r * 2 >= divisor {
+                if positive { q + 1 } else { q - 1 }
+            } else { q }
+        }
+        "HalfDown" => {
+            if abs_r * 2 > divisor {
+                if positive { q + 1 } else { q - 1 }
+            } else { q }
+        }
+        "HalfEven" => {
+            if abs_r * 2 > divisor {
+                if positive { q + 1 } else { q - 1 }
+            } else if abs_r * 2 == divisor {
+                // Round to nearest even (banker's rounding)
+                if q % 2 == 0 { q } else { if positive { q + 1 } else { q - 1 } }
+            } else { q }
+        }
+        other => return Err(format!(
+            "decimal.round_to: unknown rounding mode {other:?}; \
+             valid modes: HalfUp HalfDown HalfEven Down Up Ceiling Floor")),
+    };
+    Ok(rounded)
+}
+
+/// Format a Decimal as a decimal-notation string.
+/// e.g. `(12345, -2)` → `"123.45"`, `(7, 2)` → `"700"`, `(-63, -2)` → `"-0.63"`.
+fn decimal_to_str(c: i64, e: i64) -> Result<String, String> {
+    if e == 0 { return Ok(c.to_string()); }
+    if e > 0 {
+        let scale = decimal_pow10(e)?;
+        let val   = c.checked_mul(scale)
+            .ok_or("decimal.to_str: overflow")?;
+        return Ok(val.to_string());
+    }
+    // e < 0: render fractional digits
+    let scale          = decimal_pow10(-e)?;
+    let sign           = if c < 0 { "-" } else { "" };
+    let abs_c          = c.abs();
+    let int_part       = abs_c / scale;
+    let frac_part      = abs_c % scale;
+    let decimal_places = (-e) as usize;
+    Ok(format!("{sign}{int_part}.{frac_part:0>decimal_places$}"))
 }
 
 /// Extract `Option[Str]` arg as `Option<String>`. None and missing
