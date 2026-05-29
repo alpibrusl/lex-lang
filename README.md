@@ -626,3 +626,7 @@ cd fuzz && cargo +nightly fuzz run parser -- -max_total_time=60
 ## License
 
 [EUPL-1.2](LICENSE) — the European Union Public Licence v. 1.2.
+
+---
+
+Built under the principles of [Trust Without Comprehension](https://alpibru.com/manifesto).
