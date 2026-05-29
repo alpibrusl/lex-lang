@@ -58,3 +58,19 @@ jobs:
       # binary is enough.
       - run: cargo test -p lex-runtime --features quic --test net_serve_quic
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Manifesto demo: effects are machine-verifiable constraints. The
+      # honest effect row type-checks; a [net] call under an [io]
+      # signature is rejected. lex-cli is already compiled by the
+      # `cargo test` step above, so this `cargo run` is incremental.
+      - name: Manifesto effects demo
+        run: |
+          set -e
+          LEX="cargo run -q -p lex-cli --"
+          echo "== honest effect rows must type-check =="
+          $LEX check examples/manifesto_effects/honest.lex
+          echo "== mislabeled effect row ([io] hiding [net]) must be REJECTED =="
+          if $LEX check examples/manifesto_effects/dishonest.lex >/dev/null 2>&1; then
+            echo "::error::dishonest.lex type-checked but must be rejected"
+            exit 1
+          fi
+          echo "VALIDATED: the type system refused the mislabeled effect."
