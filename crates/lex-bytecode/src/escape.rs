@@ -62,6 +62,26 @@ use std::collections::{HashMap, HashSet};
 use crate::op::Op;
 use crate::program::Function;
 
+/// Scope policy for the escape analysis. Only `Op::Return` consults
+/// it — every other escape rule is identical across policies.
+///
+/// - `FrameScope` (default for #464 stack-record lowering): `Return`
+///   leaks its operand, because the returned value crosses the
+///   current function's frame into the caller.
+/// - `RequestScope` (for #463 arena routing): `Return` does NOT leak
+///   its operand — the value goes to the caller's stack and the
+///   caller is in the same request scope opened by
+///   `EffectHandler::enter_request_scope`. What the caller does with
+///   the returned value is an inter-procedural question, deliberately
+///   left to the caller's own conservative `Call` arm (which marks
+///   its args as escaping in the intra-procedural first cut). See
+///   `docs/design/arena-plumbing.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Policy {
+    FrameScope,
+    RequestScope,
+}
+
 /// Abstract value at a stack or local slot during the analysis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Slot {
@@ -210,9 +230,17 @@ pub fn analyze_program(functions: &[Function]) -> Vec<EscapeReport> {
         .collect()
 }
 
-/// Analyze one function. Cheap to call even when there are no
-/// record sites (early-exits after the first pass over `code`).
+/// Analyze one function under the default `Policy::FrameScope`.
+/// See `analyze_function_with_policy` for the policy-parameterized
+/// form used by #463 arena routing.
 pub fn analyze_function(func: &Function) -> EscapeReport {
+    analyze_function_with_policy(func, Policy::FrameScope)
+}
+
+/// Analyze one function under the given scope policy. Cheap to call
+/// even when there are no aggregate sites (early-exits after the
+/// first pass over `code`).
+pub fn analyze_function_with_policy(func: &Function, policy: Policy) -> EscapeReport {
     // Inventory the MakeRecord sites first. If there are none,
     // skip the whole fixpoint — the function can't benefit from
     // stack allocation anyway.
@@ -263,7 +291,7 @@ pub fn analyze_function(func: &Function) -> EscapeReport {
         in_state[pc] = Some(merged.clone());
 
         // Step the op, get the out-state + any successors.
-        let (out, succs, leaked) = step(pc, &func.code[pc], merged);
+        let (out, succs, leaked) = step(pc, &func.code[pc], merged, policy);
         escaped.extend(leaked);
         for s in succs {
             if s < n {
@@ -290,7 +318,7 @@ pub fn analyze_function(func: &Function) -> EscapeReport {
 /// returned state, except for control-flow ops where successors
 /// share the *same* state), and any sites that escaped during the
 /// step.
-fn step(pc: usize, op: &Op, mut s: State) -> (State, Vec<usize>, HashSet<u32>) {
+fn step(pc: usize, op: &Op, mut s: State, policy: Policy) -> (State, Vec<usize>, HashSet<u32>) {
     let mut escapes: HashSet<u32> = HashSet::new();
 
     // Helper closures for the common pop-n / push patterns.
@@ -426,7 +454,13 @@ fn step(pc: usize, op: &Op, mut s: State) -> (State, Vec<usize>, HashSet<u32>) {
             return (s, vec![pc + 1, target], escapes);
         }
         Op::Return => {
-            if let Some(top) = s.stack.pop() { leak(top, &mut escapes); }
+            let top = s.stack.pop();
+            // The only policy-sensitive arm: under FrameScope the
+            // returned value crosses our frame and leaks; under
+            // RequestScope it stays inside the request and does not.
+            if matches!(policy, Policy::FrameScope) {
+                if let Some(top) = top { leak(top, &mut escapes); }
+            }
             return (s, vec![], escapes);
         }
         Op::Panic(_) => {
