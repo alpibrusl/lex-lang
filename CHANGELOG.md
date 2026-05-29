@@ -7,6 +7,8 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.9.7] — 2026-05-30
+
 ### Added
 
 - **#562: `f"..."` string interpolation.** `f"hello {name}!"` desugars
@@ -30,6 +32,11 @@ bumps may carry breaking changes when justified).
   example case independently rather than short-circuiting on the first
   failure. Errors from all functions in a file were already collected; this
   fixes the within-function case.
+- **policy: `crypto` added to `Policy::permissive()`.** The `crypto`
+  effect was missing from the permissive set, causing `lex test` /
+  `lex repl` to reject any program that calls `std.crypto.*` even when
+  the function correctly declares `[crypto]`. Fixes silent test failures
+  in downstream packages (e.g. lex-agent `gen_message_id`).
 
 ## [0.9.6] — 2026-05-25
 
