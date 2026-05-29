@@ -287,6 +287,20 @@ with semantic exit codes. The auto-generated `.cli/` folder is
 committed in this repo so agents browsing GitHub can read
 `commands.json` without running the binary.
 
+### Claude Code plugin
+
+For [Claude Code](https://code.claude.com) specifically, a ready-made
+plugin lives in [`integrations/claude-plugin/`](integrations/claude-plugin).
+It bundles a skill (the `lex` CLI + idiom rules), slash commands
+(`/lex:lex-check`, `/lex:lex-repair`, `/lex:lex-publish`,
+`/lex:lex-run`), and an MCP server that bridges to a hosted
+[lex-hub](https://github.com/alpibrusl/lex-hub) gateway:
+
+```text
+/plugin marketplace add alpibrusl/lex-lang
+/plugin install lex@lex
+```
+
 ## Toolchain reference
 
 The full table is regenerable via `lex --output json introspect`; the

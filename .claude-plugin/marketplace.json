@@ -1,0 +1,17 @@
+{
+  "name": "lex",
+  "description": "Claude Code plugins for the Lex toolchain and the lex-hub gateway.",
+  "owner": {
+    "name": "alpibrusl",
+    "url": "https://github.com/alpibrusl"
+  },
+  "plugins": [
+    {
+      "name": "lex",
+      "source": "./integrations/claude-plugin",
+      "description": "Lex agent-code loop (check/repair/publish/run), idiom rules, and MCP tools for a hosted lex-hub gateway.",
+      "category": "languages",
+      "keywords": ["lex", "lex-lang", "lex-hub", "typed-effects", "mcp"]
+    }
+  ]
+}

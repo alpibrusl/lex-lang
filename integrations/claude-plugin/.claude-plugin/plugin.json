@@ -1,0 +1,14 @@
+{
+  "name": "lex",
+  "displayName": "Lex",
+  "description": "Drive the Lex toolchain (lex CLI) and a hosted lex-hub gateway from Claude Code: the agent-code loop (check → repair → publish → run), the idiom rules, and MCP tools against a remote hub.",
+  "version": "0.1.0",
+  "author": {
+    "name": "alpibrusl",
+    "url": "https://github.com/alpibrusl"
+  },
+  "homepage": "https://github.com/alpibrusl/lex-lang",
+  "repository": "https://github.com/alpibrusl/lex-lang",
+  "license": "EUPL-1.2",
+  "keywords": ["lex", "lex-lang", "lex-hub", "typed-effects", "agent", "mcp"]
+}
