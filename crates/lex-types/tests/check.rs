@@ -190,3 +190,39 @@ fn example_rule_tags_round_trip() {
     assert_eq!(arity.rule_tag(), "example-arity-mismatch");
     assert_eq!(effectful.rule_tag(), "examples-on-effectful-fn");
 }
+
+// ---- #566: accumulate all errors, don't stop at first ---------------
+
+#[test]
+fn errors_from_multiple_functions_all_reported() {
+    // Both functions have type errors; both should appear in the error list.
+    let src = "\
+fn bad_a() -> Int { \"not an int\" }
+fn bad_b() -> Str { 42 }
+";
+    let errs = check(src).unwrap_err();
+    assert!(
+        errs.len() >= 2,
+        "expected >= 2 errors (one per bad function), got {}: {errs:#?}",
+        errs.len()
+    );
+}
+
+#[test]
+fn body_and_example_errors_both_reported() {
+    // Body has wrong return type AND example expected value has wrong type.
+    // Previously only the body error was returned; now both surface.
+    let src = "\
+fn wrong(x :: Int) -> Int
+  examples {
+    wrong(1) => \"also wrong\"
+  }
+{ \"wrong\" }
+";
+    let errs = check(src).unwrap_err();
+    assert!(
+        errs.len() >= 2,
+        "expected body error + example error, got {}: {errs:#?}",
+        errs.len()
+    );
+}

@@ -189,3 +189,56 @@ fn json_parse_strict_fails_when_top_level_is_not_an_object() {
     ]);
     let _ = err_msg(&v);
 }
+
+// ---- #577: Option[T] fields are correctly wrapped -------------------
+
+fn some(v: Value) -> Value { Value::Variant { name: "Some".into(), args: vec![v] } }
+fn none() -> Value { Value::Variant { name: "None".into(), args: vec![] } }
+
+/// Like `run` but uses `check_and_rewrite_program` so that `json.parse` calls
+/// are rewritten to `json.parse_strict_typed` with the type schema injected.
+/// This is the path the real `lex run` CLI takes and the only one that
+/// exercises `apply_option_wrapping` (#577).
+fn run_typed(src: &str, fn_name: &str, args: Vec<Value>) -> Value {
+    let prog = parse_source(src).expect("parse");
+    let mut stages = canonicalize_program(&prog);
+    lex_types::check_and_rewrite_program(&mut stages)
+        .unwrap_or_else(|errs| panic!("type errors:\n{errs:#?}"));
+    let bc = Arc::new(compile_program(&stages));
+    let handler = DefaultHandler::new(Policy::pure()).with_program(Arc::clone(&bc));
+    let mut vm = Vm::with_handler(&bc, Box::new(handler));
+    vm.call(fn_name, args).unwrap_or_else(|e| panic!("call {fn_name}: {e}"))
+}
+
+const OPTION_SRC: &str = r#"
+import "std.json" as json
+
+type Profile = { name :: Str, bio :: Option[Str] }
+
+fn parse_profile(s :: Str) -> Result[Profile, Str] { json.parse(s) }
+
+fn get_bio(s :: Str) -> Option[Str] {
+  match parse_profile(s) {
+    Ok(p) => p.bio,
+    Err(_) => None,
+  }
+}
+"#;
+
+#[test]
+fn option_field_present_wraps_in_some() {
+    // A non-null value for an Option[Str] field must be wrapped in Some(...).
+    let v = run_typed(OPTION_SRC, "get_bio", vec![
+        Value::Str(r#"{"name":"Alice","bio":"developer"}"#.into()),
+    ]);
+    assert_eq!(v, some(Value::Str("developer".into())), "expected Some(\"developer\"), got {v:?}");
+}
+
+#[test]
+fn option_field_null_produces_none() {
+    // A JSON null for an Option[Str] field must produce None.
+    let v = run_typed(OPTION_SRC, "get_bio", vec![
+        Value::Str(r#"{"name":"Alice","bio":null}"#.into()),
+    ]);
+    assert_eq!(v, none(), "expected None for null bio, got {v:?}");
+}

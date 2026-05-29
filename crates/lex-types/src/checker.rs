@@ -665,105 +665,111 @@ impl Checker {
             locals.insert(p.name.clone(), t.clone());
         }
 
+        // Accumulate all errors within this function rather than returning on the
+        // first one (#566). Body errors and example errors are independent — an
+        // agent can fix both in one pass instead of running lex check repeatedly.
+        let mut errors: Vec<TypeError> = Vec::new();
         let mut inferred_effects = EffectSet::empty();
-        let body_ty = self.check_expr(&fd.body, "n_0", &mut locals, &mut inferred_effects)
-            .map_err(|e| vec![e])?;
 
-        // The body may produce an anonymous record literal where the
-        // signature expects a nominal record alias (and vice-versa,
-        // and at any nested level). `unify_with_record_coercion`
-        // handles that asymmetry while keeping nominal-vs-nominal
-        // mismatches strict.
-        if let Err(e) = self.unify_with_record_coercion(&body_ty, &ret_ty) {
-            return Err(vec![mismatch_err("n_0", e, &self.u, vec![format!("in function `{}`", fd.name)])]);
-        }
+        // Check body. Save the error but continue to example checking.
+        let body_ok = match self.check_expr(&fd.body, "n_0", &mut locals, &mut inferred_effects) {
+            Ok(body_ty) => {
+                // The body may produce an anonymous record literal where the
+                // signature expects a nominal record alias (and vice-versa,
+                // and at any nested level). `unify_with_record_coercion`
+                // handles that asymmetry while keeping nominal-vs-nominal
+                // mismatches strict.
+                if let Err(e) = self.unify_with_record_coercion(&body_ty, &ret_ty) {
+                    errors.push(mismatch_err("n_0", e, &self.u, vec![format!("in function `{}`", fd.name)]));
+                    false
+                } else {
+                    true
+                }
+            }
+            Err(e) => { errors.push(e); false }
+        };
 
-        if !inferred_effects.is_subset(&declared_effects) {
-            // Pick the first undeclared effect for the error.
+        if body_ok && !inferred_effects.is_subset(&declared_effects) {
             for e in inferred_effects.concrete.iter() {
                 if !declared_effects.concrete.iter().any(|d| d.subsumes(e)) {
-                    return Err(vec![TypeError::EffectNotDeclared {
+                    errors.push(TypeError::EffectNotDeclared {
                         at_node: "n_0".into(),
                         effect: e.pretty(),
-                    }]);
+                    });
+                    break;
                 }
             }
         }
 
         // #369: signature-level examples. Pure-only in v1; arg arity
         // must match params; each arg type-checks against its param,
-        // each expected type-checks against the return type. Behavioral
-        // equivalence (run the body, compare to expected) is a follow-up
-        // — this slice catches type-level drift, which is already a
-        // common source of stale examples.
+        // each expected type-checks against the return type.
+        // Check all examples regardless of body success (#566).
         if !fd.examples.is_empty() {
             if !declared_effects.concrete.is_empty() {
-                return Err(vec![TypeError::ExamplesOnEffectfulFn {
+                errors.push(TypeError::ExamplesOnEffectfulFn {
                     at_node: "n_0".into(),
                     fn_name: fd.name.clone(),
-                }]);
-            }
-            for (case_index, ex) in fd.examples.iter().enumerate() {
-                if ex.args.len() != param_tys.len() {
-                    return Err(vec![TypeError::ExampleArityMismatch {
-                        at_node: "n_0".into(),
-                        fn_name: fd.name.clone(),
-                        case_index,
-                        expected: param_tys.len(),
-                        got: ex.args.len(),
-                    }]);
-                }
-                let mut example_locals: IndexMap<String, Ty> = IndexMap::new();
-                let mut example_effects = EffectSet::empty();
-                for (i, (arg, expected_ty)) in
-                    ex.args.iter().zip(param_tys.iter()).enumerate()
-                {
-                    let arg_ty = self
-                        .check_expr(arg, "n_0", &mut example_locals, &mut example_effects)
-                        .map_err(|e| vec![e])?;
-                    if let Err(e) = self.unify_with_record_coercion(&arg_ty, expected_ty) {
-                        return Err(vec![mismatch_err(
-                            "n_0",
-                            e,
-                            &self.u,
-                            vec![format!(
-                                "in example #{} for `{}`, argument {}",
-                                case_index + 1,
-                                fd.name,
-                                i + 1
-                            )],
-                        )]);
+                });
+            } else {
+                for (case_index, ex) in fd.examples.iter().enumerate() {
+                    if ex.args.len() != param_tys.len() {
+                        errors.push(TypeError::ExampleArityMismatch {
+                            at_node: "n_0".into(),
+                            fn_name: fd.name.clone(),
+                            case_index,
+                            expected: param_tys.len(),
+                            got: ex.args.len(),
+                        });
+                        continue;
                     }
-                }
-                let expected_ty = self
-                    .check_expr(&ex.expected, "n_0", &mut example_locals, &mut example_effects)
-                    .map_err(|e| vec![e])?;
-                if let Err(e) = self.unify_with_record_coercion(&expected_ty, &ret_ty) {
-                    return Err(vec![mismatch_err(
-                        "n_0",
-                        e,
-                        &self.u,
-                        vec![format!(
-                            "in example #{} for `{}`, expected value",
-                            case_index + 1,
-                            fd.name
-                        )],
-                    )]);
-                }
-                // The example's args/expected are expected to be pure
-                // by construction (literals in the common case); if
-                // they invoked effects, they'd break the pure-only
-                // discipline. Reject the first one via the same effect rule.
-                if let Some(e) = example_effects.concrete.iter().next() {
-                    return Err(vec![TypeError::EffectNotDeclared {
-                        at_node: "n_0".into(),
-                        effect: e.pretty(),
-                    }]);
+                    let mut example_locals: IndexMap<String, Ty> = IndexMap::new();
+                    let mut example_effects = EffectSet::empty();
+                    let mut args_ok = true;
+                    for (i, (arg, expected_ty)) in
+                        ex.args.iter().zip(param_tys.iter()).enumerate()
+                    {
+                        match self.check_expr(arg, "n_0", &mut example_locals, &mut example_effects) {
+                            Ok(arg_ty) => {
+                                if let Err(e) = self.unify_with_record_coercion(&arg_ty, expected_ty) {
+                                    errors.push(mismatch_err(
+                                        "n_0", e, &self.u,
+                                        vec![format!("in example #{} for `{}`, argument {}", case_index + 1, fd.name, i + 1)],
+                                    ));
+                                    args_ok = false;
+                                }
+                            }
+                            Err(e) => { errors.push(e); args_ok = false; }
+                        }
+                    }
+                    if args_ok {
+                        match self.check_expr(&ex.expected, "n_0", &mut example_locals, &mut example_effects) {
+                            Ok(expected_ty) => {
+                                if let Err(e) = self.unify_with_record_coercion(&expected_ty, &ret_ty) {
+                                    errors.push(mismatch_err(
+                                        "n_0", e, &self.u,
+                                        vec![format!("in example #{} for `{}`, expected value", case_index + 1, fd.name)],
+                                    ));
+                                }
+                            }
+                            Err(e) => errors.push(e),
+                        }
+                    }
+                    // The example's args/expected are expected to be pure
+                    // by construction (literals in the common case); if
+                    // they invoked effects, they'd break the pure-only
+                    // discipline. Reject the first one via the same effect rule.
+                    if let Some(e) = example_effects.concrete.iter().next() {
+                        errors.push(TypeError::EffectNotDeclared {
+                            at_node: "n_0".into(),
+                            effect: e.pretty(),
+                        });
+                    }
                 }
             }
         }
 
-        Ok(scheme)
+        if errors.is_empty() { Ok(scheme) } else { Err(errors) }
     }
 
     fn check_expr(

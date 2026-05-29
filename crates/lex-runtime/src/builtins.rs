@@ -341,7 +341,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                     if let Err(e) = validate_field_types(&v, &schema) {
                         return Ok(err_v(Value::Str(e.into())));
                     }
-                    Ok(ok_v(json_to_value(&v)))
+                    Ok(ok_v(apply_option_wrapping(json_to_value(&v), &v, &schema)))
                 }
                 Err(e) => Ok(err_v(Value::Str(format!("{e}").into()))),
             }
@@ -376,7 +376,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                     if let Err(e) = validate_field_types(&v, &schema) {
                         return Ok(err_v(Value::Str(e.into())));
                     }
-                    Ok(ok_v(json_to_value(&v)))
+                    Ok(ok_v(apply_option_wrapping(json_to_value(&v), &v, &schema)))
                 }
                 Err(e) => Ok(err_v(Value::Str(format!("{e}").into()))),
             }
@@ -397,7 +397,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                     if let Err(e) = validate_field_types(&v, &schema) {
                         return Ok(err_v(Value::Str(e.into())));
                     }
-                    Ok(ok_v(json_to_value(&v)))
+                    Ok(ok_v(apply_option_wrapping(json_to_value(&v), &v, &schema)))
                 }
                 Err(e) => Ok(err_v(Value::Str(format!("{e}").into()))),
             }
@@ -415,7 +415,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                     if let Err(e) = validate_field_types(&v, &schema) {
                         return Ok(err_v(Value::Str(e.into())));
                     }
-                    Ok(ok_v(json_to_value(&v)))
+                    Ok(ok_v(apply_option_wrapping(json_to_value(&v), &v, &schema)))
                 }
                 Err(e) => Ok(err_v(Value::Str(format!("{e}").into()))),
             }
@@ -2368,6 +2368,42 @@ fn validate_field_types(
         }
     }
     Ok(())
+}
+
+/// Post-process a Record produced by `json_to_value` to correctly wrap
+/// `Option[X]` fields. `json_to_value` is schema-blind: it converts JSON null
+/// to `Value::Unit` and never wraps non-null values in `some(...)`. This pass
+/// fixes that for every field declared as `Option[X]` in the type schema.
+fn apply_option_wrapping(v: Value, json: &serde_json::Value, schema: &[(String, String)]) -> Value {
+    if schema.is_empty() {
+        return v;
+    }
+    let fields = match v {
+        Value::Record { fields, .. } => *fields,
+        other => return other,
+    };
+    let json_obj = match json.as_object() {
+        Some(o) => o,
+        None => return Value::record_interned(fields),
+    };
+    let mut new_fields = fields;
+    for (field_name, tag) in schema {
+        if tag.starts_with("Option[") && tag.ends_with(']') {
+            let json_val = json_obj.get(field_name.as_str());
+            let wrapped = match json_val {
+                None | Some(serde_json::Value::Null) => none(),
+                Some(_) => {
+                    let inner = new_fields
+                        .get(field_name.as_str())
+                        .cloned()
+                        .unwrap_or(Value::Unit);
+                    some(inner)
+                }
+            };
+            new_fields.insert(smol_str::SmolStr::from(field_name.as_str()), wrapped);
+        }
+    }
+    Value::record_interned(new_fields)
 }
 
 /// Recursively check that `val` conforms to the compact type `tag`.

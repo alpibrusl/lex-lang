@@ -7,6 +7,30 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added
+
+- **#562: `f"..."` string interpolation.** `f"hello {name}!"` desugars
+  at parse time to a `str.concat` chain. Requires `import "std.str" as str`
+  in scope when the interpolated portion contains expressions. Plain text
+  `f"..."` without braces works without the import.
+- **`FStr` token.** New lexer token `f"..."` (parallel to `b"..."` byte
+  strings) for interpolated strings. Existing `"..."` plain strings are
+  unaffected — no backward-compatibility break.
+
+### Fixed
+
+- **#577: `json.parse`/`toml.parse` with `Option[T]` fields now produce
+  `Some(value)` / `None` instead of raw values / `Unit`.** The
+  `parse_strict`, `parse_strict_typed`, `toml.parse_strict`, and
+  `toml.parse_strict_typed` builtins apply `apply_option_wrapping` after
+  validation, correctly wrapping fields declared as `Option[X]` in the
+  type schema.
+- **#566: `lex check` now reports all type errors, not just the first.**
+  `check_fn` accumulates errors from the function body and from every
+  example case independently rather than short-circuiting on the first
+  failure. Errors from all functions in a file were already collected; this
+  fixes the within-function case.
+
 ## [0.9.6] — 2026-05-25
 
 ### Added
