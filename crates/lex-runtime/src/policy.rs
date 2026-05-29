@@ -108,6 +108,7 @@ impl Policy {
             "stream",      // std.stream
             "fs_walk",     // std.fs directory traversal
             "concurrent",  // conc.spawn / conc.ask / conc.tell (#381)
+            "crypto",      // std.crypto hashing / signing (#562, #582)
         ] {
             s.insert(k.to_string());
         }

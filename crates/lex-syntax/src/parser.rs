@@ -2,7 +2,7 @@
 //! binary operators; everything else is straightforward LL(1)-with-lookahead.
 
 use crate::syntax::*;
-use crate::token::{Token, TokenKind};
+use crate::token::{Token, TokenKind, lex as lex_tokens};
 
 pub fn parse(tokens: Vec<Token>) -> Result<Program, ParseError> {
     // Back-compat entry: no source available, so leading comments are
@@ -63,9 +63,111 @@ struct Parser<'a> {
 /// count around 400-500 — well below even a 2 MiB test stack.
 const MAX_DEPTH: u32 = 96;
 
+/// A segment of a string interpolation literal (#562).
+enum InterpPart<'a> {
+    Text(&'a str),
+    Expr(&'a str),
+}
+
+/// Split `s` into text and `{expr}` segments. Tracks brace depth so
+/// record literals inside interpolations don't confuse the scanner.
+fn split_interp_parts(s: &str) -> Result<Vec<InterpPart<'_>>, String> {
+    let mut parts = Vec::new();
+    let mut rest = s;
+    while let Some(open) = rest.find('{') {
+        if open > 0 {
+            parts.push(InterpPart::Text(&rest[..open]));
+        }
+        let after_open = &rest[open + 1..];
+        let close = find_closing_brace(after_open)
+            .ok_or_else(|| "unclosed `{` in string interpolation".to_string())?;
+        let expr_content = &after_open[..close];
+        if expr_content.trim().is_empty() {
+            return Err("empty `{}` in string interpolation".to_string());
+        }
+        parts.push(InterpPart::Expr(expr_content));
+        rest = &after_open[close + 1..];
+    }
+    if !rest.is_empty() {
+        parts.push(InterpPart::Text(rest));
+    }
+    Ok(parts)
+}
+
+/// Find the closing `}` matching the opening `{` that was already consumed.
+/// Tracks nested brace depth so `{a: {x: 1}}` returns the outer `}`.
+fn find_closing_brace(s: &str) -> Option<usize> {
+    let mut depth: usize = 1;
+    for (i, c) in s.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Build a `str.concat(left, right)` call expression.
+fn str_concat_expr(left: Expr, right: Expr) -> Expr {
+    Expr::Call {
+        callee: Box::new(Expr::Field {
+            value: Box::new(Expr::Var("str".into())),
+            field: "concat".into(),
+        }),
+        args: vec![left, right],
+    }
+}
+
 impl<'a> Parser<'a> {
     fn new(src: &'a str, tokens: Vec<Token>) -> Self {
         Self { src, tokens, idx: 0, depth: 0, discard_counter: 0 }
+    }
+
+    /// Desugar `"hello {name}"` to `str.concat("hello ", name)` (#562).
+    /// Calls the lexer on each `{...}` content and parses it as an expression.
+    fn desugar_string_interpolation(&self, s: &str) -> Result<Expr, ParseError> {
+        let parts = match split_interp_parts(s) {
+            Ok(p) => p,
+            Err(msg) => return Err(ParseError { pos: 0, msg }),
+        };
+        let mut exprs: Vec<Expr> = Vec::new();
+        for part in parts {
+            match part {
+                InterpPart::Text(t) => {
+                    if !t.is_empty() {
+                        exprs.push(Expr::Lit(Literal::Str(t.to_string())));
+                    }
+                }
+                InterpPart::Expr(content) => {
+                    let tokens = lex_tokens(content.trim()).map_err(|e| ParseError {
+                        pos: 0,
+                        msg: format!("in string interpolation `{{{content}}}`': {e}"),
+                    })?;
+                    let mut sub = Parser::new("", tokens);
+                    exprs.push(sub.parse_expr()?);
+                    if !sub.at_eof() {
+                        return Err(ParseError {
+                            pos: 0,
+                            msg: format!("unexpected tokens after expression in `{{{content}}}`"),
+                        });
+                    }
+                }
+            }
+        }
+        if exprs.is_empty() {
+            return Ok(Expr::Lit(Literal::Str(String::new())));
+        }
+        let mut result = exprs.remove(0);
+        for next in exprs {
+            result = str_concat_expr(result, next);
+        }
+        Ok(result)
     }
 
     /// Extract `#` line-comments from the source byte range
@@ -740,6 +842,10 @@ impl<'a> Parser<'a> {
             },
             Some(TokenKind::Str(_)) => match self.bump().unwrap().kind {
                 TokenKind::Str(s) => Ok(Expr::Lit(Literal::Str(s))),
+                _ => unreachable!(),
+            },
+            Some(TokenKind::FStr(_)) => match self.bump().unwrap().kind {
+                TokenKind::FStr(s) => self.desugar_string_interpolation(&s),
                 _ => unreachable!(),
             },
             Some(TokenKind::Bytes(_)) => match self.bump().unwrap().kind {

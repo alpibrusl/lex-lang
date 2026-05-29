@@ -73,6 +73,12 @@ pub enum TokenKind {
     #[regex(r#"b"([^"\\]|\\.)*""#, |lex| unescape(&lex.slice()[2..lex.slice().len()-1]).map(|s| s.into_bytes()))]
     Bytes(Vec<u8>),
 
+    /// String interpolation literal `f"hello {name}"` (#562). The content
+    /// is unescaped the same way as `Str`; `{...}` segments are desugared
+    /// to `str.concat` chains by the parser.
+    #[regex(r#"f"([^"\\]|\\.)*""#, |lex| unescape(&lex.slice()[2..lex.slice().len()-1]))]
+    FStr(String),
+
     // Identifier. Two alternatives so a bare `_` keeps lexing as
     // the discard token (used by `match _ => ...` and the new
     // `let _ := ...`) while `_name` is recognized as a real
