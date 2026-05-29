@@ -19,11 +19,11 @@ indexmap.workspace = true
 sha2.workspace = true
 arrow-array = "58"
 arrow-schema = "58"
-lex-ast = { path = "../lex-ast", version = "0.9.5" }
-lex-types = { path = "../lex-types", version = "0.9.5" }
+lex-ast = { path = "../lex-ast", version = "0.9.6" }
+lex-types = { path = "../lex-types", version = "0.9.6" }
 
 [dev-dependencies]
-lex-syntax = { path = "../lex-syntax", version = "0.9.5" }
+lex-syntax = { path = "../lex-syntax", version = "0.9.6" }
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]

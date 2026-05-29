@@ -1,6 +1,6 @@
 # lex
 
-Version: 0.9.5
+Version: 0.9.6
 ACLI version: 0.1.0
 
 ## Commands

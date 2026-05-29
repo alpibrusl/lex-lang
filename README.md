@@ -137,7 +137,8 @@ tools, and orchestrators.
 
 | Module | Surface | Effect kind |
 |---|---|---|
-| **`std.http`** | Rich client with builders + decoders; `get` / `post` / `send`; per-host scopes | `[net]` (per-host scoped) |
+| **`std.http`** | Rich client with builders + decoders; `get` / `post` / `send` (GET/POST/PUT/PATCH/DELETE/HEAD); per-host scopes | `[net]` (per-host scoped) |
+| **`std.redis`** | Thin Redis client — key/value + pub/sub; connection pooling and work-queue retry via [lex-queue](https://github.com/alpibrusl/lex-queue) | `[net]` |
 | **`std.sql`** | Embedded SQLite **or** Postgres (`postgres://...`) under one API; per-connection locking | `[sql, fs_write]` |
 | **`std.kv`** | Persistent key-value store via sled | `[kv, fs_write]` |
 | **`std.crypto`** | SHA-256/512, BLAKE2b, HMAC, AES-GCM / ChaCha20-Poly1305 AEAD, PBKDF2 / HKDF / Argon2id KDFs, base64 / base64url / hex, constant-time `eq` | pure (KDFs / hashes) ; `[random]` for CSPRNG |
@@ -178,6 +179,28 @@ fn pg_users(conn :: Str) -> [sql, fs_write] Result[List[{ id :: Int, name :: Str
   }
 }
 ```
+
+## Ecosystem packages
+
+Lex is the toolchain; the agent-facing capabilities ship as separate
+pure-Lex packages. Add one to your project's `lex.toml`
+`[dependencies]` and `lex pkg install` fetches it. All live under the
+[alpibrusl](https://github.com/alpibrusl) org.
+
+| Package | What it is |
+|---|---|
+| [**lex-agent**](https://github.com/alpibrusl/lex-agent) | Pure-Lex implementation of the Google **Agent2Agent (A2A)** protocol — AgentCard, JSON-RPC 2.0 envelope, task lifecycle, SSE streaming |
+| [**lex-llm**](https://github.com/alpibrusl/lex-llm) | LLM-agent runtime — provider abstraction (Anthropic / OpenAI / Google / Ollama), multi-step tool-call loop, schema-validated structured output |
+| [**lex-spec**](https://github.com/alpibrusl/lex-spec) | Capability-precondition + spec DSL — three-valued evaluator, randomized property check, SMT-LIB export, "evaluate at both ends" gating |
+| [**lex-trail**](https://github.com/alpibrusl/lex-trail) | Content-addressed event log for A2A / LLM audit — tamper-evident attestation chains and task replay |
+| [**lex-schema**](https://github.com/alpibrusl/lex-schema) | JSON Schema 2020-12 model types + constraint validation, shared by lex-agent and lex-llm |
+| [**lex-web**](https://github.com/alpibrusl/lex-web) | HTTP router / framework — request-id correlation, gzip, structured access logs; A2A agents mount onto it |
+| [**lex-queue**](https://github.com/alpibrusl/lex-queue) | Redis-backed work queue + pub/sub fan-out, built on `std.redis` |
+| [**lex-code**](https://github.com/alpibrusl/lex-code) | A Lex-native coding assistant (build / plan / spec / test / review agents), written entirely in the packages above |
+
+The toolchain itself is this repo,
+[**lex-lang**](https://github.com/alpibrusl/lex-lang); the CLI-discovery
+contract it implements is [**acli**](https://github.com/alpibrusl/acli).
 
 ## Quickstart
 
@@ -507,7 +530,8 @@ context.
 | `std.conc` actor model | **Production-ready** | #381; synchronous mailbox, mutex-serialised |
 | `std.sql` (SQLite + Postgres) | **Production-ready** | `:memory:`, file, or `postgres://...` URI |
 | `std.crypto` (AEAD, KDFs, hashes, MAC, encodings) | **Production-ready** | AES-GCM, ChaCha20-Poly1305, Argon2id, PBKDF2, HKDF |
-| `std.http` rich client | **Production-ready** | per-host scopes; builders + decoders |
+| `std.http` rich client | **Production-ready** | per-host scopes; builders + decoders; GET/POST/PUT/PATCH/DELETE/HEAD |
+| `std.redis` (key/value + pub/sub) | **Production-ready** | #533; all ops `[net]`; pooling / work-queues via lex-queue |
 | `lex-lsp` (LSP — VS Code) | **Production-ready** | diagnostics, hover, QuickFix, RepairHint surface |
 | `lex-tea` web browser | **Production-ready** (read-only) | branches / fns / stage info |
 | Conformance harness + property tests | **Production-ready** | JSON descriptors at `conformance/` |
@@ -574,8 +598,8 @@ Linux (x86_64 / aarch64), macOS (x86_64 / aarch64), and Windows
 LICENSE / CHANGELOG. SHA-256 sums are uploaded alongside each tarball.
 
 ```bash
-tar -xzf lex-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz
-mv lex-vX.Y.Z-x86_64-unknown-linux-gnu/lex /usr/local/bin/
+tar -xzf lex-v0.9.6-x86_64-unknown-linux-gnu.tar.gz
+mv lex-v0.9.6-x86_64-unknown-linux-gnu/lex /usr/local/bin/
 lex version
 ```
 
@@ -586,16 +610,16 @@ containerd):
 
 ```bash
 # Run the agent VCS server (default; serves on :4040, stores at /data)
-docker run -p 4040:4040 -v lex-store:/data ghcr.io/alpibrusl/lex:v0.9.3
+docker run -p 4040:4040 -v lex-store:/data ghcr.io/alpibrusl/lex:v0.9.6
 
 # One-shot CLI invocation (subcommand args override the default CMD)
-docker run --rm ghcr.io/alpibrusl/lex:v0.9.3 --version
+docker run --rm ghcr.io/alpibrusl/lex:v0.9.6 --version
 docker run --rm -v "$(pwd):/work" -w /work \
-  ghcr.io/alpibrusl/lex:v0.9.3 check src/main.lex
+  ghcr.io/alpibrusl/lex:v0.9.6 check src/main.lex
 
 # Use as a base image for a downstream Lex project
 # (Dockerfile in your repo)
-FROM ghcr.io/alpibrusl/lex:v0.9.3
+FROM ghcr.io/alpibrusl/lex:v0.9.6
 COPY src /app/src
 WORKDIR /app
 CMD ["run", "src/main.lex", "main"]
@@ -606,7 +630,7 @@ this repo ships — same base, same uid 1000 `lex` user, same `/data`
 volume, same `lex serve` default — so the Docker Compose stack at
 [`docs/deploy.md`](docs/deploy.md) can switch between
 `build: .` (fast iteration, cargo-chef cached) and
-`image: ghcr.io/alpibrusl/lex:v0.9.3` (fast deploy, ~30s pull vs
+`image: ghcr.io/alpibrusl/lex:v0.9.6` (fast deploy, ~30s pull vs
 ~3 min build) without other changes.
 
 ## Building from source
