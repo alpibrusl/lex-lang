@@ -184,6 +184,14 @@ pub enum TrustError {
         required: Level,
         granted: Level,
     },
+    #[error(
+        "net effect to `{host}` is not in the grant's egress allowlist ({allowed} host(s) allowed)"
+    )]
+    NetHostNotAllowed { host: String, allowed: usize },
+    #[error(
+        "unscoped `[net]` cannot be proven within the egress allowlist — scope it to a host, e.g. `net(\"results.demo.internal\")`"
+    )]
+    NetUnscoped,
 }
 
 impl Grant {
@@ -291,6 +299,64 @@ impl Grant {
         Ok(())
     }
 
+    /// Like [`Self::permits_effects`] but resolves network egress
+    /// against an explicit host **allowlist** (the lex-os manifest's
+    /// egress rules — design doc demo grant `network: none EXCEPT
+    /// results.demo.internal`). The allowlist is authoritative for
+    /// network: a host-scoped `net("h")` effect is permitted iff the
+    /// grant's network is `Full`, **or** `h` matches an allowlist entry —
+    /// regardless of the coarse network level, so an allowlist can carve
+    /// exceptions into an otherwise-`none` network. An unscoped `[net]`
+    /// is permitted only under `Full` (it cannot be proven to stay
+    /// within the allowlist). Non-network effects use the same level
+    /// check as [`Self::permits_effects`].
+    pub fn permits_effects_with_allowlist(
+        &self,
+        effects: &EffectSet,
+        allowlist: &[String],
+    ) -> Result<(), TrustError> {
+        for e in &effects.concrete {
+            self.permit_one_with_allowlist(e, allowlist)?;
+        }
+        Ok(())
+    }
+
+    fn permit_one_with_allowlist(
+        &self,
+        e: &EffectKind,
+        allowlist: &[String],
+    ) -> Result<(), TrustError> {
+        if is_net_effect(&e.name) {
+            // Full network permits any host; otherwise the allowlist is
+            // the network policy.
+            if self.network == Level::Full {
+                return Ok(());
+            }
+            match net_effect_host(e) {
+                Some(host) if host_in_allowlist(host, allowlist) => Ok(()),
+                Some(host) => Err(TrustError::NetHostNotAllowed {
+                    host: host.to_string(),
+                    allowed: allowlist.len(),
+                }),
+                None => Err(TrustError::NetUnscoped),
+            }
+        } else if let Some((dim, required)) = effect_requirement(&e.name) {
+            let granted = self.level(dim);
+            if required.leq(granted) {
+                Ok(())
+            } else {
+                Err(TrustError::EffectNotPermitted {
+                    effect: e.pretty(),
+                    dimension: dim,
+                    required,
+                    granted,
+                })
+            }
+        } else {
+            Ok(())
+        }
+    }
+
     /// Canonical one-line rendering, e.g.
     /// `fs=read-only net=none exec=none`.
     pub fn pretty(&self) -> String {
@@ -373,6 +439,44 @@ pub fn effect_requirement(effect_name: &str) -> Option<(Dimension, Level)> {
     }
 }
 
+/// Is this a network-egress effect (one whose blast radius is reaching
+/// a host on the network)? Kept aligned with the `Network`-dimension
+/// entries in [`effect_requirement`].
+pub fn is_net_effect(name: &str) -> bool {
+    matches!(name, "net" | "http" | "mcp" | "llm_cloud")
+}
+
+/// The host a net effect targets, if it is host-scoped (`net("host")`).
+/// A bare `[net]` returns `None`.
+fn net_effect_host(e: &EffectKind) -> Option<&str> {
+    match &e.arg {
+        Some(crate::types::EffectArg::Str(h)) => Some(h.as_str()),
+        _ => Option::None,
+    }
+}
+
+/// Match a target `host` against one allowlist `entry`. Entries may
+/// carry a `:port` suffix (ignored for host matching) and a leading
+/// `*.` wildcard matching any subdomain — `*.example.com` matches
+/// `api.example.com` and `example.com`. Host comparison is
+/// case-insensitive.
+pub fn host_matches(entry: &str, host: &str) -> bool {
+    let entry_host = entry.split(':').next().unwrap_or(entry);
+    match entry_host.strip_prefix("*.") {
+        Some(suffix) => {
+            host.eq_ignore_ascii_case(suffix)
+                || (host.len() > suffix.len() + 1
+                    && host[host.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+                    && host.as_bytes()[host.len() - suffix.len() - 1] == b'.')
+        }
+        None => entry_host.eq_ignore_ascii_case(host),
+    }
+}
+
+fn host_in_allowlist(host: &str, allowlist: &[String]) -> bool {
+    allowlist.iter().any(|e| host_matches(e, host))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,6 +505,76 @@ mod tests {
             Level::ReadOnly.meet(Level::ReadWrite).rank(),
             Level::ReadOnly.rank()
         );
+    }
+
+    #[test]
+    fn host_matching_exact_port_and_wildcard() {
+        assert!(host_matches("results.demo.internal", "results.demo.internal"));
+        assert!(host_matches("results.demo.internal:443", "results.demo.internal"));
+        assert!(!host_matches("results.demo.internal", "evil.com"));
+        assert!(host_matches("Results.Demo.Internal", "results.demo.internal"));
+        assert!(host_matches("*.example.com", "api.example.com"));
+        assert!(host_matches("*.example.com", "example.com"));
+        assert!(!host_matches("*.example.com", "example.com.evil.com"));
+        assert!(!host_matches("*.example.com", "notexample.com"));
+    }
+
+    #[test]
+    fn allowlist_permits_only_listed_host_under_none_network() {
+        // The demo grant: network none EXCEPT one host.
+        let grant = Grant::new(Level::ReadWrite, Level::None, Level::Full);
+        let allow = vec!["results.demo.internal:443".to_string()];
+
+        let mut ok = EffectSet::empty();
+        ok.concrete.insert(EffectKind::with_str("net", "results.demo.internal"));
+        assert!(grant.permits_effects_with_allowlist(&ok, &allow).is_ok());
+
+        let mut bad = EffectSet::empty();
+        bad.concrete.insert(EffectKind::with_str("net", "evil.com"));
+        match grant.permits_effects_with_allowlist(&bad, &allow).unwrap_err() {
+            TrustError::NetHostNotAllowed { host, allowed } => {
+                assert_eq!(host, "evil.com");
+                assert_eq!(allowed, 1);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unscoped_net_rejected_unless_full() {
+        let allow = vec!["results.demo.internal".to_string()];
+        let mut bare = EffectSet::empty();
+        bare.concrete.insert(EffectKind::bare("net"));
+
+        let g = Grant::new(Level::None, Level::Allowlist, Level::None);
+        assert!(matches!(
+            g.permits_effects_with_allowlist(&bare, &allow).unwrap_err(),
+            TrustError::NetUnscoped
+        ));
+        let full = Grant::new(Level::None, Level::Full, Level::None);
+        assert!(full.permits_effects_with_allowlist(&bare, &allow).is_ok());
+    }
+
+    #[test]
+    fn full_network_permits_any_host() {
+        let g = Grant::new(Level::None, Level::Full, Level::None);
+        let mut e = EffectSet::empty();
+        e.concrete.insert(EffectKind::with_str("net", "anything.example"));
+        assert!(g.permits_effects_with_allowlist(&e, &[]).is_ok());
+    }
+
+    #[test]
+    fn allowlist_check_still_gates_non_net_effects() {
+        let g = Grant::new(Level::ReadOnly, Level::Full, Level::None);
+        let mut e = EffectSet::empty();
+        e.concrete.insert(EffectKind::bare("fs_write"));
+        assert!(matches!(
+            g.permits_effects_with_allowlist(&e, &[]).unwrap_err(),
+            TrustError::EffectNotPermitted {
+                dimension: Dimension::Filesystem,
+                ..
+            }
+        ));
     }
 
     #[test]
