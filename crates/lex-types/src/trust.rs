@@ -357,6 +357,7 @@ impl Grant {
         }
     }
 
+
     /// Canonical one-line rendering, e.g.
     /// `fs=read-only net=none exec=none`.
     pub fn pretty(&self) -> String {
@@ -476,6 +477,7 @@ pub fn host_matches(entry: &str, host: &str) -> bool {
 fn host_in_allowlist(host: &str, allowlist: &[String]) -> bool {
     allowlist.iter().any(|e| host_matches(e, host))
 }
+
 
 #[cfg(test)]
 mod tests {
