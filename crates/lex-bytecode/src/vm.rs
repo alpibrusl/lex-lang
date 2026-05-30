@@ -1168,6 +1168,113 @@ impl<'a> Vm<'a> {
         self.handler.exit_request_scope(scope_id)
     }
 
+    /// Deep-walk `value` and resolve every `Value::ArenaRecord` /
+    /// `Value::ArenaTuple` handle into its heap-owned equivalent
+    /// (`Value::Record` / `Value::Tuple`), reading field contents
+    /// out of `Vm::arena_slab` along the way. Primitives, closures,
+    /// maps/sets, and the host-managed handles (`Actor` / `Ticker` /
+    /// `ArrowTable`) are returned unchanged.
+    ///
+    /// **The boundary helper** flagged in
+    /// `docs/design/arena-plumbing.md` § "Arena handles MUST be
+    /// readable at serialization". Callers — the response
+    /// serialization path in `lex-runtime`, the trace recorder when
+    /// it records a Call/EffectCall arg, anywhere a value crosses
+    /// out of the VM into host-managed storage — call this
+    /// **while the producing scope is still active**, before
+    /// `exit_request_scope`. After exit the slab is truncated, so a
+    /// handle materialized after-the-fact would read garbage (or
+    /// panic on the bounds check).
+    ///
+    /// `Value::StackRecord` / `Value::StackTuple` would similarly
+    /// need slab resolution, but the #464 escape analysis prevents
+    /// them from reaching boundary-crossing ops in the first place
+    /// (they're frame-local by construction). Reaching here means a
+    /// hand-built or analysis-buggy program; we panic with the same
+    /// loud-not-silent contract the other inspection paths use.
+    ///
+    /// Idempotent on already-materialized values (no arena handles
+    /// in the tree → only the recursive walk's clones, no slab
+    /// lookups). Cost per call is one walk + clone of the tree —
+    /// amortized over the per-node mallocs avoided during request
+    /// handling, the net stays strongly positive.
+    pub fn materialize_arena_handles(&self, value: Value) -> Value {
+        use crate::value::Value as V;
+        match value {
+            // Primitives + opaque handles cross unchanged. Cheap
+            // — clones are essentially free for the Copy-ish ones
+            // and Arc-bumps for the handle types.
+            V::Int(_) | V::Float(_) | V::Bool(_) | V::Str(_) | V::Bytes(_)
+            | V::Unit | V::Closure { .. } | V::F64Array { .. }
+            | V::Map(_) | V::Set(_) | V::Actor(_) | V::Ticker(_)
+            | V::ArrowTable(_) => value,
+
+            // Containers: recurse on each element. Map/Set keys are
+            // MapKey (Str | Int), never Value, so no handles can
+            // hide there.
+            V::List(items) => V::List(
+                items.into_iter().map(|v| self.materialize_arena_handles(v)).collect()),
+            V::Tuple(items) => V::Tuple(
+                items.into_iter().map(|v| self.materialize_arena_handles(v)).collect()),
+            V::Deque(items) => V::Deque(
+                items.into_iter().map(|v| self.materialize_arena_handles(v)).collect()),
+            V::Variant { name, args } => V::Variant {
+                name,
+                args: args.into_iter().map(|v| self.materialize_arena_handles(v)).collect(),
+            },
+            V::Record { shape_id, fields } => {
+                let mut out: IndexMap<SmolStr, Value> = IndexMap::with_capacity(fields.len());
+                for (k, v) in fields.into_iter() {
+                    out.insert(k, self.materialize_arena_handles(v));
+                }
+                V::Record { shape_id, fields: Box::new(out) }
+            }
+
+            // The actual resolution work — read the slab and build a
+            // heap form. Field-name ordering for ArenaRecord matches
+            // the shape's, same as `MakeRecord`'s IndexMap insertion
+            // pattern; that's the contract that makes the polymorphic
+            // GetField IC work, and we reuse it here.
+            V::ArenaRecord { shape_id, slab_start, field_count } => {
+                let start = slab_start as usize;
+                let n = field_count as usize;
+                debug_assert!(start + n <= self.arena_slab.len(),
+                    "ArenaRecord handle out of bounds — likely materialized after exit_request_scope");
+                let shape = &self.program.record_shapes[shape_id as usize];
+                let mut fields: IndexMap<SmolStr, Value> = IndexMap::with_capacity(n);
+                for (i, name_const_idx) in shape.iter().take(n).enumerate() {
+                    let name: SmolStr = match &self.program.constants[*name_const_idx as usize] {
+                        Const::FieldName(s) => s.as_str().into(),
+                        _ => panic!("BUG(#463): ArenaRecord shape entry not a FieldName const"),
+                    };
+                    let v = self.materialize_arena_handles(self.arena_slab[start + i].clone());
+                    fields.insert(name, v);
+                }
+                V::Record { shape_id, fields: Box::new(fields) }
+            }
+            V::ArenaTuple { slab_start, arity } => {
+                let start = slab_start as usize;
+                let n = arity as usize;
+                debug_assert!(start + n <= self.arena_slab.len(),
+                    "ArenaTuple handle out of bounds — likely materialized after exit_request_scope");
+                let items: Vec<Value> = (0..n)
+                    .map(|i| self.materialize_arena_handles(self.arena_slab[start + i].clone()))
+                    .collect();
+                V::Tuple(items)
+            }
+
+            // #464 stack handles are frame-local; the analysis
+            // prevents them from reaching any boundary the
+            // materializer is called at. Reach = bug; panic loud.
+            V::StackRecord { .. } =>
+                panic!("BUG(#464/#463): Value::StackRecord reached materialize_arena_handles \
+                        — escape analysis should keep stack handles inside their frame"),
+            V::StackTuple { .. } =>
+                panic!("BUG(#464/#463): Value::StackTuple reached materialize_arena_handles \
+                        — escape analysis should keep stack handles inside their frame"),
+        }
+    }
+
     pub fn invoke(&mut self, fn_id: u32, args: Vec<Value>) -> Result<Value, VmError> {
         let f = &self.program.functions[fn_id as usize];
         if args.len() != f.arity as usize {

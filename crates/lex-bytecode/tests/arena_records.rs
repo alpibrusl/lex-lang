@@ -372,3 +372,165 @@ fn arena_record_round_trips_through_local() {
     vm.exit_request_scope(scope);
     assert_eq!(r, Value::Int(9));
 }
+
+// ---------------------------------------------------------------
+// Vm::materialize_arena_handles — the boundary helper (slice 2a-iii)
+// ---------------------------------------------------------------
+
+/// Helper: build a handler that returns its arena record without
+/// destructuring it (so we can hand the raw handle to materialize).
+fn handler_returning_xy_record() -> Arc<Program> {
+    let code = vec![
+        Op::PushConst(2),
+        Op::PushConst(3),
+        Op::AllocArenaRecord { shape_idx: 0, field_count: 2 },
+        Op::Return,
+    ];
+    xy_program("build_xy", 0, code)
+}
+
+#[test]
+fn materialize_passthrough_primitives() {
+    let prog = xy_program("noop", 0, vec![Op::PushConst(2), Op::Return]);
+    let vm = Vm::new(&prog);
+    assert_eq!(vm.materialize_arena_handles(Value::Int(42)), Value::Int(42));
+    assert_eq!(vm.materialize_arena_handles(Value::Bool(true)), Value::Bool(true));
+    assert_eq!(vm.materialize_arena_handles(Value::Unit), Value::Unit);
+}
+
+#[test]
+fn materialize_passthrough_heap_record() {
+    // A Value::Record already in heap form materializes to itself
+    // (idempotency over the no-arena case).
+    let prog = xy_program("noop", 0, vec![Op::PushConst(2), Op::Return]);
+    let vm = Vm::new(&prog);
+    let mut fields: IndexMap<smol_str::SmolStr, Value> = IndexMap::new();
+    fields.insert("x".into(), Value::Int(7));
+    fields.insert("y".into(), Value::Int(9));
+    let v = Value::Record { shape_id: 0, fields: Box::new(fields) };
+    assert_eq!(vm.materialize_arena_handles(v.clone()), v);
+}
+
+#[test]
+fn materialize_arena_record_becomes_heap_record() {
+    let prog = handler_returning_xy_record();
+    let mut vm = Vm::new(&prog);
+
+    let scope = vm.enter_request_scope();
+    let arena_value = vm.invoke(0, vec![]).unwrap();
+    // The handler returned a raw ArenaRecord — confirm the shape
+    // before we materialize so the assertion is meaningful.
+    assert!(matches!(arena_value, Value::ArenaRecord { .. }));
+
+    let heap_value = vm.materialize_arena_handles(arena_value);
+    // Now we can safely exit the scope — the materialized value is
+    // independent of the slab.
+    vm.exit_request_scope(scope);
+
+    match heap_value {
+        Value::Record { shape_id, fields } => {
+            assert_eq!(shape_id, 0);
+            assert_eq!(fields.get("x"), Some(&Value::Int(7)));
+            assert_eq!(fields.get("y"), Some(&Value::Int(9)));
+        }
+        other => panic!("expected materialized Value::Record, got {other:?}"),
+    }
+}
+
+#[test]
+fn materialize_arena_tuple_becomes_heap_tuple() {
+    let prog = tup_program("build_tup", 0, vec![
+        Op::PushConst(0), Op::PushConst(1),
+        Op::AllocArenaTuple { arity: 2 },
+        Op::Return,
+    ]);
+    let mut vm = Vm::new(&prog);
+    let scope = vm.enter_request_scope();
+    let arena_value = vm.invoke(0, vec![]).unwrap();
+    assert!(matches!(arena_value, Value::ArenaTuple { .. }));
+    let heap_value = vm.materialize_arena_handles(arena_value);
+    vm.exit_request_scope(scope);
+    assert_eq!(heap_value, Value::Tuple(vec![Value::Int(11), Value::Int(13)]));
+}
+
+#[test]
+fn materialize_recurses_into_list_elements() {
+    // A heap list containing arena records — confirm the walk
+    // descends into the list. (Hand-constructed because no op
+    // currently builds a list of arena handles, but the helper
+    // must handle it for slice-2b safety.)
+    let prog = handler_returning_xy_record();
+    let mut vm = Vm::new(&prog);
+    let scope = vm.enter_request_scope();
+    let arena_a = vm.invoke(0, vec![]).unwrap();
+    let arena_b = vm.invoke(0, vec![]).unwrap();
+    let list = Value::List([arena_a, arena_b].into_iter().collect());
+    let materialized = vm.materialize_arena_handles(list);
+    vm.exit_request_scope(scope);
+    match materialized {
+        Value::List(items) => {
+            assert_eq!(items.len(), 2);
+            for item in items {
+                assert!(matches!(item, Value::Record { .. }),
+                    "list element should be heap Record, got {item:?}");
+            }
+        }
+        other => panic!("expected Value::List, got {other:?}"),
+    }
+}
+
+#[test]
+fn materialize_recurses_into_record_field_value() {
+    // Heap Record whose field value is an arena handle — confirms
+    // we walk into Record fields (the common case once codegen
+    // mixes arena children inside non-arena parents).
+    let prog = handler_returning_xy_record();
+    let mut vm = Vm::new(&prog);
+    let scope = vm.enter_request_scope();
+    let inner = vm.invoke(0, vec![]).unwrap(); // ArenaRecord
+    let mut fields: IndexMap<smol_str::SmolStr, Value> = IndexMap::new();
+    fields.insert("nested".into(), inner);
+    let outer = Value::Record { shape_id: 0, fields: Box::new(fields) };
+    let materialized = vm.materialize_arena_handles(outer);
+    vm.exit_request_scope(scope);
+    match materialized {
+        Value::Record { fields, .. } => {
+            let nested = fields.get("nested").expect("nested field present");
+            assert!(matches!(nested, Value::Record { .. }),
+                "nested field should be heap Record after materialization, got {nested:?}");
+        }
+        other => panic!("expected Value::Record outer, got {other:?}"),
+    }
+}
+
+#[test]
+fn materialize_to_json_roundtrip_does_not_panic() {
+    // The whole reason this helper exists: an arena value can't be
+    // to_json'd directly (defensive panic), but materialize-then-
+    // to_json works. This pair is exactly the response-serialization
+    // pattern slice 2b will wire up.
+    let prog = handler_returning_xy_record();
+    let mut vm = Vm::new(&prog);
+    let scope = vm.enter_request_scope();
+    let arena_value = vm.invoke(0, vec![]).unwrap();
+    let heap_value = vm.materialize_arena_handles(arena_value);
+    vm.exit_request_scope(scope);
+
+    let json = heap_value.to_json();
+    assert_eq!(json["x"], serde_json::json!(7));
+    assert_eq!(json["y"], serde_json::json!(9));
+}
+
+#[test]
+fn materialize_is_idempotent() {
+    // Materialize twice — second pass walks a tree with no handles,
+    // which must return an equivalent value (clones notwithstanding).
+    let prog = handler_returning_xy_record();
+    let mut vm = Vm::new(&prog);
+    let scope = vm.enter_request_scope();
+    let arena_value = vm.invoke(0, vec![]).unwrap();
+    let once = vm.materialize_arena_handles(arena_value);
+    let twice = vm.materialize_arena_handles(once.clone());
+    vm.exit_request_scope(scope);
+    assert_eq!(once, twice);
+}
