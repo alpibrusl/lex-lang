@@ -347,6 +347,33 @@ pub struct Vm<'a> {
     pub stack_record_allocs: u64,
     pub stack_record_heap_fallbacks: u64,
     pub heap_record_allocs: u64,
+    /// Request-scoped arena slab (#463 slice 2a). Mirrors the shape of
+    /// `stack_record_arena` but lives across frames inside the
+    /// request scope opened by `EffectHandler::enter_request_scope`.
+    /// Each `Op::AllocArenaRecord` / `Op::AllocArenaTuple` appends its
+    /// field values here and pushes a handle (`Value::ArenaRecord` /
+    /// `Value::ArenaTuple`) whose `slab_start` indexes back in.
+    /// Truncated to the saved start on `exit_request_scope`, releasing
+    /// every value the scope built in O(1) — same lifetime story as
+    /// `stack_record_arena` truncating on `Op::Return`.
+    ///
+    /// Slabs nest LIFO: `arena_scope_starts` holds the
+    /// `arena_slab.len()` snapshot taken at each `enter_request_scope`,
+    /// and `exit_request_scope` truncates back to the matching entry.
+    /// An empty `arena_scope_starts` means **no active scope** — the
+    /// alloc ops fall back to their `MakeRecord` / `MakeTuple` heap
+    /// path, so the VM stays sound when arena-lowered bytecode runs in
+    /// a non-handler context.
+    arena_slab: Vec<Value>,
+    /// LIFO stack of `arena_slab.len()` snapshots, one per active
+    /// request scope. See `arena_slab`.
+    arena_scope_starts: Vec<u32>,
+    /// Counters for #463 slice-2b acceptance (will be the
+    /// arena-allocation-rate gate, paralleling the #464 stack-rate
+    /// counters above). Incremented in the op handlers; harmless in
+    /// slice 2a since codegen doesn't emit the ops yet.
+    pub arena_record_allocs: u64,
+    pub arena_record_heap_fallbacks: u64,
 }
 
 struct Frame {
@@ -573,6 +600,18 @@ fn hash_value_into<H: std::hash::Hasher>(v: &Value, h: &mut H) {
         Value::StackTuple { .. } =>
             panic!("BUG(#464): Value::StackTuple reached memo hashing — \
                     escape analysis should have prevented escape to a call boundary"),
+        // #463 slice 2a: arena handles must never reach memo hashing.
+        // The memo cache outlives every request scope, so a hashed
+        // arena handle would dangle. Slice 1's arena-eligibility
+        // analysis must exclude pure-fn allocation sites (the memo
+        // path is reached only through pure-fn calls) — any reach
+        // here is a soundness bug.
+        Value::ArenaRecord { .. } =>
+            panic!("BUG(#463): Value::ArenaRecord reached memo hashing — \
+                    arena-eligibility analysis must exclude pure-fn allocation sites"),
+        Value::ArenaTuple { .. } =>
+            panic!("BUG(#463): Value::ArenaTuple reached memo hashing — \
+                    arena-eligibility analysis must exclude pure-fn allocation sites"),
     }
 }
 
@@ -838,6 +877,13 @@ impl<'a> Vm<'a> {
             stack_record_allocs: 0,
             stack_record_heap_fallbacks: 0,
             heap_record_allocs: 0,
+            // #463 slice 2a: empty until the first enter_request_scope.
+            // Programs that never enter a scope incur zero arena cost
+            // (the alloc ops, if reached, fall back to the heap path).
+            arena_slab: Vec::new(),
+            arena_scope_starts: Vec::new(),
+            arena_record_allocs: 0,
+            arena_record_heap_fallbacks: 0,
         }
     }
 
@@ -1101,12 +1147,24 @@ impl<'a> Vm<'a> {
     /// and the matching `exit` is a no-op; `DefaultHandler`'s
     /// implementation actually allocates an arena.
     pub fn enter_request_scope(&mut self) -> u64 {
+        // #463 slice 2a: snapshot the slab high-water mark so
+        // `exit_request_scope` can truncate back to here, releasing
+        // every arena-allocated value the scope built in O(1).
+        self.arena_scope_starts.push(self.arena_slab.len() as u32);
         self.handler.enter_request_scope()
     }
 
     /// Close the request scope opened by `enter_request_scope`.
     /// Drops the associated arena.
     pub fn exit_request_scope(&mut self, scope_id: u64) {
+        // #463 slice 2a: truncate the slab back to the matching
+        // `enter` snapshot, then notify the handler. Out-of-order /
+        // unpaired exits (e.g. a stray `exit` with no prior `enter`)
+        // are tolerated as no-ops — the handler does the same, and a
+        // stray exit shouldn't crash a live server.
+        if let Some(start) = self.arena_scope_starts.pop() {
+            self.arena_slab.truncate(start as usize);
+        }
         self.handler.exit_request_scope(scope_id)
     }
 
@@ -1342,6 +1400,59 @@ impl<'a> Vm<'a> {
                         });
                     }
                 }
+                Op::AllocArenaRecord { shape_idx, field_count } => {
+                    // #463 slice 2a. Same value-stack contract as
+                    // MakeRecord, but field values land in the
+                    // request-scoped `arena_slab` instead of a
+                    // per-field heap IndexMap. Runtime fallback when
+                    // no scope is active — the op silently degrades
+                    // to the MakeRecord heap path so arena-lowered
+                    // bytecode stays sound in non-handler contexts
+                    // (REPL, tests, top-level scripts).
+                    let n = field_count as usize;
+                    if self.arena_scope_starts.is_empty() {
+                        self.arena_record_heap_fallbacks += 1;
+                        // Heap fallback path — exact copy of
+                        // MakeRecord's body. Same compile-time
+                        // contract (shape order, IndexMap insertion)
+                        // so the resulting Value::Record is
+                        // indistinguishable from a direct MakeRecord.
+                        let shape = &self.program.record_shapes[shape_idx as usize];
+                        debug_assert_eq!(shape.len(), n,
+                            "AllocArenaRecord field_count must match record_shapes[shape_idx].len()");
+                        let mut values: Vec<Value> = (0..n).map(|_| Value::Unit).collect();
+                        for i in (0..n).rev() {
+                            values[i] = self.pop()?;
+                        }
+                        let mut rec: IndexMap<SmolStr, Value> = IndexMap::with_capacity(n);
+                        for (i, val) in values.into_iter().enumerate() {
+                            let name: SmolStr = match &self.program.constants[shape[i] as usize] {
+                                Const::FieldName(s) => s.as_str().into(),
+                                _ => return Err(VmError::TypeMismatch("expected FieldName const".into())),
+                            };
+                            rec.insert(name, val);
+                        }
+                        self.stack.push(Value::Record { shape_id: shape_idx, fields: Box::new(rec) });
+                    } else {
+                        self.arena_record_allocs += 1;
+                        // Arena path: append the popped field values
+                        // to the slab in shape order (matches
+                        // MakeRecord's IndexMap insertion order, so
+                        // the polymorphic GetField IC sees the same
+                        // offset across all three variants).
+                        let slab_start = self.arena_slab.len();
+                        self.arena_slab.resize(slab_start + n, Value::Unit);
+                        for i in (0..n).rev() {
+                            let v = self.pop()?;
+                            self.arena_slab[slab_start + i] = v;
+                        }
+                        self.stack.push(Value::ArenaRecord {
+                            shape_id: shape_idx,
+                            slab_start: slab_start as u32,
+                            field_count,
+                        });
+                    }
+                }
                 Op::MakeTuple(n) => {
                     let mut items: Vec<Value> = (0..n).map(|_| Value::Unit).collect();
                     for i in (0..n as usize).rev() { items[i] = self.pop()?; }
@@ -1370,6 +1481,30 @@ impl<'a> Vm<'a> {
                             self.stack_record_arena[slab_start + i] = v;
                         }
                         self.stack.push(Value::StackTuple {
+                            slab_start: slab_start as u32,
+                            arity,
+                        });
+                    }
+                }
+                Op::AllocArenaTuple { arity } => {
+                    // #463 slice 2a. Tuple analogue of
+                    // AllocArenaRecord: arena slab when a scope is
+                    // active, MakeTuple heap fallback otherwise.
+                    let n = arity as usize;
+                    if self.arena_scope_starts.is_empty() {
+                        self.arena_record_heap_fallbacks += 1;
+                        let mut items: Vec<Value> = (0..n).map(|_| Value::Unit).collect();
+                        for i in (0..n).rev() { items[i] = self.pop()?; }
+                        self.stack.push(Value::Tuple(items));
+                    } else {
+                        self.arena_record_allocs += 1;
+                        let slab_start = self.arena_slab.len();
+                        self.arena_slab.resize(slab_start + n, Value::Unit);
+                        for i in (0..n).rev() {
+                            let v = self.pop()?;
+                            self.arena_slab[slab_start + i] = v;
+                        }
+                        self.stack.push(Value::ArenaTuple {
                             slab_start: slab_start as u32,
                             arity,
                         });
@@ -1517,6 +1652,53 @@ impl<'a> Vm<'a> {
                             };
                             self.stack.push(value);
                         }
+                        Value::ArenaRecord { shape_id, slab_start, field_count } => {
+                            // #463 slice 2a: dispatch over an
+                            // arena-allocated record. Identical IC
+                            // story to `StackRecord` above — the slot
+                            // stores `(shape_id, offset)` and offset
+                            // semantics match `Value::Record`'s
+                            // IndexMap insertion order, so the IC is
+                            // three-way interoperable.
+                            if ic_stats_enabled() {
+                                record_ic_hit(fn_id, site_idx, shape_id);
+                            }
+                            let fid = fn_id as usize;
+                            let sid = site_idx as usize;
+                            if self.field_ics[fid].is_empty() {
+                                let n = self.program.functions[fid].field_ic_sites as usize;
+                                self.field_ics[fid] = vec![None; n];
+                            }
+                            let cached = self.field_ics[fid][sid];
+                            let value = 'ic: {
+                                if let Some((cached_shape, off)) = cached {
+                                    if cached_shape == shape_id && (off as u16) < field_count {
+                                        let idx = slab_start as usize + off;
+                                        break 'ic self.arena_slab[idx].clone();
+                                    }
+                                }
+                                let shape =
+                                    &self.program.record_shapes[shape_id as usize];
+                                let target_name = match &self.program.constants[name_idx as usize] {
+                                    Const::FieldName(s) => s.as_str(),
+                                    _ => return Err(VmError::TypeMismatch(
+                                        "expected FieldName const".into())),
+                                };
+                                let mut found: Option<usize> = None;
+                                for (i, fn_const_idx) in shape.iter().enumerate() {
+                                    if let Const::FieldName(s) =
+                                        &self.program.constants[*fn_const_idx as usize]
+                                    {
+                                        if s == target_name { found = Some(i); break; }
+                                    }
+                                }
+                                let off = found.ok_or_else(|| VmError::TypeMismatch(
+                                    format!("missing field `{target_name}` on arena record")))?;
+                                self.field_ics[fid][sid] = Some((shape_id, off));
+                                self.arena_slab[slab_start as usize + off].clone()
+                            };
+                            self.stack.push(value);
+                        }
                         other => return Err(VmError::TypeMismatch(
                             format!("GetField on non-record: {other:?}"))),
                     }
@@ -1538,6 +1720,17 @@ impl<'a> Vm<'a> {
                                     format!("tuple index {i} out of range")));
                             }
                             let v = self.stack_record_arena[slab_start as usize + i as usize].clone();
+                            self.stack.push(v);
+                        }
+                        // #463 slice 2a: positional read out of an
+                        // arena tuple — same O(1) index pattern as
+                        // StackTuple but through `arena_slab`.
+                        Value::ArenaTuple { slab_start, arity } => {
+                            if i >= arity {
+                                return Err(VmError::TypeMismatch(
+                                    format!("tuple index {i} out of range")));
+                            }
+                            let v = self.arena_slab[slab_start as usize + i as usize].clone();
                             self.stack.push(v);
                         }
                         other => return Err(VmError::TypeMismatch(format!("GetElem on non-tuple: {other:?}"))),
@@ -2478,6 +2671,30 @@ impl<'a> Vm<'a> {
                     } else {
                         let off = self.resolve_stack_field(shape_id, name_idx)?;
                         (self.stack_record_arena[slab_start as usize + off].clone(),
+                         Some((shape_id, off)))
+                    }
+                }
+                // #463 slice 2a: superinstruction read out of an
+                // arena-allocated record held in a local. Same shape
+                // resolution as the stack-record arm (records share
+                // the same `record_shapes` table regardless of
+                // allocation site); only the slab indexed differs.
+                &Value::ArenaRecord { shape_id, slab_start, field_count } => {
+                    if ic_stats_enabled() {
+                        record_ic_hit(fn_id, site_idx, shape_id);
+                    }
+                    if let Some((cached_shape, off)) = cached {
+                        if cached_shape == shape_id && (off as u16) < field_count {
+                            let idx = slab_start as usize + off;
+                            (self.arena_slab[idx].clone(), None)
+                        } else {
+                            let off = self.resolve_stack_field(shape_id, name_idx)?;
+                            (self.arena_slab[slab_start as usize + off].clone(),
+                             Some((shape_id, off)))
+                        }
+                    } else {
+                        let off = self.resolve_stack_field(shape_id, name_idx)?;
+                        (self.arena_slab[slab_start as usize + off].clone(),
                          Some((shape_id, off)))
                     }
                 }

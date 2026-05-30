@@ -191,6 +191,12 @@ fn value_to_json(v: &Value) -> serde_json::Value {
         // the tracer only records args at escape sinks the analysis
         // rejects, so a frame-local tuple can't reach here.
         Value::StackTuple { .. } => J::String("<stack-tuple-unreachable>".into()),
+        // #463 slice 2a: arena-eligibility analysis (the request-scope
+        // variant of #464's escape pass) excludes the same Call /
+        // EffectCall sinks, so an arena handle can't reach the tracer
+        // either. Same defensive marker as the stack variants above.
+        Value::ArenaRecord { .. } => J::String("<arena-record-unreachable>".into()),
+        Value::ArenaTuple { .. } => J::String("<arena-tuple-unreachable>".into()),
         Value::Variant { name, args } => {
             let mut m = serde_json::Map::new();
             m.insert("$variant".into(), J::String(name.clone()));

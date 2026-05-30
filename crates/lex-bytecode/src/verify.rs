@@ -161,9 +161,14 @@ fn stack_delta(op: &Op) -> i32 {
         // field_count, pushes 1). The verifier doesn't need to know
         // about the stack-record arena — it walks bytecode shape only.
         Op::AllocStackRecord { field_count, .. } => -(*field_count as i32) + 1,
+        // #463 slice 2a: same stack-effect shape as MakeRecord
+        // (verifier sees only bytecode shape, not the slab choice).
+        Op::AllocArenaRecord { field_count, .. } => -(*field_count as i32) + 1,
         Op::MakeTuple(n)  => -(*n as i32) + 1,
         // #464 tuple codegen: same stack-effect shape as MakeTuple.
         Op::AllocStackTuple { arity } => -(*arity as i32) + 1,
+        // #463 slice 2a: same stack-effect shape as MakeTuple.
+        Op::AllocArenaTuple { arity } => -(*arity as i32) + 1,
         Op::MakeList(n)   => -(*n as i32) + 1,
         Op::MakeVariant { arity, .. } => -(*arity as i32) + 1,
 
