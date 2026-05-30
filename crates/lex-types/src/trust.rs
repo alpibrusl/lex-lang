@@ -360,8 +360,15 @@ pub fn effect_requirement(effect_name: &str) -> Option<(Dimension, Level)> {
         "net" | "http" | "mcp" | "llm_cloud" => Some((Network, Allowlist)),
         // Arbitrary process execution.
         "proc" => Some((Exec, Sandboxed)),
-        // Pure / harmless effects (io, log, time, rand, kv, env, ...)
-        // are outside the trust model.
+        // Local LLM inference reads model weights from disk.
+        "llm_local" => Some((Filesystem, ReadOnly)),
+        // Effects with no consequential reach outside the process:
+        //   io, time, rand, panic, budget — pure I/O primitives
+        //   log, kv, stream — in-process / structured output
+        //   env, sql, random — bounded local resources
+        //   chat, a2a, concurrent — inter-agent messaging, no OS boundary
+        //   crypto — hashing/signing, no external access
+        // All are safe under any grant; adding mappings would be over-broad.
         _ => Option::None,
     }
 }
@@ -483,6 +490,30 @@ mod tests {
         effects.concrete.insert(EffectKind::bare("net"));
         effects.concrete.insert(EffectKind::bare("proc"));
         assert!(grant.permits_effects(&effects).is_ok());
+    }
+
+    #[test]
+    fn empty_effect_set_always_permitted() {
+        // A grant of bottom (deny-all) still permits the empty effect set —
+        // a function that does nothing satisfies any grant.
+        let bottom = Grant::bottom();
+        assert!(bottom.permits_effects(&EffectSet::empty()).is_ok());
+    }
+
+    #[test]
+    fn llm_local_requires_filesystem_read() {
+        // llm_local reads model weights from disk; it must be rejected
+        // under a filesystem: none grant.
+        let no_fs = Grant::new(Level::None, Level::Full, Level::None);
+        let mut effects = EffectSet::empty();
+        effects.concrete.insert(EffectKind::bare("llm_local"));
+        assert!(
+            no_fs.permits_effects(&effects).is_err(),
+            "llm_local should be denied under filesystem: none"
+        );
+        // But allowed under a read-only filesystem grant.
+        let read_only_fs = Grant::new(Level::ReadOnly, Level::Full, Level::None);
+        assert!(read_only_fs.permits_effects(&effects).is_ok());
     }
 
     #[test]
