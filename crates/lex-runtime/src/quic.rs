@@ -386,6 +386,7 @@ pub(crate) fn self_signed_pem(hostname: &str) -> Result<(Vec<u8>, Vec<u8>), Stri
     let ck = rcgen::generate_simple_self_signed(vec![hostname.to_string()])
         .map_err(|e| format!("rcgen self-signed: {e}"))?;
     let cert_pem = ck.cert.pem().into_bytes();
-    let key_pem = ck.key_pair.serialize_pem().into_bytes();
+    // rcgen 0.14 renamed `CertifiedKey.key_pair` -> `signing_key`.
+    let key_pem = ck.signing_key.serialize_pem().into_bytes();
     Ok((cert_pem, key_pem))
 }

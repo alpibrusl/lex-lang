@@ -29,7 +29,8 @@
 
 use std::sync::Arc;
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use std::hint::black_box;
 use lex_ast::canonicalize_program;
 use lex_bytecode::vm::Vm;
 use lex_bytecode::{compile_program, Program, Value};

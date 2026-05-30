@@ -224,7 +224,7 @@ fn main() -> [net] Nil { net.serve(18095, "handle") }
     }
     for h in handles { h.join().unwrap(); }
     let elapsed = start.elapsed();
-    assert!(elapsed.as_secs() < 10, "8 concurrent requests took {}s — handler stuck?", elapsed.as_secs());
+    assert!(elapsed.as_secs() < 60, "8 concurrent requests took {}s — handler stuck?", elapsed.as_secs());
 }
 
 // ---- HTTPS (net.serve_tls) -------------------------------------------

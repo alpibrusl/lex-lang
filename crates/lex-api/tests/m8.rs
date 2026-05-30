@@ -67,18 +67,44 @@ fn wait_until_serving(addr: &SocketAddr) {
 }
 
 fn http(addr: &SocketAddr, method: &str, path: &str, body: &str) -> (u16, String) {
-    let mut s = TcpStream::connect(addr).unwrap();
-    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let req = format!(
         "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(), body
     );
-    s.write_all(req.as_bytes()).unwrap();
+    // Retry transient transport errors. Under heavy parallel test load
+    // the server thread can be slow to accept the connection or flush
+    // the response, which previously surfaced as a panic on
+    // `read_to_string` (m8.rs:78). A bounded retry with a generous read
+    // timeout keeps the test deterministic without weakening what it
+    // asserts: a real HTTP response (any status) is returned as-is and
+    // only I/O failures are retried.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match try_http(addr, &req) {
+            Ok(result) => return result,
+            Err(e) => {
+                if std::time::Instant::now() >= deadline {
+                    panic!("http {method} {path} failed after retries: {e}");
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+fn try_http(addr: &SocketAddr, req: &str) -> Result<(u16, String), String> {
+    let mut s =
+        TcpStream::connect_timeout(addr, Duration::from_secs(5)).map_err(|e| e.to_string())?;
+    s.set_read_timeout(Some(Duration::from_secs(15))).map_err(|e| e.to_string())?;
+    s.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
     let mut buf = String::new();
-    s.read_to_string(&mut buf).unwrap();
+    s.read_to_string(&mut buf).map_err(|e| e.to_string())?;
+    if buf.is_empty() {
+        return Err("empty response".into());
+    }
     let (head, body) = buf.split_once("\r\n\r\n").unwrap_or((&buf, ""));
     let status = head.split_whitespace().nth(1).unwrap_or("0").parse().unwrap_or(0);
-    (status, body.to_string())
+    Ok((status, body.to_string()))
 }
 
 #[test]
