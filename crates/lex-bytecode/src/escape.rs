@@ -388,6 +388,14 @@ fn step(pc: usize, op: &Op, mut s: State, policy: Policy) -> (State, Vec<usize>,
             pop_n_leak(&mut s, *field_count as usize, &mut escapes);
             s.stack.push(Slot::Agg(pc as u32));
         }
+        // #463 slice 2a: post-lowering form of MakeRecord for the
+        // arena path. Re-running either policy on already-lowered code
+        // must classify it identically to the original MakeRecord, so
+        // the abstract step is the same.
+        Op::AllocArenaRecord { field_count, .. } => {
+            pop_n_leak(&mut s, *field_count as usize, &mut escapes);
+            s.stack.push(Slot::Agg(pc as u32));
+        }
         // A tuple is a stack-allocatable aggregate, tracked the same
         // way as a record: its field operands leak (any tracked
         // aggregate stored inside it escapes), and the tuple itself
@@ -402,6 +410,12 @@ fn step(pc: usize, op: &Op, mut s: State, policy: Policy) -> (State, Vec<usize>,
         // the analysis on already-lowered code must classify it the
         // same way, so treat it identically — mirrors AllocStackRecord.
         Op::AllocStackTuple { arity } => {
+            pop_n_leak(&mut s, *arity as usize, &mut escapes);
+            s.stack.push(Slot::Agg(pc as u32));
+        }
+        // #463 slice 2a: arena-routed analogue of MakeTuple — same
+        // abstract step as the heap and stack tuple variants.
+        Op::AllocArenaTuple { arity } => {
             pop_n_leak(&mut s, *arity as usize, &mut escapes);
             s.stack.push(Slot::Agg(pc as u32));
         }

@@ -149,6 +149,33 @@ pub enum Value {
     /// variant from reaching. An unexpected arrival surfaces as a
     /// panic at the boundary, not UB (the arena is safe `Vec<Value>`).
     StackTuple { slab_start: u32, arity: u16 },
+    /// Request-scoped arena record (#463 slice 2a). Same handle shape
+    /// as `Value::StackRecord` but indexes `Vm::arena_slab` (request
+    /// lifetime) instead of `Vm::stack_record_arena` (frame lifetime).
+    /// Emitted by `Op::AllocArenaRecord` at sites
+    /// `arena::build_arena_index` proves do not escape the request
+    /// scope opened by `EffectHandler::enter_request_scope`. Reads via
+    /// `Op::GetField` (polymorphic across `Record` / `StackRecord` /
+    /// `ArenaRecord`).
+    ///
+    /// **Inspection paths (`to_json`, equality, memo hash, generic
+    /// clone) defensively panic on this variant, same contract as
+    /// `StackRecord`.** Slice 1's `arena::build_arena_index` analysis
+    /// proves these paths are unreachable in well-routed code (any
+    /// reach is a soundness bug — analysis or codegen). The
+    /// scoping doc (`docs/design/arena-plumbing.md` § "Arena handles
+    /// MUST be readable at serialization") flags this as the place
+    /// where arena diverges from #464: a future slice will materialize
+    /// arena handles at the response-serialization boundary so the
+    /// `Response`'s `to_json` reads through to the slab. That
+    /// materialization is **out of scope for slice 2a**; today
+    /// arena ops only ship for hand-crafted bytecode tests, which
+    /// avoid the inspection paths.
+    ArenaRecord { shape_id: u32, slab_start: u32, field_count: u16 },
+    /// Request-scoped arena tuple (#463 slice 2a). Tuple analogue of
+    /// `ArenaRecord`; same lifetime / fallback / inspection-panic
+    /// contract.
+    ArenaTuple { slab_start: u32, arity: u16 },
     Variant { name: String, args: Vec<Value> },
     /// First-class function value (a lambda + its captured locals). The
     /// function's first `captures.len()` params bind to `captures`; the
@@ -244,6 +271,18 @@ impl PartialEq for Value {
             (StackTuple { .. }, _) | (_, StackTuple { .. }) =>
                 panic!("BUG(#464): Value::StackTuple reached generic equality \
                         — escape analysis should have flagged its allocation site"),
+            // #463 slice 2a: arena handles must never reach generic
+            // equality — the slice-1 arena-eligibility analysis is the
+            // upstream proof. Materialization at the response boundary
+            // (slice 2a-iii / 2b) will handle the legitimate
+            // serialization case; equality reach is always a soundness
+            // bug, so panic, do not silently lie.
+            (ArenaRecord { .. }, _) | (_, ArenaRecord { .. }) =>
+                panic!("BUG(#463): Value::ArenaRecord reached generic equality \
+                        — arena-eligibility analysis should have flagged its allocation site"),
+            (ArenaTuple { .. }, _) | (_, ArenaTuple { .. }) =>
+                panic!("BUG(#463): Value::ArenaTuple reached generic equality \
+                        — arena-eligibility analysis should have flagged its allocation site"),
             (Variant { name: an, args: aa }, Variant { name: bn, args: ba }) =>
                 an == bn && aa == ba,
             (Closure { body_hash: ah, captures: ac, .. },
@@ -365,6 +404,20 @@ impl Value {
             Value::StackTuple { .. } =>
                 panic!("BUG(#464): Value::StackTuple reached to_json — \
                         escape analysis should have prevented escape to a host boundary"),
+            // #463 slice 2a: arena handles defensively panic at the
+            // host serialization boundary. The materialization helper
+            // (slice 2a-iii / 2b) will resolve handles via the
+            // request slab before this method is called, so a reach
+            // here means either (a) hand-crafted bytecode bypassed
+            // materialization or (b) a real slice-1 analysis bug.
+            // Either way, a panic is the correct response — silent
+            // wrong output would be worse.
+            Value::ArenaRecord { .. } =>
+                panic!("BUG(#463): Value::ArenaRecord reached to_json — \
+                        materialize via Vm::arena_slab before crossing the host boundary"),
+            Value::ArenaTuple { .. } =>
+                panic!("BUG(#463): Value::ArenaTuple reached to_json — \
+                        materialize via Vm::arena_slab before crossing the host boundary"),
             Value::Variant { name, args } => {
                 let mut m = serde_json::Map::new();
                 m.insert("$variant".into(), J::String(name.clone()));

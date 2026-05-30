@@ -65,6 +65,27 @@ pub enum Op {
     /// [...]}}` form, so closure identity is invariant under the
     /// step-2 lowering.
     AllocStackRecord { shape_idx: u32, field_count: u16 },
+    /// Request-scoped arena record (#463 slice 2a). Same shape semantics
+    /// as `MakeRecord` and `AllocStackRecord` — pops `field_count` field
+    /// values, pairs them with `Program.record_shapes[shape_idx]`, and
+    /// pushes a record handle — but the fields live in the VM's
+    /// **request-scoped** `arena_slab`, not the per-frame stack-record
+    /// arena, so the value can outlive the allocating frame as long as
+    /// the surrounding request scope (opened by
+    /// `EffectHandler::enter_request_scope`) is still active. The
+    /// resulting `Value::ArenaRecord` indexes the slab.
+    ///
+    /// Emitted (slice 2b) at sites `arena::build_arena_index` proves do
+    /// not escape the request scope. Runtime fallback: when **no** scope
+    /// is active (e.g. a non-handler context calls a function that was
+    /// compiled with arena lowering), the op silently degrades to the
+    /// `MakeRecord` heap path — identical observable effect.
+    ///
+    /// `body_hash` stability (#222): canonical encoding decodes back to
+    /// `{"MakeRecord":{"field_name_indices":[...]}}`, so closure
+    /// identity is invariant under the lowering, mirroring
+    /// `AllocStackRecord`.
+    AllocArenaRecord { shape_idx: u32, field_count: u16 },
     MakeTuple(u16),
     /// Frame-local tuple (#464 tuple codegen). Stack-alloc analogue of
     /// `MakeTuple`: pops `arity` values into the VM's stack-record
@@ -78,6 +99,13 @@ pub enum Op {
     /// encoding decodes this op back to `MakeTuple(arity)`, so closure
     /// identity is invariant under the lowering.
     AllocStackTuple { arity: u16 },
+    /// Request-scoped arena tuple (#463 slice 2a). Tuple analogue of
+    /// `AllocArenaRecord`: pops `arity` values into the VM's
+    /// request-scoped `arena_slab` and pushes a `Value::ArenaTuple`
+    /// handle. Same fallback rule (no active scope → `MakeTuple` heap
+    /// path) and same `body_hash` invariance (decodes back to
+    /// `MakeTuple(arity)`).
+    AllocArenaTuple { arity: u16 },
     MakeList(u32),
     MakeVariant { name_idx: u32, arity: u16 },
     /// Record field access. `name_idx` indexes a `Const::FieldName`

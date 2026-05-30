@@ -84,7 +84,8 @@ fn value_to_json(v: &Value) -> serde_json::Value {
         }
         Value::Map(_) | Value::Set(_) | Value::Deque(_) | Value::Actor(_)
         | Value::Ticker(_) | Value::ArrowTable(_)
-        | Value::StackRecord { .. } | Value::StackTuple { .. } => {
+        | Value::StackRecord { .. } | Value::StackTuple { .. }
+        | Value::ArenaRecord { .. } | Value::ArenaTuple { .. } => {
             // Tests in this file don't exercise these container values;
             // render as a placeholder so the match is exhaustive.
             J::String("<container>".into())
