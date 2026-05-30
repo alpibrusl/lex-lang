@@ -48,7 +48,13 @@ jobs:
       # `cargo build --workspace --all-targets` would duplicate work —
       # `cargo test` already compiles every test target. Dropping the
       # standalone build step halves the peak debug-target footprint.
-      - run: cargo test --workspace --no-fail-fast
+      #
+      # `--test-threads=1` runs tests serially. Several suites assert
+      # wall-clock budgets or stand up local servers and flake under the
+      # CPU contention of the default parallel run on a 2-core runner;
+      # the full suite is deterministic single-threaded. The trade is a
+      # slower job for a reliable one.
+      - run: cargo test --workspace --no-fail-fast -- --test-threads=1
       # `quic` is an opt-in feature on lex-runtime (#496). Build +
       # exercise the H/3 test separately so the default `cargo test`
       # step stays cheap — pulling in quinn + h3 + rcgen + rustls is
