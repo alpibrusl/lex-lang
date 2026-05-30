@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "lex-hub": {
+      "command": "lex-hub-mcp",
+      "env": {
+        "LEXHUB_URL": "${LEXHUB_URL}",
+        "LEXHUB_TOKEN": "${LEXHUB_TOKEN}",
+        "LEXHUB_JWT_SECRET": "${LEXHUB_JWT_SECRET}",
+        "LEXHUB_TENANT": "${LEXHUB_TENANT}",
+        "LEXHUB_JWT_AUDIENCE": "${LEXHUB_JWT_AUDIENCE}",
+        "LEXHUB_JWT_ISSUER": "${LEXHUB_JWT_ISSUER}"
+      }
+    }
+  }
+}
