@@ -65,7 +65,11 @@ fn escaping_tuple_stays_on_heap() {
     let code = fn_code(&p, "build");
     assert_eq!(count(code, |op| matches!(op, Op::AllocStackTuple { .. })), 0,
         "escaping tuple must not be stack-allocated: {code:?}");
-    assert_eq!(count(code, |op| matches!(op, Op::MakeTuple(_))), 1);
+    // Slice-2b three-tier: same as the record-shaped sibling
+    // (`escaping_record_stays_on_heap`) — frame-escaping but
+    // request-local tuples lower to arena, not heap.
+    assert_eq!(count(code, |op| matches!(op, Op::MakeTuple(_))), 0);
+    assert_eq!(count(code, |op| matches!(op, Op::AllocArenaTuple { .. })), 1);
 
     let mut vm = Vm::new(&p);
     match vm.call("build", vec![]).unwrap() {

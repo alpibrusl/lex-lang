@@ -289,6 +289,38 @@ pub fn compile_program(stages: &[a::Stage]) -> Program {
         }
     }
 
+    // #463 slice 2b-i: arena-eligibility lowering. Runs **after**
+    // `apply_escape_lowering` and targets the remaining `MakeRecord`
+    // / `MakeTuple` sites — those the stack pass left alone because
+    // they cross the frame boundary, but the request-scope analysis
+    // proves they stay inside the active `EffectHandler` arena
+    // scope. The two passes form a three-tier allocation hierarchy:
+    //
+    //   frame-local        → AllocStackRecord  (#464, cheapest)
+    //   request-local      → AllocArenaRecord  (#463, this slice)
+    //   escapes request    → MakeRecord        (heap, status quo)
+    //
+    // Order matters: a site that fits the stack tier should land
+    // there (cheapest), so the stack pass runs first. The arena
+    // pass's match doesn't fire on AllocStackRecord, so already-
+    // stack-lowered sites stay stack-lowered. Sites that escape the
+    // frame and the request both pass through unchanged.
+    //
+    // Escape hatch: `LEX_NO_ARENA_RECORDS=1` skips the lowering,
+    // mirroring `LEX_NO_STACK_RECORDS`. The slice-2b-i bench uses
+    // this to A/B identical source under matched VM conditions.
+    //
+    // `body_hash` invariance: `compute_body_hash` decodes
+    // `AllocArenaRecord` / `AllocArenaTuple` back to their legacy
+    // `MakeRecord` / `MakeTuple` form, so closure identity (#222) is
+    // bit-identical across this and the stack lowering.
+    if std::env::var_os("LEX_NO_ARENA_RECORDS").is_none() {
+        let arena_index = crate::arena::build_arena_index(&p.functions);
+        for f in p.functions.iter_mut() {
+            apply_arena_lowering(&mut f.code, &f.name, &arena_index);
+        }
+    }
+
     // Peephole pass (#461 superinstructions). Rewrites fusable opcode
     // patterns into single dispatch steps. Runs before `body_hash`
     // computation, but `compute_body_hash` decomposes each fused op
@@ -408,6 +440,48 @@ fn apply_escape_lowering(
             // #464 tuple codegen: same single-slot swap as records.
             Op::MakeTuple(arity) => {
                 *op = Op::AllocStackTuple { arity };
+            }
+            _ => {}
+        }
+    }
+}
+
+/// #463 slice 2b-i — rewrite `MakeRecord` / `MakeTuple` to the arena
+/// variants at sites the request-scope analysis
+/// (`crate::arena::build_arena_index`) proved do not escape the
+/// active `EffectHandler` arena scope.
+///
+/// Only fires on **remaining** `MakeRecord` / `MakeTuple` sites — the
+/// stack pass (`apply_escape_lowering`) runs first and converts the
+/// non-frame-escaping cheaper-tier sites. Sites that escape both the
+/// frame *and* the request stay as `MakeRecord` / `MakeTuple` (heap),
+/// untouched.
+///
+/// Each rewrite is the same single-slot swap as the stack lowering:
+/// pc / stack delta / shape semantics preserved, jump targets and
+/// downstream peephole passes see the same program shape, and
+/// `compute_body_hash` (#222) decodes both arena ops back to their
+/// legacy `MakeRecord` / `MakeTuple` form so closure identity is
+/// invariant.
+fn apply_arena_lowering(
+    code: &mut [Op],
+    fn_name: &str,
+    arena_index: &std::collections::HashMap<(String, u32), bool>,
+) {
+    for (pc, op) in code.iter_mut().enumerate() {
+        // arena_index value: true = arena-eligible. Absent or false
+        // → leave on heap (defensive default; absent means the
+        // analysis didn't observe the site).
+        let key = (fn_name.to_string(), pc as u32);
+        if !matches!(arena_index.get(&key), Some(true)) {
+            continue;
+        }
+        match *op {
+            Op::MakeRecord { shape_idx, field_count } => {
+                *op = Op::AllocArenaRecord { shape_idx, field_count };
+            }
+            Op::MakeTuple(arity) => {
+                *op = Op::AllocArenaTuple { arity };
             }
             _ => {}
         }

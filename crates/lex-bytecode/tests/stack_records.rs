@@ -49,8 +49,11 @@ fn non_escaping_record_lowers_to_alloc_stack_record() {
     assert_eq!(r, Value::Int(7));
 }
 
-/// A record that is returned escapes. The lowering pass must leave
-/// it as `MakeRecord` so it lives on the heap.
+/// A record that is returned escapes the frame, so the stack pass
+/// must leave it alone. Under #463 slice 2b-i the arena pass then
+/// picks it up — the value crosses the frame but stays inside the
+/// request scope — so the site lowers to `AllocArenaRecord` (the
+/// middle tier), not `MakeRecord` (heap). Same observable semantics.
 #[test]
 fn escaping_record_stays_on_heap() {
     let src = r#"
@@ -62,7 +65,11 @@ fn escaping_record_stays_on_heap() {
     let code = fn_code(&p, "build");
     assert_eq!(count(code, |op| matches!(op, Op::AllocStackRecord { .. })), 0,
         "escaping record must not be stack-allocated: {code:?}");
-    assert_eq!(count(code, |op| matches!(op, Op::MakeRecord { .. })), 1);
+    // Slice-2b three-tier: stays off stack, lands on arena. Pre-slice-2b
+    // this asserted `MakeRecord == 1`; now the arena pass takes it.
+    assert_eq!(count(code, |op| matches!(op, Op::MakeRecord { .. })), 0);
+    assert_eq!(count(code, |op| matches!(op, Op::AllocArenaRecord { .. })), 1,
+        "frame-escaping but request-local record should lower to AllocArenaRecord: {code:?}");
 
     let mut vm = Vm::new(&p);
     let r = vm.call("build", vec![]).unwrap();
@@ -132,8 +139,11 @@ fn record_returned_from_helper_is_not_lowered() {
     let p = compile(src);
     let make_point_code = fn_code(&p, "make_point");
     assert_eq!(count(make_point_code, |op| matches!(op, Op::AllocStackRecord { .. })), 0,
-        "helper-returned record must stay on heap: {make_point_code:?}");
-    assert_eq!(count(make_point_code, |op| matches!(op, Op::MakeRecord { .. })), 1);
+        "helper-returned record must stay off stack: {make_point_code:?}");
+    // Slice-2b three-tier: same shape as `escaping_record_stays_on_heap`
+    // — the returned record stays off stack and lands on arena.
+    assert_eq!(count(make_point_code, |op| matches!(op, Op::MakeRecord { .. })), 0);
+    assert_eq!(count(make_point_code, |op| matches!(op, Op::AllocArenaRecord { .. })), 1);
 
     let mut vm = Vm::new(&p);
     assert_eq!(vm.call("caller", vec![]).unwrap(), Value::Int(7));
@@ -220,10 +230,15 @@ fn per_site_lowering_in_mixed_function() {
     "#;
     let p = compile(src);
     let code = fn_code(&p, "mix");
+    // Three-tier: dropped record → stack (cheapest tier);
+    // returned record → arena (middle tier, slice 2b-i);
+    // no remaining heap MakeRecord in this function.
     assert_eq!(count(code, |op| matches!(op, Op::AllocStackRecord { .. })), 1,
-        "the dropped {{a,b}} record should lower");
-    assert_eq!(count(code, |op| matches!(op, Op::MakeRecord { .. })), 1,
-        "the returned {{z}} record should stay on heap");
+        "the dropped {{a,b}} record should lower to stack");
+    assert_eq!(count(code, |op| matches!(op, Op::AllocArenaRecord { .. })), 1,
+        "the returned {{z}} record should lower to arena");
+    assert_eq!(count(code, |op| matches!(op, Op::MakeRecord { .. })), 0,
+        "no record in this function should remain on the heap tier");
 
     let mut vm = Vm::new(&p);
     let r = vm.call("mix", vec![]).unwrap();
