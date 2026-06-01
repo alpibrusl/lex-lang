@@ -457,3 +457,62 @@ In rough order of value:
 
 Phase 2 (records / closures) still needs the value-rep decision —
 the MVP doesn't change that gating.
+
+---
+
+## Status update — first JIT-vs-interpreter measurement (2026-06-01)
+
+Added `crates/lex-jit/benches/jit_vs_interp.rs` (criterion). Same
+hand-crafted bytecode compiled once outside the iter loop, then run
+through both paths. **Steady-state only** — compile cost excluded.
+
+### Numbers (release build, default opt_level=none for cranelift)
+
+| Workload                  | Interp        | JIT         | Ratio |
+|---------------------------|---------------|-------------|-------|
+| `sum_loop / n=1_000`      | 120.46 µs     | 621.78 ns   | 194× |
+| `sum_loop / n=10_000`     | 1.1898 ms     | 6.137 µs    | 194× |
+| `sum_loop / n=100_000`    | 12.004 ms     | 61.917 µs   | 194× |
+| `polynomial(7, 11, 13)`   | 312.55 ns     | 3.7391 ns   | 84× |
+
+The `sum_loop` ratio is rock-stable across three orders of magnitude
+of `n` — both paths scale linearly in iteration count, so the
+constant factor is the JIT win. The straight-line `polynomial` is
+smaller (84×) because there's no loop body to amortize the per-call
+overhead over; each call is one dispatch through 20 bytecode ops vs
+one native function call to ~20 register instructions.
+
+### What the ratio actually means
+
+**~200× is a steady-state lower bound for the supported op set, on
+the work the JIT can do today — pure int arithmetic, locals, control
+flow.** That's the regime where (a) the interpreter is doing
+boxed-`Value` arithmetic via a `match`-dispatched op handler, and
+(b) the JIT is running unboxed `i64` register arithmetic. The
+disparity is exactly what the §"What the interpreter ceiling is"
+analysis predicted at the bottom of the workload spectrum.
+
+It is **not** a prediction for real Lex programs. Crucially, the
+roadmap's 1.5× ceiling caveat applies once records / closures /
+strings enter the picture — every `MakeRecord` / `Call` makes the
+function ineligible today, and unboxing those requires the
+value-rep rework or a boxing calling convention at the JIT
+boundary. The 1.5× number was about programs *dominated* by those
+allocation-heavy ops, where the JIT can't unbox anything.
+
+### What this is concrete evidence of
+
+1. The Cranelift backend choice (vs. LLVM / hand-rolled) is
+   validated for the MVP scope — 84-194× on supported workloads at
+   `opt_level=none`. Higher opt levels probably claw back another
+   1.3-2×, but for the integration question (does the pipeline
+   work, is it worth wiring up?) the answer is unambiguously yes.
+2. The bottom of the JIT-ROI distribution — leaf-arith hot paths
+   — pays the engineering off without value-rep. A
+   "JIT-the-eligible-functions-only" tier could ship before the
+   NaN-boxing decision, hitting a meaningful fraction of
+   `arith_loop`-class workloads.
+3. Compile cost is *still* unmeasured. Cranelift takes ~ms; the
+   break-even is somewhere around 10k-100k calls. The next slice
+   (tier-up integration with a `body_hash`-keyed cache) needs to
+   measure this in situ to set the warmup threshold.

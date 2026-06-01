@@ -36,3 +36,9 @@ cranelift-native = { version = "0.132", optional = true }
 [dev-dependencies]
 lex-bytecode = { path = "../lex-bytecode", version = "0.9.7" }
 indexmap.workspace = true
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "jit_vs_interp"
+harness = false
+required-features = ["cranelift"]
