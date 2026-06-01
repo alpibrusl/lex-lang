@@ -364,3 +364,96 @@ not start the 2–3 month rework on the strength of the old assumption.
 
 What explicitly should **not** be next: NaN-boxing (de-motivated),
 or #462 slice 2b polymorphic ICs (0% measured polymorphism).
+
+---
+
+## Status update — MVP JIT lands (2026-06-01)
+
+**A first-version JIT now exists in `crates/lex-jit`.** It is a
+proof-of-concept, not a tier — the VM dispatcher is unchanged and
+no caller routes through it. The goal was narrow: prove the
+bytecode → CLIF → native-code → call-back pipeline works on the
+constrained op set we'd plausibly start with.
+
+### Scope
+
+Supported ops: `PushConst(Int|Bool)`, `Pop`, `LoadLocal`,
+`StoreLocal`, all integer arithmetic (`IntAdd/Sub/Mul/Div/Mod/Neg`),
+integer comparisons (`IntEq/Lt/Le`), boolean logic
+(`BoolAnd/Or/Not`), structured control flow (`Jump`, `JumpIf`,
+`JumpIfNot`), and `Return`. Arity capped at 6 to keep the
+trampoline table finite. Every Lex value at the JIT boundary is an
+`i64` — `Int` flows unchanged, `Bool` as `0`/`1`. Anything else
+(records, lists, closures, calls, effects, floats, strings,
+superinstructions) makes the function ineligible via
+`is_jit_eligible`.
+
+### Architecture
+
+Two-pass lowering:
+
+1. `scan_blocks` walks the op stream to find basic-block entries
+   (pc 0, every jump target, every pc after a jump) and computes
+   the abstract-interpretation stack height at each entry.
+2. `Lowering::run` walks ops sequentially, emitting CLIF into the
+   current `Block`. Block-entry stack values are threaded through
+   CLIF `block_params`; jumps pass the current SSA stack as
+   block-call args. Locals are CLIF `Variable`s — Cranelift's SSA
+   frontend handles φ-nodes for joins.
+
+Cranelift is gated behind the `cranelift` cargo feature
+(default-off), so stable builds don't pull cranelift's ~30 crates
+into release artifacts.
+
+### Verification
+
+`tests/jit_vs_interpreter.rs` builds hand-crafted `Function`s,
+runs each via the bytecode VM and via the JIT, and asserts the
+results match across input batteries. 13 tests covering:
+
+- straight-line int arithmetic (add, mul-add, const pool, locals,
+  div/mod/neg);
+- boolean logic with comparisons;
+- forward conditional jumps (abs, max);
+- a backward-jump loop (sum 1..n);
+- rejection of unsupported ops / unsupported consts / overlarge
+  arity via the eligibility gate.
+
+### What this does *not* prove
+
+- **Perf.** No benchmarks. The MVP at this op set may well be
+  slower than the interpreter end-to-end once you count compile
+  cost — that's expected; the work for measurable wins is the
+  phase-1 deliverables below.
+- **Integration.** The JIT is not wired into the VM dispatcher;
+  there is no tier-up trigger, no fallback path, no NodeId
+  side table for deopt, no error mapping back to `VmError`.
+- **Value rep.** Records / closures / strings remain unsupported.
+  That's the wall the MVP hits — every interesting Lex function
+  uses at least one of them. Unboxing requires either the
+  value-rep rework (NaN-boxing) or a runtime calling convention
+  that boxes/unboxes at the JIT boundary.
+
+### Concrete next steps if we want to keep going
+
+In rough order of value:
+
+1. **Wire it into the VM as an opt-in tier.** Add a `JitTier` on
+   `Vm` that, on first `invoke`, calls `is_jit_eligible` and (if
+   yes) compiles + caches by `body_hash`. Dispatch `Op::Call` to
+   the JIT pointer when the cache hits; fall back to the
+   interpreter otherwise. This is the minimum required to put
+   real Lex programs through the JIT and measure anything.
+2. **Add a side-by-side perf bench** (extend `benches/dispatch.rs`)
+   that runs the same arith-loop both ways. Without measured
+   ROI, all further JIT work is speculative.
+3. **Extend the op set to call-into-interpreter** — JIT'd code
+   that hits an unsupported op calls back into the VM with the
+   live frame. This is the bridge that lets us ship JIT for
+   leaf-arith hot paths without first solving value rep.
+4. **NodeId side tables** (per the original phase-1 design). Map
+   native PCs back to bytecode PCs / NodeIds so traces and panics
+   keep working through JIT'd frames.
+
+Phase 2 (records / closures) still needs the value-rep decision —
+the MVP doesn't change that gating.

@@ -1,0 +1,38 @@
+[package]
+name = "lex-jit"
+description = "Cranelift-backed JIT for a subset of Lex bytecode (#465 phase-1 MVP)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+# JIT is opt-in. The default build does not pull cranelift so stable
+# CI / release artifacts are unaffected until the JIT graduates from
+# proof-of-concept to a tier in the VM.
+[features]
+default = []
+cranelift = [
+    "dep:cranelift-codegen",
+    "dep:cranelift-frontend",
+    "dep:cranelift-jit",
+    "dep:cranelift-module",
+    "dep:cranelift-native",
+]
+
+[dependencies]
+lex-bytecode = { path = "../lex-bytecode", version = "0.9.7" }
+thiserror.workspace = true
+
+cranelift-codegen = { version = "0.132", optional = true }
+cranelift-frontend = { version = "0.132", optional = true }
+cranelift-jit = { version = "0.132", optional = true }
+cranelift-module = { version = "0.132", optional = true }
+cranelift-native = { version = "0.132", optional = true }
+
+[dev-dependencies]
+lex-bytecode = { path = "../lex-bytecode", version = "0.9.7" }
+indexmap.workspace = true

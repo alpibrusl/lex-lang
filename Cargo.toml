@@ -5,6 +5,7 @@ members = [
     "crates/lex-ast",
     "crates/lex-types",
     "crates/lex-bytecode",
+    "crates/lex-jit",
     "crates/lex-store",
     "crates/lex-search",
     "crates/lex-vcs",
