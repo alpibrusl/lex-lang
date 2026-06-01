@@ -534,3 +534,161 @@ fn materialize_is_idempotent() {
     vm.exit_request_scope(scope);
     assert_eq!(once, twice);
 }
+
+// ---------------------------------------------------------------
+// Slab-direct accessors (slice 2c-i)
+// ---------------------------------------------------------------
+// Vm::get_record_field / get_tuple_elem / value_to_json — read
+// arena handles straight out of the slab without going through
+// materialize_arena_handles. Host runtimes use these to consume a
+// response record structurally without paying for a tree walk.
+
+#[test]
+fn get_record_field_reads_arena_record() {
+    let prog = handler_returning_xy_record();
+    let mut vm = Vm::new(&prog);
+    let scope = vm.enter_request_scope();
+    let arena_value = vm.invoke(0, vec![]).unwrap();
+    assert!(matches!(arena_value, Value::ArenaRecord { .. }),
+        "test precondition: arena handle, got {arena_value:?}");
+
+    // Slab-direct read — no materialize between alloc and read.
+    let x = vm.get_record_field(&arena_value, "x");
+    let y = vm.get_record_field(&arena_value, "y");
+    let missing = vm.get_record_field(&arena_value, "z");
+    assert_eq!(x, Some(Value::Int(7)));
+    assert_eq!(y, Some(Value::Int(9)));
+    assert_eq!(missing, None);
+
+    vm.exit_request_scope(scope);
+}
+
+#[test]
+fn get_record_field_reads_heap_record_uniformly() {
+    // Same API works on heap Record — uniform interface for the
+    // host that doesn't have to know which variant it has.
+    let prog = xy_program("noop", 0, vec![Op::PushConst(2), Op::Return]);
+    let vm = Vm::new(&prog);
+    let mut fields: IndexMap<smol_str::SmolStr, Value> = IndexMap::new();
+    fields.insert("x".into(), Value::Int(7));
+    fields.insert("y".into(), Value::Int(9));
+    let heap = Value::Record { shape_id: 0, fields: Box::new(fields) };
+    assert_eq!(vm.get_record_field(&heap, "x"), Some(Value::Int(7)));
+    assert_eq!(vm.get_record_field(&heap, "missing"), None);
+}
+
+#[test]
+fn get_record_field_returns_none_on_non_record() {
+    let prog = xy_program("noop", 0, vec![Op::PushConst(2), Op::Return]);
+    let vm = Vm::new(&prog);
+    assert_eq!(vm.get_record_field(&Value::Int(42), "x"), None);
+    assert_eq!(vm.get_record_field(&Value::Unit, "x"), None);
+}
+
+#[test]
+fn get_tuple_elem_reads_arena_tuple() {
+    let prog = tup_program("build_tup", 0, vec![
+        Op::PushConst(0), Op::PushConst(1),
+        Op::AllocArenaTuple { arity: 2 },
+        Op::Return,
+    ]);
+    let mut vm = Vm::new(&prog);
+    let scope = vm.enter_request_scope();
+    let arena_tup = vm.invoke(0, vec![]).unwrap();
+    assert!(matches!(arena_tup, Value::ArenaTuple { .. }));
+
+    assert_eq!(vm.get_tuple_elem(&arena_tup, 0), Some(Value::Int(11)));
+    assert_eq!(vm.get_tuple_elem(&arena_tup, 1), Some(Value::Int(13)));
+    assert_eq!(vm.get_tuple_elem(&arena_tup, 2), None);
+
+    vm.exit_request_scope(scope);
+}
+
+#[test]
+fn get_tuple_elem_reads_heap_tuple_uniformly() {
+    let prog = tup_program("noop", 0, vec![Op::PushConst(0), Op::Return]);
+    let vm = Vm::new(&prog);
+    let heap = Value::Tuple(vec![Value::Int(11), Value::Int(13)]);
+    assert_eq!(vm.get_tuple_elem(&heap, 0), Some(Value::Int(11)));
+    assert_eq!(vm.get_tuple_elem(&heap, 5), None);
+}
+
+#[test]
+fn value_to_json_matches_materialize_then_to_json_for_arena_record() {
+    let prog = handler_returning_xy_record();
+    let mut vm = Vm::new(&prog);
+    let scope = vm.enter_request_scope();
+    let arena_value = vm.invoke(0, vec![]).unwrap();
+
+    // The slab-direct path equals materialize-then-to_json byte for
+    // byte — this is the slab-direct serializer's correctness gate.
+    let direct = vm.value_to_json(&arena_value);
+    let materialized = vm.materialize_arena_handles(arena_value).to_json();
+    vm.exit_request_scope(scope);
+
+    assert_eq!(direct, materialized);
+    assert_eq!(direct["x"], serde_json::json!(7));
+    assert_eq!(direct["y"], serde_json::json!(9));
+}
+
+#[test]
+fn value_to_json_recurses_through_nested_arena_records() {
+    // Two-level nested arena record (the deep-leaf shape). The
+    // slab-direct path must reach into the slab at every level, not
+    // just the top.
+    let constants = vec![
+        Const::FieldName("inner".into()),
+        Const::FieldName("status".into()),
+        Const::FieldName("a".into()),
+        Const::Int(200),
+        Const::Int(42),
+    ];
+    let mut function_names = IndexMap::new();
+    function_names.insert("nested".to_string(), 0);
+    // Inner: { a: 42 } (shape 0)
+    // Outer: { inner: <inner>, status: 200 } (shape 1)
+    let prog = Arc::new(Program {
+        constants,
+        functions: vec![Function {
+            name: "nested".into(),
+            arity: 0,
+            locals_count: 0,
+            code: vec![
+                Op::PushConst(4),                                       // 42
+                Op::AllocArenaRecord { shape_idx: 0, field_count: 1 },  // inner: { a: 42 }
+                Op::PushConst(3),                                       // 200
+                Op::AllocArenaRecord { shape_idx: 1, field_count: 2 },  // outer: { inner, status }
+                Op::Return,
+            ],
+            effects: vec![],
+            body_hash: ZERO_BODY_HASH,
+            refinements: vec![],
+            field_ic_sites: 4,
+        }],
+        function_names,
+        module_aliases: IndexMap::new(),
+        entry: Some(0),
+        record_shapes: vec![vec![2], vec![0, 1]], // inner shape, outer shape
+    });
+    let mut vm = Vm::new(&prog);
+    let scope = vm.enter_request_scope();
+    let arena_value = vm.invoke(0, vec![]).unwrap();
+    let direct = vm.value_to_json(&arena_value);
+    vm.exit_request_scope(scope);
+
+    assert_eq!(direct["status"], serde_json::json!(200));
+    assert_eq!(direct["inner"]["a"], serde_json::json!(42));
+}
+
+#[test]
+fn value_to_json_passes_primitives_through() {
+    // The host can call value_to_json on any value — primitives
+    // delegate to the existing Value::to_json so the output stays
+    // identical.
+    let prog = xy_program("noop", 0, vec![Op::PushConst(2), Op::Return]);
+    let vm = Vm::new(&prog);
+    assert_eq!(vm.value_to_json(&Value::Int(42)), serde_json::json!(42));
+    assert_eq!(vm.value_to_json(&Value::Bool(true)), serde_json::json!(true));
+    assert_eq!(vm.value_to_json(&Value::Unit), serde_json::Value::Null);
+    assert_eq!(vm.value_to_json(&Value::Str("hi".into())), serde_json::json!("hi"));
+}
