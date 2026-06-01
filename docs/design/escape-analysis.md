@@ -156,8 +156,15 @@ The implementation pinned by `escape::tests`:
 - Fresh record round-tripped through one local → does NOT escape. ✓
 - Two MakeRecord sites in the same function classified
   independently. ✓
-- Records nested inside another record (the inner site escapes
-  via capture by the outer aggregate). ✓
+- Records nested inside another record — pre-refinement, the inner
+  site escaped at the outer's build site. With containment-tracking
+  (#463 follow-up, see `arena-plumbing.md` § "Status update
+  (2026-06-04)"), the inner is recorded as contained in the parent
+  and escapes only if the parent itself escapes (transitive expansion
+  at fixpoint exit). Under `Policy::FrameScope` the existing test
+  `record_stored_into_outer_record_escapes` still flags both because
+  the outer is `Return`'d; under `Policy::RequestScope` both stay
+  arena-eligible.
 - Records passed to `Call` / `EffectCall` / `MakeClosure` /
   `MakeList`. ✓
 - Records duplicated via `Dup`. ✓

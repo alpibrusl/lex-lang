@@ -315,3 +315,58 @@ fn match_arm_records_both_lower_to_arena_under_precision() {
     assert_eq!(vm.arena_record_allocs, 2);
     assert_eq!(vm.arena_record_heap_fallbacks, 0);
 }
+
+// ---------------------------------------------------------------
+// Deep-leaf widening (containment-tracking)
+// ---------------------------------------------------------------
+
+/// A handler returning a nested record (inner record stored as a
+/// field of the outer) should now lower **both** to arena. Pre-deep-
+/// leaf the inner was leaked at the outer's build site and stayed
+/// heap; with containment-tracking neither escapes since the outer
+/// is only consumed by `Return`.
+#[test]
+fn deep_leaf_nested_handler_lowers_both_to_arena() {
+    let src = r#"
+        fn build_inner() -> { x :: Int, y :: Int } {
+          { x: 1, y: 2 }
+        }
+        fn handler() -> { status :: Int, body :: { x :: Int, y :: Int } } {
+          { status: 200, body: { x: 7, y: 9 } }
+        }
+    "#;
+    let p = compile(src);
+    let handler_code = fn_code(&p, "handler");
+
+    // Both MakeRecord sites in `handler` should lower to arena.
+    let arena = count(handler_code, |op| matches!(op, Op::AllocArenaRecord { .. }));
+    let heap = count(handler_code, |op| matches!(op, Op::MakeRecord { .. }));
+    assert_eq!(arena, 2,
+        "expected both nested records to lower to arena: {handler_code:?}");
+    assert_eq!(heap, 0,
+        "no heap records should remain after the deep-leaf refinement");
+
+    // End-to-end runtime: the response value materializes correctly,
+    // the nested body shows up as a heap Record after materialize.
+    let mut vm = Vm::new(&p);
+    let scope = vm.enter_request_scope();
+    let r = vm.invoke(p.function_names["handler"], vec![]).unwrap();
+    let r = vm.materialize_arena_handles(r);
+    vm.exit_request_scope(scope);
+    match r {
+        Value::Record { fields, .. } => {
+            assert_eq!(fields.get("status"), Some(&Value::Int(200)));
+            match fields.get("body") {
+                Some(Value::Record { fields: inner, .. }) => {
+                    assert_eq!(inner.get("x"), Some(&Value::Int(7)));
+                    assert_eq!(inner.get("y"), Some(&Value::Int(9)));
+                }
+                other => panic!("expected nested body Record, got {other:?}"),
+            }
+        }
+        other => panic!("expected outer Record, got {other:?}"),
+    }
+    // 2 arena allocs (inner + outer) per call, 0 fallbacks.
+    assert_eq!(vm.arena_record_allocs, 2);
+    assert_eq!(vm.arena_record_heap_fallbacks, 0);
+}

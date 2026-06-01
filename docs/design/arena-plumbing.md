@@ -367,3 +367,65 @@ counters confirm `arena_allocs=360, arena_fallbacks=0` across the
   (`drop_in_place` + `Vec::resize` in the materialize walk) is still
   paid. A walker that emits JSON bytes directly out of `arena_slab`
   would shed it on the HTTP-serving path.
+
+## Status update (2026-06-04) — deep-leaf widening landed
+
+The sibling refinement from the 2026-06-03 status. The slice-1
+analysis used to leak every field operand at each tracked aggregate's
+build site (`MakeRecord` / `MakeTuple` / `AllocStack*` /
+`AllocArena*`), so a record stored as a field of another record
+escaped immediately — even when the outer itself stayed local.
+
+The fix is a **containment-tracking** refinement: at each build site,
+the analysis records the popped children as *contained in* the
+parent pc rather than escaping them. After the fixpoint, an
+expansion pass transitively escapes the children of every escaped
+parent. Net effect:
+
+- **Outer escapes → all children escape transitively** (sound — same
+  result as before).
+- **Outer stays local → children stay local** (precision win — the
+  pre-refinement analysis pessimistically over-flagged).
+
+### Deep-tree workload — the new measurement
+
+`examples/profile_deep_tree.rs` — a 3-deep nested record per call,
+`drive(1000) × 3 iters`. All three levels arena-eligible only under
+deep-leaf widening; pre-refinement only the outer was eligible (and
+even then was leaked by the slice-1 lattice for `match`-shape
+returns, fixed by the 2026-06-03 precision pass).
+
+| | I-refs | Δ vs OFF |
+|---|---|---|
+| arena off | 40,939,025 | — |
+| arena on  | **18,404,779** | **−55.0%** |
+
+| | off | on | Δ abs |
+|---|---|---|---|
+| `_int_malloc` | 10.67% | 2.98% | **−87.5%** |
+| `_int_free` | 7.01% | 2.47% | **−84.2%** |
+| `malloc` | 4.93% | 1.74% | **−84.2%** |
+| `IndexMap::insert_full` | 4.62% | gone | **−100%** |
+
+Diagnostic: `[diag] handle() record sites: arena=3, stack=0,
+heap=0`; runtime counters confirm 9000 arena allocs / 0 fallbacks
+across 3 × 1000 calls × 3 levels per call.
+
+### Headline summary across the arena work
+
+| Workload | Shape | Arena win |
+|---|---|---|
+| `alloc_heavy`     | flat return record | **−36.0%** |
+| `response_build`  | match-arm return    | **−10.7%** |
+| `deep_tree`       | 3-deep nested      | **−55.0%** |
+
+### What's still open
+
+- **Slab-direct serializer** — the materialize-at-boundary cost
+  (`drop_in_place` + `Vec::resize` in the materialize walk) is still
+  paid. The deep-tree numbers above already pay it (the relative
+  share of `drop_in_place` actually grew, from 3.42% to 9.73%, even
+  though absolute went down — total I-refs shrank faster). A walker
+  that emits JSON bytes directly out of `arena_slab` without
+  rebuilding a `Value::Record` mirror would shed it on the
+  HTTP-serving path.
