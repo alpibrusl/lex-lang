@@ -83,9 +83,17 @@ pub enum Policy {
 }
 
 /// Abstract value at a stack or local slot during the analysis.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// Per-path refinement (#463 follow-up — precision pass): a slot can
+/// hold a **set** of allocation sites, not just one, because two
+/// branches of an `if`/`match` can each push a distinct `MakeRecord`
+/// / `MakeTuple` value onto the stack and the join point's "either-
+/// or" semantics must be modeled without losing tracking. The
+/// 3-variant shape keeps the singleton case zero-alloc — `Slot::Agg`
+/// is plain 8 bytes inline — and only branch-merges allocate.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Slot {
-    /// Holds the stack-allocatable aggregate (a record from
+    /// Holds a single tracked aggregate (a record from
     /// `Op::MakeRecord` or a tuple from `Op::MakeTuple`) allocated at
     /// this pc. As long as every consumer reads this slot via a field
     /// / element read (`GetField` / `GetElem`), `Pop`, or a
@@ -94,6 +102,14 @@ pub enum Slot {
     /// aggregate kinds — only the codegen opcode differs — so the
     /// analysis tracks them with one variant keyed on the alloc pc.
     Agg(u32),
+    /// Holds one of N tracked aggregates, depending on which branch
+    /// reached this program point. Produced at join points where
+    /// distinct `Agg(p)` and `Agg(q)` flow together; the set remains
+    /// tracked across the merge so the eventual consumer (e.g.
+    /// `Return` under `Policy::RequestScope`) decides whether any
+    /// site leaks. Invariant: vec is sorted, dedup'd, length ≥ 2 —
+    /// `Slot::from_sites` normalizes single-element / empty inputs.
+    AggSet(Vec<u32>),
     /// Anything else — primitives, already-escaped aggregates,
     /// values produced by ops we don't model precisely. Treated
     /// as not-a-tracked-aggregate for escape purposes.
@@ -101,15 +117,48 @@ pub enum Slot {
 }
 
 impl Slot {
-    /// Pointwise merge for join points. Same site survives;
-    /// anything else collapses to `Other`. Callers responsible for
-    /// recording any `Rec(_)` that was merged-away into the
-    /// escape set — we lose track of those sites past this merge.
-    fn merge(self, other: Slot) -> Slot {
-        match (self, other) {
-            (Slot::Agg(a), Slot::Agg(b)) if a == b => Slot::Agg(a),
-            _ => Slot::Other,
+    /// View this slot as a slice of tracked sites. Empty for
+    /// `Other`, singleton for `Agg`, the inner vec for `AggSet`.
+    /// Lets callers iterate sites uniformly across the three
+    /// variants — used by every consumer that needs to leak all
+    /// sites a slot might hold.
+    fn sites(&self) -> &[u32] {
+        match self {
+            Slot::Agg(p) => std::slice::from_ref(p),
+            Slot::AggSet(v) => v.as_slice(),
+            Slot::Other => &[],
         }
+    }
+
+    /// Construct a slot from an arbitrary list of site pcs.
+    /// Normalizes: sorts + dedups + collapses empty → `Other`,
+    /// singleton → `Agg`. Used by `merge` and any other code that
+    /// produces a set-like slot.
+    fn from_sites(mut sites: Vec<u32>) -> Slot {
+        sites.sort_unstable();
+        sites.dedup();
+        match sites.len() {
+            0 => Slot::Other,
+            1 => Slot::Agg(sites[0]),
+            _ => Slot::AggSet(sites),
+        }
+    }
+
+    /// Pointwise merge for join points. Unions the site sets — both
+    /// sides stay tracked across the join, contra the pre-refinement
+    /// behavior of collapsing to `Other` (which also flagged both
+    /// sides as escaping). Under `Policy::RequestScope` this is the
+    /// whole point: a `match`-arm return like `match cond { true =>
+    /// {x:1}, false => {x:2} }` now produces an `AggSet([p, q])` at
+    /// the merge, which `Op::Return` passes through without leaking
+    /// (request-scope) instead of being forced into `Other` (escape).
+    fn merge(self, other: Slot) -> Slot {
+        if self == other { return self; }
+        let mut combined: Vec<u32> = Vec::with_capacity(
+            self.sites().len() + other.sites().len());
+        combined.extend_from_slice(self.sites());
+        combined.extend_from_slice(other.sites());
+        Slot::from_sites(combined)
     }
 }
 
@@ -133,43 +182,37 @@ impl State {
         }
     }
 
-    /// Merge `other` into `self`. Returns `(merged_state, escaped_sites)`
-    /// — the sites that we lost track of during the merge. Callers
-    /// union the escapes into the function-level set.
+    /// Merge `other` into `self`. Returns `(merged_state, escaped_sites)`.
+    ///
+    /// Per-path refinement: the merge itself **does not record any
+    /// escapes**. `Slot::merge` keeps both sides' sites tracked
+    /// across the join (`AggSet([p, q])` instead of `Other`), so the
+    /// downstream consumer ops decide whether any leak. The pre-
+    /// refinement collapse-to-Other behavior was the conservative
+    /// case the doc had labeled future work; this is that work.
+    ///
+    /// The one remaining escape source here is the dropped-tail case
+    /// for mismatched stack depths. That's a verifier-level bug
+    /// (#347 already checks shape-consistent merges), not the join-
+    /// point trap — those sites really are unreachable from the
+    /// merged state, so flagging them as escaped stays conservative-
+    /// correct.
     fn merge_with(&self, other: &State) -> (State, HashSet<u32>) {
         let mut escaped = HashSet::new();
-        // Mismatched stack depths are a verifier-level bug (#347
-        // already checks this); for the escape analysis we just
-        // truncate to the shorter and proceed — any sites on the
-        // extra slots count as escapes since they're no longer
-        // reachable from the join state.
         let stack_len = self.stack.len().min(other.stack.len());
         let mut stack = Vec::with_capacity(stack_len);
         for i in 0..stack_len {
-            let merged = self.stack[i].merge(other.stack[i]);
-            // If a Rec was merged-away (either path had Rec, the
-            // result is Other), the corresponding site escapes.
-            if merged == Slot::Other {
-                if let Slot::Agg(p) = self.stack[i]  { escaped.insert(p); }
-                if let Slot::Agg(p) = other.stack[i] { escaped.insert(p); }
-            }
-            stack.push(merged);
+            stack.push(self.stack[i].clone().merge(other.stack[i].clone()));
         }
-        // The dropped tail of the longer stack also leaks any Rec.
         for tail in self.stack.iter().skip(stack_len).chain(other.stack.iter().skip(stack_len)) {
-            if let Slot::Agg(p) = tail { escaped.insert(*p); }
+            for &p in tail.sites() { escaped.insert(p); }
         }
         let local_len = self.locals.len().max(other.locals.len());
         let mut locals = Vec::with_capacity(local_len);
         for i in 0..local_len {
-            let a = self.locals.get(i).copied().unwrap_or(Slot::Other);
-            let b = other.locals.get(i).copied().unwrap_or(Slot::Other);
-            let merged = a.merge(b);
-            if merged == Slot::Other {
-                if let Slot::Agg(p) = a { escaped.insert(p); }
-                if let Slot::Agg(p) = b { escaped.insert(p); }
-            }
-            locals.push(merged);
+            let a = self.locals.get(i).cloned().unwrap_or(Slot::Other);
+            let b = other.locals.get(i).cloned().unwrap_or(Slot::Other);
+            locals.push(a.merge(b));
         }
         (State { stack, locals }, escaped)
     }
@@ -321,13 +364,17 @@ pub fn analyze_function_with_policy(func: &Function, policy: Policy) -> EscapeRe
 fn step(pc: usize, op: &Op, mut s: State, policy: Policy) -> (State, Vec<usize>, HashSet<u32>) {
     let mut escapes: HashSet<u32> = HashSet::new();
 
-    // Helper closures for the common pop-n / push patterns.
-    let leak = |slot: Slot, into: &mut HashSet<u32>| {
-        if let Slot::Agg(p) = slot { into.insert(p); }
+    // Helper closures for the common pop-n / push patterns. `leak`
+    // iterates `slot.sites()` so multi-site slots (`AggSet`) leak
+    // every member — same conservative escape behavior as before for
+    // ops that genuinely escape, but now correctly handles the
+    // post-merge sets that the per-path lattice produces.
+    let leak = |slot: &Slot, into: &mut HashSet<u32>| {
+        for &p in slot.sites() { into.insert(p); }
     };
     let pop_n_leak = |state: &mut State, n: usize, esc: &mut HashSet<u32>| {
         for _ in 0..n {
-            if let Some(top) = state.stack.pop() { leak(top, esc); }
+            if let Some(top) = state.stack.pop() { leak(&top, esc); }
         }
     };
     let pop_n_drop = |state: &mut State, n: usize| {
@@ -341,14 +388,14 @@ fn step(pc: usize, op: &Op, mut s: State, policy: Policy) -> (State, Vec<usize>,
             // Aliasing breaks our linear-flow tracking. Anything
             // duplicated escapes — both copies become Other.
             if let Some(top) = s.stack.pop() {
-                leak(top, &mut escapes);
+                leak(&top, &mut escapes);
                 s.stack.push(Slot::Other);
                 s.stack.push(Slot::Other);
             }
         }
 
         Op::LoadLocal(i) => {
-            let slot = s.locals.get(*i as usize).copied().unwrap_or(Slot::Other);
+            let slot = s.locals.get(*i as usize).cloned().unwrap_or(Slot::Other);
             s.stack.push(slot);
         }
         Op::StoreLocal(i) => {
@@ -452,7 +499,7 @@ fn step(pc: usize, op: &Op, mut s: State, policy: Policy) -> (State, Vec<usize>,
         }
         Op::ListAppend => {
             // pop [list, value]; value is now inside the list → escape
-            if let Some(value) = s.stack.pop() { leak(value, &mut escapes); }
+            if let Some(value) = s.stack.pop() { leak(&value, &mut escapes); }
             s.stack.pop(); // list itself
             s.stack.push(Slot::Other);
         }
@@ -473,7 +520,7 @@ fn step(pc: usize, op: &Op, mut s: State, policy: Policy) -> (State, Vec<usize>,
             // returned value crosses our frame and leaks; under
             // RequestScope it stays inside the request and does not.
             if matches!(policy, Policy::FrameScope) {
-                if let Some(top) = top { leak(top, &mut escapes); }
+                if let Some(top) = top { leak(&top, &mut escapes); }
             }
             return (s, vec![], escapes);
         }
@@ -750,7 +797,10 @@ mod tests {
     #[test]
     fn record_in_one_branch_returned_escapes_after_merge() {
         // if cond { rec1 } else { rec2 } — Return after merge.
-        // Conservative analysis: at the merge both sites escape.
+        // Under FrameScope, Return leaks every site in the merged
+        // `AggSet`, so both still escape. The precision refinement
+        // (sibling `merged_branch_records_kept_tracked_*` tests
+        // below) only changes the answer under RequestScope.
         let f = func("brancher", 0, 1, vec![
             Op::LoadLocal(0),                          // pc=0
             Op::JumpIfNot(4),                          // pc=1; offset 4 → pc=6
@@ -763,6 +813,52 @@ mod tests {
         ]);
         let r = analyze_function(&f);
         // Both record sites escape — Return sees a merged stack.
+        assert_escapes(&r, &[(3, true), (6, true)]);
+    }
+
+    /// Per-path precision refinement: under `RequestScope`, two
+    /// records produced in alternate `if`/`else` branches and merged
+    /// before `Return` stay tracked across the join (`AggSet([p,q])`)
+    /// and `Return` leaves them alone, so neither escapes. This is
+    /// the win that makes the `response_build`-shape `match`-arm
+    /// handlers arena-eligible.
+    #[test]
+    fn merged_branch_records_kept_tracked_under_request_scope() {
+        let f = func("brancher_req", 0, 1, vec![
+            Op::LoadLocal(0),
+            Op::JumpIfNot(4),
+            Op::PushConst(0),
+            Op::MakeRecord { shape_idx: 0, field_count: 1 }, // pc=3
+            Op::Jump(2),
+            Op::PushConst(1),
+            Op::MakeRecord { shape_idx: 0, field_count: 1 }, // pc=6
+            Op::Return,
+        ]);
+        let r = analyze_function_with_policy(&f, Policy::RequestScope);
+        // Neither site escapes — both stay in the merged AggSet
+        // through Return, which doesn't leak under RequestScope.
+        assert_escapes(&r, &[(3, false), (6, false)]);
+    }
+
+    /// Sibling guard: under `RequestScope`, if the merged set is
+    /// then passed to a `Call` (a hatch under both policies), every
+    /// site in the set still escapes. Confirms the leak helper
+    /// iterates `sites()` correctly across the multi-site variant.
+    #[test]
+    fn merged_branch_records_all_escape_at_call_under_request_scope() {
+        let f = func("brancher_then_call", 0, 1, vec![
+            Op::LoadLocal(0),
+            Op::JumpIfNot(4),
+            Op::PushConst(0),
+            Op::MakeRecord { shape_idx: 0, field_count: 1 }, // pc=3
+            Op::Jump(2),
+            Op::PushConst(1),
+            Op::MakeRecord { shape_idx: 0, field_count: 1 }, // pc=6
+            Op::Call { fn_id: 1, arity: 1, node_id_idx: 0 }, // pc=7
+            Op::Return,
+        ]);
+        let r = analyze_function_with_policy(&f, Policy::RequestScope);
+        // The Call consumes the merged AggSet → both sites leak.
         assert_escapes(&r, &[(3, true), (6, true)]);
     }
 

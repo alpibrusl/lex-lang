@@ -310,3 +310,60 @@ ever materializing into `Value::Record`) would recover that cost on
 the HTTP-serving path. Not on the critical path until the analysis
 refinements above land and the response-build shape sees the arena
 fire.
+
+## Status update (2026-06-03) — per-path precision refinement landed
+
+The "next lever" from the 2026-06-02 measurement above (track
+`Slot::Rec(pc)` separately along each branch instead of merging to
+`Slot::Other` at joins) is now on `main`. `escape::Slot` gained a
+3-variant `Agg(pc) | AggSet(Vec<u32>) | Other` shape; `Slot::merge`
+unions site sets across joins; `State::merge_with` no longer records
+escapes at the merge itself; the leak helper in `step()` iterates
+`Slot::sites()` so multi-site slots leak every member at genuine
+escape ops (`Call` / `EffectCall` / `MakeClosure` / etc.).
+
+Soundness: under `Policy::FrameScope` (the #464 default), `Op::Return`
+still leaks every site in the merged set, so the frame-escape result
+is bit-identical to pre-refinement. Under `Policy::RequestScope`
+(#463), `Op::Return` is the only consumer whose answer changes — the
+merge set passes through it without leaking, and only request-leaking
+hatches downstream cause an escape.
+
+### `response_build` re-measured (same harness as 2026-06-02)
+
+`examples/profile_response_build.rs`, `drive(120)` × 3 iters,
+callgrind I-refs.
+
+| | I-refs | Δ vs OFF |
+|---|---|---|
+| arena off (LEX_NO_ARENA_RECORDS=1 / no scope) | 11,228,628 | — |
+| arena on  (precision pass + scope) | **10,023,352** | **−10.7%** |
+
+Where the savings land:
+
+| | off | on | Δ abs |
+|---|---|---|---|
+| `_int_malloc` | 4.92% | 3.43% | **−37.7%** |
+| `_int_free` | 3.37% | 2.50% | **−33.8%** |
+| `malloc` | 2.50% | 1.90% | **−32.1%** |
+| `free` | 1.47% | 1.08% | **−34.2%** |
+| `IndexMap::insert_full` | 1.00% | 0.38% | **−66.5%** |
+| `Vm::run_to` | 37.05% | 40.73% | (relative — abs ~unchanged) |
+
+Diagnostic shows `[diag] handle() record sites: arena=2, stack=6,
+heap=0` (was `arena=0, stack=6, heap=2` before the refinement). Both
+`match`-arm `Response` records now land on the arena tier; runtime
+counters confirm `arena_allocs=360, arena_fallbacks=0` across the
+3 × 120 calls.
+
+### What's still open
+
+- **Deep-leaf widening** — `MakeRecord` still pessimistically leaks
+  every field operand at the build site, so a record stored as a
+  field of another record continues to escape. Sibling to the join
+  precision; would be a second refinement to the lattice that
+  threads parent-eligibility through nested aggregates.
+- **Slab-direct serializer** — the materialize-at-boundary cost
+  (`drop_in_place` + `Vec::resize` in the materialize walk) is still
+  paid. A walker that emits JSON bytes directly out of `arena_slab`
+  would shed it on the HTTP-serving path.

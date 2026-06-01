@@ -92,62 +92,92 @@ fn compile_with_env(src: &str, no_stack_records: bool) -> Arc<Program> {
     }
 }
 
-fn count_record_sites(p: &Program) -> (usize, usize) {
+fn count_record_sites(p: &Program) -> (usize, usize, usize) {
     let mut make_record = 0usize;
     let mut alloc_stack = 0usize;
+    let mut alloc_arena = 0usize;
     for f in &p.functions {
         for op in &f.code {
             match op {
                 Op::MakeRecord { .. } => make_record += 1,
                 Op::AllocStackRecord { .. } => alloc_stack += 1,
+                Op::AllocArenaRecord { .. } => alloc_arena += 1,
                 _ => {}
             }
         }
     }
-    (make_record, alloc_stack)
+    (make_record, alloc_stack, alloc_arena)
 }
 
 /// Acceptance bar 1: ≥60% of record allocations land on the stack
 /// path. Exact, counter-driven; no timing noise.
+///
+/// History note: pre per-path-refinement (#463 follow-up) the `match
+/// v6.s > 0 { true => {Response}, false => {Response} }` shape kept
+/// the two match-arm records on the heap because the lattice merged
+/// them to `Slot::Other` at the return join and flagged both as
+/// escaping. The refinement keeps both tracked as `AggSet([p,q])`
+/// across the merge; under the request-scope policy they're now
+/// arena-eligible, and `apply_arena_lowering` rewrites them to
+/// `AllocArenaRecord`. So this workload's record allocations split
+/// across **three** tiers now (stack / arena / heap), not just two,
+/// and the assertions below cover the three-tier reality.
 #[test]
 fn at_least_60_percent_of_records_on_stack() {
     let p = compile_with_env(SRC, false);
-    let (make_record_sites, alloc_stack_sites) = count_record_sites(&p);
-    assert!(alloc_stack_sites > 0, "expected lowering to fire");
-    assert!(make_record_sites > 0, "expected at least one escaping record (the Response)");
+    let (make_record_sites, alloc_stack_sites, alloc_arena_sites) = count_record_sites(&p);
+    assert!(alloc_stack_sites > 0, "expected stack lowering to fire");
+    // Per-path refinement: the two match-arm records used to remain
+    // `MakeRecord` (heap) here — now they land on arena.
+    assert!(alloc_arena_sites > 0,
+        "expected arena lowering to fire on match-arm Response sites");
+    assert_eq!(make_record_sites, 0,
+        "no heap-tier records expected in this workload");
 
     let mut vm = Vm::new(&p);
     vm.set_step_limit(u64::MAX);
-    let r = vm.call("drive", vec![Value::Int(200)]).unwrap();
-    assert!(matches!(r, Value::Int(_)), "expected Int return, got {r:?}");
+    // Materialize through a request scope so the arena ops route
+    // through the slab — mirrors `net.serve_fn`. Without the scope
+    // the alloc ops fall back to heap and the counters below would
+    // miscount.
+    let scope = vm.enter_request_scope();
+    let r = vm.invoke(p.function_names["drive"], vec![Value::Int(200)]).unwrap();
+    let _ = vm.materialize_arena_handles(r);
+    vm.exit_request_scope(scope);
 
     let stack = vm.stack_record_allocs;
+    let arena = vm.arena_record_allocs;
     let heap = vm.heap_record_allocs;
     let fallback = vm.stack_record_heap_fallbacks;
-    let total = stack + heap + fallback;
+    let total = stack + arena + heap + fallback;
     assert!(total > 0);
     let rate = stack as f64 / total as f64;
     println!(
-        "[#464 step 3] record alloc breakdown: stack={stack}, heap={heap}, \
-         fallback={fallback}, total={total}, stack_rate={:.2}%",
+        "[#464 step 3 / #463 precision] record alloc breakdown: \
+         stack={stack}, arena={arena}, heap={heap}, fallback={fallback}, \
+         total={total}, stack_rate={:.2}%",
         rate * 100.0
     );
     assert!(rate >= 0.60,
         "stack-allocation rate {:.2}% is below the 60% acceptance bar",
         rate * 100.0);
 
-    // Exact numbers (the test acts as a regression gate for the
-    // lowering pass and the analysis):
-    //   Per `handle()` call: 6 stack records (v1..v6) + 1 heap
-    //   record (Response). drive(200) calls handle 200 times.
-    //   stack    = 200 * 6 = 1200
-    //   heap     = 200 * 1 = 200
-    //   fallback = 0 (each frame uses 21 slots ≪ 64-slot budget)
-    //   total = 1400, rate = 1200/1400 ≈ 85.7%.
+    // Exact numbers (regression gate for both the #464 stack lowering
+    // and the #463 per-path arena refinement). Per `handle()` call:
+    //   - 6 stack records (v1..v6, frame-local — #464)
+    //   - 1 arena record (the chosen match-arm Response — #463
+    //     precision; pre-refinement this was 1 heap MakeRecord).
+    // drive(200) calls handle 200 times.
+    //   stack    = 200 × 6 = 1200
+    //   arena    = 200 × 1 = 200
+    //   heap     = 0
+    //   fallback = 0
+    //   total = 1400, stack_rate = 1200/1400 ≈ 85.7% — unchanged.
     assert_eq!(fallback, 0,
         "no budget exhaustion expected for this workload");
     assert_eq!(stack, 200 * 6, "expected 6 stack records per handle × 200");
-    assert_eq!(heap, 200, "expected 1 heap record (Response) per handle × 200");
+    assert_eq!(arena, 200, "expected 1 arena Response per handle × 200");
+    assert_eq!(heap, 0, "no heap records expected after the precision refinement");
 }
 
 /// Acceptance bar 2: ≥1.5× speedup with lowering. Timing-based, so

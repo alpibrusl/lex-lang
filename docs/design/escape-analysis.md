@@ -162,8 +162,13 @@ The implementation pinned by `escape::tests`:
   `MakeList`. ✓
 - Records duplicated via `Dup`. ✓
 - Records produced in alternate `if/else` branches and merged
-  before `Return` — both escape at the join. (Conservative; a
-  per-path refinement could recover this but is out of scope.)
+  before `Return` — under `Policy::FrameScope` both escape at the
+  `Return` (`Return` leaks every site in the merged set, same
+  result as the pre-refinement collapse-to-Other). Under
+  `Policy::RequestScope` neither escapes — the join's `AggSet([p,q])`
+  passes through `Return` without leaking. This was previously
+  listed as future work; the precision refinement landed via #463
+  follow-up (see `arena-plumbing.md` § "Status update (2026-06-03)").
 
 ## API surface
 
