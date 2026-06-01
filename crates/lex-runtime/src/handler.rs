@@ -3116,7 +3116,7 @@ fn build_request_value_tiny(req: &mut tiny_http::Request) -> Value {
     Value::record_dynamic(rec)
 }
 
-pub(crate) fn unpack_response(vm: &mut Vm, v: &Value) -> (u16, ResponseBodyOut, Vec<(String, String)>) {
+pub(crate) fn unpack_response(vm: &mut Vm, v: &Value) -> UnpackedResponse {
     // Accept both heap `Record` and arena `ArenaRecord` — the new
     // slab-direct accessors below read each uniformly without
     // requiring a tree-wide materialize first. See
@@ -3191,7 +3191,7 @@ type HyperRespBody =
 /// the wire. Plain string bodies use `Full<Bytes>` which carries
 /// `Content-Length`.
 fn build_hyper_response(
-    (status, body, headers): (u16, ResponseBodyOut, Vec<(String, String)>),
+    (status, body, headers): UnpackedResponse,
 ) -> hyper::Response<HyperRespBody> {
     use http_body_util::BodyExt as _;
     let boxed_body: HyperRespBody = match body {
@@ -3295,6 +3295,13 @@ fn respond_with_body_tls(
 /// different `tiny_http` path: a single `Response::from_string` for
 /// `Str`, and a chunked-encoding `Response::new` with a `Read`-backed
 /// chunk list for the streaming variants.
+///
+/// The shape `unpack_response` returns: `(status_code, body, headers)`.
+/// Factored out as a `type` alias so call sites that store it (the
+/// spawn_blocking closures' `Result<UnpackedResponse, ...>`) don't
+/// trip clippy's `type_complexity` lint.
+pub(crate) type UnpackedResponse = (u16, ResponseBodyOut, Vec<(String, String)>);
+
 pub(crate) enum ResponseBodyOut {
     Str(String),
     /// Pre-drained text chunks. v1 ships eager-iter only; lazy producers
