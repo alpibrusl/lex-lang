@@ -2513,6 +2513,7 @@ dependencies = [
  "cranelift-jit",
  "cranelift-module",
  "cranelift-native",
+ "criterion",
  "indexmap",
  "lex-bytecode",
  "thiserror 2.0.18",
