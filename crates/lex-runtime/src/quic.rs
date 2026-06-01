@@ -280,20 +280,28 @@ where
     // The Lex VM is synchronous and may itself do blocking I/O
     // (file reads, DB calls), so we never run it on a tokio runtime
     // thread.
-    let resp_result: Result<Value, String> = tokio::task::spawn_blocking(move || {
-        let handler = DefaultHandler::new(policy).with_program(Arc::clone(&program));
-        let mut vm = Vm::with_handler(&program, Box::new(handler));
-        let r = match dispatch_kind {
-            DispatchKind::Named(name) => vm.call(&name, vec![lex_req]),
-            DispatchKind::Closure(c) => vm.invoke_closure_value(c, vec![lex_req]),
-        };
-        r.map_err(|e| format!("{e:?}"))
-    })
-    .await
-    .map_err(|e| format!("h3 vm worker: {e}"))?;
+    // #463 slab-direct wire-up: unpack runs **inside** the
+    // spawn_blocking closure so `vm` is still alive — `unpack_response`
+    // reads arena handles straight out of the slab via
+    // `Vm::get_record_field`, no materialize walk between handler
+    // return and field reads. Mirrors the hyper http1/http2 paths
+    // (see `handler.rs`).
+    let resp_result: Result<handler::UnpackedResponse, String> =
+        tokio::task::spawn_blocking(move || {
+            let handler_h = DefaultHandler::new(policy).with_program(Arc::clone(&program));
+            let mut vm = Vm::with_handler(&program, Box::new(handler_h));
+            let r = match dispatch_kind {
+                DispatchKind::Named(name) => vm.call(&name, vec![lex_req]),
+                DispatchKind::Closure(c) => vm.invoke_closure_value(c, vec![lex_req]),
+            };
+            r.map(|v| handler::unpack_response(&mut vm, &v))
+                .map_err(|e| format!("{e:?}"))
+        })
+        .await
+        .map_err(|e| format!("h3 vm worker: {e}"))?;
 
-    let lex_resp = match resp_result {
-        Ok(v) => v,
+    let (status, body_out, headers) = match resp_result {
+        Ok(t) => t,
         Err(e) => {
             // 500 the request, log the panic — same pattern as TCP.
             eprintln!("net.serve_quic: handler error: {e}");
@@ -301,8 +309,6 @@ where
             return Ok(());
         }
     };
-
-    let (status, body_out, headers) = handler::unpack_response(&lex_resp);
     let mut resp_builder = hyper::http::Response::builder().status(status);
     for (k, v) in &headers {
         resp_builder = resp_builder.header(k, v);

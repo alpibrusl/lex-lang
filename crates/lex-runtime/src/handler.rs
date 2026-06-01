@@ -2322,9 +2322,9 @@ fn serve_http_plain(
                                 .with_program(Arc::clone(&program));
                             let mut vm = Vm::with_handler(&program, Box::new(handler));
                             let r = vm.call(&handler_name, vec![lex_req]);
-                            // Drain any lazy iter in the response body
-                            // while the VM is still in scope — see #477.
-                            Ok(r.map(|mut v| { materialize_response_body(&mut vm, &mut v); v }))
+                            // Unpack inline so the VM is still in
+                            // scope (#463 wire-up).
+                            Ok(r.map(|v| unpack_response(&mut vm, &v)))
                         } else {
                             tokio::task::spawn_blocking(move || {
                                 let lex_req = build_request_value_parts(&parts, &body_bytes);
@@ -2332,12 +2332,12 @@ fn serve_http_plain(
                                     .with_program(Arc::clone(&program));
                                 let mut vm = Vm::with_handler(&program, Box::new(handler));
                                 let r = vm.call(&handler_name, vec![lex_req]);
-                                r.map(|mut v| { materialize_response_body(&mut vm, &mut v); v })
+                                r.map(|v| unpack_response(&mut vm, &v))
                             })
                             .await
                         };
                         Ok::<_, std::convert::Infallible>(match result {
-                            Ok(Ok(resp)) => build_hyper_response(&resp),
+                            Ok(Ok(unpacked)) => build_hyper_response(unpacked),
                             Ok(Err(e)) => error_response(500, &format!("internal error: {e}")),
                             Err(e) => error_response(500, &format!("task panicked: {e}")),
                         })
@@ -2396,11 +2396,13 @@ fn handle_request_tls(
     let handler = DefaultHandler::new(policy).with_program(Arc::clone(&program));
     let mut vm = Vm::with_handler(&program, Box::new(handler));
     match vm.call(&handler_name, vec![lex_req]) {
-        Ok(mut resp) => {
-            // Drain any lazy iter in the response body while the VM is
-            // still in scope — see #477.
-            materialize_response_body(&mut vm, &mut resp);
-            let (status, body, headers) = unpack_response(&resp);
+        Ok(resp) => {
+            // Drain lazy iters + read response fields straight out of
+            // any arena handles while the VM is still in scope — see
+            // #477 and `docs/design/arena-plumbing.md` § "Status
+            // update (2026-06-05)" for why this is a single fused
+            // step now.
+            let (status, body, headers) = unpack_response(&mut vm, &resp);
             respond_with_body_tls(req, status, body, headers);
         }
         Err(e) => {
@@ -2482,9 +2484,10 @@ fn serve_http_fn(
                             // follow-on Value-rep slice.
                             let scope = vm.enter_request_scope();
                             let r = vm.invoke_closure_value(closure, vec![lex_req]);
-                            // Drain any lazy iter in the response body
-                            // while the VM is still in scope — see #477.
-                            let r = r.map(|mut v| { materialize_response_body(&mut vm, &mut v); v });
+                            // Unpack inline so the VM is still in
+                            // scope for both lazy-iter draining and
+                            // slab-direct field reads (#463).
+                            let r = r.map(|v| unpack_response(&mut vm, &v));
                             vm.exit_request_scope(scope);
                             Ok(r)
                         } else {
@@ -2495,14 +2498,14 @@ fn serve_http_fn(
                                 let mut vm = Vm::with_handler(&program, Box::new(handler));
                                 let scope = vm.enter_request_scope();
                                 let r = vm.invoke_closure_value(closure, vec![lex_req]);
-                                let r = r.map(|mut v| { materialize_response_body(&mut vm, &mut v); v });
+                                let r = r.map(|v| unpack_response(&mut vm, &v));
                                 vm.exit_request_scope(scope);
                                 r
                             })
                             .await
                         };
                         Ok::<_, std::convert::Infallible>(match result {
-                            Ok(Ok(resp)) => build_hyper_response(&resp),
+                            Ok(Ok(unpacked)) => build_hyper_response(unpacked),
                             Ok(Err(e)) => error_response(500, &format!("internal error: {e}")),
                             Err(e) => error_response(500, &format!("task panicked: {e}")),
                         })
@@ -2751,9 +2754,9 @@ fn serve_http_routed(
                                 .with_program(Arc::clone(&program));
                             let mut vm = Vm::with_handler(&program, Box::new(handler));
                             let r = vm.invoke_closure_value(closure, vec![lex_req]);
-                            // Drain any lazy iter in the response body
-                            // while the VM is still in scope — see #477.
-                            Ok(r.map(|mut v| { materialize_response_body(&mut vm, &mut v); v }))
+                            // Unpack inline so the VM is still in
+                            // scope (#463 wire-up, see arena-plumbing.md).
+                            Ok(r.map(|v| unpack_response(&mut vm, &v)))
                         } else {
                             tokio::task::spawn_blocking(move || {
                                 let mut lex_req = build_request_value_parts(&parts, &body_bytes);
@@ -2766,12 +2769,12 @@ fn serve_http_routed(
                                     .with_program(Arc::clone(&program));
                                 let mut vm = Vm::with_handler(&program, Box::new(handler));
                                 let r = vm.invoke_closure_value(closure, vec![lex_req]);
-                                r.map(|mut v| { materialize_response_body(&mut vm, &mut v); v })
+                                r.map(|v| unpack_response(&mut vm, &v))
                             })
                             .await
                         };
                         Ok::<_, std::convert::Infallible>(match result {
-                            Ok(Ok(resp)) => build_hyper_response(&resp),
+                            Ok(Ok(unpacked)) => build_hyper_response(unpacked),
                             Ok(Err(e)) => error_response(500, &format!("internal error: {e}")),
                             Err(e) => error_response(500, &format!("task panicked: {e}")),
                         })
@@ -3113,58 +3116,84 @@ fn build_request_value_tiny(req: &mut tiny_http::Request) -> Value {
     Value::record_dynamic(rec)
 }
 
-pub(crate) fn unpack_response(v: &Value) -> (u16, ResponseBodyOut, Vec<(String, String)>) {
-    if let Value::Record { fields: rec, .. } = v {
-        let status = rec.get("status").and_then(|s| match s {
-            Value::Int(n) => Some(*n as u16),
-            _ => None,
-        }).unwrap_or(200);
-        let body = match rec.get("body") {
-            // Tagged ResponseBody (#375): BodyStr | BodyStream | BodyBytes.
-            Some(Value::Variant { name, args }) => match (name.as_str(), args.as_slice()) {
-                ("BodyStr",    [Value::Str(s)])             => ResponseBodyOut::Str(s.to_string()),
-                ("BodyStream", [iter_v])                    => ResponseBodyOut::TextChunks(drain_iter_str(iter_v)),
-                ("BodyBytes",  [iter_v])                    => ResponseBodyOut::BytesChunks(drain_iter_bytes(iter_v)),
-                _ => ResponseBodyOut::Str(String::new()),
-            },
-            // Escape hatch for handlers that don't use the nominal
-            // `Response` alias and just return a structural record with
-            // `body :: Str` (the pre-#375 contract). Lets internal
-            // test handlers and one-liners keep working without
-            // wrapping in `BodyStr(...)`.
-            Some(Value::Str(s)) => ResponseBodyOut::Str(s.to_string()),
-            _ => ResponseBodyOut::Str(String::new()),
-        };
-        let headers: Vec<(String, String)> = if let Some(Value::Map(hmap)) = rec.get("headers") {
-            hmap.iter().filter_map(|(k, v)| {
-                if let (lex_bytecode::MapKey::Str(name), Value::Str(val)) = (k, v) {
-                    Some((name.clone(), val.to_string()))
-                } else {
-                    None
-                }
-            }).collect()
-        } else {
-            vec![]
-        };
-        return (status, body, headers);
+pub(crate) fn unpack_response(vm: &mut Vm, v: &Value) -> UnpackedResponse {
+    // Accept both heap `Record` and arena `ArenaRecord` — the new
+    // slab-direct accessors below read each uniformly without
+    // requiring a tree-wide materialize first. See
+    // `docs/design/arena-plumbing.md` § "Status update (2026-06-05)"
+    // for the wire-up rationale.
+    if !matches!(v, Value::Record { .. } | Value::ArenaRecord { .. }) {
+        return (
+            500,
+            ResponseBodyOut::Str(format!("handler returned non-record: {v:?}")),
+            vec![],
+        );
     }
-    (
-        500,
-        ResponseBodyOut::Str(format!("handler returned non-record: {v:?}")),
-        vec![],
-    )
+
+    let status = vm.get_record_field(v, "status").and_then(|s| match s {
+        Value::Int(n) => Some(n as u16),
+        _ => None,
+    }).unwrap_or(200);
+
+    // Body — read once, drain lazy iters inline so the VM is still
+    // in scope when `materialize_lazy_iter` runs. Replaces the
+    // previously-separate `materialize_response_body` pass.
+    let body = match vm.get_record_field(v, "body") {
+        Some(Value::Variant { name, mut args }) if args.len() == 1 => {
+            let inner = args.pop().unwrap();
+            match (name.as_str(), inner) {
+                // Tagged ResponseBody (#375): BodyStr | BodyStream | BodyBytes.
+                ("BodyStr", Value::Str(s)) => ResponseBodyOut::Str(s.to_string()),
+                ("BodyStream", iter_v) => {
+                    let drained = materialize_lazy_iter(vm, iter_v);
+                    ResponseBodyOut::TextChunks(drain_iter_str(&drained))
+                }
+                ("BodyBytes", iter_v) => {
+                    let drained = materialize_lazy_iter(vm, iter_v);
+                    ResponseBodyOut::BytesChunks(drain_iter_bytes(&drained))
+                }
+                _ => ResponseBodyOut::Str(String::new()),
+            }
+        }
+        // Escape hatch for handlers that don't use the nominal
+        // `Response` alias and just return a structural record with
+        // `body :: Str` (the pre-#375 contract). Lets internal
+        // test handlers and one-liners keep working without
+        // wrapping in `BodyStr(...)`.
+        Some(Value::Str(s)) => ResponseBodyOut::Str(s.to_string()),
+        _ => ResponseBodyOut::Str(String::new()),
+    };
+
+    let headers: Vec<(String, String)> = match vm.get_record_field(v, "headers") {
+        Some(Value::Map(hmap)) => hmap.iter().filter_map(|(k, val)| {
+            if let (lex_bytecode::MapKey::Str(name), Value::Str(s)) = (k, val) {
+                Some((name.clone(), s.to_string()))
+            } else {
+                None
+            }
+        }).collect(),
+        _ => vec![],
+    };
+
+    (status, body, headers)
 }
 
 type HyperRespBody =
     http_body_util::combinators::BoxBody<bytes::Bytes, std::convert::Infallible>;
 
-/// Build a hyper response from the Lex value returned by a handler closure.
-/// Streaming bodies (`BodyStream`, `BodyBytes`) use `ChunkedBody` which has no
-/// known `size_hint`, so hyper emits `Transfer-Encoding: chunked` on the wire.
-/// Plain string bodies use `Full<Bytes>` which carries `Content-Length`.
-fn build_hyper_response(v: &Value) -> hyper::Response<HyperRespBody> {
+/// Build a hyper response from the unpacked handler tuple
+/// `(status, body, headers)`. The `unpack_response` step runs inside
+/// the spawn_blocking closure (where `vm` is still alive) so this
+/// function doesn't need `&Vm` — arena handles, lazy iters, and the
+/// like are already resolved by the time we get here. Streaming
+/// bodies (`BodyStream`, `BodyBytes`) use `ChunkedBody` which has no
+/// known `size_hint`, so hyper emits `Transfer-Encoding: chunked` on
+/// the wire. Plain string bodies use `Full<Bytes>` which carries
+/// `Content-Length`.
+fn build_hyper_response(
+    (status, body, headers): UnpackedResponse,
+) -> hyper::Response<HyperRespBody> {
     use http_body_util::BodyExt as _;
-    let (status, body, headers) = unpack_response(v);
     let boxed_body: HyperRespBody = match body {
         ResponseBodyOut::Str(s) => {
             http_body_util::Full::new(bytes::Bytes::from(s.into_bytes())).boxed()
@@ -3266,6 +3295,13 @@ fn respond_with_body_tls(
 /// different `tiny_http` path: a single `Response::from_string` for
 /// `Str`, and a chunked-encoding `Response::new` with a `Read`-backed
 /// chunk list for the streaming variants.
+///
+/// The shape `unpack_response` returns: `(status_code, body, headers)`.
+/// Factored out as a `type` alias so call sites that store it (the
+/// spawn_blocking closures' `Result<UnpackedResponse, ...>`) don't
+/// trip clippy's `type_complexity` lint.
+pub(crate) type UnpackedResponse = (u16, ResponseBodyOut, Vec<(String, String)>);
+
 pub(crate) enum ResponseBodyOut {
     Str(String),
     /// Pre-drained text chunks. v1 ships eager-iter only; lazy producers
@@ -3401,37 +3437,6 @@ fn materialize_lazy_iter(vm: &mut Vm, v: Value) -> Value {
     }
 }
 
-/// Rewrite any `body: BodyStream(__IterLazy(...))` or
-/// `body: BodyBytes(__IterLazy(...))` on a response record in place,
-/// replacing the lazy iter with an eager-materialised equivalent.
-/// Called before `unpack_response` / `build_hyper_response` so the
-/// existing drain paths can consume the iter.
-fn materialize_response_body(vm: &mut Vm, v: &mut Value) {
-    // #463 slice 2b-i: arena lowering (compiler.rs `apply_arena_lowering`)
-    // can produce a `Value::ArenaRecord` for the returned response. The
-    // arena slab is dropped on `exit_request_scope` (called immediately
-    // after this fn returns), so the handle must be resolved into a
-    // heap-owned `Value::Record` *now* — before the slab truncates and
-    // before the downstream serializer touches the value (`to_json`
-    // panics on arena handles by design).
-    //
-    // Gated on `arena_scope_active` so paths that never entered a
-    // scope (e.g. the tiny-http worker dispatch below) skip the
-    // tree-walk entirely. The helper is idempotent on no-arena trees,
-    // but it still walks them — this guard keeps the no-arena path
-    // zero-cost.
-    if vm.arena_scope_active() {
-        *v = vm.materialize_arena_handles(std::mem::replace(v, Value::Unit));
-    }
-    if let Value::Record { fields: rec, .. } = v {
-        if let Some(Value::Variant { name, args }) = rec.get_mut("body") {
-            if (name == "BodyStream" || name == "BodyBytes") && args.len() == 1 {
-                let inner = std::mem::replace(&mut args[0], Value::Unit);
-                args[0] = materialize_lazy_iter(vm, inner);
-            }
-        }
-    }
-}
 
 /// `Read` adapter that returns one Lex chunk per `read()` call so
 /// `tiny_http`'s chunked transfer-encoding emits each Lex chunk as a
@@ -5113,5 +5118,122 @@ mod kv_registry_tests {
             assert!(r.len() <= cap);
         }
         assert_eq!(r.len(), cap);
+    }
+}
+
+/// #463 slab-direct wire-up — locally-runnable coverage for
+/// `unpack_response`'s arena path. The lex-runtime integration tests
+/// (`tests/std_http.rs` etc.) overflow the dev-container disk per
+/// `arena-plumbing.md`, so CI is the only place they run end-to-end;
+/// these focused tests give us a local regression gate on the
+/// boundary code itself.
+#[cfg(test)]
+mod unpack_response_tests {
+    use super::*;
+    use std::sync::Arc;
+    use indexmap::IndexMap;
+    use lex_bytecode::{Const, Op, Program, Value};
+    use lex_bytecode::program::{Function, ZERO_BODY_HASH};
+    use lex_bytecode::vm::Vm;
+
+    /// Build a single-fn `Program` whose body produces an
+    /// `AllocArenaRecord`-backed `Response { status, body }`. The
+    /// constants table holds the field names, the body variant name,
+    /// the response text, and the status code.
+    fn build_arena_response_program() -> Arc<Program> {
+        let constants = vec![
+            Const::FieldName("status".into()), // 0
+            Const::FieldName("body".into()),   // 1
+            Const::Int(200),                   // 2
+            Const::VariantName("BodyStr".into()), // 3
+            Const::Str("hello".into()),        // 4
+        ];
+        let mut function_names = IndexMap::new();
+        function_names.insert("handler".to_string(), 0);
+        Arc::new(Program {
+            constants,
+            functions: vec![Function {
+                name: "handler".into(),
+                arity: 0,
+                locals_count: 0,
+                code: vec![
+                    Op::PushConst(2),                                       // 200
+                    Op::PushConst(4),                                       // "hello"
+                    Op::MakeVariant { name_idx: 3, arity: 1 },              // BodyStr("hello")
+                    Op::AllocArenaRecord { shape_idx: 0, field_count: 2 },  // { status, body }
+                    Op::Return,
+                ],
+                effects: vec![],
+                body_hash: ZERO_BODY_HASH,
+                refinements: vec![],
+                field_ic_sites: 0,
+            }],
+            function_names,
+            module_aliases: IndexMap::new(),
+            entry: Some(0),
+            record_shapes: vec![vec![0, 1]], // {status, body}
+        })
+    }
+
+    /// The happy path: arena handle goes in, the unpacked tuple comes
+    /// out, no `materialize_arena_handles` walk in between. The
+    /// boundary call site no longer holds a heap `Value::Record` —
+    /// `unpack_response` reads straight out of the slab via
+    /// `Vm::get_record_field`.
+    #[test]
+    fn unpack_response_reads_arena_record_via_slab() {
+        let p = build_arena_response_program();
+        let mut vm = Vm::new(&p);
+        let scope = vm.enter_request_scope();
+
+        let resp = vm.invoke(p.function_names["handler"], vec![]).unwrap();
+        // Test precondition — without this the slab-direct path isn't
+        // being exercised at all.
+        assert!(matches!(resp, Value::ArenaRecord { .. }),
+            "expected ArenaRecord (slab path), got {resp:?}");
+
+        let (status, body, headers) = unpack_response(&mut vm, &resp);
+        vm.exit_request_scope(scope);
+
+        assert_eq!(status, 200);
+        assert!(headers.is_empty());
+        match body {
+            ResponseBodyOut::Str(s) => assert_eq!(s, "hello"),
+            _ => panic!("expected BodyStr"),
+        }
+    }
+
+    /// Heap path uniformity: a handler that returns a plain
+    /// `Value::Record` (no arena scope, or a non-arena-lowered site)
+    /// produces the same tuple. The same `unpack_response` is the
+    /// single chokepoint.
+    #[test]
+    fn unpack_response_reads_heap_record() {
+        let p = build_arena_response_program();
+        let mut vm = Vm::new(&p);
+
+        // No scope — `AllocArenaRecord` falls back to heap `MakeRecord`.
+        let resp = vm.invoke(p.function_names["handler"], vec![]).unwrap();
+        assert!(matches!(resp, Value::Record { .. }),
+            "expected heap Record (fallback path), got {resp:?}");
+
+        let (status, body, headers) = unpack_response(&mut vm, &resp);
+        assert_eq!(status, 200);
+        assert!(headers.is_empty());
+        match body {
+            ResponseBodyOut::Str(s) => assert_eq!(s, "hello"),
+            _ => panic!("expected BodyStr"),
+        }
+    }
+
+    /// Defaults: handler returns a non-record. The error path produces
+    /// a 500 with a diagnostic. Unchanged from pre-wire-up behavior.
+    #[test]
+    fn unpack_response_falls_back_to_500_on_non_record() {
+        let p = build_arena_response_program();
+        let mut vm = Vm::new(&p);
+        let v = Value::Int(7);
+        let (status, _body, _headers) = unpack_response(&mut vm, &v);
+        assert_eq!(status, 500);
     }
 }
