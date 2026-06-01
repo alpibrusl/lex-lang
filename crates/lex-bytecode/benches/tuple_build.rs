@@ -52,8 +52,11 @@ fn drive(n :: Int) -> Int {
 fn compile_with_env(src: &str, no_stack: bool) -> Arc<Program> {
     // SAFETY: bench is single-threaded; the env var is set only during
     // compilation (outside the timed loop) and unset immediately after.
+    // Slice 2b-i: also suppress arena lowering so the disabled arm
+    // is a true "no lowering" baseline.
     if no_stack {
         unsafe { std::env::set_var("LEX_NO_STACK_RECORDS", "1"); }
+        unsafe { std::env::set_var("LEX_NO_ARENA_RECORDS", "1"); }
     }
     let prog = parse_source(src).expect("parse");
     let stages = canonicalize_program(&prog);
@@ -61,6 +64,7 @@ fn compile_with_env(src: &str, no_stack: bool) -> Arc<Program> {
     let p = Arc::new(compile_program(&stages));
     if no_stack {
         unsafe { std::env::remove_var("LEX_NO_STACK_RECORDS"); }
+        unsafe { std::env::remove_var("LEX_NO_ARENA_RECORDS"); }
     }
     p
 }

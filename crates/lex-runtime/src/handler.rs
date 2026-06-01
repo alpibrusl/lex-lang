@@ -3407,6 +3407,22 @@ fn materialize_lazy_iter(vm: &mut Vm, v: Value) -> Value {
 /// Called before `unpack_response` / `build_hyper_response` so the
 /// existing drain paths can consume the iter.
 fn materialize_response_body(vm: &mut Vm, v: &mut Value) {
+    // #463 slice 2b-i: arena lowering (compiler.rs `apply_arena_lowering`)
+    // can produce a `Value::ArenaRecord` for the returned response. The
+    // arena slab is dropped on `exit_request_scope` (called immediately
+    // after this fn returns), so the handle must be resolved into a
+    // heap-owned `Value::Record` *now* — before the slab truncates and
+    // before the downstream serializer touches the value (`to_json`
+    // panics on arena handles by design).
+    //
+    // Gated on `arena_scope_active` so paths that never entered a
+    // scope (e.g. the tiny-http worker dispatch below) skip the
+    // tree-walk entirely. The helper is idempotent on no-arena trees,
+    // but it still walks them — this guard keeps the no-arena path
+    // zero-cost.
+    if vm.arena_scope_active() {
+        *v = vm.materialize_arena_handles(std::mem::replace(v, Value::Unit));
+    }
     if let Value::Record { fields: rec, .. } = v {
         if let Some(Value::Variant { name, args }) = rec.get_mut("body") {
             if (name == "BodyStream" || name == "BodyBytes") && args.len() == 1 {

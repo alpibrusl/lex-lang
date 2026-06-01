@@ -73,12 +73,16 @@ fn compile_with_env(src: &str, no_stack_records: bool) -> Arc<Program> {
         // The `unsafe` is required by Rust 2024's audited env API.
         // The test is single-threaded; we set the flag, compile,
         // unset, return. No concurrent env read window.
+        // Slice 2b-i: also suppress arena lowering so the disabled
+        // arm is a true "no lowering" baseline.
         unsafe { std::env::set_var("LEX_NO_STACK_RECORDS", "1"); }
+        unsafe { std::env::set_var("LEX_NO_ARENA_RECORDS", "1"); }
         let prog = parse_source(src).expect("parse");
         let stages = canonicalize_program(&prog);
         lex_types::check_program(&stages).expect("typecheck");
         let p = Arc::new(compile_program(&stages));
         unsafe { std::env::remove_var("LEX_NO_STACK_RECORDS"); }
+        unsafe { std::env::remove_var("LEX_NO_ARENA_RECORDS"); }
         p
     } else {
         let prog = parse_source(src).expect("parse");

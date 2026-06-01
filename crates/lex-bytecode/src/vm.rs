@@ -1154,6 +1154,15 @@ impl<'a> Vm<'a> {
         self.handler.enter_request_scope()
     }
 
+    /// True iff there is at least one active request scope — i.e. an
+    /// `enter_request_scope` not yet matched by `exit_request_scope`.
+    /// Runtime layers use this to skip `materialize_arena_handles` on
+    /// paths where no scope was entered (e.g. tiny-http worker
+    /// dispatch), keeping the no-arena path zero-cost. Slice 2b-i.
+    pub fn arena_scope_active(&self) -> bool {
+        !self.arena_scope_starts.is_empty()
+    }
+
     /// Close the request scope opened by `enter_request_scope`.
     /// Drops the associated arena.
     pub fn exit_request_scope(&mut self, scope_id: u64) {

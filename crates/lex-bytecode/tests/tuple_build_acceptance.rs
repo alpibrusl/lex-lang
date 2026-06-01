@@ -52,8 +52,12 @@ fn drive(n :: Int) -> Int {
 fn compile_with_env(src: &str, no_stack: bool) -> Arc<Program> {
     // The `unsafe` is required by Rust 2024's audited env API. This
     // test is single-threaded: set the flag, compile, unset.
+    // Slice 2b-i note: the disabled arm now also suppresses arena
+    // lowering, so the A/B is a true "no record/tuple lowering" vs
+    // "all lowering" rather than partially-arena-only.
     if no_stack {
         unsafe { std::env::set_var("LEX_NO_STACK_RECORDS", "1"); }
+        unsafe { std::env::set_var("LEX_NO_ARENA_RECORDS", "1"); }
     }
     let prog = parse_source(src).expect("parse");
     let stages = canonicalize_program(&prog);
@@ -61,6 +65,7 @@ fn compile_with_env(src: &str, no_stack: bool) -> Arc<Program> {
     let p = Arc::new(compile_program(&stages));
     if no_stack {
         unsafe { std::env::remove_var("LEX_NO_STACK_RECORDS"); }
+        unsafe { std::env::remove_var("LEX_NO_ARENA_RECORDS"); }
     }
     p
 }

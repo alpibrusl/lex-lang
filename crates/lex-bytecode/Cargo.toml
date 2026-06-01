@@ -41,3 +41,7 @@ harness = false
 [[bench]]
 name = "tuple_build"
 harness = false
+
+[[bench]]
+name = "alloc_heavy"
+harness = false
