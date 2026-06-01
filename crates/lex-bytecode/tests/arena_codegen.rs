@@ -253,3 +253,65 @@ fn body_hash_unchanged_by_arena_lowering() {
     assert_eq!(on_fn.body_hash, off_fn.body_hash,
         "arena lowering must not perturb body_hash (closure identity #222)");
 }
+
+// ---------------------------------------------------------------
+// Per-path precision refinement (escape.rs `merge` keeps sets)
+// ---------------------------------------------------------------
+
+/// The win the precision pass delivers: a handler whose `match` arms
+/// each build their own response record now arena-lowers **both**
+/// records, where pre-refinement the join-point merge would have
+/// flagged both as escaping and they'd have stayed on the heap.
+/// This is the `response_build`-shape case `arena-plumbing.md`'s
+/// "Status update" measurement called out.
+#[test]
+fn match_arm_records_both_lower_to_arena_under_precision() {
+    let src = r#"
+        fn handler(cond :: Bool) -> { status :: Int, total :: Int } {
+          match cond {
+            true  => { status: 200, total: 42 },
+            false => { status: 400, total: 0 },
+          }
+        }
+    "#;
+    let p = compile(src);
+    let code = fn_code(&p, "handler");
+
+    // Both match-arm MakeRecord sites should land on the arena tier.
+    // Pre-precision they merged to Slot::Other at the return join
+    // and both were flagged escaping, so they stayed on heap.
+    let arena_sites = count(code, |op| matches!(op, Op::AllocArenaRecord { .. }));
+    let heap_sites = count(code, |op| matches!(op, Op::MakeRecord { .. }));
+    assert_eq!(arena_sites, 2,
+        "expected both match arms to lower to AllocArenaRecord, got code: {code:?}");
+    assert_eq!(heap_sites, 0,
+        "no heap MakeRecord should remain after the precision refinement");
+
+    // And the runtime path still works: each call alloc-routes
+    // through the arena, materializes correctly at the boundary.
+    let mut vm = Vm::new(&p);
+    let scope = vm.enter_request_scope();
+    let r_true = vm.invoke(p.function_names["handler"], vec![Value::Bool(true)]).unwrap();
+    let r_true = vm.materialize_arena_handles(r_true);
+    let r_false = vm.invoke(p.function_names["handler"], vec![Value::Bool(false)]).unwrap();
+    let r_false = vm.materialize_arena_handles(r_false);
+    vm.exit_request_scope(scope);
+
+    match r_true {
+        Value::Record { fields, .. } => {
+            assert_eq!(fields.get("status"), Some(&Value::Int(200)));
+            assert_eq!(fields.get("total"), Some(&Value::Int(42)));
+        }
+        other => panic!("expected materialized true-arm Record, got {other:?}"),
+    }
+    match r_false {
+        Value::Record { fields, .. } => {
+            assert_eq!(fields.get("status"), Some(&Value::Int(400)));
+            assert_eq!(fields.get("total"), Some(&Value::Int(0)));
+        }
+        other => panic!("expected materialized false-arm Record, got {other:?}"),
+    }
+    // Two calls, one arena alloc each, no fallbacks.
+    assert_eq!(vm.arena_record_allocs, 2);
+    assert_eq!(vm.arena_record_heap_fallbacks, 0);
+}
