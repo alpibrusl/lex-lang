@@ -204,3 +204,109 @@ handles** and the **worker-thread hatch** in from the start — those
 are the two places Route A genuinely diverges from #464. Repurpose or
 retire the byte-bump `arena.rs`; it backs the toolchain-blocked Route
 B, not the path we can ship.
+
+## Status update (2026-06-02) — slice 2b-i landed; measured
+
+All four planned slices are now on `main` (#579 analysis, #588 ops +
+slab, #589 boundary helper, #590 codegen lowering + runtime
+wire-up). Callgrind measurement on the two workloads we care about:
+
+### `alloc_heavy` (simple single-record-return handler)
+
+`examples/profile_alloc_heavy.rs` — `drive(1000)` × 5 iters. The
+handler is `fn handle(i) -> Response { {status: 200, total: i*2,
+count: i+1} }`. Single allocation site per call, no `match` in the
+return position, so the slice-1 analysis classifies it as arena-
+eligible and `apply_arena_lowering` rewrites it to
+`AllocArenaRecord`.
+
+| | I-refs | Δ |
+|---|---|---|
+| arena off (LEX_NO_ARENA_RECORDS=1 or no scope) | 40,078,370 | — |
+| arena on (scope wraps `vm.call("drive")`) | 25,656,712 | **−36.0%** |
+
+Where the savings land:
+
+|  | off | on | Δ |
+|---|---|---|---|
+| `_int_malloc` | 2.92M (7.28%) | 0.82M (3.19%) | **−71.9%** |
+| `_int_free` | 2.05M (5.10%) | 0.71M (2.75%) | **−65.5%** |
+| `malloc` | 1.43M (3.58%) | 0.49M (1.92%) | **−65.7%** |
+| `free` | 0.89M (2.22%) | 0.30M (1.18%) | **−65.9%** |
+| `IndexMap::insert_full` | 1.58M (3.93%) | 0 | **gone** |
+| `Vec::resize` | 0.71M (1.77%) | 1.18M (4.58%) | slab growth |
+| `Vm::run_to` | 13.57M | 12.08M | −11.0% |
+
+The per-record `Box<IndexMap>` malloc/free pair vanishes — replaced
+by bulk slab writes (`Vec::resize`) and bulk truncation on
+`exit_request_scope`. This is the alloc-churn lever the #461 profile
+identified at ~15% of total I-refs on a record-heavy workload.
+
+### `response_build` (the original `#461`-profile workload)
+
+`examples/profile_response_build.rs`. The handler returns a
+`Response` built inside a two-arm `match`:
+
+```lex
+match v6.s > 0 {
+  true  => { status: 200, total: v6.s + v6.t + v6.u },
+  false => { status: 400, total: 0 },
+}
+```
+
+| | I-refs |
+|---|---|
+| arena off | 11,005,530 |
+| arena on  | 11,009,096 |
+
+**Indistinguishable (Δ < 0.1%).** The arena pass **fires zero times**
+on this workload — `[diag] handle() record sites: arena=0, stack=6,
+heap=2`. The 6 intermediates (v1..v6) hit the cheaper #464 stack
+tier; the two `match`-arm `MakeRecord` sites are flagged as escaping
+by slice-1's lattice because the join point merges `Slot::Rec(p)`
+and `Slot::Rec(q)` to `Slot::Other` (both sites then recorded as
+escapes).
+
+This is the **"if/else merge" conservative case** already explicitly
+documented in `escape-analysis.md` § "Status quo lattice precision"
+(carries over verbatim under the request-scope policy):
+
+> "Records produced in alternate `if/else` branches and merged
+> before `Return` — both escape at the join. (Conservative; a
+> per-path refinement could recover this but is out of scope.)"
+
+So the analysis is doing exactly what its spec says, and the
+workload's shape (which is representative — handlers commonly
+return one of several response shapes via match) is precisely the
+case it conservatively rejects.
+
+### What this means for next work
+
+The honest read across both measurements:
+
+1. **The arena machinery works** and delivers a clean ~36% I-ref
+   reduction on the workload shape it covers.
+2. **The slice-1 analysis is the next lever.** A per-path refinement
+   that tracks `Slot::Rec(pc)` separately along each branch (instead
+   of merging to `Other` at joins) would let `response_build`'s
+   two-arm `match` classify both branches as arena-eligible, since
+   neither leaks under the request-scope policy. This is a pure
+   analysis change — the codegen and runtime already handle two
+   independent `AllocArenaRecord` sites in a function (slice 2b-i
+   tests cover the per-site classification).
+3. **The "deep-leaf" widening** (children whose only hatch is the
+   outer's `MakeRecord`) is a sibling case, also pure analysis.
+   Both would land via a single slice that adds two precision
+   refinements to `arena::analyze_function_with_policy`.
+
+Neither refinement requires any change to the runtime, codegen, or
+serialization paths landed in slices 2a–2b. The work is contained.
+
+Out of immediate scope: the materialize-at-boundary step (slice 2a-iii)
+does pay a non-trivial walk + alloc, and shows up as ~9% of the on-
+arm in `drop_in_place` and ~4.6% in `Vec::resize`. A future
+**slab-direct serializer** (walk arena handles → JSON bytes without
+ever materializing into `Value::Record`) would recover that cost on
+the HTTP-serving path. Not on the critical path until the analysis
+refinements above land and the response-build shape sees the arena
+fire.
