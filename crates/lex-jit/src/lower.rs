@@ -105,10 +105,13 @@ impl JitContext {
         self.next_id += 1;
         let id = self
             .module
-            .declare_function(&name, Linkage::Export, &self.ctx.func.signature)?;
-        self.module.define_function(id, &mut self.ctx)?;
+            .declare_function(&name, Linkage::Export, &self.ctx.func.signature)
+            .map_err(Box::new)?;
+        self.module
+            .define_function(id, &mut self.ctx)
+            .map_err(Box::new)?;
         self.module.clear_context(&mut self.ctx);
-        self.module.finalize_definitions()?;
+        self.module.finalize_definitions().map_err(Box::new)?;
 
         let code_ptr = self.module.get_finalized_function(id);
         Ok(JittedFn {
@@ -346,7 +349,7 @@ impl<'a> Lowering<'a> {
         let mut locals: Vec<Variable> = Vec::with_capacity(f.locals_count as usize);
         for i in 0..f.locals_count {
             let var = builder.declare_var(types::I64);
-            if (i as u16) < f.arity {
+            if i < f.arity {
                 builder.def_var(var, arg_values[i as usize]);
             } else {
                 let zero = builder.ins().iconst(types::I64, 0);
@@ -392,12 +395,7 @@ impl<'a> Lowering<'a> {
                     self.builder.ins().jump(block, args.iter());
                 }
                 self.builder.switch_to_block(block);
-                self.stack = self
-                    .builder
-                    .block_params(block)
-                    .iter()
-                    .copied()
-                    .collect();
+                self.stack = self.builder.block_params(block).to_vec();
                 self.terminated = false;
             } else if self.terminated {
                 // Unreachable code between blocks. Skip until the

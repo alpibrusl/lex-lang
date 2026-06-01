@@ -71,9 +71,12 @@ pub enum JitError {
     HeightMismatch { pc: usize, existing: u32, seen: u32 },
     #[error("function has no Return on a reachable path")]
     NoReturn,
+    /// Boxed because `cranelift_module::ModuleError` is ~136 bytes,
+    /// which would make every `Result<_, JitError>` carry a fat
+    /// payload across the JIT boundary (clippy::result_large_err).
     #[cfg(feature = "cranelift")]
     #[error("cranelift module error: {0}")]
-    Module(#[from] cranelift_module::ModuleError),
+    Module(#[from] Box<cranelift_module::ModuleError>),
     /// Catch-all for backend errors and feature-gating messages.
     #[error("backend error: {0}")]
     Backend(String),
@@ -147,6 +150,13 @@ mod stub {
     }
     pub struct JittedFn;
     impl JittedFn {
+        /// Mirror of the cranelift-feature `JittedFn::call` surface.
+        ///
+        /// # Safety
+        ///
+        /// Unconstructible without the `cranelift` feature — the
+        /// surface exists only so callers can name the type. Any
+        /// invocation panics via `unreachable!`.
         pub unsafe fn call(&self, _args: &[i64]) -> i64 {
             unreachable!("no JittedFn can be constructed without the `cranelift` feature")
         }
