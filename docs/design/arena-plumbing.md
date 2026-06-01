@@ -497,3 +497,91 @@ When that wire-up lands, the win on a real `/plaintext`-style HTTP
 benchmark — one fewer `IndexMap` allocation per request, scaled by
 request rate — becomes measurable. Estimated saving: small per
 request but cumulative on a hot path.
+
+## Status update (2026-06-06) — runtime wire-up landed
+
+The recommended Option 1 from the 2026-06-05 entry is now on `main`.
+The full slab-direct serializer path is live across all five
+handler dispatch sites in `crates/lex-runtime/src/handler.rs`:
+
+- **`unpack_response`** rewritten to `fn unpack_response(vm: &mut
+  Vm, v: &Value) -> (u16, ResponseBodyOut, Vec<(String, String)>)`.
+  Reads `status` / `body` / `headers` via `Vm::get_record_field` —
+  uniform over `Value::Record` (heap) and `Value::ArenaRecord`
+  (slab). The body's lazy-iter drain (previously a separate
+  `materialize_response_body` step) is merged inline: when the body
+  is `BodyStream` / `BodyBytes`, the iter arg is materialized while
+  `vm` is still in scope.
+- **`build_hyper_response`** takes the unpacked tuple directly: `fn
+  build_hyper_response((status, body, headers): (u16,
+  ResponseBodyOut, Vec<(String, String)>)) -> ...`. No `Vm` needed
+  at this layer.
+- **Five call sites updated** to the new pattern: closure returns
+  `Result<(u16, ResponseBodyOut, Vec<_>), VmError>` instead of
+  `Result<Value, VmError>`; outer `match` calls
+  `build_hyper_response(unpacked)`. The tiny-http path
+  (`respond_with_body_tls`) gains the same treatment.
+- **`materialize_response_body` deleted.** Dead code under the new
+  flow.
+
+### What this changes per request on the common `BodyStr` path
+
+Before:
+1. Handler runs, returns `Value::ArenaRecord` (or `Value::Record`).
+2. `materialize_response_body` walks the tree, allocating a heap
+   `Value::Record` mirror with `Box<IndexMap>` + per-field clones.
+3. Closure returns the materialized `Value`; vm dropped.
+4. `build_hyper_response` calls `unpack_response`, which pattern-
+   matches on `Value::Record` and reads the three top-level fields.
+
+After:
+1. Handler runs, returns `Value::ArenaRecord` (or `Value::Record`).
+2. `unpack_response` reads the three top-level fields via
+   `Vm::get_record_field` (one O(field_count) shape walk for arena,
+   one `IndexMap::get` for heap). No materialize walk.
+3. Closure returns the unpacked tuple; vm dropped.
+4. `build_hyper_response` consumes the tuple.
+
+Net: **one fewer `Box<IndexMap>` allocation per HTTP request** on
+the common path, plus the saved per-field clones and the drop. On
+the `BodyStream` / `BodyBytes` path the iter materialization step
+still runs (unchanged), but the surrounding response materialize is
+gone there too.
+
+### Coverage
+
+`handler::unpack_response_tests` (new, locally-runnable):
+- `unpack_response_reads_arena_record_via_slab` — the slab-direct
+  happy path: hand-crafted `AllocArenaRecord` handler, scope active,
+  asserts the unpacked tuple comes back correctly without
+  `materialize_arena_handles` having run.
+- `unpack_response_reads_heap_record` — same handler, no scope; the
+  alloc op falls back to heap and the same `unpack_response` reads
+  it uniformly.
+- `unpack_response_falls_back_to_500_on_non_record` — error path
+  preserved.
+
+`cargo test -p lex-runtime --lib`: 52 passing (49 existing + 3
+new). Workspace-wide integration tests (`tests/std_http.rs`,
+`analytics_app.rs`, `arena_lifecycle.rs`, …) overflow the dev
+container disk per this repo's constraint, so CI is the gate for
+end-to-end HTTP coverage — handler-level call sites + the focused
+unit tests above carry the local-runnable load.
+
+### What's still open
+
+The arena work has now reached the point where most analysis
+refinements have been spent (per-path precision, deep-leaf
+containment, slab-direct boundary). The remaining levers all live
+elsewhere:
+
+- **Threaded dispatch (#461 slice C)** — still the largest single
+  remaining lever per the original profile, still blocked on the
+  pinned stable toolchain.
+- **Inter-procedural escape** — would let the analysis recover the
+  `format_response(r: Response) -> Str` and similar helper-shape
+  patterns that today are pessimistically flagged at the `Call`
+  hatch. Out of scope until inlining lands (#465 phase 1).
+- **Real-workload measurement** — re-profile a representative
+  `bench/floor.lex /plaintext` and `/json` run on `main` to confirm
+  the wire-up's per-request saving shows up.
