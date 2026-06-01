@@ -266,13 +266,15 @@ mod tests {
     }
 
     /// Inner record stored as a field of outer; outer returned.
-    /// Inner escapes (consumed by the outer aggregate's heap
-    /// constructor — slice-1 doesn't yet model "outer is also
-    /// arena → inner can live with it"; that's a slice-2 codegen
-    /// question). Outer is arena-eligible — its only consumer is
-    /// `Return`, which doesn't escape under request scope.
+    /// **Deep-leaf widening** (#463 follow-up): the analysis now
+    /// tracks `inner` as contained in `outer` rather than leaking
+    /// it at the build site. Under `Policy::RequestScope` `Return`
+    /// doesn't escape `outer`, and the transitive expansion never
+    /// touches `inner` — so **both** sites are arena-eligible. The
+    /// pre-refinement answer was `[(1, false), (3, true)]`; the
+    /// recovery is the deep-tree response shape's whole point.
     #[test]
-    fn outer_returned_aggregate_is_arena_eligible_inner_field_is_not() {
+    fn outer_returned_aggregate_makes_inner_field_arena_eligible_too() {
         let f = func("nest", 0, 0, vec![
             Op::PushConst(0),
             Op::MakeRecord { shape_idx: 0, field_count: 1 }, // inner @ pc=1
@@ -281,7 +283,7 @@ mod tests {
             Op::Return,
         ]);
         let r = analyze_function(&f);
-        assert_eligible(&r, &[(1, false), (3, true)]);
+        assert_eligible(&r, &[(1, true), (3, true)]);
     }
 
     /// Two sites in one function, independently classified: one

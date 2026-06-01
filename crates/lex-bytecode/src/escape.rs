@@ -312,6 +312,14 @@ pub fn analyze_function_with_policy(func: &Function, policy: Policy) -> EscapeRe
     // Per-pc in-states, computed by the fixpoint. None = unvisited.
     let mut in_state: Vec<Option<State>> = vec![None; n];
     let mut escaped: HashSet<u32> = HashSet::new();
+    // Containment map for deep-leaf widening: at each tracked-
+    // aggregate build site (MakeRecord / MakeTuple / AllocStack* /
+    // AllocArena*), the set of child sites whose values were popped
+    // as fields/elements. Used to transitively escape children when
+    // a parent escapes, instead of pessimistically leaking children
+    // at the build site. Accumulates monotonically across worklist
+    // iterations — sites can only be added.
+    let mut containment: HashMap<u32, HashSet<u32>> = HashMap::new();
 
     let mut worklist: Vec<(usize, State)> = vec![(0, State::entry(locals_count, arity))];
 
@@ -334,11 +342,28 @@ pub fn analyze_function_with_policy(func: &Function, policy: Policy) -> EscapeRe
         in_state[pc] = Some(merged.clone());
 
         // Step the op, get the out-state + any successors.
-        let (out, succs, leaked) = step(pc, &func.code[pc], merged, policy);
+        let (out, succs, leaked) = step(pc, &func.code[pc], merged, policy, &mut containment);
         escaped.extend(leaked);
         for s in succs {
             if s < n {
                 worklist.push((s, out.clone()));
+            }
+        }
+    }
+
+    // Deep-leaf widening: every escaped parent transitively escapes
+    // all sites the containment map records as living inside it. Run
+    // to fixpoint over the accumulated containment so chains
+    // (`a` in `b` in `c`, c escapes → b, a) propagate correctly.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let snapshot: Vec<u32> = escaped.iter().copied().collect();
+        for p in snapshot {
+            if let Some(contained) = containment.get(&p) {
+                for &c in contained {
+                    if escaped.insert(c) { changed = true; }
+                }
             }
         }
     }
@@ -361,8 +386,37 @@ pub fn analyze_function_with_policy(func: &Function, policy: Policy) -> EscapeRe
 /// returned state, except for control-flow ops where successors
 /// share the *same* state), and any sites that escaped during the
 /// step.
-fn step(pc: usize, op: &Op, mut s: State, policy: Policy) -> (State, Vec<usize>, HashSet<u32>) {
+fn step(
+    pc: usize,
+    op: &Op,
+    mut s: State,
+    policy: Policy,
+    containment: &mut HashMap<u32, HashSet<u32>>,
+) -> (State, Vec<usize>, HashSet<u32>) {
     let mut escapes: HashSet<u32> = HashSet::new();
+
+    // Deep-leaf widening helper: pop `n` slots, but instead of
+    // leaking their sites immediately (as `pop_n_leak` does for
+    // genuine escape ops), record them as contained in the parent
+    // pc. The parent's later fate determines whether the children
+    // escape — transitive expansion at fixpoint exit propagates.
+    let pop_n_contain = |state: &mut State,
+                         n: usize,
+                         parent: u32,
+                         containment: &mut HashMap<u32, HashSet<u32>>| {
+        let entry = containment.entry(parent).or_default();
+        for _ in 0..n {
+            if let Some(top) = state.stack.pop() {
+                for &child in top.sites() {
+                    // Skip self-reference defensively (a parent
+                    // shouldn't appear in its own field operands;
+                    // if it ever does, a self-loop in containment
+                    // would still be sound but pointless).
+                    if child != parent { entry.insert(child); }
+                }
+            }
+        }
+    };
 
     // Helper closures for the common pop-n / push patterns. `leak`
     // iterates `slot.sites()` so multi-site slots (`AggSet`) leak
@@ -420,50 +474,43 @@ fn step(pc: usize, op: &Op, mut s: State, policy: Policy) -> (State, Vec<usize>,
             }
         }
 
-        // Allocation site.
+        // Allocation site. Deep-leaf widening (#463 follow-up):
+        // record child sites as **contained in** this parent
+        // instead of leaking them at the build site. The parent's
+        // eventual fate (escape via Call/etc., or stay local)
+        // decides what happens to the children — caught at the
+        // post-fixpoint transitive-expansion pass.
         Op::MakeRecord { field_count, .. } => {
-            // Field values get stored in the new heap record; if
-            // any of them is itself a tracked Rec, it escapes (now
-            // referenced from inside the parent).
-            pop_n_leak(&mut s, *field_count as usize, &mut escapes);
+            pop_n_contain(&mut s, *field_count as usize, pc as u32, containment);
             s.stack.push(Slot::Agg(pc as u32));
         }
-        // #464 step 2: post-lowering form of MakeRecord (escape
-        // proved). Re-running the analysis on already-lowered code
-        // must produce the same shape, so treat it identically.
+        // #464 step 2: post-lowering form of MakeRecord. Same deep-
+        // leaf containment story so re-running the analysis on
+        // already-lowered code produces the same shape.
         Op::AllocStackRecord { field_count, .. } => {
-            pop_n_leak(&mut s, *field_count as usize, &mut escapes);
+            pop_n_contain(&mut s, *field_count as usize, pc as u32, containment);
             s.stack.push(Slot::Agg(pc as u32));
         }
         // #463 slice 2a: post-lowering form of MakeRecord for the
-        // arena path. Re-running either policy on already-lowered code
-        // must classify it identically to the original MakeRecord, so
-        // the abstract step is the same.
+        // arena path. Same containment treatment.
         Op::AllocArenaRecord { field_count, .. } => {
-            pop_n_leak(&mut s, *field_count as usize, &mut escapes);
+            pop_n_contain(&mut s, *field_count as usize, pc as u32, containment);
             s.stack.push(Slot::Agg(pc as u32));
         }
-        // A tuple is a stack-allocatable aggregate, tracked the same
-        // way as a record: its field operands leak (any tracked
-        // aggregate stored inside it escapes), and the tuple itself
-        // becomes a tracked candidate keyed on this pc. `GetElem`
-        // reads an element without escaping the tuple, exactly as
-        // `GetField` does for records.
+        // Tuple build sites: identical deep-leaf treatment to
+        // records. `GetElem` reads an element without escaping the
+        // tuple, exactly as `GetField` does for records.
         Op::MakeTuple(n) => {
-            pop_n_leak(&mut s, *n as usize, &mut escapes);
+            pop_n_contain(&mut s, *n as usize, pc as u32, containment);
             s.stack.push(Slot::Agg(pc as u32));
         }
-        // Post-lowering form of MakeTuple (escape proved). Re-running
-        // the analysis on already-lowered code must classify it the
-        // same way, so treat it identically — mirrors AllocStackRecord.
+        // Post-lowering form of MakeTuple — same containment.
         Op::AllocStackTuple { arity } => {
-            pop_n_leak(&mut s, *arity as usize, &mut escapes);
+            pop_n_contain(&mut s, *arity as usize, pc as u32, containment);
             s.stack.push(Slot::Agg(pc as u32));
         }
-        // #463 slice 2a: arena-routed analogue of MakeTuple — same
-        // abstract step as the heap and stack tuple variants.
         Op::AllocArenaTuple { arity } => {
-            pop_n_leak(&mut s, *arity as usize, &mut escapes);
+            pop_n_contain(&mut s, *arity as usize, pc as u32, containment);
             s.stack.push(Slot::Agg(pc as u32));
         }
         // Lists and variants remain escape sinks for any tracked
@@ -862,6 +909,81 @@ mod tests {
         assert_escapes(&r, &[(3, true), (6, true)]);
     }
 
+    // ---- Deep-leaf widening (containment-tracking) ----
+
+    /// Inner record returned inside outer record — both arena-
+    /// eligible under request-scope. Pre-deep-leaf, `inner` was
+    /// leaked at the outer's `MakeRecord`; the transitive
+    /// expansion now leaves it alone because the outer doesn't
+    /// escape under `Policy::RequestScope`.
+    #[test]
+    fn deep_leaf_nested_records_both_arena_eligible() {
+        let f = func("nested_ret", 0, 0, vec![
+            Op::PushConst(0),
+            Op::MakeRecord { shape_idx: 0, field_count: 1 }, // inner @ pc=1
+            Op::PushConst(1),
+            Op::MakeRecord { shape_idx: 1, field_count: 2 }, // outer @ pc=3, holds inner
+            Op::Return,
+        ]);
+        let r = analyze_function_with_policy(&f, Policy::RequestScope);
+        assert_escapes(&r, &[(1, false), (3, false)]);
+    }
+
+    /// 3-deep nesting: inner → middle → outer → Return. Under
+    /// `RequestScope` all three are arena-eligible — transitive
+    /// expansion in `analyze_function_with_policy` chains through
+    /// the containment map.
+    #[test]
+    fn deep_leaf_three_deep_chain_all_arena_eligible() {
+        let f = func("three_deep", 0, 0, vec![
+            Op::PushConst(0),
+            Op::MakeRecord { shape_idx: 0, field_count: 1 }, // inner @ pc=1
+            Op::MakeRecord { shape_idx: 0, field_count: 1 }, // middle @ pc=2
+            Op::MakeRecord { shape_idx: 0, field_count: 1 }, // outer @ pc=3
+            Op::Return,
+        ]);
+        let r = analyze_function_with_policy(&f, Policy::RequestScope);
+        assert_escapes(&r, &[(1, false), (2, false), (3, false)]);
+    }
+
+    /// Soundness guard: when the outer reaches a real hatch
+    /// (`Call`), all contained children escape transitively. Same
+    /// chain shape as above but with the outer leaving via Call.
+    #[test]
+    fn deep_leaf_chain_all_escape_when_root_passed_to_call() {
+        let f = func("three_deep_call", 0, 0, vec![
+            Op::PushConst(0),
+            Op::MakeRecord { shape_idx: 0, field_count: 1 }, // inner @ pc=1
+            Op::MakeRecord { shape_idx: 0, field_count: 1 }, // middle @ pc=2
+            Op::MakeRecord { shape_idx: 0, field_count: 1 }, // outer @ pc=3
+            Op::Call { fn_id: 1, arity: 1, node_id_idx: 0 }, // pc=4
+            Op::Return,
+        ]);
+        let r = analyze_function_with_policy(&f, Policy::RequestScope);
+        // outer escapes via Call → middle escapes via containment →
+        // inner escapes via containment. All three flagged.
+        assert_escapes(&r, &[(1, true), (2, true), (3, true)]);
+    }
+
+    /// Mixed: outer dropped, inner contained. Under FrameScope the
+    /// outer is dropped and never returned, so the transitive
+    /// expansion leaves inner alone too — even under FrameScope
+    /// this is a precision win over the pre-refinement behavior
+    /// that leaked inner at the outer's build site.
+    #[test]
+    fn deep_leaf_outer_popped_inner_stays_local_under_frame_scope() {
+        let f = func("nested_pop", 0, 0, vec![
+            Op::PushConst(0),
+            Op::MakeRecord { shape_idx: 0, field_count: 1 }, // inner @ pc=1
+            Op::MakeRecord { shape_idx: 0, field_count: 1 }, // outer @ pc=2
+            Op::Pop,
+            Op::PushConst(0),
+            Op::Return,
+        ]);
+        let r = analyze_function(&f); // FrameScope
+        assert_escapes(&r, &[(1, false), (2, false)]);
+    }
+
     #[test]
     fn two_sites_classified_independently() {
         // One record returned, one popped — they should classify
@@ -1034,9 +1156,16 @@ mod tests {
     }
 
     #[test]
-    fn record_stored_into_tuple_escapes_tuple_stays_local() {
-        // Build a record, wrap it in a tuple, drop the tuple. The
-        // record escapes into the tuple; the tuple itself is local.
+    fn record_stored_into_tuple_dropped_outer_neither_escapes() {
+        // Build a record, wrap it in a tuple, drop the tuple.
+        // Pre-deep-leaf this asserted `[(1, true), (2, false)]` —
+        // the record was leaked at the tuple's build site because
+        // we conservatively assumed any captured value escaped.
+        // With containment-tracking, the record's fate is bound to
+        // the tuple's: the tuple is dropped (no escape), so via
+        // transitive expansion the record doesn't escape either.
+        // The win is real — both can live in the frame's stack-
+        // record arena now.
         let f = func("rec_in_tup", 0, 0, vec![
             Op::PushConst(0),
             Op::MakeRecord { shape_idx: 0, field_count: 1 }, // rec @ pc=1
@@ -1046,7 +1175,7 @@ mod tests {
             Op::Return,
         ]);
         let r = analyze_function(&f);
-        assert_escapes(&r, &[(1, true), (2, false)]);
+        assert_escapes(&r, &[(1, false), (2, false)]);
     }
 
     #[test]
