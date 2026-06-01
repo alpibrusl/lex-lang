@@ -585,3 +585,70 @@ elsewhere:
 - **Real-workload measurement** — re-profile a representative
   `bench/floor.lex /plaintext` and `/json` run on `main` to confirm
   the wire-up's per-request saving shows up.
+
+## Status update (2026-06-07) — wire-up measured
+
+`examples/profile_unpack_response.rs` (new) compares the
+**per-request boundary cost** of the pre-wire-up and post-wire-up
+patterns on a typical `Response { status, body, total }` handler.
+Both arms hold an active request scope so the response is a
+`Value::ArenaRecord` (the case the wire-up actually changes — the
+arena-off baseline degenerates to a heap `Value::Record` and both
+arms collapse to `IndexMap::get` lookups).
+
+10,000-iteration callgrind run:
+
+| | I-refs | Δ |
+|---|---|---|
+| materialize path (pre-#595) | 46,453,233 | — |
+| slab-direct (post-#595) | **18,931,066** | **−59.2%** |
+
+Where the savings land:
+
+| | materialize | slab-direct | Δ abs |
+|---|---|---|---|
+| `materialize_arena_handles` | 3,460,000 (7.45%) | 0 | **−100%** |
+| `IndexMap::insert_full` | 3,133,707 (6.75%) | 13,707 (0.07%) | **−99.6%** |
+| `_int_malloc` (combined w/ malloc) | 1,370,441 (2.95%) | 20,483 (0.11%) | **−98.5%** |
+| `_int_free` (combined w/ free) | 1,648,466 (3.55%) | 28,520 (0.15%) | **−98.3%** |
+| NEW: `Vm::get_record_field` | — | 2,940,000 (15.53%) | (replaces the above) |
+| `Vm::run_to` | 6,270,000 (13.50%) | 6,270,000 (33.12%) | unchanged abs |
+
+**Per-request saving: ~2,752 I-refs.** The materialize walk and its
+`Box<IndexMap>` allocation + insertion + drop are fully replaced by
+three `Vm::get_record_field` reads that walk the shape's
+field-name vec (typically ≤ 10 entries) and index the slab. The
+total I-ref budget for the response boundary drops from ~4.6K per
+request to ~1.9K per request.
+
+For a `/plaintext`-style workload at 1M requests/sec, the wire-up
+sheds ~2.75 billion I-refs/sec from the response-boundary path
+alone. Caveat: this is a *boundary-isolated* harness — real HTTP
+serving adds hyper / TLS / accept-loop costs that aren't measured
+here. The headline ratio is upper-bound on what's recoverable from
+the materialize step specifically.
+
+### Final headline summary
+
+| Lever | Workload | Win |
+|---|---|---|
+| Arena lowering (slice 2b-i) | `alloc_heavy` (flat return) | −36.0% |
+| Per-path precision | `response_build` (match-arm) | −10.7% |
+| Deep-leaf containment | `deep_tree` (3-deep nested) | −55.0% |
+| Slab-direct wire-up | `unpack_response` boundary | **−59.2%** |
+
+### What's still on the JIT-prereq board
+
+The arena work is at a natural stopping point — the analysis is
+intra-procedurally precise, the runtime path skips materialize, and
+all measured workloads see clean wins. The two remaining levers
+both need decisions outside this work:
+
+- **Threaded dispatch (#461 slice C)** — still the largest single
+  remaining lever per the original 2026-05-21 profile (`Vm::run_to`
+  at ~48% of I-refs there; ~33% on the slab-direct path above).
+  Still blocked on the pinned stable toolchain.
+- **Inter-procedural escape** — would let the analysis recover
+  helper-shape patterns (`format_response(r: Response) -> Str`)
+  that today are flagged at the `Call` hatch. Out of scope until
+  inlining lands (#465 phase 1).
