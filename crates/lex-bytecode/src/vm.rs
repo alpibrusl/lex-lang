@@ -1284,6 +1284,157 @@ impl<'a> Vm<'a> {
         }
     }
 
+    /// Read a named field out of a record without materializing its
+    /// parent. Works uniformly on `Value::Record` (heap) and
+    /// `Value::ArenaRecord` (slab handle), so a runtime layer can
+    /// consume the response record structurally — straight out of
+    /// the arena slab — instead of paying for a tree-wide
+    /// `materialize_arena_handles` walk just to read three top-level
+    /// fields.
+    ///
+    /// Returns `None` if the value isn't a record or the field
+    /// doesn't exist. The returned `Value` is a clone of the slot
+    /// contents (records' field values can themselves be records,
+    /// variants, etc.; cloning at the boundary is unavoidable
+    /// without lifetime trickery on the public API).
+    ///
+    /// Performance: on the heap path it's a `IndexMap::get` + clone.
+    /// On the arena path it's a linear walk of the shape's
+    /// field-name vec (`field_count` long, typically ≤ 10) +
+    /// an O(1) slab index + clone. The polymorphic-IC equivalent
+    /// inside the VM is faster, but this API is for **host**
+    /// consumers, not hot-loop dispatch.
+    ///
+    /// `Value::StackRecord` is deliberately not handled — those
+    /// handles are frame-local by construction (#464 escape pass)
+    /// and shouldn't reach host boundaries; reaching them here is
+    /// a soundness bug surfaced as a panic, matching the existing
+    /// inspection-path contract.
+    pub fn get_record_field(&self, value: &Value, name: &str) -> Option<Value> {
+        match value {
+            Value::Record { fields, .. } => fields.get(name).cloned(),
+            Value::ArenaRecord { shape_id, slab_start, field_count } => {
+                let shape = self.program.record_shapes.get(*shape_id as usize)?;
+                let n = (*field_count as usize).min(shape.len());
+                for (i, &name_const_idx) in shape.iter().take(n).enumerate() {
+                    if let Const::FieldName(s) = &self.program.constants[name_const_idx as usize] {
+                        if s == name {
+                            return Some(self.arena_slab[*slab_start as usize + i].clone());
+                        }
+                    }
+                }
+                None
+            }
+            Value::StackRecord { .. } =>
+                panic!("BUG(#464): Value::StackRecord reached Vm::get_record_field \
+                        — frame-local handles should never reach the host boundary"),
+            _ => None,
+        }
+    }
+
+    /// Positional read out of a tuple without materializing its
+    /// parent. Works uniformly on `Value::Tuple` and
+    /// `Value::ArenaTuple`. See `get_record_field` for the lifetime
+    /// rationale.
+    pub fn get_tuple_elem(&self, value: &Value, idx: u16) -> Option<Value> {
+        match value {
+            Value::Tuple(items) => items.get(idx as usize).cloned(),
+            Value::ArenaTuple { slab_start, arity } => {
+                if idx >= *arity { return None; }
+                Some(self.arena_slab[*slab_start as usize + idx as usize].clone())
+            }
+            Value::StackTuple { .. } =>
+                panic!("BUG(#464): Value::StackTuple reached Vm::get_tuple_elem \
+                        — frame-local handles should never reach the host boundary"),
+            _ => None,
+        }
+    }
+
+    /// Arena-aware `to_json` — produces a `serde_json::Value` from
+    /// a `Value` whose tree may contain `ArenaRecord` / `ArenaTuple`
+    /// handles, reading them straight out of `Vm::arena_slab`
+    /// instead of materializing into a heap `Value::Record` mirror
+    /// first.
+    ///
+    /// Equivalent output to `value.to_json()` on a fully-materialized
+    /// tree (idempotent in that sense). Use this when serializing a
+    /// handler return value to JSON for the response — saves the
+    /// per-node IndexMap allocations the materialize-then-to_json
+    /// pattern pays.
+    pub fn value_to_json(&self, value: &Value) -> serde_json::Value {
+        use serde_json::Value as J;
+        match value {
+            // Primitives + opaque host handles: delegate to the
+            // existing `Value::to_json` — its output is identical
+            // and it handles the host-handle types we don't model
+            // (Actor / Ticker / ArrowTable / F64Array / Map / Set /
+            // Closure / Bytes encoding) in one place.
+            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Str(_)
+            | Value::Bytes(_) | Value::Unit | Value::Closure { .. }
+            | Value::F64Array { .. } | Value::Map(_) | Value::Set(_)
+            | Value::Actor(_) | Value::Ticker(_) | Value::ArrowTable(_)
+                => value.to_json(),
+
+            Value::List(items) => J::Array(items.iter().map(|v| self.value_to_json(v)).collect()),
+            Value::Tuple(items) => J::Array(items.iter().map(|v| self.value_to_json(v)).collect()),
+            Value::Deque(items) => J::Array(items.iter().map(|v| self.value_to_json(v)).collect()),
+            Value::Variant { name, args } => {
+                let mut m = serde_json::Map::new();
+                m.insert("$variant".into(), J::String(name.clone()));
+                m.insert("args".into(),
+                    J::Array(args.iter().map(|v| self.value_to_json(v)).collect()));
+                J::Object(m)
+            }
+            Value::Record { fields, .. } => {
+                let mut m = serde_json::Map::new();
+                for (k, v) in fields.iter() {
+                    m.insert(k.to_string(), self.value_to_json(v));
+                }
+                J::Object(m)
+            }
+
+            // Slab-direct: read the cells in shape order, emit a
+            // JSON object using the shape's field names. The cost
+            // delta vs the `Value::to_json` materialize-then-walk
+            // path is the saved `Box<IndexMap>` allocation +
+            // insertion + drop.
+            Value::ArenaRecord { shape_id, slab_start, field_count } => {
+                let shape = match self.program.record_shapes.get(*shape_id as usize) {
+                    Some(s) => s,
+                    None => return J::Null,
+                };
+                let n = (*field_count as usize).min(shape.len());
+                let mut m = serde_json::Map::with_capacity(n);
+                for (i, &name_const_idx) in shape.iter().take(n).enumerate() {
+                    let name = match &self.program.constants[name_const_idx as usize] {
+                        Const::FieldName(s) => s.to_string(),
+                        _ => continue,
+                    };
+                    let cell = &self.arena_slab[*slab_start as usize + i];
+                    m.insert(name, self.value_to_json(cell));
+                }
+                J::Object(m)
+            }
+            Value::ArenaTuple { slab_start, arity } => {
+                let start = *slab_start as usize;
+                let n = *arity as usize;
+                let items: Vec<serde_json::Value> = (0..n)
+                    .map(|i| self.value_to_json(&self.arena_slab[start + i]))
+                    .collect();
+                J::Array(items)
+            }
+
+            // Stack handles must not reach the host — same defensive
+            // panic as the other inspection paths.
+            Value::StackRecord { .. } =>
+                panic!("BUG(#464): Value::StackRecord reached Vm::value_to_json \
+                        — frame-local handles should never reach the host boundary"),
+            Value::StackTuple { .. } =>
+                panic!("BUG(#464): Value::StackTuple reached Vm::value_to_json \
+                        — frame-local handles should never reach the host boundary"),
+        }
+    }
+
     pub fn invoke(&mut self, fn_id: u32, args: Vec<Value>) -> Result<Value, VmError> {
         let f = &self.program.functions[fn_id as usize];
         if args.len() != f.arity as usize {

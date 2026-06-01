@@ -429,3 +429,71 @@ across 3 × 1000 calls × 3 levels per call.
   that emits JSON bytes directly out of `arena_slab` without
   rebuilding a `Value::Record` mirror would shed it on the
   HTTP-serving path.
+
+## Status update (2026-06-05) — slab-direct accessors landed
+
+Bytecode-side foundations for the slab-direct serializer:
+
+- **`Vm::get_record_field(&self, value: &Value, name: &str) ->
+  Option<Value>`** — uniform field access over `Value::Record` (heap)
+  and `Value::ArenaRecord` (slab handle). On the arena path it walks
+  the shape's field-name vec and reads from `arena_slab` directly,
+  with no `IndexMap` allocation.
+- **`Vm::get_tuple_elem(&self, value: &Value, idx: u16) ->
+  Option<Value>`** — same for `Value::Tuple` / `Value::ArenaTuple`.
+- **`Vm::value_to_json(&self, value: &Value) -> serde_json::Value`** —
+  arena-aware analogue of `Value::to_json`. Recurses through
+  `ArenaRecord` / `ArenaTuple` reading cells out of `arena_slab`,
+  delegates to `Value::to_json` for primitives + opaque host handles
+  to keep output identical. Saves the per-record `Box<IndexMap>`
+  alloc + insert + drop that the materialize-then-`to_json` path
+  pays.
+
+`Value::StackRecord` / `Value::StackTuple` defensively panic on
+these methods, mirroring the existing inspection-path contract —
+frame-local handles by construction shouldn't reach the host.
+
+### Unit-test coverage
+
+`crates/lex-bytecode/tests/arena_records.rs` gains 8 tests:
+- `get_record_field` on arena + heap variants + non-record fallthrough.
+- `get_tuple_elem` on arena + heap variants.
+- `value_to_json` byte-identical with `materialize_arena_handles` +
+  `to_json` (the **correctness gate** the wire-up will rely on).
+- `value_to_json` recurses correctly through 2-deep nested arena
+  records.
+- `value_to_json` passes primitives through to `Value::to_json`.
+
+### What's still open: `lex-runtime` wire-up
+
+The accessor API is ready; the wire-up into `net.serve_fn`'s response
+pipeline is a separate slice because of a real **runtime
+architecture obstacle**:
+
+`build_hyper_response` and the `unpack_response` it calls live
+**outside** the `tokio::task::spawn_blocking` closure where `vm`
+lives (`handler.rs:2329` / `:2493` / `:2754`). By the time the
+hyper-response is built, the vm has been dropped. So a vm-aware
+`unpack_response` requires either:
+
+1. Moving the `unpack_response` call **inside** the spawn_blocking
+   closure (closure returns the unpacked tuple instead of the raw
+   `Value`), so `vm` is still alive — natural fit but rearranges
+   three call sites' control flow.
+2. Returning the `Vm` *alongside* the `Value` and arranging
+   lifetimes through the response pipeline — more invasive,
+   touches lifetimes across `async` boundaries.
+
+Option 1 is the recommended next slice. The lifetime change is
+local to the three spawn_blocking sites; `unpack_response` becomes
+`fn unpack_response(vm: &mut Vm, v: &Value) -> (u16,
+ResponseBodyOut, Vec<...>)` and merges with the lazy-iter draining
+of `materialize_response_body`; `build_hyper_response` then takes
+the unpacked tuple (no `Vm` needed). The materialize call disappears
+on the common `BodyStr` path; only the `BodyStream` / `BodyBytes`
+case still needs the iter materialization step.
+
+When that wire-up lands, the win on a real `/plaintext`-style HTTP
+benchmark — one fewer `IndexMap` allocation per request, scaled by
+request rate — becomes measurable. Estimated saving: small per
+request but cumulative on a hot path.
