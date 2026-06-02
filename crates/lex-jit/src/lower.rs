@@ -70,8 +70,15 @@ impl JitContext {
     }
 
     /// Compile `f` against `consts`. Returns a callable
-    /// [`JittedFn`] bound to the lifetime of `self`.
-    pub fn compile(&mut self, f: &Function, consts: &[Const]) -> Result<JittedFn<'_>, JitError> {
+    /// [`JittedFn`] whose lifetime is *implicitly* bounded by
+    /// `self` — the JITed code lives in `self.module`'s
+    /// executable mmap, which is freed on [`JitContext`] drop.
+    /// Callers must not invoke a [`JittedFn`] after dropping the
+    /// owning context; this is documented as a safety contract on
+    /// [`JittedFn::call`] rather than enforced through a borrow
+    /// lifetime, because the borrow form blocks self-referential
+    /// caches (e.g. [`tier::JitVm`]) from holding both at once.
+    pub fn compile(&mut self, f: &Function, consts: &[Const]) -> Result<JittedFn, JitError> {
         if !is_jit_eligible(f, consts) {
             // Surface the first offender for callers that didn't
             // pre-check, matching the doc-comment on JitContext::compile.
@@ -114,24 +121,20 @@ impl JitContext {
         self.module.finalize_definitions().map_err(Box::new)?;
 
         let code_ptr = self.module.get_finalized_function(id);
-        Ok(JittedFn {
-            code_ptr,
-            arity: f.arity,
-            _phantom: std::marker::PhantomData,
-        })
+        Ok(JittedFn { code_ptr, arity: f.arity })
     }
 }
 
 /// Handle to a JITed function. The code lives in the parent
-/// [`JitContext`]'s `JITModule`; `'ctx` ties the lifetime so calling
-/// after the context drops won't compile.
-pub struct JittedFn<'ctx> {
+/// [`JitContext`]'s `JITModule` and is freed when that context
+/// drops. No lifetime parameter — see the safety note on
+/// [`JittedFn::call`].
+pub struct JittedFn {
     code_ptr: *const u8,
     arity: u16,
-    _phantom: std::marker::PhantomData<&'ctx JitContext>,
 }
 
-impl<'ctx> JittedFn<'ctx> {
+impl JittedFn {
     pub fn arity(&self) -> u16 {
         self.arity
     }
@@ -145,8 +148,12 @@ impl<'ctx> JittedFn<'ctx> {
     /// - `args.len()` must equal `self.arity()` — otherwise we
     ///   transmute to the wrong fn signature and undefined behavior
     ///   follows.
-    /// - The parent [`JitContext`] must still be alive (enforced
-    ///   by the `'ctx` lifetime borrow at construction).
+    /// - The parent [`JitContext`] must still be alive. The lifetime
+    ///   is *not* enforced by the borrow checker (see the doc on
+    ///   the struct); callers must uphold it themselves. The
+    ///   intended pattern is to colocate the context and the
+    ///   [`JittedFn`] in the same owning struct (e.g.
+    ///   [`tier::JitVm`]).
     pub unsafe fn call(&self, args: &[i64]) -> i64 {
         assert_eq!(args.len(), self.arity as usize, "JittedFn arity mismatch");
         let p = self.code_ptr;
@@ -187,8 +194,8 @@ impl<'ctx> JittedFn<'ctx> {
 
 // SAFETY: code_ptr points into the JITModule's executable mmap,
 // which is `Send + Sync` for read-execute access.
-unsafe impl<'ctx> Send for JittedFn<'ctx> {}
-unsafe impl<'ctx> Sync for JittedFn<'ctx> {}
+unsafe impl Send for JittedFn {}
+unsafe impl Sync for JittedFn {}
 
 // ---------------------------------------------------------------------------
 // Block-discovery pre-pass

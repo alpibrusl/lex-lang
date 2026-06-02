@@ -516,3 +516,72 @@ allocation-heavy ops, where the JIT can't unbox anything.
    break-even is somewhere around 10k-100k calls. The next slice
    (tier-up integration with a `body_hash`-keyed cache) needs to
    measure this in situ to set the warmup threshold.
+
+---
+
+## Status update — tier integration lands (2026-06-01)
+
+`crates/lex-jit/src/tier.rs` adds `JitVm<'a>`, a wrapper around `Vm`
+that owns a `JitContext` plus a per-function `CompileState` cache.
+`JitVm::call(name, args)` looks up `fn_id`, bumps a counter, and at
+the `threshold`-th call (default `1` — eager) attempts compilation:
+ineligible functions are marked terminally and forwarded to the
+interpreter; compiled ones run native with arg unbox + result re-box
+at the boundary.
+
+What it does **not** do: hook `Op::Call` inside the dispatch loop.
+Internal calls between Lex functions still flow through the
+interpreter. That extension needs either a callback indirection or
+a crate-graph restructure (lex-bytecode and lex-jit currently can't
+both depend on each other), so it's deferred.
+
+### Numbers (release build, opt_level=none)
+
+| Workload                  | Interp     | `jit_raw`   | `jit_vm`    | `jit_vm` vs Interp |
+|---------------------------|------------|-------------|-------------|--------------------|
+| `sum_loop / n=100`        | 14.020 µs  | 73.219 ns   | 126.98 ns   | **110×** |
+| `sum_loop / n=1_000`      | 138.47 µs  | 623.93 ns   | 674.92 ns   | **205×** |
+| `sum_loop / n=10_000`     | 1.4220 ms  | 6.1470 µs   | 6.2484 µs   | **228×** |
+| `sum_loop / n=100_000`    | 13.918 ms  | 61.567 µs   | 61.343 µs   | **227×** |
+| `polynomial(7, 11, 13)`   | 344.05 ns  | 4.6524 ns   | 68.500 ns   | **5.0×** |
+
+(`jit_raw` calls the function pointer directly; `jit_vm` goes
+through `JitVm::call` — same path a real consumer of the public
+API would take.)
+
+### What the new numbers tell us
+
+The wrapper costs ~50-65 ns per call — Vec<Value> arg materialization,
+fn_id lookup, cache indexing, and Value::Int return wrapping. Reading
+the table:
+
+- For loop workloads where the body does meaningful work (n ≥ 1000),
+  the wrapper overhead is amortized and `jit_vm` is within a few
+  percent of the raw fn-pointer call. **At n=100k, the wrapper is
+  measurement noise — the table even shows `jit_vm` 0.4% faster than
+  `jit_raw`, well inside criterion's ~1% confidence interval.**
+- For one-shot ultra-short calls (the polynomial), the wrapper
+  dominates: `jit_raw` runs in 4.7 ns, but `jit_vm`'s 64 ns of
+  fixed-cost dispatch knocks the realized speedup from 84× down to
+  5×. **This is the boundary cost the value-rep rework was supposed
+  to address** — when args and returns are themselves unboxed
+  i64-sized tagged values, the wrap/unwrap step disappears.
+
+### Where this leaves the JIT story
+
+Three things are now true that weren't before this slice:
+
+1. **End-to-end consumer API works.** Any `Vm` user can swap `Vm`
+   for `JitVm` and get JIT speedups on eligible functions
+   transparently. No code generation, no special-casing.
+2. **The boundary cost is measured, not theoretical.** ~64 ns per
+   call to wrap/unwrap. Concrete number to compare against any
+   future value-rep proposal.
+3. **The `Op::Call` integration is the remaining piece of the
+   phase-1 deliverable.** Without it, `JitVm` only helps when the
+   *outermost* call is eligible — internal hot loops calling
+   eligible leaf functions still pay full dispatch cost. The
+   measured wrapper overhead suggests that an inline-cache-style
+   integration at `Op::Call` (where the dispatch already exists and
+   args don't need to be re-built into a Vec) would close most of
+   the remaining gap. That's the next slice.
