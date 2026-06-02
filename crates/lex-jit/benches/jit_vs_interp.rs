@@ -241,5 +241,120 @@ fn bench_polynomial(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_sum_loop, bench_polynomial);
+/// Outer loop that calls an inner eligible function many times.
+/// This is the shape `Op::Call` interception was built for:
+///
+///   `outer(n)` is ineligible (contains a `MakeTuple`), so the
+///   *outer* call lands on the interpreter; but its tight loop
+///   calls `square(i)` via `Op::Call`, and `square` *is*
+///   eligible. The JIT tier intercepts each inner call.
+fn sum_of_squares_program() -> Program {
+    let outer = Function {
+        name: "outer".into(),
+        arity: 1,
+        locals_count: 3,
+        code: vec![
+            Op::PushConst(0),            // acc = 0
+            Op::StoreLocal(1),
+            Op::PushConst(0),            // i = 0
+            Op::StoreLocal(2),
+            Op::LoadLocal(2),            // loop:
+            Op::LoadLocal(0),
+            Op::IntLt,
+            Op::JumpIfNot(10),           // -> after-loop block at pc 18
+            Op::LoadLocal(1),
+            Op::LoadLocal(2),
+            Op::Call { fn_id: 1, arity: 1, node_id_idx: 2 },
+            Op::IntAdd,
+            Op::StoreLocal(1),
+            Op::LoadLocal(2),
+            Op::PushConst(1),
+            Op::IntAdd,
+            Op::StoreLocal(2),
+            Op::Jump(-14),               // -> pc 4
+            Op::PushConst(0),            // dummy tuple to keep `outer` ineligible
+            Op::PushConst(0),
+            Op::MakeTuple(2),
+            Op::Pop,
+            Op::LoadLocal(1),
+            Op::Return,
+        ],
+        effects: vec![],
+        body_hash: ZERO_BODY_HASH,
+        refinements: vec![],
+        field_ic_sites: 0,
+    };
+    let square = Function {
+        name: "square".into(),
+        arity: 1,
+        locals_count: 1,
+        code: vec![
+            Op::LoadLocal(0),
+            Op::LoadLocal(0),
+            Op::IntMul,
+            Op::Return,
+        ],
+        effects: vec![],
+        body_hash: ZERO_BODY_HASH,
+        refinements: vec![],
+        field_ic_sites: 0,
+    };
+    let mut function_names = IndexMap::new();
+    function_names.insert("outer".to_string(), 0);
+    function_names.insert("square".to_string(), 1);
+    Program {
+        constants: vec![
+            Const::Int(0),
+            Const::Int(1),
+            Const::NodeId("outer_calls_square".into()),
+        ],
+        functions: vec![outer, square],
+        function_names,
+        module_aliases: IndexMap::new(),
+        entry: Some(0),
+        record_shapes: vec![],
+    }
+}
+
+fn bench_sum_of_squares(c: &mut Criterion) {
+    let prog = sum_of_squares_program();
+    let mut group = c.benchmark_group("jit_vs_interp/sum_of_squares");
+
+    for &n in &[100i64, 1_000, 10_000] {
+        group.throughput(Throughput::Elements(n as u64));
+
+        // Interpreter: outer interpreted, every `square(i)` also
+        // interpreted via Op::Call frame setup.
+        group.bench_function(format!("interp/n={n}"), |b| {
+            let mut vm = Vm::new(&prog);
+            vm.set_step_limit(u64::MAX);
+            b.iter(|| {
+                black_box(
+                    vm.call("outer", vec![Value::Int(black_box(n))])
+                        .expect("interp call"),
+                )
+            });
+        });
+
+        // jit_vm: outer interpreted (it's ineligible), but each
+        // `square(i)` dispatches through the JIT via the hook.
+        // This is the Op::Call interception story.
+        group.bench_function(format!("jit_vm/n={n}"), |b| {
+            let mut jitvm = JitVm::new(&prog).expect("JitVm::new");
+            jitvm
+                .call("outer", vec![Value::Int(n)])
+                .expect("prime cache");
+            b.iter(|| {
+                black_box(
+                    jitvm
+                        .call("outer", vec![Value::Int(black_box(n))])
+                        .expect("jit_vm call"),
+                )
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_sum_loop, bench_polynomial, bench_sum_of_squares);
 criterion_main!(benches);

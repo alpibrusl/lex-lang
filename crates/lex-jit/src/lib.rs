@@ -91,6 +91,24 @@ pub fn is_jit_eligible(f: &Function, consts: &[Const]) -> bool {
     if f.arity > 6 {
         return false;
     }
+    // Refinements run at the call boundary; bypassing them via JIT
+    // would silently change observable behavior (a refinement
+    // failure would no longer raise `VmError::RefinementFailed`).
+    // The interpreter checks refinements *before* consulting the
+    // hook, so by-the-letter-of-the-contract a refinement-bearing
+    // function could be JITed safely — but we reject conservatively
+    // to keep the eligibility predicate independent of where the
+    // hook fires.
+    if f.refinements.iter().any(|r| r.is_some()) {
+        return false;
+    }
+    // Effects: the MVP op set excludes EffectCall, so any function
+    // with declared effects could only be eligible by accident
+    // (effects could still appear in tracer/handler interactions).
+    // Reject to keep the contract simple.
+    if !f.effects.is_empty() {
+        return false;
+    }
     for op in &f.code {
         if !op_supported(op, consts) {
             return false;
@@ -136,7 +154,7 @@ pub mod tier;
 #[cfg(feature = "cranelift")]
 pub use lower::{JitContext, JittedFn};
 #[cfg(feature = "cranelift")]
-pub use tier::{CacheStats, JitVm};
+pub use tier::{CacheStats, JitTier, JitVm};
 
 #[cfg(not(feature = "cranelift"))]
 mod stub {

@@ -374,6 +374,12 @@ pub struct Vm<'a> {
     /// slice 2a since codegen doesn't emit the ops yet.
     pub arena_record_allocs: u64,
     pub arena_record_heap_fallbacks: u64,
+    /// Optional JIT tier hook (#465 phase-1 integration). Consulted
+    /// by the `Op::Call` dispatch arm after refinements + memo. See
+    /// `crate::jit_hook` for the trait contract. `None` means
+    /// "interpreter-only" — that branch in the dispatch arm folds
+    /// to a single null-pointer check the optimizer can hoist.
+    jit_hook: Option<Box<dyn crate::jit_hook::JitHook + 'a>>,
 }
 
 struct Frame {
@@ -884,11 +890,21 @@ impl<'a> Vm<'a> {
             arena_scope_starts: Vec::new(),
             arena_record_allocs: 0,
             arena_record_heap_fallbacks: 0,
+            jit_hook: None,
         }
     }
 
     pub fn set_tracer(&mut self, tracer: Box<dyn Tracer + 'a>) {
         self.tracer = tracer;
+    }
+
+    /// Install (or replace) the JIT hook consulted by `Op::Call`'s
+    /// dispatch arm. With `None`, dispatch behaves exactly as before
+    /// — the hook check is a single null-option branch the optimizer
+    /// can hoist. See the [`crate::jit_hook`] module for the
+    /// contract callers must uphold.
+    pub fn set_jit_hook(&mut self, hook: Option<Box<dyn crate::jit_hook::JitHook + 'a>>) {
+        self.jit_hook = hook;
     }
 
     /// Cap the number of opcode dispatches before the VM aborts with
@@ -1471,6 +1487,17 @@ impl<'a> Vm<'a> {
                         reason,
                     }),
                 }
+            }
+        }
+        // #465 JIT tier hook at the public entry — same contract as
+        // the `Op::Call` dispatch arm. Pure-fn memo is not consulted
+        // at this layer (memo is per-Op::Call); the hook fires
+        // unconditionally for refinement-clean calls.
+        if let Some(mut hook) = self.jit_hook.take() {
+            let hook_result = hook.try_call(fn_id, &args);
+            self.jit_hook = Some(hook);
+            if let Some(result) = hook_result? {
+                return Ok(result);
             }
         }
         let f = &self.program.functions[fn_id as usize];
@@ -2398,6 +2425,37 @@ impl<'a> Vm<'a> {
                         let st = &mut self.memo_fn_state[fid];
                         if st.calls >= MEMO_WARMUP_CALLS && st.hits == 0 {
                             st.enabled = false;
+                        }
+                    }
+                    // #465 JIT tier hook. Consulted after refinements +
+                    // memo. The hook contract (see `crate::jit_hook`)
+                    // requires the dispatcher to emit the synthetic
+                    // tracer events itself — we do that on hit, then
+                    // truncate the args off the stack and push the
+                    // result, mirroring the memo-hit path above.
+                    //
+                    // Take/restore around the call so the hook can
+                    // borrow `&self.stack` for its args slice while
+                    // we hold `&mut hook`. Cheaper than cloning the
+                    // args; the take/put is two pointer writes.
+                    if let Some(mut hook) = self.jit_hook.take() {
+                        let hook_result = hook.try_call(fn_id, &self.stack[args_base..]);
+                        self.jit_hook = Some(hook);
+                        match hook_result? {
+                            Some(result) => {
+                                self.tracer.enter_call(&node_id, &self.program.functions[fid].name, &self.stack[args_base..]);
+                                self.tracer.exit_ok(&result);
+                                // Memoize the result if memo is enabled
+                                // for this fn — same semantics as a
+                                // regular call's Return path.
+                                if let Some(key) = memo_key {
+                                    self.pure_memo.insert(key, result.clone());
+                                }
+                                self.stack.truncate(args_base);
+                                self.stack.push(result);
+                                continue;
+                            }
+                            None => { /* hook declined; fall through */ }
                         }
                     }
                     self.tracer.enter_call(&node_id, &self.program.functions[fid].name, &self.stack[args_base..]);

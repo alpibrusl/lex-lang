@@ -11,6 +11,7 @@ pub mod vm;
 pub mod verify;
 pub mod escape;
 pub mod arena;
+pub mod jit_hook;
 
 pub use compiler::compile_program;
 pub use op::{Const, Op};
@@ -22,3 +23,4 @@ pub use escape::{analyze_program as analyze_escapes, EscapeReport, EscapeSite, P
 pub use arena::{
     analyze_program as analyze_arena, build_arena_index, ArenaReport, ArenaSite,
 };
+pub use jit_hook::JitHook;

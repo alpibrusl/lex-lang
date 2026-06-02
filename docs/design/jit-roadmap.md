@@ -585,3 +585,117 @@ Three things are now true that weren't before this slice:
    integration at `Op::Call` (where the dispatch already exists and
    args don't need to be re-built into a Vec) would close most of
    the remaining gap. That's the next slice.
+
+---
+
+## Status update — `Op::Call` interception lands (2026-06-02)
+
+The previous tier integration (#599 / 2026-06-01) only fired on the
+outermost `Vm::call`. Internal `Op::Call`s between Lex functions
+still flowed through the interpreter even when the callee was
+eligible. This slice closes that gap.
+
+### Architecture
+
+The "crate-graph circularity" called out in the prior status update
+is sidestepped via trait inversion:
+
+- `lex-bytecode` defines `trait JitHook` (new module `jit_hook.rs`),
+  plus `Vm::set_jit_hook(Option<Box<dyn JitHook + 'a>>)` and a
+  field on `Vm` that holds it.
+- The dispatch loop calls `self.jit_hook.as_mut().and_then(|h|
+  h.try_call(...))` at two seams: `Op::Call` (right after the memo
+  miss path) and `Vm::invoke` (right after refinement check).
+  Hook returns `Ok(Some(v))` → dispatcher emits synthetic
+  `tracer.enter_call` + `exit_ok`, truncates args, pushes the
+  result, continues. Hook returns `Ok(None)` → normal frame setup.
+- `lex-jit::JitTier` impls `JitHook`. Owns the `JitContext` +
+  per-fn `CompileState` cache.
+- `lex-jit::JitVm` is a convenience wrapper that constructs a
+  `Vm` and `JitTier` together and installs the latter on the
+  former.
+
+`lex-bytecode` has no compile-time dep on `lex-jit`. The hook
+field is `None` in default builds; the dispatch-loop check is a
+single null-Option branch the optimizer can hoist.
+
+### Eligibility tightening
+
+`is_jit_eligible` now also rejects functions with **any** non-`None`
+refinement or declared effect. The interpreter checks refinements
+*before* the hook fires, so JITing a refinement-bearing function
+would be correct in principle — but the predicate stays
+conservative to keep the contract independent of dispatcher
+ordering.
+
+### Verification — new test
+
+`tests/jitvm_vs_vm.rs::op_call_intercepts_inner_eligible`:
+
+```text
+outer(n):                    -- ineligible (MakeTuple)
+  acc = 0; i = 0
+  while i < n:
+    acc += square(i)         -- Op::Call → hook fires
+    i += 1
+  return acc
+
+square(x): x * x             -- eligible
+```
+
+After running, the parallel tier's `cache_stats()` reports:
+- `square`: **Compiled** — proves the Op::Call hook triggered the
+  compile (not the outermost `JitVm::call`, which only sees
+  `outer`)
+- `outer`: **Ineligible** — confirms the MakeTuple correctly
+  blocked it
+
+### Numbers (release build, opt_level=none)
+
+Three workloads, all run via `JitVm::call`:
+
+| Workload                                  | Interp        | `jit_vm`      | Speedup |
+|-------------------------------------------|---------------|---------------|---------|
+| `sum_loop / n=100_000`                    | 11.117 ms     | 62.27 µs      | **179×** |
+| `polynomial(7, 11, 13)`                   | 302.81 ns     | 51.61 ns      | **5.9×** |
+| `sum_of_squares / n=100` (Op::Call)       | 20.58 µs      | 17.11 µs      | **1.20×** |
+| `sum_of_squares / n=1_000` (Op::Call)     | 204.22 µs     | 176.79 µs     | **1.16×** |
+| `sum_of_squares / n=10_000` (Op::Call)    | 2.041 ms      | 1.697 ms      | **1.20×** |
+
+The `polynomial` row also went from 68.50 ns → 51.61 ns (25%
+faster) compared to PR #599 — the `Vm::invoke` hook bypasses
+some frame setup the wrapper-only path still went through.
+
+### What this slice does and does NOT prove
+
+**Proves:**
+1. The trait-inversion design works — no crate-graph restructure
+   needed, dispatch-loop overhead is one branch when off.
+2. `Op::Call` interception is wired up and demonstrably routes
+   `square(i)` through native code on every iteration of an
+   interpreter loop.
+
+**Doesn't prove:**
+1. **Large speedups on real Lex code.** `sum_of_squares` shows the
+   honest range: when the JITed callee is trivial relative to the
+   surrounding interpreter loop, the hook saves ~30-40 ns per call
+   (out of ~200 ns total per-iter cost), netting ~1.2×. The big
+   wins come when the inner work is heavier OR the outer is also
+   JITed (closing more of the dispatch loop).
+2. **`Op::TailCall` / `Op::CallClosure`.** Tail calls need
+   frame-replacement coordination with the tracer; closures need
+   `body_hash` keyed caching (no `fn_id`). Both deferred.
+
+### Where this leaves the JIT story
+
+Phase-1 baseline JIT acceptance per `#465`: "all prereqs done +
+arch decisions resolved + scope re-evaluated + re-file with
+deliverables." The three slices shipped this session
+(`#597`/`#598`/`#599` + this one) cover everything except
+`Op::TailCall`, which is the standard Lex idiom for arithmetic
+loops. Without it, hand-rolled iterative arith (like
+`sum_loop`) hits 179×, but tail-recursive sums hit interpreter
+speed. That's the next slice if we keep going.
+
+Phase 2 (records / closures) still needs the value-rep decision,
+unchanged from prior status updates.
