@@ -32,7 +32,7 @@ use lex_bytecode::op::{Const, Op};
 use lex_bytecode::program::{Function, Program, ZERO_BODY_HASH};
 use lex_bytecode::value::Value;
 use lex_bytecode::vm::Vm;
-use lex_jit::JitContext;
+use lex_jit::{JitContext, JitVm};
 
 /// Build the loop `fn f(n :: Int) -> Int { let acc=0, i=1; while i<=n
 /// { acc+=i; i+=1 }; acc }` — the same bytecode the JIT MVP test
@@ -153,8 +153,27 @@ fn bench_sum_loop(c: &mut Criterion) {
             });
         });
 
-        group.bench_function(format!("jit/n={n}"), |b| {
+        group.bench_function(format!("jit_raw/n={n}"), |b| {
             b.iter(|| black_box(unsafe { jitted.call(&[black_box(n)]) }));
+        });
+
+        // The tiered path — `JitVm::call`. Includes the wrapper's
+        // per-call overhead (lookup, cache hit, arg unbox, result
+        // re-box). Measures what a real caller of the public API
+        // would actually see, vs the raw fn-pointer call above.
+        group.bench_function(format!("jit_vm/n={n}"), |b| {
+            let mut jitvm = JitVm::new(&prog).expect("JitVm::new");
+            // Prime the cache so we're measuring steady-state.
+            jitvm
+                .call("f", vec![Value::Int(n)])
+                .expect("prime jit_vm cache");
+            b.iter(|| {
+                black_box(
+                    jitvm
+                        .call("f", vec![Value::Int(black_box(n))])
+                        .expect("jit_vm call"),
+                )
+            });
         });
     }
     group.finish();
@@ -187,13 +206,38 @@ fn bench_polynomial(c: &mut Criterion) {
         });
     });
 
-    group.bench_function("jit", |b| {
+    group.bench_function("jit_raw", |b| {
         b.iter(|| {
             black_box(unsafe {
                 jitted.call(&[black_box(7), black_box(11), black_box(13)])
             })
         });
     });
+
+    group.bench_function("jit_vm", |b| {
+        let mut jitvm = JitVm::new(&prog).expect("JitVm::new");
+        jitvm
+            .call(
+                "f",
+                vec![Value::Int(7), Value::Int(11), Value::Int(13)],
+            )
+            .expect("prime jit_vm cache");
+        b.iter(|| {
+            black_box(
+                jitvm
+                    .call(
+                        "f",
+                        vec![
+                            Value::Int(black_box(7)),
+                            Value::Int(black_box(11)),
+                            Value::Int(black_box(13)),
+                        ],
+                    )
+                    .expect("jit_vm call"),
+            )
+        });
+    });
+
     group.finish();
 }
 

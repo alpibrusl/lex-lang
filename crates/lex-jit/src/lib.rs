@@ -130,9 +130,13 @@ pub(crate) fn op_supported(op: &Op, consts: &[Const]) -> bool {
 
 #[cfg(feature = "cranelift")]
 mod lower;
+#[cfg(feature = "cranelift")]
+pub mod tier;
 
 #[cfg(feature = "cranelift")]
 pub use lower::{JitContext, JittedFn};
+#[cfg(feature = "cranelift")]
+pub use tier::{CacheStats, JitVm};
 
 #[cfg(not(feature = "cranelift"))]
 mod stub {
