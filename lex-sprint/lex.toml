@@ -1,0 +1,14 @@
+[package]
+name    = "lex-sprint"
+version = "0.0.0"
+edition = "2025"
+license = "EUPL-1.2"
+description = "Multi-agent sprint cycles for the Lex ecosystem (design stage)"
+
+# Dependencies are listed here as the design intent; they are wired up
+# in the first implementation PR (M1+). See docs/design/sprint-cycles.md.
+[dependencies]
+"lex-llm"    = { git = "https://github.com/alpibrusl/lex-llm" }
+"lex-agent"  = { git = "https://github.com/alpibrusl/lex-agent" }
+"lex-spec"   = { git = "https://github.com/alpibrusl/lex-spec" }
+"lex-schema" = { git = "https://github.com/alpibrusl/lex-schema" }
