@@ -78,15 +78,15 @@ impl JitContext {
     /// [`JittedFn::call`] rather than enforced through a borrow
     /// lifetime, because the borrow form blocks self-referential
     /// caches (e.g. [`tier::JitVm`]) from holding both at once.
-    pub fn compile(&mut self, f: &Function, consts: &[Const]) -> Result<JittedFn, JitError> {
-        if !is_jit_eligible(f, consts) {
+    pub fn compile(&mut self, fn_id: u32, f: &Function, consts: &[Const]) -> Result<JittedFn, JitError> {
+        if !is_jit_eligible(fn_id, f, consts) {
             // Surface the first offender for callers that didn't
             // pre-check, matching the doc-comment on JitContext::compile.
             if f.arity > 6 {
                 return Err(JitError::ArityTooLarge(f.arity));
             }
             for op in &f.code {
-                if !crate::op_supported(op, consts) {
+                if !crate::op_supported_in(op, consts, fn_id) {
                     if let Op::PushConst(i) = op {
                         return Err(JitError::UnsupportedConst(*i));
                     }
@@ -214,12 +214,13 @@ fn op_height_delta(op: &Op) -> (u32, u32) {
         Op::Jump(_) => (0, 0),
         Op::JumpIf(_) | Op::JumpIfNot(_) => (1, 0),
         Op::Return => (1, 0),
+        Op::TailCall { arity, .. } => (*arity as u32, 0),
         _ => (0, 0),
     }
 }
 
 fn is_terminator(op: &Op) -> bool {
-    matches!(op, Op::Jump(_) | Op::Return)
+    matches!(op, Op::Jump(_) | Op::Return | Op::TailCall { .. })
 }
 
 /// Resolve a relative jump offset against the dispatch semantics
@@ -271,6 +272,14 @@ fn scan_blocks(f: &Function) -> Result<BTreeMap<usize, u32>, JitError> {
 
             match op {
                 Op::Return => break,
+                Op::TailCall { .. } => {
+                    // Self-recursive tail call lowers to a backward
+                    // jump into pc 0 — already seeded at worklist
+                    // init, with entry height 0 (after-height here
+                    // equals 0 because the pops drain the arity).
+                    debug_assert_eq!(after_height, 0);
+                    break;
+                }
                 Op::Jump(off) => {
                     let t = jump_target(pc, *off, code.len())?;
                     worklist.push((t, after_height));
@@ -308,6 +317,10 @@ struct Lowering<'a> {
     /// Lex compiler uses dense slot numbers `0..locals_count`, so a
     /// `Vec` indexed by slot suffices.
     locals: Vec<Variable>,
+    /// Function arity — needed by `Op::TailCall` to know how many
+    /// values to pop off the SSA stack and reassign into locals
+    /// before jumping back to the entry block.
+    arity: u16,
     /// Set true after a terminator; resets when we switch into the
     /// next block at its entry pc.
     terminated: bool,
@@ -375,6 +388,7 @@ impl<'a> Lowering<'a> {
             code: &f.code,
             stack: Vec::new(),
             locals,
+            arity: f.arity,
             terminated: true, // forces enter-block at pc 0
         };
 
@@ -523,6 +537,30 @@ impl<'a> Lowering<'a> {
             Op::Return => {
                 let v = self.pop(pc)?;
                 self.builder.ins().return_(&[v]);
+                self.terminated = true;
+            }
+            Op::TailCall { arity, .. } => {
+                // Self-recursive tail call lowers to a backward jump
+                // into the function's entry block, with the new args
+                // written into locals[0..arity]. Cranelift's SSA
+                // frontend introduces φ-nodes across the loop
+                // header automatically. The args sit on the SSA
+                // stack with `arg[0]` deepest, so we pop in reverse
+                // to assign locals[arity-1] first.
+                let n = arity as usize;
+                debug_assert!(
+                    n <= self.arity as usize,
+                    "tail-call arity {n} exceeds function arity {}",
+                    self.arity
+                );
+                for i in (0..n).rev() {
+                    let v = self.pop(pc)?;
+                    self.builder.def_var(self.locals[i], v);
+                }
+                debug_assert!(self.stack.is_empty(), "tail call must leave SSA stack empty");
+                let (entry_block, entry_height) = self.blocks[&0];
+                debug_assert_eq!(entry_height, 0);
+                self.builder.ins().jump(entry_block, &[]);
                 self.terminated = true;
             }
             other => return Err(JitError::UnsupportedOp(other)),

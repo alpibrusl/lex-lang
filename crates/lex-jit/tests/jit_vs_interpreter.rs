@@ -53,11 +53,11 @@ fn run_interp(program: &Program, args: Vec<i64>) -> i64 {
 fn jit_and_call(program: &Program, args: &[i64]) -> i64 {
     let f = &program.functions[0];
     assert!(
-        is_jit_eligible(f, &program.constants),
+        is_jit_eligible(0, f, &program.constants),
         "function not JIT-eligible — fix the test or extend the JIT"
     );
     let mut ctx = JitContext::new().expect("JitContext init");
-    let jitted = ctx.compile(f, &program.constants).expect("JIT compile");
+    let jitted = ctx.compile(0, f, &program.constants).expect("JIT compile");
     unsafe { jitted.call(args) }
 }
 
@@ -396,6 +396,71 @@ fn sum_from_one_to_n_via_loop() {
 }
 
 // ---------------------------------------------------------------------------
+// 4b. Self-recursive tail call — lowered to a backward jump.
+//     `fn sum_to(n, acc) = match n { 0 => acc; _ => sum_to(n-1, acc+n) }`
+//     is the canonical Lex tail-recursive arith idiom. Without this
+//     lowering, every tail call would force a fall-through to the
+//     interpreter; with it, the JIT compiles the whole recursion as
+//     a native loop.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn self_tail_recursion_sums_to() {
+    // sum_to(n, acc):
+    //   if n == 0: return acc
+    //   else: tailcall sum_to(n-1, acc + n)
+    //
+    // Bytecode (locals: n=0, acc=1):
+    //   0: LoadLocal(0)            n
+    //   1: PushConst(0) {=0}       n 0
+    //   2: IntEq                   (n==0)
+    //   3: JumpIfNot(+2)           -- target = 4+2 = 6 (recursive arm)
+    //   4: LoadLocal(1)            acc
+    //   5: Return
+    //   6: LoadLocal(0)            n
+    //   7: PushConst(1) {=1}       n 1
+    //   8: IntSub                  (n-1)
+    //   9: LoadLocal(1)            (n-1) acc
+    //  10: LoadLocal(0)            (n-1) acc n
+    //  11: IntAdd                  (n-1) (acc+n)
+    //  12: TailCall { fn_id: 0, arity: 2 }
+    let p = mk_program(
+        "f",
+        2,
+        2,
+        vec![
+            Op::LoadLocal(0),
+            Op::PushConst(0),
+            Op::IntEq,
+            Op::JumpIfNot(2),
+            Op::LoadLocal(1),
+            Op::Return,
+            Op::LoadLocal(0),
+            Op::PushConst(1),
+            Op::IntSub,
+            Op::LoadLocal(1),
+            Op::LoadLocal(0),
+            Op::IntAdd,
+            Op::TailCall { fn_id: 0, arity: 2, node_id_idx: 2 },
+        ],
+        vec![Const::Int(0), Const::Int(1), Const::NodeId("sum_to_rec".into())],
+    );
+    // Interpreter computes sum_to(n, 0) = 0+1+...+n = n*(n+1)/2.
+    // JIT computes the same via a native loop.
+    assert_jit_matches(
+        &p,
+        &[
+            vec![0, 0],
+            vec![1, 0],
+            vec![5, 0],
+            vec![100, 0],
+            vec![1000, 0],
+            vec![10_000, 0],
+        ],
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 5. Eligibility gate
 // ---------------------------------------------------------------------------
 
@@ -418,7 +483,7 @@ fn rejects_unsupported_op_via_eligibility() {
         refinements: vec![],
         field_ic_sites: 0,
     };
-    assert!(!is_jit_eligible(&f, &[]));
+    assert!(!is_jit_eligible(0, &f, &[]));
 }
 
 #[test]
@@ -434,7 +499,7 @@ fn rejects_unsupported_const_via_eligibility() {
         refinements: vec![],
         field_ic_sites: 0,
     };
-    assert!(!is_jit_eligible(&f, &[Const::Str("nope".into())]));
+    assert!(!is_jit_eligible(0, &f, &[Const::Str("nope".into())]));
 }
 
 #[test]
@@ -449,5 +514,5 @@ fn rejects_overlarge_arity() {
         refinements: vec![],
         field_ic_sites: 0,
     };
-    assert!(!is_jit_eligible(&f, &[]));
+    assert!(!is_jit_eligible(0, &f, &[]));
 }

@@ -135,7 +135,7 @@ fn bench_sum_loop(c: &mut Criterion) {
     let prog = sum_loop_program();
     let mut ctx = JitContext::new().expect("jit ctx");
     let jitted = ctx
-        .compile(&prog.functions[0], &prog.constants)
+        .compile(0, &prog.functions[0], &prog.constants)
         .expect("jit compile");
 
     let mut group = c.benchmark_group("jit_vs_interp/sum_loop");
@@ -183,7 +183,7 @@ fn bench_polynomial(c: &mut Criterion) {
     let prog = polynomial_program();
     let mut ctx = JitContext::new().expect("jit ctx");
     let jitted = ctx
-        .compile(&prog.functions[0], &prog.constants)
+        .compile(0, &prog.functions[0], &prog.constants)
         .expect("jit compile");
 
     let mut group = c.benchmark_group("jit_vs_interp/polynomial");
@@ -356,5 +356,101 @@ fn bench_sum_of_squares(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_sum_loop, bench_polynomial, bench_sum_of_squares);
+/// The canonical Lex tail-recursive arithmetic idiom:
+///
+///   fn sum_to(n, acc) = match n { 0 => acc; _ => sum_to(n-1, acc+n) }
+///
+/// Before this slice the JIT rejected any function with
+/// `Op::TailCall` — most real Lex loops were therefore
+/// interpreter-only. With self-tail-call → backward-jump
+/// lowering, this compiles as a native loop.
+fn sum_to_program() -> Program {
+    let code = vec![
+        Op::LoadLocal(0),
+        Op::PushConst(0),
+        Op::IntEq,
+        Op::JumpIfNot(2),
+        Op::LoadLocal(1),
+        Op::Return,
+        Op::LoadLocal(0),
+        Op::PushConst(1),
+        Op::IntSub,
+        Op::LoadLocal(1),
+        Op::LoadLocal(0),
+        Op::IntAdd,
+        Op::TailCall { fn_id: 0, arity: 2, node_id_idx: 2 },
+    ];
+    let mut function_names = IndexMap::new();
+    function_names.insert("sum_to".to_string(), 0);
+    Program {
+        constants: vec![
+            Const::Int(0),
+            Const::Int(1),
+            Const::NodeId("sum_to_rec".into()),
+        ],
+        functions: vec![Function {
+            name: "sum_to".into(),
+            arity: 2,
+            locals_count: 2,
+            code,
+            effects: vec![],
+            body_hash: ZERO_BODY_HASH,
+            refinements: vec![],
+            field_ic_sites: 0,
+        }],
+        function_names,
+        module_aliases: IndexMap::new(),
+        entry: Some(0),
+        record_shapes: vec![],
+    }
+}
+
+fn bench_sum_to_tailrec(c: &mut Criterion) {
+    let prog = sum_to_program();
+    let mut group = c.benchmark_group("jit_vs_interp/sum_to_tailrec");
+
+    for &n in &[100i64, 1_000, 10_000, 100_000] {
+        group.throughput(Throughput::Elements(n as u64));
+
+        group.bench_function(format!("interp/n={n}"), |b| {
+            let mut vm = Vm::new(&prog);
+            vm.set_step_limit(u64::MAX);
+            b.iter(|| {
+                black_box(
+                    vm.call(
+                        "sum_to",
+                        vec![Value::Int(black_box(n)), Value::Int(0)],
+                    )
+                    .expect("interp call"),
+                )
+            });
+        });
+
+        group.bench_function(format!("jit_vm/n={n}"), |b| {
+            let mut jitvm = JitVm::new(&prog).expect("JitVm::new");
+            jitvm
+                .call("sum_to", vec![Value::Int(n), Value::Int(0)])
+                .expect("prime");
+            b.iter(|| {
+                black_box(
+                    jitvm
+                        .call(
+                            "sum_to",
+                            vec![Value::Int(black_box(n)), Value::Int(0)],
+                        )
+                        .expect("jit_vm call"),
+                )
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_sum_loop,
+    bench_polynomial,
+    bench_sum_of_squares,
+    bench_sum_to_tailrec,
+);
 criterion_main!(benches);
