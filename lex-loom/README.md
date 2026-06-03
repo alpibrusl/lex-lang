@@ -1,8 +1,8 @@
-# lex-sprint
+# lex-loom
 
-> **Incubator.** Lives in `lex-lang/lex-sprint/` while the design and API
+> **Incubator.** Lives in `lex-lang/lex-loom/` while the design and API
 > surface firm up — the same path `lex-jobs` took. Intended to extract to
-> a standalone `lex-sprint` package once the design has seen real use.
+> a standalone `lex-loom` package once the design has seen real use.
 > (The standalone repo could not be created from the authoring session;
 > this doc is self-contained and transplants unchanged.)
 
@@ -30,7 +30,7 @@ at both ends, an honest effect row, and a hash-chained attestation.
 
 lex-llm · lex-agent (A2A) · lex-spec · lex-schema · lex-trail · lex-jobs ·
 lex-hub · lex-vcs · lex-mcp · lex-code. See the design doc's reuse map —
-lex-sprint is mostly wiring on top of these.
+lex-loom is mostly wiring on top of these.
 
 ---
 
