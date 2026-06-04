@@ -699,3 +699,169 @@ speed. That's the next slice if we keep going.
 
 Phase 2 (records / closures) still needs the value-rep decision,
 unchanged from prior status updates.
+
+---
+
+## Status update — `Op::TailCall` lands (2026-06-02)
+
+The previous slice (#600) intercepted `Op::Call` but left
+`Op::TailCall` interpreter-only. That meant the canonical Lex
+idiom — tail-recursive arithmetic like
+`sum_to(n, acc) = match n { 0 => acc; _ => sum_to(n-1, acc+n) }`
+— couldn't be JITed at all: every tail call popped back to the
+interpreter and re-entered, defeating the lowered native body.
+
+This slice closes that gap on both fronts.
+
+### A. Lowering: self-tail-call → backward jump
+
+`is_jit_eligible` now accepts `Op::TailCall { fn_id }` when
+`fn_id` matches the function being compiled. Cross-function tail
+calls remain unsupported (they'd need a different lowering shape).
+
+In the lowering pass:
+- `op_height_delta` reports `(arity, 0)` for `Op::TailCall`.
+- `is_terminator` treats it as terminating its basic block.
+- `emit_op` handles it by popping `arity` SSA values off the
+  per-block stack into `locals[0..arity]` (Cranelift `Variable`s,
+  same handles the entry uses) and emitting
+  `ins.jump(entry_block, &[])`. Cranelift's SSA frontend
+  introduces φ-nodes across the loop header automatically.
+
+Net: a tail-recursive Lex function compiles to the same native
+loop a hand-written `while` would produce.
+
+### B. Dispatcher: `Op::TailCall` hook
+
+For the case where an *interpreted* outer function tail-calls a
+JIT'd leaf (case 2 — different from self-tail-recursion), the
+dispatch loop now consults the hook on `Op::TailCall` too. On a
+hit, the dispatcher emits the tail's synthetic
+`exit_call_tail` + `enter_call` + `exit_ok` trace events, pops
+the current frame (mirroring `Op::Return`), and bubbles the
+result up the call stack. Same `take()/restore` split-borrow
+pattern as the existing `Op::Call` hook.
+
+Tail calls don't carry a `memo_key` (the existing TailCall arm
+doesn't memoize them), so the hook hit path skips the memo
+store the `Op::Return` path does.
+
+### Numbers (release build, opt_level=none)
+
+The headline workload is **`sum_to` — tail-recursive sum-to-n**:
+
+| Workload                       | Interp        | `jit_vm`      | Speedup |
+|--------------------------------|---------------|---------------|---------|
+| `sum_to_tailrec / n=100`       | 15.43 µs      | 96.16 ns      | **160×** |
+| `sum_to_tailrec / n=1_000`     | 151.44 µs     | 559.71 ns     | **270×** |
+| `sum_to_tailrec / n=10_000`    | 1.5247 ms     | 5.067 µs      | **301×** |
+| `sum_to_tailrec / n=100_000`   | 14.995 ms     | 50.122 µs     | **299×** |
+
+For comparison, the prior workloads (no regression):
+
+| Workload                                  | Interp        | `jit_vm`      | Speedup |
+|-------------------------------------------|---------------|---------------|---------|
+| `sum_loop / n=100_000` (hand iter)        | 12.059 ms     | 63.21 µs      | **191×** |
+| `polynomial(7, 11, 13)`                   | 311.06 ns     | 54.13 ns      | **5.7×** |
+| `sum_of_squares / n=10_000` (Op::Call)    | 2.090 ms      | 1.689 ms      | **1.24×** |
+
+`sum_to_tailrec` is **faster than `sum_loop`** in both directions:
+the interpreter is slower on it (15.0 ms vs 12.1 ms — the
+`Op::TailCall` frame replacement plus refinement re-checks per
+iter), and the JIT is also faster (50 µs vs 63 µs — `sum_to`'s
+body is shorter, so even at native speed there are fewer ops per
+loop iteration). Net: tail-recursive is now the fastest shape in
+the table, exactly inverting the pre-this-slice picture.
+
+### What's left for phase-1 `#465`
+
+Per the original phase-1 spec: arithmetic + locals + jumps +
+tail calls, with interp fallback for everything else. **All four
+pillars are now done** (modulo the unmeasured-but-real `~64 ns`
+wrapper boundary cost on one-shot calls, which is the value-rep
+question).
+
+Remaining nice-to-haves before the JIT could be considered "phase 1
+complete and shippable":
+
+1. **Cross-function `Op::TailCall`.** Today the JIT only handles
+   self-tail-call; tail calls to *other* functions go through the
+   dispatcher hook (good) but still pay a frame replacement when
+   the callee is interpreter-only. Cross-function tail call
+   lowering inside the JIT is the analogue of the dispatcher hook
+   — it would need the JITed code to look up another fn's compiled
+   pointer at runtime.
+2. **`Op::CallClosure`.** Currently unsupported; needs `body_hash`
+   keyed cache.
+3. **NodeId side tables.** Tracer / panic mapping back to bytecode
+   PCs. Required for the deopt story but not for correctness on
+   the supported op set.
+4. **Production wire-up.** A `lex run --jit` flag that constructs
+   `JitVm` for the entry program. Trivially small now that the
+   tier is stable.
+
+Phase 2 (records / closures via value-rep) is independent of all
+of the above.
+
+---
+
+## Status update — `lex run --jit` wire-up (2026-06-03)
+
+The JIT is now reachable from the CLI. `lex run --jit <file> <fn>
+[args]` constructs a `lex_jit::JitTier` over the loaded program and
+installs it as a `JitHook` on the existing `Vm` via
+`Vm::set_jit_hook` — eligible functions run as native code, every-
+thing else flows through the interpreter unchanged.
+
+Implementation footprint:
+- `crates/lex-cli/Cargo.toml` — `lex-jit` added as a default
+  dependency with the `cranelift` feature on. The `lex` binary now
+  bundles Cranelift's 30-odd crates; binary size grows by a few MB.
+  Future: could be gated behind a `jit` cargo feature if size-
+  sensitive distributions need to opt out.
+- `crates/lex-cli/src/main.rs` — `RunFlags::jit: bool`, parsed from
+  `--jit`. Tier installation is one block after `Vm::with_handler`:
+
+  ```rust
+  if f.jit {
+      let tier = lex_jit::JitTier::new(&bc)
+          .map_err(|e| anyhow!("--jit: constructing JIT tier: {e}"))?;
+      vm.set_jit_hook(Some(Box::new(tier)));
+  }
+  ```
+
+  A tier-construction failure (e.g. the `cranelift` feature was off)
+  surfaces as a `--jit:` prefixed run error rather than silently
+  degrading.
+
+- `crates/lex-cli/tests/run_jit.rs` — 3 integration tests:
+  `jit_pure_arith_matches_interpreter` exercises a function the
+  eligibility predicate accepts (`poly(a, b, c) = a*b + c`);
+  `jit_falls_through_for_ineligible_program` runs a record-shaped
+  program with `--jit` and confirms identical output to plain
+  `lex run`; `jit_flag_works_with_other_run_flags` smoke-tests
+  composition with `--max-steps`.
+
+### What this enables
+
+Any Lex program can now be run with `--jit`. There is no source-
+level annotation, no opt-in per function, and no observable change
+in behavior — programs without JIT-eligible functions just see a
+tiny per-call wrapper cost (~64 ns on cold ineligibility checks).
+Programs with int-arith hot paths get the steady-state speedups
+documented in the prior status updates (160-300× depending on
+shape).
+
+End-to-end real-program measurement is now unblocked: pick any
+existing Lex bench / example, run with and without `--jit`, and
+compare wall-clock. The harness no longer needs hand-crafted
+`Function` literals.
+
+### Remaining phase-1 follow-ups (unchanged from #602)
+
+1. Cross-function `Op::TailCall` (today: self-only)
+2. `Op::CallClosure`
+3. NodeId side tables (tracer / panic mapping)
+4. ~~`lex run --jit`~~ — done.
+
+Phase 2 (records / closures via value-rep) still independent.

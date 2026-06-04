@@ -2521,6 +2521,35 @@ impl<'a> Vm<'a> {
                             }
                         }
                     }
+                    // #465 JIT tier hook for tail calls. A tail-called
+                    // function's result IS the current frame's result,
+                    // so on a hook hit we collapse the current frame:
+                    // truncate state back to the frame's entry, emit
+                    // the synthetic enter+exit_ok trace events that a
+                    // normal tail-into-return would have produced, then
+                    // bubble the result up the same way Op::Return
+                    // does.
+                    if let Some(mut hook) = self.jit_hook.take() {
+                        let hook_result = hook.try_call(fn_id, &self.stack[args_base..]);
+                        self.jit_hook = Some(hook);
+                        if let Some(result) = hook_result? {
+                            self.tracer.exit_call_tail();
+                            self.tracer.enter_call(&node_id, &self.program.functions[fid].name, &self.stack[args_base..]);
+                            self.tracer.exit_ok(&result);
+                            let frame = self.frames.pop().unwrap();
+                            self.stack.truncate(frame.stack_base);
+                            self.locals_storage.truncate(frame.locals_start);
+                            self.stack_record_arena.truncate(frame.stack_record_arena_start);
+                            // Tail calls don't carry a memo_key (the
+                            // existing arm doesn't memoize them), so
+                            // skip the memo store the Return path does.
+                            if self.frames.len() <= base_depth {
+                                return Ok(result);
+                            }
+                            self.stack.push(result);
+                            continue;
+                        }
+                    }
                     // A tail call closes the current call's trace frame and
                     // opens a new one in its place — preserves the caller's
                     // tree depth in the trace.

@@ -82,12 +82,13 @@ pub enum JitError {
     Backend(String),
 }
 
-/// Cheap structural check: does every op in this function belong
-/// to the MVP-supported set? Callers should run this *before*
-/// instantiating a [`JitContext`] — `compile` will return
-/// [`JitError::UnsupportedOp`] for the first offender, but the
-/// predicate lets you do the gate without building a module.
-pub fn is_jit_eligible(f: &Function, consts: &[Const]) -> bool {
+/// Cheap structural check: is every op in this function in the
+/// MVP-supported set? Self-recursive `Op::TailCall` is treated as a
+/// supported op (lowered to a backward jump to the function entry);
+/// `fn_id` is the index of `f` in its `Program.functions` so the
+/// predicate can recognize self-references. Callers that hand-build
+/// functions for testing can pass `0`.
+pub fn is_jit_eligible(fn_id: u32, f: &Function, consts: &[Const]) -> bool {
     if f.arity > 6 {
         return false;
     }
@@ -110,7 +111,7 @@ pub fn is_jit_eligible(f: &Function, consts: &[Const]) -> bool {
         return false;
     }
     for op in &f.code {
-        if !op_supported(op, consts) {
+        if !op_supported_in(op, consts, fn_id) {
             return false;
         }
     }
@@ -118,6 +119,9 @@ pub fn is_jit_eligible(f: &Function, consts: &[Const]) -> bool {
 }
 
 pub(crate) fn op_supported(op: &Op, consts: &[Const]) -> bool {
+    // Standalone op check used by the lowering's per-op fallthrough.
+    // The `op_supported_in` variant additionally accepts
+    // self-recursive tail calls (which need the current fn_id).
     match op {
         Op::PushConst(i) => matches!(
             consts.get(*i as usize),
@@ -144,6 +148,18 @@ pub(crate) fn op_supported(op: &Op, consts: &[Const]) -> bool {
         | Op::Return => true,
         _ => false,
     }
+}
+
+pub(crate) fn op_supported_in(op: &Op, consts: &[Const], self_fn_id: u32) -> bool {
+    // Self-recursive tail calls lower to a backward jump that
+    // re-enters the function's entry block with new args.
+    // Cross-function tail calls remain unsupported — they'd need
+    // a different lowering (basically a call instruction) which
+    // pulls all the cross-function caching back in.
+    if let Op::TailCall { fn_id, .. } = op {
+        return *fn_id == self_fn_id;
+    }
+    op_supported(op, consts)
 }
 
 #[cfg(feature = "cranelift")]

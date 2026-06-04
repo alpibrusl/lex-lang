@@ -113,10 +113,10 @@ impl<'a> JitTier<'a> {
 
     fn attempt_compile(&mut self, fn_id: usize) -> CompileState {
         let f = &self.program.functions[fn_id];
-        if !is_jit_eligible(f, &self.program.constants) {
+        if !is_jit_eligible(fn_id as u32, f, &self.program.constants) {
             return CompileState::Ineligible;
         }
-        match self.ctx.compile(f, &self.program.constants) {
+        match self.ctx.compile(fn_id as u32, f, &self.program.constants) {
             Ok(jitted) => CompileState::Compiled(jitted),
             Err(_) => CompileState::Ineligible,
         }
