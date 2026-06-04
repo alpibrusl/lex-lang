@@ -802,3 +802,66 @@ complete and shippable":
 
 Phase 2 (records / closures via value-rep) is independent of all
 of the above.
+
+---
+
+## Status update — `lex run --jit` wire-up (2026-06-03)
+
+The JIT is now reachable from the CLI. `lex run --jit <file> <fn>
+[args]` constructs a `lex_jit::JitTier` over the loaded program and
+installs it as a `JitHook` on the existing `Vm` via
+`Vm::set_jit_hook` — eligible functions run as native code, every-
+thing else flows through the interpreter unchanged.
+
+Implementation footprint:
+- `crates/lex-cli/Cargo.toml` — `lex-jit` added as a default
+  dependency with the `cranelift` feature on. The `lex` binary now
+  bundles Cranelift's 30-odd crates; binary size grows by a few MB.
+  Future: could be gated behind a `jit` cargo feature if size-
+  sensitive distributions need to opt out.
+- `crates/lex-cli/src/main.rs` — `RunFlags::jit: bool`, parsed from
+  `--jit`. Tier installation is one block after `Vm::with_handler`:
+
+  ```rust
+  if f.jit {
+      let tier = lex_jit::JitTier::new(&bc)
+          .map_err(|e| anyhow!("--jit: constructing JIT tier: {e}"))?;
+      vm.set_jit_hook(Some(Box::new(tier)));
+  }
+  ```
+
+  A tier-construction failure (e.g. the `cranelift` feature was off)
+  surfaces as a `--jit:` prefixed run error rather than silently
+  degrading.
+
+- `crates/lex-cli/tests/run_jit.rs` — 3 integration tests:
+  `jit_pure_arith_matches_interpreter` exercises a function the
+  eligibility predicate accepts (`poly(a, b, c) = a*b + c`);
+  `jit_falls_through_for_ineligible_program` runs a record-shaped
+  program with `--jit` and confirms identical output to plain
+  `lex run`; `jit_flag_works_with_other_run_flags` smoke-tests
+  composition with `--max-steps`.
+
+### What this enables
+
+Any Lex program can now be run with `--jit`. There is no source-
+level annotation, no opt-in per function, and no observable change
+in behavior — programs without JIT-eligible functions just see a
+tiny per-call wrapper cost (~64 ns on cold ineligibility checks).
+Programs with int-arith hot paths get the steady-state speedups
+documented in the prior status updates (160-300× depending on
+shape).
+
+End-to-end real-program measurement is now unblocked: pick any
+existing Lex bench / example, run with and without `--jit`, and
+compare wall-clock. The harness no longer needs hand-crafted
+`Function` literals.
+
+### Remaining phase-1 follow-ups (unchanged from #602)
+
+1. Cross-function `Op::TailCall` (today: self-only)
+2. `Op::CallClosure`
+3. NodeId side tables (tracer / panic mapping)
+4. ~~`lex run --jit`~~ — done.
+
+Phase 2 (records / closures via value-rep) still independent.

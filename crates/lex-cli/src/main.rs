@@ -632,6 +632,18 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         .with_program_args(f.program_args.clone());
     let mut vm = Vm::with_handler(&bc, Box::new(handler));
     if let Some(n) = f.max_steps { vm.set_step_limit(n); }
+    // #465: install the JIT tier as a hook on the Vm. Eligible
+    // functions (pure-int arith subset) compile to native code on
+    // first call; everything else flows through the interpreter
+    // unchanged. A construction failure (e.g. the `cranelift` feature
+    // was off) propagates the JitError as a user-visible run error
+    // rather than silently falling back, so a `--jit` invocation that
+    // can't actually JIT is loud.
+    if f.jit {
+        let tier = lex_jit::JitTier::new(&bc)
+            .map_err(|e| anyhow!("--jit: constructing JIT tier: {e}"))?;
+        vm.set_jit_hook(Some(Box::new(tier)));
+    }
     let recorder = lex_trace::Recorder::new();
     let trace_handle = recorder.handle();
     if f.trace { vm.set_tracer(Box::new(recorder)); }
@@ -764,6 +776,12 @@ struct RunFlags {
     trusted_key: Option<String>,
     /// Args after `--` separator, passed to `io.argv()` in the program.
     program_args: Vec<String>,
+    /// #465: route eligible functions through the Cranelift JIT
+    /// tier (`lex_jit::JitTier`). Default-off because the JIT only
+    /// pays off on numeric hot paths; programs without those run
+    /// the same speed either way and pay a small per-call wrapper
+    /// cost. Enabled with `--jit`.
+    jit: bool,
 }
 
 fn parse_run_flags(args: &[String]) -> Result<RunFlags> {
@@ -814,6 +832,7 @@ fn parse_run_flags(args: &[String]) -> Result<RunFlags> {
             }
             "--trace" => { f.trace = true; i += 1; }
             "--dry-run" => { f.dry_run = true; i += 1; }
+            "--jit" => { f.jit = true; i += 1; }
             "--from-canonical" => {
                 // #206 slice 3: read the program as canonical-AST
                 // bytes instead of `.lex` text. The path argument
