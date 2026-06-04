@@ -632,6 +632,25 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         .with_program_args(f.program_args.clone());
     let mut vm = Vm::with_handler(&bc, Box::new(handler));
     if let Some(n) = f.max_steps { vm.set_step_limit(n); }
+    // #465 / cursor[bot] medium-severity review on #608: JIT'd code
+    // runs in native loops (the self-tail-call backward jump, any
+    // backward `Jump(-N)` in iterative loops) that do **not**
+    // increment `Vm::steps`, so an explicit `--max-steps` cap would
+    // be silently bypassed once a hot loop tiers up. The
+    // `set_step_limit` doc explicitly calls out untrusted code (the
+    // `agent-tool` sandbox) as the threat model — so refuse the
+    // combination rather than degrade the guarantee. The
+    // architectural fix (pass the counter into JIT'd code, abort
+    // via a multi-return ABI) is a separate slice; this is the
+    // immediate guardrail.
+    if f.jit && f.max_steps.is_some() {
+        bail!(
+            "--jit and --max-steps are mutually exclusive: the JIT \
+             runs native loops that bypass the per-op step counter, so \
+             an explicit step limit would not be honored. Drop one of \
+             the two flags."
+        );
+    }
     // #465: install the JIT tier as a hook on the Vm. Eligible
     // functions (pure-int arith subset) compile to native code on
     // first call; everything else flows through the interpreter
