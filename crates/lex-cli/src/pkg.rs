@@ -1,10 +1,12 @@
 //! `lex pkg` subcommands — package manifest management.
 //!
 //! Commands:
-//!   lex pkg init                    — create a starter lex.toml in the CWD
-//!   lex pkg add <name> --path <p>   — add a path dependency
-//!   lex pkg add <name> --git  <url> — add a git dependency (clones on first use)
-//!   lex pkg list                    — list dependencies in lex.toml
+//!   lex pkg init                                       — create a starter lex.toml in the CWD
+//!   lex pkg add <name> --path <p>                      — add a path dependency
+//!   lex pkg add <name> --git  <url>                    — add a git dependency (clones on first use)
+//!   lex pkg add <name> --registry <url> --version <v>  — add a registry dependency
+//!   lex pkg list                                       — list dependencies in lex.toml
+//!   lex pkg publish [--registry <url>] [--token <jwt>] — publish package to a registry
 
 use anyhow::{bail, Result};
 use std::path::Path;
@@ -15,8 +17,9 @@ pub fn cmd_pkg(args: &[String]) -> Result<()> {
         Some("add")     => cmd_add(&args[1..]),
         Some("list")    => cmd_list(),
         Some("install") => cmd_install(),
-        Some(other)     => bail!("unknown pkg subcommand `{other}`; try: init, add, install, list"),
-        None            => bail!("usage: lex pkg <init|add|install|list>"),
+        Some("publish") => cmd_publish(&args[1..]),
+        Some(other)     => bail!("unknown pkg subcommand `{other}`; try: init, add, install, list, publish"),
+        None            => bail!("usage: lex pkg <init|add|install|list|publish>"),
     }
 }
 
@@ -49,12 +52,14 @@ version = "0.1.0"
 // ── lex pkg add ───────────────────────────────────────────────────────────────
 
 fn cmd_add(args: &[String]) -> Result<()> {
-    // Usage: lex pkg add <name> (--path <p> | --git <url>)
+    // Usage: lex pkg add <name> (--path <p> | --git <url> | --registry <url> --version <v>)
     let name = args.first().ok_or_else(|| anyhow::anyhow!(
-        "usage: lex pkg add <name> (--path <p> | --git <url>)"))?;
+        "usage: lex pkg add <name> (--path <p> | --git <url> | --registry <url> --version <v>)"))?;
 
-    let mut path_val: Option<String> = None;
-    let mut git_val:  Option<String> = None;
+    let mut path_val:     Option<String> = None;
+    let mut git_val:      Option<String> = None;
+    let mut registry_val: Option<String> = None;
+    let mut version_val:  Option<String> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -70,16 +75,30 @@ fn cmd_add(args: &[String]) -> Result<()> {
                     anyhow::anyhow!("--git requires a value")
                 })?);
             }
+            "--registry" => {
+                i += 1;
+                registry_val = Some(args.get(i).cloned().ok_or_else(|| {
+                    anyhow::anyhow!("--registry requires a value")
+                })?);
+            }
+            "--version" => {
+                i += 1;
+                version_val = Some(args.get(i).cloned().ok_or_else(|| {
+                    anyhow::anyhow!("--version requires a value")
+                })?);
+            }
             other => bail!("unknown flag `{other}`"),
         }
         i += 1;
     }
 
-    let dep_entry = match (path_val, git_val) {
-        (Some(p), None) => format!(r#"{{ path = "{p}" }}"#),
-        (None, Some(u)) => format!(r#"{{ git = "{u}" }}"#),
-        (Some(_), Some(_)) => bail!("specify either --path or --git, not both"),
-        (None, None) => bail!("usage: lex pkg add <name> (--path <p> | --git <url>)"),
+    let dep_entry = match (path_val, git_val, registry_val, version_val) {
+        (Some(p), None, None, None) => format!(r#"{{ path = "{p}" }}"#),
+        (None, Some(u), None, None) => format!(r#"{{ git = "{u}" }}"#),
+        (None, None, Some(r), Some(v)) => format!(r#"{{ registry = "{r}", version = "{v}" }}"#),
+        (None, None, Some(_), None) => bail!("--registry requires --version"),
+        (None, None, None, Some(_)) => bail!("--version requires --registry"),
+        _ => bail!("specify exactly one of --path, --git, or --registry (with --version)"),
     };
 
     upsert_dependency(name, &dep_entry)
@@ -120,9 +139,21 @@ fn cmd_install() -> Result<()> {
                 }
             }
             lex_syntax::workspace::Dependency::Git { git } => {
-                print!("  {} (git)   {} ... ", name, git);
-                // resolve_package_import triggers git_ensure_cached internally.
-                // We use a dummy module name — we only care about the side-effect.
+                print!("  {} (git)      {} ... ", name, git);
+                let dummy_file = toml_dir.join("__install_probe__.lex");
+                match lex_syntax::workspace::resolve_package_import(&dummy_file, name, "__probe__") {
+                    Ok(_) | Err(lex_syntax::PackageError::ModuleNotFound { .. }) => {
+                        println!("ok");
+                    }
+                    Err(e) => {
+                        println!("FAILED");
+                        eprintln!("    {e}");
+                        errors.push(format!("{name}: {e}"));
+                    }
+                }
+            }
+            lex_syntax::workspace::Dependency::Registry { registry, version } => {
+                print!("  {} (registry) {}@{} ... ", name, registry, version);
                 let dummy_file = toml_dir.join("__install_probe__.lex");
                 match lex_syntax::workspace::resolve_package_import(&dummy_file, name, "__probe__") {
                     Ok(_) | Err(lex_syntax::PackageError::ModuleNotFound { .. }) => {
@@ -164,11 +195,110 @@ fn cmd_list() -> Result<()> {
     for (name, dep) in &manifest.dependencies {
         match dep {
             lex_syntax::workspace::Dependency::Path { path } =>
-                println!("  {name}  path = {path}"),
+                println!("  {name}  path     = {path}"),
             lex_syntax::workspace::Dependency::Git { git } =>
-                println!("  {name}  git  = {git}"),
+                println!("  {name}  git      = {git}"),
+            lex_syntax::workspace::Dependency::Registry { registry, version } =>
+                println!("  {name}  registry = {registry}  version = {version}"),
         }
     }
+    Ok(())
+}
+
+// ── lex pkg publish ───────────────────────────────────────────────────────────
+
+/// Pack `lex.toml` + `src/**` into a gzipped tar archive in memory.
+fn build_archive(toml_dir: &std::path::Path) -> Result<Vec<u8>> {
+    let buf = Vec::new();
+    let gz = flate2::write::GzEncoder::new(buf, flate2::Compression::default());
+    let mut ar = tar::Builder::new(gz);
+
+    // Include lex.toml at archive root.
+    let toml_path = toml_dir.join("lex.toml");
+    ar.append_path_with_name(&toml_path, "lex.toml")?;
+
+    // Include every file under src/.
+    let src_dir = toml_dir.join("src");
+    if src_dir.exists() {
+        ar.append_dir_all("src", &src_dir)?;
+    }
+
+    let gz = ar.into_inner()?;
+    Ok(gz.finish()?)
+}
+
+fn cmd_publish(args: &[String]) -> Result<()> {
+    let mut registry_arg: Option<String> = None;
+    let mut token_arg:    Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--registry" => {
+                i += 1;
+                registry_arg = Some(args.get(i).cloned().ok_or_else(|| {
+                    anyhow::anyhow!("--registry requires a value")
+                })?);
+            }
+            "--token" => {
+                i += 1;
+                token_arg = Some(args.get(i).cloned().ok_or_else(|| {
+                    anyhow::anyhow!("--token requires a value")
+                })?);
+            }
+            other => bail!("unknown flag `{other}`"),
+        }
+        i += 1;
+    }
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    let (toml_path, toml_dir) = lex_syntax::find_manifest(&cwd)
+        .ok_or_else(|| anyhow::anyhow!("no lex.toml found (run `lex pkg init` to create one)"))?;
+
+    let manifest = lex_syntax::Manifest::load(&toml_path)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let pkg = manifest.package.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("lex.toml must have a [package] section"))?;
+
+    let registry = registry_arg
+        .or_else(|| pkg.registry.clone())
+        .ok_or_else(|| anyhow::anyhow!(
+            "no registry URL: pass --registry <url> or set `registry` in [package]"
+        ))?;
+
+    let token = token_arg
+        .or_else(|| std::env::var("LEX_PUBLISH_TOKEN").ok())
+        .ok_or_else(|| anyhow::anyhow!(
+            "no publish token: pass --token <jwt> or set LEX_PUBLISH_TOKEN"
+        ))?;
+
+    println!("publishing {}@{} to {} ...", pkg.name, pkg.version, registry);
+
+    let archive = build_archive(&toml_dir)
+        .map_err(|e| anyhow::anyhow!("building archive: {e}"))?;
+
+    let url = format!("{}/v1/pkg/publish", registry.trim_end_matches('/'));
+    let response = ureq::post(&url)
+        .header("Authorization", &format!("Bearer {token}"))
+        .header("Content-Type", "application/octet-stream")
+        .send(&archive[..])
+        .map_err(|e| anyhow::anyhow!("POST {url}: {e}"))?;
+
+    let status = response.status().as_u16();
+    let body: serde_json::Value = response
+        .into_body()
+        .read_json()
+        .map_err(|e| anyhow::anyhow!("reading response: {e}"))?;
+
+    if status != 200 {
+        bail!(
+            "publish failed (HTTP {status}): {}",
+            body.get("error").and_then(|v| v.as_str()).unwrap_or("unknown error")
+        );
+    }
+
+    let head_op = body.get("head_op").and_then(|v| v.as_str()).unwrap_or("(none)");
+    println!("published  head_op = {head_op}");
     Ok(())
 }
 
