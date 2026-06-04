@@ -3,7 +3,8 @@
 //! Commands:
 //!   lex pkg init                                       — create a starter lex.toml in the CWD
 //!   lex pkg add <name> --path <p>                      — add a path dependency
-//!   lex pkg add <name> --git  <url>                    — add a git dependency (clones on first use)
+//!   lex pkg add <name> --git <url> [--tag|--branch|--rev <ref>]
+//!                                                      — add a pinned git dependency
 //!   lex pkg add <name> --registry <url> --version <v>  — add a registry dependency
 //!   lex pkg list                                       — list dependencies in lex.toml
 //!   lex pkg publish [--registry <url>] [--token <jwt>] — publish package to a registry
@@ -41,7 +42,7 @@ version = "0.1.0"
 
 [dependencies]
 # lex-schema = {{ path = "../lex-schema" }}
-# lex-schema = {{ git = "https://github.com/alpibrusl/lex-schema" }}
+# lex-schema = {{ git = "https://github.com/alpibrusl/lex-schema", tag = "v1.0.0" }}
 "#
     );
     std::fs::write(toml_path, content)?;
@@ -52,28 +53,40 @@ version = "0.1.0"
 // ── lex pkg add ───────────────────────────────────────────────────────────────
 
 fn cmd_add(args: &[String]) -> Result<()> {
-    // Usage: lex pkg add <name> (--path <p> | --git <url> | --registry <url> --version <v>)
+    // Usage: lex pkg add <name> (--path <p> | --git <url> [--tag|--branch|--rev <ref>] | --registry <url> --version <v>)
     let name = args.first().ok_or_else(|| anyhow::anyhow!(
-        "usage: lex pkg add <name> (--path <p> | --git <url> | --registry <url> --version <v>)"))?;
+        "usage: lex pkg add <name> (--path <p> | --git <url> [--tag|--branch|--rev <ref>] | --registry <url> --version <v>)"))?;
 
     let mut path_val:     Option<String> = None;
     let mut git_val:      Option<String> = None;
+    let mut branch_val:   Option<String> = None;
+    let mut tag_val:      Option<String> = None;
+    let mut rev_val:      Option<String> = None;
     let mut registry_val: Option<String> = None;
     let mut version_val:  Option<String> = None;
+
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--path" => {
                 i += 1;
-                path_val = Some(args.get(i).cloned().ok_or_else(|| {
-                    anyhow::anyhow!("--path requires a value")
-                })?);
+                path_val = Some(args.get(i).cloned().ok_or_else(|| anyhow::anyhow!("--path requires a value"))?);
             }
             "--git" => {
                 i += 1;
-                git_val = Some(args.get(i).cloned().ok_or_else(|| {
-                    anyhow::anyhow!("--git requires a value")
-                })?);
+                git_val = Some(args.get(i).cloned().ok_or_else(|| anyhow::anyhow!("--git requires a value"))?);
+            }
+            "--branch" => {
+                i += 1;
+                branch_val = Some(args.get(i).cloned().ok_or_else(|| anyhow::anyhow!("--branch requires a value"))?);
+            }
+            "--tag" => {
+                i += 1;
+                tag_val = Some(args.get(i).cloned().ok_or_else(|| anyhow::anyhow!("--tag requires a value"))?);
+            }
+            "--rev" => {
+                i += 1;
+                rev_val = Some(args.get(i).cloned().ok_or_else(|| anyhow::anyhow!("--rev requires a value"))?);
             }
             "--registry" => {
                 i += 1;
@@ -92,9 +105,26 @@ fn cmd_add(args: &[String]) -> Result<()> {
         i += 1;
     }
 
+    // Validate: --branch/--tag/--rev only make sense with --git, and are mutually exclusive.
+    let has_ref = branch_val.is_some() || tag_val.is_some() || rev_val.is_some();
+    if has_ref && git_val.is_none() {
+        bail!("--branch, --tag, and --rev require --git");
+    }
+    let ref_count = [&branch_val, &tag_val, &rev_val].iter().filter(|o| o.is_some()).count();
+    if ref_count > 1 {
+        bail!("at most one of --branch, --tag, --rev may be specified");
+    }
+
     let dep_entry = match (path_val, git_val, registry_val, version_val) {
         (Some(p), None, None, None) => format!(r#"{{ path = "{p}" }}"#),
-        (None, Some(u), None, None) => format!(r#"{{ git = "{u}" }}"#),
+        (None, Some(u), None, None) => {
+            let mut parts = format!(r#"{{ git = "{u}""#);
+            if let Some(b) = branch_val { parts.push_str(&format!(r#", branch = "{b}""#)); }
+            if let Some(t) = tag_val    { parts.push_str(&format!(r#", tag = "{t}""#)); }
+            if let Some(r) = rev_val    { parts.push_str(&format!(r#", rev = "{r}""#)); }
+            parts.push_str(" }");
+            parts
+        }
         (None, None, Some(r), Some(v)) => format!(r#"{{ registry = "{r}", version = "{v}" }}"#),
         (None, None, Some(_), None) => bail!("--registry requires --version"),
         (None, None, None, Some(_)) => bail!("--version requires --registry"),
@@ -138,8 +168,15 @@ fn cmd_install() -> Result<()> {
                     errors.push(msg);
                 }
             }
-            lex_syntax::workspace::Dependency::Git { git } => {
-                print!("  {} (git)      {} ... ", name, git);
+            lex_syntax::workspace::Dependency::Git { git, branch, tag, rev } => {
+                let ref_desc = branch.as_deref()
+                    .map(|b| format!(" branch={b}"))
+                    .or_else(|| tag.as_deref().map(|t| format!(" tag={t}")))
+                    .or_else(|| rev.as_deref().map(|r| format!(" rev={}", &r[..r.len().min(12)])))
+                    .unwrap_or_default();
+                print!("  {} (git)      {}{} ... ", name, git, ref_desc);
+                // resolve_package_import triggers git_ensure_cached internally.
+                // We use a dummy module name — we only care about the side-effect.
                 let dummy_file = toml_dir.join("__install_probe__.lex");
                 match lex_syntax::workspace::resolve_package_import(&dummy_file, name, "__probe__") {
                     Ok(_) | Err(lex_syntax::PackageError::ModuleNotFound { .. }) => {
@@ -196,8 +233,13 @@ fn cmd_list() -> Result<()> {
         match dep {
             lex_syntax::workspace::Dependency::Path { path } =>
                 println!("  {name}  path     = {path}"),
-            lex_syntax::workspace::Dependency::Git { git } =>
-                println!("  {name}  git      = {git}"),
+            lex_syntax::workspace::Dependency::Git { git, branch, tag, rev } => {
+                let pin = branch.as_deref().map(|b| format!(" branch={b}"))
+                    .or_else(|| tag.as_deref().map(|t| format!(" tag={t}")))
+                    .or_else(|| rev.as_deref().map(|r| format!(" rev={}", &r[..r.len().min(12)])))
+                    .unwrap_or_else(|| " (unpinned — consider adding tag or rev)".into());
+                println!("  {name}  git      = {git}{pin}");
+            }
             lex_syntax::workspace::Dependency::Registry { registry, version } =>
                 println!("  {name}  registry = {registry}  version = {version}"),
         }

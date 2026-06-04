@@ -13,11 +13,18 @@
 //!
 //! [dependencies]
 //! lex-schema = { path = "../lex-schema" }
-//! # or:
-//! lex-schema = { git = "https://github.com/alpibrusl/lex-schema" }
-//! # or:
+//! # pin to a tag:
+//! lex-schema = { git = "https://github.com/alpibrusl/lex-schema", tag = "v1.2.0" }
+//! # pin to a commit:
+//! lex-schema = { git = "https://github.com/alpibrusl/lex-schema", rev = "abc1234" }
+//! # track a branch:
+//! lex-schema = { git = "https://github.com/alpibrusl/lex-schema", branch = "stable" }
+//! # or from a registry:
 //! lex-schema = { registry = "https://lexhub.alpibru.com", version = "0.9.2" }
 //! ```
+//!
+//! At most one of `tag`, `rev`, `branch` may be set; omitting all three
+//! clones the default branch at HEAD (not reproducible — pin for releases).
 //!
 //! ## Module resolution
 //!
@@ -28,7 +35,7 @@
 //! 2. Looks up `lex-schema` in `[dependencies]`.
 //! 3. For `path =`: resolves `{dep_path}/src/validate.lex`; falls back to
 //!    `{dep_path}/validate.lex` if `src/` doesn't exist.
-//! 4. For `git =`: clones the repo into `~/.lex/packages/lex-schema/`
+//! 4. For `git =`: clones the repo into `~/.lex/packages/lex-schema-<ref>/`
 //!    (once; subsequent loads hit the cache), then resolves the same way.
 
 use serde::Deserialize;
@@ -60,8 +67,29 @@ pub struct PackageMeta {
 #[serde(untagged)]
 pub enum Dependency {
     Path     { path: String },
-    Git      { git:  String },
+    Git      {
+        git:    String,
+        #[serde(default)]
+        branch: Option<String>,
+        #[serde(default)]
+        tag:    Option<String>,
+        #[serde(default)]
+        rev:    Option<String>,
+    },
     Registry { registry: String, version: String },
+}
+
+impl Dependency {
+    /// Return an error if more than one of branch/tag/rev is set.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Dependency::Git { branch, tag, rev, .. } = self {
+            let count = [branch, tag, rev].iter().filter(|o| o.is_some()).count();
+            if count > 1 {
+                return Err("at most one of `branch`, `tag`, `rev` may be set on a git dependency".into());
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Manifest {
@@ -131,7 +159,14 @@ pub fn resolve_package_import(
                 detail: e.to_string(),
             })?
         }
-        Dependency::Git { git } => git_ensure_cached(pkg_name, git)?,
+        Dependency::Git { git, branch, tag, rev } => {
+            dep.validate().map_err(|e| PackageError::ManifestParse {
+                path: toml_path.display().to_string(),
+                detail: e,
+            })?;
+            let git_ref = GitRef::from(branch.as_deref(), tag.as_deref(), rev.as_deref());
+            git_ensure_cached(pkg_name, git, &git_ref)?
+        }
         Dependency::Registry { registry, version } => {
             registry_ensure_cached(pkg_name, registry, version)?
         }
@@ -161,13 +196,49 @@ fn find_module_file(pkg_root: &Path, module_path: &str) -> Option<PathBuf> {
 
 // ── Git cache ─────────────────────────────────────────────────────────────────
 
+/// Parsed ref from a git dependency declaration.
+#[derive(Debug)]
+enum GitRef<'a> {
+    Branch(&'a str),
+    Tag(&'a str),
+    Rev(&'a str),
+    DefaultBranch,
+}
+
+impl<'a> GitRef<'a> {
+    fn from(branch: Option<&'a str>, tag: Option<&'a str>, rev: Option<&'a str>) -> Self {
+        if let Some(b) = branch { return GitRef::Branch(b); }
+        if let Some(t) = tag    { return GitRef::Tag(t); }
+        if let Some(r) = rev    { return GitRef::Rev(r); }
+        GitRef::DefaultBranch
+    }
+
+    /// Slug appended to the cache directory name to prevent collisions between
+    /// different refs of the same repo.
+    fn cache_slug(&self) -> String {
+        match self {
+            GitRef::Branch(b)    => format!("@branch-{}", sanitize_ref(b)),
+            GitRef::Tag(t)       => format!("@tag-{}", sanitize_ref(t)),
+            GitRef::Rev(r)       => format!("@rev-{}", &r[..r.len().min(12)]),
+            GitRef::DefaultBranch => String::new(),
+        }
+    }
+}
+
+/// Replace characters that are not safe in directory names.
+fn sanitize_ref(r: &str) -> String {
+    r.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '.' { c } else { '_' }).collect()
+}
+
 /// Return the local cache directory for `pkg_name`, cloning from `url`
-/// if it isn't there yet.
+/// at the given ref if it isn't there yet.
 ///
 /// Cache root: `$LEX_PACKAGES_DIR` if set, otherwise `~/.lex/packages/`.
-fn git_ensure_cached(pkg_name: &str, url: &str) -> Result<PathBuf, PackageError> {
+/// Cache key:  `{pkg_name}{ref_slug}` so different tags/revs don't collide.
+fn git_ensure_cached(pkg_name: &str, url: &str, git_ref: &GitRef<'_>) -> Result<PathBuf, PackageError> {
     let cache_root = packages_cache_dir()?;
-    let pkg_dir = cache_root.join(pkg_name);
+    let dir_name = format!("{}{}", pkg_name, git_ref.cache_slug());
+    let pkg_dir = cache_root.join(&dir_name);
     if pkg_dir.exists() {
         return Ok(pkg_dir);
     }
@@ -175,23 +246,52 @@ fn git_ensure_cached(pkg_name: &str, url: &str) -> Result<PathBuf, PackageError>
         path: cache_root.display().to_string(),
         detail: e.to_string(),
     })?;
+
+    let dest = pkg_dir.to_str().unwrap_or(&dir_name);
+
+    let status = match git_ref {
+        GitRef::Rev(rev) => {
+            // Shallow clone is not possible for arbitrary commits; do a full
+            // clone then check out the specific revision.
+            let s = run_git(&["clone", "--quiet", url, dest], url)?;
+            if s {
+                run_git(&["-C", dest, "checkout", "--quiet", rev], url)?;
+                true
+            } else {
+                false
+            }
+        }
+        GitRef::Tag(tag) => run_git(&["clone", "--quiet", "--depth=1", "--branch", tag, url, dest], url)?,
+        GitRef::Branch(branch) => run_git(&["clone", "--quiet", "--depth=1", "--branch", branch, url, dest], url)?,
+        GitRef::DefaultBranch  => run_git(&["clone", "--quiet", "--depth=1", url, dest], url)?,
+    };
+
+    if !status {
+        // Clean up partial clone so a retry doesn't hit the cache check above.
+        let _ = std::fs::remove_dir_all(&pkg_dir);
+        return Err(PackageError::GitFailed {
+            url: url.to_string(),
+            detail: "`git` exited with non-zero status".into(),
+        });
+    }
+
+    pkg_dir.canonicalize().map_err(|e| PackageError::Io {
+        path: pkg_dir.display().to_string(),
+        detail: e.to_string(),
+    })
+}
+
+/// Run a git command and return `Ok(true)` on success, `Ok(false)` on non-zero
+/// exit, or `Err` if git could not be spawned.
+fn run_git(args: &[&str], url: &str) -> Result<bool, PackageError> {
     let status = std::process::Command::new("git")
-        .args(["clone", "--depth=1", url, pkg_dir.to_str().unwrap_or(pkg_name)])
+        .args(args)
         .status()
         .map_err(|e| PackageError::GitFailed {
             url: url.to_string(),
             detail: format!("could not run `git`: {e}"),
         })?;
-    if !status.success() {
-        return Err(PackageError::GitFailed {
-            url: url.to_string(),
-            detail: format!("`git clone` exited with {status}"),
-        });
-    }
-    pkg_dir.canonicalize().map_err(|e| PackageError::Io {
-        path: pkg_dir.display().to_string(),
-        detail: e.to_string(),
-    })
+    Ok(status.success())
 }
 
 /// Download a registry package archive and extract it to the local cache.
