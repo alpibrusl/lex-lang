@@ -7,7 +7,74 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
-## [0.9.7] — 2026-05-30
+## [0.9.8] — 2026-06-04
+
+### Added
+
+- **Package registry — `lex pkg publish`.** Authors run `lex pkg publish
+  [--registry <url>] [--token <jwt>]` to pack `src/` + `lex.toml` into a
+  tar.gz and POST it to a LexHub registry. The registry URL and publish token
+  fall back to `[package].registry` in `lex.toml` and the
+  `LEX_PUBLISH_TOKEN` env var respectively, keeping CI friction low.
+- **`Dependency::Registry` in `lex.toml`.** Consumers declare
+  `pkg = { registry = "https://lexhub.alpibru.com", version = "0.9.2" }`;
+  the resolver downloads and caches the source archive on first use under
+  `~/.lex/packages/{name}-{version}/`.
+- **`lex pkg add --registry <url> --version <v>`.** Adds a registry
+  dependency entry from the CLI, alongside the existing `--path` and
+  `--git` forms.
+- **Versioned package storage in the API.** `PkgRecord` is now stored as
+  `packages/{name}/index.json` + `packages/{name}/{version}.json` +
+  `packages/{name}/{version}.tar.gz`, replacing the flat single-file
+  layout. Re-publishing the same `(name, version)` returns HTTP 409 to
+  keep the op log stable — bump the semver label to ship a new release.
+- **New package API endpoints.**
+  - `GET /v1/pkg/{name}/versions` — list all published versions + head_ops.
+  - `GET /v1/pkg/{name}/{version}` — specific version details.
+  - `GET /v1/pkg/{name}/{version}/archive` — download source tar.gz (used
+    by the registry resolver to populate the local cache).
+- **JIT tier-up — Cranelift MVP.** Hot bytecode functions are promoted to
+  native code via Cranelift through a trait-inversion hook on `JitVm`.
+  Benchmark: 84–194× on arithmetic-heavy ops over the interpreter baseline.
+  Feature-gated; opt in with `--features jit`. Slices 4–5 (inlining,
+  loop hoisting) are deferred.
+- **Trust lattice.** Effect-narrowing as subtyping: `[net("api.example.com")]
+  <: [net]`. Per-host egress allowlist for `net` effects; host matching in
+  the trust scoring path. Enables fine-grained capability delegation without
+  broadening signatures.
+- **`[package].description` and `[package].registry` fields in `lex.toml`.**
+  `description` is surfaced in registry listings; `registry` is the default
+  publish target so `lex pkg publish` works without a flag.
+- **Claude Code plugin** — lex-lang and lex-hub now ship a `.claude/`
+  plugin directory with pre-configured MCP server integration and agent
+  guidelines so Claude Code sessions start with the full toolchain context.
+
+### Performance
+
+- **Arena/slab lowering pass** — slice 2a/2b-i. Non-escaping values
+  allocated in a bump arena; `materialize-at-boundary` helper limits
+  heap spill to response edges. `alloc_heavy` −36%, `response_build` −10.7%.
+- **Slab-direct wire-up** — `net.serve_fn` skips `materialize` on the
+  common path; `Vm::get_record_field` / `get_tuple_elem` / `value_to_json`
+  operate directly on slab slots. `response_build` −59.2%.
+- **Deep-leaf widening (containment-tracking).** Escape lattice tracks
+  containment depth; deep trees widen to heap only at the outermost
+  boundary. `deep_tree` −55%.
+- **Per-path precision in escape lattice.** Each data-flow path carries
+  its own escape verdict instead of the join. `response_build` −10.7%
+  additional.
+
+### Fixed
+
+- **rcgen 0.14 API compatibility.** QUIC self-signed cert generation updated
+  to `rcgen 0.14`'s renamed `CertifiedKey::key_pair`.
+- **Criterion 0.8 deprecated `black_box`.** Replaced with
+  `std::hint::black_box` across all bench crates.
+- **CI de-flake.** Workspace tests run single-threaded (`-- --test-threads
+  1`); wall-clock budgets widened across the load-sensitive suite; HTTP
+  client test made load-tolerant.
+
+
 
 ### Added
 

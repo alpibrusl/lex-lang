@@ -36,6 +36,12 @@ The store is an append-only log of typed operations (`AddFunction`, `ModifyBody`
 **4. Coordination — session budgets, ProducerTrust, multi-agent.**
 Multiple proposers race via `Candidate / Promote` without CAS contention. Per-session budget gates cost across all participating agents. `ProducerTrust` scores tools against a rolling window of attestations.
 
+**5. JIT tier-up — Cranelift native compilation.**
+Hot functions are promoted from the bytecode interpreter to native code via Cranelift. Benchmark: 84–194× on arithmetic-heavy ops; pure computation falls through to native without interpreter overhead.
+
+**6. Package registry — publish and consume via LexHub.**
+`lex pkg publish` packs a `lex.toml` project and ships it to a registry. Consumers declare `{ registry = "…", version = "…" }` dependencies; the resolver downloads and caches the archive on first use. The canonical registry is [LexHub](https://lexhub.alpibru.com).
+
 ## Quickstart
 
 ```sh
@@ -62,6 +68,10 @@ curl -sX POST localhost:4040/v1/check \
   -H 'content-type: application/json' \
   -d '{"source":"fn add(x :: Int, y :: Int) -> Int { x + y }"}'
 # → {"ok": true}
+
+# Publish a package to LexHub.
+cd my-lex-project
+lex pkg publish --token $LEX_PUBLISH_TOKEN   # registry = "..." in lex.toml
 ```
 
 ## Examples
@@ -76,10 +86,36 @@ curl -sX POST localhost:4040/v1/check \
 | [`inbox_app.lex`](examples/inbox_app.lex) | Webhook router — adding a network call to the spam handler is a type error |
 | [`agent_dispatcher.lex`](examples/agent_dispatcher.lex) | `[proc]` effect with binary allow-list; typed argv |
 
+## Packages
+
+Packages published to [LexHub](https://lexhub.alpibru.com) — the canonical Lex package registry. Add them to `lex.toml` and run `lex pkg install`.
+
+| Package | Version | What it is |
+|---|---|---|
+| [**lex-schema**](https://github.com/alpibrusl/lex-schema) | 0.9.2 | Pydantic-style runtime validation, codegen, and schema utilities. `required_str`, `optional_*`, `ModelSchema`, JSON validation. |
+
+```toml
+# lex.toml
+[dependencies]
+lex-schema = { registry = "https://lexhub.alpibru.com", version = "0.9.2" }
+```
+
+**Publishing your own package:**
+
+```sh
+# lex.toml must have [package] name, version, and registry fields.
+lex pkg publish --token $LEX_PUBLISH_TOKEN
+```
+
+Tokens are issued by the LexHub operator. See [`lex-hub`](https://github.com/alpibrusl/lex-hub) for self-hosting.
+
 ## Ecosystem
+
+Tooling and runtime libraries that extend the Lex platform:
 
 | Package | What it is |
 |---|---|
+| [**lex-hub**](https://github.com/alpibrusl/lex-hub) | Multi-tenant SaaS gateway — JWT auth, per-tenant stores, package registry host |
 | [**lex-agent**](https://github.com/alpibrusl/lex-agent) | Google Agent2Agent (A2A) protocol — AgentCard, JSON-RPC 2.0, SSE streaming |
 | [**lex-llm**](https://github.com/alpibrusl/lex-llm) | LLM-agent runtime — Anthropic / OpenAI / Google / Ollama, multi-step tool-call loop |
 | [**lex-spec**](https://github.com/alpibrusl/lex-spec) | Capability-precondition DSL — randomized property check + SMT-LIB export |
@@ -93,7 +129,7 @@ curl -sX POST localhost:4040/v1/check \
 **Pre-built binaries** for Linux (x86_64 / aarch64), macOS (x86_64 / aarch64), and Windows are on [GitHub Releases](https://github.com/alpibrusl/lex-lang/releases):
 
 ```sh
-tar -xzf lex-v0.9.7-x86_64-unknown-linux-gnu.tar.gz
+tar -xzf lex-v0.9.8-x86_64-unknown-linux-gnu.tar.gz
 mv lex /usr/local/bin/
 lex version
 ```
@@ -101,8 +137,8 @@ lex version
 **Container image** — multi-arch (`linux/amd64` + `linux/arm64`):
 
 ```sh
-docker run -p 4040:4040 -v lex-store:/data ghcr.io/alpibrusl/lex:v0.9.7
-docker run --rm -v "$(pwd):/work" -w /work ghcr.io/alpibrusl/lex:v0.9.7 check src/main.lex
+docker run -p 4040:4040 -v lex-store:/data ghcr.io/alpibrusl/lex:v0.9.8
+docker run --rm -v "$(pwd):/work" -w /work ghcr.io/alpibrusl/lex:v0.9.8 check src/main.lex
 ```
 
 **From source** — requires Rust 1.80+:
@@ -120,12 +156,15 @@ All core capabilities are production-ready. Key highlights:
 - Content-addressed AST + typed Operation log (VCS tier-2)
 - Typed transforms: `ReplaceMatchArm`, `RenameLocal`, `InlineLet`, `ExtractFunction`
 - Closed repair loop: `lex repair --apply` + `RepairAttempt` attestation
+- JIT tier-up — Cranelift native compilation, 84–194× on hot arithmetic paths
+- Trust lattice — effect-narrowing as subtyping + per-host net egress allowlist
+- Package registry — `lex pkg publish` + `GET /v1/pkg/{name}/{version}/archive`
 - `std.conc` actors, `std.sql` (SQLite + Postgres), `std.crypto`, `std.redis`, `std.http`
 - Multi-agent `Candidate / Promote` + per-session budget gate
 - `lex-lsp` (VS Code), `lex-tea` web UI, ACLI compliance
 - Spec checker (randomized + SMT-LIB export), fuzz CI, conformance harness
 
-Deferred: `flow.parallel_record` (needs row polymorphism), VCS tier-3 federation, JIT slice 5, in-process Z3, store-native imports. Full table: [`docs/STATUS.md`](docs/STATUS.md).
+Deferred: `flow.parallel_record` (needs row polymorphism), VCS tier-3 federation, JIT slices 4–5, in-process Z3, store-native imports. Full table: [`docs/STATUS.md`](docs/STATUS.md).
 
 ## Docs
 
