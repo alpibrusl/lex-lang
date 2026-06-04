@@ -159,9 +159,35 @@ fn double(n :: Int) -> Int {
 }
 "#,
     );
-    let (code, out, err) = run(&[
+    let (code, out, _err) = run(&[
         "run", "--jit", path.to_str().unwrap(), "double", "21",
     ]);
-    assert_eq!(code, 0, "--jit alone failed: {err}");
+    assert_eq!(code, 0, "--jit alone failed");
     assert!(out.trim().contains("42"), "expected 42, got {out:?}");
+}
+
+#[test]
+fn jit_warns_about_step_limit_bypass() {
+    // Cursor[bot] follow-up: even without explicit `--max-steps`,
+    // `--jit` disables the VM's default step-limit DoS guard
+    // because JIT'd native loops don't bump the counter. We
+    // surface this as a stderr warning so interactive users see
+    // they've opted out of the guard; scripts that swallow stderr
+    // get the same opt-out but quietly.
+    let path = write_tempfile(
+        "arith4.lex",
+        r#"
+fn ident(n :: Int) -> Int {
+  n
+}
+"#,
+    );
+    let (code, _out, err) = run(&[
+        "run", "--jit", path.to_str().unwrap(), "ident", "1",
+    ]);
+    assert_eq!(code, 0, "--jit alone failed: {err}");
+    assert!(
+        err.contains("step-limit") || err.contains("step limit"),
+        "expected stderr warning about step-limit bypass, got: {err:?}"
+    );
 }

@@ -659,6 +659,25 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     // rather than silently falling back, so a `--jit` invocation that
     // can't actually JIT is loud.
     if f.jit {
+        // The explicit `--max-steps` bail above protects users who
+        // asked for a step cap. But `Vm::new` *also* installs a
+        // default 10M cap that the JIT silently bypasses once a hot
+        // loop tiers up — cursor[bot]'s follow-up review on this PR
+        // called that out. Saturate the cap to `u64::MAX` so the VM
+        // state honestly reflects "no step counting under --jit"
+        // instead of pretending a guard exists, and print a stderr
+        // warning so interactive users notice. The architectural fix
+        // (in-JIT counter check via multi-return ABI) is the same
+        // for both the explicit-cap and default-cap cases and is
+        // filed as a follow-up.
+        vm.set_step_limit(u64::MAX);
+        eprintln!(
+            "warning: --jit disables the VM step-limit DoS guard. \
+             JIT'd code runs native loops that bypass the per-op \
+             counter — do not pass untrusted Lex code to a host \
+             running with --jit unless you've sandboxed it some \
+             other way."
+        );
         let tier = lex_jit::JitTier::new(&bc)
             .map_err(|e| anyhow!("--jit: constructing JIT tier: {e}"))?;
         vm.set_jit_hook(Some(Box::new(tier)));
