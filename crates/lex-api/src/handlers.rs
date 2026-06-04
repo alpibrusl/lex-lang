@@ -397,6 +397,29 @@ fn route(
             let name = &p["/v1/pkg/".len()..p.len() - "/head".len()];
             pkg_head_handler(state, name)
         }
+        (Method::Get, p) if p.starts_with("/v1/pkg/") && p.ends_with("/versions") => {
+            let name = &p["/v1/pkg/".len()..p.len() - "/versions".len()];
+            pkg_versions_handler(state, name)
+        }
+        // /v1/pkg/{name}/{version}/archive — must match before the generic /{name}/{version}
+        (Method::Get, p) if p.starts_with("/v1/pkg/") && p.ends_with("/archive") => {
+            let inner = &p["/v1/pkg/".len()..p.len() - "/archive".len()];
+            // inner = "{name}/{version}"
+            if let Some((name, version)) = inner.split_once('/') {
+                pkg_archive_handler(state, name, version)
+            } else {
+                error_response(400, "expected /v1/pkg/{name}/{version}/archive")
+            }
+        }
+        // /v1/pkg/{name}/{version}
+        (Method::Get, p) if p.starts_with("/v1/pkg/") && p["/v1/pkg/".len()..].contains('/') => {
+            let inner = &p["/v1/pkg/".len()..];
+            if let Some((name, version)) = inner.split_once('/') {
+                pkg_get_version_handler(state, name, version)
+            } else {
+                error_response(400, "expected /v1/pkg/{name}/{version}")
+            }
+        }
         (Method::Get, p) if p.starts_with("/v1/pkg/") => {
             let name = &p["/v1/pkg/".len()..];
             pkg_get_handler(state, name)
@@ -1493,55 +1516,111 @@ pub(crate) fn attestations_since_handler(state: &State, query: &str)
 
 // ── Package concept (#4) ────────────────────────────────────────────────────
 
-/// Persistent record for a published package stored in
-/// `{store_root}/packages/{name}.json`.
+/// Per-version record stored at `{store_root}/packages/{name}/{version}.json`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PkgRecord {
     name: String,
     version: String,
     head_op: Option<String>,
     published_at: u64,
-    /// Function names introduced or updated by this package (for retract).
+    /// Function names introduced or updated by this version (for retract).
     function_names: Vec<String>,
-    /// Raw op JSON from each file publish (for inspection via GET /v1/pkg/{name}).
+    /// Raw op JSON from each file in this publish.
     ops: Vec<serde_json::Value>,
 }
 
-fn pkg_index_dir(root: &std::path::Path) -> PathBuf {
-    root.join("packages")
+/// Index stored at `{store_root}/packages/{name}/index.json`.
+///
+/// Tracks which versions have been published and which is "latest", so
+/// consumers can resolve `{name}@latest` without listing every file.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+struct PkgIndex {
+    /// The most recently published version string (human label, not OpId).
+    latest: Option<String>,
+    /// All published versions, newest-last.
+    versions: Vec<PkgVersionSummary>,
 }
 
-fn pkg_record_path(root: &std::path::Path, name: &str) -> PathBuf {
-    pkg_index_dir(root).join(format!("{}.json", name))
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PkgVersionSummary {
+    version: String,
+    head_op: Option<String>,
+    published_at: u64,
 }
 
-fn load_pkg_record(root: &std::path::Path, name: &str) -> Option<PkgRecord> {
-    let bytes = std::fs::read(pkg_record_path(root, name)).ok()?;
+fn pkg_name_dir(root: &std::path::Path, name: &str) -> PathBuf {
+    root.join("packages").join(name)
+}
+
+fn pkg_index_path(root: &std::path::Path, name: &str) -> PathBuf {
+    pkg_name_dir(root, name).join("index.json")
+}
+
+fn pkg_version_path(root: &std::path::Path, name: &str, version: &str) -> PathBuf {
+    pkg_name_dir(root, name).join(format!("{version}.json"))
+}
+
+fn pkg_archive_path(root: &std::path::Path, name: &str, version: &str) -> PathBuf {
+    pkg_name_dir(root, name).join(format!("{version}.tar.gz"))
+}
+
+fn load_pkg_index(root: &std::path::Path, name: &str) -> Option<PkgIndex> {
+    let bytes = std::fs::read(pkg_index_path(root, name)).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
-fn save_pkg_record(root: &std::path::Path, record: &PkgRecord) -> std::io::Result<()> {
-    let dir = pkg_index_dir(root);
-    std::fs::create_dir_all(&dir)?;
-    let bytes = serde_json::to_vec_pretty(record).unwrap_or_default();
-    std::fs::write(pkg_record_path(root, &record.name), bytes)
+fn load_pkg_record(root: &std::path::Path, name: &str, version: &str) -> Option<PkgRecord> {
+    let bytes = std::fs::read(pkg_version_path(root, name, version)).ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
-fn list_pkg_records(root: &std::path::Path) -> Vec<PkgRecord> {
-    let dir = pkg_index_dir(root);
+fn load_latest_pkg_record(root: &std::path::Path, name: &str) -> Option<PkgRecord> {
+    let index = load_pkg_index(root, name)?;
+    let latest = index.latest?;
+    load_pkg_record(root, name, &latest)
+}
+
+fn save_pkg_record(
+    root: &std::path::Path,
+    record: &PkgRecord,
+    archive: &[u8],
+) -> std::io::Result<()> {
+    let dir = pkg_name_dir(root, &record.name);
+    std::fs::create_dir_all(&dir)?;
+
+    // Per-version record.
+    let rec_bytes = serde_json::to_vec_pretty(record).unwrap_or_default();
+    std::fs::write(pkg_version_path(root, &record.name, &record.version), rec_bytes)?;
+
+    // Archive (tar.gz) for the download endpoint.
+    std::fs::write(pkg_archive_path(root, &record.name, &record.version), archive)?;
+
+    // Update the index.
+    let mut index = load_pkg_index(root, &record.name).unwrap_or_default();
+    index.latest = Some(record.version.clone());
+    if !index.versions.iter().any(|v| v.version == record.version) {
+        index.versions.push(PkgVersionSummary {
+            version: record.version.clone(),
+            head_op: record.head_op.clone(),
+            published_at: record.published_at,
+        });
+    }
+    let idx_bytes = serde_json::to_vec_pretty(&index).unwrap_or_default();
+    std::fs::write(pkg_index_path(root, &record.name), idx_bytes)
+}
+
+fn list_pkg_names(root: &std::path::Path) -> Vec<String> {
+    let dir = root.join("packages");
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
-    let mut records: Vec<PkgRecord> = entries
+    let mut names: Vec<String> = entries
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
-        .filter_map(|e| {
-            let bytes = std::fs::read(e.path()).ok()?;
-            serde_json::from_slice(&bytes).ok()
-        })
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().into_string().ok())
         .collect();
-    records.sort_by(|a, b| a.name.cmp(&b.name));
-    records
+    names.sort();
+    names
 }
 
 fn collect_lex_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
@@ -1675,6 +1754,17 @@ fn pkg_publish_handler(state: &State, body: &[u8]) -> Response<std::io::Cursor<V
         }
     }
 
+    // Reject re-publish of the same (name, version) to keep the op log stable.
+    if load_pkg_record(&state.root, &pkg_name, &pkg_version).is_some() {
+        return error_response(
+            409,
+            format!(
+                "package {pkg_name}@{pkg_version} already published; \
+                 bump the version in lex.toml to publish a new release"
+            ),
+        );
+    }
+
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1687,7 +1777,7 @@ fn pkg_publish_handler(state: &State, body: &[u8]) -> Response<std::io::Cursor<V
         function_names: all_function_names,
         ops: all_ops.clone(),
     };
-    if let Err(e) = save_pkg_record(&state.root, &record) {
+    if let Err(e) = save_pkg_record(&state.root, &record, body) {
         return error_response(500, format!("save package index: {e}"));
     }
 
@@ -1698,21 +1788,28 @@ fn pkg_publish_handler(state: &State, body: &[u8]) -> Response<std::io::Cursor<V
     }))
 }
 
-/// `GET /v1/pkg` — list packages published by this tenant.
+/// `GET /v1/pkg` — list packages published by this tenant (latest version of each).
 fn pkg_list_handler(state: &State) -> Response<std::io::Cursor<Vec<u8>>> {
-    let records = list_pkg_records(&state.root);
-    let packages: Vec<serde_json::Value> = records.iter().map(|r| serde_json::json!({
-        "name": r.name,
-        "version": r.version,
-        "head_op": r.head_op,
-        "published_at": r.published_at,
-    })).collect();
+    let names = list_pkg_names(&state.root);
+    let packages: Vec<serde_json::Value> = names.iter()
+        .filter_map(|name| {
+            let idx = load_pkg_index(&state.root, name)?;
+            let latest = idx.latest.as_deref()?;
+            let r = load_pkg_record(&state.root, name, latest)?;
+            Some(serde_json::json!({
+                "name": r.name,
+                "version": r.version,
+                "head_op": r.head_op,
+                "published_at": r.published_at,
+            }))
+        })
+        .collect();
     json_response(200, &serde_json::json!({ "packages": packages }))
 }
 
-/// `GET /v1/pkg/{name}` — list stages belonging to a package.
+/// `GET /v1/pkg/{name}` — latest version details for a package.
 fn pkg_get_handler(state: &State, name: &str) -> Response<std::io::Cursor<Vec<u8>>> {
-    match load_pkg_record(&state.root, name) {
+    match load_latest_pkg_record(&state.root, name) {
         Some(r) => json_response(200, &serde_json::json!({
             "name": r.name,
             "version": r.version,
@@ -1725,20 +1822,65 @@ fn pkg_get_handler(state: &State, name: &str) -> Response<std::io::Cursor<Vec<u8
     }
 }
 
-/// `GET /v1/pkg/{name}/head` — head op for a package's branch.
-fn pkg_head_handler(state: &State, name: &str) -> Response<std::io::Cursor<Vec<u8>>> {
-    match load_pkg_record(&state.root, name) {
+/// `GET /v1/pkg/{name}/versions` — all published versions for a package.
+fn pkg_versions_handler(state: &State, name: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    match load_pkg_index(&state.root, name) {
+        Some(idx) => json_response(200, &serde_json::json!({
+            "name": name,
+            "latest": idx.latest,
+            "versions": idx.versions,
+        })),
+        None => error_response(404, format!("package {name:?} not found")),
+    }
+}
+
+/// `GET /v1/pkg/{name}/{version}` — specific version details.
+fn pkg_get_version_handler(state: &State, name: &str, version: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    match load_pkg_record(&state.root, name, version) {
         Some(r) => json_response(200, &serde_json::json!({
             "name": r.name,
+            "version": r.version,
+            "head_op": r.head_op,
+            "published_at": r.published_at,
+            "function_names": r.function_names,
+            "ops": r.ops,
+        })),
+        None => error_response(404, format!("package {name:?}@{version:?} not found")),
+    }
+}
+
+/// `GET /v1/pkg/{name}/{version}/archive` — download the source tar.gz.
+fn pkg_archive_handler(state: &State, name: &str, version: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    let path = pkg_archive_path(&state.root, name, version);
+    match std::fs::read(&path) {
+        Ok(bytes) => Response::from_data(bytes)
+            .with_status_code(200)
+            .with_header(
+                tiny_http::Header::from_bytes(
+                    &b"Content-Type"[..],
+                    &b"application/gzip"[..],
+                )
+                .unwrap(),
+            ),
+        Err(_) => error_response(404, format!("archive for {name:?}@{version:?} not found")),
+    }
+}
+
+/// `GET /v1/pkg/{name}/head` — head op for a package's latest version.
+fn pkg_head_handler(state: &State, name: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    match load_latest_pkg_record(&state.root, name) {
+        Some(r) => json_response(200, &serde_json::json!({
+            "name": r.name,
+            "version": r.version,
             "head_op": r.head_op,
         })),
         None => error_response(404, format!("package {name:?} not found")),
     }
 }
 
-/// `DELETE /v1/pkg/{name}` — retract all stages introduced by a package.
+/// `DELETE /v1/pkg/{name}` — retract the latest version of a package.
 fn pkg_delete_handler(state: &State, name: &str) -> Response<std::io::Cursor<Vec<u8>>> {
-    let record = match load_pkg_record(&state.root, name) {
+    let record = match load_latest_pkg_record(&state.root, name) {
         Some(r) => r,
         None => return error_response(404, format!("package {name:?} not found")),
     };
@@ -1767,9 +1909,24 @@ fn pkg_delete_handler(state: &State, name: &str) -> Response<std::io::Cursor<Vec
 
     match store.publish_program(&branch, &[], &report, &empty_imports, false) {
         Ok(outcome) => {
-            let _ = std::fs::remove_file(pkg_record_path(&state.root, name));
+            // Remove the version record and archive, then update the index.
+            let ver = record.version.clone();
+            let _ = std::fs::remove_file(pkg_version_path(&state.root, name, &ver));
+            let _ = std::fs::remove_file(pkg_archive_path(&state.root, name, &ver));
+            // Update index: remove this version, set latest to previous if any.
+            if let Some(mut idx) = load_pkg_index(&state.root, name) {
+                idx.versions.retain(|v| v.version != ver);
+                idx.latest = idx.versions.last().map(|v| v.version.clone());
+                if idx.versions.is_empty() {
+                    let _ = std::fs::remove_dir_all(pkg_name_dir(&state.root, name));
+                } else {
+                    let bytes = serde_json::to_vec_pretty(&idx).unwrap_or_default();
+                    let _ = std::fs::write(pkg_index_path(&state.root, name), bytes);
+                }
+            }
             json_response(200, &serde_json::json!({
                 "deleted": name,
+                "version": ver,
                 "ops": outcome.ops,
                 "head_op": outcome.head_op,
             }))

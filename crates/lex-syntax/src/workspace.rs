@@ -15,6 +15,8 @@
 //! lex-schema = { path = "../lex-schema" }
 //! # or:
 //! lex-schema = { git = "https://github.com/alpibrusl/lex-schema" }
+//! # or:
+//! lex-schema = { registry = "https://lexhub.alpibru.com", version = "0.9.2" }
 //! ```
 //!
 //! ## Module resolution
@@ -47,13 +49,19 @@ pub struct PackageMeta {
     pub name: String,
     #[serde(default)]
     pub version: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Default registry URL for `lex pkg publish` when `--registry` is not supplied.
+    #[serde(default)]
+    pub registry: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum Dependency {
-    Path { path: String },
-    Git  { git:  String },
+    Path     { path: String },
+    Git      { git:  String },
+    Registry { registry: String, version: String },
 }
 
 impl Manifest {
@@ -124,6 +132,9 @@ pub fn resolve_package_import(
             })?
         }
         Dependency::Git { git } => git_ensure_cached(pkg_name, git)?,
+        Dependency::Registry { registry, version } => {
+            registry_ensure_cached(pkg_name, registry, version)?
+        }
     };
 
     find_module_file(&pkg_root, module_path).ok_or_else(|| PackageError::ModuleNotFound {
@@ -183,6 +194,75 @@ fn git_ensure_cached(pkg_name: &str, url: &str) -> Result<PathBuf, PackageError>
     })
 }
 
+/// Download a registry package archive and extract it to the local cache.
+///
+/// Cache path: `$LEX_PACKAGES_DIR/{name}-{version}/` (versioned to avoid
+/// collisions with git-cached packages at `{name}/`).
+///
+/// Download URL: `{registry}/v1/pkg/{name}/{version}/archive`
+fn registry_ensure_cached(
+    pkg_name: &str,
+    registry: &str,
+    version: &str,
+) -> Result<PathBuf, PackageError> {
+    let cache_root = packages_cache_dir()?;
+    // Registry packages are cached under `{name}-{version}` to keep multiple
+    // versions side-by-side and separate from git-cached directories.
+    let pkg_dir = cache_root.join(format!("{pkg_name}-{version}"));
+    if pkg_dir.exists() {
+        return Ok(pkg_dir);
+    }
+    std::fs::create_dir_all(&cache_root).map_err(|e| PackageError::Io {
+        path: cache_root.display().to_string(),
+        detail: e.to_string(),
+    })?;
+
+    let url = format!(
+        "{}/v1/pkg/{}/{}/archive",
+        registry.trim_end_matches('/'),
+        pkg_name,
+        version,
+    );
+    let response = ureq::get(&url).call().map_err(|e| PackageError::RegistryFailed {
+        name: pkg_name.to_string(),
+        registry: registry.to_string(),
+        version: version.to_string(),
+        detail: format!("GET {url}: {e}"),
+    })?;
+    if response.status() != 200 {
+        return Err(PackageError::RegistryFailed {
+            name: pkg_name.to_string(),
+            registry: registry.to_string(),
+            version: version.to_string(),
+            detail: format!("GET {url} returned HTTP {}", response.status()),
+        });
+    }
+
+    let archive_bytes = response
+        .into_body()
+        .read_to_vec()
+        .map_err(|e| PackageError::RegistryFailed {
+            name: pkg_name.to_string(),
+            registry: registry.to_string(),
+            version: version.to_string(),
+            detail: format!("reading response body: {e}"),
+        })?;
+
+    let gz = flate2::read::GzDecoder::new(std::io::Cursor::new(&archive_bytes));
+    let mut ar = tar::Archive::new(gz);
+    ar.unpack(&pkg_dir).map_err(|e| PackageError::RegistryFailed {
+        name: pkg_name.to_string(),
+        registry: registry.to_string(),
+        version: version.to_string(),
+        detail: format!("extracting archive: {e}"),
+    })?;
+
+    pkg_dir.canonicalize().map_err(|e| PackageError::Io {
+        path: pkg_dir.display().to_string(),
+        detail: e.to_string(),
+    })
+}
+
 fn packages_cache_dir() -> Result<PathBuf, PackageError> {
     if let Ok(dir) = std::env::var("LEX_PACKAGES_DIR") {
         return Ok(PathBuf::from(dir));
@@ -214,6 +294,9 @@ pub enum PackageError {
 
     #[error("git clone of {url} failed: {detail}")]
     GitFailed { url: String, detail: String },
+
+    #[error("registry fetch of {name}@{version} from {registry} failed: {detail}")]
+    RegistryFailed { name: String, registry: String, version: String, detail: String },
 
     #[error("I/O error at {path}: {detail}")]
     Io { path: String, detail: String },
