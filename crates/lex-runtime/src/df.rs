@@ -138,7 +138,7 @@ fn from_polars(df: &DataFrame) -> Result<RecordBatch, String> {
             PlDt::Int64 => {
                 let v: Vec<Option<i64>> = s.i64()
                     .map_err(|e| format!("df: column `{name}` as i64: {e}"))?
-                    .into_iter().collect();
+                    .iter().collect();
                 (
                     Field::new(name, ArrowDt::Int64, true),
                     Arc::new(Int64Array::from(v)),
@@ -147,7 +147,7 @@ fn from_polars(df: &DataFrame) -> Result<RecordBatch, String> {
             PlDt::Float64 => {
                 let v: Vec<Option<f64>> = s.f64()
                     .map_err(|e| format!("df: column `{name}` as f64: {e}"))?
-                    .into_iter().collect();
+                    .iter().collect();
                 (
                     Field::new(name, ArrowDt::Float64, true),
                     Arc::new(Float64Array::from(v)),
@@ -156,7 +156,7 @@ fn from_polars(df: &DataFrame) -> Result<RecordBatch, String> {
             PlDt::String => {
                 let v: Vec<Option<String>> = s.str()
                     .map_err(|e| format!("df: column `{name}` as Utf8: {e}"))?
-                    .into_iter().map(|x| x.map(|s| s.to_string())).collect();
+                    .iter().map(|x| x.map(|s| s.to_string())).collect();
                 (
                     Field::new(name, ArrowDt::Utf8, true),
                     Arc::new(StringArray::from(v)),
@@ -167,7 +167,7 @@ fn from_polars(df: &DataFrame) -> Result<RecordBatch, String> {
             PlDt::UInt32 => {
                 let v: Vec<Option<i64>> = s.u32()
                     .map_err(|e| format!("df: column `{name}` as u32: {e}"))?
-                    .into_iter().map(|x| x.map(|n| n as i64)).collect();
+                    .iter().map(|x| x.map(|n| n as i64)).collect();
                 (
                     Field::new(name, ArrowDt::Int64, true),
                     Arc::new(Int64Array::from(v)),
