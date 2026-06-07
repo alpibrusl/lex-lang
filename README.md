@@ -37,7 +37,7 @@ The store is an append-only log of typed operations (`AddFunction`, `ModifyBody`
 Multiple proposers race via `Candidate / Promote` without CAS contention. Per-session budget gates cost across all participating agents. `ProducerTrust` scores tools against a rolling window of attestations.
 
 **5. JIT tier-up — Cranelift native compilation.**
-Hot functions are promoted from the bytecode interpreter to native code via Cranelift. Benchmark: 84–194× on arithmetic-heavy ops; pure computation falls through to native without interpreter overhead.
+Hot functions are promoted from the bytecode interpreter to native code via Cranelift. The current backend is a phase-1 MVP covering an op subset (pure-int arithmetic; no closures/records yet). On that subset a steady-state micro-benchmark shows 84–194× over the interpreter — a *lower bound* for JIT ROI; real programs land between that and 1× ([`crates/lex-jit/benches`](crates/lex-jit/benches), [`docs/design/jit-roadmap.md`](docs/design/jit-roadmap.md)).
 
 **6. Package registry — publish and consume via LexHub.**
 `lex pkg publish` packs a `lex.toml` project and ships it to a registry. Consumers declare `{ registry = "…", version = "…" }` dependencies; the resolver downloads and caches the archive on first use. The canonical registry is [LexHub](https://lexhub.alpibru.com).
@@ -62,7 +62,7 @@ lex agent-tool --allow-effects net --input "url" \
   --body 'match io.read("/etc/passwd") { Ok(s) => s, Err(e) => e }'
 # → TYPE-CHECK REJECTED  exit 2
 
-# Start the HTTP/JSON agent API on :4040.
+# Start the HTTP/JSON agent API on :4040 (add --mcp for a stdio MCP server).
 lex serve &
 curl -sX POST localhost:4040/v1/check \
   -H 'content-type: application/json' \
@@ -150,21 +150,21 @@ cargo test --workspace
 
 ## Status
 
-All core capabilities are production-ready. Key highlights:
+The core language, sandbox, VCS, and registry are stable and exercised in CI; the Cranelift JIT is an MVP (see below). Key highlights:
 
 - Effect-typed sandbox — 7/7 adversarial blocks pre-execution
 - Content-addressed AST + typed Operation log (VCS tier-2)
 - Typed transforms: `ReplaceMatchArm`, `RenameLocal`, `InlineLet`, `ExtractFunction`
 - Closed repair loop: `lex repair --apply` + `RepairAttempt` attestation
-- JIT tier-up — Cranelift native compilation, 84–194× on hot arithmetic paths
+- JIT tier-up — Cranelift native compilation (phase-1 MVP, op subset), 84–194× on hot arithmetic paths
 - Trust lattice — effect-narrowing as subtyping + per-host net egress allowlist
 - Package registry — `lex pkg publish` + `GET /v1/pkg/{name}/{version}/archive`
 - `std.conc` actors, `std.sql` (SQLite + Postgres), `std.crypto`, `std.redis`, `std.http`
 - Multi-agent `Candidate / Promote` + per-session budget gate
-- `lex-lsp` (VS Code), `lex-tea` web UI, ACLI compliance
+- `lex-lsp` language server (LSP — VS Code, Cursor, Zed, JetBrains, …), `lex-tea` web UI, MCP server (`lex serve --mcp`), ACLI compliance
 - Spec checker (randomized + SMT-LIB export), fuzz CI, conformance harness
 
-Deferred: `flow.parallel_record` (needs row polymorphism), VCS tier-3 federation, JIT slices 4–5, in-process Z3, store-native imports. Full table: [`docs/STATUS.md`](docs/STATUS.md).
+Deferred: `flow.parallel_record` (needs row polymorphism), VCS tier-3 federation, JIT slice 5, in-process Z3, store-native imports. Full table: [`docs/STATUS.md`](docs/STATUS.md).
 
 ## Docs
 
