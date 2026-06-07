@@ -13,3 +13,6 @@ corpus/parser/*
 corpus/type_checker/*
 !corpus/parser/seed_*.lex
 !corpus/type_checker/seed_*.lex
+!corpus/effect_soundness/
+corpus/effect_soundness/*
+!corpus/effect_soundness/seed_*

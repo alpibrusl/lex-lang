@@ -26,3 +26,10 @@ path = "fuzz_targets/type_checker.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "effect_soundness"
+path = "fuzz_targets/effect_soundness.rs"
+test = false
+doc = false
+bench = false
