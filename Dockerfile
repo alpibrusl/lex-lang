@@ -37,7 +37,7 @@ FROM debian:bookworm-slim AS runtime
 # `[mcp]` calls a Lex program might make. Add ca-certificates +
 # tini for clean signal handling on `docker stop`.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates tini \
+ && apt-get install -y --no-install-recommends ca-certificates tini git \
  && rm -rf /var/lib/apt/lists/*
 
 # Non-root user owns /data so a host volume mount with the
