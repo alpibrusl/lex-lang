@@ -117,8 +117,11 @@ fn greet(p :: Person) -> Str {
 }
 
 #[test]
-fn jit_flag_works_with_other_run_flags() {
-    // Smoke: --jit composes with --max-steps.
+fn jit_refuses_explicit_max_steps() {
+    // Security guard (cursor[bot] medium-severity review on #608):
+    // JIT'd code runs native loops that don't bump `Vm::steps`, so
+    // `--max-steps` would be silently bypassed. The CLI rejects the
+    // combination rather than degrade the documented DoS guard.
     let path = write_tempfile(
         "arith2.lex",
         r#"
@@ -127,7 +130,7 @@ fn double(n :: Int) -> Int {
 }
 "#,
     );
-    let (code, out, err) = run(&[
+    let (code, _out, err) = run(&[
         "run",
         "--jit",
         "--max-steps",
@@ -136,6 +139,55 @@ fn double(n :: Int) -> Int {
         "double",
         "21",
     ]);
-    assert_eq!(code, 0, "jit + --max-steps failed: {err}");
+    assert_ne!(code, 0, "expected --jit + --max-steps to fail, succeeded: {err}");
+    assert!(
+        err.contains("mutually exclusive"),
+        "expected error to explain the incompatibility, got: {err:?}"
+    );
+}
+
+#[test]
+fn jit_composes_with_unrelated_flags() {
+    // Sanity: `--jit` alone works (no `--max-steps`). This is the
+    // common-path replacement for the prior test that combined
+    // `--jit --max-steps`, which is now rejected.
+    let path = write_tempfile(
+        "arith3.lex",
+        r#"
+fn double(n :: Int) -> Int {
+  n + n
+}
+"#,
+    );
+    let (code, out, _err) = run(&[
+        "run", "--jit", path.to_str().unwrap(), "double", "21",
+    ]);
+    assert_eq!(code, 0, "--jit alone failed");
     assert!(out.trim().contains("42"), "expected 42, got {out:?}");
+}
+
+#[test]
+fn jit_warns_about_step_limit_bypass() {
+    // Cursor[bot] follow-up: even without explicit `--max-steps`,
+    // `--jit` disables the VM's default step-limit DoS guard
+    // because JIT'd native loops don't bump the counter. We
+    // surface this as a stderr warning so interactive users see
+    // they've opted out of the guard; scripts that swallow stderr
+    // get the same opt-out but quietly.
+    let path = write_tempfile(
+        "arith4.lex",
+        r#"
+fn ident(n :: Int) -> Int {
+  n
+}
+"#,
+    );
+    let (code, _out, err) = run(&[
+        "run", "--jit", path.to_str().unwrap(), "ident", "1",
+    ]);
+    assert_eq!(code, 0, "--jit alone failed: {err}");
+    assert!(
+        err.contains("step-limit") || err.contains("step limit"),
+        "expected stderr warning about step-limit bypass, got: {err:?}"
+    );
 }
