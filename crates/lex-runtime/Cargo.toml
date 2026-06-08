@@ -54,7 +54,7 @@ rcgen  = { version = "0.14", optional = true, default-features = false, features
 toml = "1.1"
 serde_yaml = "0.9"
 csv = "1"
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 postgres = "0.19"
 redis = "1.2"
 arrow-array = "58"
