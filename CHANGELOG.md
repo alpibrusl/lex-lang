@@ -7,6 +7,30 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.9.9] — 2026-06-08
+
+### Fixed
+
+- **JIT + `--max-steps` are now mutually exclusive (#609).** The JIT runs
+  native loops that bypass `Vm::steps`, so `--max-steps` (the DoS guard for
+  the `agent-tool` sandbox) was silently ignored once a hot loop tiered up.
+  `lex run --jit --max-steps N` now exits with a clear error. Users who need
+  a step cap should drop `--jit`; users who need max throughput should drop
+  `--max-steps`. The architectural fix (passing the step counter into JIT'd
+  code at every backward jump) is tracked as a follow-up.
+- **`lex-runtime` Polars 0.54 compatibility (#612).** Polars 0.54 removed the
+  borrowed `IntoIterator` impl used by `std.df` when converting dataframe
+  columns back to Arrow arrays. Updated to use the explicit chunked-array
+  iterators. Unblocks the Polars 0.54.4 dependency bump (#610).
+
+### Dependencies
+
+- **rusqlite 0.39 → 0.40.1 (#611).** Includes bundled SQLite 3.53.2,
+  a SAVEPOINT-name SQL-injection fix (upstream rusqlite#1854), and hashlink
+  version bump. No API changes to `std.sql`.
+- **polars 0.53 → 0.54.4 (#610).** Streaming engine stabilized, nested
+  common subplan elimination, LazyFrame.gather, AsOf join streaming support.
+
 ## [0.9.8] — 2026-06-04
 
 ### Added
@@ -74,7 +98,7 @@ bumps may carry breaking changes when justified).
   1`); wall-clock budgets widened across the load-sensitive suite; HTTP
   client test made load-tolerant.
 
-
+## [0.9.7] — 2026-05-30
 
 ### Added
 
