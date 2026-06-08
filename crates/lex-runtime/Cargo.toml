@@ -68,7 +68,7 @@ parquet = { version = "58", default-features = false, features = ["arrow", "snap
 # `strings`; add `temporal` explicitly so `strings`'s string ops still
 # compile. Found the hard way during the arrow-55→58 / polars-0.50→0.53
 # coordinated bump.
-polars = { version = "0.53", optional = true, default-features = false, features = ["lazy", "is_in", "csv", "performant", "strings", "temporal"] }
+polars = { version = "0.54", optional = true, default-features = false, features = ["lazy", "is_in", "csv", "performant", "strings", "temporal"] }
 lex-bytecode = { path = "../lex-bytecode", version = "0.9.6" }
 smol_str = { workspace = true }
 
