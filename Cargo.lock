@@ -2511,7 +2511,10 @@ dependencies = [
  "cranelift-native",
  "criterion",
  "indexmap",
+ "lex-ast",
  "lex-bytecode",
+ "lex-syntax",
+ "lex-types",
  "thiserror 2.0.18",
 ]
 
