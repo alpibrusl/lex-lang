@@ -7,10 +7,10 @@
 //! license header that may itself be only 32 chars. A real Rubric
 //! port tripped on this against a 32-char LICENSE file.
 //!
-//! New behaviour: `hi` is clamped to `s.len()`, `lo` is clamped to
-//! `[0, s.len()]`. `lo > hi` after clamping still errors (caller
-//! logic bug). A mid-codepoint `lo` after clamping still errors so
-//! silent UTF-8 truncation never sneaks through.
+//! New behaviour (updated 2026-06-09, #620): indices are codepoint
+//! (Unicode scalar value) positions, not byte offsets. `hi` past the
+//! codepoint count clamps to the end; negative `lo`/`hi` clamp to 0.
+//! `lo > hi` after clamping still errors (caller logic bug).
 
 use lex_ast::canonicalize_program;
 use lex_bytecode::{compile_program, vm::Vm, Value};
@@ -100,17 +100,25 @@ fn lo_greater_than_hi_after_clamping_errors() {
 }
 
 #[test]
-fn mid_codepoint_lo_still_errors() {
-    // "héllo" is 6 bytes (h-é(0xc3 0xa9)-l-l-o). lo=2 lands inside
-    // 'é'. Clamping is purely length-based; UTF-8 boundary errors
-    // remain so callers don't accidentally produce ill-formed
-    // strings.
-    let err = run(SRC, "slice", vec![
+fn multibyte_codepoint_slice_works() {
+    // "héllo" is 6 bytes (h=1B, é=2B, l=1B, l=1B, o=1B).
+    // Codepoint indices: h=0, é=1, l=2, l=3, o=4.
+    // slice(s, 1, 4) should return "éll" (codepoints 1..4). (#620)
+    let v = run(SRC, "slice", vec![
         Value::Str("héllo".into()),
-        Value::Int(2), Value::Int(5),
-    ]).unwrap_err();
-    assert!(err.contains("char boundaries"),
-        "expected char-boundary error, got: {err}");
+        Value::Int(1), Value::Int(4),
+    ]).unwrap();
+    assert_eq!(v, Value::Str("éll".into()));
+}
+
+#[test]
+fn multibyte_full_string_slice() {
+    // Slicing the full codepoint range of a multi-byte string returns it unchanged.
+    let v = run(SRC, "slice", vec![
+        Value::Str("héllo".into()),
+        Value::Int(0), Value::Int(5),
+    ]).unwrap();
+    assert_eq!(v, Value::Str("héllo".into()));
 }
 
 #[test]
