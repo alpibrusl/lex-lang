@@ -354,6 +354,32 @@ impl Value {
         match self { Value::Str(s) => s, other => panic!("expected Str, got {other:?}") }
     }
 
+    /// Returns `true` if this value is, or transitively contains, an
+    /// `ArenaRecord` or `ArenaTuple`. Used by the memo gate to skip
+    /// memoization when request-scoped arena handles are present in the
+    /// call arguments — such values cannot be safely hashed because the
+    /// memo cache outlives the request arena (#621).
+    pub fn contains_arena_record(&self) -> bool {
+        match self {
+            Value::ArenaRecord { .. } | Value::ArenaTuple { .. } => true,
+            Value::List(items) =>
+                items.iter().any(|v| v.contains_arena_record()),
+            Value::Tuple(items) =>
+                items.iter().any(|v| v.contains_arena_record()),
+            Value::Deque(items) =>
+                items.iter().any(|v| v.contains_arena_record()),
+            Value::Variant { args, .. } =>
+                args.iter().any(|v| v.contains_arena_record()),
+            Value::Record { fields, .. } =>
+                fields.values().any(|v| v.contains_arena_record()),
+            Value::Closure { captures, .. } =>
+                captures.iter().any(|v| v.contains_arena_record()),
+            Value::Map(m) =>
+                m.values().any(|v| v.contains_arena_record()),
+            _ => false,
+        }
+    }
+
     /// Render this `Value` as a `serde_json::Value` for emission to
     /// CLI output, the agent API, conformance harness reports, etc.
     /// Canonical mapping shared across crates; previously every
