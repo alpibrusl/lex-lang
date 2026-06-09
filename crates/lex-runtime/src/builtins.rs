@@ -162,29 +162,24 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             })
         }
         ("str", "slice") => {
-            // Half-open byte-range slice. `hi` is clamped to `s.len()`
-            // and a negative `lo` / `hi` clamps to `0`, mirroring
-            // Python's `s[lo:hi]` semantics (and matching what
-            // production users expect when slicing fixed sizes off
-            // a possibly-shorter string — e.g. the first 64 chars
-            // of a license header). Reversed ranges (`lo > hi` after
-            // clamping) error since that's a caller logic bug. A
-            // mid-codepoint `lo` after clamping still errors so
-            // silent UTF-8 truncation never sneaks through.
+            // Half-open codepoint-index slice. `lo` and `hi` are Unicode
+            // scalar value (codepoint) indices, not byte offsets. Out-of-range
+            // indices clamp to the codepoint count, mirroring Python's `s[lo:hi]`
+            // semantics. Reversed ranges error as a caller logic bug. (#620)
             let s = expect_str(args.first())?;
             let lo_i = expect_int(args.get(1))?;
             let hi_i = expect_int(args.get(2))?;
-            let lo = (lo_i.max(0) as usize).min(s.len());
-            let hi = (hi_i.max(0) as usize).min(s.len());
-            if lo > hi {
+            let lo_cp = lo_i.max(0) as usize;
+            let hi_cp = hi_i.max(0) as usize;
+            if lo_cp > hi_cp {
                 return Err(format!(
-                    "str.slice: reversed range [{lo}..{hi}] (after clamping to len {})",
-                    s.len()));
+                    "str.slice: reversed range [{lo_cp}..{hi_cp}]"));
             }
-            if !s.is_char_boundary(lo) || !s.is_char_boundary(hi) {
-                return Err(format!("str.slice: [{lo}..{hi}] not on char boundaries"));
-            }
-            Ok(Value::Str(s[lo..hi].into()))
+            // Resolve codepoint indices to byte offsets in a single pass.
+            // Indices past the end clamp to s.len(), yielding an empty slice.
+            let lo_byte = s.char_indices().nth(lo_cp).map(|(b, _)| b).unwrap_or(s.len());
+            let hi_byte = s.char_indices().nth(hi_cp).map(|(b, _)| b).unwrap_or(s.len());
+            Ok(Value::Str(s[lo_byte..hi_byte].into()))
         }
 
         // -- int / float --

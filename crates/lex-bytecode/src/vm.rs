@@ -2399,6 +2399,10 @@ impl<'a> Vm<'a> {
                     let memo_key: Option<(u32, [u8; 16])> =
                         if self.program.functions[fid].effects.is_empty()
                             && self.memo_fn_state[fid].enabled
+                            // #621: skip memo if any arg contains a request-scoped
+                            // arena handle. The memo cache outlives the request arena,
+                            // so hashing such a handle would dangle.
+                            && !self.stack[args_base..].iter().any(|v| v.contains_arena_record())
                         {
                             Some((fn_id, hash_call_args(&self.stack[args_base..])))
                         } else {
