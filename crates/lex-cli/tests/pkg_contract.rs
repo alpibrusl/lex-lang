@@ -159,6 +159,98 @@ fn verify_rejects_a_tampered_contract() {
 }
 
 #[test]
+fn publish_can_derive_the_grant_from_typed_effects() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pkg = tmp.path().join("pkg");
+    std::fs::create_dir_all(pkg.join("src")).unwrap();
+    std::fs::write(
+        pkg.join("lex.toml"),
+        "[package]\nname = \"lex-weather\"\nversion = \"1.2.0\"\n",
+    )
+    .unwrap();
+    // Declared effect rows: fs_read + host-scoped + bare net. No --requires.
+    std::fs::write(
+        pkg.join("src/main.lex"),
+        "fn fetch() -> [net(\"api.weather.example\"), fs_read] Int { 0 }\nfn main() -> [net] Int { fetch() }\n",
+    )
+    .unwrap();
+
+    let contract = tmp.path().join("contract.json");
+    let archive = tmp.path().join("art.tar");
+    let out = Command::new(lex_bin())
+        .current_dir(&pkg)
+        .args([
+            "pkg",
+            "publish",
+            "--sign",
+            SECRET,
+            "--derive-grant",
+            "--contract-out",
+            contract.to_str().unwrap(),
+            "--archive-out",
+            archive.to_str().unwrap(),
+            "--no-upload",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "derive publish failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The contract requires exactly the least authority the effects imply.
+    let signed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&contract).unwrap()).unwrap();
+    let c = &signed["contract"];
+    assert_eq!(c["requires"]["filesystem"], "ReadOnly");
+    assert_eq!(c["requires"]["network"], "Allowlist");
+    assert_eq!(c["requires"]["exec"], "None");
+    assert_eq!(c["egress"][0], "api.weather.example");
+
+    // And it verifies (signature + content_hash) under the publisher's key.
+    let keyring = write_keyring(tmp.path(), &[&signer_pubkey()]);
+    let v = verify(&contract, &archive, Some(&keyring));
+    assert!(
+        v.status.success(),
+        "derived contract should verify: {}",
+        String::from_utf8_lossy(&v.stderr)
+    );
+}
+
+#[test]
+fn publish_rejects_requires_and_derive_together() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pkg = tmp.path().join("pkg");
+    std::fs::create_dir_all(pkg.join("src")).unwrap();
+    std::fs::write(
+        pkg.join("lex.toml"),
+        "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(pkg.join("src/main.lex"), "fn main() -> Int { 0 }\n").unwrap();
+    let grant = tmp.path().join("grant.json");
+    std::fs::write(&grant, "{\"filesystem\":\"None\",\"network\":\"None\",\"exec\":\"None\"}\n").unwrap();
+
+    let out = Command::new(lex_bin())
+        .current_dir(&pkg)
+        .args([
+            "pkg",
+            "publish",
+            "--sign",
+            SECRET,
+            "--derive-grant",
+            "--requires",
+            grant.to_str().unwrap(),
+            "--no-upload",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("mutually exclusive"));
+}
+
+#[test]
 fn verify_rejects_an_untrusted_signer() {
     let tmp = tempfile::tempdir().unwrap();
     let (contract, archive) = publish_signed(tmp.path());

@@ -293,6 +293,10 @@ fn cmd_publish(args: &[String]) -> Result<()> {
     let mut egress_arg:   Vec<String>    = Vec::new();
     let mut contract_out: Option<String> = None;
     let mut archive_out:  Option<String> = None;
+    // Derive the required grant from the entrypoint's typed effects instead of
+    // declaring it with --requires.
+    let mut derive_grant = false;
+    let mut entrypoint:   Option<String> = None;
     let mut no_upload = false;
     let mut i = 0;
     while i < args.len() {
@@ -340,6 +344,13 @@ fn cmd_publish(args: &[String]) -> Result<()> {
                     anyhow::anyhow!("--archive-out requires a path")
                 })?);
             }
+            "--derive-grant" => derive_grant = true,
+            "--entrypoint" => {
+                i += 1;
+                entrypoint = Some(args.get(i).cloned().ok_or_else(|| {
+                    anyhow::anyhow!("--entrypoint requires a path (relative to lex.toml, default src/main.lex)")
+                })?);
+            }
             "--no-upload" => no_upload = true,
             other => bail!("unknown flag `{other}`"),
         }
@@ -371,10 +382,41 @@ fn cmd_publish(args: &[String]) -> Result<()> {
 
     // ── Provenance: emit a signed capability contract ──────────────────────
     if let Some(key_spec) = &sign_arg {
-        let requires_path = requires_arg.as_ref().ok_or_else(|| anyhow::anyhow!(
-            "--sign requires --requires <grant.json> (the capability the package needs)"
-        ))?;
-        let requires = load_grant(requires_path)?;
+        if derive_grant && requires_arg.is_some() {
+            bail!("--derive-grant and --requires are mutually exclusive (derive from code, or declare)");
+        }
+        // The grant the contract requires: derived from the entrypoint's typed
+        // effects, or declared via --requires.
+        let (requires, mut egress) = if derive_grant {
+            let entry_rel = entrypoint.as_deref().unwrap_or("src/main.lex");
+            let entry_path = toml_dir.join(entry_rel);
+            let source = std::fs::read_to_string(&entry_path).with_context(|| {
+                format!("reading entrypoint {} for --derive-grant", entry_path.display())
+            })?;
+            let (grant, derived_egress) =
+                crate::capsule_contract::derive_grant_from_source(&source)
+                    .map_err(|e| anyhow::anyhow!("deriving grant from {entry_rel}: {e}"))?;
+            println!(
+                "derived grant from {entry_rel}:  fs={}  net={}  exec={}",
+                grant.filesystem.as_str(),
+                grant.network.as_str(),
+                grant.exec.as_str(),
+            );
+            (grant, derived_egress)
+        } else {
+            let requires_path = requires_arg.as_ref().ok_or_else(|| anyhow::anyhow!(
+                "--sign needs --requires <grant.json> or --derive-grant (the capability the package needs)"
+            ))?;
+            (load_grant(requires_path)?, Vec::new())
+        };
+        // Any explicit --egress hosts are unioned in (e.g. for bare `[net]`).
+        for h in &egress_arg {
+            if !egress.contains(h) {
+                egress.push(h.clone());
+            }
+        }
+        egress.sort();
+        egress.dedup();
         let keypair = resolve_pkg_signing_key(key_spec)?;
 
         let contract = CapabilityContract {
@@ -384,7 +426,7 @@ fn cmd_publish(args: &[String]) -> Result<()> {
                 content_hash: content_hash.clone(),
             },
             requires,
-            egress: egress_arg.clone(),
+            egress,
         };
         let contract_id = contract.content_id();
         let signed = contract.sign(&keypair);
@@ -403,8 +445,13 @@ fn cmd_publish(args: &[String]) -> Result<()> {
             signed.signer,
         );
         println!("  -> {out_path}  (install with: lex-os capsule install --contract {out_path} --artifact <archive>)");
-    } else if contract_out.is_some() || requires_arg.is_some() || !egress_arg.is_empty() {
-        bail!("--requires / --egress / --contract-out only apply with --sign");
+    } else if contract_out.is_some()
+        || requires_arg.is_some()
+        || !egress_arg.is_empty()
+        || derive_grant
+        || entrypoint.is_some()
+    {
+        bail!("--requires / --derive-grant / --entrypoint / --egress / --contract-out only apply with --sign");
     }
 
     // ── Registry upload ────────────────────────────────────────────────────

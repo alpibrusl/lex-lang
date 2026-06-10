@@ -175,8 +175,8 @@ fn cmd_pkg() -> CommandInfo {
         ("Install deps", "lex pkg install"),
         ("Add a path dep", "lex pkg add mylib --path ../mylib"),
         (
-            "Publish with a signed contract",
-            "lex pkg publish --sign <key> --requires grant.json --contract-out c.json --archive-out pkg.tar",
+            "Publish with a contract whose grant is derived from the code's effects",
+            "lex pkg publish --sign <key> --derive-grant --contract-out c.json --archive-out pkg.tar",
         ),
         (
             "Verify a package against its contract",
