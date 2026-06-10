@@ -210,6 +210,59 @@ impl Keyring {
     }
 }
 
+/// Derive the minimal capability [`Grant`] and egress allowlist a package
+/// entrypoint needs, **from its typed effect rows**.
+///
+/// This is lex-lang's edge over a hand-declared `--requires`: a function's
+/// effect row already includes every effect of everything it calls (the type
+/// checker propagates them and enforces honesty), so the union over the
+/// entrypoint file's declarations is the *least authority* that admits the
+/// code. It reads the same declared rows lex-os's `collect_effects` reads, and
+/// maps them through the very same `lex_types::trust::effect_requirement` table
+/// that `lex-os capsule install` checks a grant against — the two are one source
+/// of truth and cannot disagree, so a derived contract installs by construction.
+///
+/// Honesty of the rows (a `[io]` signature must not hide a `[net]` body) is
+/// enforced by the type checker at `lex check` and re-applied by lex-os at
+/// `install --run`; this reads the rows rather than re-checking them, so it
+/// stays robust to package-relative imports the single-file checker can't yet
+/// resolve.
+pub fn derive_grant_from_source(src: &str) -> Result<(Grant, Vec<String>), String> {
+    use lex_types::trust::{effect_requirement, is_net_effect, Dimension, Level};
+
+    let program = lex_syntax::parse_source(src).map_err(|e| format!("parse error: {e:?}"))?;
+    let stages = lex_ast::canonicalize_program(&program);
+
+    let mut grant = Grant {
+        filesystem: Level::None,
+        network: Level::None,
+        exec: Level::None,
+    };
+    let mut egress = std::collections::BTreeSet::new();
+    for stage in &stages {
+        if let lex_ast::Stage::FnDecl(fd) = stage {
+            for e in &fd.effects {
+                if let Some((dim, level)) = effect_requirement(&e.name) {
+                    match dim {
+                        Dimension::Filesystem => grant.filesystem = grant.filesystem.join(level),
+                        Dimension::Network => grant.network = grant.network.join(level),
+                        Dimension::Exec => grant.exec = grant.exec.join(level),
+                    }
+                }
+                // Host-scoped `net("host")` effects contribute to the egress
+                // allowlist; a bare `[net]` raises the network level but names
+                // no host (the consumer's egress bounds it at install).
+                if is_net_effect(&e.name) {
+                    if let Some(lex_ast::EffectArg::Str { value }) = &e.arg {
+                        egress.insert(value.clone());
+                    }
+                }
+            }
+        }
+    }
+    Ok((grant, egress.into_iter().collect()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,6 +329,35 @@ mod tests {
         let signed = c.sign(&lex_vcs::Keypair::from_seed(&[3u8; 32]));
         assert!(signed.matches_artifact(bytes).is_ok());
         assert!(signed.matches_artifact(b"different bytes").is_err());
+    }
+
+    #[test]
+    fn derive_grant_pure_program_needs_nothing() {
+        let (g, egress) =
+            derive_grant_from_source("fn add(a :: Int, b :: Int) -> Int { a + b }").unwrap();
+        assert_eq!((g.filesystem.rank(), g.network.rank(), g.exec.rank()), (0, 0, 0));
+        assert!(egress.is_empty());
+    }
+
+    #[test]
+    fn derive_grant_joins_effects_to_least_authority() {
+        // Declared effect rows across the file are unioned per dimension and
+        // mapped through the shared effect_requirement table.
+        let src = "\
+fn reads() -> [fs_read] Int { 0 }
+fn writes() -> [fs_write] Int { 0 }
+fn calls() -> [net(\"api.example\"), proc] Int { 0 }
+fn main() -> [net] Int { 0 }";
+        let (g, egress) = derive_grant_from_source(src).unwrap();
+        assert_eq!(g.filesystem.rank(), 2, "fs_read ∨ fs_write → read-write");
+        assert_eq!(g.network.rank(), 2, "net (bare ∨ host-scoped) → allowlist");
+        assert_eq!(g.exec.rank(), 1, "proc → sandboxed exec");
+        assert_eq!(egress, vec!["api.example".to_string()], "host-scoped net → egress");
+    }
+
+    #[test]
+    fn derive_grant_rejects_unparseable_source() {
+        assert!(derive_grant_from_source("fn (((").is_err());
     }
 
     #[test]
