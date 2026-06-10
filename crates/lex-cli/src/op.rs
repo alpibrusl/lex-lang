@@ -7,10 +7,19 @@ use lex_store::Store;
 use lex_vcs::{OpLog, OperationRecord};
 use std::path::PathBuf;
 
-/// Attach `Authorization: Bearer <token>` to a request when a token
-/// is present. Falls back to the unmodified builder when absent so
-/// unauthenticated `lex serve` remotes keep working (#630).
+/// Prepare an outgoing request: disable ureq's "non-2xx is an error"
+/// behaviour and attach `Authorization: Bearer <token>` when a token is
+/// present (absent → unmodified, so unauthenticated `lex serve` remotes keep
+/// working, #630).
+///
+/// ureq 3.x treats 4xx/5xx status codes as transport errors by default, so
+/// `.send()`/`.call()` bail before the caller can read the status — which
+/// left the `status == 401` / `status >= 400` branches unreachable (the 401
+/// auth hint never fired; batch-rejection bodies were never surfaced).
+/// Turning `http_status_as_error` off returns `Ok(resp)` for error statuses
+/// so those handlers run.
 fn with_auth<B>(req: ureq::RequestBuilder<B>, token: Option<&str>) -> ureq::RequestBuilder<B> {
+    let req = req.config().http_status_as_error(false).build();
     match token {
         Some(t) => req.header("Authorization", &format!("Bearer {t}")),
         None => req,
