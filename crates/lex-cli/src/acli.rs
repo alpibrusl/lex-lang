@@ -592,7 +592,7 @@ fn cmd_attest() -> CommandInfo {
     .add_option(
         "--kind",
         "string",
-        "attestation kind: type_check | spec | examples | diff_body | effect_audit | sandbox_run",
+        "attestation kind: type_check | spec | examples | diff_body | effect_audit | sandbox_run | capsule_install",
         None,
     )
     .add_option("--result", "string", "passed | failed | inconclusive", None)
@@ -600,6 +600,18 @@ fn cmd_attest() -> CommandInfo {
         "--since",
         "string",
         "epoch seconds or YYYY-MM-DD; only attestations on or after this time",
+        None,
+    )
+    .add_option("--store", "string", "store root directory", None);
+    let import_install = CommandInfo::new(
+        "import-install",
+        "promote lex-os capsule-install records into durable attestations (signer-keyed; feeds producer-trust)",
+    )
+    .idempotent(true)
+    .add_option(
+        "--audit",
+        "string",
+        "lex-os audit log JSON (from `lex-os capsule install --audit-out`)",
         None,
     )
     .add_option("--store", "string", "store root directory", None);
@@ -617,12 +629,16 @@ fn cmd_attest() -> CommandInfo {
             "lex attest filter --kind type_check --since 2026-05-01",
         ),
         (
+            "Promote capsule installs to attestations",
+            "lex attest import-install --audit install.audit.json",
+        ),
+        (
             "Machine-readable",
             "lex --output json attest filter --kind spec",
         ),
     ])
-    .with_see_also(vec!["stage", "blame"]);
-    info.subcommands = vec![filter];
+    .with_see_also(vec!["stage", "blame", "producer-trust"]);
+    info.subcommands = vec![filter, import_install];
     info
 }
 

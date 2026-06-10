@@ -866,6 +866,9 @@ fn kind_short(k: &AttestationKind) -> String {
         AttestationKind::ProducerTrust { tool_id, score_thousandths, .. } => {
             format!("ProducerTrust({tool_id}, {:.3})", *score_thousandths as f64 / 1000.0)
         }
+        AttestationKind::CapsuleInstall { artifact, signer, .. } => {
+            format!("CapsuleInstall({artifact} by {signer:.12}…)")
+        }
         AttestationKind::TrustWaived { producer, kind_tag, .. } => {
             format!("TrustWaived({producer}/{kind_tag})")
         }

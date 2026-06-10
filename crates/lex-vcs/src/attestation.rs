@@ -295,6 +295,35 @@ pub enum AttestationKind {
         /// (e.g. `spec`, `type_check`).
         kind_tag: String,
     },
+    /// A capsule installed cleanly under lex-os (lex-os#36 / #38).
+    /// Promotes the tamper-evident `CapsuleInstalled` record from a
+    /// `lex-os capsule install --audit-out` log into a durable,
+    /// content-addressed attestation, via `lex attest import-install`.
+    ///
+    /// In the capsule distribution model the publisher's signing key
+    /// *is* the producer identity, so these records are stored under
+    /// `stage_id == signer` **and** carry `produced_by.tool == signer`
+    /// — the same convention `ProducerBlock` / `ProducerTrust` use.
+    /// That makes a publisher's install track record feed
+    /// `recompute_producer_trust` (which scores `produced_by.tool`)
+    /// and, through it, the trusted-keys keyring that `capsule install
+    /// --trusted-keys` consumes. The loop closes: install → attestation
+    /// → earned trust → keyring → next install.
+    CapsuleInstall {
+        /// `name@version` label of the installed artifact.
+        artifact: String,
+        /// Hex SHA-256 of the published archive bytes — the
+        /// publish-time identity of exactly which bytes installed.
+        /// Empty when imported from a pre-content-hash audit log.
+        content_hash: ContentHash,
+        /// The publisher's Ed25519 public key (hex): the verified
+        /// signer of the capability contract. Duplicated from
+        /// `stage_id` / `produced_by.tool` for clarity in the JSON.
+        signer: String,
+        /// The grant the box actually ran at — `meet(consumer,
+        /// requires)`, pretty-printed.
+        effective_grant: String,
+    },
 }
 
 /// Walk a tool's `ProducerBlock` / `ProducerUnblock` attestations
