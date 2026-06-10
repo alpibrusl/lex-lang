@@ -122,6 +122,15 @@ impl Keypair {
             signature: hex::encode(sig.to_bytes()),
         }
     }
+
+    /// Sign arbitrary `msg` bytes, returning the lowercase-hex of the
+    /// 64-byte Ed25519 signature. Unlike [`Keypair::sign_stage_id`], the
+    /// caller controls the exact bytes — used for signing a capability
+    /// contract's domain-separated payload (`lex pkg publish`), which is
+    /// not a StageId. Verify with [`verify_message`].
+    pub fn sign_message(&self, msg: &[u8]) -> String {
+        hex::encode(self.inner.sign(msg).to_bytes())
+    }
 }
 
 /// Verify that `signature` is a valid Ed25519 signature over the
@@ -156,6 +165,40 @@ pub fn verify_stage_id(stage_id: &str, signature: &Signature) -> Result<(), Sign
     let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
     pk.verify(stage_id.as_bytes(), &sig)
         .map_err(|_| SigningError::VerifyFailed)
+}
+
+/// Verify a raw Ed25519 signature (lowercase hex, 128 chars) over `msg`
+/// against `public_key_hex` (64 chars). The byte-level twin of
+/// [`verify_stage_id`] for callers that signed a domain-separated
+/// payload rather than a StageId string (e.g. a capability contract).
+pub fn verify_message(
+    public_key_hex: &str,
+    msg: &[u8],
+    signature_hex: &str,
+) -> Result<(), SigningError> {
+    const PK_HEX_LEN: usize = 64;
+    const SIG_HEX_LEN: usize = 128;
+    if public_key_hex.len() != PK_HEX_LEN {
+        return Err(SigningError::PublicKeyLength {
+            expected: PK_HEX_LEN,
+            got: public_key_hex.len(),
+        });
+    }
+    if signature_hex.len() != SIG_HEX_LEN {
+        return Err(SigningError::SignatureLength {
+            expected: SIG_HEX_LEN,
+            got: signature_hex.len(),
+        });
+    }
+    let pk_bytes =
+        hex::decode(public_key_hex).map_err(|e| SigningError::BadHex(e.to_string()))?;
+    let sig_bytes =
+        hex::decode(signature_hex).map_err(|e| SigningError::BadHex(e.to_string()))?;
+    let pk_arr: [u8; 32] = pk_bytes.try_into().expect("length-checked");
+    let sig_arr: [u8; 64] = sig_bytes.try_into().expect("length-checked");
+    let pk = VerifyingKey::from_bytes(&pk_arr).map_err(|_| SigningError::BadPublicKey)?;
+    let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+    pk.verify(msg, &sig).map_err(|_| SigningError::VerifyFailed)
 }
 
 #[cfg(test)]
