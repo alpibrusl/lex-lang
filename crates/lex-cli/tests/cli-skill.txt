@@ -49,7 +49,7 @@ description: "Invoke the `lex` CLI. Commands: parse, check, run, hash…"
 - `lex plan` — list repair-candidate paths for a goal, cheapest-first, within budget (idempotent)
 - `lex repair` — apply a typed repair transform to a failed op; emits a RepairAttempt
 - `lex policy` — manage store policy.json (producer blocks + required attestations)
-- `lex producer-trust` — show per-tool trust scores that gate required-attestation waivers (idempotent)
+- `lex producer-trust` — recompute per-tool trust from attestation history, or export a trusted-keys keyring above a score threshold
 
 ## `lex parse`
 
@@ -966,13 +966,22 @@ lex policy show
 
 ## `lex producer-trust`
 
-show per-tool trust scores that gate required-attestation waivers
+recompute per-tool trust from attestation history, or export a trusted-keys keyring above a score threshold
+
+### Arguments
+
+- `subcommand` (enum[recompute|keyring], required) — what to do
 
 ### Examples
 
 ```bash
-# Show scores
-lex producer-trust show
+# Recompute a tool's trust
+lex producer-trust recompute --tool <id>
+```
+
+```bash
+# Export a capsule keyring
+lex producer-trust keyring --min-trust 700 --out trusted.json
 ```
 
 **See also:** `lex policy`, `lex attest`

@@ -289,8 +289,12 @@ fn print_usage() {
     println!("                                     manage <store>/policy.json — negative gate on");
     println!("                                     producers (#181) and positive gate on required");
     println!("                                     attestations for branch advance (#245)");
-    println!("  producer-trust [show] [--store DIR]");
-    println!("                                     per-tool trust scores that gate required-attestation waivers");
+    println!("  producer-trust recompute --tool <id> [--window N] [--store DIR]");
+    println!("  producer-trust keyring [--min-trust N] [--out FILE] [--store DIR]");
+    println!("                                     recompute per-tool trust, or export a capsule");
+    println!(
+        "                                     trusted-keys keyring of producers above a score"
+    );
     println!("  op {{show|log|push|pull|repack|gc}} [--store DIR]");
     println!("                                     inspect and sync the operation log");
     println!("  log [branch]                       show the operation log for a branch (alias of `branch log`)");
@@ -1673,12 +1677,14 @@ fn cmd_repair_apply(
 fn cmd_producer_trust(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let sub = args.first().ok_or_else(|| {
         anyhow!(
-            "usage: lex producer-trust recompute --tool <id> [--window N] \
-         [--granted-by ACTOR] [--store DIR]"
+            "usage: lex producer-trust <recompute|keyring> ... \
+             (recompute --tool <id>; keyring [--min-trust N] [--out FILE])"
         )
     })?;
-    if sub != "recompute" {
-        bail!("unknown `lex producer-trust` subcommand: {sub}");
+    match sub.as_str() {
+        "recompute" => {} // handled inline below
+        "keyring" => return cmd_producer_trust_keyring(fmt, &args[1..]),
+        other => bail!("unknown `lex producer-trust` subcommand: {other}"),
     }
     let (root, rest, _, _) = parse_store_flag(&args[1..]);
     let mut tool: Option<String> = None;
@@ -1745,6 +1751,64 @@ fn cmd_producer_trust(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                 env_for_text["reason"].as_str().unwrap_or("?")
             );
         }
+    });
+    Ok(())
+}
+
+/// `lex producer-trust keyring [--store DIR] [--min-trust N] [--out FILE]`:
+/// export a capsule trusted-keys keyring of every producer whose live
+/// `ProducerTrust` score is ≥ N thousandths (default 700). The producer id is
+/// the publisher's signing key in the capsule model, so this turns *earned*
+/// trust into the `{"trusted":[…]}` file that
+/// `lex-os capsule install --trusted-keys` consumes — authorization derived
+/// from a publisher's track record, not a hand-pinned allowlist. Prints the
+/// keyring to stdout when `--out` is omitted, so it can be piped.
+fn cmd_producer_trust_keyring(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let (root, rest, _, _) = parse_store_flag(args);
+    let mut min_trust: u32 = 700;
+    let mut out: Option<String> = None;
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--min-trust" => {
+                min_trust = it
+                    .next()
+                    .ok_or_else(|| anyhow!("--min-trust needs N (0..=1000)"))?
+                    .parse()
+                    .map_err(|e| anyhow!("--min-trust: {e}"))?;
+            }
+            "--out" => {
+                out = Some(
+                    it.next()
+                        .ok_or_else(|| anyhow!("--out needs a path"))?
+                        .clone(),
+                );
+            }
+            other => bail!("unexpected arg `{other}`"),
+        }
+    }
+    let store = Store::open(&root)?;
+    let scores = store.live_producer_trust_scores()?;
+    let trusted: Vec<String> = scores
+        .iter()
+        .filter(|(_, s)| **s >= min_trust)
+        .map(|(k, _)| k.clone())
+        .collect();
+    let keyring = serde_json::json!({ "trusted": trusted });
+    let pretty = serde_json::to_string_pretty(&keyring)?;
+    if let Some(path) = &out {
+        std::fs::write(path, format!("{pretty}\n")).with_context(|| format!("writing {path}"))?;
+    }
+    let count = trusted.len();
+    let data = serde_json::json!({
+        "min_trust_thousandths": min_trust,
+        "trusted_count": count,
+        "trusted": trusted,
+        "written_to": out,
+    });
+    acli::emit_or_text("producer-trust.keyring", data, fmt, move || match &out {
+        Some(p) => eprintln!("wrote {count} trusted key(s) (score ≥ {min_trust}) to {p}"),
+        None => println!("{pretty}"),
     });
     Ok(())
 }

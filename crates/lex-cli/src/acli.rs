@@ -329,10 +329,14 @@ fn cmd_policy() -> CommandInfo {
 fn cmd_producer_trust() -> CommandInfo {
     CommandInfo::new(
         "producer-trust",
-        "show per-tool trust scores that gate required-attestation waivers",
+        "recompute per-tool trust from attestation history, or export a trusted-keys keyring above a score threshold",
     )
-    .idempotent(true)
-    .with_examples(vec![("Show scores", "lex producer-trust show")])
+    .idempotent(false)
+    .add_argument("subcommand", "enum[recompute|keyring]", "what to do", true)
+    .with_examples(vec![
+        ("Recompute a tool's trust", "lex producer-trust recompute --tool <id>"),
+        ("Export a capsule keyring", "lex producer-trust keyring --min-trust 700 --out trusted.json"),
+    ])
     .with_see_also(vec!["policy", "attest"])
 }
 

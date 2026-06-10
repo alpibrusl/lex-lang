@@ -86,9 +86,7 @@ pub enum StoreError {
     /// The op is *not* persisted; the branch head is unchanged.
     /// The caller should either start a new session, raise the
     /// cap, or refactor to fit the budget. HTTP API maps to 503.
-    #[error(
-        "session `{session_id}` budget exceeded: spent_after={spent_after} > cap={cap}"
-    )]
+    #[error("session `{session_id}` budget exceeded: spent_after={spent_after} > cap={cap}")]
     BudgetExceeded {
         session_id: String,
         cap: u64,
@@ -153,17 +151,32 @@ impl Store {
         Ok(Self { root })
     }
 
-    pub fn root(&self) -> &Path { &self.root }
-
-    fn now() -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
-    fn sig_dir(&self, sig: &str) -> PathBuf { self.root.join("stages").join(sig) }
-    fn impl_dir(&self, sig: &str) -> PathBuf { self.sig_dir(sig).join("implementations") }
-    fn tests_dir(&self, sig: &str) -> PathBuf { self.sig_dir(sig).join("tests") }
-    fn specs_dir(&self, sig: &str) -> PathBuf { self.sig_dir(sig).join("specs") }
-    fn lifecycle_path(&self, sig: &str) -> PathBuf { self.sig_dir(sig).join("lifecycle.json") }
+    fn now() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    fn sig_dir(&self, sig: &str) -> PathBuf {
+        self.root.join("stages").join(sig)
+    }
+    fn impl_dir(&self, sig: &str) -> PathBuf {
+        self.sig_dir(sig).join("implementations")
+    }
+    fn tests_dir(&self, sig: &str) -> PathBuf {
+        self.sig_dir(sig).join("tests")
+    }
+    fn specs_dir(&self, sig: &str) -> PathBuf {
+        self.sig_dir(sig).join("specs")
+    }
+    fn lifecycle_path(&self, sig: &str) -> PathBuf {
+        self.sig_dir(sig).join("lifecycle.json")
+    }
 
     // ---- publish ----
 
@@ -200,7 +213,9 @@ impl Store {
 
         let ast_path = self.impl_dir(&sig).join(format!("{}.ast.json", stage_id));
         let delta_path = self.impl_dir(&sig).join(format!("{}.delta.json", stage_id));
-        let meta_path = self.impl_dir(&sig).join(format!("{}.metadata.json", stage_id));
+        let meta_path = self
+            .impl_dir(&sig)
+            .join(format!("{}.metadata.json", stage_id));
 
         // #261 slice 3: try delta encoding against the most recent
         // prior stage in this sig's lifecycle. Falls back to a full
@@ -261,7 +276,9 @@ impl Store {
         }
         let cur = life.status_of(stage_id);
         if cur == Some(StageStatus::Tombstone) {
-            return Err(StoreError::InvalidTransition("tombstoned cannot be activated".into()));
+            return Err(StoreError::InvalidTransition(
+                "tombstoned cannot be activated".into(),
+            ));
         }
         life.transitions.push(Transition {
             stage_id: stage_id.into(),
@@ -275,9 +292,13 @@ impl Store {
 
     pub fn deprecate(&self, stage_id: &str, reason: impl Into<String>) -> Result<(), StoreError> {
         let (sig, mut life) = self.lookup_lifecycle(stage_id)?;
-        let cur = life.status_of(stage_id).ok_or_else(|| StoreError::UnknownStage(stage_id.into()))?;
+        let cur = life
+            .status_of(stage_id)
+            .ok_or_else(|| StoreError::UnknownStage(stage_id.into()))?;
         if cur != StageStatus::Active {
-            return Err(StoreError::InvalidTransition(format!("{cur:?} ⇒ Deprecated")));
+            return Err(StoreError::InvalidTransition(format!(
+                "{cur:?} ⇒ Deprecated"
+            )));
         }
         life.transitions.push(Transition {
             stage_id: stage_id.into(),
@@ -291,9 +312,13 @@ impl Store {
 
     pub fn tombstone(&self, stage_id: &str) -> Result<(), StoreError> {
         let (sig, mut life) = self.lookup_lifecycle(stage_id)?;
-        let cur = life.status_of(stage_id).ok_or_else(|| StoreError::UnknownStage(stage_id.into()))?;
+        let cur = life
+            .status_of(stage_id)
+            .ok_or_else(|| StoreError::UnknownStage(stage_id.into()))?;
         if cur != StageStatus::Deprecated {
-            return Err(StoreError::InvalidTransition(format!("{cur:?} ⇒ Tombstone")));
+            return Err(StoreError::InvalidTransition(format!(
+                "{cur:?} ⇒ Tombstone"
+            )));
         }
         life.transitions.push(Transition {
             stage_id: stage_id.into(),
@@ -330,15 +355,16 @@ impl Store {
         // Collapse transitions: latest status + last_at per stage,
         // plus the timestamp of the first Draft transition (≈ when
         // the stage was published) when one exists.
-        let mut by_stage: indexmap::IndexMap<String, StageHistoryEntry> =
-            indexmap::IndexMap::new();
+        let mut by_stage: indexmap::IndexMap<String, StageHistoryEntry> = indexmap::IndexMap::new();
         for t in &life.transitions {
-            let entry = by_stage.entry(t.stage_id.clone()).or_insert(StageHistoryEntry {
-                stage_id: t.stage_id.clone(),
-                status: t.to,
-                last_at: t.at,
-                published_at: None,
-            });
+            let entry = by_stage
+                .entry(t.stage_id.clone())
+                .or_insert(StageHistoryEntry {
+                    stage_id: t.stage_id.clone(),
+                    status: t.to,
+                    last_at: t.at,
+                    published_at: None,
+                });
             entry.status = t.to;
             entry.last_at = t.at;
             if t.from == StageStatus::Draft && entry.published_at.is_none() {
@@ -365,11 +391,7 @@ impl Store {
     /// any delta chain (#261 slice 3). The recursion ends at a
     /// `<stage_id>.ast.json` file (a full snapshot) or, in the
     /// degenerate case of a missing chain, with `UnknownStage`.
-    fn read_stage_canonical_bytes(
-        &self,
-        sig: &str,
-        stage_id: &str,
-    ) -> Result<Vec<u8>, StoreError> {
+    fn read_stage_canonical_bytes(&self, sig: &str, stage_id: &str) -> Result<Vec<u8>, StoreError> {
         let ast_path = self.impl_dir(sig).join(format!("{}.ast.json", stage_id));
         if ast_path.exists() {
             return Ok(fs::read(&ast_path)?);
@@ -381,11 +403,12 @@ impl Store {
         let delta_bytes = fs::read(&delta_path)?;
         let delta: crate::delta::StageDelta = serde_json::from_slice(&delta_bytes)?;
         let base_bytes = self.read_stage_canonical_bytes(sig, &delta.base_stage_id)?;
-        crate::delta::apply(&base_bytes, &delta)
-            .map_err(|e| StoreError::Io(std::io::Error::new(
+        crate::delta::apply(&base_bytes, &delta).map_err(|e| {
+            StoreError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("applying delta for {stage_id}: {e}"),
-            )))
+            ))
+        })
     }
 
     /// Persist a freshly-published stage's canonical bytes (#261
@@ -402,9 +425,7 @@ impl Store {
         delta_path: &Path,
     ) -> Result<(), StoreError> {
         let new_bytes = canonical_bytes(stage)?;
-        if let Some((base_stage_id, base_chain_length)) =
-            self.pick_delta_base(sig, stage_id)?
-        {
+        if let Some((base_stage_id, base_chain_length)) = self.pick_delta_base(sig, stage_id)? {
             let base_bytes = self.read_stage_canonical_bytes(sig, &base_stage_id)?;
             let (prefix, suffix, middle) = crate::delta::splice(&base_bytes, &new_bytes);
             let chain_length = base_chain_length + 1;
@@ -421,7 +442,9 @@ impl Store {
             }
         }
         // Fall through: full snapshot.
-        if let Some(parent) = ast_path.parent() { fs::create_dir_all(parent)?; }
+        if let Some(parent) = ast_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         fs::write(ast_path, &new_bytes)?;
         Ok(())
     }
@@ -437,7 +460,9 @@ impl Store {
         new_stage_id: &str,
     ) -> Result<Option<(String, usize)>, StoreError> {
         let life = self.read_lifecycle(sig).ok();
-        let Some(life) = life else { return Ok(None); };
+        let Some(life) = life else {
+            return Ok(None);
+        };
         // Walk transitions newest-first; pick the first prior
         // stage that isn't this one and isn't tombstoned.
         let mut latest_per_stage: indexmap::IndexMap<&str, StageStatus> = indexmap::IndexMap::new();
@@ -446,16 +471,16 @@ impl Store {
         }
         let mut candidates: Vec<&str> = latest_per_stage
             .iter()
-            .filter(|(id, status)| {
-                **id != new_stage_id && **status != StageStatus::Tombstone
-            })
+            .filter(|(id, status)| **id != new_stage_id && **status != StageStatus::Tombstone)
             .map(|(id, _)| *id)
             .collect();
         // Reverse to get newest-first (transitions are append-only,
         // so latest_per_stage's iteration order matches insertion
         // order, oldest-first).
         candidates.reverse();
-        let Some(&base) = candidates.first() else { return Ok(None); };
+        let Some(&base) = candidates.first() else {
+            return Ok(None);
+        };
         let base_chain_length = self.delta_chain_length(sig, base)?;
         Ok(Some((base.to_string(), base_chain_length)))
     }
@@ -479,14 +504,17 @@ impl Store {
 
     pub fn get_metadata(&self, stage_id: &str) -> Result<Metadata, StoreError> {
         let (sig, _) = self.lookup_lifecycle(stage_id)?;
-        let path = self.impl_dir(&sig).join(format!("{}.metadata.json", stage_id));
+        let path = self
+            .impl_dir(&sig)
+            .join(format!("{}.metadata.json", stage_id));
         let bytes = fs::read(&path)?;
         Ok(serde_json::from_slice(&bytes)?)
     }
 
     pub fn get_status(&self, stage_id: &str) -> Result<StageStatus, StoreError> {
         let (_sig, life) = self.lookup_lifecycle(stage_id)?;
-        life.status_of(stage_id).ok_or_else(|| StoreError::UnknownStage(stage_id.into()))
+        life.status_of(stage_id)
+            .ok_or_else(|| StoreError::UnknownStage(stage_id.into()))
     }
 
     pub fn list_stages_by_name(&self, name: &str) -> Result<Vec<String>, StoreError> {
@@ -494,25 +522,34 @@ impl Store {
         // name matches, include the SigId.
         let mut out = Vec::new();
         let stages_dir = self.root.join("stages");
-        if !stages_dir.exists() { return Ok(out); }
+        if !stages_dir.exists() {
+            return Ok(out);
+        }
         for entry in fs::read_dir(&stages_dir)? {
             let entry = entry?;
             let sig_dir = entry.path();
-            if !sig_dir.is_dir() { continue; }
+            if !sig_dir.is_dir() {
+                continue;
+            }
             let sig = entry.file_name().to_string_lossy().to_string();
             // Look at any one metadata file under this SigId.
             let impls = self.impl_dir(&sig);
-            if !impls.exists() { continue; }
+            if !impls.exists() {
+                continue;
+            }
             for f in fs::read_dir(impls)? {
                 let f = f?;
                 let p = f.path();
                 if p.extension().is_some_and(|e| e == "json")
-                    && p.file_name().is_some_and(|n| n.to_string_lossy().ends_with(".metadata.json"))
+                    && p.file_name()
+                        .is_some_and(|n| n.to_string_lossy().ends_with(".metadata.json"))
                 {
                     if let Ok(bytes) = fs::read(&p) {
                         if let Ok(m) = serde_json::from_slice::<Metadata>(&bytes) {
                             if m.name == name {
-                                if !out.contains(&sig) { out.push(sig.clone()); }
+                                if !out.contains(&sig) {
+                                    out.push(sig.clone());
+                                }
                                 break;
                             }
                         }
@@ -527,7 +564,9 @@ impl Store {
     pub fn list_sigs(&self) -> Result<Vec<String>, StoreError> {
         let stages_dir = self.root.join("stages");
         let mut out = Vec::new();
-        if !stages_dir.exists() { return Ok(out); }
+        if !stages_dir.exists() {
+            return Ok(out);
+        }
         for entry in fs::read_dir(stages_dir)? {
             let entry = entry?;
             if entry.file_type()?.is_dir() {
@@ -552,7 +591,9 @@ impl Store {
 
     pub fn list_tests(&self, sig: &str) -> Result<Vec<Test>, StoreError> {
         let dir = self.tests_dir(sig);
-        if !dir.exists() { return Ok(Vec::new()); }
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
         let mut out = Vec::new();
         for f in fs::read_dir(dir)? {
             let f = f?;
@@ -576,7 +617,9 @@ impl Store {
 
     pub fn list_specs(&self, sig: &str) -> Result<Vec<Spec>, StoreError> {
         let dir = self.specs_dir(sig);
-        if !dir.exists() { return Ok(Vec::new()); }
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
         let mut out = Vec::new();
         for f in fs::read_dir(dir)? {
             let f = f?;
@@ -607,7 +650,9 @@ impl Store {
 
     pub fn list_traces(&self) -> Result<Vec<String>, StoreError> {
         let dir = self.root.join("traces");
-        if !dir.exists() { return Ok(Vec::new()); }
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
         let mut out = Vec::new();
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
@@ -636,7 +681,10 @@ impl Store {
     fn read_lifecycle(&self, sig: &str) -> Result<Lifecycle, StoreError> {
         let path = self.lifecycle_path(sig);
         if !path.exists() {
-            return Ok(Lifecycle { sig_id: sig.into(), transitions: Vec::new() });
+            return Ok(Lifecycle {
+                sig_id: sig.into(),
+                transitions: Vec::new(),
+            });
         }
         let bytes = fs::read(&path)?;
         Ok(serde_json::from_slice(&bytes)?)
@@ -698,18 +746,18 @@ impl Store {
 
         // Build old-side views from the current branch.
         let old_head = self.branch_head(branch)?;
-        let old_name_to_sig: BTreeMap<String, String> = old_head.iter()
-            .filter_map(|(sig, stg)| {
-                self.get_metadata(stg).ok().map(|m| (m.name, sig.clone()))
-            })
+        let old_name_to_sig: BTreeMap<String, String> = old_head
+            .iter()
+            .filter_map(|(sig, stg)| self.get_metadata(stg).ok().map(|m| (m.name, sig.clone())))
             .collect();
-        let old_effects: BTreeMap<String, BTreeSet<String>> = old_head.iter()
+        let old_effects: BTreeMap<String, BTreeSet<String>> = old_head
+            .iter()
             .filter_map(|(sig, stg)| {
                 let ast = self.get_ast(stg).ok()?;
                 match ast {
                     lex_ast::Stage::FnDecl(fd) => {
-                        let s: BTreeSet<String> = fd.effects.iter()
-                            .map(|e| e.name.clone()).collect();
+                        let s: BTreeSet<String> =
+                            fd.effects.iter().map(|e| e.name.clone()).collect();
                         Some((sig.clone(), s))
                     }
                     _ => None,
@@ -726,7 +774,8 @@ impl Store {
             new_stages: stages,
             new_imports,
             diff,
-        }).map_err(|e| StoreError::InvalidTransition(format!("diff_to_ops: {e}")))?;
+        })
+        .map_err(|e| StoreError::InvalidTransition(format!("diff_to_ops: {e}")))?;
 
         let mut ops_out: Vec<PublishOp> = Vec::new();
         let mut last_op_id: Option<lex_vcs::OpId> = None;
@@ -746,16 +795,13 @@ impl Store {
             let transition = transition_for_kind(&kind);
             let attestable = attestable_stage_ids(&transition);
             let head_now = self.get_branch(branch)?.and_then(|b| b.head_op);
-            let op = lex_vcs::Operation::new(
-                kind.clone(),
-                head_now.into_iter().collect::<Vec<_>>(),
-            );
+            let op =
+                lex_vcs::Operation::new(kind.clone(), head_now.into_iter().collect::<Vec<_>>());
             let op_id = self.apply_operation(branch, op, transition)?;
             self.record_typecheck_passed(&attestable, &op_id)?;
             ops_out.push(PublishOp {
                 op_id: op_id.clone(),
-                kind: serde_json::to_value(&kind)
-                    .map_err(StoreError::Serde)?,
+                kind: serde_json::to_value(&kind).map_err(StoreError::Serde)?,
             });
             last_op_id = Some(op_id);
         }
@@ -789,7 +835,9 @@ impl Store {
                     out.entry(in_file).or_default().insert(module);
                 }
                 RemoveImport { in_file, module } => {
-                    if let Some(set) = out.get_mut(&in_file) { set.remove(&module); }
+                    if let Some(set) = out.get_mut(&in_file) {
+                        set.remove(&module);
+                    }
                 }
                 _ => {}
             }
@@ -886,9 +934,7 @@ impl Store {
         // first attempt's CAS fail and surface Contention.
         self.cas_retry_advance(branch, op, transition, |new_head| {
             self.record_typecheck_passed(&attestable, &new_head.op_id)?;
-            self.run_required_attestations_gate(
-                branch, &new_head.op_id, &attestable, &op_effects,
-            )
+            self.run_required_attestations_gate(branch, &new_head.op_id, &attestable, &op_effects)
         })
     }
 
@@ -931,13 +977,18 @@ impl Store {
         }
         // Filter to attestations from this tool, newest-first by
         // timestamp, then take the window.
-        let mut from_tool: Vec<&lex_vcs::Attestation> = all.iter()
+        let mut from_tool: Vec<&lex_vcs::Attestation> = all
+            .iter()
             .filter(|a| a.produced_by.tool == tool_id)
             // Ignore self-referential trust attestations (we're
             // scoring evidence, not previous trust statements).
-            .filter(|a| !matches!(a.kind,
-                lex_vcs::AttestationKind::ProducerTrust { .. }
-                | lex_vcs::AttestationKind::TrustWaived { .. }))
+            .filter(|a| {
+                !matches!(
+                    a.kind,
+                    lex_vcs::AttestationKind::ProducerTrust { .. }
+                        | lex_vcs::AttestationKind::TrustWaived { .. }
+                )
+            })
             .collect();
         from_tool.sort_by_key(|a| std::cmp::Reverse(a.timestamp));
         from_tool.truncate(window);
@@ -957,11 +1008,15 @@ impl Store {
             let raw = (passed as f64) * 1000.0 / (total as f64);
             raw.round().clamp(0.0, 1000.0) as u32
         };
-        let head_op = self.list_branches()?
+        let head_op = self
+            .list_branches()?
             .into_iter()
             .find_map(|b| self.get_branch(&b).ok().flatten().and_then(|x| x.head_op))
             .unwrap_or_else(|| "fresh".into());
-        let evidence = format!("window={window}, sample={}, head_op={head_op:.16}", from_tool.len());
+        let evidence = format!(
+            "window={window}, sample={}, head_op={head_op:.16}",
+            from_tool.len()
+        );
         let attestation = lex_vcs::Attestation::new(
             tool_id.to_string(),
             None,
@@ -979,6 +1034,46 @@ impl Store {
         let id = attestation.attestation_id.clone();
         log.put(&attestation)?;
         Ok(Some(id))
+    }
+
+    /// The latest live `ProducerTrust` score (thousandths, `0..=1000`) for
+    /// every producer that currently has trust: the newest score per tool by
+    /// timestamp, excluding any tool under an active `ProducerBlock` (a block
+    /// is a hard veto over trust, matching `recompute_producer_trust`).
+    ///
+    /// Used to export a capsule trusted-keys keyring from *earned* trust — the
+    /// producer id doubles as the publisher's signing key downstream, so this
+    /// turns track record into the allowlist `capsule install` consumes.
+    pub fn live_producer_trust_scores(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, u32>, StoreError> {
+        let log = self.attestation_log()?;
+        let all = log.list_all()?;
+        // Newest score per tool.
+        let mut latest: std::collections::BTreeMap<String, (u64, u32)> =
+            std::collections::BTreeMap::new();
+        for a in &all {
+            if let lex_vcs::AttestationKind::ProducerTrust {
+                tool_id,
+                score_thousandths,
+                ..
+            } = &a.kind
+            {
+                let entry = latest.entry(tool_id.clone()).or_insert((0, 0));
+                if a.timestamp >= entry.0 {
+                    *entry = (a.timestamp, *score_thousandths);
+                }
+            }
+        }
+        // Drop blocked producers; a block vetoes trust.
+        let mut scores = std::collections::BTreeMap::new();
+        for (tool, (_, score)) in latest {
+            if lex_vcs::active_producer_block(&all, &tool).is_some() {
+                continue;
+            }
+            scores.insert(tool, score);
+        }
+        Ok(scores)
     }
 
     pub fn attestation_log(&self) -> Result<lex_vcs::AttestationLog, StoreError> {
@@ -1028,11 +1123,10 @@ impl Store {
     ///
     /// Ops without an `intent_id`, or whose intent has no
     /// configured cap, return Ok without any disk read.
-    fn check_session_budget(
-        &self,
-        op: &lex_vcs::Operation,
-    ) -> Result<(), StoreError> {
-        let Some(intent_id) = op.intent_id.as_deref() else { return Ok(()); };
+    fn check_session_budget(&self, op: &lex_vcs::Operation) -> Result<(), StoreError> {
+        let Some(intent_id) = op.intent_id.as_deref() else {
+            return Ok(());
+        };
         let intent_log = lex_vcs::IntentLog::open(self.root())?;
         let Some(intent) = intent_log.get(&intent_id.to_string())? else {
             // Dangling intent — treat as "no session" and let it
@@ -1085,8 +1179,7 @@ impl Store {
         if stage_ids.is_empty() {
             return Ok(());
         }
-        let errors_json = serde_json::to_value(errors)
-            .map_err(StoreError::Serde)?;
+        let errors_json = serde_json::to_value(errors).map_err(StoreError::Serde)?;
         // #306 slice 3: look up the static suggested_transform for
         // the first error's rule_tag. Multiple errors per op are
         // possible — when they fire in lockstep (e.g. one bad let
@@ -1099,9 +1192,9 @@ impl Store {
         for stage_id in stage_ids {
             let attestation = lex_vcs::Attestation::new(
                 stage_id.clone(),
-                None,  // the failed op was never persisted; not the
-                       // attestation's op_id (which is for a
-                       // *successful* op).
+                None, // the failed op was never persisted; not the
+                // attestation's op_id (which is for a
+                // *successful* op).
                 None,
                 lex_vcs::AttestationKind::RepairHint {
                     failed_op_id: failed_op_id.clone(),
@@ -1109,8 +1202,11 @@ impl Store {
                     suggested_transform: suggested_transform.clone(),
                 },
                 lex_vcs::AttestationResult::Failed {
-                    detail: format!("op {} rejected: {} type error(s)",
-                        failed_op_id, errors.len()),
+                    detail: format!(
+                        "op {} rejected: {} type error(s)",
+                        failed_op_id,
+                        errors.len()
+                    ),
                 },
                 repair_hint_producer(),
                 None,
@@ -1146,7 +1242,8 @@ impl Store {
         producer: lex_vcs::ProducerDescriptor,
     ) -> Result<usize, StoreError> {
         let log = lex_vcs::OpLog::open(self.root())?;
-        let rec = log.get(op_id)?
+        let rec = log
+            .get(op_id)?
             .ok_or_else(|| StoreError::UnknownOp(op_id.clone()))?;
         let stage_ids = attestable_stage_ids(&rec.produces);
         if stage_ids.is_empty() {
@@ -1206,8 +1303,11 @@ impl Store {
         let mut total = 0;
         for rec in new_ops {
             total += self.record_op_trace(
-                run_id, root_target, &rec.op_id,
-                result.clone(), producer.clone(),
+                run_id,
+                root_target,
+                &rec.op_id,
+                result.clone(),
+                producer.clone(),
             )?;
         }
         Ok(total)
@@ -1246,11 +1346,9 @@ impl Store {
         new_body: lex_ast::CExpr,
     ) -> Result<lex_vcs::OpId, StoreError> {
         let from_stage = self.get_ast(from_stage_id)?;
-        let new_stage = lex_ast::replace_match_arm(
-            &from_stage, match_node, arm_index, new_body,
-        ).map_err(StoreError::TransformError)?;
-        let sig = lex_ast::sig_id(&from_stage)
-            .ok_or(StoreError::CannotPublishImport)?;
+        let new_stage = lex_ast::replace_match_arm(&from_stage, match_node, arm_index, new_body)
+            .map_err(StoreError::TransformError)?;
+        let sig = lex_ast::sig_id(&from_stage).ok_or(StoreError::CannotPublishImport)?;
         let to_stage_id = self.publish(&new_stage)?;
         if to_stage_id == from_stage_id {
             // No-op transform — the new body was structurally
@@ -1301,10 +1399,7 @@ impl Store {
             from: from_stage_id.to_string(),
             to: to_stage_id.clone(),
         };
-        let op = lex_vcs::Operation::new(
-            kind,
-            head_now.into_iter().collect::<Vec<_>>(),
-        );
+        let op = lex_vcs::Operation::new(kind, head_now.into_iter().collect::<Vec<_>>());
         self.apply_operation_checked(branch, op, transition, &candidate)
     }
 
@@ -1324,12 +1419,10 @@ impl Store {
         // Read the old name before running the transform, so the
         // op log records the rename target rather than just the
         // new value.
-        let old_name = read_let_name(&from_stage, let_node)
-            .map_err(StoreError::TransformError)?;
+        let old_name = read_let_name(&from_stage, let_node).map_err(StoreError::TransformError)?;
         let new_stage = lex_ast::rename_local(&from_stage, let_node, new_name)
             .map_err(StoreError::TransformError)?;
-        let sig = lex_ast::sig_id(&from_stage)
-            .ok_or(StoreError::CannotPublishImport)?;
+        let sig = lex_ast::sig_id(&from_stage).ok_or(StoreError::CannotPublishImport)?;
         let to_stage_id = self.publish(&new_stage)?;
         if to_stage_id == from_stage_id {
             return Err(StoreError::InvalidTransition(format!(
@@ -1368,10 +1461,7 @@ impl Store {
             from: from_stage_id.to_string(),
             to: to_stage_id.clone(),
         };
-        let op = lex_vcs::Operation::new(
-            kind,
-            head_now.into_iter().collect::<Vec<_>>(),
-        );
+        let op = lex_vcs::Operation::new(kind, head_now.into_iter().collect::<Vec<_>>());
         self.apply_operation_checked(branch, op, transition, &candidate)
     }
 
@@ -1387,12 +1477,11 @@ impl Store {
         let_node: &lex_ast::NodeId,
     ) -> Result<lex_vcs::OpId, StoreError> {
         let from_stage = self.get_ast(from_stage_id)?;
-        let binding_name = read_let_name(&from_stage, let_node)
-            .map_err(StoreError::TransformError)?;
-        let new_stage = lex_ast::inline_let(&from_stage, let_node)
-            .map_err(StoreError::TransformError)?;
-        let sig = lex_ast::sig_id(&from_stage)
-            .ok_or(StoreError::CannotPublishImport)?;
+        let binding_name =
+            read_let_name(&from_stage, let_node).map_err(StoreError::TransformError)?;
+        let new_stage =
+            lex_ast::inline_let(&from_stage, let_node).map_err(StoreError::TransformError)?;
+        let sig = lex_ast::sig_id(&from_stage).ok_or(StoreError::CannotPublishImport)?;
         let to_stage_id = self.publish(&new_stage)?;
         if to_stage_id == from_stage_id {
             return Err(StoreError::InvalidTransition(format!(
@@ -1430,10 +1519,7 @@ impl Store {
             from: from_stage_id.to_string(),
             to: to_stage_id.clone(),
         };
-        let op = lex_vcs::Operation::new(
-            kind,
-            head_now.into_iter().collect::<Vec<_>>(),
-        );
+        let op = lex_vcs::Operation::new(kind, head_now.into_iter().collect::<Vec<_>>());
         self.apply_operation_checked(branch, op, transition, &candidate)
     }
 
@@ -1466,10 +1552,8 @@ impl Store {
             lex_ast::extract_function(&from_stage, expr_node, spec)
                 .map_err(StoreError::TransformError)?;
 
-        let source_sig = lex_ast::sig_id(&from_stage)
-            .ok_or(StoreError::CannotPublishImport)?;
-        let new_fn_sig = lex_ast::sig_id(&new_fn_stage)
-            .ok_or(StoreError::CannotPublishImport)?;
+        let source_sig = lex_ast::sig_id(&from_stage).ok_or(StoreError::CannotPublishImport)?;
+        let new_fn_sig = lex_ast::sig_id(&new_fn_stage).ok_or(StoreError::CannotPublishImport)?;
         if source_sig == new_fn_sig {
             return Err(StoreError::InvalidTransition(format!(
                 "extract_function produced a sig matching the source `{source_sig}`"
@@ -1514,13 +1598,11 @@ impl Store {
         // the candidate program by appending the new fn to every
         // stage on the current branch head.
         let new_fn_effects: std::collections::BTreeSet<String> = match &new_fn_stage {
-            lex_ast::Stage::FnDecl(fd) => fd.effects.iter()
-                .map(|e| e.name.clone()).collect(),
+            lex_ast::Stage::FnDecl(fd) => fd.effects.iter().map(|e| e.name.clone()).collect(),
             _ => Default::default(),
         };
         let new_fn_budget = budget_of_stage(&new_fn_stage);
-        let mut candidate_with_new_fn: Vec<lex_ast::Stage> =
-            Vec::with_capacity(head.len() + 1);
+        let mut candidate_with_new_fn: Vec<lex_ast::Stage> = Vec::with_capacity(head.len() + 1);
         for stage_id in head.values() {
             candidate_with_new_fn.push(self.get_ast(stage_id)?);
         }
@@ -1534,22 +1616,21 @@ impl Store {
                 budget_cost: new_fn_budget,
             },
             head_now.into_iter().collect::<Vec<_>>(),
-        ).with_intent(intent_id.clone());
+        )
+        .with_intent(intent_id.clone());
         let add_transition = lex_vcs::StageTransition::Create {
             sig_id: new_fn_sig.clone(),
             stage_id: new_fn_stage_id.clone(),
         };
-        let add_op_id = self.apply_operation_checked(
-            branch, add_op, add_transition, &candidate_with_new_fn,
-        )?;
+        let add_op_id =
+            self.apply_operation_checked(branch, add_op, add_transition, &candidate_with_new_fn)?;
 
         // Step 2 — emit the ModifyBody op for the source. Build
         // the candidate program by replacing the source's stage
         // with `modified_stage` and keeping the new fn alongside.
         let from_budget = budget_of_stage(&from_stage);
         let to_budget = budget_of_stage(&modified_stage);
-        let mut candidate_with_modified: Vec<lex_ast::Stage> =
-            Vec::with_capacity(head.len() + 1);
+        let mut candidate_with_modified: Vec<lex_ast::Stage> = Vec::with_capacity(head.len() + 1);
         for (other_sig, other_stage_id) in &head {
             if other_sig == &source_sig {
                 candidate_with_modified.push(modified_stage.clone());
@@ -1568,14 +1649,18 @@ impl Store {
                 to_budget,
             },
             head_now.into_iter().collect::<Vec<_>>(),
-        ).with_intent(intent_id);
+        )
+        .with_intent(intent_id);
         let modify_transition = lex_vcs::StageTransition::Replace {
             sig_id: source_sig,
             from: from_stage_id.to_string(),
             to: modified_stage_id,
         };
         let modify_op_id = self.apply_operation_checked(
-            branch, modify_op, modify_transition, &candidate_with_modified,
+            branch,
+            modify_op,
+            modify_transition,
+            &candidate_with_modified,
         )?;
 
         Ok((add_op_id, modify_op_id))
@@ -1604,8 +1689,7 @@ impl Store {
         new_stage: &lex_ast::Stage,
         intent_id: &lex_vcs::IntentId,
     ) -> Result<lex_vcs::OpId, StoreError> {
-        let sig = lex_ast::sig_id(new_stage)
-            .ok_or(StoreError::CannotPublishImport)?;
+        let sig = lex_ast::sig_id(new_stage).ok_or(StoreError::CannotPublishImport)?;
         let stage_id = self.publish(new_stage)?;
         let head_now = self.get_branch(branch)?.and_then(|b| b.head_op);
         let op = lex_vcs::Operation::new(
@@ -1614,7 +1698,8 @@ impl Store {
                 stage_id,
             },
             head_now.into_iter().collect::<Vec<_>>(),
-        ).with_intent(intent_id.clone());
+        )
+        .with_intent(intent_id.clone());
         let transition = lex_vcs::StageTransition::ImportOnly;
         self.apply_operation(branch, op, transition)
     }
@@ -1632,18 +1717,37 @@ impl Store {
         // live.
         let mut referenced: std::collections::BTreeSet<lex_vcs::OpId> = Default::default();
         for rec in &all {
-            if let lex_vcs::OperationKind::Promote { sig_id: s, winner_candidate, supersedes, .. } = &rec.op.kind {
-                if s != sig_id { continue; }
+            if let lex_vcs::OperationKind::Promote {
+                sig_id: s,
+                winner_candidate,
+                supersedes,
+                ..
+            } = &rec.op.kind
+            {
+                if s != sig_id {
+                    continue;
+                }
                 referenced.insert(winner_candidate.clone());
-                for sup in supersedes { referenced.insert(sup.clone()); }
+                for sup in supersedes {
+                    referenced.insert(sup.clone());
+                }
             }
         }
         let mut out: Vec<CandidateInfo> = Vec::new();
         for rec in all {
-            let lex_vcs::OperationKind::Candidate { sig_id: s, stage_id } = &rec.op.kind
-                else { continue };
-            if s != sig_id { continue; }
-            if referenced.contains(&rec.op_id) { continue; }
+            let lex_vcs::OperationKind::Candidate {
+                sig_id: s,
+                stage_id,
+            } = &rec.op.kind
+            else {
+                continue;
+            };
+            if s != sig_id {
+                continue;
+            }
+            if referenced.contains(&rec.op_id) {
+                continue;
+            }
             out.push(CandidateInfo {
                 op_id: rec.op_id.clone(),
                 stage_id: stage_id.clone(),
@@ -1671,20 +1775,26 @@ impl Store {
         candidate_op_id: &lex_vcs::OpId,
     ) -> Result<lex_vcs::OpId, StoreError> {
         let log = lex_vcs::OpLog::open(self.root())?;
-        let candidate_rec = log.get(candidate_op_id)?
+        let candidate_rec = log
+            .get(candidate_op_id)?
             .ok_or_else(|| StoreError::UnknownOp(candidate_op_id.clone()))?;
         let (sig, winner_stage_id) = match &candidate_rec.op.kind {
-            lex_vcs::OperationKind::Candidate { sig_id, stage_id } =>
-                (sig_id.clone(), stage_id.clone()),
-            other => return Err(StoreError::InvalidTransition(format!(
-                "op `{candidate_op_id}` is a `{:?}`, not a Candidate", other
-            ))),
+            lex_vcs::OperationKind::Candidate { sig_id, stage_id } => {
+                (sig_id.clone(), stage_id.clone())
+            }
+            other => {
+                return Err(StoreError::InvalidTransition(format!(
+                    "op `{candidate_op_id}` is a `{:?}`, not a Candidate",
+                    other
+                )))
+            }
         };
 
         // Gather every OTHER live candidate for this sig — the
         // ones this Promote will supersede.
         let live = self.list_candidates(&sig)?;
-        let mut supersedes: Vec<lex_vcs::OpId> = live.iter()
+        let mut supersedes: Vec<lex_vcs::OpId> = live
+            .iter()
             .filter(|c| &c.op_id != candidate_op_id)
             .map(|c| c.op_id.clone())
             .collect();
@@ -1713,7 +1823,8 @@ impl Store {
         let from_stage_id = head.get(&sig).cloned();
         // Budget delta from old head to winner — same shape as
         // ModifyBody.
-        let from_budget = from_stage_id.as_deref()
+        let from_budget = from_stage_id
+            .as_deref()
             .and_then(|s| self.get_ast(s).ok())
             .and_then(|s| budget_of_stage(&s));
         let to_budget = budget_of_stage(&winner_stage);
@@ -1756,9 +1867,7 @@ impl Store {
         let attestable = attestable_stage_ids(&transition);
         let op_effects = op_declared_effects(&op.kind);
         self.cas_retry_advance(branch, op, transition, |new_head| {
-            self.run_required_attestations_gate(
-                branch, &new_head.op_id, &attestable, &op_effects,
-            )
+            self.run_required_attestations_gate(branch, &new_head.op_id, &attestable, &op_effects)
         })
     }
 
@@ -1810,9 +1919,7 @@ impl Store {
         for attempt in 1..=MAX_ATTEMPTS {
             // Read the current head BEFORE we persist — this is
             // the value we'll compare against in the CAS.
-            let parent = self
-                .get_branch(branch)?
-                .and_then(|b| b.head_op);
+            let parent = self.get_branch(branch)?.and_then(|b| b.head_op);
 
             // Rebuild the op against the current head, but only
             // on retries (not the caller's first attempt) and
@@ -1823,8 +1930,7 @@ impl Store {
             // the exception note above) so concurrent apply
             // doesn't false-positive on StaleParent.
             let should_rebuild = is_rebuildable
-                && (rebuilt_already
-                    || (current_op.parents.is_empty() && parent.is_some()));
+                && (rebuilt_already || (current_op.parents.is_empty() && parent.is_some()));
             if should_rebuild {
                 current_op = lex_vcs::Operation {
                     kind: kind.clone(),
@@ -1920,7 +2026,6 @@ impl Store {
         })
     }
 
-
     /// Run the `required_attestations` gate (#245) and the
     /// retroactive producer-block gate (#248) over a single op
     /// against the store's `policy.json` and attestation log.
@@ -1949,15 +2054,18 @@ impl Store {
         // Build the candidate slice for the new op. Ops with no
         // attestable stage (imports, empty merges) get a single
         // `None`-stage tuple; both gates skip those.
-        let new_op_candidate: Vec<(lex_vcs::OpId, Option<String>, std::collections::BTreeSet<String>)> =
-            if stage_ids.is_empty() {
-                vec![(op_id.clone(), None, op_effects.clone())]
-            } else {
-                stage_ids
-                    .iter()
-                    .map(|sid| (op_id.clone(), Some(sid.clone()), op_effects.clone()))
-                    .collect()
-            };
+        let new_op_candidate: Vec<(
+            lex_vcs::OpId,
+            Option<String>,
+            std::collections::BTreeSet<String>,
+        )> = if stage_ids.is_empty() {
+            vec![(op_id.clone(), None, op_effects.clone())]
+        } else {
+            stage_ids
+                .iter()
+                .map(|sid| (op_id.clone(), Some(sid.clone()), op_effects.clone()))
+                .collect()
+        };
         let attest_log = self.attestation_log()?;
 
         // #248 + #256: producer-block gate, walk-back style.
@@ -1989,9 +2097,9 @@ impl Store {
             Some(p) if !p.required_attestations.is_empty() => p,
             _ => return Ok(()),
         };
-        let waivers = crate::policy::check_required_attestations(
-            &attest_log, &new_op_candidate, &policy,
-        ).map_err(StoreError::BranchAdvanceBlocked)?;
+        let waivers =
+            crate::policy::check_required_attestations(&attest_log, &new_op_candidate, &policy)
+                .map_err(StoreError::BranchAdvanceBlocked)?;
         // #293: emit one `TrustWaived` attestation per waiver so
         // the audit trail records every skip. Idempotent on
         // attestation_id (content-addressed dedup) — re-running
@@ -2021,15 +2129,14 @@ impl Store {
     /// tuples for every attestable stage touched by an ancestor
     /// (#256). Empty when the branch is fresh, when the checkpoint
     /// equals the head, or when the head is None.
-    fn collect_ancestor_candidates(
-        &self,
-        branch: &str,
-    ) -> Result<Vec<GateCandidate>, StoreError> {
+    fn collect_ancestor_candidates(&self, branch: &str) -> Result<Vec<GateCandidate>, StoreError> {
         let b = match self.get_branch(branch)? {
             Some(b) => b,
             None => return Ok(Vec::new()),
         };
-        let Some(head) = b.head_op else { return Ok(Vec::new()); };
+        let Some(head) = b.head_op else {
+            return Ok(Vec::new());
+        };
         if Some(&head) == b.last_gate_checkpoint.as_ref() {
             // Steady-state common case: previous advance left the
             // checkpoint at head. Nothing to re-walk.
@@ -2072,44 +2179,94 @@ fn stage_for_kind<'a>(
 ) -> Option<&'a lex_ast::Stage> {
     use lex_vcs::OperationKind::*;
     let target_sig = match kind {
-        AddFunction { sig_id, .. } | ModifyBody { sig_id, .. }
-        | ChangeEffectSig { sig_id, .. } | AddType { sig_id, .. }
+        AddFunction { sig_id, .. }
+        | ModifyBody { sig_id, .. }
+        | ChangeEffectSig { sig_id, .. }
+        | AddType { sig_id, .. }
         | ModifyType { sig_id, .. } => Some(sig_id.clone()),
         RenameSymbol { to, .. } => Some(to.clone()),
         _ => None,
     };
     let target_sig = target_sig?;
-    stages.iter().find(|s| sig_id(s).as_deref() == Some(target_sig.as_str()))
+    stages
+        .iter()
+        .find(|s| sig_id(s).as_deref() == Some(target_sig.as_str()))
 }
 
 fn transition_for_kind(kind: &lex_vcs::OperationKind) -> lex_vcs::StageTransition {
     use lex_vcs::OperationKind::*;
     use lex_vcs::StageTransition;
     match kind {
-        AddFunction { sig_id, stage_id, .. }
+        AddFunction {
+            sig_id, stage_id, ..
+        }
         | AddType { sig_id, stage_id } => StageTransition::Create {
-            sig_id: sig_id.clone(), stage_id: stage_id.clone(),
+            sig_id: sig_id.clone(),
+            stage_id: stage_id.clone(),
         },
-        RemoveFunction { sig_id, last_stage_id }
-        | RemoveType { sig_id, last_stage_id } => StageTransition::Remove {
-            sig_id: sig_id.clone(), last: last_stage_id.clone(),
+        RemoveFunction {
+            sig_id,
+            last_stage_id,
+        }
+        | RemoveType {
+            sig_id,
+            last_stage_id,
+        } => StageTransition::Remove {
+            sig_id: sig_id.clone(),
+            last: last_stage_id.clone(),
         },
-        ModifyBody { sig_id, from_stage_id, to_stage_id, .. }
-        | ChangeEffectSig { sig_id, from_stage_id, to_stage_id, .. }
-        | ModifyType { sig_id, from_stage_id, to_stage_id }
-        | ReplaceMatchArm { sig_id, from_stage_id, to_stage_id, .. }
-        | RenameLocal { sig_id, from_stage_id, to_stage_id, .. }
-        | InlineLet { sig_id, from_stage_id, to_stage_id, .. } => StageTransition::Replace {
+        ModifyBody {
+            sig_id,
+            from_stage_id,
+            to_stage_id,
+            ..
+        }
+        | ChangeEffectSig {
+            sig_id,
+            from_stage_id,
+            to_stage_id,
+            ..
+        }
+        | ModifyType {
+            sig_id,
+            from_stage_id,
+            to_stage_id,
+        }
+        | ReplaceMatchArm {
+            sig_id,
+            from_stage_id,
+            to_stage_id,
+            ..
+        }
+        | RenameLocal {
+            sig_id,
+            from_stage_id,
+            to_stage_id,
+            ..
+        }
+        | InlineLet {
+            sig_id,
+            from_stage_id,
+            to_stage_id,
+            ..
+        } => StageTransition::Replace {
             sig_id: sig_id.clone(),
             from: from_stage_id.clone(),
-            to:   to_stage_id.clone(),
+            to: to_stage_id.clone(),
         },
-        RenameSymbol { from, to, body_stage_id } => StageTransition::Rename {
-            from: from.clone(), to: to.clone(),
+        RenameSymbol {
+            from,
+            to,
+            body_stage_id,
+        } => StageTransition::Rename {
+            from: from.clone(),
+            to: to.clone(),
             body_stage_id: body_stage_id.clone(),
         },
         AddImport { .. } | RemoveImport { .. } => StageTransition::ImportOnly,
-        Merge { .. } => StageTransition::Merge { entries: Default::default() },
+        Merge { .. } => StageTransition::Merge {
+            entries: Default::default(),
+        },
         // #294: a Candidate proposes a stage without advancing
         // the branch. ImportOnly keeps the branch head untouched
         // — the stage IS published on disk (Store::propose_candidate
@@ -2118,7 +2275,12 @@ fn transition_for_kind(kind: &lex_vcs::OperationKind) -> lex_vcs::StageTransitio
         // A Promote advances the head exactly like ModifyBody
         // (or Create when the sig had no head). The winner
         // stage is the new branch state for that sig.
-        Promote { sig_id, winner_stage_id, from_stage_id, .. } => match from_stage_id {
+        Promote {
+            sig_id,
+            winner_stage_id,
+            from_stage_id,
+            ..
+        } => match from_stage_id {
             Some(from) => StageTransition::Replace {
                 sig_id: sig_id.clone(),
                 from: from.clone(),
@@ -2191,7 +2353,11 @@ fn producer_trust_producer() -> lex_vcs::ProducerDescriptor {
 /// gates: `(op_id, stage_id, op_effects)`. The `stage_id` is
 /// `None` for ops that don't touch a stage (imports, empty
 /// merges) — the gate skips those.
-type GateCandidate = (lex_vcs::OpId, Option<String>, std::collections::BTreeSet<String>);
+type GateCandidate = (
+    lex_vcs::OpId,
+    Option<String>,
+    std::collections::BTreeSet<String>,
+);
 
 /// Effect set declared *by the operation itself* (#245). Used by
 /// the `required_attestations` gate's `EffectsIntersect` clause.
@@ -2218,10 +2384,7 @@ fn attestable_stage_ids(transition: &lex_vcs::StageTransition) -> Vec<String> {
         Create { stage_id, .. } => vec![stage_id.clone()],
         Replace { to, .. } => vec![to.clone()],
         Rename { body_stage_id, .. } => vec![body_stage_id.clone()],
-        Merge { entries } => entries
-            .values()
-            .filter_map(|opt| opt.clone())
-            .collect(),
+        Merge { entries } => entries.values().filter_map(|opt| opt.clone()).collect(),
         Remove { .. } | ImportOnly => Vec::new(),
     }
 }
@@ -2229,7 +2392,9 @@ fn attestable_stage_ids(transition: &lex_vcs::StageTransition) -> Vec<String> {
 fn write_canonical_json<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreError> {
     let v = serde_json::to_value(value)?;
     let s = lex_ast::canon_json::to_canonical_string(&v);
-    if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     fs::write(path, s)?;
     Ok(())
 }
@@ -2254,13 +2419,17 @@ fn read_let_name(
     // value — we only need the *original* name.)
     let probed = lex_ast::rename_local(stage, let_node, "__lex_rename_probe__")?;
     let Stage::FnDecl(fd) = probed else {
-        return Err(lex_ast::TransformError::NonFnTarget { stage_kind: "non-FnDecl" });
+        return Err(lex_ast::TransformError::NonFnTarget {
+            stage_kind: "non-FnDecl",
+        });
     };
     // Walk back to the probed let to read its old name from the
     // *original* stage — the probed stage's let has already been
     // renamed.
     let Stage::FnDecl(orig_fd) = stage else {
-        return Err(lex_ast::TransformError::NonFnTarget { stage_kind: "non-FnDecl" });
+        return Err(lex_ast::TransformError::NonFnTarget {
+            stage_kind: "non-FnDecl",
+        });
     };
     // Path-based lookup matches the transformer's navigation.
     let path = parse_let_node_path(let_node.as_str())?;
@@ -2282,16 +2451,22 @@ fn read_let_name(
 }
 
 fn parse_let_node_path(id: &str) -> Result<Vec<usize>, lex_ast::TransformError> {
-    let s = id.strip_prefix("n_")
+    let s = id
+        .strip_prefix("n_")
         .ok_or_else(|| lex_ast::TransformError::BadNodeId(id.into()))?;
     let mut parts = s.split('.');
-    let head = parts.next()
+    let head = parts
+        .next()
         .ok_or_else(|| lex_ast::TransformError::BadNodeId(id.into()))?;
-    if head != "0" { return Err(lex_ast::TransformError::BadNodeId(id.into())); }
+    if head != "0" {
+        return Err(lex_ast::TransformError::BadNodeId(id.into()));
+    }
     let mut out = Vec::new();
     for p in parts {
-        out.push(p.parse::<usize>()
-            .map_err(|_| lex_ast::TransformError::BadNodeId(id.into()))?);
+        out.push(
+            p.parse::<usize>()
+                .map_err(|_| lex_ast::TransformError::BadNodeId(id.into()))?,
+        );
     }
     Ok(out)
 }
@@ -2306,40 +2481,58 @@ fn navigate_to_let<'a>(
     for &idx in path {
         current = match current {
             Call { callee, args } => {
-                if idx == 0 { callee } else { args.get(idx - 1)
-                    .ok_or_else(|| lex_ast::TransformError::UnknownNode { at: at.into() })? }
+                if idx == 0 {
+                    callee
+                } else {
+                    args.get(idx - 1)
+                        .ok_or_else(|| lex_ast::TransformError::UnknownNode { at: at.into() })?
+                }
             }
             Let { value, body, .. } => match idx {
-                0 => value, 1 => body,
+                0 => value,
+                1 => body,
                 _ => return Err(lex_ast::TransformError::UnknownNode { at: at.into() }),
             },
             Match { scrutinee, arms } => {
-                if idx == 0 { scrutinee } else {
+                if idx == 0 {
+                    scrutinee
+                } else {
                     let arm_off = idx - 1;
                     if arm_off % 2 != 1 {
                         return Err(lex_ast::TransformError::UnknownNode { at: at.into() });
                     }
                     let arm_index = arm_off / 2;
-                    &arms.get(arm_index)
+                    &arms
+                        .get(arm_index)
                         .ok_or_else(|| lex_ast::TransformError::UnknownNode { at: at.into() })?
                         .body
                 }
             }
             Block { statements, result } => {
-                if idx < statements.len() { &statements[idx] }
-                else if idx == statements.len() { result }
-                else { return Err(lex_ast::TransformError::UnknownNode { at: at.into() }); }
+                if idx < statements.len() {
+                    &statements[idx]
+                } else if idx == statements.len() {
+                    result
+                } else {
+                    return Err(lex_ast::TransformError::UnknownNode { at: at.into() });
+                }
             }
-            Constructor { args, .. } | TupleLit { items: args, .. }
-            | ListLit { items: args, .. } => args.get(idx)
+            Constructor { args, .. }
+            | TupleLit { items: args, .. }
+            | ListLit { items: args, .. } => args
+                .get(idx)
                 .ok_or_else(|| lex_ast::TransformError::UnknownNode { at: at.into() })?,
-            RecordLit { fields } => &fields.get(idx)
-                .ok_or_else(|| lex_ast::TransformError::UnknownNode { at: at.into() })?
-                .value,
+            RecordLit { fields } => {
+                &fields
+                    .get(idx)
+                    .ok_or_else(|| lex_ast::TransformError::UnknownNode { at: at.into() })?
+                    .value
+            }
             FieldAccess { value, .. } if idx == 0 => value,
             Lambda { body, .. } if idx == 0 => body,
             BinOp { lhs, rhs, .. } => match idx {
-                0 => lhs, 1 => rhs,
+                0 => lhs,
+                1 => rhs,
                 _ => return Err(lex_ast::TransformError::UnknownNode { at: at.into() }),
             },
             UnaryOp { expr, .. } if idx == 0 => expr,
@@ -2359,13 +2552,20 @@ fn navigate_to_let<'a>(
 fn lex_cexpr_kind(e: &lex_ast::CExpr) -> &'static str {
     use lex_ast::CExpr::*;
     match e {
-        Literal { .. } => "Literal", Var { .. } => "Var",
-        Call { .. } => "Call", Let { .. } => "Let",
-        Match { .. } => "Match", Block { .. } => "Block",
-        Constructor { .. } => "Constructor", RecordLit { .. } => "RecordLit",
-        TupleLit { .. } => "TupleLit", ListLit { .. } => "ListLit",
-        FieldAccess { .. } => "FieldAccess", Lambda { .. } => "Lambda",
-        BinOp { .. } => "BinOp", UnaryOp { .. } => "UnaryOp",
+        Literal { .. } => "Literal",
+        Var { .. } => "Var",
+        Call { .. } => "Call",
+        Let { .. } => "Let",
+        Match { .. } => "Match",
+        Block { .. } => "Block",
+        Constructor { .. } => "Constructor",
+        RecordLit { .. } => "RecordLit",
+        TupleLit { .. } => "TupleLit",
+        ListLit { .. } => "ListLit",
+        FieldAccess { .. } => "FieldAccess",
+        Lambda { .. } => "Lambda",
+        BinOp { .. } => "BinOp",
+        UnaryOp { .. } => "UnaryOp",
         Return { .. } => "Return",
     }
 }
@@ -2381,7 +2581,9 @@ fn budget_of_stage(stage: &Stage) -> Option<u64> {
     };
     let mut min_cost: Option<u64> = None;
     for eff in &fd.effects {
-        if eff.name != "budget" { continue }
+        if eff.name != "budget" {
+            continue;
+        }
         if let Some(lex_ast::EffectArg::Int { value }) = &eff.arg {
             let n = *value as u64;
             min_cost = Some(min_cost.map(|c| c.min(n)).unwrap_or(n));
