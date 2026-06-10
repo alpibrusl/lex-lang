@@ -10,7 +10,7 @@ use std::path::PathBuf;
 /// Attach `Authorization: Bearer <token>` to a request when a token
 /// is present. Falls back to the unmodified builder when absent so
 /// unauthenticated `lex serve` remotes keep working (#630).
-fn with_auth(req: ureq::RequestBuilder, token: Option<&str>) -> ureq::RequestBuilder {
+fn with_auth<B>(req: ureq::RequestBuilder<B>, token: Option<&str>) -> ureq::RequestBuilder<B> {
     match token {
         Some(t) => req.header("Authorization", &format!("Bearer {t}")),
         None => req,
