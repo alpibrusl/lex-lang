@@ -15,6 +15,7 @@ mod agent_guidelines;
 mod ast_merge;
 mod audit;
 mod branch;
+mod capsule_contract;
 mod ci;
 mod diff;
 mod docs;

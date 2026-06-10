@@ -38,7 +38,7 @@ description: "Invoke the `lex` CLI. Commands: parse, check, run, hash…"
 - `lex watch` — re-run check or run on file save (agent inner loop)
 - `lex agent-guidelines` — emit the AI-agent authoring contract (idiom rules) for this Lex toolchain (idempotent)
 - `lex init` — scaffold a new project (lex.toml, src/, tests/, CI)
-- `lex pkg` — package manager: init, add, install, list dependencies
+- `lex pkg` — package manager: init, add, install, list deps; publish/verify signed capability contracts
 - `lex fmt` — format .lex files; --check exits 1 if any need it
 - `lex ci` — run the full pipeline: pkg install, check --strict, fmt --check, test
 - `lex test` — run tests/test_*.lex files (calls run_all in each) (idempotent)
@@ -754,11 +754,11 @@ lex init my-proj
 
 ## `lex pkg`
 
-package manager: init, add, install, list dependencies
+package manager: init, add, install, list deps; publish/verify signed capability contracts
 
 ### Arguments
 
-- `subcommand` (enum[init|add|install|list], required) — what to do
+- `subcommand` (enum[init|add|install|list|publish|verify], required) — what to do
 
 ### Examples
 
@@ -772,7 +772,17 @@ lex pkg install
 lex pkg add mylib --path ../mylib
 ```
 
-**See also:** `lex init`, `lex ci`
+```bash
+# Publish with a signed contract
+lex pkg publish --sign <key> --requires grant.json --contract-out c.json --archive-out pkg.tar
+```
+
+```bash
+# Verify a package against its contract
+lex pkg verify --archive pkg.tar --contract c.json --trusted-keys keyring.json
+```
+
+**See also:** `lex init`, `lex ci`, `lex keygen`
 
 ## `lex fmt`
 

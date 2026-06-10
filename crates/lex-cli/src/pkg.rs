@@ -8,9 +8,22 @@
 //!   lex pkg add <name> --registry <url> --version <v>  — add a registry dependency
 //!   lex pkg list                                       — list dependencies in lex.toml
 //!   lex pkg publish [--registry <url>] [--token <jwt>] — publish package to a registry
+//!       [--sign <key>] [--requires <grant.json>] [--egress h,h] [--contract-out <file>]
+//!                                                      — also emit a signed capability
+//!                                                        contract (the lex-os capsule
+//!                                                        format) binding the published
+//!                                                        bytes to the grant it needs
+//!   lex pkg verify --archive <tar> --contract <c.json> [--trusted-keys <keyring.json>]
+//!                                                      — verify a package against its
+//!                                                        signed contract (signature +
+//!                                                        content hash + signer trust)
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::path::Path;
+
+use crate::capsule_contract::{
+    ArtifactRef, CapabilityContract, Keyring, SignedContract,
+};
 
 pub fn cmd_pkg(args: &[String]) -> Result<()> {
     match args.first().map(|s| s.as_str()) {
@@ -19,8 +32,9 @@ pub fn cmd_pkg(args: &[String]) -> Result<()> {
         Some("list")    => cmd_list(),
         Some("install") => cmd_install(),
         Some("publish") => cmd_publish(&args[1..]),
-        Some(other)     => bail!("unknown pkg subcommand `{other}`; try: init, add, install, list, publish"),
-        None            => bail!("usage: lex pkg <init|add|install|list|publish>"),
+        Some("verify")  => cmd_verify(&args[1..]),
+        Some(other)     => bail!("unknown pkg subcommand `{other}`; try: init, add, install, list, publish, verify"),
+        None            => bail!("usage: lex pkg <init|add|install|list|publish|verify>"),
     }
 }
 
@@ -272,6 +286,14 @@ fn build_archive(toml_dir: &std::path::Path) -> Result<Vec<u8>> {
 fn cmd_publish(args: &[String]) -> Result<()> {
     let mut registry_arg: Option<String> = None;
     let mut token_arg:    Option<String> = None;
+    // Provenance: when --sign is given, emit a signed capability contract
+    // (the lex-os capsule format) alongside / instead of uploading.
+    let mut sign_arg:     Option<String> = None;
+    let mut requires_arg: Option<String> = None;
+    let mut egress_arg:   Vec<String>    = Vec::new();
+    let mut contract_out: Option<String> = None;
+    let mut archive_out:  Option<String> = None;
+    let mut no_upload = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -287,6 +309,38 @@ fn cmd_publish(args: &[String]) -> Result<()> {
                     anyhow::anyhow!("--token requires a value")
                 })?);
             }
+            "--sign" => {
+                i += 1;
+                sign_arg = Some(args.get(i).cloned().ok_or_else(|| {
+                    anyhow::anyhow!("--sign requires a key (64-hex secret, or @path / env LEX_SIGNING_KEY)")
+                })?);
+            }
+            "--requires" => {
+                i += 1;
+                requires_arg = Some(args.get(i).cloned().ok_or_else(|| {
+                    anyhow::anyhow!("--requires requires a path to a grant JSON file")
+                })?);
+            }
+            "--egress" => {
+                i += 1;
+                let v = args.get(i).cloned().ok_or_else(|| {
+                    anyhow::anyhow!("--egress requires a comma-separated host list")
+                })?;
+                egress_arg.extend(v.split(',').filter(|s| !s.is_empty()).map(String::from));
+            }
+            "--contract-out" => {
+                i += 1;
+                contract_out = Some(args.get(i).cloned().ok_or_else(|| {
+                    anyhow::anyhow!("--contract-out requires a path")
+                })?);
+            }
+            "--archive-out" => {
+                i += 1;
+                archive_out = Some(args.get(i).cloned().ok_or_else(|| {
+                    anyhow::anyhow!("--archive-out requires a path")
+                })?);
+            }
+            "--no-upload" => no_upload = true,
             other => bail!("unknown flag `{other}`"),
         }
         i += 1;
@@ -302,46 +356,210 @@ fn cmd_publish(args: &[String]) -> Result<()> {
     let pkg = manifest.package.as_ref()
         .ok_or_else(|| anyhow::anyhow!("lex.toml must have a [package] section"))?;
 
-    let registry = registry_arg
-        .or_else(|| pkg.registry.clone())
-        .ok_or_else(|| anyhow::anyhow!(
-            "no registry URL: pass --registry <url> or set `registry` in [package]"
-        ))?;
-
-    let token = token_arg
-        .or_else(|| std::env::var("LEX_PUBLISH_TOKEN").ok())
-        .ok_or_else(|| anyhow::anyhow!(
-            "no publish token: pass --token <jwt> or set LEX_PUBLISH_TOKEN"
-        ))?;
-
-    println!("publishing {}@{} to {} ...", pkg.name, pkg.version, registry);
-
+    // Build the archive once: the same bytes are hashed for the contract and
+    // uploaded to the registry, so the content_hash binds what installs.
     let archive = build_archive(&toml_dir)
         .map_err(|e| anyhow::anyhow!("building archive: {e}"))?;
+    let content_hash = crate::capsule_contract::hash_artifact_bytes(&archive);
 
-    let url = format!("{}/v1/pkg/publish", registry.trim_end_matches('/'));
-    let response = ureq::post(&url)
-        .header("Authorization", &format!("Bearer {token}"))
-        .header("Content-Type", "application/octet-stream")
-        .send(&archive[..])
-        .map_err(|e| anyhow::anyhow!("POST {url}: {e}"))?;
-
-    let status = response.status().as_u16();
-    let body: serde_json::Value = response
-        .into_body()
-        .read_json()
-        .map_err(|e| anyhow::anyhow!("reading response: {e}"))?;
-
-    if status != 200 {
-        bail!(
-            "publish failed (HTTP {status}): {}",
-            body.get("error").and_then(|v| v.as_str()).unwrap_or("unknown error")
-        );
+    // Emit the exact bytes the content_hash binds, so a consumer can verify and
+    // `lex-os capsule install --artifact <archive>` can run them.
+    if let Some(path) = &archive_out {
+        std::fs::write(path, &archive)
+            .with_context(|| format!("writing archive to {path}"))?;
     }
 
-    let head_op = body.get("head_op").and_then(|v| v.as_str()).unwrap_or("(none)");
-    println!("published  head_op = {head_op}");
+    // ── Provenance: emit a signed capability contract ──────────────────────
+    if let Some(key_spec) = &sign_arg {
+        let requires_path = requires_arg.as_ref().ok_or_else(|| anyhow::anyhow!(
+            "--sign requires --requires <grant.json> (the capability the package needs)"
+        ))?;
+        let requires = load_grant(requires_path)?;
+        let keypair = resolve_pkg_signing_key(key_spec)?;
+
+        let contract = CapabilityContract {
+            artifact: ArtifactRef {
+                name: pkg.name.clone(),
+                version: pkg.version.clone(),
+                content_hash: content_hash.clone(),
+            },
+            requires,
+            egress: egress_arg.clone(),
+        };
+        let contract_id = contract.content_id();
+        let signed = contract.sign(&keypair);
+        let json = serde_json::to_string_pretty(&signed)
+            .map_err(|e| anyhow::anyhow!("serializing contract: {e}"))?;
+
+        let out_path = contract_out
+            .clone()
+            .unwrap_or_else(|| format!("{}-{}.contract.json", pkg.name, pkg.version));
+        std::fs::write(&out_path, format!("{json}\n"))
+            .with_context(|| format!("writing contract to {out_path}"))?;
+        println!(
+            "signed contract  {}@{}  contract_id={contract_id}  content_hash={content_hash}  signer={}",
+            pkg.name,
+            pkg.version,
+            signed.signer,
+        );
+        println!("  -> {out_path}  (install with: lex-os capsule install --contract {out_path} --artifact <archive>)");
+    } else if contract_out.is_some() || requires_arg.is_some() || !egress_arg.is_empty() {
+        bail!("--requires / --egress / --contract-out only apply with --sign");
+    }
+
+    // ── Registry upload ────────────────────────────────────────────────────
+    // Resolve the registry/token; if a contract was emitted and no registry is
+    // configured, that's a complete local publish — don't force an upload.
+    let registry = registry_arg.or_else(|| pkg.registry.clone());
+    let token = token_arg.or_else(|| std::env::var("LEX_PUBLISH_TOKEN").ok());
+
+    if no_upload {
+        return Ok(());
+    }
+    match (registry, token) {
+        (Some(registry), Some(token)) => {
+            println!("publishing {}@{} to {} ...", pkg.name, pkg.version, registry);
+            let url = format!("{}/v1/pkg/publish", registry.trim_end_matches('/'));
+            let response = ureq::post(&url)
+                .header("Authorization", &format!("Bearer {token}"))
+                .header("Content-Type", "application/octet-stream")
+                .send(&archive[..])
+                .map_err(|e| anyhow::anyhow!("POST {url}: {e}"))?;
+
+            let status = response.status().as_u16();
+            let body: serde_json::Value = response
+                .into_body()
+                .read_json()
+                .map_err(|e| anyhow::anyhow!("reading response: {e}"))?;
+            if status != 200 {
+                bail!(
+                    "publish failed (HTTP {status}): {}",
+                    body.get("error").and_then(|v| v.as_str()).unwrap_or("unknown error")
+                );
+            }
+            let head_op = body.get("head_op").and_then(|v| v.as_str()).unwrap_or("(none)");
+            println!("published  head_op = {head_op}");
+            Ok(())
+        }
+        // Contract emitted but no registry: a complete local publish.
+        _ if sign_arg.is_some() => Ok(()),
+        _ => bail!(
+            "no registry URL: pass --registry <url> or set `registry` in [package] \
+             (or use --sign … to emit a contract locally without uploading)"
+        ),
+    }
+}
+
+// ── lex pkg verify ────────────────────────────────────────────────────────────
+
+/// Verify a published package against its signed capability contract: the
+/// signature binds the contract to its declared signer, the archive bytes hash
+/// to the contract's `content_hash`, and — with `--trusted-keys` — the signer
+/// is one the consumer pinned. The same three gates `lex-os capsule install`
+/// applies, available to the package manager before a dependency is trusted.
+fn cmd_verify(args: &[String]) -> Result<()> {
+    let mut archive_path: Option<String> = None;
+    let mut contract_path: Option<String> = None;
+    let mut trusted_keys: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--archive" => {
+                i += 1;
+                archive_path = Some(args.get(i).cloned().ok_or_else(|| {
+                    anyhow::anyhow!("--archive requires a path")
+                })?);
+            }
+            "--contract" => {
+                i += 1;
+                contract_path = Some(args.get(i).cloned().ok_or_else(|| {
+                    anyhow::anyhow!("--contract requires a path")
+                })?);
+            }
+            "--trusted-keys" => {
+                i += 1;
+                trusted_keys = Some(args.get(i).cloned().ok_or_else(|| {
+                    anyhow::anyhow!("--trusted-keys requires a path")
+                })?);
+            }
+            other => bail!("unknown flag `{other}`"),
+        }
+        i += 1;
+    }
+    let archive_path = archive_path.ok_or_else(|| anyhow::anyhow!(
+        "usage: lex pkg verify --archive <tar> --contract <c.json> [--trusted-keys <keyring.json>]"
+    ))?;
+    let contract_path = contract_path.ok_or_else(|| anyhow::anyhow!(
+        "usage: lex pkg verify --archive <tar> --contract <c.json> [--trusted-keys <keyring.json>]"
+    ))?;
+
+    let contract_raw = std::fs::read_to_string(&contract_path)
+        .with_context(|| format!("reading contract {contract_path}"))?;
+    let signed: SignedContract = serde_json::from_str(&contract_raw)
+        .with_context(|| format!("parsing contract {contract_path}"))?;
+    let archive = std::fs::read(&archive_path)
+        .with_context(|| format!("reading archive {archive_path}"))?;
+
+    // 1. Authenticity: the signature binds the contract to its signer.
+    let signer = signed.verify().map_err(|e| anyhow::anyhow!("authenticity: {e}"))?;
+    // 2. Integrity: the bytes are the ones the contract was signed over.
+    signed.matches_artifact(&archive).map_err(|e| anyhow::anyhow!("integrity: {e}"))?;
+    // 3. Authorization: the signer is trusted (if a keyring was supplied).
+    let trust_checked = match &trusted_keys {
+        Some(path) => {
+            let raw = std::fs::read_to_string(path)
+                .with_context(|| format!("reading keyring {path}"))?;
+            let keyring: Keyring = serde_json::from_str(&raw)
+                .with_context(|| format!("parsing keyring {path}"))?;
+            if !keyring.trusts(&signer) {
+                bail!("authorization: signer {signer} is not in the trusted keyring {path}");
+            }
+            true
+        }
+        None => {
+            eprintln!(
+                "⚠  signer NOT checked against a trusted keyring — any valid signature is \
+                 accepted. Pass --trusted-keys <keyring.json> to pin publishers."
+            );
+            false
+        }
+    };
+
+    let a = &signed.contract.artifact;
+    println!(
+        "verified  {}@{}  content_hash={}  signer={signer}  signer_trust_checked={trust_checked}",
+        a.name, a.version, a.content_hash,
+    );
     Ok(())
+}
+
+/// Load a `lex_types::trust::Grant` from a JSON file (the `--requires` shape:
+/// `{"filesystem":"ReadOnly","network":"Allowlist","exec":"None"}`).
+fn load_grant(path: &str) -> Result<lex_types::trust::Grant> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading grant file {path}"))?;
+    serde_json::from_str(&raw)
+        .with_context(|| format!("parsing grant {path} (expected {{\"filesystem\":…,\"network\":…,\"exec\":…}})"))
+}
+
+/// Resolve a signing key for `lex pkg publish --sign`. Accepts a 64-hex secret
+/// directly, `@<path>` to read it from a file, or falls back to
+/// `LEX_SIGNING_KEY` when the literal `env` is passed — mirroring how
+/// `lex publish` resolves its signer.
+fn resolve_pkg_signing_key(spec: &str) -> Result<lex_vcs::Keypair> {
+    let hex = if let Some(path) = spec.strip_prefix('@') {
+        std::fs::read_to_string(path)
+            .with_context(|| format!("reading signing key from {path}"))?
+            .trim()
+            .to_string()
+    } else if spec == "env" {
+        std::env::var("LEX_SIGNING_KEY")
+            .map_err(|_| anyhow::anyhow!("--sign env requires LEX_SIGNING_KEY to be set"))?
+    } else {
+        spec.to_string()
+    };
+    lex_vcs::Keypair::from_secret_hex(&hex)
+        .map_err(|e| anyhow::anyhow!("invalid signing key: {e}"))
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

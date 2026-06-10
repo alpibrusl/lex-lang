@@ -162,20 +162,28 @@ fn cmd_init() -> CommandInfo {
 fn cmd_pkg() -> CommandInfo {
     CommandInfo::new(
         "pkg",
-        "package manager: init, add, install, list dependencies",
+        "package manager: init, add, install, list deps; publish/verify signed capability contracts",
     )
     .idempotent(false)
     .add_argument(
         "subcommand",
-        "enum[init|add|install|list]",
+        "enum[init|add|install|list|publish|verify]",
         "what to do",
         true,
     )
     .with_examples(vec![
         ("Install deps", "lex pkg install"),
         ("Add a path dep", "lex pkg add mylib --path ../mylib"),
+        (
+            "Publish with a signed contract",
+            "lex pkg publish --sign <key> --requires grant.json --contract-out c.json --archive-out pkg.tar",
+        ),
+        (
+            "Verify a package against its contract",
+            "lex pkg verify --archive pkg.tar --contract c.json --trusted-keys keyring.json",
+        ),
     ])
-    .with_see_also(vec!["init", "ci"])
+    .with_see_also(vec!["init", "ci", "keygen"])
 }
 
 fn cmd_fmt() -> CommandInfo {
