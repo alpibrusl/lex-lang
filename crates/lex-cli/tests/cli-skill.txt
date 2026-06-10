@@ -276,11 +276,16 @@ lex attest filter --kind type_check --since 2026-05-01
 ```
 
 ```bash
+# Promote capsule installs to attestations
+lex attest import-install --audit install.audit.json
+```
+
+```bash
 # Machine-readable
 lex --output json attest filter --kind spec
 ```
 
-**See also:** `lex stage`, `lex blame`
+**See also:** `lex stage`, `lex blame`, `lex producer-trust`
 
 ## `lex trace`
 

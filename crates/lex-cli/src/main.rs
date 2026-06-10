@@ -3436,6 +3436,11 @@ fn cmd_stage(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                     } => {
                         format!("TrustWaived({producer}/{kind_tag})")
                     }
+                    lex_vcs::AttestationKind::CapsuleInstall {
+                        artifact, signer, ..
+                    } => {
+                        format!("CapsuleInstall({artifact} by {signer:.12}…)")
+                    }
                 };
                 let result = match &a.result {
                     lex_vcs::AttestationResult::Passed => "passed".to_string(),
@@ -3816,7 +3821,7 @@ fn cmd_stage_decision(
 fn cmd_attest(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let sub = args
         .first()
-        .ok_or_else(|| anyhow!("usage: lex attest {{filter|push}} ..."))?;
+        .ok_or_else(|| anyhow!("usage: lex attest {{filter|import-install|push|pull|retro-block|retro-unblock}} ..."))?;
     let rest = &args[1..];
     if sub == "push" {
         return cmd_attest_push(fmt, rest);
@@ -3925,10 +3930,128 @@ fn cmd_attest(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             });
             Ok(())
         }
+        "import-install" => cmd_attest_import_install(fmt, rest),
         "retro-block" => cmd_attest_retro_block(fmt, rest),
         "retro-unblock" => cmd_attest_retro_unblock(fmt, rest),
         other => bail!("unknown `lex attest` subcommand: {other}"),
     }
+}
+
+/// `lex attest import-install --audit <lex-os-audit.json> [--store DIR]`
+/// (lex-os#36 / #38). Promotes lex-os capsule-install records into the
+/// durable attestation graph so an install becomes queryable evidence —
+/// not a throwaway audit file.
+///
+/// Reads a tamper-evident audit log (as written by `lex-os capsule
+/// install --audit-out`) and, for every `capsule_installed` event,
+/// emits a [`lex_vcs::AttestationKind::CapsuleInstall`] under
+/// `stage_id == signer` with `produced_by.tool == signer`. That keys the
+/// record by the publisher in both the by-stage index and the
+/// producer-trust scorer, so `lex producer-trust recompute --tool
+/// <signer>` folds real installs into the signer's earned trust and the
+/// keyring `capsule install --trusted-keys` consumes.
+///
+/// Idempotent: the content-addressed attestation id dedups re-imports of
+/// the same log (two installs of identical bytes by the same signer are
+/// one fact). The audit log is *not* re-verified here — promotion records
+/// what lex-os decided; verifying the chain remains `lex-os audit verify`.
+fn cmd_attest_import_install(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let (root, rest, _, _) = parse_store_flag(args);
+    let mut audit_path: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--audit" => {
+                audit_path = rest.get(i + 1).map(PathBuf::from);
+                i += 2;
+            }
+            other => bail!("unexpected arg `{other}`"),
+        }
+    }
+    let audit_path = audit_path.ok_or_else(|| {
+        anyhow!("usage: lex attest import-install --audit <lex-os-audit.json> [--store DIR]")
+    })?;
+    let raw = std::fs::read_to_string(&audit_path)
+        .with_context(|| format!("reading audit log {}", audit_path.display()))?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing audit log {} as JSON", audit_path.display()))?;
+    let entries = parsed.as_array().ok_or_else(|| {
+        anyhow!(
+            "audit log {} is not a JSON array of entries",
+            audit_path.display()
+        )
+    })?;
+
+    let store =
+        Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
+    let log = store.attestation_log()?;
+
+    let mut imported: Vec<serde_json::Value> = Vec::new();
+    let mut already_present = 0usize;
+    for entry in entries {
+        let event = &entry["event"];
+        if event["kind"].as_str() != Some("capsule_installed") {
+            continue;
+        }
+        // A malformed install event is a hard error: refuse to mint a
+        // half-attributed trust record rather than silently skip it.
+        let signer = event["signer"]
+            .as_str()
+            .ok_or_else(|| anyhow!("capsule_installed event missing `signer`"))?;
+        let artifact = event["artifact"]
+            .as_str()
+            .ok_or_else(|| anyhow!("capsule_installed event missing `artifact`"))?;
+        let effective_grant = event["effective_grant"].as_str().unwrap_or("").to_string();
+        // content_hash names the exact bytes. Older logs predate it; we
+        // import them with an empty hash rather than refusing.
+        let content_hash = event["content_hash"].as_str().unwrap_or("").to_string();
+
+        let producer = lex_vcs::ProducerDescriptor {
+            tool: signer.to_string(),
+            version: "lex-os-capsule".into(),
+            model: None,
+        };
+        let attestation = lex_vcs::Attestation::new(
+            signer.to_string(),
+            None,
+            None,
+            lex_vcs::AttestationKind::CapsuleInstall {
+                artifact: artifact.to_string(),
+                content_hash: content_hash.clone(),
+                signer: signer.to_string(),
+                effective_grant,
+            },
+            lex_vcs::AttestationResult::Passed,
+            producer,
+            None,
+        );
+        let existed = log.get(&attestation.attestation_id)?.is_some();
+        log.put(&attestation)?;
+        if existed {
+            already_present += 1;
+        }
+        imported.push(serde_json::json!({
+            "attestation_id": attestation.attestation_id,
+            "artifact": artifact,
+            "signer": signer,
+            "content_hash": content_hash,
+            "already_present": existed,
+        }));
+    }
+
+    let count = imported.len();
+    let data = serde_json::json!({
+        "audit_log": audit_path.display().to_string(),
+        "imported": count,
+        "already_present": already_present,
+        "attestations": imported,
+    });
+    acli::emit_or_text("attest", data, fmt, move || {
+        println!(
+            "→ imported {count} capsule-install attestation(s) ({already_present} already present)"
+        );
+    });
+    Ok(())
 }
 
 /// `lex attest retro-block --producer <tool_id> --reason "..."` (#248).
@@ -4401,6 +4524,7 @@ fn attestation_kind_tag(k: &lex_vcs::AttestationKind) -> &'static str {
         RepairAttempt { .. } => "repair_attempt",
         ProducerTrust { .. } => "producer_trust",
         TrustWaived { .. } => "trust_waived",
+        CapsuleInstall { .. } => "capsule_install",
     }
 }
 
