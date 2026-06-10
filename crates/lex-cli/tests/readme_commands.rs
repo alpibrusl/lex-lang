@@ -11,6 +11,12 @@
 //!     Every command the README invokes must be in it.
 //!  2. **Documented exit codes hold.** The Quickstart's load-bearing exit
 //!     codes are run for real against the built binary.
+//!  3. **The CLI surface is snapshotted.** `lex skill` (the ACLI surface
+//!     agents discover, built from the command definitions) is pinned to a
+//!     committed golden file, so adding / removing / renaming a command or
+//!     changing its description, options, or exit codes fails CI until the
+//!     snapshot is regenerated — the flag-level twin of guard 1, matching
+//!     lex-os's `cli_reference_is_in_sync`.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -192,5 +198,33 @@ fn documented_exit_codes_hold() {
         ]),
         2,
         "an effect-lying agent body should be TYPE-CHECK REJECTED with exit 2"
+    );
+}
+
+/// Capture stdout of `lex <args>`, with the crate version normalized to
+/// `<VERSION>` so the snapshot survives releases (the only volatile token in
+/// `lex skill` is the `vX.Y.Z` in its header).
+fn run_stdout(args: &[&str]) -> String {
+    let out = Command::new(BIN)
+        .args(args)
+        .current_dir(repo_root())
+        .output()
+        .expect("spawn lex");
+    String::from_utf8_lossy(&out.stdout).replace(env!("CARGO_PKG_VERSION"), "<VERSION>")
+}
+
+#[test]
+fn cli_skill_is_in_sync() {
+    let current = run_stdout(&["skill"]);
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/cli-skill.txt");
+    if std::env::var_os("UPDATE_CLI_SKILL").is_some() {
+        std::fs::write(&path, &current).expect("write skill snapshot");
+        return;
+    }
+    let committed = std::fs::read_to_string(&path).unwrap_or_default();
+    assert_eq!(
+        current, committed,
+        "`lex skill` surface drifted from tests/cli-skill.txt.\n\
+         Regenerate: UPDATE_CLI_SKILL=1 cargo test -p lex-cli --test readme_commands cli_skill_is_in_sync"
     );
 }
