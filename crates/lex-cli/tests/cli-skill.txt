@@ -37,6 +37,19 @@ description: "Invoke the `lex` CLI. Commands: parse, check, run, hash…"
 - `lex repl` — interactive evaluator (Lex source line-by-line)
 - `lex watch` — re-run check or run on file save (agent inner loop)
 - `lex agent-guidelines` — emit the AI-agent authoring contract (idiom rules) for this Lex toolchain (idempotent)
+- `lex init` — scaffold a new project (lex.toml, src/, tests/, CI)
+- `lex pkg` — package manager: init, add, install, list dependencies
+- `lex fmt` — format .lex files; --check exits 1 if any need it
+- `lex ci` — run the full pipeline: pkg install, check --strict, fmt --check, test
+- `lex test` — run tests/test_*.lex files (calls run_all in each) (idempotent)
+- `lex keygen` — print a fresh Ed25519 keypair (hex) for signing stages
+- `lex canonical` — encode/decode the canonical wire form of an AST (idempotent)
+- `lex docs` — emit machine-readable API/workspace docs (idempotent)
+- `lex op` — inspect and sync the operation log (show|log|push|pull|repack|gc)
+- `lex plan` — list repair-candidate paths for a goal, cheapest-first, within budget (idempotent)
+- `lex repair` — apply a typed repair transform to a failed op; emits a RepairAttempt
+- `lex policy` — manage store policy.json (producer blocks + required attestations)
+- `lex producer-trust` — recompute per-tool trust from attestation history, or export a trusted-keys keyring above a score threshold
 
 ## `lex parse`
 
@@ -711,6 +724,267 @@ lex agent-guidelines --version-only
 ```
 
 **See also:** `lex skill`, `lex introspect`, `lex init`
+
+## `lex init`
+
+scaffold a new project (lex.toml, src/, tests/, CI)
+
+### Arguments
+
+- `dir` (string, optional) — target directory (default: current)
+
+### Examples
+
+```bash
+# Scaffold here
+lex init
+```
+
+```bash
+# Into a dir
+lex init my-proj
+```
+
+**See also:** `lex pkg`, `lex agent-guidelines`
+
+## `lex pkg`
+
+package manager: init, add, install, list dependencies
+
+### Arguments
+
+- `subcommand` (enum[init|add|install|list], required) — what to do
+
+### Examples
+
+```bash
+# Install deps
+lex pkg install
+```
+
+```bash
+# Add a path dep
+lex pkg add mylib --path ../mylib
+```
+
+**See also:** `lex init`, `lex ci`
+
+## `lex fmt`
+
+format .lex files; --check exits 1 if any need it
+
+### Options
+
+- `----check` (bool) — don't write; exit 1 if any file is unformatted
+
+### Arguments
+
+- `path` (string[], required) — files or directories to format
+
+### Examples
+
+```bash
+# Format src
+lex fmt src/
+```
+
+```bash
+# Verify in CI
+lex fmt --check src/
+```
+
+**See also:** `lex check`, `lex ci`
+
+## `lex ci`
+
+run the full pipeline: pkg install, check --strict, fmt --check, test
+
+### Options
+
+- `----no-fmt` (bool) — skip the fmt --check stage
+
+### Examples
+
+```bash
+# Run the gate
+lex ci
+```
+
+**See also:** `lex check`, `lex fmt`, `lex test`
+
+## `lex test`
+
+run tests/test_*.lex files (calls run_all in each)
+
+### Arguments
+
+- `dir` (string, optional) — test directory (default: tests/)
+
+### Examples
+
+```bash
+# Run tests
+lex test
+```
+
+**See also:** `lex check`, `lex ci`
+
+## `lex keygen`
+
+print a fresh Ed25519 keypair (hex) for signing stages
+
+### Examples
+
+```bash
+# Generate a key
+lex keygen
+```
+
+**See also:** `lex publish`, `lex store`
+
+## `lex canonical`
+
+encode/decode the canonical wire form of an AST
+
+### Arguments
+
+- `subcommand` (enum[encode|decode], required) — direction
+
+### Examples
+
+```bash
+# Encode
+lex canonical encode a.lex
+```
+
+```bash
+# Decode
+lex canonical decode a.canon
+```
+
+**See also:** `lex parse`, `lex hash`
+
+## `lex docs`
+
+emit machine-readable API/workspace docs
+
+### Options
+
+- `----for-agent` (bool) — emit one JSON object describing the whole workspace
+
+### Arguments
+
+- `path` (string[], optional) — source files/dirs (omit with --for-agent)
+
+### Examples
+
+```bash
+# Workspace docs
+lex docs --for-agent
+```
+
+```bash
+# Per-file
+lex docs src/
+```
+
+**See also:** `lex skill`, `lex introspect`
+
+## `lex op`
+
+inspect and sync the operation log (show|log|push|pull|repack|gc)
+
+### Arguments
+
+- `subcommand` (enum[show|log|push|pull|repack|gc], required) — what to do
+
+### Examples
+
+```bash
+# List ops
+lex op log
+```
+
+```bash
+# Garbage-collect
+lex op gc --confirm
+```
+
+**See also:** `lex log`, `lex store`
+
+## `lex plan`
+
+list repair-candidate paths for a goal, cheapest-first, within budget
+
+### Examples
+
+```bash
+# Plan repairs
+lex plan <goal>
+```
+
+**See also:** `lex repair`, `lex check`
+
+## `lex repair`
+
+apply a typed repair transform to a failed op; emits a RepairAttempt
+
+### Options
+
+- `----apply` (bool) — execute the transform (vs. preview)
+- `----transform` (string) — the typed transform as JSON
+
+### Arguments
+
+- `op_id` (string, required) — the failed operation to repair
+
+### Examples
+
+```bash
+# Apply a transform
+lex repair <op_id> --apply --transform '<json>'
+```
+
+**See also:** `lex plan`, `lex check`
+
+## `lex policy`
+
+manage store policy.json (producer blocks + required attestations)
+
+### Arguments
+
+- `subcommand` (enum[block-producer|unblock-producer|require-attestation|unrequire-attestation|show], required) — what to do
+
+### Examples
+
+```bash
+# Show policy
+lex policy show
+```
+
+**See also:** `lex attest`, `lex producer-trust`
+
+## `lex producer-trust`
+
+recompute per-tool trust from attestation history, or export a trusted-keys keyring above a score threshold
+
+### Arguments
+
+- `subcommand` (enum[recompute|keyring], required) — what to do
+
+### Examples
+
+```bash
+# Recompute a tool's trust
+lex producer-trust recompute --tool <id>
+```
+
+```bash
+# Export a capsule keyring
+lex producer-trust keyring --min-trust 700 --out trusted.json
+```
+
+**See also:** `lex policy`, `lex attest`
 
 ## Output format
 
