@@ -7,6 +7,21 @@ use lex_store::Store;
 use lex_vcs::{OpLog, OperationRecord};
 use std::path::PathBuf;
 
+/// Attach `Authorization: Bearer <token>` to a request when a token
+/// is present. Falls back to the unmodified builder when absent so
+/// unauthenticated `lex serve` remotes keep working (#630).
+fn with_auth(req: ureq::RequestBuilder, token: Option<&str>) -> ureq::RequestBuilder {
+    match token {
+        Some(t) => req.header("Authorization", &format!("Bearer {t}")),
+        None => req,
+    }
+}
+
+/// Resolve the Bearer token: `--token` flag > `LEXHUB_TOKEN` env var > None.
+fn resolve_token(flag: Option<String>) -> Option<String> {
+    flag.or_else(|| std::env::var("LEXHUB_TOKEN").ok().filter(|s| !s.is_empty()))
+}
+
 fn parse_store(args: &[String]) -> (PathBuf, Vec<String>) {
     let mut root: Option<PathBuf> = None;
     let mut rest: Vec<String> = Vec::new();
@@ -312,6 +327,7 @@ fn cmd_op_push(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let mut remote: Option<String> = None;
     let mut branch: Option<String> = None;
     let mut since: Option<String> = None;
+    let mut token: Option<String> = None;
     let mut dry_run = false;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
@@ -322,6 +338,9 @@ fn cmd_op_push(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             "--since" => {
                 since = Some(it.next().ok_or_else(|| anyhow!("--since needs an op_id"))?.clone());
             }
+            "--token" => {
+                token = Some(it.next().ok_or_else(|| anyhow!("--token needs a value"))?.clone());
+            }
             "--dry-run" => dry_run = true,
             other if !other.starts_with("--") && remote.is_none() => {
                 remote = Some(other.to_string());
@@ -330,8 +349,10 @@ fn cmd_op_push(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         }
     }
     let remote = remote.ok_or_else(|| anyhow!(
-        "usage: lex op push <remote_url> [--branch NAME] [--since OP_ID] [--dry-run] [--store DIR]"
+        "usage: lex op push <remote_url> [--branch NAME] [--since OP_ID] [--dry-run] [--store DIR] [--token TOKEN]\n\
+         auth: set LEXHUB_TOKEN env var or pass --token to authenticate against lex-hub"
     ))?;
+    let token = resolve_token(token);
     let store = Store::open(&root)?;
     let branch = branch.unwrap_or_else(|| store.current_branch());
 
@@ -341,7 +362,7 @@ fn cmd_op_push(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     // Resolve `--since`: explicit > probe > local.
     let cutoff: Option<String> = match since {
         Some(s) => Some(s),
-        None => probe_remote_head(&remote, &branch).unwrap_or(None),
+        None => probe_remote_head(&remote, &branch, token.as_deref()).unwrap_or(None),
     };
 
     let to_send: Vec<OperationRecord> = match local_head.as_ref() {
@@ -396,13 +417,16 @@ fn cmd_op_push(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let url = format!("{}/v1/ops/batch", remote.trim_end_matches('/'));
     let body = serde_json::to_string(&to_send)
         .map_err(|e| anyhow!("serializing batch: {e}"))?;
-    let resp = ureq::post(&url)
+    let resp = with_auth(ureq::post(&url), token.as_deref())
         .header("Content-Type", "application/json")
         .send(body)
         .map_err(|e| anyhow!("POST {url}: {e}"))?;
     let status = resp.status().as_u16();
     let resp_body: serde_json::Value = resp.into_body().read_json()
         .map_err(|e| anyhow!("decoding response: {e}"))?;
+    if status == 401 {
+        bail!("remote requires auth (HTTP 401) — set LEXHUB_TOKEN or pass --token");
+    }
     if status >= 400 {
         bail!("server rejected batch (HTTP {status}): {resp_body}");
     }
@@ -432,14 +456,18 @@ fn cmd_op_push(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 /// when the remote knows the branch, Ok(None) when it doesn't,
 /// Err(_) on transport failure. The caller treats Err as "fall
 /// back to sending everything we have."
-pub(crate) fn probe_remote_head(remote: &str, branch: &str) -> Result<Option<String>> {
+pub(crate) fn probe_remote_head(remote: &str, branch: &str, token: Option<&str>) -> Result<Option<String>> {
     let url = format!(
         "{}/v1/branches/{branch}/head",
         remote.trim_end_matches('/'),
     );
-    let resp = ureq::get(&url)
+    let resp = with_auth(ureq::get(&url), token)
         .call()
         .map_err(|e| anyhow!("GET {url}: {e}"))?;
+    let status = resp.status().as_u16();
+    if status == 401 {
+        bail!("remote requires auth (HTTP 401) — set LEXHUB_TOKEN or pass --token");
+    }
     let body: serde_json::Value = resp.into_body().read_json()
         .map_err(|e| anyhow!("decoding response: {e}"))?;
     Ok(body.get("head_op")
@@ -468,6 +496,7 @@ fn cmd_op_pull(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let mut branch: Option<String> = None;
     let mut since: Option<String> = None;
     let mut limit: Option<usize> = None;
+    let mut token: Option<String> = None;
     let mut dry_run = false;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
@@ -482,6 +511,9 @@ fn cmd_op_pull(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                 limit = Some(it.next().ok_or_else(|| anyhow!("--limit needs N"))?
                     .parse().map_err(|e| anyhow!("--limit: {e}"))?);
             }
+            "--token" => {
+                token = Some(it.next().ok_or_else(|| anyhow!("--token needs a value"))?.clone());
+            }
             "--dry-run" => dry_run = true,
             other if !other.starts_with("--") && remote.is_none() => {
                 remote = Some(other.to_string());
@@ -490,8 +522,10 @@ fn cmd_op_pull(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         }
     }
     let remote = remote.ok_or_else(|| anyhow!(
-        "usage: lex op pull <remote_url> [--branch NAME] [--since OP_ID] [--limit N] [--dry-run] [--store DIR]"
+        "usage: lex op pull <remote_url> [--branch NAME] [--since OP_ID] [--limit N] [--dry-run] [--store DIR] [--token TOKEN]\n\
+         auth: set LEXHUB_TOKEN env var or pass --token to authenticate against lex-hub"
     ))?;
+    let token = resolve_token(token);
     let store = Store::open(&root)?;
     let branch = branch.unwrap_or_else(|| store.current_branch());
 
@@ -501,7 +535,7 @@ fn cmd_op_pull(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     // Fetch the delta from the remote. Returns oldest-first so we
     // can apply in topological order with the existing idempotent
     // OpLog::put.
-    let received = fetch_ops_since(&remote, &branch, cutoff.as_deref(), limit)?;
+    let received = fetch_ops_since(&remote, &branch, cutoff.as_deref(), limit, token.as_deref())?;
 
     if dry_run {
         let ids: Vec<&String> = received.iter().map(|r| &r.op_id).collect();
@@ -638,6 +672,7 @@ fn fetch_ops_since(
     branch: &str,
     after: Option<&str>,
     limit: Option<usize>,
+    token: Option<&str>,
 ) -> Result<Vec<OperationRecord>> {
     let mut url = format!(
         "{}/v1/ops/since?branch={branch}",
@@ -645,10 +680,13 @@ fn fetch_ops_since(
     );
     if let Some(a) = after { url.push_str(&format!("&after={a}")); }
     if let Some(n) = limit { url.push_str(&format!("&limit={n}")); }
-    let resp = ureq::get(&url)
+    let resp = with_auth(ureq::get(&url), token)
         .call()
         .map_err(|e| anyhow!("GET {url}: {e}"))?;
     let status = resp.status().as_u16();
+    if status == 401 {
+        bail!("remote requires auth (HTTP 401) — set LEXHUB_TOKEN or pass --token");
+    }
     if status >= 400 {
         let body = resp.into_body().read_to_string()
             .unwrap_or_else(|_| "(unreadable body)".into());
