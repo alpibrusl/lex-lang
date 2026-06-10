@@ -1,0 +1,1003 @@
+---
+name: lex
+description: "Invoke the `lex` CLI. Commands: parse, check, run, hash…"
+---
+
+# lex
+
+> Auto-generated skill file for `lex` v<VERSION>
+> Re-generate with: `lex skill` or `acli skill --bin lex`
+
+## Available commands
+
+- `lex parse` — print canonical AST as JSON (idempotent)
+- `lex check` — type-check; exit 0 or print errors (idempotent)
+- `lex run` — execute fn under capability policy (args parsed as JSON)
+- `lex hash` — print canonical SigId/StageId hashes for each function (idempotent)
+- `lex blame` — show each fn's stage history from the store (idempotent)
+- `lex publish` — publish each stage in a file to the store as Draft
+- `lex store` — browse the content-addressed code store
+- `lex stage` — print stage info, or list attestations for a stage (idempotent)
+- `lex attest` — cross-stage attestation queries (CI / dashboards)
+- `lex trace` — print a saved execution trace tree as JSON (idempotent)
+- `lex replay` — re-execute with effect overrides keyed by NodeId
+- `lex diff` — first NodeId where two execution traces diverge (idempotent)
+- `lex serve` — start the agent API HTTP server
+- `lex conformance` — run all JSON test descriptors under a directory (idempotent)
+- `lex spec` — Spec proof checker (randomized + SMT-LIB export)
+- `lex agent-tool` — have an LLM emit a Lex tool body, run it under declared effects
+- `lex tool-registry` — runtime tool registration over HTTP
+- `lex audit` — structural code search by effect / call / hostname / AST kind (idempotent)
+- `lex ast-diff` — AST-native diff: added/removed/renamed/modified fns + body patches (idempotent)
+- `lex ast-merge` — three-way structural merge with structured JSON conflicts
+- `lex branch` — snapshot branches in lex-store (tier-1 agent-native VC)
+- `lex store-merge` — three-way merge between two branches in the store
+- `lex merge` — stateful agent-driven merge (CLI mirror of /v1/merge/*)
+- `lex log` — show the merge journal of a branch (top-level alias for `lex branch log`) (idempotent)
+- `lex repl` — interactive evaluator (Lex source line-by-line)
+- `lex watch` — re-run check or run on file save (agent inner loop)
+- `lex agent-guidelines` — emit the AI-agent authoring contract (idiom rules) for this Lex toolchain (idempotent)
+- `lex init` — scaffold a new project (lex.toml, src/, tests/, CI)
+- `lex pkg` — package manager: init, add, install, list dependencies
+- `lex fmt` — format .lex files; --check exits 1 if any need it
+- `lex ci` — run the full pipeline: pkg install, check --strict, fmt --check, test
+- `lex test` — run tests/test_*.lex files (calls run_all in each) (idempotent)
+- `lex keygen` — print a fresh Ed25519 keypair (hex) for signing stages
+- `lex canonical` — encode/decode the canonical wire form of an AST (idempotent)
+- `lex docs` — emit machine-readable API/workspace docs (idempotent)
+- `lex op` — inspect and sync the operation log (show|log|push|pull|repack|gc)
+- `lex plan` — list repair-candidate paths for a goal, cheapest-first, within budget (idempotent)
+- `lex repair` — apply a typed repair transform to a failed op; emits a RepairAttempt
+- `lex policy` — manage store policy.json (producer blocks + required attestations)
+- `lex producer-trust` — show per-tool trust scores that gate required-attestation waivers (idempotent)
+
+## `lex parse`
+
+print canonical AST as JSON
+
+### Arguments
+
+- `file` (string, required) — path to a .lex file (or `-` for stdin)
+
+### Examples
+
+```bash
+# Parse a file
+lex parse hello.lex
+```
+
+```bash
+# Parse stdin
+cat hello.lex | lex parse -
+```
+
+**See also:** `lex check`, `lex hash`
+
+## `lex check`
+
+type-check; exit 0 or print errors
+
+### Arguments
+
+- `file` (string, required) — path to a .lex file
+
+### Examples
+
+```bash
+# Type-check a file
+lex check hello.lex
+```
+
+```bash
+# Check before running
+lex check app.lex && lex run app.lex main
+```
+
+**See also:** `lex parse`, `lex run`
+
+## `lex run`
+
+execute fn under capability policy (args parsed as JSON)
+
+### Options
+
+- `----allow-effects` (string) — comma-separated effect kinds to permit
+- `----allow-fs-read` (string) — filesystem path tree readable by fs_read
+- `----allow-fs-write` (string) — filesystem path tree writable by fs_write
+- `----allow-net-host` (string) — permit net effects to this host
+- `----budget` (int) — cap aggregate declared budget
+- `----max-steps` (int) — cap VM opcode dispatches (DoS guard)
+
+### Arguments
+
+- `file` (string, required) — path to a .lex file
+- `fn` (string, required) — function name to invoke
+- `args` (string[], optional) — JSON-encoded positional args
+
+### Examples
+
+```bash
+# Run main()
+lex run app.lex main
+```
+
+```bash
+# Run with fs read scope
+lex run --allow-fs-read /tmp app.lex load "/tmp/x.json"
+```
+
+**See also:** `lex check`, `lex replay`, `lex trace`
+
+## `lex hash`
+
+print canonical SigId/StageId hashes for each function
+
+### Arguments
+
+- `file` (string, required) — path to a .lex file
+
+### Examples
+
+```bash
+# Hash a file
+lex hash app.lex
+```
+
+```bash
+# Diff hashes across versions
+diff <(lex hash a.lex) <(lex hash b.lex)
+```
+
+**See also:** `lex publish`, `lex ast-diff`
+
+## `lex blame`
+
+show each fn's stage history from the store
+
+### Options
+
+- `----store` (string) — store root directory
+- `----with-evidence` (bool) — attach attestations to each history entry
+
+### Arguments
+
+- `file` (string, required) — path to a .lex file
+
+### Examples
+
+```bash
+# Blame a file
+lex blame app.lex
+```
+
+```bash
+# With evidence trail
+lex blame --with-evidence app.lex
+```
+
+```bash
+# Machine-readable
+lex --output json blame app.lex
+```
+
+**See also:** `lex hash`, `lex publish`, `lex store`, `lex stage`, `lex log`
+
+## `lex publish`
+
+publish each stage in a file to the store as Draft
+
+### Options
+
+- `----store` (string) — store root directory (default: ~/.lex/store)
+- `----activate` (bool) — transition published stages to Active
+
+### Arguments
+
+- `file` (string, required) — path to a .lex file
+
+### Examples
+
+```bash
+# Publish drafts
+lex publish app.lex
+```
+
+```bash
+# Publish + activate
+lex publish --activate app.lex
+```
+
+**See also:** `lex store`, `lex branch`
+
+## `lex store`
+
+browse the content-addressed code store
+
+### Examples
+
+```bash
+# List sigs
+lex store list
+```
+
+```bash
+# Get a stage
+lex store get abc123...
+```
+
+**See also:** `lex publish`, `lex branch`, `lex store-merge`
+
+## `lex stage`
+
+print stage info, or list attestations for a stage
+
+### Options
+
+- `----store` (string) — store root directory
+- `----attestations` (bool) — list attestations instead of stage info
+
+### Arguments
+
+- `stage_id` (string, required) — StageId hex
+
+### Examples
+
+```bash
+# Print stage info
+lex stage abc123...
+```
+
+```bash
+# List attestations
+lex stage abc123... --attestations
+```
+
+```bash
+# Machine-readable
+lex --output json stage abc123... --attestations
+```
+
+**See also:** `lex store`, `lex blame`, `lex publish`
+
+## `lex attest`
+
+cross-stage attestation queries (CI / dashboards)
+
+### Examples
+
+```bash
+# All Spec verdicts that passed
+lex attest filter --kind spec --result passed
+```
+
+```bash
+# Recent type-check evidence
+lex attest filter --kind type_check --since 2026-05-01
+```
+
+```bash
+# Machine-readable
+lex --output json attest filter --kind spec
+```
+
+**See also:** `lex stage`, `lex blame`
+
+## `lex trace`
+
+print a saved execution trace tree as JSON
+
+### Arguments
+
+- `run_id` (string, required) — run identifier
+
+### Examples
+
+```bash
+# Inspect a trace
+lex trace 2024-01-15-abc
+```
+
+**See also:** `lex replay`, `lex diff`
+
+## `lex replay`
+
+re-execute with effect overrides keyed by NodeId
+
+### Options
+
+- `----override` (string) — NODE=JSON override (repeatable)
+
+### Arguments
+
+- `run_id` (string, required) — run identifier
+- `file` (string, required) — source file
+- `fn` (string, required) — function name
+- `args` (string[], optional) — JSON-encoded positional args
+
+### Examples
+
+```bash
+# Replay verbatim
+lex replay 2024-01-15-abc app.lex main
+```
+
+```bash
+# Replay with override
+lex replay 2024-01-15-abc app.lex main --override 7=42
+```
+
+**See also:** `lex run`, `lex trace`, `lex diff`
+
+## `lex diff`
+
+first NodeId where two execution traces diverge
+
+### Arguments
+
+- `run_a` (string, required) — first run id
+- `run_b` (string, required) — second run id
+
+### Examples
+
+```bash
+# Compare two runs
+lex diff run-1 run-2
+```
+
+**See also:** `lex replay`, `lex trace`, `lex ast-diff`
+
+## `lex serve`
+
+start the agent API HTTP server
+
+### Options
+
+- `----port` (int) — TCP port (default: 7000)
+- `----store` (string) — store root directory
+
+### Examples
+
+```bash
+# Start with defaults
+lex serve
+```
+
+```bash
+# Pin port + store
+lex serve --port 8080 --store /var/lex
+```
+
+**See also:** `lex tool-registry`
+
+## `lex conformance`
+
+run all JSON test descriptors under a directory
+
+### Arguments
+
+- `dir` (string, required) — directory of conformance descriptors
+
+### Examples
+
+```bash
+# Run shipped suite
+lex conformance crates/conformance/tests/data
+```
+
+**See also:** `lex check`, `lex spec`
+
+## `lex spec`
+
+Spec proof checker (randomized + SMT-LIB export)
+
+### Examples
+
+```bash
+# Check a spec
+lex spec check sort.spec --source sort.lex
+```
+
+```bash
+# Export SMT-LIB
+lex spec smt sort.spec
+```
+
+**See also:** `lex check`, `lex conformance`
+
+## `lex agent-tool`
+
+have an LLM emit a Lex tool body, run it under declared effects
+
+### Options
+
+- `----allow-effects` (string) — permitted effect kinds
+- `----request` (string) — natural-language request
+- `----body` (string) — inline tool body
+- `----body-file` (string) — tool body in a file
+- `----spec` (string) — spec file for behavioral verification
+- `----examples` (string) — JSON examples for behavioral checking
+- `----diff-body` (string) — differential evaluation: alternate body
+- `----diff-body-file` (string) — differential evaluation: alternate body file
+- `----store` (string) — if set, persist verification attestations against the tool stage
+- `----json` (bool) — machine-readable output
+
+### Examples
+
+```bash
+# Run with allow-list
+lex agent-tool --allow-effects fs_read --request "sum lines of /tmp/log"
+```
+
+```bash
+# Verify against spec
+lex agent-tool --spec sort.spec --body-file body.lex --json
+```
+
+```bash
+# Persist attestations
+lex agent-tool --examples cases.json --body-file body.lex --store ~/.lex/store
+```
+
+**See also:** `lex check`, `lex spec`, `lex run`, `lex attest`, `lex stage`
+
+## `lex tool-registry`
+
+runtime tool registration over HTTP
+
+### Examples
+
+```bash
+# Run on default port
+lex tool-registry serve
+```
+
+**See also:** `lex serve`, `lex agent-tool`
+
+## `lex audit`
+
+structural code search by effect / call / hostname / AST kind
+
+### Options
+
+- `----effect` (string) — effect kind filter
+- `----call` (string) — called-function filter
+- `----host` (string) — hostname filter (literal)
+- `----kind` (string) — AST node kind filter
+- `----json` (bool) — machine-readable output
+- `----store` (string) — with --effect, persist EffectAudit attestations against each scanned stage
+
+### Arguments
+
+- `paths` (string[], optional) — files / directories to scan
+
+### Examples
+
+```bash
+# Find network calls
+lex audit --effect net examples
+```
+
+```bash
+# Find a host as JSON
+lex audit --host api.example.com --json src
+```
+
+```bash
+# Persist effect audits
+lex audit --effect fs_write --store ~/.lex/store src
+```
+
+**See also:** `lex ast-diff`, `lex ast-merge`, `lex attest`, `lex stage`
+
+## `lex ast-diff`
+
+AST-native diff: added/removed/renamed/modified fns + body patches
+
+### Options
+
+- `----json` (bool) — structured JSON output
+
+### Arguments
+
+- `file_a` (string, required) — left source file
+- `file_b` (string, required) — right source file
+
+### Examples
+
+```bash
+# Compare two versions
+lex ast-diff a.lex b.lex
+```
+
+```bash
+# Machine-readable
+lex ast-diff --json a.lex b.lex
+```
+
+**See also:** `lex audit`, `lex ast-merge`
+
+## `lex ast-merge`
+
+three-way structural merge with structured JSON conflicts
+
+### Options
+
+- `----output` (string) — write merged source to a file
+- `----json` (bool) — emit conflicts as JSON
+
+### Arguments
+
+- `base` (string, required) — common ancestor source
+- `ours` (string, required) — our side
+- `theirs` (string, required) — their side
+
+### Examples
+
+```bash
+# Merge three versions
+lex ast-merge base.lex ours.lex theirs.lex
+```
+
+```bash
+# Materialize merge
+lex ast-merge base.lex ours.lex theirs.lex --output merged.lex
+```
+
+**See also:** `lex ast-diff`, `lex store-merge`
+
+## `lex branch`
+
+snapshot branches in lex-store (tier-1 agent-native VC)
+
+### Examples
+
+```bash
+# List branches
+lex branch list
+```
+
+```bash
+# Create a feature
+lex branch create feature --from main
+```
+
+```bash
+# Peek what feature has done since fork
+lex branch peek feature --since-fork
+```
+
+```bash
+# Preview merging feature into main
+lex branch overlay feature --on main
+```
+
+**See also:** `lex store-merge`, `lex store`, `lex log`, `lex merge`
+
+## `lex store-merge`
+
+three-way merge between two branches in the store
+
+### Options
+
+- `----commit` (bool) — apply a clean merge to dst (refused if conflicts)
+- `----json` (bool) — emit the merge report as JSON
+- `----store` (string) — store root directory
+
+### Arguments
+
+- `src` (string, required) — source branch
+- `dst` (string, required) — destination branch
+
+### Examples
+
+```bash
+# Preview a merge
+lex store-merge feature main
+```
+
+```bash
+# Commit a clean merge
+lex store-merge feature main --commit
+```
+
+**See also:** `lex branch`, `lex ast-merge`, `lex merge`
+
+## `lex merge`
+
+stateful agent-driven merge (CLI mirror of /v1/merge/*)
+
+### Examples
+
+```bash
+# Open a merge
+lex merge start --src feature --dst main
+```
+
+```bash
+# See remaining work
+lex merge status merge_...
+```
+
+```bash
+# Submit resolutions
+lex merge resolve merge_... --file resolutions.json
+```
+
+```bash
+# Land the merge
+lex merge commit merge_...
+```
+
+**See also:** `lex store-merge`, `lex branch`, `lex log`
+
+## `lex log`
+
+show the merge journal of a branch (top-level alias for `lex branch log`)
+
+### Options
+
+- `----store` (string) — store root
+
+### Arguments
+
+- `name` (string, optional) — branch name (default: current)
+
+### Examples
+
+```bash
+# Log of the current branch
+lex log
+```
+
+```bash
+# Log of a named branch as JSON
+lex --output json log feature
+```
+
+**See also:** `lex branch`, `lex store-merge`
+
+## `lex repl`
+
+interactive evaluator (Lex source line-by-line)
+
+### Examples
+
+```bash
+# Start a session
+lex repl
+```
+
+```bash
+# Evaluate at the prompt
+lex> 1 + 2 * 3
+```
+
+**See also:** `lex check`, `lex run`
+
+## `lex watch`
+
+re-run check or run on file save (agent inner loop)
+
+### Arguments
+
+- `file` (string, required) — file or directory to watch
+- `action` (enum[check|run], optional) — what to re-run on change (default: check)
+- `forwarded` (string[], optional) — forwarded to the underlying subcommand
+
+### Examples
+
+```bash
+# Watch + check
+lex watch app.lex
+```
+
+```bash
+# Watch + run
+lex watch app.lex run main
+```
+
+**See also:** `lex check`, `lex run`
+
+## `lex agent-guidelines`
+
+emit the AI-agent authoring contract (idiom rules) for this Lex toolchain
+
+### Options
+
+- `----version-only` (bool) — print only the toolchain version
+
+### Examples
+
+```bash
+# Read the rules
+lex agent-guidelines
+```
+
+```bash
+# Capture into a repo
+lex agent-guidelines > AGENTS.md
+```
+
+```bash
+# Version of the doc
+lex agent-guidelines --version-only
+```
+
+**See also:** `lex skill`, `lex introspect`, `lex init`
+
+## `lex init`
+
+scaffold a new project (lex.toml, src/, tests/, CI)
+
+### Arguments
+
+- `dir` (string, optional) — target directory (default: current)
+
+### Examples
+
+```bash
+# Scaffold here
+lex init
+```
+
+```bash
+# Into a dir
+lex init my-proj
+```
+
+**See also:** `lex pkg`, `lex agent-guidelines`
+
+## `lex pkg`
+
+package manager: init, add, install, list dependencies
+
+### Arguments
+
+- `subcommand` (enum[init|add|install|list], required) — what to do
+
+### Examples
+
+```bash
+# Install deps
+lex pkg install
+```
+
+```bash
+# Add a path dep
+lex pkg add mylib --path ../mylib
+```
+
+**See also:** `lex init`, `lex ci`
+
+## `lex fmt`
+
+format .lex files; --check exits 1 if any need it
+
+### Options
+
+- `----check` (bool) — don't write; exit 1 if any file is unformatted
+
+### Arguments
+
+- `path` (string[], required) — files or directories to format
+
+### Examples
+
+```bash
+# Format src
+lex fmt src/
+```
+
+```bash
+# Verify in CI
+lex fmt --check src/
+```
+
+**See also:** `lex check`, `lex ci`
+
+## `lex ci`
+
+run the full pipeline: pkg install, check --strict, fmt --check, test
+
+### Options
+
+- `----no-fmt` (bool) — skip the fmt --check stage
+
+### Examples
+
+```bash
+# Run the gate
+lex ci
+```
+
+**See also:** `lex check`, `lex fmt`, `lex test`
+
+## `lex test`
+
+run tests/test_*.lex files (calls run_all in each)
+
+### Arguments
+
+- `dir` (string, optional) — test directory (default: tests/)
+
+### Examples
+
+```bash
+# Run tests
+lex test
+```
+
+**See also:** `lex check`, `lex ci`
+
+## `lex keygen`
+
+print a fresh Ed25519 keypair (hex) for signing stages
+
+### Examples
+
+```bash
+# Generate a key
+lex keygen
+```
+
+**See also:** `lex publish`, `lex store`
+
+## `lex canonical`
+
+encode/decode the canonical wire form of an AST
+
+### Arguments
+
+- `subcommand` (enum[encode|decode], required) — direction
+
+### Examples
+
+```bash
+# Encode
+lex canonical encode a.lex
+```
+
+```bash
+# Decode
+lex canonical decode a.canon
+```
+
+**See also:** `lex parse`, `lex hash`
+
+## `lex docs`
+
+emit machine-readable API/workspace docs
+
+### Options
+
+- `----for-agent` (bool) — emit one JSON object describing the whole workspace
+
+### Arguments
+
+- `path` (string[], optional) — source files/dirs (omit with --for-agent)
+
+### Examples
+
+```bash
+# Workspace docs
+lex docs --for-agent
+```
+
+```bash
+# Per-file
+lex docs src/
+```
+
+**See also:** `lex skill`, `lex introspect`
+
+## `lex op`
+
+inspect and sync the operation log (show|log|push|pull|repack|gc)
+
+### Arguments
+
+- `subcommand` (enum[show|log|push|pull|repack|gc], required) — what to do
+
+### Examples
+
+```bash
+# List ops
+lex op log
+```
+
+```bash
+# Garbage-collect
+lex op gc --confirm
+```
+
+**See also:** `lex log`, `lex store`
+
+## `lex plan`
+
+list repair-candidate paths for a goal, cheapest-first, within budget
+
+### Examples
+
+```bash
+# Plan repairs
+lex plan <goal>
+```
+
+**See also:** `lex repair`, `lex check`
+
+## `lex repair`
+
+apply a typed repair transform to a failed op; emits a RepairAttempt
+
+### Options
+
+- `----apply` (bool) — execute the transform (vs. preview)
+- `----transform` (string) — the typed transform as JSON
+
+### Arguments
+
+- `op_id` (string, required) — the failed operation to repair
+
+### Examples
+
+```bash
+# Apply a transform
+lex repair <op_id> --apply --transform '<json>'
+```
+
+**See also:** `lex plan`, `lex check`
+
+## `lex policy`
+
+manage store policy.json (producer blocks + required attestations)
+
+### Arguments
+
+- `subcommand` (enum[block-producer|unblock-producer|require-attestation|unrequire-attestation|show], required) — what to do
+
+### Examples
+
+```bash
+# Show policy
+lex policy show
+```
+
+**See also:** `lex attest`, `lex producer-trust`
+
+## `lex producer-trust`
+
+show per-tool trust scores that gate required-attestation waivers
+
+### Examples
+
+```bash
+# Show scores
+lex producer-trust show
+```
+
+**See also:** `lex policy`, `lex attest`
+
+## Output format
+
+All commands support `--output json|text|table`. When using `--output json`, responses follow a standard envelope:
+
+```json
+{"ok": true, "command": "...", "data": {...}, "meta": {"duration_ms": ..., "version": "..."}}
+```
+
+## Exit codes
+
+| Code | Meaning | Action |
+|------|---------|--------|
+| 0 | Success | Proceed |
+| 2 | Invalid arguments | Correct and retry |
+| 3 | Not found | Check inputs |
+| 5 | Conflict | Resolve conflict |
+| 8 | Precondition failed | Fix precondition |
+| 9 | Dry-run completed | Review and confirm |
+
+## Further discovery
+
+- `lex --help` — full help for any command
+- `lex introspect` — machine-readable command tree (JSON)
+- `.cli/README.md` — persistent reference (survives context resets)

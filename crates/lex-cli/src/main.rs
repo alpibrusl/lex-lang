@@ -10,25 +10,25 @@
 //!   lex store list [--store DIR]
 //!   lex store get [--store DIR] <stage_id>
 
-mod tool_registry;
-mod audit;
-mod diff;
-mod ast_merge;
-mod branch;
-mod merge;
 mod acli;
+mod agent_guidelines;
+mod ast_merge;
+mod audit;
+mod branch;
+mod ci;
+mod diff;
 mod docs;
-mod op;
-mod repl;
-mod lint;
-mod pkg;
-mod test_runner;
-mod watch;
+mod examples_eval;
 mod fmt;
 mod init;
-mod ci;
-mod examples_eval;
-mod agent_guidelines;
+mod lint;
+mod merge;
+mod op;
+mod pkg;
+mod repl;
+mod test_runner;
+mod tool_registry;
+mod watch;
 
 use ::acli::OutputFormat;
 use anyhow::{anyhow, bail, Context, Result};
@@ -56,20 +56,31 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let cmd_for_err = rest_after_format.first().cloned()
+    let cmd_for_err = rest_after_format
+        .first()
+        .cloned()
         .unwrap_or_else(|| "lex".into());
     if let Err(e) = run(&fmt, &rest_after_format) {
-        acli::emit_error(&cmd_for_err, &format!("{e:#}"), &fmt,
-            ::acli::ExitCode::GeneralError);
+        acli::emit_error(
+            &cmd_for_err,
+            &format!("{e:#}"),
+            &fmt,
+            ::acli::ExitCode::GeneralError,
+        );
         std::process::exit(1);
     }
 }
 
 fn run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
-    let cmd = args.first().ok_or_else(|| anyhow!("usage: lex <command> ..."))?;
+    let cmd = args
+        .first()
+        .ok_or_else(|| anyhow!("usage: lex <command> ..."))?;
     match cmd.as_str() {
         // ACLI built-ins — emit JSON envelopes via the SDK.
-        "introspect" => { acli::build_app().handle_introspect(fmt); Ok(()) }
+        "introspect" => {
+            acli::build_app().handle_introspect(fmt);
+            Ok(())
+        }
         "skill" => {
             let out_path = args.get(1).map(|s| s.as_str());
             acli::build_app().handle_skill(out_path, fmt);
@@ -119,15 +130,18 @@ fn run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "producer-trust" => cmd_producer_trust(fmt, &args[1..]),
         "canonical" => cmd_canonical(fmt, &args[1..]),
         "keygen" => cmd_keygen(fmt, &args[1..]),
-        "pkg"  => pkg::cmd_pkg(&args[1..]),
+        "pkg" => pkg::cmd_pkg(&args[1..]),
         "repl" => repl::cmd_repl(&args[1..]),
         "test" => test_runner::cmd_test(fmt, &args[1..]),
         "watch" => watch::cmd_watch(&args[1..]),
-        "fmt"  => fmt::cmd_fmt(&args[1..]),
+        "fmt" => fmt::cmd_fmt(&args[1..]),
         "init" => init::cmd_init(&args[1..]),
-        "ci"   => ci::cmd_ci(&args[1..]),
+        "ci" => ci::cmd_ci(&args[1..]),
         "agent-guidelines" => agent_guidelines::cmd_agent_guidelines(fmt, &args[1..]),
-        "help" | "--help" | "-h" => { print_usage(); Ok(()) }
+        "help" | "--help" | "-h" => {
+            print_usage();
+            Ok(())
+        }
         other => bail!("unknown command `{other}`. try `lex help`"),
     }
 }
@@ -163,12 +177,22 @@ fn parse_output_format(args: &[String]) -> Result<(OutputFormat, Vec<String>)> {
 fn print_usage() {
     println!("lex — Lex toolchain\n");
     println!("commands:");
-    println!("  init [<dir>]                       scaffold a new project (lex.toml, src/, tests/, CI)");
+    println!(
+        "  init [<dir>]                       scaffold a new project (lex.toml, src/, tests/, CI)"
+    );
     println!("  parse <file>                       print canonical AST as JSON");
     println!("  check [--strict] <file>            type-check; --strict adds lint warnings");
-    println!("  fmt [--check] <file|dir>...        format .lex files; --check exits 1 if any need it");
+    println!("  repair <op_id> [--apply --transform '<json>'] [--store DIR]");
+    println!("                                     apply a typed repair to a failed op; emits a RepairAttempt");
+    println!("  plan <goal> [--budget N] [--store DIR]");
+    println!("                                     list repair paths for a goal, cheapest-first, within budget");
+    println!(
+        "  fmt [--check] <file|dir>...        format .lex files; --check exits 1 if any need it"
+    );
     println!("  ci [--no-fmt] [--src <d>] [--tests <d>]");
-    println!("                                     run the full pipeline: pkg install, check --strict,");
+    println!(
+        "                                     run the full pipeline: pkg install, check --strict,"
+    );
     println!("                                     fmt --check, test — same as CI in lex.yml");
     println!("  pkg init                           create lex.toml in current directory");
     println!("  pkg add <name> --path <p>          add a local path dependency");
@@ -180,6 +204,10 @@ fn print_usage() {
     println!("                                     run a stage straight out of the store;");
     println!("                                     verify Ed25519 signature when present.");
     println!("  hash <file>                        print stage canonical hashes");
+    println!("  blame <fn> [--with-evidence]       show each fn's stage history from the store");
+    println!(
+        "  canonical <encode|decode> <file>   encode/decode the canonical wire form of an AST"
+    );
     println!("  publish [--store DIR] [--branch NAME] [--activate] [--signing-key HEX] <file>");
     println!("                                     publish each stage to the store as Draft;");
     println!("                                     --signing-key (or LEX_SIGNING_KEY) attaches an");
@@ -200,11 +228,19 @@ fn print_usage() {
     println!("                                     cross-stage attestation queries");
     println!("  trace <run_id>                     print a saved trace tree as JSON");
     println!("  replay <run_id> <file> <fn> [args] [--override NODE=JSON]...");
-    println!("                                     re-execute with effect overrides keyed by NodeId");
+    println!(
+        "                                     re-execute with effect overrides keyed by NodeId"
+    );
     println!("  diff <run_a> <run_b>               first NodeId where two traces diverge");
     println!("  serve [--port N] [--store DIR]     start the agent API HTTP server");
     println!("  repl [--load <file>]...            interactive evaluator; --load pre-loads source");
-    println!("  test [<dir>]                       run tests/test_*.lex files (calls run_all in each)");
+    println!(
+        "  watch <file> [check|run] [args]    re-run check or run on file save (agent inner loop)"
+    );
+    println!("  docs [<path>...] [--for-agent]     emit machine-readable API / workspace docs");
+    println!(
+        "  test [<dir>]                       run tests/test_*.lex files (calls run_all in each)"
+    );
     println!("  conformance <dir>                  run all JSON test descriptors in <dir>");
     println!("  spec check <spec> --source <file> [--store DIR] [--trials N]");
     println!("                                     check a Spec against a Lex source");
@@ -217,28 +253,50 @@ fn print_usage() {
     println!("  tool-registry serve [--port N]    HTTP service to register Lex tools at runtime");
     println!("                                     and invoke them via /tools/{{id}}/invoke");
     println!("  audit [paths...] [filters]        structural code search by effect / call /");
-    println!("                                     hostname / AST kind. --json for machine-readable.");
+    println!(
+        "                                     hostname / AST kind. --json for machine-readable."
+    );
     println!("  audit --query \"<text>\" [--limit N] [--effect K]");
     println!("                                     semantic search over the store; --effect");
     println!("                                     post-filters the ranked list.");
     println!("  ast-diff <file_a> <file_b>        AST-native diff: added/removed/renamed/modified");
-    println!("                                     fns, plus body-level patches per modified body.");
+    println!(
+        "                                     fns, plus body-level patches per modified body."
+    );
     println!("  ast-merge <base> <ours> <theirs>  three-way structural merge; structured-JSON");
-    println!("                                     conflicts via --json; --output writes merged source.");
+    println!(
+        "                                     conflicts via --json; --output writes merged source."
+    );
     println!("  branch <subcommand> ...           snapshot branches in lex-store. subcommands:");
-    println!("                                     list | show <name> | create <name> [--from B] |");
+    println!(
+        "                                     list | show <name> | create <name> [--from B] |"
+    );
     println!("                                     delete <name> | use <name> | current");
-    println!("  store-merge <src> <dst> [--commit] [--json]  three-way merge between two branches in");
-    println!("                                     the store; conflicts as JSON. --commit applies a");
+    println!(
+        "  store-merge <src> <dst> [--commit] [--json]  three-way merge between two branches in"
+    );
+    println!(
+        "                                     the store; conflicts as JSON. --commit applies a"
+    );
     println!("                                     clean merge; refuses if any conflicts remain.");
     println!("  merge {{start|status|resolve|defer|commit}}");
-    println!("                                     stateful merge for agent loops (#134); persists");
+    println!(
+        "                                     stateful merge for agent loops (#134); persists"
+    );
     println!("                                     a session under <store>/merges/<merge_id>.json");
     println!("  policy {{block-producer|unblock-producer|require-attestation|");
     println!("          unrequire-attestation|show}}");
     println!("                                     manage <store>/policy.json — negative gate on");
     println!("                                     producers (#181) and positive gate on required");
     println!("                                     attestations for branch advance (#245)");
+    println!("  producer-trust [show] [--store DIR]");
+    println!("                                     per-tool trust scores that gate required-attestation waivers");
+    println!("  op {{show|log|push|pull|repack|gc}} [--store DIR]");
+    println!("                                     inspect and sync the operation log");
+    println!("  log [branch]                       show the operation log for a branch (alias of `branch log`)");
+    println!(
+        "  agent-guidelines [--version-only]  emit the AI-agent authoring contract (idiom rules)"
+    );
     println!();
     println!("policy flags (run, replay):");
     println!("  --allow-effects k1,k2,...   permit these effect kinds");
@@ -251,7 +309,9 @@ fn print_usage() {
 fn read_source(path: &str) -> Result<String> {
     if path == "-" {
         let mut s = String::new();
-        std::io::stdin().read_to_string(&mut s).context("reading stdin")?;
+        std::io::stdin()
+            .read_to_string(&mut s)
+            .context("reading stdin")?;
         Ok(s)
     } else {
         fs::read_to_string(path).with_context(|| format!("reading {path}"))
@@ -264,7 +324,9 @@ fn read_source(path: &str) -> Result<String> {
 fn read_program(path: &str) -> Result<SynProgram> {
     if path == "-" {
         let mut s = String::new();
-        std::io::stdin().read_to_string(&mut s).context("reading stdin")?;
+        std::io::stdin()
+            .read_to_string(&mut s)
+            .context("reading stdin")?;
         load_program_from_str(&s).map_err(Into::into)
     } else {
         load_program(std::path::Path::new(path)).map_err(Into::into)
@@ -282,13 +344,14 @@ fn load_stages(path: &str, from_canonical: bool) -> Result<Vec<lex_ast::Stage>> 
     if from_canonical {
         let bytes = if path == "-" {
             let mut buf = Vec::new();
-            std::io::stdin().read_to_end(&mut buf).context("reading stdin")?;
+            std::io::stdin()
+                .read_to_end(&mut buf)
+                .context("reading stdin")?;
             buf
         } else {
             std::fs::read(path).map_err(|e| anyhow!("read {path}: {e}"))?
         };
-        lex_ast::canonical_format::decode_program(&bytes)
-            .map_err(|e| anyhow!("decode {path}: {e}"))
+        lex_ast::canonical_format::decode_program(&bytes).map_err(|e| anyhow!("decode {path}: {e}"))
     } else {
         let prog = read_program(path)?;
         Ok(canonicalize_program(&prog))
@@ -306,18 +369,22 @@ fn load_stages_from_store(
     require_signed: bool,
     trusted_key: Option<&str>,
 ) -> Result<Vec<lex_ast::Stage>> {
-    let store = lex_store::Store::open(default_store_root())
-        .with_context(|| "opening default store")?;
-    let meta = store.get_metadata(stage_id)
+    let store =
+        lex_store::Store::open(default_store_root()).with_context(|| "opening default store")?;
+    let meta = store
+        .get_metadata(stage_id)
         .with_context(|| format!("loading metadata for stage `{stage_id}`"))?;
     verify_metadata_signature(&meta, require_signed, trusted_key)?;
-    let stage = store.get_ast(stage_id)
+    let stage = store
+        .get_ast(stage_id)
         .with_context(|| format!("loading AST for stage `{stage_id}`"))?;
     Ok(vec![stage])
 }
 
 fn cmd_parse(fmt: &OutputFormat, args: &[String]) -> Result<()> {
-    let path = args.first().ok_or_else(|| anyhow!("usage: lex parse <file>"))?;
+    let path = args
+        .first()
+        .ok_or_else(|| anyhow!("usage: lex parse <file>"))?;
     let prog = read_program(path)?;
     let stages = canonicalize_program(&prog);
     let data = serde_json::to_value(&stages)?;
@@ -335,8 +402,12 @@ fn cmd_check(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let mut path: Option<&str> = None;
     for a in args {
         match a.as_str() {
-            "--from-canonical" => { from_canonical = true; }
-            "--strict" => { strict = true; }
+            "--from-canonical" => {
+                from_canonical = true;
+            }
+            "--strict" => {
+                strict = true;
+            }
             other if !other.starts_with("--") => {
                 if path.is_some() {
                     bail!("usage: lex check [--from-canonical] [--strict] <file>");
@@ -346,8 +417,8 @@ fn cmd_check(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             other => bail!("unknown flag `{other}` for `lex check`"),
         }
     }
-    let path = path.ok_or_else(|| anyhow!(
-        "usage: lex check [--from-canonical] [--strict] <file>"))?;
+    let path =
+        path.ok_or_else(|| anyhow!("usage: lex check [--from-canonical] [--strict] <file>"))?;
     let stages = load_stages(path, from_canonical)?;
 
     // #306 slice 1: when checking a `.lex` source file (not a
@@ -358,12 +429,20 @@ fn cmd_check(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let positions: Option<std::collections::BTreeMap<String, lex_types::Position>> =
         if !from_canonical && path != "-" {
             std::fs::read_to_string(path).ok().and_then(|src| {
-                lex_syntax::parse_source_with_positions(&src).ok().map(|(_, fn_pos)| {
-                    fn_pos.into_iter().map(|(name, byte)| {
-                        let (line, col) = lex_types::byte_to_line_col(&src, byte);
-                        (name, lex_types::Position::new(Some(path.to_string()), line, col))
-                    }).collect()
-                })
+                lex_syntax::parse_source_with_positions(&src)
+                    .ok()
+                    .map(|(_, fn_pos)| {
+                        fn_pos
+                            .into_iter()
+                            .map(|(name, byte)| {
+                                let (line, col) = lex_types::byte_to_line_col(&src, byte);
+                                (
+                                    name,
+                                    lex_types::Position::new(Some(path.to_string()), line, col),
+                                )
+                            })
+                            .collect()
+                    })
             })
         } else {
             None
@@ -372,8 +451,11 @@ fn cmd_check(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let check_result = match &positions {
         Some(pos) => lex_types::check_program_with_positions(&stages, pos)
             .map_err(|errs| errs.into_iter().collect::<Vec<_>>()),
-        None => lex_types::check_program(&stages)
-            .map_err(|errs| errs.into_iter().map(lex_types::PositionedError::from).collect()),
+        None => lex_types::check_program(&stages).map_err(|errs| {
+            errs.into_iter()
+                .map(lex_types::PositionedError::from)
+                .collect()
+        }),
     };
 
     match check_result {
@@ -409,7 +491,8 @@ fn cmd_check(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             // --strict: run AST lint passes + bytecode stack verifier (#347 A2).
             // Warnings are non-fatal but exit 1 so CI can enforce them.
             let mut lint_warnings = if strict && !from_canonical && path != "-" {
-                std::fs::read_to_string(path).ok()
+                std::fs::read_to_string(path)
+                    .ok()
                     .and_then(|src| lex_syntax::parse_source(&src).ok())
                     .map(|prog| lint::lint_program(&prog))
                     .unwrap_or_default()
@@ -466,7 +549,10 @@ fn cmd_check(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                     if !summary.net_host.is_empty() {
                         println!("required net hosts: {}", summary.net_host.join(", "));
                     }
-                    println!("hint: lex run {} {path} <fn> [args]", suggest_grants(&summary));
+                    println!(
+                        "hint: lex run {} {path} <fn> [args]",
+                        suggest_grants(&summary)
+                    );
                 }
             });
             if !lint_warnings.is_empty() {
@@ -475,8 +561,10 @@ fn cmd_check(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             Ok(())
         }
         Err(errs) => {
-            let arr: Vec<serde_json::Value> = errs.iter()
-                .map(|e| serde_json::to_value(e).unwrap()).collect();
+            let arr: Vec<serde_json::Value> = errs
+                .iter()
+                .map(|e| serde_json::to_value(e).unwrap())
+                .collect();
             let data = serde_json::json!({ "ok": false, "errors": arr });
             acli::emit_or_text("check", data, fmt, || {
                 for e in &errs {
@@ -519,9 +607,15 @@ fn effects_summary(stages: &[lex_ast::Stage]) -> EffectsSummary {
                         lex_ast::EffectArg::Ident { value } => value.clone(),
                     };
                     match e.name.as_str() {
-                        "fs_read" => { fs_read.insert(arg_str); }
-                        "fs_write" => { fs_write.insert(arg_str); }
-                        "net" => { net_host.insert(arg_str); }
+                        "fs_read" => {
+                            fs_read.insert(arg_str);
+                        }
+                        "fs_write" => {
+                            fs_write.insert(arg_str);
+                        }
+                        "net" => {
+                            net_host.insert(arg_str);
+                        }
                         _ => {}
                     }
                 }
@@ -568,7 +662,11 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             "usage: lex run [policy] [--from-canonical] <file> [fn] [args] or <file> -- [program args]"))?;
         // When `--` was the separator, positional has only the file path;
         // default to calling `main` with empty vargs and program_args in io.argv().
-        let func = f.positional.get(1).cloned().unwrap_or_else(|| "main".to_string());
+        let func = f
+            .positional
+            .get(1)
+            .cloned()
+            .unwrap_or_else(|| "main".to_string());
         (path.clone(), func, 2)
     };
     let policy = &f.policy;
@@ -588,8 +686,12 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             "trace": f.trace,
             "max_steps": f.max_steps,
         })];
-        acli::emit_dry_run("run", fmt,
-            &format!("would call `{func}` in {source_label}"), actions);
+        acli::emit_dry_run(
+            "run",
+            fmt,
+            &format!("would call `{func}` in {source_label}"),
+            actions,
+        );
     }
     // #206 slice 3 (text/canonical paths) or #227 follow-up
     // (store path). Each produces the same Vec<Stage>; the typecheck
@@ -602,12 +704,16 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     // #168: rewrite stdlib parse calls during type-check so the
     // runtime sees the strict (validated) shape.
     if let Err(errs) = lex_types::check_and_rewrite_program(&mut stages) {
-        let arr: Vec<serde_json::Value> = errs.iter()
-            .map(|e| serde_json::to_value(e).unwrap()).collect();
+        let arr: Vec<serde_json::Value> = errs
+            .iter()
+            .map(|e| serde_json::to_value(e).unwrap())
+            .collect();
         let data = serde_json::json!({ "phase": "type-check", "errors": arr });
         acli::emit_or_text("run", data, fmt, || {
             for e in &errs {
-                if let Ok(j) = serde_json::to_string(e) { eprintln!("{j}"); }
+                if let Ok(j) = serde_json::to_string(e) {
+                    eprintln!("{j}");
+                }
             }
         });
         std::process::exit(2);
@@ -615,12 +721,16 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let bc = compile_program(&stages);
 
     if let Err(violations) = check_policy(&bc, policy) {
-        let arr: Vec<serde_json::Value> = violations.iter()
-            .map(|v| serde_json::to_value(v).unwrap()).collect();
+        let arr: Vec<serde_json::Value> = violations
+            .iter()
+            .map(|v| serde_json::to_value(v).unwrap())
+            .collect();
         let data = serde_json::json!({ "phase": "policy", "violations": arr });
         acli::emit_or_text("run", data, fmt, || {
             for v in &violations {
-                if let Ok(j) = serde_json::to_string(v) { eprintln!("{j}"); }
+                if let Ok(j) = serde_json::to_string(v) {
+                    eprintln!("{j}");
+                }
             }
         });
         std::process::exit(3);
@@ -631,7 +741,9 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         .with_program(std::sync::Arc::clone(&bc))
         .with_program_args(f.program_args.clone());
     let mut vm = Vm::with_handler(&bc, Box::new(handler));
-    if let Some(n) = f.max_steps { vm.set_step_limit(n); }
+    if let Some(n) = f.max_steps {
+        vm.set_step_limit(n);
+    }
     // #465 / cursor[bot] medium-severity review on #608: JIT'd code
     // runs in native loops (the self-tail-call backward jump, any
     // backward `Jump(-N)` in iterative loops) that do **not**
@@ -678,13 +790,15 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
              running with --jit unless you've sandboxed it some \
              other way."
         );
-        let tier = lex_jit::JitTier::new(&bc)
-            .map_err(|e| anyhow!("--jit: constructing JIT tier: {e}"))?;
+        let tier =
+            lex_jit::JitTier::new(&bc).map_err(|e| anyhow!("--jit: constructing JIT tier: {e}"))?;
         vm.set_jit_hook(Some(Box::new(tier)));
     }
     let recorder = lex_trace::Recorder::new();
     let trace_handle = recorder.handle();
-    if f.trace { vm.set_tracer(Box::new(recorder)); }
+    if f.trace {
+        vm.set_tracer(Box::new(recorder));
+    }
     // #257: snapshot the default branch's head before the run so we
     // can attribute any ops committed during the run back to the
     // run's `run_id` via Trace attestations. `pre_run_head` is
@@ -693,7 +807,8 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     // the right behavior on an empty pre-run history.
     let pre_run_head = if f.trace {
         let store = lex_store::Store::open(default_store_root())?;
-        store.get_branch(lex_store::DEFAULT_BRANCH)
+        store
+            .get_branch(lex_store::DEFAULT_BRANCH)
             .map_err(|e| anyhow!("reading branch: {e}"))?
             .and_then(|b| b.head_op)
     } else {
@@ -707,17 +822,21 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         f.positional[arg_positional_start..]
             .iter()
             .map(|a| {
-                let v: serde_json::Value = serde_json::from_str(a)
-                    .with_context(|| format!("arg `{a}` must be JSON"))?;
+                let v: serde_json::Value =
+                    serde_json::from_str(a).with_context(|| format!("arg `{a}` must be JSON"))?;
                 Ok(json_to_value(&v))
             })
             .collect::<Result<Vec<_>>>()?
     };
     let started = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let result = vm.call(&func, vargs);
     let ended = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let mut trace_id: Option<String> = None;
     if f.trace {
         let store = lex_store::Store::open(default_store_root())?;
@@ -725,8 +844,14 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             Ok(v) => (Some(value_to_json(v)), None),
             Err(e) => (None, Some(format!("{e}"))),
         };
-        let tree = trace_handle.finalize(func.clone(), serde_json::Value::Null,
-            root_out, root_err, started, ended);
+        let tree = trace_handle.finalize(
+            func.clone(),
+            serde_json::Value::Null,
+            root_out,
+            root_err,
+            started,
+            ended,
+        );
         let id = store.save_trace(&tree)?;
         // #246: emit a `Trace` attestation linking the run to the
         // entry stage. Skipped silently if the entry function isn't
@@ -754,7 +879,8 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             );
             // Use the store's attestation log helper so the file
             // layout is consistent with `lex publish`'s emissions.
-            store.attestation_log()
+            store
+                .attestation_log()
                 .map_err(|e| anyhow!("opening attestation log: {e}"))?
                 .put(&attestation)
                 .map_err(|e| anyhow!("recording trace attestation: {e}"))?;
@@ -770,19 +896,23 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                 detail: format!("{e}"),
             },
         };
-        let n_op_traces = store.record_run_committed_ops_since(
-            &id,
-            &func,
-            lex_store::DEFAULT_BRANCH,
-            pre_run_head.as_ref(),
-            att_result,
-            trace_producer(),
-        ).map_err(|e| anyhow!("recording op traces: {e}"))?;
+        let n_op_traces = store
+            .record_run_committed_ops_since(
+                &id,
+                &func,
+                lex_store::DEFAULT_BRANCH,
+                pre_run_head.as_ref(),
+                att_result,
+                trace_producer(),
+            )
+            .map_err(|e| anyhow!("recording op traces: {e}"))?;
         if n_op_traces > 0 && !matches!(fmt, OutputFormat::Json) {
             eprintln!("trace attestations: {n_op_traces} op(s) linked to run");
         }
         trace_id = Some(id.clone());
-        if !matches!(fmt, OutputFormat::Json) { eprintln!("trace saved: {id}"); }
+        if !matches!(fmt, OutputFormat::Json) {
+            eprintln!("trace saved: {id}");
+        }
     }
     let r = result.map_err(|e| anyhow!("runtime: {e}"))?;
     let result_json = value_to_json(&r);
@@ -790,7 +920,9 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         Some(id) => serde_json::json!({ "result": result_json, "trace_id": id }),
         None => serde_json::json!({ "result": result_json }),
     };
-    acli::emit_or_text("run", data, fmt, || println!("{}", value_to_json_string(&r)));
+    acli::emit_or_text("run", data, fmt, || {
+        println!("{}", value_to_json_string(&r))
+    });
     Ok(())
 }
 
@@ -823,54 +955,83 @@ struct RunFlags {
 }
 
 fn parse_run_flags(args: &[String]) -> Result<RunFlags> {
-    let mut f = RunFlags { policy: Policy::pure(), ..Default::default() };
+    let mut f = RunFlags {
+        policy: Policy::pure(),
+        ..Default::default()
+    };
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
         match a.as_str() {
             "--allow-effects" => {
-                let val = args.get(i + 1).ok_or_else(|| anyhow!("--allow-effects needs a value"))?;
-                f.policy.allow_effects = val.split(',').filter(|s| !s.is_empty())
-                    .map(|s| s.to_string()).collect::<BTreeSet<_>>();
+                let val = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("--allow-effects needs a value"))?;
+                f.policy.allow_effects = val
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect::<BTreeSet<_>>();
                 i += 2;
             }
             "--allow-fs-read" => {
-                let val = args.get(i + 1).ok_or_else(|| anyhow!("--allow-fs-read needs a value"))?;
+                let val = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("--allow-fs-read needs a value"))?;
                 f.policy.allow_fs_read.push(PathBuf::from(val));
                 i += 2;
             }
             "--allow-fs-write" => {
-                let val = args.get(i + 1).ok_or_else(|| anyhow!("--allow-fs-write needs a value"))?;
+                let val = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("--allow-fs-write needs a value"))?;
                 f.policy.allow_fs_write.push(PathBuf::from(val));
                 i += 2;
             }
             "--allow-net-host" => {
-                let val = args.get(i + 1).ok_or_else(|| anyhow!("--allow-net-host needs a value"))?;
+                let val = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("--allow-net-host needs a value"))?;
                 f.policy.allow_net_host.push(val.clone());
                 i += 2;
             }
             "--allow-proc" => {
                 // Comma-separated binary basenames the [proc] effect
                 // is allowed to spawn. Read SECURITY.md before granting.
-                let val = args.get(i + 1).ok_or_else(|| anyhow!("--allow-proc needs a value"))?;
+                let val = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("--allow-proc needs a value"))?;
                 for name in val.split(',').filter(|s| !s.is_empty()) {
                     f.policy.allow_proc.push(name.to_string());
                 }
                 i += 2;
             }
             "--budget" => {
-                let val = args.get(i + 1).ok_or_else(|| anyhow!("--budget needs a value"))?;
+                let val = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("--budget needs a value"))?;
                 f.policy.budget = Some(val.parse().context("--budget must be an integer")?);
                 i += 2;
             }
             "--max-steps" => {
-                let val = args.get(i + 1).ok_or_else(|| anyhow!("--max-steps needs a value"))?;
+                let val = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("--max-steps needs a value"))?;
                 f.max_steps = Some(val.parse().context("--max-steps must be an integer")?);
                 i += 2;
             }
-            "--trace" => { f.trace = true; i += 1; }
-            "--dry-run" => { f.dry_run = true; i += 1; }
-            "--jit" => { f.jit = true; i += 1; }
+            "--trace" => {
+                f.trace = true;
+                i += 1;
+            }
+            "--dry-run" => {
+                f.dry_run = true;
+                i += 1;
+            }
+            "--jit" => {
+                f.jit = true;
+                i += 1;
+            }
             "--from-canonical" => {
                 // #206 slice 3: read the program as canonical-AST
                 // bytes instead of `.lex` text. The path argument
@@ -880,13 +1041,20 @@ fn parse_run_flags(args: &[String]) -> Result<RunFlags> {
                 i += 1;
             }
             "--from-store" => {
-                let val = args.get(i + 1).ok_or_else(|| anyhow!("--from-store needs a stage_id"))?;
+                let val = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("--from-store needs a stage_id"))?;
                 f.from_store = Some(val.clone());
                 i += 2;
             }
-            "--require-signed" => { f.require_signed = true; i += 1; }
+            "--require-signed" => {
+                f.require_signed = true;
+                i += 1;
+            }
             "--trusted-key" => {
-                let val = args.get(i + 1).ok_or_else(|| anyhow!("--trusted-key needs a hex value"))?;
+                let val = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("--trusted-key needs a hex value"))?;
                 f.trusted_key = Some(val.clone());
                 f.require_signed = true;
                 i += 2;
@@ -897,7 +1065,10 @@ fn parse_run_flags(args: &[String]) -> Result<RunFlags> {
                 f.program_args = args[i + 1..].to_vec();
                 break;
             }
-            _ => { f.positional.push(a.clone()); i += 1; }
+            _ => {
+                f.positional.push(a.clone());
+                i += 1;
+            }
         }
     }
     Ok(f)
@@ -920,14 +1091,18 @@ fn cmd_trace(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     while i < args.len() {
         match args[i].as_str() {
             "--op" => {
-                op_filter = Some(args.get(i + 1)
-                    .ok_or_else(|| anyhow!("--op needs an op_id"))?
-                    .clone());
+                op_filter = Some(
+                    args.get(i + 1)
+                        .ok_or_else(|| anyhow!("--op needs an op_id"))?
+                        .clone(),
+                );
                 i += 2;
             }
             "--store" => {
-                store_root = Some(PathBuf::from(args.get(i + 1)
-                    .ok_or_else(|| anyhow!("--store needs a path"))?));
+                store_root = Some(PathBuf::from(
+                    args.get(i + 1)
+                        .ok_or_else(|| anyhow!("--store needs a path"))?,
+                ));
                 i += 2;
             }
             other if !other.starts_with("--") => {
@@ -943,10 +1118,13 @@ fn cmd_trace(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 
     if let Some(op_id) = op_filter {
         let log = store.attestation_log()?;
-        let traces: Vec<lex_vcs::Attestation> = log.list_all()?
+        let traces: Vec<lex_vcs::Attestation> = log
+            .list_all()?
             .into_iter()
-            .filter(|a| matches!(a.kind, lex_vcs::AttestationKind::Trace { .. })
-                && a.op_id.as_deref() == Some(op_id.as_str()))
+            .filter(|a| {
+                matches!(a.kind, lex_vcs::AttestationKind::Trace { .. })
+                    && a.op_id.as_deref() == Some(op_id.as_str())
+            })
             .collect();
         let data = serde_json::json!({
             "op_id": op_id,
@@ -960,7 +1138,11 @@ fn cmd_trace(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                 return;
             }
             for a in &listing {
-                if let lex_vcs::AttestationKind::Trace { run_id, root_target } = &a.kind {
+                if let lex_vcs::AttestationKind::Trace {
+                    run_id,
+                    root_target,
+                } = &a.kind
+                {
                     println!("{run_id}\t{root_target}\tat={}", a.timestamp);
                 }
             }
@@ -969,9 +1151,9 @@ fn cmd_trace(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     }
 
     // Positional path: load and dump the trace tree.
-    let id = positional.first().ok_or_else(|| anyhow!(
-        "usage: lex trace <run_id> | lex trace --op <op_id> [--store DIR]"
-    ))?;
+    let id = positional.first().ok_or_else(|| {
+        anyhow!("usage: lex trace <run_id> | lex trace --op <op_id> [--store DIR]")
+    })?;
     let tree = store.load_trace(id)?;
     let data = serde_json::to_value(&tree)?;
     acli::emit_or_text("trace", data.clone(), fmt, || {
@@ -1010,8 +1192,12 @@ fn trace_producer() -> lex_vcs::ProducerDescriptor {
 }
 
 fn cmd_diff(fmt: &OutputFormat, args: &[String]) -> Result<()> {
-    let a = args.first().ok_or_else(|| anyhow!("usage: lex diff <run_a> <run_b>"))?;
-    let b = args.get(1).ok_or_else(|| anyhow!("missing second run id"))?;
+    let a = args
+        .first()
+        .ok_or_else(|| anyhow!("usage: lex diff <run_a> <run_b>"))?;
+    let b = args
+        .get(1)
+        .ok_or_else(|| anyhow!("missing second run id"))?;
     let store = lex_store::Store::open(default_store_root())?;
     let ta = store.load_trace(a)?;
     let tb = store.load_trace(b)?;
@@ -1027,13 +1213,16 @@ fn cmd_diff(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 
 /// `lex canonical <encode|decode>` dispatcher (#206 slice 2).
 fn cmd_canonical(fmt: &OutputFormat, args: &[String]) -> Result<()> {
-    let sub = args.first().ok_or_else(|| anyhow!(
-        "usage: lex canonical <encode|decode> ..."))?;
+    let sub = args
+        .first()
+        .ok_or_else(|| anyhow!("usage: lex canonical <encode|decode> ..."))?;
     match sub.as_str() {
         "encode" => cmd_canonical_encode(fmt, &args[1..]),
         "decode" => cmd_canonical_decode(fmt, &args[1..]),
-        other => bail!("unknown `lex canonical` action `{other}`; \
-                       expected `encode` or `decode`"),
+        other => bail!(
+            "unknown `lex canonical` action `{other}`; \
+                       expected `encode` or `decode`"
+        ),
     }
 }
 
@@ -1056,8 +1245,11 @@ fn cmd_canonical_encode(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     while i < args.len() {
         match args[i].as_str() {
             "--out" => {
-                out_path = Some(args.get(i + 1).map(|s| s.as_str())
-                    .ok_or_else(|| anyhow!("--out needs a path"))?);
+                out_path = Some(
+                    args.get(i + 1)
+                        .map(|s| s.as_str())
+                        .ok_or_else(|| anyhow!("--out needs a path"))?,
+                );
                 i += 2;
             }
             s if s.starts_with("--") => bail!("unknown flag `{s}` for `lex canonical encode`"),
@@ -1070,16 +1262,15 @@ fn cmd_canonical_encode(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             }
         }
     }
-    let path = path.ok_or_else(|| anyhow!(
-        "usage: lex canonical encode <text-file> [--out <bytes-file>]"))?;
+    let path = path
+        .ok_or_else(|| anyhow!("usage: lex canonical encode <text-file> [--out <bytes-file>]"))?;
 
     let prog = read_program(path)?;
     let stages = canonicalize_program(&prog);
     let bytes = lex_ast::canonical_format::encode_program(&stages);
 
     if let Some(out) = out_path {
-        std::fs::write(out, &bytes)
-            .map_err(|e| anyhow!("write {out}: {e}"))?;
+        std::fs::write(out, &bytes).map_err(|e| anyhow!("write {out}: {e}"))?;
         let data = serde_json::json!({
             "ok": true,
             "out": out,
@@ -1102,7 +1293,8 @@ fn cmd_canonical_encode(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             }
             _ => {
                 use std::io::Write;
-                std::io::stdout().write_all(&bytes)
+                std::io::stdout()
+                    .write_all(&bytes)
                     .map_err(|e| anyhow!("stdout: {e}"))?;
             }
         }
@@ -1128,7 +1320,9 @@ fn cmd_canonical_encode(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 /// (Ollama or OpenAI-compat per `LEX_EMBED_PROVIDER`) wrapped in a
 /// filesystem cache under `<store>/search/embeddings/`. Otherwise
 /// we use the deterministic [`lex_search::MockEmbedder`].
-pub(crate) fn build_embedder(store_root: &std::path::Path) -> Result<Box<dyn lex_search::Embedder>> {
+pub(crate) fn build_embedder(
+    store_root: &std::path::Path,
+) -> Result<Box<dyn lex_search::Embedder>> {
     if let Some(http) = lex_search::HttpEmbedder::from_env()
         .map_err(|e| anyhow!("LEX_EMBED_URL configuration: {e}"))?
     {
@@ -1166,17 +1360,22 @@ fn cmd_plan(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             }
             "--intent" => intent = it.next().cloned(),
             "--branch" => branch = it.next().cloned(),
-            "--store" => root = Some(std::path::PathBuf::from(
-                it.next().ok_or_else(|| anyhow!("--store needs a path"))?,
-            )),
+            "--store" => {
+                root = Some(std::path::PathBuf::from(
+                    it.next().ok_or_else(|| anyhow!("--store needs a path"))?,
+                ))
+            }
             other => bail!("unexpected arg `{other}` for `lex plan`"),
         }
     }
-    let goal = goal.ok_or_else(|| anyhow!(
-        "usage: lex plan --goal <fn> [--max-cost N] [--intent <id>] [--branch B] [--store DIR]"))?;
+    let goal = goal.ok_or_else(|| {
+        anyhow!(
+            "usage: lex plan --goal <fn> [--max-cost N] [--intent <id>] [--branch B] [--store DIR]"
+        )
+    })?;
     let root = root.unwrap_or_else(default_store_root);
-    let store = Store::open(&root)
-        .with_context(|| format!("opening store at {}", root.display()))?;
+    let store =
+        Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
     let branch = branch.unwrap_or_else(|| store.current_branch());
 
     // If `--intent` is supplied, resolve its session id via the
@@ -1209,7 +1408,10 @@ fn cmd_plan(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             let effs = if p.effects.is_empty() {
                 String::new()
             } else {
-                format!(" [{}]", p.effects.iter().cloned().collect::<Vec<_>>().join(", "))
+                format!(
+                    " [{}]",
+                    p.effects.iter().cloned().collect::<Vec<_>>().join(", ")
+                )
             };
             println!(
                 "  {mark} cost={} {}{}",
@@ -1239,18 +1441,24 @@ fn cmd_repair(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--store" => {
-                root = Some(PathBuf::from(it.next()
-                    .ok_or_else(|| anyhow!("--store needs a path"))?));
+                root = Some(PathBuf::from(
+                    it.next().ok_or_else(|| anyhow!("--store needs a path"))?,
+                ));
             }
             "--apply" => apply = true,
             "--transform" => {
-                transform_json = Some(it.next()
-                    .ok_or_else(|| anyhow!("--transform needs a JSON payload"))?
-                    .clone());
+                transform_json = Some(
+                    it.next()
+                        .ok_or_else(|| anyhow!("--transform needs a JSON payload"))?
+                        .clone(),
+                );
             }
             "--branch" => {
-                branch = Some(it.next()
-                    .ok_or_else(|| anyhow!("--branch needs a name"))?.clone());
+                branch = Some(
+                    it.next()
+                        .ok_or_else(|| anyhow!("--branch needs a name"))?
+                        .clone(),
+                );
             }
             other if !other.starts_with("--") => {
                 if op_id.is_some() {
@@ -1261,10 +1469,14 @@ fn cmd_repair(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             other => bail!("unexpected arg `{other}`"),
         }
     }
-    let op_id = op_id.ok_or_else(|| anyhow!(
-        "usage: lex repair <op_id> [--apply --transform '<json>'] [--branch B] [--store DIR]"))?;
+    let op_id = op_id.ok_or_else(|| {
+        anyhow!(
+            "usage: lex repair <op_id> [--apply --transform '<json>'] [--branch B] [--store DIR]"
+        )
+    })?;
     let root = root.unwrap_or_else(|| {
-        let home = std::env::var("HOME").map(PathBuf::from)
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("."));
         home.join(".lex/store")
     });
@@ -1286,19 +1498,19 @@ fn cmd_repair(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     cmd_repair_read(fmt, &store, &op_id)
 }
 
-fn cmd_repair_read(
-    fmt: &OutputFormat,
-    store: &Store,
-    op_id: &str,
-) -> Result<()> {
-    let attlog = store.attestation_log()
+fn cmd_repair_read(fmt: &OutputFormat, store: &Store, op_id: &str) -> Result<()> {
+    let attlog = store
+        .attestation_log()
         .map_err(|e| anyhow!("opening attestation log: {e}"))?;
-    let mut hits: Vec<lex_vcs::Attestation> = attlog.list_all()
+    let mut hits: Vec<lex_vcs::Attestation> = attlog
+        .list_all()
         .map_err(|e| anyhow!("listing attestations: {e}"))?
         .into_iter()
-        .filter(|a| matches!(&a.kind,
+        .filter(|a| {
+            matches!(&a.kind,
             lex_vcs::AttestationKind::RepairHint { failed_op_id, .. }
-                if failed_op_id == op_id))
+                if failed_op_id == op_id)
+        })
         .collect();
     hits.sort_by_key(|a| a.timestamp);
     let latest = hits.last().cloned();
@@ -1308,7 +1520,10 @@ fn cmd_repair_read(
                 failed_op_id,
                 errors,
                 suggested_transform,
-            } = &a.kind else { unreachable!() };
+            } = &a.kind
+            else {
+                unreachable!()
+            };
             serde_json::json!({
                 "found": true,
                 "failed_op_id": failed_op_id,
@@ -1329,18 +1544,19 @@ fn cmd_repair_read(
         if envelope["found"] == false {
             println!("no RepairHint found for op_id `{op_id_owned}`");
         } else {
-            let n = envelope["errors"].as_array()
-                .map(|a| a.len()).unwrap_or(0);
+            let n = envelope["errors"].as_array().map(|a| a.len()).unwrap_or(0);
             let stage = envelope["stage_id"].as_str().unwrap_or("?");
             println!("RepairHint for op_id `{op_id_owned}`:");
             println!("  stage:  {stage}");
             println!("  errors: {n}");
-            println!("  suggested_transform: {}",
+            println!(
+                "  suggested_transform: {}",
                 if envelope["suggested_transform"].is_null() {
                     "(none — supply one via `lex repair --apply --transform ...`)".to_string()
                 } else {
                     envelope["suggested_transform"].to_string()
-                });
+                }
+            );
         }
     });
     Ok(())
@@ -1364,25 +1580,33 @@ fn cmd_repair_apply(
     // Find the hint we're attesting against. Required so the
     // RepairAttempt's `hint_id` field is meaningful; without one,
     // a repair has no target to record progress against.
-    let attlog = store.attestation_log()
+    let attlog = store
+        .attestation_log()
         .map_err(|e| anyhow!("opening attestation log: {e}"))?;
-    let hint = attlog.list_all()
+    let hint = attlog
+        .list_all()
         .map_err(|e| anyhow!("listing attestations: {e}"))?
         .into_iter()
-        .filter(|a| matches!(&a.kind,
+        .filter(|a| {
+            matches!(&a.kind,
             lex_vcs::AttestationKind::RepairHint { failed_op_id: f, .. }
-                if f == failed_op_id))
+                if f == failed_op_id)
+        })
         .max_by_key(|a| a.timestamp)
-        .ok_or_else(|| anyhow!(
-            "no RepairHint exists for op_id `{failed_op_id}` — \
+        .ok_or_else(|| {
+            anyhow!(
+                "no RepairHint exists for op_id `{failed_op_id}` — \
              a hint is required to apply a repair"
-        ))?;
+            )
+        })?;
     let hint_attestation_id = hint.attestation_id.clone();
     let hint_stage_id = hint.stage_id.clone();
 
     let parsed: serde_json::Value = serde_json::from_str(transform_json)
         .with_context(|| format!("parsing --transform JSON: {transform_json}"))?;
-    let kind = parsed.get("kind").and_then(|v| v.as_str())
+    let kind = parsed
+        .get("kind")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("--transform JSON missing `kind` field"))?;
 
     let result = dispatch_repair_transform(store, branch, &parsed, kind);
@@ -1412,7 +1636,8 @@ fn cmd_repair_apply(
         repair_attempt_producer(),
         None,
     );
-    attlog.put(&attempt)
+    attlog
+        .put(&attempt)
         .map_err(|e| anyhow!("recording RepairAttempt: {e}"))?;
 
     let env = serde_json::json!({
@@ -1427,10 +1652,7 @@ fn cmd_repair_apply(
                 "repair applied: new op_id = {}",
                 env["applied_op_id"].as_str().unwrap_or("?")
             ),
-            _ => println!(
-                "repair failed: {}",
-                env["error"].as_str().unwrap_or("?")
-            ),
+            _ => println!("repair failed: {}", env["error"].as_str().unwrap_or("?")),
         }
     });
 
@@ -1449,9 +1671,12 @@ fn cmd_repair_apply(
 /// `required_attestations` gate consults the latest score per
 /// tool to apply trust-based waivers.
 fn cmd_producer_trust(fmt: &OutputFormat, args: &[String]) -> Result<()> {
-    let sub = args.first().ok_or_else(|| anyhow!(
-        "usage: lex producer-trust recompute --tool <id> [--window N] \
-         [--granted-by ACTOR] [--store DIR]"))?;
+    let sub = args.first().ok_or_else(|| {
+        anyhow!(
+            "usage: lex producer-trust recompute --tool <id> [--window N] \
+         [--granted-by ACTOR] [--store DIR]"
+        )
+    })?;
     if sub != "recompute" {
         bail!("unknown `lex producer-trust` subcommand: {sub}");
     }
@@ -1463,23 +1688,30 @@ fn cmd_producer_trust(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--tool" => {
-                tool = Some(it.next()
-                    .ok_or_else(|| anyhow!("--tool needs an id"))?.clone());
+                tool = Some(
+                    it.next()
+                        .ok_or_else(|| anyhow!("--tool needs an id"))?
+                        .clone(),
+                );
             }
             "--window" => {
-                window = it.next()
+                window = it
+                    .next()
                     .ok_or_else(|| anyhow!("--window needs N"))?
-                    .parse().map_err(|e| anyhow!("--window: {e}"))?;
+                    .parse()
+                    .map_err(|e| anyhow!("--window: {e}"))?;
             }
             "--granted-by" => {
-                granted_by = it.next()
-                    .ok_or_else(|| anyhow!("--granted-by needs an actor"))?.clone();
+                granted_by = it
+                    .next()
+                    .ok_or_else(|| anyhow!("--granted-by needs an actor"))?
+                    .clone();
             }
             other => bail!("unexpected arg `{other}`"),
         }
     }
-    let tool = tool.ok_or_else(|| anyhow!(
-        "usage: lex producer-trust recompute --tool <id> ..."))?;
+    let tool =
+        tool.ok_or_else(|| anyhow!("usage: lex producer-trust recompute --tool <id> ..."))?;
 
     let store = Store::open(&root)?;
     let result = store.recompute_producer_trust(&tool, window, &granted_by)?;
@@ -1503,11 +1735,15 @@ fn cmd_producer_trust(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let tool_for_text = tool.clone();
     acli::emit_or_text("producer-trust", env, fmt, move || {
         if env_for_text["ok"] == true {
-            println!("recomputed trust for `{tool_for_text}` → attestation_id={}",
-                env_for_text["attestation_id"].as_str().unwrap_or("?"));
+            println!(
+                "recomputed trust for `{tool_for_text}` → attestation_id={}",
+                env_for_text["attestation_id"].as_str().unwrap_or("?")
+            );
         } else {
-            println!("no trust recompute: {}",
-                env_for_text["reason"].as_str().unwrap_or("?"));
+            println!(
+                "no trust recompute: {}",
+                env_for_text["reason"].as_str().unwrap_or("?")
+            );
         }
     });
     Ok(())
@@ -1550,33 +1786,45 @@ fn cmd_repair_apply_llm(
     failed_op_id: &str,
     branch: &str,
 ) -> Result<()> {
-    let attlog = store.attestation_log()
+    let attlog = store
+        .attestation_log()
         .map_err(|e| anyhow!("opening attestation log: {e}"))?;
-    let hint = attlog.list_all()
+    let hint = attlog
+        .list_all()
         .map_err(|e| anyhow!("listing attestations: {e}"))?
         .into_iter()
-        .filter(|a| matches!(&a.kind,
+        .filter(|a| {
+            matches!(&a.kind,
             lex_vcs::AttestationKind::RepairHint { failed_op_id: f, .. }
-                if f == failed_op_id))
+                if f == failed_op_id)
+        })
         .max_by_key(|a| a.timestamp)
-        .ok_or_else(|| anyhow!(
-            "no RepairHint exists for op_id `{failed_op_id}` — \
+        .ok_or_else(|| {
+            anyhow!(
+                "no RepairHint exists for op_id `{failed_op_id}` — \
              a hint is required to apply a repair"
-        ))?;
-    let lex_vcs::AttestationKind::RepairHint { errors, .. } = &hint.kind
-        else { unreachable!() };
+            )
+        })?;
+    let lex_vcs::AttestationKind::RepairHint { errors, .. } = &hint.kind else {
+        unreachable!()
+    };
 
     let candidate_stage_id = &hint.stage_id;
-    let candidate_stage = store.get_ast(candidate_stage_id)
+    let candidate_stage = store
+        .get_ast(candidate_stage_id)
         .map_err(|e| anyhow!("loading candidate stage `{candidate_stage_id}`: {e}"))?;
     let sig = lex_ast::sig_id(&candidate_stage)
         .ok_or_else(|| anyhow!("candidate stage has no sig_id"))?;
-    let head = store.branch_head(branch)
+    let head = store
+        .branch_head(branch)
         .map_err(|e| anyhow!("reading branch head: {e}"))?;
     let from_stage_id = head.get(&sig).cloned();
     let from_stage = match &from_stage_id {
-        Some(id) => Some(store.get_ast(id)
-            .map_err(|e| anyhow!("loading branch-head stage `{id}`: {e}"))?),
+        Some(id) => Some(
+            store
+                .get_ast(id)
+                .map_err(|e| anyhow!("loading branch-head stage `{id}`: {e}"))?,
+        ),
         None => None,
     };
 
@@ -1595,7 +1843,8 @@ fn cmd_repair_apply_llm(
     // as a `RepairAttempt` failure rather than propagated as
     // exit-non-zero — the LLM gave a bad answer; the command
     // itself processed correctly.
-    let parse_err: Option<String> = match serde_json::from_str::<serde_json::Value>(&transform_json) {
+    let parse_err: Option<String> = match serde_json::from_str::<serde_json::Value>(&transform_json)
+    {
         Ok(v) => {
             if v.get("kind").and_then(|x| x.as_str()).is_none() {
                 Some("LLM response missing `kind` field".into())
@@ -1606,7 +1855,8 @@ fn cmd_repair_apply_llm(
         Err(e) => Some(format!("LLM response is not valid JSON: {e}")),
     };
     if let Some(reason) = parse_err {
-        let attlog = store.attestation_log()
+        let attlog = store
+            .attestation_log()
             .map_err(|e| anyhow!("opening attestation log: {e}"))?;
         let attempt = lex_vcs::Attestation::new(
             hint.stage_id.clone(),
@@ -1617,11 +1867,14 @@ fn cmd_repair_apply_llm(
                 outcome: "failed".into(),
                 applied_op_id: None,
             },
-            lex_vcs::AttestationResult::Failed { detail: reason.clone() },
+            lex_vcs::AttestationResult::Failed {
+                detail: reason.clone(),
+            },
             repair_attempt_producer(),
             None,
         );
-        attlog.put(&attempt)
+        attlog
+            .put(&attempt)
             .map_err(|e| anyhow!("recording RepairAttempt: {e}"))?;
         let env = serde_json::json!({
             "outcome": "failed",
@@ -1631,7 +1884,10 @@ fn cmd_repair_apply_llm(
         });
         let env_for_text = env.clone();
         acli::emit_or_text("repair-apply", env, fmt, move || {
-            println!("repair failed: {}", env_for_text["error"].as_str().unwrap_or("?"));
+            println!(
+                "repair failed: {}",
+                env_for_text["error"].as_str().unwrap_or("?")
+            );
         });
         return Ok(());
     }
@@ -1652,16 +1908,15 @@ fn build_repair_prompt(
     from_stage: Option<&lex_ast::Stage>,
     errors: &serde_json::Value,
 ) -> String {
-    let candidate_json = serde_json::to_string_pretty(candidate_stage)
-        .unwrap_or_default();
+    let candidate_json = serde_json::to_string_pretty(candidate_stage).unwrap_or_default();
     let from_json = from_stage
         .map(|s| serde_json::to_string_pretty(s).unwrap_or_default())
         .unwrap_or_else(|| "(no current branch-head stage for this sig)".into());
     let from_id_render = from_stage_id.unwrap_or("(none)");
-    let errors_json = serde_json::to_string_pretty(errors)
-        .unwrap_or_default();
+    let errors_json = serde_json::to_string_pretty(errors).unwrap_or_default();
 
-    format!(r#"You are a Lex type-error repair assistant. The user attempted a
+    format!(
+        r#"You are a Lex type-error repair assistant. The user attempted a
 typed transform; the resulting stage didn't typecheck. Suggest
 exactly one typed AST transform that would fix the type errors.
 
@@ -1727,7 +1982,8 @@ Type errors:
 
 Output ONLY the JSON object for your chosen transform. No prose,
 no markdown fences, no surrounding commentary.
-"#)
+"#
+    )
 }
 
 /// Call the configured LLM. Test escape hatch: when
@@ -1739,8 +1995,7 @@ fn call_repair_llm(prompt: &str) -> Result<String> {
         return std::fs::read_to_string(&path)
             .with_context(|| format!("reading LEX_REPAIR_LLM_FIXTURE at `{path}`"));
     }
-    lex_runtime::llm::cloud_complete(prompt)
-        .map_err(|e| anyhow!("LLM cloud_complete: {e}"))
+    lex_runtime::llm::cloud_complete(prompt).map_err(|e| anyhow!("LLM cloud_complete: {e}"))
 }
 
 /// Dispatch a `--transform` payload to the matching
@@ -1756,17 +2011,24 @@ fn dispatch_repair_transform(
         "replace_match_arm" => {
             let from = require_str(payload, "from_stage_id")?;
             let match_node = require_str(payload, "match_node")?;
-            let arm_index = payload.get("arm_index")
+            let arm_index = payload
+                .get("arm_index")
                 .and_then(|v| v.as_u64())
                 .ok_or_else(|| anyhow!("replace_match_arm: missing arm_index"))?
                 as usize;
             let new_body: lex_ast::CExpr = serde_json::from_value(
-                payload.get("new_body").cloned()
-                    .ok_or_else(|| anyhow!("replace_match_arm: missing new_body"))?
-            ).context("parsing new_body CExpr")?;
+                payload
+                    .get("new_body")
+                    .cloned()
+                    .ok_or_else(|| anyhow!("replace_match_arm: missing new_body"))?,
+            )
+            .context("parsing new_body CExpr")?;
             let op = store.apply_replace_match_arm(
-                branch, from, &lex_ast::NodeId(match_node.into()),
-                arm_index, new_body,
+                branch,
+                from,
+                &lex_ast::NodeId(match_node.into()),
+                arm_index,
+                new_body,
             )?;
             Ok(vec![op])
         }
@@ -1775,27 +2037,32 @@ fn dispatch_repair_transform(
             let let_node = require_str(payload, "let_node")?;
             let new_name = require_str(payload, "new_name")?;
             let op = store.apply_rename_local(
-                branch, from, &lex_ast::NodeId(let_node.into()), new_name,
+                branch,
+                from,
+                &lex_ast::NodeId(let_node.into()),
+                new_name,
             )?;
             Ok(vec![op])
         }
         "inline_let" => {
             let from = require_str(payload, "from_stage_id")?;
             let let_node = require_str(payload, "let_node")?;
-            let op = store.apply_inline_let(
-                branch, from, &lex_ast::NodeId(let_node.into()),
-            )?;
+            let op = store.apply_inline_let(branch, from, &lex_ast::NodeId(let_node.into()))?;
             Ok(vec![op])
         }
         "extract_function" => {
             let from = require_str(payload, "from_stage_id")?;
             let expr_node = require_str(payload, "expr_node")?;
             let spec: lex_ast::ExtractFnSpec = parse_extract_spec(
-                payload.get("spec")
-                    .ok_or_else(|| anyhow!("extract_function: missing spec"))?
+                payload
+                    .get("spec")
+                    .ok_or_else(|| anyhow!("extract_function: missing spec"))?,
             )?;
             let (add, modify) = store.apply_extract_function(
-                branch, from, &lex_ast::NodeId(expr_node.into()), spec,
+                branch,
+                from,
+                &lex_ast::NodeId(expr_node.into()),
+                spec,
             )?;
             Ok(vec![add, modify])
         }
@@ -1818,33 +2085,46 @@ fn require_str<'a>(v: &'a serde_json::Value, key: &str) -> Result<&'a str> {
 /// `Effect` go through `lex-ast`'s canonical-JSON form (which is
 /// the same shape, but worth being explicit).
 fn parse_extract_spec(v: &serde_json::Value) -> Result<lex_ast::ExtractFnSpec> {
-    let name = v.get("name").and_then(|x| x.as_str())
+    let name = v
+        .get("name")
+        .and_then(|x| x.as_str())
         .ok_or_else(|| anyhow!("extract_function spec: missing name"))?
         .to_string();
-    let type_params: Vec<String> = v.get("type_params")
+    let type_params: Vec<String> = v
+        .get("type_params")
         .map(|x| serde_json::from_value(x.clone()))
-        .transpose().context("extract_function spec.type_params")?
+        .transpose()
+        .context("extract_function spec.type_params")?
         .unwrap_or_default();
     let params: Vec<lex_ast::Param> = serde_json::from_value(
-        v.get("params").cloned()
-            .ok_or_else(|| anyhow!("extract_function spec: missing params"))?
-    ).context("extract_function spec.params")?;
+        v.get("params")
+            .cloned()
+            .ok_or_else(|| anyhow!("extract_function spec: missing params"))?,
+    )
+    .context("extract_function spec.params")?;
     let return_type: lex_ast::TypeExpr = serde_json::from_value(
-        v.get("return_type").cloned()
-            .ok_or_else(|| anyhow!("extract_function spec: missing return_type"))?
-    ).context("extract_function spec.return_type")?;
-    let effects: Vec<lex_ast::Effect> = v.get("effects")
+        v.get("return_type")
+            .cloned()
+            .ok_or_else(|| anyhow!("extract_function spec: missing return_type"))?,
+    )
+    .context("extract_function spec.return_type")?;
+    let effects: Vec<lex_ast::Effect> = v
+        .get("effects")
         .map(|x| serde_json::from_value(x.clone()))
-        .transpose().context("extract_function spec.effects")?
+        .transpose()
+        .context("extract_function spec.effects")?
         .unwrap_or_default();
     Ok(lex_ast::ExtractFnSpec {
-        name, type_params, params, return_type, effects,
+        name,
+        type_params,
+        params,
+        return_type,
+        effects,
     })
 }
 
 fn cmd_keygen(fmt: &OutputFormat, _args: &[String]) -> Result<()> {
-    let kp = lex_vcs::Keypair::generate()
-        .map_err(|e| anyhow!("keygen: {e}"))?;
+    let kp = lex_vcs::Keypair::generate().map_err(|e| anyhow!("keygen: {e}"))?;
     let data = serde_json::json!({
         "public_key": kp.public_hex(),
         "secret_key": kp.secret_hex(),
@@ -1868,10 +2148,12 @@ fn resolve_signing_key(flag_value: Option<&str>) -> Result<Option<lex_vcs::Keypa
     };
     match hex_str {
         Some(s) if !s.is_empty() => {
-            let kp = lex_vcs::Keypair::from_secret_hex(s.trim())
-                .map_err(|e| anyhow!(
+            let kp = lex_vcs::Keypair::from_secret_hex(s.trim()).map_err(|e| {
+                anyhow!(
                     "invalid signing key (hex): {e}. \
-                     Expected 64 hex chars from `lex keygen`."))?;
+                     Expected 64 hex chars from `lex keygen`."
+                )
+            })?;
             Ok(Some(kp))
         }
         _ => Ok(None),
@@ -1898,20 +2180,28 @@ fn verify_metadata_signature(
     match &meta.signature {
         None => {
             if require_signed {
-                bail!("stage `{}` is not signed (--require-signed/--trusted-key was set)",
-                    meta.stage_id);
+                bail!(
+                    "stage `{}` is not signed (--require-signed/--trusted-key was set)",
+                    meta.stage_id
+                );
             }
             Ok(())
         }
         Some(sig) => {
-            lex_vcs::verify_stage_id(&meta.stage_id, sig)
-                .map_err(|e| anyhow!(
+            lex_vcs::verify_stage_id(&meta.stage_id, sig).map_err(|e| {
+                anyhow!(
                     "signature on stage `{}` failed verification: {e}",
-                    meta.stage_id))?;
+                    meta.stage_id
+                )
+            })?;
             if let Some(trusted) = trusted_key {
                 if !sig.public_key.eq_ignore_ascii_case(trusted) {
-                    bail!("stage `{}` is signed by `{}`, not by trusted key `{}`",
-                        meta.stage_id, sig.public_key, trusted);
+                    bail!(
+                        "stage `{}` is signed by `{}`, not by trusted key `{}`",
+                        meta.stage_id,
+                        sig.public_key,
+                        trusted
+                    );
                 }
             }
             Ok(())
@@ -1920,10 +2210,10 @@ fn verify_metadata_signature(
 }
 
 fn cmd_canonical_decode(fmt: &OutputFormat, args: &[String]) -> Result<()> {
-    let path = args.first().ok_or_else(|| anyhow!(
-        "usage: lex canonical decode <bytes-file>"))?;
-    let bytes = std::fs::read(path)
-        .map_err(|e| anyhow!("read {path}: {e}"))?;
+    let path = args
+        .first()
+        .ok_or_else(|| anyhow!("usage: lex canonical decode <bytes-file>"))?;
+    let bytes = std::fs::read(path).map_err(|e| anyhow!("read {path}: {e}"))?;
     let stages = lex_ast::canonical_format::decode_program(&bytes)
         .map_err(|e| anyhow!("decode {path}: {e}"))?;
     let text = lex_ast::print_stages(&stages);
@@ -1942,8 +2232,7 @@ fn cmd_canonical_decode(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 /// a `base64` crate dep just for this CLI surface — standard
 /// alphabet (RFC 4648 §4), padded.
 fn encode_b64(bytes: &[u8]) -> String {
-    const A: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     let mut i = 0;
     while i + 3 <= bytes.len() {
@@ -1975,19 +2264,24 @@ fn encode_b64(bytes: &[u8]) -> String {
 }
 
 fn cmd_hash(fmt: &OutputFormat, args: &[String]) -> Result<()> {
-    let path = args.first().ok_or_else(|| anyhow!("usage: lex hash <file>"))?;
+    let path = args
+        .first()
+        .ok_or_else(|| anyhow!("usage: lex hash <file>"))?;
     let prog = read_program(path)?;
     let stages = canonicalize_program(&prog);
-    let entries: Vec<serde_json::Value> = stages.iter().map(|s| {
-        let name = stage_name(s);
-        let h = stage_canonical_hash_hex(s);
-        let sid = stage_id(s).unwrap_or_else(|| "-".into());
-        serde_json::json!({
-            "name": name,
-            "canonical_ast": h,
-            "stage_id": sid,
+    let entries: Vec<serde_json::Value> = stages
+        .iter()
+        .map(|s| {
+            let name = stage_name(s);
+            let h = stage_canonical_hash_hex(s);
+            let sid = stage_id(s).unwrap_or_else(|| "-".into());
+            serde_json::json!({
+                "name": name,
+                "canonical_ast": h,
+                "stage_id": sid,
+            })
         })
-    }).collect();
+        .collect();
     let data = serde_json::json!({ "stages": entries });
     acli::emit_or_text("hash", data, fmt, || {
         for s in &stages {
@@ -2005,49 +2299,66 @@ fn cmd_blame(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let (root, mut rest, _, _) = parse_store_flag(args);
     let with_evidence = rest.iter().any(|a| a == "--with-evidence");
     rest.retain(|a| a != "--with-evidence");
-    let path = rest.first().ok_or_else(|| anyhow!("usage: lex blame [--store DIR] [--with-evidence] <file>"))?;
+    let path = rest
+        .first()
+        .ok_or_else(|| anyhow!("usage: lex blame [--store DIR] [--with-evidence] <file>"))?;
     let prog = read_program(path)?;
     let stages = canonicalize_program(&prog);
-    let store = Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
+    let store =
+        Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
     // Attestation log is opened once per blame run (not per stage)
     // so a 1000-entry blame doesn't pay 1000 fs::create_dir_all
     // calls. The log itself is just a path holder; reads are
     // per-stage directory listings.
-    let att_log = if with_evidence { Some(store.attestation_log()?) } else { None };
+    let att_log = if with_evidence {
+        Some(store.attestation_log()?)
+    } else {
+        None
+    };
 
     let mut entries = Vec::new();
     for s in &stages {
         // Imports don't have stage identities.
-        if matches!(s, Stage::Import(_)) { continue; }
+        if matches!(s, Stage::Import(_)) {
+            continue;
+        }
         let name = stage_name(s).to_string();
-        let sig = match lex_ast::sig_id(s) { Some(id) => id, None => continue };
+        let sig = match lex_ast::sig_id(s) {
+            Some(id) => id,
+            None => continue,
+        };
         let here_stage = stage_id(s).unwrap_or_default();
         let history = store.sig_history(&sig)?;
         let active_stage = store.resolve_sig(&sig).ok().flatten();
 
         // Where does this source's stage stand?
-        let here_status = history.iter().find(|h| h.stage_id == here_stage)
+        let here_status = history
+            .iter()
+            .find(|h| h.stage_id == here_stage)
             .map(|h| format!("{:?}", h.status).to_lowercase());
 
-        let history_json: Vec<serde_json::Value> = history.iter().map(|h| {
-            let mut entry = serde_json::json!({
-                "stage_id": h.stage_id,
-                "status": format!("{:?}", h.status).to_lowercase(),
-                "last_at": h.last_at,
-                "published_at": h.published_at,
-            });
-            if let Some(log) = &att_log {
-                let mut atts = log.list_for_stage(&h.stage_id).unwrap_or_default();
-                atts.sort_by_key(|a| std::cmp::Reverse(a.timestamp));
-                if let Some(obj) = entry.as_object_mut() {
-                    obj.insert(
-                        "attestations".into(),
-                        serde_json::to_value(&atts).unwrap_or(serde_json::Value::Null),
-                    );
+        let history_json: Vec<serde_json::Value> = history
+            .iter()
+            .map(|h| {
+                let mut entry = serde_json::json!({
+                    "stage_id": h.stage_id,
+                    "status": format!("{:?}", h.status).to_lowercase(),
+                    "last_at": h.last_at,
+                    "published_at": h.published_at,
+                });
+                if let Some(log) = &att_log {
+                    let mut atts = log.list_for_stage(&h.stage_id).unwrap_or_default();
+                    atts.sort_by_key(|a| std::cmp::Reverse(a.timestamp));
+                    if let Some(obj) = entry.as_object_mut() {
+                        obj.insert(
+                            "attestations".into(),
+                            serde_json::to_value(&atts).unwrap_or(serde_json::Value::Null),
+                        );
+                    }
                 }
-            }
-            entry
-        }).collect();
+                entry
+            })
+            .collect();
         entries.push(serde_json::json!({
             "name": name,
             "sig_id": sig,
@@ -2059,11 +2370,14 @@ fn cmd_blame(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 
         // New: causal history from the op log.
         let log = lex_vcs::OpLog::open(store.root()).ok();
-        let head_op = store.get_branch(&store.current_branch()).ok()
+        let head_op = store
+            .get_branch(&store.current_branch())
+            .ok()
             .and_then(|opt| opt.and_then(|b| b.head_op));
         let causal: Vec<serde_json::Value> = match (log, head_op) {
             (Some(log), Some(head)) => {
-                log.walk_back(&head, None).unwrap_or_default()
+                log.walk_back(&head, None)
+                    .unwrap_or_default()
                     .into_iter()
                     .filter(|r| {
                         // Touch this sig (or, for renames, produce it as the new sig).
@@ -2075,13 +2389,15 @@ fn cmd_blame(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                             | lex_vcs::OperationKind::ModifyType { sig_id, .. }
                             | lex_vcs::OperationKind::RemoveFunction { sig_id, .. }
                             | lex_vcs::OperationKind::RemoveType { sig_id, .. } => sig_id == &sig,
-                            lex_vcs::OperationKind::RenameSymbol { from, to, .. } =>
-                                from == &sig || to == &sig,
+                            lex_vcs::OperationKind::RenameSymbol { from, to, .. } => {
+                                from == &sig || to == &sig
+                            }
                             _ => false,
                         }
                     })
                     .map(|r| {
-                        let kind_tag = serde_json::to_value(&r.op.kind).ok()
+                        let kind_tag = serde_json::to_value(&r.op.kind)
+                            .ok()
                             .and_then(|v| v.get("op").cloned())
                             .unwrap_or(serde_json::Value::Null);
                         serde_json::json!({
@@ -2096,7 +2412,8 @@ fn cmd_blame(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 
         // Mutate the most-recent entries.push value to attach causal_history.
         if let Some(last) = entries.last_mut() {
-            last.as_object_mut().unwrap()
+            last.as_object_mut()
+                .unwrap()
                 .insert("causal_history".into(), serde_json::Value::Array(causal));
         }
     }
@@ -2134,8 +2451,8 @@ fn print_blame_entry(e: &serde_json::Value) {
         println!("  history: {} stage(s)", history.len());
         for h in history {
             let sid = h["stage_id"].as_str().unwrap_or("");
-            let st  = h["status"].as_str().unwrap_or("?");
-            let at  = h["last_at"].as_u64().unwrap_or(0);
+            let st = h["status"].as_str().unwrap_or("?");
+            let at = h["last_at"].as_u64().unwrap_or(0);
             let marker = if sid == here { " ←" } else { "" };
             println!("    {sid:.16}…  {st:<10} {}{marker}", format_blame_ts(at));
             // `--with-evidence` attaches attestations to each history
@@ -2163,19 +2480,45 @@ fn format_blame_ts(secs: u64) -> String {
     let mut s = secs as i64;
     let mut days = s.div_euclid(86_400);
     s = s.rem_euclid(86_400);
-    let h = s / 3600; s %= 3600;
+    let h = s / 3600;
+    s %= 3600;
     let m = s / 60;
     let mut y: i64 = 1970;
     loop {
-        let yd = if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 { 366 } else { 365 };
-        if days < yd { break; }
-        days -= yd; y += 1;
+        let yd = if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+            366
+        } else {
+            365
+        };
+        if days < yd {
+            break;
+        }
+        days -= yd;
+        y += 1;
     }
-    let mdays = [31,
-        if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 { 29 } else { 28 },
-        31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mdays = [
+        31,
+        if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+            29
+        } else {
+            28
+        },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut mo = 0usize;
-    while mo < 12 && days >= mdays[mo] { days -= mdays[mo]; mo += 1; }
+    while mo < 12 && days >= mdays[mo] {
+        days -= mdays[mo];
+        mo += 1;
+    }
     format!("{y:04}-{:02}-{:02}T{:02}:{:02}Z", mo + 1, days + 1, h, m)
 }
 
@@ -2203,7 +2546,9 @@ fn json_to_value(v: &serde_json::Value) -> Value {
 fn find_stage_id_for_fn(lex_src: &str, fn_name: &str) -> Option<String> {
     let prog = load_program_from_str(lex_src).ok()?;
     let stages = canonicalize_program(&prog);
-    let stage = stages.iter().find(|s| matches!(s, Stage::FnDecl(fd) if fd.name == fn_name))?;
+    let stage = stages
+        .iter()
+        .find(|s| matches!(s, Stage::FnDecl(fd) if fd.name == fn_name))?;
     stage_id(stage)
 }
 
@@ -2229,14 +2574,21 @@ fn record_spec_attestation(
     let result = match r.status {
         spec_checker::ProofStatus::Proved => AttestationResult::Passed,
         spec_checker::ProofStatus::Counterexample => {
-            let detail = r.evidence.counterexample.as_ref()
+            let detail = r
+                .evidence
+                .counterexample
+                .as_ref()
                 .and_then(|c| serde_json::to_string(c).ok())
                 .map(|s| format!("counterexample: {s}"))
                 .unwrap_or_else(|| "counterexample".into());
             AttestationResult::Failed { detail }
         }
         spec_checker::ProofStatus::Inconclusive => AttestationResult::Inconclusive {
-            detail: r.evidence.note.clone().unwrap_or_else(|| "inconclusive".into()),
+            detail: r
+                .evidence
+                .note
+                .clone()
+                .unwrap_or_else(|| "inconclusive".into()),
         },
     };
     let kind = AttestationKind::Spec {
@@ -2314,12 +2666,16 @@ fn value_to_json_string(v: &Value) -> String {
     serde_json::to_string(&v.to_json()).unwrap()
 }
 
-fn value_to_json(v: &Value) -> serde_json::Value { v.to_json() }
+fn value_to_json(v: &Value) -> serde_json::Value {
+    v.to_json()
+}
 
 // ---- M6: store subcommands ----
 
 fn default_store_root() -> PathBuf {
-    if let Ok(s) = std::env::var("LEX_STORE") { return PathBuf::from(s); }
+    if let Ok(s) = std::env::var("LEX_STORE") {
+        return PathBuf::from(s);
+    }
     if let Ok(home) = std::env::var("HOME") {
         return PathBuf::from(home).join(".lex").join("store");
     }
@@ -2343,11 +2699,25 @@ fn parse_store_flag(args: &[String]) -> (PathBuf, Vec<String>, bool, bool) {
     while i < args.len() {
         match args[i].as_str() {
             "--store" => {
-                if let Some(v) = args.get(i + 1) { root = PathBuf::from(v); i += 2; } else { i += 1; }
+                if let Some(v) = args.get(i + 1) {
+                    root = PathBuf::from(v);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
             }
-            "--activate" => { activate = true; i += 1; }
-            "--dry-run" => { dry_run = true; i += 1; }
-            _ => { rest.push(args[i].clone()); i += 1; }
+            "--activate" => {
+                activate = true;
+                i += 1;
+            }
+            "--dry-run" => {
+                dry_run = true;
+                i += 1;
+            }
+            _ => {
+                rest.push(args[i].clone());
+                i += 1;
+            }
         }
     }
     (root, rest, activate, dry_run)
@@ -2364,16 +2734,25 @@ fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         if a == "--branch" {
-            branch = Some(it.next().ok_or_else(|| anyhow!("--branch needs a value"))?.clone());
+            branch = Some(
+                it.next()
+                    .ok_or_else(|| anyhow!("--branch needs a value"))?
+                    .clone(),
+            );
         } else if a == "--signing-key" {
-            signing_key_flag = Some(it.next()
-                .ok_or_else(|| anyhow!("--signing-key needs a hex value"))?.clone());
+            signing_key_flag = Some(
+                it.next()
+                    .ok_or_else(|| anyhow!("--signing-key needs a hex value"))?
+                    .clone(),
+            );
         } else {
             positional.push(a.clone());
         }
     }
-    let path = positional.first().ok_or_else(|| anyhow!(
-        "usage: lex publish [--store DIR] [--branch NAME] [--activate] [--signing-key HEX] <file>"))?;
+    let path = positional.first().ok_or_else(|| {
+        anyhow!(
+        "usage: lex publish [--store DIR] [--branch NAME] [--activate] [--signing-key HEX] <file>")
+    })?;
     let signer = resolve_signing_key(signing_key_flag.as_deref())?;
 
     let prog = read_program(path)?;
@@ -2384,28 +2763,41 @@ fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     // publish) sees the strict shape.
     let mut stages = canonicalize_program(&prog);
     if let Err(errs) = lex_types::check_and_rewrite_program(&mut stages) {
-        let arr: Vec<serde_json::Value> = errs.iter()
-            .map(|e| serde_json::to_value(e).unwrap()).collect();
+        let arr: Vec<serde_json::Value> = errs
+            .iter()
+            .map(|e| serde_json::to_value(e).unwrap())
+            .collect();
         let data = serde_json::json!({ "phase": "type-check", "errors": arr });
         acli::emit_or_text("publish", data, fmt, || {
             for e in &errs {
-                if let Ok(j) = serde_json::to_string(e) { eprintln!("{j}"); }
+                if let Ok(j) = serde_json::to_string(e) {
+                    eprintln!("{j}");
+                }
             }
         });
         std::process::exit(2);
     }
 
-    let store = Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
+    let store =
+        Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
     let branch = branch.unwrap_or_else(|| store.current_branch());
 
     // Compute the diff. We need the old fns and new fns.
     let old_head = store.branch_head(&branch)?;
-    let old_fns: BTreeMap<String, lex_ast::FnDecl> = old_head.values()
+    let old_fns: BTreeMap<String, lex_ast::FnDecl> = old_head
+        .values()
         .filter_map(|stg| store.get_ast(stg).ok())
-        .filter_map(|s| match s { Stage::FnDecl(fd) => Some((fd.name.clone(), fd)), _ => None })
+        .filter_map(|s| match s {
+            Stage::FnDecl(fd) => Some((fd.name.clone(), fd)),
+            _ => None,
+        })
         .collect();
-    let new_fns: BTreeMap<String, lex_ast::FnDecl> = stages.iter()
-        .filter_map(|s| match s { Stage::FnDecl(fd) => Some((fd.name.clone(), fd.clone())), _ => None })
+    let new_fns: BTreeMap<String, lex_ast::FnDecl> = stages
+        .iter()
+        .filter_map(|s| match s {
+            Stage::FnDecl(fd) => Some((fd.name.clone(), fd.clone())),
+            _ => None,
+        })
         .collect();
     let report = diff::compute_diff(&old_fns, &new_fns, /* body_patches: */ true);
 
@@ -2426,18 +2818,18 @@ fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     if dry_run {
         // Compute the op kinds for the dry-run preview using diff_to_ops
         // directly, without persisting anything.
-        let old_name_to_sig: BTreeMap<String, String> = old_head.iter()
-            .filter_map(|(sig, stg)| {
-                store.get_metadata(stg).ok().map(|m| (m.name, sig.clone()))
-            })
+        let old_name_to_sig: BTreeMap<String, String> = old_head
+            .iter()
+            .filter_map(|(sig, stg)| store.get_metadata(stg).ok().map(|m| (m.name, sig.clone())))
             .collect();
-        let old_effects: BTreeMap<String, BTreeSet<String>> = old_head.iter()
+        let old_effects: BTreeMap<String, BTreeSet<String>> = old_head
+            .iter()
             .filter_map(|(sig, stg)| {
                 let ast = store.get_ast(stg).ok()?;
                 match ast {
                     Stage::FnDecl(fd) => {
-                        let s: BTreeSet<String> = fd.effects.iter()
-                            .map(|e| e.name.clone()).collect();
+                        let s: BTreeSet<String> =
+                            fd.effects.iter().map(|e| e.name.clone()).collect();
                         Some((sig.clone(), s))
                     }
                     _ => None,
@@ -2453,18 +2845,29 @@ fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             new_stages: &stages,
             new_imports: &new_imports,
             diff: &report,
-        }).map_err(|e| anyhow!("diff_to_ops: {e}"))?;
-        let actions: Vec<serde_json::Value> = op_kinds.iter()
+        })
+        .map_err(|e| anyhow!("diff_to_ops: {e}"))?;
+        let actions: Vec<serde_json::Value> = op_kinds
+            .iter()
             .map(|k| serde_json::to_value(k).unwrap())
             .collect();
-        acli::emit_dry_run("publish", fmt,
+        acli::emit_dry_run(
+            "publish",
+            fmt,
             &format!("would apply {} op(s) to branch {}", op_kinds.len(), branch),
-            actions);
+            actions,
+        );
         return Ok(());
     }
 
     let outcome = store.publish_program_signed(
-        &branch, &stages, &report, &new_imports, activate, signer.as_ref())?;
+        &branch,
+        &stages,
+        &report,
+        &new_imports,
+        activate,
+        signer.as_ref(),
+    )?;
     let signed = signer.as_ref().map(|kp| kp.public_hex());
     let data = serde_json::json!({
         "ops": outcome.ops,
@@ -2476,17 +2879,23 @@ fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 }
 
 fn cmd_store(fmt: &OutputFormat, args: &[String]) -> Result<()> {
-    let sub = args.first().ok_or_else(|| anyhow!("usage: lex store {{list|get}} ..."))?;
+    let sub = args
+        .first()
+        .ok_or_else(|| anyhow!("usage: lex store {{list|get}} ..."))?;
     let rest = &args[1..];
     match sub.as_str() {
         "list" => {
             let (root, _rest, _, _) = parse_store_flag(rest);
-            let store = Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
+            let store = Store::open(&root)
+                .with_context(|| format!("opening store at {}", root.display()))?;
             let sigs = store.list_sigs()?;
-            let entries: Vec<serde_json::Value> = sigs.iter().map(|s| {
-                let active = store.resolve_sig(s).ok().flatten().unwrap_or_default();
-                serde_json::json!({ "sig_id": s, "active_stage_id": active })
-            }).collect();
+            let entries: Vec<serde_json::Value> = sigs
+                .iter()
+                .map(|s| {
+                    let active = store.resolve_sig(s).ok().flatten().unwrap_or_default();
+                    serde_json::json!({ "sig_id": s, "active_stage_id": active })
+                })
+                .collect();
             let data = serde_json::json!({ "sigs": entries });
             acli::emit_or_text("store", data, fmt, || {
                 for s in &sigs {
@@ -2498,7 +2907,8 @@ fn cmd_store(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         }
         "get" => {
             let (root, rest, _, _) = parse_store_flag(rest);
-            let store = Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
+            let store = Store::open(&root)
+                .with_context(|| format!("opening store at {}", root.display()))?;
             // #227 verification flags. `--require-signed` rejects an
             // unsigned stage; `--trusted-key HEX` rejects any stage
             // whose signature was made by a different key. Both are
@@ -2511,17 +2921,19 @@ fn cmd_store(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                 if a == "--require-signed" {
                     require_signed = true;
                 } else if a == "--trusted-key" {
-                    trusted_key = Some(it.next()
-                        .ok_or_else(|| anyhow!("--trusted-key needs a hex value"))?
-                        .clone());
+                    trusted_key = Some(
+                        it.next()
+                            .ok_or_else(|| anyhow!("--trusted-key needs a hex value"))?
+                            .clone(),
+                    );
                     require_signed = true;
                 } else {
                     positional.push(a);
                 }
             }
-            let id = positional.first()
-                .ok_or_else(|| anyhow!(
-                    "usage: lex store get [--require-signed] [--trusted-key HEX] <stage_id>"))?;
+            let id = positional.first().ok_or_else(|| {
+                anyhow!("usage: lex store get [--require-signed] [--trusted-key HEX] <stage_id>")
+            })?;
             let meta = store.get_metadata(id)?;
             verify_metadata_signature(&meta, require_signed, trusted_key.as_deref())?;
             let ast = store.get_ast(id)?;
@@ -2569,9 +2981,11 @@ fn cmd_store_migrate_ops(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     while let Some(a) = iter.next() {
         match a.as_str() {
             "--to" => {
-                target_str = Some(iter.next()
-                    .ok_or_else(|| anyhow!("--to needs a format tag (today: v1)"))?
-                    .clone());
+                target_str = Some(
+                    iter.next()
+                        .ok_or_else(|| anyhow!("--to needs a format tag (today: v1)"))?
+                        .clone(),
+                );
             }
             "--confirm" => confirm = true,
             other => bail!("unknown flag `{other}` for `lex store migrate-ops`"),
@@ -2586,8 +3000,7 @@ fn cmd_store_migrate_ops(fmt: &OutputFormat, args: &[String]) -> Result<()> {
              --confirm to apply"
         );
     }
-    let target_str = target_str
-        .ok_or_else(|| anyhow!("--to <format> is required (today: v1)"))?;
+    let target_str = target_str.ok_or_else(|| anyhow!("--to <format> is required (today: v1)"))?;
     let target: lex_vcs::OperationFormat = match target_str.as_str() {
         "v1" | "V1" => lex_vcs::OperationFormat::V1,
         other => bail!("unknown operation format `{other}` — supported: v1"),
@@ -2595,8 +3008,8 @@ fn cmd_store_migrate_ops(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 
     let log = lex_vcs::OpLog::open(&root)
         .with_context(|| format!("opening op log at {}", root.display()))?;
-    let plan = lex_vcs::migrate::plan_migration(&log, target)
-        .with_context(|| "planning migration")?;
+    let plan =
+        lex_vcs::migrate::plan_migration(&log, target).with_context(|| "planning migration")?;
 
     let mapping = plan.mapping();
     let changed: Vec<&lex_vcs::migrate::MigrationStep> = plan
@@ -2650,18 +3063,18 @@ fn cmd_store_migrate_ops(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     }
 
     // --confirm path: apply.
-    lex_vcs::migrate::apply_migration(&log, &plan)
-        .with_context(|| "applying op-log migration")?;
+    lex_vcs::migrate::apply_migration(&log, &plan).with_context(|| "applying op-log migration")?;
 
-    let branch_updates = rewrite_branch_heads(&root, &mapping)
-        .with_context(|| "rewriting branch heads")?;
+    let branch_updates =
+        rewrite_branch_heads(&root, &mapping).with_context(|| "rewriting branch heads")?;
 
     // #258: cascade migrate attestations whose `op_id` references
     // a rotated op. Their `attestation_id` is computed including
     // op_id, so they all rotate too.
     let store = lex_store::Store::open(&root)
         .with_context(|| format!("opening store at {}", root.display()))?;
-    let attest_log = store.attestation_log()
+    let attest_log = store
+        .attestation_log()
         .with_context(|| "opening attestation log")?;
     let att_steps = lex_vcs::migrate::plan_attestation_migration(&attest_log, &mapping)
         .with_context(|| "planning attestation cascade")?;
@@ -2765,7 +3178,9 @@ fn cmd_store_search(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     while let Some(a) = iter.next() {
         match a.as_str() {
             "--limit" => {
-                let v = iter.next().ok_or_else(|| anyhow!("--limit needs a value"))?;
+                let v = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("--limit needs a value"))?;
                 limit = v.parse().context("--limit must be a positive integer")?;
             }
             other if !other.starts_with("--") => {
@@ -2777,15 +3192,15 @@ fn cmd_store_search(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             other => bail!("unknown flag `{other}` for `lex store search`"),
         }
     }
-    let query = query.ok_or_else(|| anyhow!(
-        "usage: lex store search [--limit N] \"<query>\""))?;
+    let query = query.ok_or_else(|| anyhow!("usage: lex store search [--limit N] \"<query>\""))?;
 
-    let store = Store::open(&root)
-        .with_context(|| format!("opening store at {}", root.display()))?;
+    let store =
+        Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
     let embedder = build_embedder(&root)?;
     let idx = lex_search::SearchIndex::build(&store, &*embedder)
         .map_err(|e| anyhow!("building search index: {e}"))?;
-    let hits = idx.query(&*embedder, &query, limit)
+    let hits = idx
+        .query(&*embedder, &query, limit)
         .map_err(|e| anyhow!("query embedding: {e}"))?;
     let v = serde_json::json!({
         "query": &query,
@@ -2800,7 +3215,9 @@ fn cmd_store_search(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                 "  {:>6.3}  {}::{}  {}",
                 h.score.fused, h.stage_id, h.name, h.signature,
             );
-            if let Some(d) = &h.description { println!("          note: {d}"); }
+            if let Some(d) = &h.description {
+                println!("          note: {d}");
+            }
         }
     });
     Ok(())
@@ -2819,8 +3236,8 @@ fn cmd_store_search(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 /// Emits `{ indexed, dim, embedder, store }` as the JSON envelope.
 fn cmd_store_search_reindex(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let (root, _rest, _, _) = parse_store_flag(args);
-    let store = Store::open(&root)
-        .with_context(|| format!("opening store at {}", root.display()))?;
+    let store =
+        Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
     let embedder = build_embedder(&root)?;
     let started = std::time::Instant::now();
     let idx = lex_search::SearchIndex::build(&store, &*embedder)
@@ -2833,8 +3250,12 @@ fn cmd_store_search_reindex(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "store": root.display().to_string(),
     });
     acli::emit_or_text("store-search-reindex", v.clone(), fmt, || {
-        println!("indexed {} stage(s) ({}-dim embeddings, {} ms)",
-            idx.stages.len(), embedder.dim(), elapsed_ms);
+        println!(
+            "indexed {} stage(s) ({}-dim embeddings, {} ms)",
+            idx.stages.len(),
+            embedder.dim(),
+            elapsed_ms
+        );
     });
     Ok(())
 }
@@ -2851,13 +3272,10 @@ fn cmd_stage(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     // shapes keep working unchanged.
     if let Some(action) = rest.first().map(String::as_str) {
         match action {
-            "pin"     => return cmd_stage_pin(fmt, &root, &rest[1..]),
-            "defer"   => return cmd_stage_decision(
-                fmt, &root, &rest[1..], StageDecision::Defer),
-            "block"   => return cmd_stage_decision(
-                fmt, &root, &rest[1..], StageDecision::Block),
-            "unblock" => return cmd_stage_decision(
-                fmt, &root, &rest[1..], StageDecision::Unblock),
+            "pin" => return cmd_stage_pin(fmt, &root, &rest[1..]),
+            "defer" => return cmd_stage_decision(fmt, &root, &rest[1..], StageDecision::Defer),
+            "block" => return cmd_stage_decision(fmt, &root, &rest[1..], StageDecision::Block),
+            "unblock" => return cmd_stage_decision(fmt, &root, &rest[1..], StageDecision::Unblock),
             // #294: multi-agent coordination.
             "candidates" => return cmd_stage_candidates(fmt, &root, &rest[1..]),
             "promote-candidate" => return cmd_stage_promote_candidate(fmt, &root, &rest[1..]),
@@ -2869,7 +3287,8 @@ fn cmd_stage(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         .iter()
         .find(|a| !a.starts_with("--"))
         .ok_or_else(|| anyhow!("usage: lex stage <stage_id> [--attestations]"))?;
-    let store = Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
+    let store =
+        Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
 
     if attestations_mode {
         // 404-equivalent: refuse to list against an unknown stage so
@@ -2918,7 +3337,10 @@ fn cmd_stage(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                     lex_vcs::AttestationKind::Unblock { actor, .. } => {
                         format!("Unblock({actor})")
                     }
-                    lex_vcs::AttestationKind::Trace { run_id, root_target } => {
+                    lex_vcs::AttestationKind::Trace {
+                        run_id,
+                        root_target,
+                    } => {
                         format!("Trace({root_target}@{run_id:.12}…)")
                     }
                     lex_vcs::AttestationKind::ProducerBlock { tool_id, .. } => {
@@ -2930,20 +3352,33 @@ fn cmd_stage(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                     lex_vcs::AttestationKind::RepairHint { failed_op_id, .. } => {
                         format!("RepairHint({failed_op_id:.12}…)")
                     }
-                    lex_vcs::AttestationKind::RepairAttempt { hint_id, outcome, .. } => {
+                    lex_vcs::AttestationKind::RepairAttempt {
+                        hint_id, outcome, ..
+                    } => {
                         format!("RepairAttempt({outcome}, {hint_id:.12}…)")
                     }
-                    lex_vcs::AttestationKind::ProducerTrust { tool_id, score_thousandths, .. } => {
-                        format!("ProducerTrust({tool_id}, {:.3})", *score_thousandths as f64 / 1000.0)
+                    lex_vcs::AttestationKind::ProducerTrust {
+                        tool_id,
+                        score_thousandths,
+                        ..
+                    } => {
+                        format!(
+                            "ProducerTrust({tool_id}, {:.3})",
+                            *score_thousandths as f64 / 1000.0
+                        )
                     }
-                    lex_vcs::AttestationKind::TrustWaived { producer, kind_tag, .. } => {
+                    lex_vcs::AttestationKind::TrustWaived {
+                        producer, kind_tag, ..
+                    } => {
                         format!("TrustWaived({producer}/{kind_tag})")
                     }
                 };
                 let result = match &a.result {
                     lex_vcs::AttestationResult::Passed => "passed".to_string(),
                     lex_vcs::AttestationResult::Failed { detail } => format!("failed: {detail}"),
-                    lex_vcs::AttestationResult::Inconclusive { detail } => format!("inconclusive: {detail}"),
+                    lex_vcs::AttestationResult::Inconclusive { detail } => {
+                        format!("inconclusive: {detail}")
+                    }
                 };
                 println!(
                     "{}\t{}\t{}\tby={}@{}",
@@ -2974,16 +3409,12 @@ fn cmd_stage(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 /// when `<root>/users.json` exists requires the resulting name
 /// to be in the file. Returns a printable error mentioning the
 /// command verb so the user can see which surface refused them.
-fn resolve_actor(
-    root: &std::path::Path,
-    supplied: Option<String>,
-    verb: &str,
-) -> Result<String> {
+fn resolve_actor(root: &std::path::Path, supplied: Option<String>, verb: &str) -> Result<String> {
     let actor = supplied
         .or_else(|| std::env::var("LEX_TEA_USER").ok())
-        .ok_or_else(|| anyhow!(
-            "lex stage {verb}: actor unknown — pass --actor NAME or set LEX_TEA_USER"
-        ))?;
+        .ok_or_else(|| {
+            anyhow!("lex stage {verb}: actor unknown — pass --actor NAME or set LEX_TEA_USER")
+        })?;
     if let Some(users) = lex_store::users::load(root)
         .with_context(|| format!("reading users.json at {}", root.display()))?
     {
@@ -3009,13 +3440,10 @@ fn resolve_actor(
 /// every live `Candidate` op for the sig — those not yet
 /// referenced as winner or in `supersedes` by any `Promote`.
 /// Sorted by op_id for reproducibility.
-fn cmd_stage_candidates(
-    fmt: &OutputFormat,
-    root: &std::path::Path,
-    rest: &[String],
-) -> Result<()> {
-    let sig_id = rest.first().ok_or_else(|| anyhow!(
-        "usage: lex stage candidates <sig_id> [--store DIR]"))?;
+fn cmd_stage_candidates(fmt: &OutputFormat, root: &std::path::Path, rest: &[String]) -> Result<()> {
+    let sig_id = rest
+        .first()
+        .ok_or_else(|| anyhow!("usage: lex stage candidates <sig_id> [--store DIR]"))?;
     let store = Store::open(root)?;
     let candidates = store.list_candidates(sig_id)?;
     let data = serde_json::json!({
@@ -3033,8 +3461,10 @@ fn cmd_stage_candidates(
         println!("{} candidate(s) for `{sig_for_text}`:", printable.len());
         for c in &printable {
             let intent = c.intent_id.as_deref().unwrap_or("(none)");
-            println!("  op_id={:.16}…  stage_id={:.16}…  intent={:.16}…",
-                c.op_id, c.stage_id, intent);
+            println!(
+                "  op_id={:.16}…  stage_id={:.16}…  intent={:.16}…",
+                c.op_id, c.stage_id, intent
+            );
         }
     });
     Ok(())
@@ -3056,8 +3486,11 @@ fn cmd_stage_promote_candidate(
     while let Some(a) = it.next() {
         match a.as_str() {
             "--branch" => {
-                branch = Some(it.next()
-                    .ok_or_else(|| anyhow!("--branch needs a name"))?.clone());
+                branch = Some(
+                    it.next()
+                        .ok_or_else(|| anyhow!("--branch needs a name"))?
+                        .clone(),
+                );
             }
             other if !other.starts_with("--") => {
                 if op_id.is_some() {
@@ -3068,8 +3501,9 @@ fn cmd_stage_promote_candidate(
             other => bail!("unexpected arg `{other}`"),
         }
     }
-    let op_id = op_id.ok_or_else(|| anyhow!(
-        "usage: lex stage promote-candidate <op_id> [--branch B] [--store DIR]"))?;
+    let op_id = op_id.ok_or_else(|| {
+        anyhow!("usage: lex stage promote-candidate <op_id> [--branch B] [--store DIR]")
+    })?;
     let store = Store::open(root)?;
     let branch = branch.unwrap_or_else(|| store.current_branch());
     let new_op_id = store.promote_candidate(&branch, &op_id)?;
@@ -3090,37 +3524,43 @@ fn cmd_stage_promote_candidate(
 
 /// a pin can't land anonymously. When `<store>/users.json`
 /// exists, the resolved name must be in the file (v3d, #172).
-fn cmd_stage_pin(
-    fmt: &OutputFormat,
-    root: &std::path::Path,
-    args: &[String],
-) -> Result<()> {
+fn cmd_stage_pin(fmt: &OutputFormat, root: &std::path::Path, args: &[String]) -> Result<()> {
     let mut id: Option<String> = None;
     let mut reason: Option<String> = None;
     let mut actor: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--reason" => { reason = args.get(i + 1).cloned(); i += 2; }
-            "--actor"  => { actor  = args.get(i + 1).cloned(); i += 2; }
-            other if id.is_none() => { id = Some(other.to_string()); i += 1; }
+            "--reason" => {
+                reason = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--actor" => {
+                actor = args.get(i + 1).cloned();
+                i += 2;
+            }
+            other if id.is_none() => {
+                id = Some(other.to_string());
+                i += 1;
+            }
             other => bail!("unexpected arg `{other}`"),
         }
     }
-    let id = id.ok_or_else(|| anyhow!(
-        "usage: lex stage pin <stage_id> --reason \"...\" [--actor NAME]"
-    ))?;
-    let reason = reason.ok_or_else(|| anyhow!(
-        "lex stage pin: --reason required (overrides need a paper trail)"
-    ))?;
+    let id = id.ok_or_else(|| {
+        anyhow!("usage: lex stage pin <stage_id> --reason \"...\" [--actor NAME]")
+    })?;
+    let reason = reason.ok_or_else(|| {
+        anyhow!("lex stage pin: --reason required (overrides need a paper trail)")
+    })?;
     let actor = resolve_actor(root, actor, "pin")?;
 
-    let store = Store::open(root)
-        .with_context(|| format!("opening store at {}", root.display()))?;
+    let store =
+        Store::open(root).with_context(|| format!("opening store at {}", root.display()))?;
     // Verify the stage exists; refuse to pin something that's not
     // even there so a typo can't accidentally activate the wrong
     // sig later.
-    let _ = store.get_metadata(&id)
+    let _ = store
+        .get_metadata(&id)
         .with_context(|| format!("unknown stage `{id}`"))?;
 
     // Refuse to pin a blocked stage. The block is only meaningful
@@ -3137,7 +3577,8 @@ fn cmd_stage_pin(
     // audit. Order matters: if activate fails, no audit is written;
     // if audit fails after a successful activate, the user retries
     // and the attestation_id is content-addressed so re-puts dedup.
-    store.activate(&id)
+    store
+        .activate(&id)
         .with_context(|| format!("activate stage `{id}`"))?;
 
     let producer = lex_vcs::ProducerDescriptor {
@@ -3146,7 +3587,9 @@ fn cmd_stage_pin(
         model: None,
     };
     let attestation = lex_vcs::Attestation::new(
-        id.clone(), None, None,
+        id.clone(),
+        None,
+        None,
         lex_vcs::AttestationKind::Override {
             actor: actor.clone(),
             reason: reason.clone(),
@@ -3157,7 +3600,8 @@ fn cmd_stage_pin(
         // recorded successfully" — Failed/Inconclusive don't
         // apply to administrative actions.
         lex_vcs::AttestationResult::Passed,
-        producer, None,
+        producer,
+        None,
     );
     let log = store.attestation_log()?;
     log.put(&attestation)?;
@@ -3223,35 +3667,48 @@ fn cmd_stage_decision(
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--reason" => { reason = args.get(i + 1).cloned(); i += 2; }
-            "--actor"  => { actor  = args.get(i + 1).cloned(); i += 2; }
-            other if id.is_none() => { id = Some(other.to_string()); i += 1; }
+            "--reason" => {
+                reason = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--actor" => {
+                actor = args.get(i + 1).cloned();
+                i += 2;
+            }
+            other if id.is_none() => {
+                id = Some(other.to_string());
+                i += 1;
+            }
             other => bail!("unexpected arg `{other}`"),
         }
     }
     let verb = decision.verb();
-    let id = id.ok_or_else(|| anyhow!(
-        "usage: lex stage {verb} <stage_id> --reason \"...\" [--actor NAME]"
-    ))?;
-    let reason = reason.ok_or_else(|| anyhow!(
-        "lex stage {verb}: --reason required (triage decisions need a paper trail)"
-    ))?;
+    let id = id.ok_or_else(|| {
+        anyhow!("usage: lex stage {verb} <stage_id> --reason \"...\" [--actor NAME]")
+    })?;
+    let reason = reason.ok_or_else(|| {
+        anyhow!("lex stage {verb}: --reason required (triage decisions need a paper trail)")
+    })?;
     let actor = resolve_actor(root, actor, verb)?;
 
-    let store = Store::open(root)
-        .with_context(|| format!("opening store at {}", root.display()))?;
-    let _ = store.get_metadata(&id)
+    let store =
+        Store::open(root).with_context(|| format!("opening store at {}", root.display()))?;
+    let _ = store
+        .get_metadata(&id)
         .with_context(|| format!("unknown stage `{id}`"))?;
 
     let kind = match decision {
         StageDecision::Defer => lex_vcs::AttestationKind::Defer {
-            actor: actor.clone(), reason: reason.clone(),
+            actor: actor.clone(),
+            reason: reason.clone(),
         },
         StageDecision::Block => lex_vcs::AttestationKind::Block {
-            actor: actor.clone(), reason: reason.clone(),
+            actor: actor.clone(),
+            reason: reason.clone(),
         },
         StageDecision::Unblock => lex_vcs::AttestationKind::Unblock {
-            actor: actor.clone(), reason: reason.clone(),
+            actor: actor.clone(),
+            reason: reason.clone(),
         },
     };
     let producer = lex_vcs::ProducerDescriptor {
@@ -3260,10 +3717,13 @@ fn cmd_stage_decision(
         model: None,
     };
     let attestation = lex_vcs::Attestation::new(
-        id.clone(), None, None,
+        id.clone(),
+        None,
+        None,
         kind,
         lex_vcs::AttestationResult::Passed,
-        producer, None,
+        producer,
+        None,
     );
     let log = store.attestation_log()?;
     log.put(&attestation)?;
@@ -3290,9 +3750,9 @@ fn cmd_stage_decision(
 /// the supplied criteria. Designed for CI / dashboard queries
 /// that span the whole log rather than a single stage.
 fn cmd_attest(fmt: &OutputFormat, args: &[String]) -> Result<()> {
-    let sub = args.first().ok_or_else(|| anyhow!(
-        "usage: lex attest {{filter|push}} ..."
-    ))?;
+    let sub = args
+        .first()
+        .ok_or_else(|| anyhow!("usage: lex attest {{filter|push}} ..."))?;
     let rest = &args[1..];
     if sub == "push" {
         return cmd_attest_push(fmt, rest);
@@ -3321,9 +3781,12 @@ fn cmd_attest(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                         i += 2;
                     }
                     "--since" => {
-                        let raw = rest.get(i + 1).ok_or_else(|| anyhow!("--since needs a value"))?;
-                        since = Some(parse_since(raw)
-                            .ok_or_else(|| anyhow!("--since must be epoch seconds or YYYY-MM-DD, got `{raw}`"))?);
+                        let raw = rest
+                            .get(i + 1)
+                            .ok_or_else(|| anyhow!("--since needs a value"))?;
+                        since = Some(parse_since(raw).ok_or_else(|| {
+                            anyhow!("--since must be epoch seconds or YYYY-MM-DD, got `{raw}`")
+                        })?);
                         i += 2;
                     }
                     "--store" => {
@@ -3349,7 +3812,8 @@ fn cmd_attest(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                 None => log.list_all()?,
             };
 
-            let mut filtered: Vec<lex_vcs::Attestation> = all.into_iter()
+            let mut filtered: Vec<lex_vcs::Attestation> = all
+                .into_iter()
                 .filter(|a| {
                     if let Some(k) = &kind_filter {
                         if attestation_kind_tag(&a.kind) != *k {
@@ -3362,7 +3826,9 @@ fn cmd_attest(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                         }
                     }
                     if let Some(s) = since {
-                        if a.timestamp < s { return false; }
+                        if a.timestamp < s {
+                            return false;
+                        }
                     }
                     true
                 })
@@ -3384,8 +3850,12 @@ fn cmd_attest(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                     let result = attestation_result_tag(&a.result);
                     println!(
                         "{}\t{}\t{}\t{:.16}…\tby={}@{}",
-                        a.timestamp, kind, result, a.stage_id,
-                        a.produced_by.tool, a.produced_by.version,
+                        a.timestamp,
+                        kind,
+                        result,
+                        a.stage_id,
+                        a.produced_by.tool,
+                        a.produced_by.version,
                     );
                 }
             });
@@ -3421,15 +3891,13 @@ fn cmd_attest_retro_block(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             other => bail!("unexpected arg `{other}`"),
         }
     }
-    let tool_id = producer.ok_or_else(|| anyhow!(
-        "usage: lex attest retro-block --producer <tool_id> --reason \"...\""
-    ))?;
-    let reason = reason.ok_or_else(|| anyhow!(
-        "lex attest retro-block: --reason required"
-    ))?;
+    let tool_id = producer.ok_or_else(|| {
+        anyhow!("usage: lex attest retro-block --producer <tool_id> --reason \"...\"")
+    })?;
+    let reason = reason.ok_or_else(|| anyhow!("lex attest retro-block: --reason required"))?;
 
-    let store = Store::open(&root)
-        .with_context(|| format!("opening store at {}", root.display()))?;
+    let store =
+        Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
     let log = store.attestation_log()?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3457,7 +3925,8 @@ fn cmd_attest_retro_block(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     // #256: a fresh ProducerBlock invalidates every branch's
     // walk-back gate checkpoint, forcing the next advance to
     // re-walk the chain and discover any contamination.
-    let invalidated = store.invalidate_gate_checkpoints()
+    let invalidated = store
+        .invalidate_gate_checkpoints()
         .with_context(|| "invalidating gate checkpoints after retro-block")?;
 
     let data = serde_json::json!({
@@ -3496,15 +3965,13 @@ fn cmd_attest_retro_unblock(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             other => bail!("unexpected arg `{other}`"),
         }
     }
-    let tool_id = producer.ok_or_else(|| anyhow!(
-        "usage: lex attest retro-unblock --producer <tool_id> --reason \"...\""
-    ))?;
-    let reason = reason.ok_or_else(|| anyhow!(
-        "lex attest retro-unblock: --reason required"
-    ))?;
+    let tool_id = producer.ok_or_else(|| {
+        anyhow!("usage: lex attest retro-unblock --producer <tool_id> --reason \"...\"")
+    })?;
+    let reason = reason.ok_or_else(|| anyhow!("lex attest retro-unblock: --reason required"))?;
 
-    let store = Store::open(&root)
-        .with_context(|| format!("opening store at {}", root.display()))?;
+    let store =
+        Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
     let log = store.attestation_log()?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3528,7 +3995,8 @@ fn cmd_attest_retro_unblock(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     // #256: an unblock can also unblock previously-refused branch
     // advances. Invalidate so the next advance re-walks and lets
     // through anything the unblock cleared.
-    let invalidated = store.invalidate_gate_checkpoints()
+    let invalidated = store
+        .invalidate_gate_checkpoints()
         .with_context(|| "invalidating gate checkpoints after retro-unblock")?;
 
     let data = serde_json::json!({
@@ -3583,7 +4051,11 @@ fn cmd_attest_push(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--since-op" => {
-                since_op = Some(it.next().ok_or_else(|| anyhow!("--since-op needs an op_id"))?.clone());
+                since_op = Some(
+                    it.next()
+                        .ok_or_else(|| anyhow!("--since-op needs an op_id"))?
+                        .clone(),
+                );
             }
             "--dry-run" => dry_run = true,
             other if !other.starts_with("--") && remote.is_none() => {
@@ -3592,9 +4064,9 @@ fn cmd_attest_push(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             other => bail!("unexpected arg `{other}`"),
         }
     }
-    let remote = remote.ok_or_else(|| anyhow!(
-        "usage: lex attest push <remote_url> [--since-op OP_ID] [--dry-run] [--store DIR]"
-    ))?;
+    let remote = remote.ok_or_else(|| {
+        anyhow!("usage: lex attest push <remote_url> [--since-op OP_ID] [--dry-run] [--store DIR]")
+    })?;
 
     let store = lex_store::Store::open(&root)
         .with_context(|| format!("opening store at {}", root.display()))?;
@@ -3611,11 +4083,11 @@ fn cmd_attest_push(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             let op_log = lex_vcs::OpLog::open(&root)?;
             // Set of op_ids we should NOT re-send: every ancestor of
             // `cutoff`, inclusive.
-            let exclude: std::collections::BTreeSet<String> =
-                op_log.walk_back(cutoff, None)?
-                    .into_iter()
-                    .map(|r| r.op_id)
-                    .collect();
+            let exclude: std::collections::BTreeSet<String> = op_log
+                .walk_back(cutoff, None)?
+                .into_iter()
+                .map(|r| r.op_id)
+                .collect();
             all.into_iter()
                 .filter(|a| match &a.op_id {
                     Some(op_id) => !exclude.contains(op_id),
@@ -3655,22 +4127,29 @@ fn cmd_attest_push(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     }
 
     let url = format!("{}/v1/attestations/batch", remote.trim_end_matches('/'));
-    let body = serde_json::to_string(&to_send)
-        .map_err(|e| anyhow!("serializing batch: {e}"))?;
+    let body = serde_json::to_string(&to_send).map_err(|e| anyhow!("serializing batch: {e}"))?;
     let resp = ureq::post(&url)
         .header("Content-Type", "application/json")
         .send(body)
         .map_err(|e| anyhow!("POST {url}: {e}"))?;
     let status = resp.status().as_u16();
-    let resp_body: serde_json::Value = resp.into_body().read_json()
+    let resp_body: serde_json::Value = resp
+        .into_body()
+        .read_json()
         .map_err(|e| anyhow!("decoding response: {e}"))?;
     if status >= 400 {
         bail!("server rejected batch (HTTP {status}): {resp_body}");
     }
 
-    let received = resp_body.get("received").and_then(|v| v.as_u64()).unwrap_or(0);
+    let received = resp_body
+        .get("received")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let added = resp_body.get("added").and_then(|v| v.as_u64()).unwrap_or(0);
-    let skipped = resp_body.get("skipped").and_then(|v| v.as_u64()).unwrap_or(0);
+    let skipped = resp_body
+        .get("skipped")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     let data = serde_json::json!({
         "remote": remote,
         "received": received,
@@ -3709,11 +4188,19 @@ fn cmd_attest_pull(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--since-op" => {
-                since_op = Some(it.next().ok_or_else(|| anyhow!("--since-op needs an op_id"))?.clone());
+                since_op = Some(
+                    it.next()
+                        .ok_or_else(|| anyhow!("--since-op needs an op_id"))?
+                        .clone(),
+                );
             }
             "--limit" => {
-                limit = Some(it.next().ok_or_else(|| anyhow!("--limit needs N"))?
-                    .parse().map_err(|e| anyhow!("--limit: {e}"))?);
+                limit = Some(
+                    it.next()
+                        .ok_or_else(|| anyhow!("--limit needs N"))?
+                        .parse()
+                        .map_err(|e| anyhow!("--limit: {e}"))?,
+                );
             }
             "--dry-run" => dry_run = true,
             other if !other.starts_with("--") && remote.is_none() => {
@@ -3726,10 +4213,7 @@ fn cmd_attest_pull(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "usage: lex attest pull <remote_url> [--since-op OP_ID] [--limit N] [--dry-run] [--store DIR]"
     ))?;
 
-    let mut url = format!(
-        "{}/v1/attestations/since",
-        remote.trim_end_matches('/'),
-    );
+    let mut url = format!("{}/v1/attestations/since", remote.trim_end_matches('/'),);
     let mut sep = '?';
     if let Some(op) = &since_op {
         url.push_str(&format!("{sep}after-op={op}"));
@@ -3743,11 +4227,15 @@ fn cmd_attest_pull(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         .map_err(|e| anyhow!("GET {url}: {e}"))?;
     let status = resp.status().as_u16();
     if status >= 400 {
-        let body = resp.into_body().read_to_string()
+        let body = resp
+            .into_body()
+            .read_to_string()
             .unwrap_or_else(|_| "(unreadable body)".into());
         bail!("server returned HTTP {status}: {body}");
     }
-    let received: Vec<lex_vcs::Attestation> = resp.into_body().read_json()
+    let received: Vec<lex_vcs::Attestation> = resp
+        .into_body()
+        .read_json()
         .map_err(|e| anyhow!("decoding response from {url}: {e}"))?;
 
     if dry_run {
@@ -3784,11 +4272,13 @@ fn cmd_attest_pull(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             att.produced_by.clone(),
             att.cost.clone(),
             att.timestamp,
-        ).attestation_id;
+        )
+        .attestation_id;
         if expected != att.attestation_id {
             bail!(
                 "remote returned attestation with mismatched id: supplied={}, expected={}",
-                att.attestation_id, expected,
+                att.attestation_id,
+                expected,
             );
         }
         // If the attestation references an op_id, that op must
@@ -3830,23 +4320,23 @@ fn cmd_attest_pull(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 fn attestation_kind_tag(k: &lex_vcs::AttestationKind) -> &'static str {
     use lex_vcs::AttestationKind::*;
     match k {
-        Examples { .. }         => "examples",
-        Spec { .. }             => "spec",
-        DiffBody { .. }         => "diff_body",
-        TypeCheck               => "type_check",
-        EffectAudit             => "effect_audit",
-        SandboxRun { .. }       => "sandbox_run",
-        Override { .. }         => "override",
-        Defer { .. }            => "defer",
-        Block { .. }            => "block",
-        Unblock { .. }          => "unblock",
-        Trace { .. }            => "trace",
-        ProducerBlock { .. }    => "producer_block",
-        ProducerUnblock { .. }  => "producer_unblock",
-        RepairHint { .. }       => "repair_hint",
-        RepairAttempt { .. }    => "repair_attempt",
-        ProducerTrust { .. }    => "producer_trust",
-        TrustWaived { .. }      => "trust_waived",
+        Examples { .. } => "examples",
+        Spec { .. } => "spec",
+        DiffBody { .. } => "diff_body",
+        TypeCheck => "type_check",
+        EffectAudit => "effect_audit",
+        SandboxRun { .. } => "sandbox_run",
+        Override { .. } => "override",
+        Defer { .. } => "defer",
+        Block { .. } => "block",
+        Unblock { .. } => "unblock",
+        Trace { .. } => "trace",
+        ProducerBlock { .. } => "producer_block",
+        ProducerUnblock { .. } => "producer_unblock",
+        RepairHint { .. } => "repair_hint",
+        RepairAttempt { .. } => "repair_attempt",
+        ProducerTrust { .. } => "producer_trust",
+        TrustWaived { .. } => "trust_waived",
     }
 }
 
@@ -3866,14 +4356,14 @@ fn cmd_policy(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     ))?;
     let rest = &args[1..];
     match sub.as_str() {
-        "block-producer"        => cmd_policy_block(fmt, rest),
-        "unblock-producer"      => cmd_policy_unblock(fmt, rest),
-        "require-attestation"   => cmd_policy_require_attestation(fmt, rest),
+        "block-producer" => cmd_policy_block(fmt, rest),
+        "unblock-producer" => cmd_policy_unblock(fmt, rest),
+        "require-attestation" => cmd_policy_require_attestation(fmt, rest),
         "unrequire-attestation" => cmd_policy_unrequire_attestation(fmt, rest),
-        "session-budget"        => cmd_policy_session_budget(fmt, rest),
+        "session-budget" => cmd_policy_session_budget(fmt, rest),
         // `show` is the new name; `list` is kept as an alias for the
         // pre-#245 muscle memory.
-        "list" | "show"         => cmd_policy_show(fmt, rest),
+        "list" | "show" => cmd_policy_show(fmt, rest),
         other => bail!("unknown `lex policy` subcommand: {other}"),
     }
 }
@@ -3881,10 +4371,12 @@ fn cmd_policy(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 /// `lex policy session-budget <subcmd>` — manage
 /// `policy.session_budgets` (#292 slices 2 + 3).
 fn cmd_policy_session_budget(fmt: &OutputFormat, args: &[String]) -> Result<()> {
-    let sub = args.first().ok_or_else(|| anyhow!(
-        "usage: lex policy session-budget {{set-default <N> | set <id> <N> | \
+    let sub = args.first().ok_or_else(|| {
+        anyhow!(
+            "usage: lex policy session-budget {{set-default <N> | set <id> <N> | \
          unbounded <id> | clear <id> | clear-default}} [--store DIR]"
-    ))?;
+        )
+    })?;
     let (root, rest, _, _) = parse_store_flag(&args[1..]);
     let mut policy = lex_store::policy::load(&root)
         .map_err(|e| anyhow!("loading policy.json: {e}"))?
@@ -3892,32 +4384,39 @@ fn cmd_policy_session_budget(fmt: &OutputFormat, args: &[String]) -> Result<()> 
     let action;
     match sub.as_str() {
         "set-default" => {
-            let n: u64 = rest.first().ok_or_else(|| anyhow!(
-                "usage: lex policy session-budget set-default <N>"))?
-                .parse().map_err(|e| anyhow!("invalid N: {e}"))?;
+            let n: u64 = rest
+                .first()
+                .ok_or_else(|| anyhow!("usage: lex policy session-budget set-default <N>"))?
+                .parse()
+                .map_err(|e| anyhow!("invalid N: {e}"))?;
             policy.session_budgets.default_cap = Some(n);
             action = format!("set default_cap to {n}");
         }
         "set" => {
-            let id = rest.first().ok_or_else(|| anyhow!(
-                "usage: lex policy session-budget set <session_id> <N>"))?
+            let id = rest
+                .first()
+                .ok_or_else(|| anyhow!("usage: lex policy session-budget set <session_id> <N>"))?
                 .clone();
-            let n: u64 = rest.get(1).ok_or_else(|| anyhow!(
-                "usage: lex policy session-budget set <session_id> <N>"))?
-                .parse().map_err(|e| anyhow!("invalid N: {e}"))?;
+            let n: u64 = rest
+                .get(1)
+                .ok_or_else(|| anyhow!("usage: lex policy session-budget set <session_id> <N>"))?
+                .parse()
+                .map_err(|e| anyhow!("invalid N: {e}"))?;
             policy.session_budgets.overrides.insert(id.clone(), Some(n));
             action = format!("set override `{id}` to {n}");
         }
         "unbounded" => {
-            let id = rest.first().ok_or_else(|| anyhow!(
-                "usage: lex policy session-budget unbounded <session_id>"))?
+            let id = rest
+                .first()
+                .ok_or_else(|| anyhow!("usage: lex policy session-budget unbounded <session_id>"))?
                 .clone();
             policy.session_budgets.overrides.insert(id.clone(), None);
             action = format!("set override `{id}` to unbounded");
         }
         "clear" => {
-            let id = rest.first().ok_or_else(|| anyhow!(
-                "usage: lex policy session-budget clear <session_id>"))?;
+            let id = rest
+                .first()
+                .ok_or_else(|| anyhow!("usage: lex policy session-budget clear <session_id>"))?;
             policy.session_budgets.overrides.remove(id);
             action = format!("cleared override `{id}`");
         }
@@ -3927,8 +4426,7 @@ fn cmd_policy_session_budget(fmt: &OutputFormat, args: &[String]) -> Result<()> 
         }
         other => bail!("unknown `session-budget` subcommand: {other}"),
     }
-    lex_store::policy::save(&root, &policy)
-        .map_err(|e| anyhow!("writing policy.json: {e}"))?;
+    lex_store::policy::save(&root, &policy).map_err(|e| anyhow!("writing policy.json: {e}"))?;
     let action_for_text = action.clone();
     let data = serde_json::json!({
         "action": action,
@@ -3947,19 +4445,20 @@ fn cmd_policy_block(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
-            "--reason" => { reason = rest.get(i + 1).cloned(); i += 2; }
+            "--reason" => {
+                reason = rest.get(i + 1).cloned();
+                i += 2;
+            }
             other if name.is_none() && !other.starts_with("--") => {
-                name = Some(other.to_string()); i += 1;
+                name = Some(other.to_string());
+                i += 1;
             }
             other => bail!("unexpected arg `{other}`"),
         }
     }
-    let name = name.ok_or_else(|| anyhow!(
-        "usage: lex policy block-producer <name> --reason \"...\""
-    ))?;
-    let reason = reason.ok_or_else(|| anyhow!(
-        "lex policy block-producer: --reason required"
-    ))?;
+    let name =
+        name.ok_or_else(|| anyhow!("usage: lex policy block-producer <name> --reason \"...\""))?;
+    let reason = reason.ok_or_else(|| anyhow!("lex policy block-producer: --reason required"))?;
     let mut policy = lex_store::policy::load(&root)
         .with_context(|| format!("reading policy.json at {}", root.display()))?
         .unwrap_or_default();
@@ -3991,7 +4490,8 @@ fn cmd_policy_block(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 
 fn cmd_policy_unblock(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let (root, rest, _, _) = parse_store_flag(args);
-    let name = rest.iter()
+    let name = rest
+        .iter()
         .find(|a| !a.starts_with("--"))
         .ok_or_else(|| anyhow!("usage: lex policy unblock-producer <name>"))?
         .clone();
@@ -4099,9 +4599,15 @@ fn cmd_policy_require_attestation(fmt: &OutputFormat, args: &[String]) -> Result
     while i < rest.len() {
         match rest[i].as_str() {
             "--when-effects" => {
-                let v = rest.get(i + 1)
+                let v = rest
+                    .get(i + 1)
                     .ok_or_else(|| anyhow!("--when-effects needs a comma-separated list"))?;
-                effects = Some(v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect());
+                effects = Some(
+                    v.split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect(),
+                );
                 i += 2;
             }
             other if kind_str.is_none() && !other.starts_with("--") => {
@@ -4111,10 +4617,12 @@ fn cmd_policy_require_attestation(fmt: &OutputFormat, args: &[String]) -> Result
             other => bail!("unexpected arg `{other}`"),
         }
     }
-    let kind_str = kind_str.ok_or_else(|| anyhow!(
-        "usage: lex policy require-attestation <kind> [--when-effects e1,e2,...]\n\
+    let kind_str = kind_str.ok_or_else(|| {
+        anyhow!(
+            "usage: lex policy require-attestation <kind> [--when-effects e1,e2,...]\n\
          supported kinds: type_check, spec, sandbox_run, examples, diff_body, effect_audit"
-    ))?;
+        )
+    })?;
     let kind = lex_store::policy::RequiredAttestationKind::from_tag(&kind_str)
         .ok_or_else(|| anyhow!("unknown attestation kind `{kind_str}`"))?;
     let when = match effects {
@@ -4155,7 +4663,8 @@ fn cmd_policy_require_attestation(fmt: &OutputFormat, args: &[String]) -> Result
 /// unrequire then re-require.
 fn cmd_policy_unrequire_attestation(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let (root, rest, _, _) = parse_store_flag(args);
-    let kind_str = rest.iter()
+    let kind_str = rest
+        .iter()
         .find(|a| !a.starts_with("--"))
         .ok_or_else(|| anyhow!("usage: lex policy unrequire-attestation <kind>"))?
         .clone();
@@ -4187,8 +4696,8 @@ fn cmd_policy_unrequire_attestation(fmt: &OutputFormat, args: &[String]) -> Resu
 fn attestation_result_tag(r: &lex_vcs::AttestationResult) -> &'static str {
     use lex_vcs::AttestationResult::*;
     match r {
-        Passed              => "passed",
-        Failed { .. }       => "failed",
+        Passed => "passed",
+        Failed { .. } => "failed",
         Inconclusive { .. } => "inconclusive",
     }
 }
@@ -4202,22 +4711,47 @@ fn parse_since(s: &str) -> Option<u64> {
         return Some(secs);
     }
     let parts: Vec<&str> = s.split('-').collect();
-    if parts.len() != 3 { return None; }
+    if parts.len() != 3 {
+        return None;
+    }
     let y: i64 = parts[0].parse().ok()?;
     let m: u32 = parts[1].parse().ok()?;
     let d: u32 = parts[2].parse().ok()?;
-    if !(1..=12).contains(&m) || d == 0 { return None; }
-    if y < 1970 { return None; }
+    if !(1..=12).contains(&m) || d == 0 {
+        return None;
+    }
+    if y < 1970 {
+        return None;
+    }
 
     let mut days: i64 = 0;
     for yr in 1970..y {
-        let yd = if (yr % 4 == 0 && yr % 100 != 0) || yr % 400 == 0 { 366 } else { 365 };
+        let yd = if (yr % 4 == 0 && yr % 100 != 0) || yr % 400 == 0 {
+            366
+        } else {
+            365
+        };
         days += yd;
     }
     let leap_year = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-    let mdays = [31, if leap_year { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mdays = [
+        31,
+        if leap_year { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mi = (m - 1) as usize;
-    if d > mdays[mi] as u32 { return None; }
+    if d > mdays[mi] as u32 {
+        return None;
+    }
     days += mdays.iter().take(mi).sum::<i64>();
     days += (d - 1) as i64;
     Some((days as u64) * 86_400)
@@ -4232,47 +4766,69 @@ fn cmd_replay(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     while i < args.len() {
         match args[i].as_str() {
             "--override" => {
-                let val = args.get(i + 1).ok_or_else(|| anyhow!("--override needs NODE=JSON"))?;
-                let (node, json) = val.split_once('=').ok_or_else(|| anyhow!("--override expects NODE=JSON"))?;
+                let val = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("--override needs NODE=JSON"))?;
+                let (node, json) = val
+                    .split_once('=')
+                    .ok_or_else(|| anyhow!("--override expects NODE=JSON"))?;
                 let v: serde_json::Value = serde_json::from_str(json)
                     .with_context(|| format!("--override value must be JSON: {json}"))?;
                 overrides.insert(node.to_string(), v);
                 i += 2;
             }
             "--allow-effects" => {
-                let val = args.get(i + 1).ok_or_else(|| anyhow!("--allow-effects needs a value"))?;
-                policy.allow_effects = val.split(',').filter(|s| !s.is_empty())
-                    .map(|s| s.to_string()).collect::<BTreeSet<_>>();
+                let val = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("--allow-effects needs a value"))?;
+                policy.allow_effects = val
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect::<BTreeSet<_>>();
                 i += 2;
             }
-            _ => { positional.push(args[i].clone()); i += 1; }
+            _ => {
+                positional.push(args[i].clone());
+                i += 1;
+            }
         }
     }
-    let _orig_run_id = positional.first().ok_or_else(|| anyhow!("usage: lex replay <run_id> <file> <fn> [args]"))?;
+    let _orig_run_id = positional
+        .first()
+        .ok_or_else(|| anyhow!("usage: lex replay <run_id> <file> <fn> [args]"))?;
     let path = positional.get(1).ok_or_else(|| anyhow!("missing <file>"))?;
     let func = positional.get(2).ok_or_else(|| anyhow!("missing <fn>"))?;
 
     let prog = read_program(path)?;
     let stages = canonicalize_program(&prog);
     if let Err(errs) = lex_types::check_program(&stages) {
-        let arr: Vec<serde_json::Value> = errs.iter()
-            .map(|e| serde_json::to_value(e).unwrap()).collect();
+        let arr: Vec<serde_json::Value> = errs
+            .iter()
+            .map(|e| serde_json::to_value(e).unwrap())
+            .collect();
         let data = serde_json::json!({ "phase": "type-check", "errors": arr });
         acli::emit_or_text("replay", data, fmt, || {
             for e in &errs {
-                if let Ok(j) = serde_json::to_string(e) { eprintln!("{j}"); }
+                if let Ok(j) = serde_json::to_string(e) {
+                    eprintln!("{j}");
+                }
             }
         });
         std::process::exit(2);
     }
     let bc = compile_program(&stages);
     if let Err(violations) = check_policy(&bc, &policy) {
-        let arr: Vec<serde_json::Value> = violations.iter()
-            .map(|v| serde_json::to_value(v).unwrap()).collect();
+        let arr: Vec<serde_json::Value> = violations
+            .iter()
+            .map(|v| serde_json::to_value(v).unwrap())
+            .collect();
         let data = serde_json::json!({ "phase": "policy", "violations": arr });
         acli::emit_or_text("replay", data, fmt, || {
             for v in &violations {
-                if let Ok(j) = serde_json::to_string(v) { eprintln!("{j}"); }
+                if let Ok(j) = serde_json::to_string(v) {
+                    eprintln!("{j}");
+                }
             }
         });
         std::process::exit(3);
@@ -4285,30 +4841,50 @@ fn cmd_replay(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let mut vm = Vm::with_handler(&bc, Box::new(handler));
     vm.set_tracer(Box::new(recorder));
 
-    let vargs: Vec<Value> = positional[3..].iter().map(|a| {
-        let v: serde_json::Value = serde_json::from_str(a)
-            .with_context(|| format!("arg `{a}` must be JSON"))?;
-        Ok(json_to_value(&v))
-    }).collect::<Result<Vec<_>>>()?;
+    let vargs: Vec<Value> = positional[3..]
+        .iter()
+        .map(|a| {
+            let v: serde_json::Value =
+                serde_json::from_str(a).with_context(|| format!("arg `{a}` must be JSON"))?;
+            Ok(json_to_value(&v))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
-    let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let result = vm.call(func, vargs);
-    let ended = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let ended = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
 
     let store = lex_store::Store::open(default_store_root())?;
     let (root_out, root_err) = match &result {
         Ok(v) => (Some(value_to_json(v)), None),
         Err(e) => (None, Some(format!("{e}"))),
     };
-    let tree = handle.finalize(func.clone(), serde_json::Value::Null, root_out, root_err, started, ended);
+    let tree = handle.finalize(
+        func.clone(),
+        serde_json::Value::Null,
+        root_out,
+        root_err,
+        started,
+        ended,
+    );
     let new_run_id = store.save_trace(&tree)?;
-    if !matches!(fmt, OutputFormat::Json) { eprintln!("trace saved: {new_run_id}"); }
+    if !matches!(fmt, OutputFormat::Json) {
+        eprintln!("trace saved: {new_run_id}");
+    }
     let r = result.map_err(|e| anyhow!("runtime: {e}"))?;
     let data = serde_json::json!({
         "result": value_to_json(&r),
         "trace_id": new_run_id,
     });
-    acli::emit_or_text("replay", data, fmt, || println!("{}", value_to_json_string(&r)));
+    acli::emit_or_text("replay", data, fmt, || {
+        println!("{}", value_to_json_string(&r))
+    });
     Ok(())
 }
 
@@ -4320,16 +4896,23 @@ fn cmd_serve(args: &[String]) -> Result<()> {
     while i < args.len() {
         match args[i].as_str() {
             "--port" => {
-                let v = args.get(i + 1).ok_or_else(|| anyhow!("--port needs value"))?;
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("--port needs value"))?;
                 port = v.parse().context("--port must be u16")?;
                 i += 2;
             }
             "--store" => {
-                let v = args.get(i + 1).ok_or_else(|| anyhow!("--store needs path"))?;
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("--store needs path"))?;
                 store_root = std::path::PathBuf::from(v);
                 i += 2;
             }
-            "--mcp" => { mcp = true; i += 1; }
+            "--mcp" => {
+                mcp = true;
+                i += 1;
+            }
             _ => i += 1,
         }
     }
@@ -4346,12 +4929,17 @@ fn cmd_serve(args: &[String]) -> Result<()> {
 }
 
 fn cmd_conformance(fmt: &OutputFormat, args: &[String]) -> Result<()> {
-    let dir = args.first().ok_or_else(|| anyhow!("usage: lex conformance <dir>"))?;
+    let dir = args
+        .first()
+        .ok_or_else(|| anyhow!("usage: lex conformance <dir>"))?;
     let report = conformance::run_directory(dir).context("reading conformance directory")?;
     let total = report.total();
     let passed_n = report.passed.len();
-    let failed: Vec<serde_json::Value> = report.failed.iter()
-        .map(|(n, w)| serde_json::json!({ "name": n, "reason": w })).collect();
+    let failed: Vec<serde_json::Value> = report
+        .failed
+        .iter()
+        .map(|(n, w)| serde_json::json!({ "name": n, "reason": w }))
+        .collect();
     let data = serde_json::json!({
         "passed": &report.passed,
         "failed": failed,
@@ -4360,16 +4948,26 @@ fn cmd_conformance(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "ok": report.ok(),
     });
     acli::emit_or_text("conformance", data, fmt, || {
-        for name in &report.passed { println!("PASS  {name}"); }
-        for (name, why) in &report.failed { println!("FAIL  {name}: {why}"); }
+        for name in &report.passed {
+            println!("PASS  {name}");
+        }
+        for (name, why) in &report.failed {
+            println!("FAIL  {name}: {why}");
+        }
         println!();
         println!("{}/{} passed", passed_n, total);
     });
-    if report.ok() { Ok(()) } else { std::process::exit(4); }
+    if report.ok() {
+        Ok(())
+    } else {
+        std::process::exit(4);
+    }
 }
 
 fn cmd_spec(fmt: &OutputFormat, args: &[String]) -> Result<()> {
-    let sub = args.first().ok_or_else(|| anyhow!("usage: lex spec {{check|smt}} ..."))?;
+    let sub = args
+        .first()
+        .ok_or_else(|| anyhow!("usage: lex spec {{check|smt}} ..."))?;
     let rest = &args[1..];
     match sub.as_str() {
         "check" => {
@@ -4380,9 +4978,14 @@ fn cmd_spec(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             let mut i = 0;
             while i < rest.len() {
                 match rest[i].as_str() {
-                    "--source" => { src_path = rest.get(i + 1); i += 2; }
+                    "--source" => {
+                        src_path = rest.get(i + 1);
+                        i += 2;
+                    }
                     "--trials" => {
-                        trials = rest.get(i + 1).and_then(|s| s.parse().ok())
+                        trials = rest
+                            .get(i + 1)
+                            .and_then(|s| s.parse().ok())
                             .ok_or_else(|| anyhow!("--trials needs a u32"))?;
                         i += 2;
                     }
@@ -4390,16 +4993,20 @@ fn cmd_spec(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                         store_root = rest.get(i + 1).map(PathBuf::from);
                         i += 2;
                     }
-                    _ if spec_path.is_none() => { spec_path = Some(&rest[i]); i += 1; }
+                    _ if spec_path.is_none() => {
+                        spec_path = Some(&rest[i]);
+                        i += 1;
+                    }
                     other => bail!("unexpected arg `{other}`"),
                 }
             }
-            let spec_path = spec_path.ok_or_else(|| anyhow!("usage: lex spec check <spec> --source <file>"))?;
+            let spec_path =
+                spec_path.ok_or_else(|| anyhow!("usage: lex spec check <spec> --source <file>"))?;
             let src_path = src_path.ok_or_else(|| anyhow!("--source <file> required"))?;
             let spec_src = read_source(spec_path)?;
             let lex_src = read_source(src_path)?;
-            let spec = spec_checker::parse_spec(&spec_src)
-                .map_err(|e| anyhow!("spec parse: {e}"))?;
+            let spec =
+                spec_checker::parse_spec(&spec_src).map_err(|e| anyhow!("spec parse: {e}"))?;
             let r = spec_checker::check_spec(&spec, &lex_src, trials);
 
             // #132: when --store is provided, emit a Spec attestation
@@ -4431,10 +5038,12 @@ fn cmd_spec(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             }
         }
         "smt" => {
-            let path = rest.first().ok_or_else(|| anyhow!("usage: lex spec smt <spec>"))?;
+            let path = rest
+                .first()
+                .ok_or_else(|| anyhow!("usage: lex spec smt <spec>"))?;
             let spec_src = read_source(path)?;
-            let spec = spec_checker::parse_spec(&spec_src)
-                .map_err(|e| anyhow!("spec parse: {e}"))?;
+            let spec =
+                spec_checker::parse_spec(&spec_src).map_err(|e| anyhow!("spec parse: {e}"))?;
             let smt = spec_checker::to_smtlib(&spec);
             let data = serde_json::json!({ "smt_lib": &smt });
             acli::emit_or_text("spec", data, fmt, || print!("{smt}"));
@@ -4520,14 +5129,20 @@ fn cmd_agent_tool(args: &[String]) -> Result<()> {
     // 1) Get the tool body — from Claude or supplied verbatim.
     let body = match &opts.body_source {
         BodySource::Literal(b) => b.clone(),
-        BodySource::File(p) => fs::read_to_string(p)
-            .with_context(|| format!("read body from {}", p.display()))?,
+        BodySource::File(p) => {
+            fs::read_to_string(p).with_context(|| format!("read body from {}", p.display()))?
+        }
         BodySource::Request(req) => {
-            let api_key = opts.api_key.clone()
+            let api_key = opts
+                .api_key
+                .clone()
                 .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
-                .ok_or_else(|| anyhow!(
-                    "--request needs ANTHROPIC_API_KEY (or pass --api-key); \
-                     for offline use try --body or --body-file"))?;
+                .ok_or_else(|| {
+                    anyhow!(
+                        "--request needs ANTHROPIC_API_KEY (or pass --api-key); \
+                     for offline use try --body or --body-file"
+                    )
+                })?;
             call_claude_for_body(req, &opts.allowed_effects, &api_key, &opts.model)?
         }
     };
@@ -4535,14 +5150,18 @@ fn cmd_agent_tool(args: &[String]) -> Result<()> {
 
     if opts.show_source {
         eprintln!("→ tool body:");
-        for l in body.lines() { eprintln!("    {l}"); }
+        for l in body.lines() {
+            eprintln!("    {l}");
+        }
     }
 
     // 2) Splice into the template.
     let src = build_tool_program(&body, &opts.allowed_effects);
     if opts.show_source {
         eprintln!("→ assembled program:");
-        for l in src.lines() { eprintln!("    {l}"); }
+        for l in src.lines() {
+            eprintln!("    {l}");
+        }
     }
 
     // 3) Parse + type-check. This is where a malicious body gets caught:
@@ -4557,11 +5176,10 @@ fn cmd_agent_tool(args: &[String]) -> Result<()> {
     // sites are content-addressed against this StageId so a later
     // `lex stage <id> --attestations` can answer "what evidence
     // exists for this exact body?".
-    let tool_stage_id: Option<String> = stages.iter()
-        .find_map(|s| match s {
-            Stage::FnDecl(fd) if fd.name == "tool" => stage_id(s),
-            _ => None,
-        });
+    let tool_stage_id: Option<String> = stages.iter().find_map(|s| match s {
+        Stage::FnDecl(fd) if fd.name == "tool" => stage_id(s),
+        _ => None,
+    });
     let att_log: Option<lex_vcs::AttestationLog> = match &opts.store_root {
         Some(root) => {
             let store = Store::open(root)
@@ -4580,8 +5198,10 @@ fn cmd_agent_tool(args: &[String]) -> Result<()> {
         for e in &errs {
             eprintln!("  {e}");
             if let lex_types::TypeError::EffectNotDeclared { effect, .. } = e {
-                eprintln!("    (the body uses effect `{effect}` but the host only allows {:?})",
-                    opts.allowed_effects);
+                eprintln!(
+                    "    (the body uses effect `{effect}` but the host only allows {:?})",
+                    opts.allowed_effects
+                );
             }
         }
         std::process::exit(2);
@@ -4610,8 +5230,7 @@ fn cmd_agent_tool(args: &[String]) -> Result<()> {
     if let Some(path) = opts.spec_file.as_ref() {
         let spec_text = fs::read_to_string(path)
             .with_context(|| format!("read spec file {}", path.display()))?;
-        let spec = spec_checker::parse_spec(&spec_text)
-            .map_err(|e| anyhow!("spec parse: {e}"))?;
+        let spec = spec_checker::parse_spec(&spec_text).map_err(|e| anyhow!("spec parse: {e}"))?;
         if opts.show_source {
             eprintln!("→ checking spec `{}`…", spec.name);
         }
@@ -4625,15 +5244,24 @@ fn cmd_agent_tool(args: &[String]) -> Result<()> {
             let result = match &report.status {
                 spec_checker::ProofStatus::Proved => lex_vcs::AttestationResult::Passed,
                 spec_checker::ProofStatus::Counterexample => {
-                    let detail = report.evidence.counterexample.as_ref()
+                    let detail = report
+                        .evidence
+                        .counterexample
+                        .as_ref()
                         .and_then(|c| serde_json::to_string(c).ok())
                         .map(|s| format!("counterexample: {s}"))
                         .unwrap_or_else(|| "counterexample".into());
                     lex_vcs::AttestationResult::Failed { detail }
                 }
-                spec_checker::ProofStatus::Inconclusive => lex_vcs::AttestationResult::Inconclusive {
-                    detail: report.evidence.note.clone().unwrap_or_else(|| "inconclusive".into()),
-                },
+                spec_checker::ProofStatus::Inconclusive => {
+                    lex_vcs::AttestationResult::Inconclusive {
+                        detail: report
+                            .evidence
+                            .note
+                            .clone()
+                            .unwrap_or_else(|| "inconclusive".into()),
+                    }
+                }
             };
             let kind = lex_vcs::AttestationKind::Spec {
                 spec_id: report.spec_id.clone(),
@@ -4646,14 +5274,18 @@ fn cmd_agent_tool(args: &[String]) -> Result<()> {
         match report.status {
             spec_checker::ProofStatus::Proved => {
                 if opts.show_source {
-                    eprintln!("  spec proved ({} method, {} trials)",
-                        report.evidence.method, report.evidence.trials);
+                    eprintln!(
+                        "  spec proved ({} method, {} trials)",
+                        report.evidence.method, report.evidence.trials
+                    );
                 }
             }
             spec_checker::ProofStatus::Counterexample => {
                 eprintln!("→ SPEC COUNTEREXAMPLE — tool not run.");
                 if let Some(cx) = &report.evidence.counterexample {
-                    for (k, v) in cx { eprintln!("  {k} = {v}"); }
+                    for (k, v) in cx {
+                        eprintln!("  {k} = {v}");
+                    }
                 }
                 if let Some(note) = &report.evidence.note {
                     eprintln!("  ({note})");
@@ -4691,7 +5323,8 @@ fn cmd_agent_tool(args: &[String]) -> Result<()> {
                 .with_context(|| format!("read diff body from {}", p.display()))?,
             BodySource::Request(_) => bail!(
                 "--diff-body and --diff-body-file accept literal source; \
-                 invoke Claude separately and pass the body in"),
+                 invoke Claude separately and pass the body in"
+            ),
         };
         let diff_body_text = strip_code_fences(&diff_body_text);
         let diff_src = build_tool_program(&diff_body_text, &opts.allowed_effects);
@@ -4699,7 +5332,9 @@ fn cmd_agent_tool(args: &[String]) -> Result<()> {
         let stages_b = canonicalize_program(&prog_b);
         if let Err(errs) = lex_types::check_program(&stages_b) {
             eprintln!("→ DIFF BODY type-check rejected.");
-            for e in &errs { eprintln!("  {e}"); }
+            for e in &errs {
+                eprintln!("  {e}");
+            }
             std::process::exit(2);
         }
         let bc_b = compile_program(&stages_b);
@@ -4751,8 +5386,11 @@ fn cmd_agent_tool(args: &[String]) -> Result<()> {
         }
 
         if !diverged.is_empty() {
-            eprintln!("→ DIFFERENTIAL DIVERGENCE — {} of {} inputs differ.",
-                diverged.len(), inputs.len());
+            eprintln!(
+                "→ DIFFERENTIAL DIVERGENCE — {} of {} inputs differ.",
+                diverged.len(),
+                inputs.len()
+            );
             for (input, a, b) in &diverged {
                 eprintln!("  input={input:?}");
                 eprintln!("    body A → {a:?}");
@@ -4787,11 +5425,15 @@ fn cmd_agent_tool(args: &[String]) -> Result<()> {
     // the type system says what code touches; the examples say what it
     // should return. On any mismatch, exit 5 (distinct from 2/3/4).
     if let Some(path) = opts.examples_file.as_ref() {
-        let raw_examples = fs::read(path)
-            .with_context(|| format!("read examples file {}", path.display()))?;
+        let raw_examples =
+            fs::read(path).with_context(|| format!("read examples file {}", path.display()))?;
         let examples_file_hash = sha256_hex(&raw_examples);
-        let examples: Vec<Example> = serde_json::from_slice(&raw_examples)
-            .with_context(|| format!("parse examples file {}; expected JSON array of {{input, expected}}", path.display()))?;
+        let examples: Vec<Example> = serde_json::from_slice(&raw_examples).with_context(|| {
+            format!(
+                "parse examples file {}; expected JSON array of {{input, expected}}",
+                path.display()
+            )
+        })?;
         if opts.show_source {
             eprintln!("→ checking {} example(s)…", examples.len());
         }
@@ -4821,8 +5463,11 @@ fn cmd_agent_tool(args: &[String]) -> Result<()> {
         }
 
         if !failures.is_empty() {
-            eprintln!("→ EXAMPLES FAILED — tool not trusted ({} of {} mismatched).",
-                failures.len(), examples.len());
+            eprintln!(
+                "→ EXAMPLES FAILED — tool not trusted ({} of {} mismatched).",
+                failures.len(),
+                examples.len()
+            );
             for (i, ex, got) in &failures {
                 eprintln!("  [{i}] input={:?}", ex.input);
                 eprintln!("       expected={:?}", ex.expected);
@@ -4868,8 +5513,12 @@ struct Example {
 fn load_examples(path: &std::path::Path) -> Result<Vec<Example>> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("read examples file {}", path.display()))?;
-    let cases: Vec<Example> = serde_json::from_str(&raw)
-        .with_context(|| format!("parse examples file {}; expected JSON array of {{input, expected}}", path.display()))?;
+    let cases: Vec<Example> = serde_json::from_str(&raw).with_context(|| {
+        format!(
+            "parse examples file {}; expected JSON array of {{input, expected}}",
+            path.display()
+        )
+    })?;
     Ok(cases)
 }
 
@@ -4888,7 +5537,10 @@ fn run_tool_once(
             let msg = format!("{e}");
             if msg.contains("step limit") {
                 eprintln!("→ STEP-LIMIT EXCEEDED — tool aborted at {max_steps} steps.");
-                eprintln!("  (raise with --max-steps; default {})", default_max_steps());
+                eprintln!(
+                    "  (raise with --max-steps; default {})",
+                    default_max_steps()
+                );
                 std::process::exit(4);
             }
             // Runtime scope rejections (--allow-fs-read / --allow-net-host
@@ -4913,7 +5565,9 @@ fn run_tool_once(
     })
 }
 
-const fn default_max_steps() -> u64 { 1_000_000 }
+const fn default_max_steps() -> u64 {
+    1_000_000
+}
 
 fn parse_agent_tool_args(args: &[String]) -> Result<AgentToolOpts> {
     let mut allowed_effects: Vec<String> = Vec::new();
@@ -4935,92 +5589,148 @@ fn parse_agent_tool_args(args: &[String]) -> Result<AgentToolOpts> {
     while i < args.len() {
         match args[i].as_str() {
             "--allow-effects" => {
-                let v = args.get(i + 1).ok_or_else(|| anyhow!("--allow-effects needs a value"))?;
-                allowed_effects = v.split(',').filter(|s| !s.is_empty()).map(String::from).collect();
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("--allow-effects needs a value"))?;
+                allowed_effects = v
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect();
                 i += 2;
             }
             "--allow-fs-read" => {
-                let v = args.get(i + 1).ok_or_else(|| anyhow!("--allow-fs-read needs a path"))?;
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("--allow-fs-read needs a path"))?;
                 allow_fs_read.push(PathBuf::from(v));
                 i += 2;
             }
             "--allow-net-host" => {
-                let v = args.get(i + 1).ok_or_else(|| anyhow!("--allow-net-host needs a host"))?;
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("--allow-net-host needs a host"))?;
                 allow_net_host.push(v.clone());
                 i += 2;
             }
             "--input" => {
-                user_input = Some(args.get(i + 1).ok_or_else(|| anyhow!("--input needs a value"))?.clone());
+                user_input = Some(
+                    args.get(i + 1)
+                        .ok_or_else(|| anyhow!("--input needs a value"))?
+                        .clone(),
+                );
                 i += 2;
             }
             "--request" => {
-                let v = args.get(i + 1).ok_or_else(|| anyhow!("--request needs a value"))?.clone();
-                if user_input.is_none() { user_input = Some(v.clone()); }
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("--request needs a value"))?
+                    .clone();
+                if user_input.is_none() {
+                    user_input = Some(v.clone());
+                }
                 body = Some(BodySource::Request(v));
                 i += 2;
             }
             "--body" => {
-                body = Some(BodySource::Literal(args.get(i + 1).ok_or_else(|| anyhow!("--body needs a value"))?.clone()));
+                body = Some(BodySource::Literal(
+                    args.get(i + 1)
+                        .ok_or_else(|| anyhow!("--body needs a value"))?
+                        .clone(),
+                ));
                 i += 2;
             }
             "--body-file" => {
-                body = Some(BodySource::File(PathBuf::from(args.get(i + 1)
-                    .ok_or_else(|| anyhow!("--body-file needs a path"))?)));
+                body = Some(BodySource::File(PathBuf::from(
+                    args.get(i + 1)
+                        .ok_or_else(|| anyhow!("--body-file needs a path"))?,
+                )));
                 i += 2;
             }
             "--api-key" => {
-                api_key = Some(args.get(i + 1).ok_or_else(|| anyhow!("--api-key needs a value"))?.clone());
+                api_key = Some(
+                    args.get(i + 1)
+                        .ok_or_else(|| anyhow!("--api-key needs a value"))?
+                        .clone(),
+                );
                 i += 2;
             }
             "--model" => {
-                model = args.get(i + 1).ok_or_else(|| anyhow!("--model needs a value"))?.clone();
+                model = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("--model needs a value"))?
+                    .clone();
                 i += 2;
             }
             "--max-steps" => {
-                max_steps = args.get(i + 1).ok_or_else(|| anyhow!("--max-steps needs a value"))?
-                    .parse().context("--max-steps must be an integer")?;
+                max_steps = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("--max-steps needs a value"))?
+                    .parse()
+                    .context("--max-steps must be an integer")?;
                 i += 2;
             }
             "--examples" => {
-                let v = args.get(i + 1).ok_or_else(|| anyhow!("--examples needs a path"))?;
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("--examples needs a path"))?;
                 examples_file = Some(PathBuf::from(v));
                 i += 2;
             }
             "--spec" => {
-                let v = args.get(i + 1).ok_or_else(|| anyhow!("--spec needs a path"))?;
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("--spec needs a path"))?;
                 spec_file = Some(PathBuf::from(v));
                 i += 2;
             }
-            "--spec-allow-inconclusive" => { spec_allow_inconclusive = true; i += 1; }
+            "--spec-allow-inconclusive" => {
+                spec_allow_inconclusive = true;
+                i += 1;
+            }
             "--spec-trials" => {
-                spec_trials = args.get(i + 1).ok_or_else(|| anyhow!("--spec-trials needs an integer"))?
-                    .parse().context("--spec-trials must be a u32")?;
+                spec_trials = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("--spec-trials needs an integer"))?
+                    .parse()
+                    .context("--spec-trials must be a u32")?;
                 i += 2;
             }
             "--diff-body" => {
-                diff_body = Some(BodySource::Literal(args.get(i + 1)
-                    .ok_or_else(|| anyhow!("--diff-body needs a value"))?.clone()));
+                diff_body = Some(BodySource::Literal(
+                    args.get(i + 1)
+                        .ok_or_else(|| anyhow!("--diff-body needs a value"))?
+                        .clone(),
+                ));
                 i += 2;
             }
             "--diff-body-file" => {
-                diff_body = Some(BodySource::File(PathBuf::from(args.get(i + 1)
-                    .ok_or_else(|| anyhow!("--diff-body-file needs a path"))?)));
+                diff_body = Some(BodySource::File(PathBuf::from(
+                    args.get(i + 1)
+                        .ok_or_else(|| anyhow!("--diff-body-file needs a path"))?,
+                )));
                 i += 2;
             }
             "--store" => {
-                store_root = Some(PathBuf::from(args.get(i + 1)
-                    .ok_or_else(|| anyhow!("--store needs a path"))?));
+                store_root = Some(PathBuf::from(
+                    args.get(i + 1)
+                        .ok_or_else(|| anyhow!("--store needs a path"))?,
+                ));
                 i += 2;
             }
-            "--quiet" => { show_source = false; i += 1; }
+            "--quiet" => {
+                show_source = false;
+                i += 1;
+            }
             other => bail!("unknown agent-tool flag: {other}"),
         }
     }
     Ok(AgentToolOpts {
         allowed_effects,
         user_input: user_input.unwrap_or_default(),
-        body_source: body.ok_or_else(||
-            anyhow!("must pass --request '<query>', --body '<src>', or --body-file <path>"))?,
+        body_source: body.ok_or_else(|| {
+            anyhow!("must pass --request '<query>', --body '<src>', or --body-file <path>")
+        })?,
         api_key,
         model,
         show_source,
@@ -5052,7 +5762,8 @@ fn build_tool_program(body: &str, allowed_effects: &[String]) -> String {
         "import \"std.list\"  as list",
         "import \"std.json\"  as json",
         "import \"std.bytes\" as bytes",
-    ].join("\n");
+    ]
+    .join("\n");
     let effects = if allowed_effects.is_empty() {
         String::new()
     } else {
@@ -5066,7 +5777,10 @@ fn build_tool_program(body: &str, allowed_effects: &[String]) -> String {
 
 fn strip_code_fences(s: &str) -> String {
     let t = s.trim();
-    let t = t.strip_prefix("```lex").or_else(|| t.strip_prefix("```")).unwrap_or(t);
+    let t = t
+        .strip_prefix("```lex")
+        .or_else(|| t.strip_prefix("```"))
+        .unwrap_or(t);
     let t = t.strip_suffix("```").unwrap_or(t).trim();
     // If the model wrapped the body in `fn tool(...) { ... }`, peel it down
     // to just the inner block so the template re-wraps it cleanly.
@@ -5092,7 +5806,8 @@ fn call_claude_for_body(
     } else {
         format!("[{}]", allowed_effects.join(", "))
     };
-    let system = format!(r#"You are a code generator for the Lex programming language.
+    let system = format!(
+        r#"You are a code generator for the Lex programming language.
 
 Output ONLY the body of:
 
@@ -5117,7 +5832,8 @@ Hard constraints:
    imports, no markdown fences). Begin directly with code.
 3. Match Result with Ok/Err arms; never use a `.unwrap`.
 4. Lex has no string interpolation — chain `str.concat(a, b)` calls.
-"#);
+"#
+    );
     let body = serde_json::json!({
         "model": model,
         "max_tokens": 1024,
@@ -5133,13 +5849,18 @@ Hard constraints:
         .body_mut()
         .read_json::<serde_json::Value>()
         .context("decode claude response")?;
-    let text = resp.get("content")
+    let text = resp
+        .get("content")
         .and_then(|c| c.as_array())
-        .and_then(|arr| arr.iter().find_map(|item| {
-            if item.get("type")?.as_str()? == "text" {
-                item.get("text")?.as_str().map(String::from)
-            } else { None }
-        }))
+        .and_then(|arr| {
+            arr.iter().find_map(|item| {
+                if item.get("type")?.as_str()? == "text" {
+                    item.get("text")?.as_str().map(String::from)
+                } else {
+                    None
+                }
+            })
+        })
         .ok_or_else(|| anyhow!("claude response missing text content; got: {resp}"))?;
     Ok(text)
 }
