@@ -19,7 +19,7 @@
 //!                                                        content hash + signer trust)
 
 use anyhow::{bail, Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::capsule_contract::{
     ArtifactRef, CapabilityContract, Keyring, SignedContract,
@@ -150,15 +150,25 @@ fn cmd_add(args: &[String]) -> Result<()> {
 
 // ── lex pkg install ───────────────────────────────────────────────────────────
 
-/// Resolve and install all dependencies declared in the nearest lex.toml.
+/// Resolve and install the **full transitive closure** of dependencies
+/// declared in the nearest lex.toml (#634).
 ///
-/// For path dependencies: verify the directory exists.
-/// For git dependencies: clone into the cache directory if not already present.
-/// For registry dependencies: fetch the published **signed contract** and verify
-/// the archive against it (authenticity + content hash) before trusting it —
-/// `--trusted-keys <keyring.json>` additionally pins the signer, and
-/// `--require-contracts` refuses any registry dep the registry serves unsigned.
+/// Algorithm: BFS starting from the top-level manifest. After each
+/// package is successfully cloned its own `lex.toml` is read and its
+/// deps are enqueued (if not already seen). A `seen` map (name →
+/// source-key) terminates cycles and detects version conflicts.
+///
+/// Conflict policy: two packages in the closure requiring the same dep
+/// name under different sources (different git URL / ref / path) is an
+/// error — the flat `LEX_PACKAGES_DIR` layout can only hold one copy.
+///
+/// For registry dependencies: fetch the published **signed contract** and
+/// verify the archive against it before trusting it — `--trusted-keys`
+/// additionally pins the signer, and `--require-contracts` refuses any
+/// registry dep the registry serves unsigned.
 fn cmd_install(args: &[String]) -> Result<()> {
+    use std::collections::{HashMap, VecDeque};
+
     let mut trusted_keys: Option<String> = None;
     let mut require_contracts = false;
     let mut i = 0;
@@ -197,93 +207,162 @@ fn cmd_install(args: &[String]) -> Result<()> {
     }
 
     println!("installing dependencies from {}:", toml_path.display());
-    let mut errors = Vec::new();
+
+    // BFS queue: (dep_name, dir_of_declaring_lex_toml, is_direct_dep)
+    let mut queue: VecDeque<(String, PathBuf, bool)> = VecDeque::new();
+    // seen: dep_name → source_key — detects cycles and version conflicts.
+    let mut seen: HashMap<String, String> = HashMap::new();
 
     for (name, dep) in &manifest.dependencies {
-        match dep {
-            lex_syntax::workspace::Dependency::Path { path } => {
-                let full = toml_dir.join(path);
-                if full.exists() {
-                    println!("  {} (path)  ok — {}", name, full.display());
-                } else {
-                    let msg = format!("  {} (path)  NOT FOUND: {}", name, full.display());
-                    eprintln!("{msg}");
-                    errors.push(msg);
-                }
-            }
-            lex_syntax::workspace::Dependency::Git { git, branch, tag, rev } => {
-                let ref_desc = branch.as_deref()
-                    .map(|b| format!(" branch={b}"))
+        let src = dep_source_key(dep, &toml_dir);
+        seen.insert(name.clone(), src);
+        queue.push_back((name.clone(), toml_dir.clone(), true));
+    }
+
+    let mut errors: Vec<String> = Vec::new();
+    let mut total = 0usize;
+
+    while let Some((name, importer_dir, direct)) = queue.pop_front() {
+        let dummy = importer_dir.join("__install_probe__.lex");
+
+        // Read dep from declaring manifest (owned) for display + registry contract check.
+        let dep_owned: Option<lex_syntax::workspace::Dependency> =
+            lex_syntax::Manifest::load(&importer_dir.join("lex.toml"))
+                .ok()
+                .and_then(|mut m| m.dependencies.remove(&name));
+
+        let dep_display = match &dep_owned {
+            Some(lex_syntax::workspace::Dependency::Git { git, branch, tag, rev }) => {
+                let ref_desc = branch.as_deref().map(|b| format!(" branch={b}"))
                     .or_else(|| tag.as_deref().map(|t| format!(" tag={t}")))
                     .or_else(|| rev.as_deref().map(|r| format!(" rev={}", &r[..r.len().min(12)])))
                     .unwrap_or_default();
-                print!("  {} (git)      {}{} ... ", name, git, ref_desc);
-                // resolve_package_import triggers git_ensure_cached internally.
-                // We use a dummy module name — we only care about the side-effect.
-                let dummy_file = toml_dir.join("__install_probe__.lex");
-                match lex_syntax::workspace::resolve_package_import(&dummy_file, name, "__probe__") {
-                    Ok(_) | Err(lex_syntax::PackageError::ModuleNotFound { .. }) => {
-                        println!("ok");
+                format!("{}{}", git, ref_desc)
+            }
+            Some(lex_syntax::workspace::Dependency::Path { path }) => path.clone(),
+            Some(lex_syntax::workspace::Dependency::Registry { registry, version }) =>
+                format!("{registry}@{version}"),
+            None => "?".into(),
+        };
+        let transitive_tag = if direct { "" } else { "  [transitive]" };
+        print!("  {name}  {dep_display}{transitive_tag} ... ");
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+
+        // For registry deps: verify the published contract before installing.
+        if let Some(lex_syntax::workspace::Dependency::Registry { registry, version }) = &dep_owned {
+            match verify_registry_dep(registry, &name, version, keyring.as_ref()) {
+                Ok(DepVerification::Verified { signer, signer_trusted, .. }) => {
+                    let trust = if signer_trusted {
+                        " (signer trusted)".to_string()
+                    } else if keyring.is_some() {
+                        String::new()
+                    } else {
+                        " (signer not pinned — pass --trusted-keys)".to_string()
+                    };
+                    print!("contract verified, signer {:.12}…{trust} ... ", signer);
+                    std::io::Write::flush(&mut std::io::stdout()).ok();
+                }
+                Ok(DepVerification::NoContract) => {
+                    if require_contracts {
+                        println!("REFUSED");
+                        let msg = format!(
+                            "{name}: registry served no contract and --require-contracts is set"
+                        );
+                        eprintln!("    {msg}");
+                        errors.push(msg);
+                        continue;
                     }
-                    Err(e) => {
-                        println!("FAILED");
-                        eprintln!("    {e}");
-                        errors.push(format!("{name}: {e}"));
+                    eprint!("⚠ no contract (unsigned) ... ");
+                }
+                Err(e) => {
+                    println!("REFUSED");
+                    eprintln!("    {name}: contract verification failed: {e}");
+                    errors.push(format!("{name}: {e}"));
+                    continue;
+                }
+            }
+        }
+
+        match lex_syntax::workspace::resolve_package_import(&dummy, &name, "__probe__") {
+            Ok(_) => {
+                println!("ok");
+                total += 1;
+            }
+            Err(lex_syntax::PackageError::ModuleNotFound { pkg_root, .. }) => {
+                println!("ok");
+                total += 1;
+                // Read the installed package's own lex.toml and enqueue its deps.
+                let pkg_dir = std::path::Path::new(&pkg_root);
+                let pkg_toml = pkg_dir.join("lex.toml");
+                if pkg_toml.exists() {
+                    match lex_syntax::Manifest::load(&pkg_toml) {
+                        Ok(dep_manifest) => {
+                            for (trans_name, trans_dep) in &dep_manifest.dependencies {
+                                let new_src = dep_source_key(trans_dep, pkg_dir);
+                                match seen.get(trans_name) {
+                                    Some(existing) if existing != &new_src => {
+                                        let msg = format!(
+                                            "version conflict: `{trans_name}` is required as \
+                                             \"{existing}\" (already seen) but `{name}` \
+                                             requires \"{new_src}\" — flat layout can only \
+                                             hold one copy"
+                                        );
+                                        eprintln!("  error: {msg}");
+                                        errors.push(msg);
+                                    }
+                                    Some(_) => { /* already queued/installed — skip */ }
+                                    None => {
+                                        seen.insert(trans_name.clone(), new_src);
+                                        queue.push_back((
+                                            trans_name.clone(),
+                                            PathBuf::from(&pkg_root),
+                                            false,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "  warning: could not read {}: {e} \
+                                 (transitive deps of `{name}` may be incomplete)",
+                                pkg_toml.display()
+                            );
+                        }
                     }
                 }
             }
-            lex_syntax::workspace::Dependency::Registry { registry, version } => {
-                print!("  {} (registry) {}@{} ... ", name, registry, version);
-                // Provenance gate: verify the published contract binds these
-                // bytes to a (optionally trusted) signer before installing.
-                match verify_registry_dep(registry, name, version, keyring.as_ref()) {
-                    Ok(DepVerification::Verified { signer, signer_trusted, .. }) => {
-                        let trust = if signer_trusted {
-                            " (signer trusted)".to_string()
-                        } else if keyring.is_some() {
-                            String::new()
-                        } else {
-                            " (signer not pinned — pass --trusted-keys)".to_string()
-                        };
-                        print!("contract verified, signer {:.12}…{trust} ... ", signer);
-                    }
-                    Ok(DepVerification::NoContract) => {
-                        if require_contracts {
-                            println!("REFUSED");
-                            let msg = format!("{name}: registry served no contract and --require-contracts is set");
-                            eprintln!("    {msg}");
-                            errors.push(msg);
-                            continue;
-                        }
-                        eprint!("⚠ no contract (unsigned) ... ");
-                    }
-                    Err(e) => {
-                        println!("REFUSED");
-                        eprintln!("    {name}: contract verification failed: {e}");
-                        errors.push(format!("{name}: {e}"));
-                        continue;
-                    }
-                }
-                let dummy_file = toml_dir.join("__install_probe__.lex");
-                match lex_syntax::workspace::resolve_package_import(&dummy_file, name, "__probe__") {
-                    Ok(_) | Err(lex_syntax::PackageError::ModuleNotFound { .. }) => {
-                        println!("ok");
-                    }
-                    Err(e) => {
-                        println!("FAILED");
-                        eprintln!("    {e}");
-                        errors.push(format!("{name}: {e}"));
-                    }
-                }
+            Err(e) => {
+                println!("FAILED");
+                eprintln!("    {e}");
+                errors.push(format!("{name}: {e}"));
             }
         }
     }
 
     if errors.is_empty() {
-        println!("all {} dependency/dependencies installed", manifest.dependencies.len());
+        println!("installed {} package(s) (full transitive closure)", total);
         Ok(())
     } else {
-        bail!("{} dependency/dependencies failed to install", errors.len())
+        bail!("{} error(s) during install", errors.len())
+    }
+}
+
+/// Canonical string key for a dependency, used to detect version conflicts.
+/// Two entries with the same name but different source keys cannot coexist
+/// in the flat `LEX_PACKAGES_DIR` layout.
+fn dep_source_key(dep: &lex_syntax::workspace::Dependency, base_dir: &Path) -> String {
+    use lex_syntax::workspace::Dependency;
+    match dep {
+        Dependency::Git { git, branch, tag, rev } => {
+            let ref_part = branch.as_deref().map(|b| format!("@branch:{b}"))
+                .or_else(|| tag.as_deref().map(|t| format!("@tag:{t}")))
+                .or_else(|| rev.as_deref().map(|r| format!("@rev:{r}")))
+                .unwrap_or_default();
+            format!("git:{git}{ref_part}")
+        }
+        Dependency::Path { path } => format!("path:{}", base_dir.join(path).display()),
+        Dependency::Registry { registry, version } => format!("registry:{registry}@{version}"),
     }
 }
 
