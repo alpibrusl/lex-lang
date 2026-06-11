@@ -19,7 +19,7 @@
 //!                                                        content hash + signer trust)
 
 use anyhow::{bail, Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::capsule_contract::{
     ArtifactRef, CapabilityContract, Keyring, SignedContract,
