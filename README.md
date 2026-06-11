@@ -109,6 +109,37 @@ lex pkg publish --token $LEX_PUBLISH_TOKEN
 
 Tokens are issued by the LexHub operator. See [`lex-hub`](https://github.com/alpibrusl/lex-hub) for self-hosting.
 
+## Supply-chain provenance
+
+A published package can carry a **signed capability contract** — the same format the [lex-os](https://github.com/alpibrusl/lex-os) capsule runtime installs — binding the published bytes to the **grant the code actually needs**, so a consumer verifies *what it's getting* before trusting it, and a runtime runs it at *least authority*.
+
+```sh
+# Publish: derive the required grant from the code's typed effects, then sign.
+lex pkg publish --sign $KEY --derive-grant \
+    --contract-out weather.contract.json --archive-out weather.tar
+#   the contract's grant is the union of the entrypoint's declared effects —
+#   the publisher can't over- or under-declare; it's provably least authority.
+
+# Verify a package against its contract (signature · content hash · signer).
+lex pkg verify --archive weather.tar --contract weather.contract.json \
+    --trusted-keys keyring.json
+
+# Install: verify every registry dependency's contract before trusting it.
+lex pkg install --trusted-keys keyring.json --require-contracts
+#   refuses a substituted archive (integrity), a forged contract (authenticity),
+#   or a signer you didn't pin (authorization) — the gates capsule install uses.
+```
+
+Trust is **earned, not just pinned**. An install lands as a durable, content-addressed attestation, and a publisher's track record becomes the keyring the next install consults:
+
+```sh
+lex attest import-install --audit install.audit.json   # install → attestation graph
+lex producer-trust recompute --tool $SIGNER            # score the publisher's record
+lex producer-trust keyring --min-trust 700 --out keyring.json   # earned trusted-keys
+```
+
+**`bash demo/supply-chain.sh`** runs the whole loop end-to-end against a stand-in registry (one `lex` binary, no network): derive-grant publish → verify-on-install → a tampered-archive refusal → durable attestation → an earned keyring. The same contract and keyring then drive `lex-os capsule install`.
+
 ## Ecosystem
 
 Tooling and runtime libraries that extend the Lex platform:
