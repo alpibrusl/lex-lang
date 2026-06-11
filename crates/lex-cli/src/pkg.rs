@@ -30,7 +30,7 @@ pub fn cmd_pkg(args: &[String]) -> Result<()> {
         Some("init")    => cmd_init(),
         Some("add")     => cmd_add(&args[1..]),
         Some("list")    => cmd_list(),
-        Some("install") => cmd_install(),
+        Some("install") => cmd_install(&args[1..]),
         Some("publish") => cmd_publish(&args[1..]),
         Some("verify")  => cmd_verify(&args[1..]),
         Some(other)     => bail!("unknown pkg subcommand `{other}`; try: init, add, install, list, publish, verify"),
@@ -154,7 +154,36 @@ fn cmd_add(args: &[String]) -> Result<()> {
 ///
 /// For path dependencies: verify the directory exists.
 /// For git dependencies: clone into the cache directory if not already present.
-fn cmd_install() -> Result<()> {
+/// For registry dependencies: fetch the published **signed contract** and verify
+/// the archive against it (authenticity + content hash) before trusting it —
+/// `--trusted-keys <keyring.json>` additionally pins the signer, and
+/// `--require-contracts` refuses any registry dep the registry serves unsigned.
+fn cmd_install(args: &[String]) -> Result<()> {
+    let mut trusted_keys: Option<String> = None;
+    let mut require_contracts = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--trusted-keys" => {
+                i += 1;
+                trusted_keys = Some(args.get(i).cloned().ok_or_else(|| {
+                    anyhow::anyhow!("--trusted-keys requires a path")
+                })?);
+            }
+            "--require-contracts" => require_contracts = true,
+            other => bail!("unknown flag `{other}`"),
+        }
+        i += 1;
+    }
+    let keyring = match &trusted_keys {
+        Some(path) => {
+            let raw = std::fs::read_to_string(path)
+                .with_context(|| format!("reading keyring {path}"))?;
+            Some(serde_json::from_str::<Keyring>(&raw).with_context(|| format!("parsing keyring {path}"))?)
+        }
+        None => None,
+    };
+
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let (toml_path, toml_dir) = lex_syntax::find_manifest(&cwd)
         .ok_or_else(|| anyhow::anyhow!("no lex.toml found (run `lex pkg init` to create one)"))?;
@@ -205,6 +234,36 @@ fn cmd_install() -> Result<()> {
             }
             lex_syntax::workspace::Dependency::Registry { registry, version } => {
                 print!("  {} (registry) {}@{} ... ", name, registry, version);
+                // Provenance gate: verify the published contract binds these
+                // bytes to a (optionally trusted) signer before installing.
+                match verify_registry_dep(registry, name, version, keyring.as_ref()) {
+                    Ok(DepVerification::Verified { signer, signer_trusted, .. }) => {
+                        let trust = if signer_trusted {
+                            " (signer trusted)".to_string()
+                        } else if keyring.is_some() {
+                            String::new()
+                        } else {
+                            " (signer not pinned — pass --trusted-keys)".to_string()
+                        };
+                        print!("contract verified, signer {:.12}…{trust} ... ", signer);
+                    }
+                    Ok(DepVerification::NoContract) => {
+                        if require_contracts {
+                            println!("REFUSED");
+                            let msg = format!("{name}: registry served no contract and --require-contracts is set");
+                            eprintln!("    {msg}");
+                            errors.push(msg);
+                            continue;
+                        }
+                        eprint!("⚠ no contract (unsigned) ... ");
+                    }
+                    Err(e) => {
+                        println!("REFUSED");
+                        eprintln!("    {name}: contract verification failed: {e}");
+                        errors.push(format!("{name}: {e}"));
+                        continue;
+                    }
+                }
                 let dummy_file = toml_dir.join("__install_probe__.lex");
                 match lex_syntax::workspace::resolve_package_import(&dummy_file, name, "__probe__") {
                     Ok(_) | Err(lex_syntax::PackageError::ModuleNotFound { .. }) => {
@@ -607,6 +666,78 @@ fn resolve_pkg_signing_key(spec: &str) -> Result<lex_vcs::Keypair> {
     };
     lex_vcs::Keypair::from_secret_hex(&hex)
         .map_err(|e| anyhow::anyhow!("invalid signing key: {e}"))
+}
+
+/// Outcome of verifying a registry dependency against its published contract.
+enum DepVerification {
+    /// The registry served a contract; its signature binds it to `signer` and
+    /// the archive bytes hash to the contract's `content_hash`. `signer_trusted`
+    /// is set when a `--trusted-keys` keyring was supplied and lists the signer.
+    Verified {
+        signer: String,
+        signer_trusted: bool,
+    },
+    /// The registry served no contract (HTTP 404) — an unsigned dependency.
+    NoContract,
+}
+
+/// Fetch `{registry}/v1/pkg/{name}/{version}/{contract,archive}` and verify the
+/// archive against the signed contract: authenticity (the signature binds the
+/// contract to its signer), integrity (the archive bytes hash to the contract's
+/// `content_hash`), and — when `trusted` is supplied — authorization (the signer
+/// is pinned). The same three gates `lex-os capsule install` applies, now at
+/// `lex pkg install` time, against the same `lex pkg publish`-emitted contract.
+fn verify_registry_dep(
+    registry: &str,
+    name: &str,
+    version: &str,
+    trusted: Option<&Keyring>,
+) -> Result<DepVerification> {
+    let base = registry.trim_end_matches('/');
+    let contract_url = format!("{base}/v1/pkg/{name}/{version}/contract");
+    let signed: SignedContract = match ureq::get(&contract_url).call() {
+        Ok(resp) => {
+            let body = resp
+                .into_body()
+                .read_to_string()
+                .map_err(|e| anyhow::anyhow!("reading contract: {e}"))?;
+            serde_json::from_str(&body)
+                .with_context(|| format!("parsing contract from {contract_url}"))?
+        }
+        // A registry that doesn't publish a contract for this version.
+        Err(ureq::Error::StatusCode(404)) => return Ok(DepVerification::NoContract),
+        Err(e) => bail!("GET {contract_url}: {e}"),
+    };
+
+    let archive_url = format!("{base}/v1/pkg/{name}/{version}/archive");
+    let archive = ureq::get(&archive_url)
+        .call()
+        .map_err(|e| anyhow::anyhow!("GET {archive_url}: {e}"))?
+        .into_body()
+        .read_to_vec()
+        .map_err(|e| anyhow::anyhow!("reading archive: {e}"))?;
+
+    // 1. Authenticity, 2. Integrity (same primitives as `lex pkg verify`).
+    let signer = signed
+        .verify()
+        .map_err(|e| anyhow::anyhow!("authenticity: {e}"))?;
+    signed
+        .matches_artifact(&archive)
+        .map_err(|e| anyhow::anyhow!("integrity: {e}"))?;
+    // 3. Authorization (only when a keyring pins publishers).
+    let signer_trusted = match trusted {
+        Some(k) => {
+            if !k.trusts(&signer) {
+                bail!("authorization: signer {signer} is not in the trusted keyring");
+            }
+            true
+        }
+        None => false,
+    };
+    Ok(DepVerification::Verified {
+        signer,
+        signer_trusted,
+    })
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

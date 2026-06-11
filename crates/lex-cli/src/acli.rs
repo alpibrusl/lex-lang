@@ -173,6 +173,10 @@ fn cmd_pkg() -> CommandInfo {
     )
     .with_examples(vec![
         ("Install deps", "lex pkg install"),
+        (
+            "Install, verifying each registry dep's signed contract against pinned publishers",
+            "lex pkg install --trusted-keys keyring.json --require-contracts",
+        ),
         ("Add a path dep", "lex pkg add mylib --path ../mylib"),
         (
             "Publish with a contract whose grant is derived from the code's effects",
