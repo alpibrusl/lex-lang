@@ -58,7 +58,7 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 postgres = "0.19"
 redis = "1.2"
 arrow-array = "58"
-arrow-schema = "58"
+arrow-schema = "59"
 arrow-select = "58"
 arrow-arith = "58"
 arrow-cast = "58"
