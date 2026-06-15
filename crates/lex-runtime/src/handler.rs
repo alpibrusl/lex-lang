@@ -26,7 +26,7 @@ pub struct StdoutSink;
 impl IoSink for StdoutSink {
     fn print_line(&mut self, s: &str) {
         use std::io::Write;
-        print!("{s}");
+        println!("{s}");
         let _ = std::io::stdout().flush();
     }
 }
