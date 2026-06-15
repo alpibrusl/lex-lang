@@ -1,5 +1,9 @@
 # lex-lang
 
+[![CI](https://github.com/alpibrusl/lex-lang/actions/workflows/ci.yml/badge.svg)](https://github.com/alpibrusl/lex-lang/actions/workflows/ci.yml)
+
+**Part of the [Lex](https://lexlang.org) project** — Substrate · [Manifesto](https://lexlang.org/manifesto) · [All packages](https://lexlang.org)
+
 [![CI](https://github.com/alpibrusl/lex-lang/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/alpibrusl/lex-lang/actions/workflows/ci.yml)
 [![fuzz](https://github.com/alpibrusl/lex-lang/actions/workflows/fuzz.yml/badge.svg?branch=main)](https://github.com/alpibrusl/lex-lang/actions/workflows/fuzz.yml)
 [![License: EUPL-1.2](https://img.shields.io/badge/license-EUPL--1.2-blue.svg)](LICENSE)
