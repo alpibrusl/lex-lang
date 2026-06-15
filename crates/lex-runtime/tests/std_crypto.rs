@@ -262,3 +262,84 @@ fn random_without_grant_is_rejected_by_static_policy_walk() {
         "expected static policy walk to reject [random] without grant"
     );
 }
+
+// ─── ed25519 asymmetric signatures (#643) ────────────────────────────────────
+const ED25519_SRC: &str = r#"
+import "std.crypto" as crypto
+
+fn roundtrip(secret :: Bytes, msg :: Bytes) -> Bool {
+  match crypto.ed25519_public_key(secret) {
+    Err(_) => false,
+    Ok(pk) => match crypto.ed25519_sign(secret, msg) {
+      Err(_) => false,
+      Ok(sig) => crypto.ed25519_verify(pk, msg, sig),
+    },
+  }
+}
+fn wrong_msg(secret :: Bytes, msg :: Bytes, other :: Bytes) -> Bool {
+  match crypto.ed25519_public_key(secret) {
+    Err(_) => false,
+    Ok(pk) => match crypto.ed25519_sign(secret, msg) {
+      Err(_) => false,
+      Ok(sig) => crypto.ed25519_verify(pk, other, sig),
+    },
+  }
+}
+fn pub_of(secret :: Bytes) -> Result[Bytes, Str] { crypto.ed25519_public_key(secret) }
+"#;
+
+fn is_true(v: Value) -> bool {
+    match v {
+        Value::Bool(b) => b,
+        other => panic!("expected Bool, got {other:?}"),
+    }
+}
+
+#[test]
+fn ed25519_sign_verify_roundtrip() {
+    let secret = vec![7u8; 32];
+    let msg = b"transfer authorized".to_vec();
+    let ok = run(ED25519_SRC, "roundtrip",
+        vec![Value::Bytes(secret.clone()), Value::Bytes(msg.clone())]);
+    assert!(is_true(ok), "valid signature must verify");
+}
+
+#[test]
+fn ed25519_rejects_wrong_message() {
+    let secret = vec![7u8; 32];
+    let msg = b"transfer 100".to_vec();
+    let other = b"transfer 9999".to_vec();
+    let bad = run(ED25519_SRC, "wrong_msg",
+        vec![Value::Bytes(secret), Value::Bytes(msg), Value::Bytes(other)]);
+    assert!(!is_true(bad), "signature must not verify for a different message");
+}
+
+#[test]
+fn ed25519_public_key_is_deterministic_and_32_bytes() {
+    let secret = vec![3u8; 32];
+    let a = run(ED25519_SRC, "pub_of", vec![Value::Bytes(secret.clone())]);
+    let b = run(ED25519_SRC, "pub_of", vec![Value::Bytes(secret)]);
+    match (a, b) {
+        (Value::Variant { name: n1, args: a1 }, Value::Variant { name: n2, args: a2 }) => {
+            assert_eq!(n1, "Ok");
+            assert_eq!(n2, "Ok");
+            match (&a1[0], &a2[0]) {
+                (Value::Bytes(p1), Value::Bytes(p2)) => {
+                    assert_eq!(p1.len(), 32, "public key must be 32 bytes");
+                    assert_eq!(p1, p2, "derivation must be deterministic");
+                }
+                other => panic!("expected Bytes, got {other:?}"),
+            }
+        }
+        other => panic!("expected Ok variants, got {other:?}"),
+    }
+}
+
+#[test]
+fn ed25519_public_key_rejects_bad_length() {
+    let v = run(ED25519_SRC, "pub_of", vec![Value::Bytes(vec![1u8; 10])]);
+    match v {
+        Value::Variant { name, .. } => assert_eq!(name, "Err", "10-byte secret must Err"),
+        other => panic!("expected Result, got {other:?}"),
+    }
+}

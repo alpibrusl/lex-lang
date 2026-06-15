@@ -1716,6 +1716,26 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                     Ty::bytes(),
                 ));
             }
+            // ed25519 asymmetric signatures (#643). A secret key is its 32-byte
+            // seed (generate via `crypto.random(32)`); all three ops are pure.
+            //   ed25519_public_key(secret :: Bytes) -> Result[Bytes, Str]
+            //   ed25519_sign(secret :: Bytes, message :: Bytes) -> Result[Bytes, Str]
+            //   ed25519_verify(public :: Bytes, message :: Bytes, sig :: Bytes) -> Bool
+            fields.insert("ed25519_public_key".into(), Ty::function(
+                vec![Ty::bytes()],
+                EffectSet::empty(),
+                Ty::Con("Result".into(), vec![Ty::bytes(), Ty::str()]),
+            ));
+            fields.insert("ed25519_sign".into(), Ty::function(
+                vec![Ty::bytes(), Ty::bytes()],
+                EffectSet::empty(),
+                Ty::Con("Result".into(), vec![Ty::bytes(), Ty::str()]),
+            ));
+            fields.insert("ed25519_verify".into(), Ty::function(
+                vec![Ty::bytes(), Ty::bytes(), Ty::bytes()],
+                EffectSet::empty(),
+                Ty::bool(),
+            ));
             // base64 / hex
             fields.insert("base64_encode".into(), Ty::function(
                 vec![Ty::bytes()], EffectSet::empty(), Ty::str()));
@@ -2265,11 +2285,11 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             fields.insert("get_float".into(), Ty::function(
                 vec![Ty::Var(0), Ty::str()],
                 EffectSet::empty(),
-                Ty::Con("Option".into(), vec![Ty::Con("Float".into(), vec![])])));
+                Ty::Con("Option".into(), vec![Ty::float()])));
             fields.insert("get_bool".into(), Ty::function(
                 vec![Ty::Var(0), Ty::str()],
                 EffectSet::empty(),
-                Ty::Con("Option".into(), vec![Ty::Con("Bool".into(), vec![])])));
+                Ty::Con("Option".into(), vec![Ty::bool()])));
 
             Some(Ty::Record(fields))
         }

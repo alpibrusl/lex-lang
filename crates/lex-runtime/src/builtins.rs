@@ -1097,6 +1097,50 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             mac.update(data);
             Ok(Value::Bytes(mac.finalize().into_bytes().to_vec()))
         }
+        // ed25519 asymmetric signatures (#643). A secret key is its 32-byte
+        // seed — generate one with the effectful `crypto.random(32)`. These three
+        // ops are pure (deterministic given their inputs).
+        ("crypto", "ed25519_public_key") => {
+            use ed25519_dalek::SigningKey;
+            let secret = expect_bytes(args.first())?;
+            let seed: [u8; 32] = match secret.as_slice().try_into() {
+                Ok(s)  => s,
+                Err(_) => return Ok(err_v(Value::Str("ed25519_public_key: secret must be 32 bytes".into()))),
+            };
+            let sk = SigningKey::from_bytes(&seed);
+            Ok(ok_v(Value::Bytes(sk.verifying_key().to_bytes().to_vec())))
+        }
+        ("crypto", "ed25519_sign") => {
+            use ed25519_dalek::{Signer, SigningKey};
+            let secret = expect_bytes(args.first())?;
+            let message = expect_bytes(args.get(1))?;
+            let seed: [u8; 32] = match secret.as_slice().try_into() {
+                Ok(s)  => s,
+                Err(_) => return Ok(err_v(Value::Str("ed25519_sign: secret must be 32 bytes".into()))),
+            };
+            let sk = SigningKey::from_bytes(&seed);
+            Ok(ok_v(Value::Bytes(sk.sign(message).to_bytes().to_vec())))
+        }
+        ("crypto", "ed25519_verify") => {
+            use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+            let public = expect_bytes(args.first())?;
+            let message = expect_bytes(args.get(1))?;
+            let sig_bytes = expect_bytes(args.get(2))?;
+            let pk_arr: [u8; 32] = match public.as_slice().try_into() {
+                Ok(p)  => p,
+                Err(_) => return Ok(Value::Bool(false)),
+            };
+            let sig_arr: [u8; 64] = match sig_bytes.as_slice().try_into() {
+                Ok(s)  => s,
+                Err(_) => return Ok(Value::Bool(false)),
+            };
+            let vk = match VerifyingKey::from_bytes(&pk_arr) {
+                Ok(v)  => v,
+                Err(_) => return Ok(Value::Bool(false)),
+            };
+            let sig = Signature::from_bytes(&sig_arr);
+            Ok(Value::Bool(vk.verify(message, &sig).is_ok()))
+        }
         ("crypto", "base64_encode") => {
             use base64::{Engine, engine::general_purpose::STANDARD};
             let data = expect_bytes(args.first())?;
