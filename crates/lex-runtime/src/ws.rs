@@ -1298,6 +1298,6 @@ mod tests {
     #[test]
     fn genuine_handshake_failure_is_surfaced() {
         let failure: ProbeResult = Err(HandshakeError::Failure(Error::ConnectionClosed));
-        assert!(matches!(accept_or_drop_probe(failure), Err(_)));
+        assert!(accept_or_drop_probe(failure).is_err());
     }
 }
