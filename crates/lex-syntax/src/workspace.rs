@@ -363,6 +363,15 @@ fn registry_ensure_cached(
     })
 }
 
+/// The flat package cache root used by the resolver — `$LEX_PACKAGES_DIR`
+/// if set, otherwise `~/.lex/packages/`. Returns `None` only when neither is
+/// available. Exposed so tooling can recognise dependencies whose path
+/// resolves *into* this cache (and are therefore aliases of an
+/// already-installed package rather than independent sources).
+pub fn packages_cache_root() -> Option<PathBuf> {
+    packages_cache_dir().ok()
+}
+
 fn packages_cache_dir() -> Result<PathBuf, PackageError> {
     if let Ok(dir) = std::env::var("LEX_PACKAGES_DIR") {
         return Ok(PathBuf::from(dir));
