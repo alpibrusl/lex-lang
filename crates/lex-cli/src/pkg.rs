@@ -210,12 +210,11 @@ fn cmd_install(args: &[String]) -> Result<()> {
 
     // BFS queue: (dep_name, dir_of_declaring_lex_toml, is_direct_dep)
     let mut queue: VecDeque<(String, PathBuf, bool)> = VecDeque::new();
-    // seen: dep_name → source_key — detects cycles and version conflicts.
-    let mut seen: HashMap<String, String> = HashMap::new();
+    // seen: dep_name → flat-layout identity — detects cycles and version conflicts.
+    let mut seen: HashMap<String, DepIdentity> = HashMap::new();
 
     for (name, dep) in &manifest.dependencies {
-        let src = dep_source_key(dep, &toml_dir);
-        seen.insert(name.clone(), src);
+        seen.insert(name.clone(), dep_identity(dep, &toml_dir));
         queue.push_back((name.clone(), toml_dir.clone(), true));
     }
 
@@ -298,21 +297,32 @@ fn cmd_install(args: &[String]) -> Result<()> {
                     match lex_syntax::Manifest::load(&pkg_toml) {
                         Ok(dep_manifest) => {
                             for (trans_name, trans_dep) in &dep_manifest.dependencies {
-                                let new_src = dep_source_key(trans_dep, pkg_dir);
+                                let new_id = dep_identity(trans_dep, pkg_dir);
                                 match seen.get(trans_name) {
-                                    Some(existing) if existing != &new_src => {
-                                        let msg = format!(
-                                            "version conflict: `{trans_name}` is required as \
-                                             \"{existing}\" (already seen) but `{name}` \
-                                             requires \"{new_src}\" — flat layout can only \
-                                             hold one copy"
-                                        );
-                                        eprintln!("  error: {msg}");
-                                        errors.push(msg);
+                                    Some(existing) => {
+                                        if let Some(msg) =
+                                            conflict_message(trans_name, existing, &new_id, &name)
+                                        {
+                                            eprintln!("  error: {msg}");
+                                            errors.push(msg);
+                                        } else if matches!(existing, DepIdentity::Alias)
+                                            && matches!(new_id, DepIdentity::Concrete(_))
+                                        {
+                                            // A concrete source supersedes a prior path
+                                            // alias for the same slot: record it and queue
+                                            // the install so the slot gets populated.
+                                            seen.insert(trans_name.clone(), new_id);
+                                            queue.push_back((
+                                                trans_name.clone(),
+                                                PathBuf::from(&pkg_root),
+                                                false,
+                                            ));
+                                        }
+                                        // else: same source, or a harmless alias of an
+                                        // already-present slot — skip.
                                     }
-                                    Some(_) => { /* already queued/installed — skip */ }
                                     None => {
-                                        seen.insert(trans_name.clone(), new_src);
+                                        seen.insert(trans_name.clone(), new_id);
                                         queue.push_back((
                                             trans_name.clone(),
                                             PathBuf::from(&pkg_root),
@@ -348,9 +358,66 @@ fn cmd_install(args: &[String]) -> Result<()> {
     }
 }
 
-/// Canonical string key for a dependency, used to detect version conflicts.
-/// Two entries with the same name but different source keys cannot coexist
-/// in the flat `LEX_PACKAGES_DIR` layout.
+/// A dependency's identity for flat-layout conflict detection.
+///
+/// The flat `LEX_PACKAGES_DIR` layout holds a single copy per package name, so
+/// a conflict is "two requirements would fill the same slot with different
+/// bytes" — not "two declarations spell their source differently". A git dep
+/// and a sibling-`path` dep (`../name`, the standard inter-package reference)
+/// both resolve to the *same* cache slot, so they must not be treated as a
+/// conflict.
+#[derive(Clone, PartialEq, Eq)]
+enum DepIdentity {
+    /// A source that *populates* the package's cache slot with specific bytes:
+    /// a git repo, a registry release, or a local path pointing *outside* the
+    /// cache. Two differing concrete identities for one name genuinely conflict.
+    Concrete(String),
+    /// A path dependency resolving to a sibling already inside the package
+    /// cache. It introduces no new bytes — it aliases whatever fills that slot
+    /// — so it never conflicts with the concrete source that installs there.
+    Alias,
+}
+
+/// Classify a dependency for conflict detection. Git/registry deps are always
+/// concrete; a `path` dep is an [`DepIdentity::Alias`] when it resolves into the
+/// package cache, otherwise a concrete local-path source.
+fn dep_identity(dep: &lex_syntax::workspace::Dependency, base_dir: &Path) -> DepIdentity {
+    use lex_syntax::workspace::Dependency;
+    match dep {
+        Dependency::Git { .. } | Dependency::Registry { .. } => {
+            DepIdentity::Concrete(dep_source_key(dep, base_dir))
+        }
+        Dependency::Path { path } => {
+            let resolved = normalize_path(&base_dir.join(path));
+            if path_in_cache(&resolved) {
+                DepIdentity::Alias
+            } else {
+                DepIdentity::Concrete(format!("path:{}", resolved.display()))
+            }
+        }
+    }
+}
+
+/// Returns `Some(message)` when two flat-layout requirements for the same name
+/// genuinely conflict, or `None` when they can coexist. Only two *concrete*
+/// sources with differing identities collide; an alias defers to whatever fills
+/// the slot.
+fn conflict_message(
+    name: &str,
+    existing: &DepIdentity,
+    incoming: &DepIdentity,
+    requiring_pkg: &str,
+) -> Option<String> {
+    match (existing, incoming) {
+        (DepIdentity::Concrete(a), DepIdentity::Concrete(b)) if a != b => Some(format!(
+            "version conflict: `{name}` is required as \"{a}\" (already seen) but \
+             `{requiring_pkg}` requires \"{b}\" — flat layout can only hold one copy"
+        )),
+        _ => None,
+    }
+}
+
+/// Canonical string key for a git/registry dependency's bytes-source.
 fn dep_source_key(dep: &lex_syntax::workspace::Dependency, base_dir: &Path) -> String {
     use lex_syntax::workspace::Dependency;
     match dep {
@@ -363,6 +430,36 @@ fn dep_source_key(dep: &lex_syntax::workspace::Dependency, base_dir: &Path) -> S
         }
         Dependency::Path { path } => format!("path:{}", base_dir.join(path).display()),
         Dependency::Registry { registry, version } => format!("registry:{registry}@{version}"),
+    }
+}
+
+/// Resolve a path for cache-membership comparison: canonicalize if it exists,
+/// otherwise fold `.`/`..` lexically so `…/lex-web/../lex-orm` reduces to
+/// `…/lex-orm` even when the target isn't on disk yet.
+fn normalize_path(p: &Path) -> PathBuf {
+    if let Ok(canonical) = p.canonicalize() {
+        return canonical;
+    }
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            std::path::Component::ParentDir => { out.pop(); }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// True if `resolved` lives inside the flat package cache root — i.e. it is a
+/// sibling reference to another already-installed package, not external bytes.
+fn path_in_cache(resolved: &Path) -> bool {
+    match lex_syntax::workspace::packages_cache_root() {
+        Some(root) => {
+            let root = root.canonicalize().unwrap_or(root);
+            resolved.starts_with(&root)
+        }
+        None => false,
     }
 }
 
@@ -871,4 +968,80 @@ fn locate_or_create_toml() -> Result<std::path::PathBuf> {
     ))?;
     println!("created {}", path.display());
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lex_syntax::workspace::Dependency;
+
+    fn git(url: &str) -> Dependency {
+        Dependency::Git { git: url.into(), branch: None, tag: None, rev: None }
+    }
+    fn git_tag(url: &str, tag: &str) -> Dependency {
+        Dependency::Git { git: url.into(), branch: None, tag: Some(tag.into()), rev: None }
+    }
+    fn path(p: &str) -> Dependency {
+        Dependency::Path { path: p.into() }
+    }
+
+    /// All conflict-detection scenarios from issue #637, exercised through the
+    /// pure classification logic. Runs in one test so the single shared
+    /// `LEX_PACKAGES_DIR` env var is not raced by parallel tests.
+    #[test]
+    fn flat_layout_conflict_detection() {
+        let cache = tempfile::tempdir().unwrap();
+        let cache_root = cache.path().to_path_buf();
+        // The cache must exist on disk for `path_in_cache` to canonicalize it.
+        let web_dir = cache_root.join("lex-web");
+        let orm_dir = cache_root.join("lex-orm");
+        std::fs::create_dir_all(&web_dir).unwrap();
+        std::fs::create_dir_all(&orm_dir).unwrap();
+        std::env::set_var("LEX_PACKAGES_DIR", &cache_root);
+
+        // The top manifest declares lex-orm as a git dep → concrete.
+        let top = git("https://github.com/alpibrusl/lex-orm");
+        let top_id = dep_identity(&top, &cache_root);
+        assert!(matches!(top_id, DepIdentity::Concrete(_)));
+
+        // lex-web's own manifest references lex-orm as a sibling path `../lex-orm`.
+        // Resolved from inside the cache it is an alias of the same slot — #637.
+        let sibling = path("../lex-orm");
+        let sibling_id = dep_identity(&sibling, &web_dir);
+        assert!(matches!(sibling_id, DepIdentity::Alias));
+
+        // Acceptance 1: git dep + sibling-path dep for the same name → no conflict.
+        assert!(
+            conflict_message("lex-orm", &top_id, &sibling_id, "lex-web").is_none(),
+            "git dep and sibling-path dep must not falsely conflict"
+        );
+
+        // Acceptance 3a: two different git URLs for the same name → real conflict.
+        let other_url = git("https://github.com/someone-else/lex-orm");
+        let other_id = dep_identity(&other_url, &cache_root);
+        assert!(
+            conflict_message("lex-orm", &top_id, &other_id, "lex-web").is_some(),
+            "different git URLs for one name must still conflict"
+        );
+
+        // Acceptance 3b: two different git refs for the same URL → real conflict.
+        let pinned = git_tag("https://github.com/alpibrusl/lex-orm", "v1.0.0");
+        let pinned_id = dep_identity(&pinned, &cache_root);
+        assert!(
+            conflict_message("lex-orm", &top_id, &pinned_id, "lex-web").is_some(),
+            "different git refs for one name must still conflict"
+        );
+
+        // A path pointing *outside* the cache is concrete (external bytes), so it
+        // conflicts with the git source rather than aliasing it.
+        let external = path("../../somewhere-else/lex-orm");
+        let external_id = dep_identity(&external, cache.path().parent().unwrap());
+        assert!(matches!(external_id, DepIdentity::Concrete(_)));
+        assert!(
+            conflict_message("lex-orm", &top_id, &external_id, "lex-web").is_some(),
+            "an out-of-cache path with different bytes must conflict"
+        );
+
+        std::env::remove_var("LEX_PACKAGES_DIR");
+    }
 }
