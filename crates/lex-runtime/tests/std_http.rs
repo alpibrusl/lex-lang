@@ -93,6 +93,28 @@ fn spawn_oneshot(
     port
 }
 
+/// Like `spawn_oneshot`, but waits `delay` before sending the *first*
+/// byte of the response — modelling a slow upstream (e.g. an LLM
+/// cold-loading a model) whose first response byte arrives well after
+/// the connection is established. Used to exercise the `timeout_ms`
+/// budget on slow first responses (#646).
+fn spawn_oneshot_delayed(response: &'static str, delay: std::time::Duration) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        if let Ok((mut s, _)) = listener.accept() {
+            // Drain the request so the client finishes its send phase and
+            // is genuinely blocked waiting for the response.
+            let _ = s.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+            let mut tmp = [0u8; 4096];
+            let _ = s.read(&mut tmp);
+            thread::sleep(delay);
+            let _ = s.write_all(response.as_bytes());
+        }
+    });
+    port
+}
+
 fn err_variant_name(v: &Value) -> Option<&str> {
     match v {
         Value::Variant { name, args } if name == "Err" && !args.is_empty() => match &args[0] {
@@ -587,6 +609,72 @@ fn assert_method_round_trip(method: &str, body: &str, expect_body_on_wire: bool)
             "{method}: expected body {body:?} at end of {captured:?}",
         );
     }
+}
+
+// ---- #646 — timeout_ms governs slow first responses ----------------
+//
+// A response whose first byte is slow to arrive (an LLM cold-loading a
+// model is the motivating case) must be bounded by `timeout_ms`, not by
+// a shorter per-phase default underneath. The agent now applies the
+// caller's budget as a single global timeout so the whole operation —
+// including the wait for the first response byte — gets the full budget.
+
+#[test]
+fn http_send_waits_for_slow_first_response_within_timeout() {
+    // First byte arrives ~600ms after connect; SEND_VIA_RECORD_SRC sets
+    // timeout_ms: Some(2000). 600ms < 2000ms, so the call must succeed
+    // rather than give up early on the slow first response.
+    let port = spawn_oneshot_delayed(
+        "HTTP/1.0 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        std::time::Duration::from_millis(600),
+    );
+    let url = format!("http://127.0.0.1:{port}/slow");
+    let v = run(
+        SEND_VIA_RECORD_SRC,
+        "send",
+        vec![
+            Value::Str("GET".into()),
+            Value::Str(url.into()),
+            Value::Str("".into()),
+        ],
+        allow_net(),
+    );
+    let r = unwrap_ok_record(v);
+    assert_eq!(r.get("status"), Some(&Value::Int(200)));
+    match r.get("body") {
+        Some(Value::Bytes(b)) => assert_eq!(b, b"ok"),
+        other => panic!("body was {other:?}"),
+    }
+}
+
+#[test]
+fn http_send_times_out_when_first_response_exceeds_budget() {
+    // First byte would arrive after ~1.5s, but the budget is 300ms, so
+    // `timeout_ms` is honoured as the upper bound and a TimeoutError is
+    // surfaced rather than hanging or ignoring the budget.
+    let port = spawn_oneshot_delayed(
+        "HTTP/1.0 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        std::time::Duration::from_millis(1500),
+    );
+    let url = format!("http://127.0.0.1:{port}/tooslow");
+    let src = r#"
+import "std.bytes" as bytes
+import "std.http"  as http
+import "std.map"   as map
+
+fn send(u :: Str) -> [net] Result[HttpResponse, HttpError] {
+  let req := {
+    method:     "GET",
+    url:        u,
+    headers:    map.new(),
+    body:       None,
+    timeout_ms: Some(300),
+  }
+  http.send(req)
+}
+"#;
+    let v = run(src, "send", vec![Value::Str(url.into())], allow_net());
+    assert_eq!(err_variant_name(&v), Some("TimeoutError"));
 }
 
 #[test]

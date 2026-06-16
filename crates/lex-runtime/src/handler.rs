@@ -3538,18 +3538,30 @@ fn http_stream_agent() -> ureq::Agent {
 /// timeout (None → use the same defaults as the legacy `net.{get,post}`
 /// path). Separate from `http_request` so the rich `http.send` flow
 /// can supply per-request overrides.
+///
+/// When the caller supplies `timeout_ms` we apply it as a single
+/// `timeout_global` covering the whole operation (connect + send + recv)
+/// and drop the per-phase caps — exactly like `http_stream_agent`. A
+/// per-phase cap (notably the bound on waiting for the *first* response
+/// byte) would otherwise fire long before the caller's budget: a slow
+/// first response — e.g. an LLM cold-loading a multi-GB model — then
+/// fails at ~10s even though `timeout_ms` was set to 120000. (#646)
 fn http_agent(timeout_ms: Option<u64>) -> ureq::Agent {
     use std::time::Duration;
-    let mut b = ureq::Agent::config_builder()
-        .timeout_connect(Some(Duration::from_secs(10)))
-        .timeout_recv_body(Some(Duration::from_secs(30)))
-        .timeout_send_body(Some(Duration::from_secs(10)))
-        .http_status_as_error(false);
-    if let Some(ms) = timeout_ms {
-        let d = Duration::from_millis(ms);
-        b = b.timeout_global(Some(d));
+    match timeout_ms {
+        Some(ms) => ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_millis(ms)))
+            .http_status_as_error(false)
+            .build()
+            .into(),
+        None => ureq::Agent::config_builder()
+            .timeout_connect(Some(Duration::from_secs(10)))
+            .timeout_recv_body(Some(Duration::from_secs(30)))
+            .timeout_send_body(Some(Duration::from_secs(10)))
+            .http_status_as_error(false)
+            .build()
+            .into(),
     }
-    b.build().into()
 }
 
 /// Map ureq's transport error to the structured `HttpError` variant
