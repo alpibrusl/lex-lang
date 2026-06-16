@@ -31,6 +31,10 @@ pub enum StoreError {
     InvalidTransition(String),
     #[error("unknown branch `{0}`")]
     UnknownBranch(String),
+    #[error("unknown blob `{0}`")]
+    UnknownBlob(String),
+    #[error("unknown blob ref `{namespace}/{key}`")]
+    UnknownBlobRef { namespace: String, key: String },
     #[error("unknown op_id `{0}`")]
     UnknownOp(lex_vcs::OpId),
     /// A typed AST transform (#280) — e.g. `ReplaceMatchArm` — was
@@ -153,6 +157,141 @@ impl Store {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    // ── Generic content-addressed blobs (#5 / M6.1) ──────────────────────────
+    //
+    // The stage store holds typed Lex ASTs; loom-style artifacts (generated
+    // code, JSON, prose) are opaque text. These blob methods give the store a
+    // generic content-addressed object alongside stages, plus a lightweight
+    // ref namespace so callers can bind names (e.g. a sprint's node ids) to
+    // blob shas without touching the operation-log branch machinery.
+    //
+    // The sha is the lowercase hex SHA-256 of the content's UTF-8 bytes —
+    // identical to Lex's `crypto.sha256_str`, so a blob written here and an
+    // artifact content-addressed in loom's SQLite store share the same id and
+    // are interchangeable by reference. Store-scoped, so under lex-hub each
+    // tenant store gets its own blob space for free.
+
+    fn blobs_dir(&self) -> PathBuf {
+        self.root.join("blobs")
+    }
+
+    fn blob_refs_dir(&self) -> PathBuf {
+        self.root.join("blobrefs")
+    }
+
+    /// Content-address `content` and persist it under `<root>/blobs/<sha>`.
+    /// Returns the sha. Idempotent: re-putting identical content is a no-op.
+    /// Concurrency-safe — writes to a unique temp file then atomically renames
+    /// onto the content-addressed path, so parallel writers of the same content
+    /// can't corrupt it.
+    pub fn put_blob(&self, content: &str) -> Result<String, StoreError> {
+        use sha2::{Digest, Sha256};
+        let sha = hex::encode(Sha256::digest(content.as_bytes()));
+        let dir = self.blobs_dir();
+        let path = dir.join(&sha);
+        if path.exists() {
+            return Ok(sha);
+        }
+        fs::create_dir_all(&dir)?;
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = dir.join(format!(".{sha}.{}.{n}.tmp", std::process::id()));
+        fs::write(&tmp, content.as_bytes())?;
+        // rename is atomic on the same filesystem; identical content makes a
+        // last-writer-wins race harmless.
+        fs::rename(&tmp, &path)?;
+        Ok(sha)
+    }
+
+    /// Read a blob by its sha. `UnknownBlob` if absent.
+    pub fn get_blob(&self, sha: &str) -> Result<String, StoreError> {
+        match fs::read_to_string(self.blobs_dir().join(sha)) {
+            Ok(s) => Ok(s),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(StoreError::UnknownBlob(sha.to_string()))
+            }
+            Err(e) => Err(StoreError::Io(e)),
+        }
+    }
+
+    /// Whether a blob with this sha exists.
+    pub fn has_blob(&self, sha: &str) -> bool {
+        self.blobs_dir().join(sha).exists()
+    }
+
+    /// Bind `key` to a blob `sha` within `namespace` (e.g. namespace
+    /// `"loom/sprint-abc"`, key `"build-node"`). Overwrites an existing
+    /// binding. The namespace may contain `/`; neither namespace nor key may
+    /// contain a `..` path component.
+    pub fn set_blob_ref(&self, namespace: &str, key: &str, sha: &str) -> Result<(), StoreError> {
+        let dir = self.blob_ref_namespace_dir(namespace, key)?;
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join(key), sha.as_bytes())?;
+        Ok(())
+    }
+
+    /// Resolve `namespace`/`key` to a blob sha. `UnknownBlobRef` if unbound.
+    pub fn get_blob_ref(&self, namespace: &str, key: &str) -> Result<String, StoreError> {
+        let dir = self.blob_ref_namespace_dir(namespace, key)?;
+        match fs::read_to_string(dir.join(key)) {
+            Ok(s) => Ok(s.trim().to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(StoreError::UnknownBlobRef {
+                namespace: namespace.to_string(),
+                key: key.to_string(),
+            }),
+            Err(e) => Err(StoreError::Io(e)),
+        }
+    }
+
+    /// All `key → sha` bindings in a namespace (e.g. every artifact in a
+    /// sprint). Empty map if the namespace has no bindings yet.
+    pub fn list_blob_refs(
+        &self,
+        namespace: &str,
+    ) -> Result<std::collections::BTreeMap<String, String>, StoreError> {
+        let dir = self.blob_ref_namespace_dir(namespace, "x")?;
+        let mut out = std::collections::BTreeMap::new();
+        let entries = match fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(StoreError::Io(e)),
+        };
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                let key = entry.file_name().to_string_lossy().to_string();
+                let sha = fs::read_to_string(entry.path())?.trim().to_string();
+                out.insert(key, sha);
+            }
+        }
+        Ok(out)
+    }
+
+    // Resolve the on-disk dir for a (namespace, key), rejecting `..` traversal
+    // and `/` in the key. `key` is validated but not joined here (callers join
+    // it themselves so `list_blob_refs` can pass a dummy).
+    fn blob_ref_namespace_dir(&self, namespace: &str, key: &str) -> Result<PathBuf, StoreError> {
+        if key.contains('/') || key.contains('\\') || key.split('/').any(|c| c == "..") {
+            return Err(StoreError::UnknownBlobRef {
+                namespace: namespace.to_string(),
+                key: key.to_string(),
+            });
+        }
+        let mut dir = self.blob_refs_dir();
+        for comp in namespace.split('/') {
+            if comp == ".." || comp.contains('\\') {
+                return Err(StoreError::UnknownBlobRef {
+                    namespace: namespace.to_string(),
+                    key: key.to_string(),
+                });
+            }
+            if !comp.is_empty() {
+                dir.push(comp);
+            }
+        }
+        Ok(dir)
     }
 
     fn now() -> u64 {
