@@ -113,6 +113,38 @@ pub fn serve_ws(
     Ok(Value::Unit)
 }
 
+/// Classify a tungstenite handshake outcome, dropping bare TCP probes
+/// silently instead of treating them as connection errors.
+///
+/// `HandshakeError::Failure(Error::Protocol(ProtocolError::HandshakeIncomplete))`
+/// is what tungstenite returns when a peer opens a TCP connection and
+/// closes it without sending a complete HTTP upgrade — i.e. a bare TCP
+/// liveness probe such as a Docker healthcheck running
+/// `echo > /dev/tcp/host/port`. That is a probe, not a misbehaving
+/// client, so logging an error for each one floods the logs at the
+/// healthcheck interval. Returns `Ok(Some(ws))` for a completed
+/// handshake, `Ok(None)` for such a probe (caller returns cleanly), and
+/// `Err(msg)` for a genuine handshake failure. (#624)
+fn accept_or_drop_probe<Cb>(
+    result: Result<
+        tungstenite::WebSocket<std::net::TcpStream>,
+        tungstenite::HandshakeError<
+            tungstenite::handshake::server::ServerHandshake<std::net::TcpStream, Cb>,
+        >,
+    >,
+) -> Result<Option<tungstenite::WebSocket<std::net::TcpStream>>, String>
+where
+    Cb: tungstenite::handshake::server::Callback,
+{
+    match result {
+        Ok(ws) => Ok(Some(ws)),
+        Err(tungstenite::HandshakeError::Failure(tungstenite::Error::Protocol(
+            tungstenite::error::ProtocolError::HandshakeIncomplete,
+        ))) => Ok(None),
+        Err(e) => Err(format!("ws handshake: {e}")),
+    }
+}
+
 fn handle_connection(
     stream: std::net::TcpStream,
     program: Arc<Program>,
@@ -125,10 +157,14 @@ fn handle_connection(
     // Capture the request path during the handshake — used as the room name.
     let mut path = String::new();
     let path_ref = &mut path;
-    let mut ws = accept_hdr(stream, |req: &Request, resp: Response| {
+    let accepted = accept_hdr(stream, |req: &Request, resp: Response| {
         *path_ref = req.uri().path().to_string();
         Ok(resp)
-    }).map_err(|e| format!("ws handshake: {e}"))?;
+    });
+    let mut ws = match accept_or_drop_probe(accepted)? {
+        Some(ws) => ws,
+        None => return Ok(()), // bare TCP probe — dropped silently
+    };
 
     let room = path.trim_start_matches('/').to_string();
 
@@ -331,11 +367,15 @@ fn handle_connection_fn(
     let mut path = String::new();
     let path_ref = &mut path;
     let subproto_for_handshake = subprotocol.clone();
-    let mut ws = accept_hdr(stream, |req: &Request, mut resp: Response| {
+    let accepted = accept_hdr(stream, |req: &Request, mut resp: Response| {
         *path_ref = req.uri().path().to_string();
         maybe_echo_subprotocol(req, &mut resp, &subproto_for_handshake);
         Ok(resp)
-    }).map_err(|e| format!("ws handshake: {e}"))?;
+    });
+    let mut ws = match accept_or_drop_probe(accepted)? {
+        Some(ws) => ws,
+        None => return Ok(()), // bare TCP probe — dropped silently
+    };
 
     let (tx, rx) = mpsc::channel::<String>();
     let conn_id = registry.register(path.trim_start_matches('/').to_string(), tx);
@@ -493,7 +533,7 @@ fn handle_connection_fn_auth(
     let auth_registry = Arc::clone(&registry);
     let auth_closure_for_cb = auth_closure;
 
-    let mut ws = accept_hdr(stream, move |req: &Request, mut resp: Response| {
+    let accepted = accept_hdr(stream, move |req: &Request, mut resp: Response| {
         *path_ref = req.uri().path().to_string();
 
         let headers_value = build_headers_value(req);
@@ -539,7 +579,11 @@ fn handle_connection_fn_auth(
                 Err(err)
             }
         }
-    }).map_err(|e| format!("ws handshake: {e}"))?;
+    });
+    let mut ws = match accept_or_drop_probe(accepted)? {
+        Some(ws) => ws,
+        None => return Ok(()), // bare TCP probe — dropped silently
+    };
 
     let (tx, rx) = mpsc::channel::<String>();
     let conn_id = registry.register(path.trim_start_matches('/').to_string(), tx);
@@ -753,11 +797,15 @@ fn handle_connection_fn_actor(
     let mut path = String::new();
     let path_ref = &mut path;
     let subproto_for_handshake = subprotocol.clone();
-    let mut ws = accept_hdr(stream, |req: &Request, mut resp: Response| {
+    let accepted = accept_hdr(stream, |req: &Request, mut resp: Response| {
         *path_ref = req.uri().path().to_string();
         maybe_echo_subprotocol(req, &mut resp, &subproto_for_handshake);
         Ok(resp)
-    }).map_err(|e| format!("ws handshake: {e}"))?;
+    });
+    let mut ws = match accept_or_drop_probe(accepted)? {
+        Some(ws) => ws,
+        None => return Ok(()), // bare TCP probe — dropped silently
+    };
 
     let (tx, rx) = mpsc::channel::<String>();
     let conn_id = registry.register(path.trim_start_matches('/').to_string(), tx.clone());
@@ -1219,5 +1267,37 @@ fn dial_run_loop(
                 Err(e) => return Err(format!("net.dial_ws: on_message: {e}")),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::accept_or_drop_probe;
+    use tungstenite::handshake::server::{NoCallback, ServerHandshake};
+    use tungstenite::{error::ProtocolError, Error, HandshakeError, WebSocket};
+
+    type ProbeResult = Result<
+        WebSocket<std::net::TcpStream>,
+        HandshakeError<ServerHandshake<std::net::TcpStream, NoCallback>>,
+    >;
+
+    /// A bare TCP probe (open + close without completing the HTTP
+    /// upgrade) surfaces as `HandshakeIncomplete` and must be dropped
+    /// silently — `Ok(None)`, so the caller returns cleanly with no
+    /// logged connection error. (#624)
+    #[test]
+    fn handshake_incomplete_is_dropped_as_probe() {
+        let probe: ProbeResult = Err(HandshakeError::Failure(Error::Protocol(
+            ProtocolError::HandshakeIncomplete,
+        )));
+        assert!(matches!(accept_or_drop_probe(probe), Ok(None)));
+    }
+
+    /// A genuine handshake failure is still surfaced as an error so it
+    /// is logged as a connection error.
+    #[test]
+    fn genuine_handshake_failure_is_surfaced() {
+        let failure: ProbeResult = Err(HandshakeError::Failure(Error::ConnectionClosed));
+        assert!(matches!(accept_or_drop_probe(failure), Err(_)));
     }
 }
