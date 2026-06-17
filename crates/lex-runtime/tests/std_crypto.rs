@@ -343,3 +343,139 @@ fn ed25519_public_key_rejects_bad_length() {
         other => panic!("expected Result, got {other:?}"),
     }
 }
+
+// ─── P-256 ECDSA / ES256 (#651) ──────────────────────────────────────────────
+const P256_SRC: &str = r#"
+import "std.crypto" as crypto
+
+# generate -> sign -> verify round-trip, returns Ok(true) on success.
+fn mint() -> [random] Result[Bytes, Str] { crypto.p256_generate() }
+
+fn pub_of(secret :: Bytes) -> Result[Bytes, Str] { crypto.p256_public_key(secret) }
+
+fn roundtrip(secret :: Bytes, msg :: Bytes) -> Bool {
+  match crypto.p256_public_key(secret) {
+    Err(_) => false,
+    Ok(pk) => match crypto.p256_sign(secret, msg) {
+      Err(_) => false,
+      Ok(sig) => crypto.p256_verify(pk, msg, sig),
+    },
+  }
+}
+fn wrong_msg(secret :: Bytes, msg :: Bytes, other :: Bytes) -> Bool {
+  match crypto.p256_public_key(secret) {
+    Err(_) => false,
+    Ok(pk) => match crypto.p256_sign(secret, msg) {
+      Err(_) => false,
+      Ok(sig) => crypto.p256_verify(pk, other, sig),
+    },
+  }
+}
+fn sign_of(secret :: Bytes, msg :: Bytes) -> Result[Bytes, Str] {
+  crypto.p256_sign(secret, msg)
+}
+"#;
+
+// A fixed, valid 32-byte P-256 scalar (NIST test vector private key).
+fn p256_test_secret() -> Vec<u8> {
+    // 0xC9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721
+    hex::decode("c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721")
+        .expect("valid hex")
+}
+
+#[test]
+fn p256_generate_returns_32_byte_secret() {
+    let v = run_with_policy(P256_SRC, "mint", vec![], random_policy());
+    match v {
+        Value::Variant { name, args } if name == "Ok" => match &args[0] {
+            Value::Bytes(b) => assert_eq!(b.len(), 32, "P-256 secret scalar is 32 bytes"),
+            other => panic!("expected Bytes, got {other:?}"),
+        },
+        other => panic!("expected Ok(Bytes), got {other:?}"),
+    }
+}
+
+#[test]
+fn p256_generate_two_calls_differ() {
+    let mint = || match run_with_policy(P256_SRC, "mint", vec![], random_policy()) {
+        Value::Variant { name, args } if name == "Ok" => bytes(args.into_iter().next().unwrap()),
+        other => panic!("expected Ok, got {other:?}"),
+    };
+    assert_ne!(mint(), mint(), "fresh keys must differ");
+}
+
+#[test]
+fn p256_public_key_is_33_byte_compressed_point() {
+    let v = run(P256_SRC, "pub_of", vec![Value::Bytes(p256_test_secret())]);
+    match v {
+        Value::Variant { name, args } if name == "Ok" => match &args[0] {
+            Value::Bytes(b) => {
+                assert_eq!(b.len(), 33, "SEC1 compressed point is 33 bytes");
+                // Compressed points start with 0x02 or 0x03.
+                assert!(b[0] == 0x02 || b[0] == 0x03, "leading byte tags y-parity");
+            }
+            other => panic!("expected Bytes, got {other:?}"),
+        },
+        other => panic!("expected Ok(Bytes), got {other:?}"),
+    }
+}
+
+#[test]
+fn p256_sign_verify_roundtrip() {
+    let secret = p256_test_secret();
+    let msg = b"checkout mandate: pay 42.00 USD".to_vec();
+    let ok = run(P256_SRC, "roundtrip",
+        vec![Value::Bytes(secret), Value::Bytes(msg)]);
+    assert!(is_true(ok), "valid ES256 signature must verify");
+}
+
+#[test]
+fn p256_rejects_wrong_message() {
+    let secret = p256_test_secret();
+    let msg = b"transfer 100".to_vec();
+    let other = b"transfer 9999".to_vec();
+    let bad = run(P256_SRC, "wrong_msg",
+        vec![Value::Bytes(secret), Value::Bytes(msg), Value::Bytes(other)]);
+    assert!(!is_true(bad), "signature must not verify for a different message");
+}
+
+#[test]
+fn p256_signature_is_der_encoded() {
+    let v = run(P256_SRC, "sign_of",
+        vec![Value::Bytes(p256_test_secret()), Value::Bytes(b"hi".to_vec())]);
+    match v {
+        Value::Variant { name, args } if name == "Ok" => match &args[0] {
+            // DER SEQUENCE of two INTEGERs: leading tag 0x30, and a
+            // P-256 signature DER-encodes to roughly 70-72 bytes.
+            Value::Bytes(b) => {
+                assert_eq!(b[0], 0x30, "DER signature starts with SEQUENCE tag");
+                assert!((68..=72).contains(&b.len()), "P-256 DER sig is ~70 bytes, got {}", b.len());
+            }
+            other => panic!("expected Bytes, got {other:?}"),
+        },
+        other => panic!("expected Ok(Bytes), got {other:?}"),
+    }
+}
+
+#[test]
+fn p256_public_key_rejects_bad_length() {
+    let v = run(P256_SRC, "pub_of", vec![Value::Bytes(vec![1u8; 10])]);
+    match v {
+        Value::Variant { name, .. } => assert_eq!(name, "Err", "10-byte secret must Err"),
+        other => panic!("expected Result, got {other:?}"),
+    }
+}
+
+#[test]
+fn p256_generate_without_grant_is_rejected_by_static_policy_walk() {
+    use lex_runtime::policy::check_program;
+    let prog = parse_source(P256_SRC).expect("parse");
+    let stages = canonicalize_program(&prog);
+    lex_types::check_program(&stages).expect("type-check");
+    let bc = compile_program(&stages);
+    let policy = Policy::pure(); // no [random] grant
+    assert!(
+        check_program(&bc, &policy).is_err(),
+        "expected static policy walk to reject p256_generate's [random] without grant"
+    );
+}

@@ -1736,6 +1736,47 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::empty(),
                 Ty::bool(),
             ));
+            // P-256 ECDSA / ES256 (#651). The JWT/SD-JWT signature
+            // algorithm for AP2 agent keys; `lex-jose` builds the
+            // token layer on top of these primitives. Key bytes are
+            // raw: a secret key is the 32-byte scalar, a public key is
+            // the 33-byte SEC1 compressed point; JWK serialization
+            // lives downstream in `lex-jose`.
+            //
+            //   p256_generate()                       -> [random] Result[Bytes, Str]
+            //   p256_public_key(sk :: Bytes)          -> Result[Bytes, Str]
+            //   p256_sign(sk :: Bytes, msg :: Bytes)  -> Result[Bytes, Str]
+            //   p256_verify(pk :: Bytes, msg :: Bytes, sig :: Bytes) -> Bool
+            //
+            // `p256_generate` mints fresh key material from the OS RNG,
+            // so it carries the same fine-grained `[random]` effect as
+            // `crypto.random` — every key-minting call stays visible to
+            // `lex audit --effect random`. (The issue sketched `[env]`;
+            // `[random]` is the dedicated effect for OS randomness in
+            // this codebase, so we use that for consistency.)
+            // `sign`/`verify` are pure: signing hashes `msg` with
+            // SHA-256 internally (standard ES256) and the signature is
+            // DER-encoded.
+            fields.insert("p256_generate".into(), Ty::function(
+                vec![],
+                EffectSet::singleton("random"),
+                Ty::Con("Result".into(), vec![Ty::bytes(), Ty::str()]),
+            ));
+            fields.insert("p256_public_key".into(), Ty::function(
+                vec![Ty::bytes()],
+                EffectSet::empty(),
+                Ty::Con("Result".into(), vec![Ty::bytes(), Ty::str()]),
+            ));
+            fields.insert("p256_sign".into(), Ty::function(
+                vec![Ty::bytes(), Ty::bytes()],
+                EffectSet::empty(),
+                Ty::Con("Result".into(), vec![Ty::bytes(), Ty::str()]),
+            ));
+            fields.insert("p256_verify".into(), Ty::function(
+                vec![Ty::bytes(), Ty::bytes(), Ty::bytes()],
+                EffectSet::empty(),
+                Ty::bool(),
+            ));
             // base64 / hex
             fields.insert("base64_encode".into(), Ty::function(
                 vec![Ty::bytes()], EffectSet::empty(), Ty::str()));

@@ -7,6 +7,26 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added
+
+- **P-256 ECDSA (ES256) in `std.crypto` (#651).** Four new primitives complete
+  the JWT/SD-JWT signing surface that `lex-jose` (and AP2 Checkout/Payment
+  Mandates) needs:
+  - `crypto.p256_generate() -> [random] Result[Bytes, Str]` — mint a fresh
+    secret key (32-byte scalar) from the OS RNG. Carries the same `[random]`
+    effect as `crypto.random`, so key minting stays visible to
+    `lex audit --effect random`. (The issue sketched `[env]`; `[random]` is the
+    dedicated OS-randomness effect in this codebase.)
+  - `crypto.p256_public_key(sk :: Bytes) -> Result[Bytes, Str]` — derive the
+    33-byte SEC1 compressed public point.
+  - `crypto.p256_sign(sk :: Bytes, msg :: Bytes) -> Result[Bytes, Str]` — sign
+    `msg` (SHA-256 applied internally, per ES256); returns a DER-encoded
+    signature.
+  - `crypto.p256_verify(pk :: Bytes, msg :: Bytes, sig :: Bytes) -> Bool`.
+
+  Keys and signatures are raw bytes; JWK/PEM serialization is left to the
+  downstream `lex-jose` package. Backed by the RustCrypto `p256` crate.
+
 ## [0.9.9] — 2026-06-08
 
 ### Fixed

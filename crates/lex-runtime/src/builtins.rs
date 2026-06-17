@@ -15,6 +15,9 @@ pub fn is_pure_call(kind: &str, op: &str) -> bool {
         (kind, op),
         ("crypto", "random")
         | ("crypto", "random_str_hex")
+        // p256_generate mints key material from the OS RNG → [random]
+        // effect, handled on the effect path (#651).
+        | ("crypto", "p256_generate")
         | ("datetime", "now")
         | ("http", "send")
         | ("http", "get")
@@ -1139,6 +1142,55 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                 Err(_) => return Ok(Value::Bool(false)),
             };
             let sig = Signature::from_bytes(&sig_arr);
+            Ok(Value::Bool(vk.verify(message, &sig).is_ok()))
+        }
+        // P-256 ECDSA / ES256 (#651). Backs the JWT/SD-JWT signing
+        // primitives `lex-jose` needs for AP2 mandates. Key minting
+        // (`p256_generate`) is effectful (`[random]`) and lives in the
+        // handler; these three ops are deterministic given their inputs.
+        //
+        // - Secret key: 32-byte scalar (`SigningKey::to_bytes`).
+        // - Public key: 33-byte SEC1 *compressed* point.
+        // - Signature: ASN.1 DER-encoded (standard for ES256/JOSE
+        //   producers that emit DER; JWK/raw-r||s conversion is a
+        //   `lex-jose` concern).
+        // Signing hashes `msg` with SHA-256 internally (ES256).
+        ("crypto", "p256_public_key") => {
+            use p256::ecdsa::SigningKey;
+            let secret = expect_bytes(args.first())?;
+            let sk = match SigningKey::from_slice(secret) {
+                Ok(k)  => k,
+                Err(_) => return Ok(err_v(Value::Str(
+                    "p256_public_key: secret must be a 32-byte P-256 scalar".into()))),
+            };
+            let point = sk.verifying_key().to_encoded_point(true);
+            Ok(ok_v(Value::Bytes(point.as_bytes().to_vec())))
+        }
+        ("crypto", "p256_sign") => {
+            use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+            let secret = expect_bytes(args.first())?;
+            let message = expect_bytes(args.get(1))?;
+            let sk = match SigningKey::from_slice(secret) {
+                Ok(k)  => k,
+                Err(_) => return Ok(err_v(Value::Str(
+                    "p256_sign: secret must be a 32-byte P-256 scalar".into()))),
+            };
+            let sig: Signature = sk.sign(message);
+            Ok(ok_v(Value::Bytes(sig.to_der().as_bytes().to_vec())))
+        }
+        ("crypto", "p256_verify") => {
+            use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+            let public = expect_bytes(args.first())?;
+            let message = expect_bytes(args.get(1))?;
+            let sig_bytes = expect_bytes(args.get(2))?;
+            let vk = match VerifyingKey::from_sec1_bytes(public) {
+                Ok(v)  => v,
+                Err(_) => return Ok(Value::Bool(false)),
+            };
+            let sig = match Signature::from_der(sig_bytes) {
+                Ok(s)  => s,
+                Err(_) => return Ok(Value::Bool(false)),
+            };
             Ok(Value::Bool(vk.verify(message, &sig).is_ok()))
         }
         ("crypto", "base64_encode") => {

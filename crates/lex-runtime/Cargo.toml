@@ -18,6 +18,10 @@ indexmap.workspace = true
 sha2.workspace = true
 hmac = "0.13"
 ed25519-dalek = "2"
+# P-256 ECDSA / ES256 for std.crypto (#651) — JWT / SD-JWT / AP2 signing.
+# `ecdsa` feature brings sign/verify + DER; `pem` is intentionally off
+# (JWK/PEM serialization lives in the downstream `lex-jose` package).
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 blake2 = "0.10"
 aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
