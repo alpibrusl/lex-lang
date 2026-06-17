@@ -271,6 +271,16 @@ fn run(url :: Str) -> [net, time, concurrent] Result[Unit, Str] {
 ### `std.crypto`
 `hash`, `random` — `random` requires `[random]` effect.
 
+Asymmetric signatures:
+- Ed25519: `ed25519_public_key`, `ed25519_sign`, `ed25519_verify` (raw 32-byte
+  keys, 64-byte signatures; all pure).
+- P-256 / ES256 (#651): `p256_generate :: () -> [random] Result[Bytes, Str]`
+  (mints a 32-byte secret scalar — `[random]` effect, like `crypto.random`),
+  `p256_public_key :: Bytes -> Result[Bytes, Str]` (33-byte SEC1 compressed
+  point), `p256_sign :: (Bytes, Bytes) -> Result[Bytes, Str]` (SHA-256 applied
+  internally; DER-encoded signature), `p256_verify :: (Bytes, Bytes, Bytes) ->
+  Bool`. JWK/PEM serialization lives in the downstream `lex-jose` package.
+
 ### `std.arrow`
 Apache Arrow `RecordBatch` as a first-class `Value::ArrowTable`. Column
 reductions and slicing run as one Rust call over the flat buffer, bypassing

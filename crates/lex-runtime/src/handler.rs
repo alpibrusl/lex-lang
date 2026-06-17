@@ -807,6 +807,33 @@ impl EffectHandler for DefaultHandler {
                 .map_err(|e| format!("crypto.random_str_hex: OS RNG: {e}"))?;
             return Ok(Value::Str(hex::encode(&buf).into()));
         }
+        // crypto.p256_generate() — mint a fresh P-256 (ES256) secret
+        // key from the OS RNG (#651). Returns the 32-byte scalar as
+        // `Ok(Bytes)`. Same `[random]` gate as `crypto.random`: key
+        // minting stays visible to `lex audit --effect random`.
+        //
+        // We sample 32 bytes and let `SigningKey::from_slice` reject
+        // the (vanishingly rare, ~2^-32) out-of-range scalar rather
+        // than pulling in p256's own `rand_core` — that crate is on a
+        // different `rand_core` major than the workspace `rand`, so
+        // bridging RNG traits here would mean an extra dependency for
+        // no behavioural gain. Retry a handful of times so a one-in-
+        // four-billion miss never surfaces as a spurious `Err`.
+        if kind == "crypto" && op == "p256_generate" {
+            self.ensure_kind_allowed("random")?;
+            use p256::ecdsa::SigningKey;
+            use rand::{rngs::SysRng, TryRng};
+            for _ in 0..16 {
+                let mut buf = [0u8; 32];
+                SysRng.try_fill_bytes(&mut buf)
+                    .map_err(|e| format!("crypto.p256_generate: OS RNG: {e}"))?;
+                if let Ok(sk) = SigningKey::from_slice(&buf) {
+                    return Ok(ok(Value::Bytes(sk.to_bytes().to_vec())));
+                }
+            }
+            return Ok(err(Value::Str(
+                "crypto.p256_generate: failed to sample a valid scalar".into())));
+        }
         // `std.http` wire ops (send/get/post) gate on the `net`
         // effect kind, not the module name. This matches the
         // declared signature (`http.get :: Str -> [net] ...`) and
