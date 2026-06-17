@@ -112,11 +112,22 @@ fn page(title: &str, current: &str, body: &str) -> String {
     )
 }
 
+/// HTML-escape store-derived text before interpolating it into markup.
+///
+/// **Contract:** every dynamic (client- or store-supplied) value that
+/// reaches HTML — text nodes *and* quoted attribute values — must pass
+/// through `esc()`. Numeric values (`u64` timestamps/counts) and
+/// `&'static str` labels are safe as-is. Escapes the full OWASP set for
+/// quoted-attribute and text contexts (`& < > " '`), so a value is safe
+/// in both `"…"` and `'…'` attributes. Do not interpolate unescaped data
+/// into unquoted attributes, `<script>`/`<style>`, event handlers, or
+/// `javascript:` URLs — `esc()` does not make those contexts safe.
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 // ---- Activity stream (`GET /`) -----------------------------------
@@ -902,5 +913,15 @@ mod xss_tests {
     #[test]
     fn esc_covers_html_metacharacters() {
         assert_eq!(esc(r#"<a href="x">&y"#), "&lt;a href=&quot;x&quot;&gt;&amp;y");
+    }
+
+    #[test]
+    fn esc_escapes_single_quote() {
+        // Single quotes are escaped too, so an esc()'d value is safe in
+        // both double- and single-quoted attribute contexts. A store
+        // value like `' onmouseover='alert(1)` cannot close a
+        // single-quoted attribute and inject an event handler.
+        assert_eq!(esc("' onmouseover='x"), "&#39; onmouseover=&#39;x");
+        assert!(!esc("a'b").contains('\''));
     }
 }
