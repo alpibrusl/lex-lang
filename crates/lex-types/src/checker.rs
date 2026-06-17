@@ -456,6 +456,12 @@ struct Checker {
     /// this side-table keeps the pre-stripped `TypeExpr` available
     /// for static discharge of literal arguments.
     fn_params: IndexMap<String, Vec<a::Param>>,
+    /// Errors recovered from independent sub-expressions within a
+    /// function body (discarded `Block` statements, `Let` binding
+    /// values) so a single `lex check` run surfaces every independent
+    /// error instead of stopping at the first (#566). Drained by
+    /// `check_fn` after each body/example check.
+    recovered_errors: Vec<TypeError>,
 }
 
 impl Checker {
@@ -467,6 +473,30 @@ impl Checker {
             module_aliases: IndexMap::new(),
             pending_parse_calls: Vec::new(),
             fn_params: IndexMap::new(),
+            recovered_errors: Vec::new(),
+        }
+    }
+
+    /// Check an independent sub-expression but, on error, record it and
+    /// continue with a fresh type variable rather than aborting the whole
+    /// body. Used for positions whose result type does not flow into a
+    /// strict constraint — a discarded `Block` statement, or a `Let`
+    /// binding's value — so `check_fn` can surface every independent error
+    /// in one pass (#566). A fresh var unifies with anything, so recovery
+    /// does not manufacture spurious follow-on mismatches.
+    fn check_expr_recover(
+        &mut self,
+        e: &a::CExpr,
+        node_id: &str,
+        locals: &mut IndexMap<String, Ty>,
+        effs: &mut EffectSet,
+    ) -> Ty {
+        match self.check_expr(e, node_id, locals, effs) {
+            Ok(ty) => ty,
+            Err(err) => {
+                self.recovered_errors.push(err);
+                self.u.fresh()
+            }
         }
     }
 
@@ -689,7 +719,17 @@ impl Checker {
             Err(e) => { errors.push(e); false }
         };
 
-        if body_ok && !inferred_effects.is_subset(&declared_effects) {
+        // Surface errors recovered from independent positions in the body
+        // (discarded `Block` statements, `Let` values) so every independent
+        // error is reported in one pass (#566), not just the first.
+        let body_had_recovered = !self.recovered_errors.is_empty();
+        errors.append(&mut self.recovered_errors);
+
+        // Skip the effect-not-declared check when the body had recovered
+        // errors: effect inference is incomplete (recovered sub-exprs became
+        // fresh vars that contribute no effects), so a missing/extra effect
+        // would be misleading noise next to the real errors.
+        if body_ok && !body_had_recovered && !inferred_effects.is_subset(&declared_effects) {
             for e in inferred_effects.concrete.iter() {
                 if !declared_effects.concrete.iter().any(|d| d.subsumes(e)) {
                     errors.push(TypeError::EffectNotDeclared {
@@ -769,6 +809,8 @@ impl Checker {
             }
         }
 
+        // Catch any errors recovered while checking example sub-expressions.
+        errors.append(&mut self.recovered_errors);
         if errors.is_empty() { Ok(scheme) } else { Err(errors) }
     }
 
@@ -793,7 +835,10 @@ impl Checker {
             a::CExpr::Constructor { name, args } => self.check_constructor(name, args, node_id, locals, effs),
             a::CExpr::Call { callee, args } => self.check_call(e, callee, args, node_id, locals, effs),
             a::CExpr::Let { name, ty, value, body } => {
-                let v_ty = self.check_expr(value, node_id, locals, effs)?;
+                // Recover if the bound value fails to check: record the error
+                // and bind the name to a fresh var so the `let` body (which
+                // may hold further independent errors) is still checked (#566).
+                let v_ty = self.check_expr_recover(value, node_id, locals, effs);
                 if let Some(declared) = ty {
                     let d = ty_from_canon_env(declared, &[], &self.type_env);
                     if let Err(err) = self.unify_with_record_coercion(&v_ty, &d) {
@@ -827,8 +872,11 @@ impl Checker {
                 Ok(result_ty)
             }
             a::CExpr::Block { statements, result } => {
+                // Each statement's value is discarded, so an error in one
+                // doesn't feed a later type — recover and keep checking the
+                // rest so every independent error surfaces in one pass (#566).
                 for s in statements {
-                    self.check_expr(s, node_id, locals, effs)?;
+                    let _ = self.check_expr_recover(s, node_id, locals, effs);
                 }
                 self.check_expr(result, node_id, locals, effs)
             }
