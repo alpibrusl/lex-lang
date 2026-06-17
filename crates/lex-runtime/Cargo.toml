@@ -68,7 +68,7 @@ arrow-select = "58"
 arrow-arith = "58"
 arrow-cast = "58"
 arrow-csv = "58"
-parquet = { version = "58", default-features = false, features = ["arrow", "snap"] }
+parquet = { version = "59", default-features = false, features = ["arrow", "snap"] }
 # polars 0.53 split the previously-transitive `polars-time` dep out of
 # `strings`; add `temporal` explicitly so `strings`'s string ops still
 # compile. Found the hard way during the arrow-55→58 / polars-0.50→0.53
