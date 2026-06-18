@@ -280,6 +280,19 @@ Asymmetric signatures:
   point), `p256_sign :: (Bytes, Bytes) -> Result[Bytes, Str]` (SHA-256 applied
   internally; DER-encoded signature), `p256_verify :: (Bytes, Bytes, Bytes) ->
   Bool`. JWK/PEM serialization lives in the downstream `lex-jose` package.
+- secp256k1 / EVM (#655): the Ethereum curve, for EIP-712 typed-data signing
+  (EIP-3009 / x402 `exact`). `keccak256 :: Bytes -> Bytes` (Ethereum's hash,
+  not SHA3-256), `secp256k1_generate :: () -> [random] Result[Bytes, Str]`
+  (32-byte secret scalar), `secp256k1_public_key :: Bytes -> Result[Bytes, Str]`
+  (65-byte *uncompressed* SEC1 point, so an address is
+  `keccak256(pk[1..])[12..]`), `secp256k1_sign_digest :: (Bytes, Bytes) ->
+  Result[Bytes, Str]` (signs a pre-hashed 32-byte digest — EIP-712 already
+  hashes — returning 65-byte `r‖s‖v`, v ∈ {27,28}, low-S),
+  `secp256k1_recover :: (Bytes, Bytes) -> Result[Bytes, Str]` (recover the
+  65-byte uncompressed pubkey from digest + signature),
+  `secp256k1_verify :: (Bytes, Bytes, Bytes) -> Bool`. EIP-712 struct
+  encoding, EIP-3009 payloads and the facilitator client live in the
+  downstream `lex-x402` package.
 
 ### `std.arrow`
 Apache Arrow `RecordBatch` as a first-class `Value::ArrowTable`. Column

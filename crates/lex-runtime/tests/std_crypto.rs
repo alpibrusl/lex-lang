@@ -479,3 +479,198 @@ fn p256_generate_without_grant_is_rejected_by_static_policy_walk() {
         "expected static policy walk to reject p256_generate's [random] without grant"
     );
 }
+
+// ─── secp256k1 / keccak256 — EVM (EIP-712 / x402) primitives (#655) ───────────
+const SECP_SRC: &str = r#"
+import "std.crypto" as crypto
+
+fn mint() -> [random] Result[Bytes, Str] { crypto.secp256k1_generate() }
+
+fn pub_of(secret :: Bytes) -> Result[Bytes, Str] { crypto.secp256k1_public_key(secret) }
+
+fn keccak(data :: Bytes) -> Bytes { crypto.keccak256(data) }
+
+fn sign_of(secret :: Bytes, digest :: Bytes) -> Result[Bytes, Str] {
+  crypto.secp256k1_sign_digest(secret, digest)
+}
+
+# sign a digest, recover the pubkey, check it matches the signer's pubkey.
+fn recover_matches(secret :: Bytes, digest :: Bytes) -> Bool {
+  match crypto.secp256k1_public_key(secret) {
+    Err(_) => false,
+    Ok(pk) => match crypto.secp256k1_sign_digest(secret, digest) {
+      Err(_) => false,
+      Ok(sig) => match crypto.secp256k1_recover(digest, sig) {
+        Err(_) => false,
+        Ok(rec) => crypto.eq(pk, rec),
+      },
+    },
+  }
+}
+
+fn verify_roundtrip(secret :: Bytes, digest :: Bytes) -> Bool {
+  match crypto.secp256k1_public_key(secret) {
+    Err(_) => false,
+    Ok(pk) => match crypto.secp256k1_sign_digest(secret, digest) {
+      Err(_) => false,
+      Ok(sig) => crypto.secp256k1_verify(pk, digest, sig),
+    },
+  }
+}
+
+fn verify_wrong_digest(secret :: Bytes, digest :: Bytes, other :: Bytes) -> Bool {
+  match crypto.secp256k1_public_key(secret) {
+    Err(_) => false,
+    Ok(pk) => match crypto.secp256k1_sign_digest(secret, digest) {
+      Err(_) => false,
+      Ok(sig) => crypto.secp256k1_verify(pk, other, sig),
+    },
+  }
+}
+"#;
+
+// A fixed, valid 32-byte secp256k1 scalar (the well-known "1" test key's
+// sibling — any in-range scalar works; this is deterministic for the tests).
+fn secp_test_secret() -> Vec<u8> {
+    hex::decode("4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318")
+        .expect("valid hex")
+}
+
+// A fixed 32-byte digest (stands in for an EIP-712 signing digest).
+fn secp_test_digest() -> Vec<u8> {
+    // keccak256("") — a stable 32-byte value; the signer doesn't re-hash.
+    hex::decode("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470")
+        .expect("valid hex")
+}
+
+#[test]
+fn keccak256_empty_matches_known_vector() {
+    // The canonical Keccak-256 of the empty input (Ethereum's hash).
+    let v = run(SECP_SRC, "keccak", vec![Value::Bytes(vec![])]);
+    assert_eq!(
+        hex::encode(bytes(v)),
+        "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+        "keccak256(\"\") must match the Ethereum constant (not SHA3-256)"
+    );
+}
+
+#[test]
+fn keccak256_is_not_sha3_256() {
+    // SHA3-256("") is a000...80a5; Keccak-256 differs in padding. Guard
+    // against accidentally wiring up Sha3_256 instead of Keccak256.
+    let v = run(SECP_SRC, "keccak", vec![Value::Bytes(vec![])]);
+    assert_ne!(
+        hex::encode(bytes(v)),
+        "a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a",
+        "keccak256 must not equal SHA3-256"
+    );
+}
+
+#[test]
+fn secp256k1_generate_returns_32_byte_secret() {
+    let v = run_with_policy(SECP_SRC, "mint", vec![], random_policy());
+    match v {
+        Value::Variant { name, args } if name == "Ok" => match &args[0] {
+            Value::Bytes(b) => assert_eq!(b.len(), 32, "secp256k1 secret scalar is 32 bytes"),
+            other => panic!("expected Bytes, got {other:?}"),
+        },
+        other => panic!("expected Ok(Bytes), got {other:?}"),
+    }
+}
+
+#[test]
+fn secp256k1_generate_two_calls_differ() {
+    let mint = || match run_with_policy(SECP_SRC, "mint", vec![], random_policy()) {
+        Value::Variant { name, args } if name == "Ok" => bytes(args.into_iter().next().unwrap()),
+        other => panic!("expected Ok, got {other:?}"),
+    };
+    assert_ne!(mint(), mint(), "fresh keys must differ");
+}
+
+#[test]
+fn secp256k1_public_key_is_65_byte_uncompressed_point() {
+    let v = run(SECP_SRC, "pub_of", vec![Value::Bytes(secp_test_secret())]);
+    match v {
+        Value::Variant { name, args } if name == "Ok" => match &args[0] {
+            Value::Bytes(b) => {
+                assert_eq!(b.len(), 65, "uncompressed SEC1 point is 65 bytes");
+                assert_eq!(b[0], 0x04, "uncompressed points start with 0x04");
+            }
+            other => panic!("expected Bytes, got {other:?}"),
+        },
+        other => panic!("expected Ok(Bytes), got {other:?}"),
+    }
+}
+
+#[test]
+fn secp256k1_signature_is_65_bytes_with_eth_v() {
+    let v = run(SECP_SRC, "sign_of",
+        vec![Value::Bytes(secp_test_secret()), Value::Bytes(secp_test_digest())]);
+    match v {
+        Value::Variant { name, args } if name == "Ok" => match &args[0] {
+            Value::Bytes(b) => {
+                assert_eq!(b.len(), 65, "r‖s‖v is 65 bytes");
+                assert!(b[64] == 27 || b[64] == 28, "Ethereum v is 27 or 28, got {}", b[64]);
+            }
+            other => panic!("expected Bytes, got {other:?}"),
+        },
+        other => panic!("expected Ok(Bytes), got {other:?}"),
+    }
+}
+
+#[test]
+fn secp256k1_recover_yields_signer_pubkey() {
+    let ok = run(SECP_SRC, "recover_matches",
+        vec![Value::Bytes(secp_test_secret()), Value::Bytes(secp_test_digest())]);
+    assert!(is_true(ok), "recovered pubkey must equal the signer's pubkey");
+}
+
+#[test]
+fn secp256k1_sign_verify_roundtrip() {
+    let ok = run(SECP_SRC, "verify_roundtrip",
+        vec![Value::Bytes(secp_test_secret()), Value::Bytes(secp_test_digest())]);
+    assert!(is_true(ok), "a valid signature must verify against the signer's pubkey");
+}
+
+#[test]
+fn secp256k1_rejects_wrong_digest() {
+    let other = hex::decode(
+        "1111111111111111111111111111111111111111111111111111111111111111").unwrap();
+    let bad = run(SECP_SRC, "verify_wrong_digest",
+        vec![Value::Bytes(secp_test_secret()), Value::Bytes(secp_test_digest()),
+             Value::Bytes(other)]);
+    assert!(!is_true(bad), "signature must not verify against a different digest");
+}
+
+#[test]
+fn secp256k1_sign_digest_rejects_non_32_byte_digest() {
+    let v = run(SECP_SRC, "sign_of",
+        vec![Value::Bytes(secp_test_secret()), Value::Bytes(vec![0u8; 31])]);
+    match v {
+        Value::Variant { name, .. } => assert_eq!(name, "Err", "31-byte digest must Err"),
+        other => panic!("expected Result, got {other:?}"),
+    }
+}
+
+#[test]
+fn secp256k1_public_key_rejects_bad_length() {
+    let v = run(SECP_SRC, "pub_of", vec![Value::Bytes(vec![1u8; 10])]);
+    match v {
+        Value::Variant { name, .. } => assert_eq!(name, "Err", "10-byte secret must Err"),
+        other => panic!("expected Result, got {other:?}"),
+    }
+}
+
+#[test]
+fn secp256k1_generate_without_grant_is_rejected_by_static_policy_walk() {
+    use lex_runtime::policy::check_program;
+    let prog = parse_source(SECP_SRC).expect("parse");
+    let stages = canonicalize_program(&prog);
+    lex_types::check_program(&stages).expect("type-check");
+    let bc = compile_program(&stages);
+    let policy = Policy::pure(); // no [random] grant
+    assert!(
+        check_program(&bc, &policy).is_err(),
+        "expected static policy walk to reject secp256k1_generate's [random] without grant"
+    );
+}

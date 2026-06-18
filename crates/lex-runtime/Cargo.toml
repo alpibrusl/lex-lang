@@ -22,6 +22,13 @@ ed25519-dalek = "2"
 # `ecdsa` feature brings sign/verify + DER; `pem` is intentionally off
 # (JWK/PEM serialization lives in the downstream `lex-jose` package).
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+# secp256k1 ECDSA + public-key recovery for EVM / EIP-712 / x402 signing (#655).
+# `ecdsa` brings sign/verify + recoverable signatures (sign_prehash_recoverable /
+# recover_from_prehash); PEM/JWK serialization stays out (downstream concern).
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+# Keccak-256 (Ethereum padding, distinct from SHA3-256) for EIP-712 / address
+# derivation (#655).
+sha3 = "0.11"
 blake2 = "0.10"
 aes-gcm = "0.10"
 chacha20poly1305 = "0.10"

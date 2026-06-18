@@ -1777,6 +1777,60 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::empty(),
                 Ty::bool(),
             ));
+            // secp256k1 ECDSA + recovery (#655). The EVM curve — backs
+            // EIP-712 typed-data signing (EIP-3009 / x402 `exact`) and
+            // Ethereum address derivation. Unlike `p256_*`/`ed25519_*`,
+            // the sign/verify ops here take a **pre-hashed 32-byte
+            // digest** (EIP-712 already hashes), hence the `_digest`
+            // suffix — they do NOT hash the input again.
+            //
+            // - Secret key: 32-byte scalar.
+            // - Public key: 65-byte UNCOMPRESSED SEC1 point (0x04‖X‖Y),
+            //   so an address is `keccak256(pk[1..])[12..]` with no
+            //   decompression step. (p256 returns compressed; the EVM
+            //   convention is uncompressed.)
+            // - Signature: 65 bytes `r(32)‖s(32)‖v(1)`, v ∈ {27,28}
+            //   (Ethereum), low-S normalized (EIP-2).
+            //
+            //   keccak256(data :: Bytes) -> Bytes
+            //   secp256k1_generate()                          -> [random] Result[Bytes, Str]
+            //   secp256k1_public_key(sk :: Bytes)             -> Result[Bytes, Str]
+            //   secp256k1_sign_digest(sk :: Bytes, digest :: Bytes) -> Result[Bytes, Str]
+            //   secp256k1_recover(digest :: Bytes, sig :: Bytes)    -> Result[Bytes, Str]
+            //   secp256k1_verify(pk :: Bytes, digest :: Bytes, sig :: Bytes) -> Bool
+            //
+            // `secp256k1_generate` mints from the OS RNG, so it carries
+            // the same `[random]` effect as `crypto.random` / `p256_generate`.
+            fields.insert("keccak256".into(), Ty::function(
+                vec![Ty::bytes()],
+                EffectSet::empty(),
+                Ty::bytes(),
+            ));
+            fields.insert("secp256k1_generate".into(), Ty::function(
+                vec![],
+                EffectSet::singleton("random"),
+                Ty::Con("Result".into(), vec![Ty::bytes(), Ty::str()]),
+            ));
+            fields.insert("secp256k1_public_key".into(), Ty::function(
+                vec![Ty::bytes()],
+                EffectSet::empty(),
+                Ty::Con("Result".into(), vec![Ty::bytes(), Ty::str()]),
+            ));
+            fields.insert("secp256k1_sign_digest".into(), Ty::function(
+                vec![Ty::bytes(), Ty::bytes()],
+                EffectSet::empty(),
+                Ty::Con("Result".into(), vec![Ty::bytes(), Ty::str()]),
+            ));
+            fields.insert("secp256k1_recover".into(), Ty::function(
+                vec![Ty::bytes(), Ty::bytes()],
+                EffectSet::empty(),
+                Ty::Con("Result".into(), vec![Ty::bytes(), Ty::str()]),
+            ));
+            fields.insert("secp256k1_verify".into(), Ty::function(
+                vec![Ty::bytes(), Ty::bytes(), Ty::bytes()],
+                EffectSet::empty(),
+                Ty::bool(),
+            ));
             // base64 / hex
             fields.insert("base64_encode".into(), Ty::function(
                 vec![Ty::bytes()], EffectSet::empty(), Ty::str()));
