@@ -1346,6 +1346,20 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                 Err(e) => Ok(err_v(Value::Str(format!("hex: {e}").into()))),
             }
         }
+        // base58 (#658). Bitcoin/Solana alphabet, no Base58Check checksum —
+        // the encoding Solana uses for pubkeys, signatures, and the x402
+        // `exact` payload. Pure, like base64/hex.
+        ("crypto", "base58_encode") => {
+            let data = expect_bytes(args.first())?;
+            Ok(Value::Str(bs58::encode(data).into_string().into()))
+        }
+        ("crypto", "base58_decode") => {
+            let s = expect_str(args.first())?;
+            match bs58::decode(s).into_vec() {
+                Ok(b)  => Ok(ok_v(Value::Bytes(b))),
+                Err(e) => Ok(err_v(Value::Str(format!("base58: {e}").into()))),
+            }
+        }
         ("crypto", "constant_time_eq") | ("crypto", "eq") => {
             use subtle::ConstantTimeEq;
             let a = expect_bytes(args.first())?;

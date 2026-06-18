@@ -674,3 +674,51 @@ fn secp256k1_generate_without_grant_is_rejected_by_static_policy_walk() {
         "expected static policy walk to reject secp256k1_generate's [random] without grant"
     );
 }
+
+// ─── base58 — Solana / x402 encoding (#658) ──────────────────────────────────
+const B58_SRC: &str = r#"
+import "std.crypto" as crypto
+
+fn enc(data :: Bytes) -> Str { crypto.base58_encode(data) }
+
+fn dec(s :: Str) -> Result[Bytes, Str] { crypto.base58_decode(s) }
+
+# round-trip: decode(encode(x)) == x
+fn roundtrip(data :: Bytes) -> Bool {
+  match crypto.base58_decode(crypto.base58_encode(data)) {
+    Err(_) => false,
+    Ok(back) => crypto.eq(data, back),
+  }
+}
+"#;
+
+#[test]
+fn base58_encodes_32_zero_bytes_as_solana_default_pubkey() {
+    // 32 zero bytes is Solana's "default"/system pubkey: 32 '1' chars.
+    let v = run(B58_SRC, "enc", vec![Value::Bytes(vec![0u8; 32])]);
+    assert_eq!(s(v), "1".repeat(32), "32 zero bytes encode to 32 leading '1's");
+}
+
+#[test]
+fn base58_leading_zeros_become_ones() {
+    // Each leading zero byte maps to one '1'; the rest encodes the value.
+    let v = run(B58_SRC, "enc", vec![Value::Bytes(vec![0, 0, 0])]);
+    assert_eq!(s(v), "111");
+}
+
+#[test]
+fn base58_round_trip() {
+    let ok = run(B58_SRC, "roundtrip",
+        vec![Value::Bytes(b"\x00\x01\x02the quick brown fox".to_vec())]);
+    assert!(is_true(ok), "base58 decode(encode(x)) must equal x");
+}
+
+#[test]
+fn base58_decode_rejects_invalid_char() {
+    // '0', 'O', 'I', 'l' are not in the base58 alphabet.
+    let v = run(B58_SRC, "dec", vec![Value::Str("0OIl".into())]);
+    match v {
+        Value::Variant { name, .. } => assert_eq!(name, "Err", "invalid base58 must Err"),
+        other => panic!("expected Result, got {other:?}"),
+    }
+}

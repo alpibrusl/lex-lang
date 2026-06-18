@@ -1850,6 +1850,14 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             fields.insert("hex_decode".into(), Ty::function(
                 vec![Ty::str()], EffectSet::empty(),
                 Ty::Con("Result".into(), vec![Ty::bytes(), Ty::str()])));
+            // base58 (#658) — Bitcoin/Solana alphabet, no checksum. Solana
+            // addresses, mints, signatures and the x402 `exact` payload are
+            // base58; this is the Solana analog of keccak/secp256k1 (#655).
+            fields.insert("base58_encode".into(), Ty::function(
+                vec![Ty::bytes()], EffectSet::empty(), Ty::str()));
+            fields.insert("base58_decode".into(), Ty::function(
+                vec![Ty::str()], EffectSet::empty(),
+                Ty::Con("Result".into(), vec![Ty::bytes(), Ty::str()])));
             // Constant-time equality (for HMAC verification etc.).
             // `eq` / `eq_str` (#382) are the recommended spelling;
             // `constant_time_eq` stays as a deprecated alias.

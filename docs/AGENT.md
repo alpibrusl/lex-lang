@@ -294,6 +294,11 @@ Asymmetric signatures:
   encoding, EIP-3009 payloads and the facilitator client live in the
   downstream `lex-x402` package.
 
+Encodings: `base64_encode`/`base64_decode`, `base64url_encode`/`base64url_decode`,
+`hex_encode`/`hex_decode`, and `base58_encode`/`base58_decode` (#658 — Bitcoin/
+Solana alphabet, no checksum; for Solana addresses/signatures and the x402
+Solana `exact` payload). Encoders return `Str`; decoders return `Result[Bytes, Str]`.
+
 ### `std.arrow`
 Apache Arrow `RecordBatch` as a first-class `Value::ArrowTable`. Column
 reductions and slicing run as one Rust call over the flat buffer, bypassing
