@@ -834,6 +834,27 @@ impl EffectHandler for DefaultHandler {
             return Ok(err(Value::Str(
                 "crypto.p256_generate: failed to sample a valid scalar".into())));
         }
+        // crypto.secp256k1_generate() — mint a fresh secp256k1 secret key
+        // from the OS RNG (#655) for EVM / EIP-712 / x402 signing. Returns
+        // the 32-byte scalar as `Ok(Bytes)`. Same `[random]` gate and
+        // sample-and-reject loop as `p256_generate` (the curve order is
+        // close enough to 2^256 that a miss is ~2^-128, but the loop
+        // keeps the contract identical).
+        if kind == "crypto" && op == "secp256k1_generate" {
+            self.ensure_kind_allowed("random")?;
+            use k256::ecdsa::SigningKey;
+            use rand::{rngs::SysRng, TryRng};
+            for _ in 0..16 {
+                let mut buf = [0u8; 32];
+                SysRng.try_fill_bytes(&mut buf)
+                    .map_err(|e| format!("crypto.secp256k1_generate: OS RNG: {e}"))?;
+                if let Ok(sk) = SigningKey::from_slice(&buf) {
+                    return Ok(ok(Value::Bytes(sk.to_bytes().to_vec())));
+                }
+            }
+            return Ok(err(Value::Str(
+                "crypto.secp256k1_generate: failed to sample a valid scalar".into())));
+        }
         // `std.http` wire ops (send/get/post) gate on the `net`
         // effect kind, not the module name. This matches the
         // declared signature (`http.get :: Str -> [net] ...`) and

@@ -18,6 +18,8 @@ pub fn is_pure_call(kind: &str, op: &str) -> bool {
         // p256_generate mints key material from the OS RNG → [random]
         // effect, handled on the effect path (#651).
         | ("crypto", "p256_generate")
+        // secp256k1_generate likewise mints from the OS RNG → [random] (#655).
+        | ("crypto", "secp256k1_generate")
         | ("datetime", "now")
         | ("http", "send")
         | ("http", "get")
@@ -1063,6 +1065,17 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             h.update(data);
             Ok(Value::Bytes(h.finalize().to_vec()))
         }
+        // Keccak-256 (#655) — Ethereum's hash. This is the original
+        // Keccak padding (0x01), NOT NIST SHA3-256 (0x06); they produce
+        // different digests for the same input. Used for EIP-712 struct
+        // hashing, the final signing digest, and address derivation.
+        ("crypto", "keccak256") => {
+            use sha3::{Digest, Keccak256};
+            let data = expect_bytes(args.first())?;
+            let mut h = Keccak256::new();
+            h.update(data);
+            Ok(Value::Bytes(h.finalize().to_vec()))
+        }
         // Hex-string convenience hashers (#382). Equivalent to
         // `hex_encode(shaN(bytes_of_str(s)))` for the common case
         // where the caller has a Str and wants a hex Str digest.
@@ -1193,6 +1206,106 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             };
             Ok(Value::Bool(vk.verify(message, &sig).is_ok()))
         }
+        // secp256k1 ECDSA + recovery (#655) — the EVM curve, for EIP-712
+        // typed-data signing (EIP-3009 / x402 `exact`). Key minting
+        // (`secp256k1_generate`) is effectful (`[random]`) and lives in
+        // the handler; these ops are deterministic given their inputs.
+        //
+        // Unlike `p256_*`, sign/verify take a PRE-HASHED 32-byte digest
+        // (EIP-712 already hashed) and do not hash again.
+        // - Secret key: 32-byte scalar.
+        // - Public key: 65-byte uncompressed SEC1 point (0x04‖X‖Y).
+        // - Signature: 65 bytes `r‖s‖v`, v ∈ {27,28}, low-S (EIP-2).
+        ("crypto", "secp256k1_public_key") => {
+            use k256::ecdsa::SigningKey;
+            let secret = expect_bytes(args.first())?;
+            let sk = match SigningKey::from_slice(secret) {
+                Ok(k)  => k,
+                Err(_) => return Ok(err_v(Value::Str(
+                    "secp256k1_public_key: secret must be a 32-byte secp256k1 scalar".into()))),
+            };
+            // Uncompressed SEC1 so callers can derive an Ethereum address
+            // as keccak256(point[1..])[12..] without decompressing.
+            let point = sk.verifying_key().to_encoded_point(false);
+            Ok(ok_v(Value::Bytes(point.as_bytes().to_vec())))
+        }
+        ("crypto", "secp256k1_sign_digest") => {
+            use k256::ecdsa::SigningKey;
+            let secret = expect_bytes(args.first())?;
+            let digest = expect_bytes(args.get(1))?;
+            if digest.len() != 32 {
+                return Ok(err_v(Value::Str(
+                    "secp256k1_sign_digest: digest must be exactly 32 bytes".into())));
+            }
+            let sk = match SigningKey::from_slice(secret) {
+                Ok(k)  => k,
+                Err(_) => return Ok(err_v(Value::Str(
+                    "secp256k1_sign_digest: secret must be a 32-byte secp256k1 scalar".into()))),
+            };
+            // RustCrypto normalizes to low-S (EIP-2) and returns the
+            // recovery id. Ethereum's `v` is 27 + recid.
+            match sk.sign_prehash_recoverable(digest) {
+                Ok((sig, recid)) => {
+                    let mut out = sig.to_bytes().to_vec(); // 64 bytes: r‖s
+                    out.push(27u8 + recid.to_byte());
+                    Ok(ok_v(Value::Bytes(out)))
+                }
+                Err(e) => Ok(err_v(Value::Str(
+                    format!("secp256k1_sign_digest: {e}").into()))),
+            }
+        }
+        ("crypto", "secp256k1_recover") => {
+            use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
+            let digest = expect_bytes(args.first())?;
+            let sig_bytes = expect_bytes(args.get(1))?;
+            if digest.len() != 32 {
+                return Ok(err_v(Value::Str(
+                    "secp256k1_recover: digest must be exactly 32 bytes".into())));
+            }
+            if sig_bytes.len() != 65 {
+                return Ok(err_v(Value::Str(
+                    "secp256k1_recover: signature must be 65 bytes (r‖s‖v)".into())));
+            }
+            let sig = match Signature::from_slice(&sig_bytes[..64]) {
+                Ok(s)  => s,
+                Err(_) => return Ok(err_v(Value::Str(
+                    "secp256k1_recover: malformed r‖s".into()))),
+            };
+            // Accept both Ethereum {27,28} and raw {0,1} encodings of v.
+            let v = sig_bytes[64];
+            let recid_byte = if v >= 27 { v - 27 } else { v };
+            let recid = match RecoveryId::from_byte(recid_byte) {
+                Some(r) => r,
+                None    => return Ok(err_v(Value::Str(
+                    "secp256k1_recover: invalid recovery id".into()))),
+            };
+            match VerifyingKey::recover_from_prehash(digest, &sig, recid) {
+                Ok(vk) => Ok(ok_v(Value::Bytes(
+                    vk.to_encoded_point(false).as_bytes().to_vec()))),
+                Err(e) => Ok(err_v(Value::Str(
+                    format!("secp256k1_recover: {e}").into()))),
+            }
+        }
+        ("crypto", "secp256k1_verify") => {
+            use k256::ecdsa::{signature::hazmat::PrehashVerifier, Signature, VerifyingKey};
+            let public = expect_bytes(args.first())?;
+            let digest = expect_bytes(args.get(1))?;
+            let sig_bytes = expect_bytes(args.get(2))?;
+            if digest.len() != 32 {
+                return Ok(Value::Bool(false));
+            }
+            let vk = match VerifyingKey::from_sec1_bytes(public) {
+                Ok(v)  => v,
+                Err(_) => return Ok(Value::Bool(false)),
+            };
+            // Accept a 65-byte recoverable sig (drop v) or a bare 64-byte r‖s.
+            let rs = if sig_bytes.len() == 65 { &sig_bytes[..64] } else { sig_bytes.as_slice() };
+            let sig = match Signature::from_slice(rs) {
+                Ok(s)  => s,
+                Err(_) => return Ok(Value::Bool(false)),
+            };
+            Ok(Value::Bool(vk.verify_prehash(digest, &sig).is_ok()))
+        }
         ("crypto", "base64_encode") => {
             use base64::{Engine, engine::general_purpose::STANDARD};
             let data = expect_bytes(args.first())?;
@@ -1231,6 +1344,20 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             match hex::decode(s) {
                 Ok(b)  => Ok(ok_v(Value::Bytes(b))),
                 Err(e) => Ok(err_v(Value::Str(format!("hex: {e}").into()))),
+            }
+        }
+        // base58 (#658). Bitcoin/Solana alphabet, no Base58Check checksum —
+        // the encoding Solana uses for pubkeys, signatures, and the x402
+        // `exact` payload. Pure, like base64/hex.
+        ("crypto", "base58_encode") => {
+            let data = expect_bytes(args.first())?;
+            Ok(Value::Str(bs58::encode(data).into_string().into()))
+        }
+        ("crypto", "base58_decode") => {
+            let s = expect_str(args.first())?;
+            match bs58::decode(s).into_vec() {
+                Ok(b)  => Ok(ok_v(Value::Bytes(b))),
+                Err(e) => Ok(err_v(Value::Str(format!("base58: {e}").into()))),
             }
         }
         ("crypto", "constant_time_eq") | ("crypto", "eq") => {
