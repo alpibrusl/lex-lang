@@ -2614,7 +2614,15 @@ impl<'a> Vm<'a> {
                         // handler closure must run on the calling VM so it can
                         // dispatch arbitrary effects through the same handler
                         // chain (e.g. sql queries inside an actor).
+                        //
+                        // `conc.spawn_thread` (#623) is the one exception: it
+                        // is a genuinely concurrent primitive that must reach
+                        // the effect handler, where `Arc<Program>` + `Policy`
+                        // are available to build a fresh per-thread VM (the VM
+                        // can't move its `Box<dyn EffectHandler>` onto a new
+                        // thread). So it falls through to `dispatch`.
                         None if kind.as_str() == "conc"
+                            && op_name.as_str() != "spawn_thread"
                             => self.run_conc_op(op_name.as_str(), args),
                         None => self.handler.dispatch(&kind, &op_name, args),
                     };

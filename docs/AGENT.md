@@ -175,7 +175,17 @@ to bound runaway loops; use process-level scheduling for longer waits.
 ### `std.conc`
 `spawn` [concurrent], `ask` [concurrent], `tell` [concurrent],
 `register` [concurrent], `lookup` [concurrent], `unregister` [concurrent],
-`registered` [concurrent]
+`registered` [concurrent],
+`spawn_thread(() -> [Eff] Unit)` [concurrent, Eff]
+
+`spawn_thread` is the one non-actor primitive: it runs the zero-arg
+closure on a fresh **detached** OS thread and returns `Unit` immediately,
+so a long-running blocking task (e.g. a `net.dial_ws` loop) can run
+alongside a foreground `net.serve_fn`. The closure's effect row
+propagates into the call row and is gated by the same `Policy`; errors
+are logged to stderr; there is no join handle (fire-and-forget). Reach
+for actors first — use `spawn_thread` only for a genuinely concurrent
+background task.
 
 Actors hold per-process state across messages. `spawn(init, handler)`
 returns `Actor[S]`; `ask` / `tell` run `handler(state, msg)` on the

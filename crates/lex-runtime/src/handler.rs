@@ -165,10 +165,16 @@ impl DefaultHandler {
     }
 
     fn ensure_kind_allowed(&self, kind: &str) -> Result<(), String> {
-        if self.policy.allow_effects.contains(kind) {
+        // For every module kind == effect name, except `conc`: its
+        // effect is named `concurrent` in the type system and policy.
+        // The actor ops (spawn/ask/tell) are intercepted at the VM
+        // level and never reach this gate, but `conc.spawn_thread`
+        // (#623) does, so normalize the kind to the effect it carries.
+        let effect = if kind == "conc" { "concurrent" } else { kind };
+        if self.policy.allow_effects.contains(effect) {
             Ok(())
         } else {
-            Err(format!("effect `{kind}` not in --allow-effects"))
+            Err(format!("effect `{effect}` not in --allow-effects"))
         }
     }
 
@@ -1473,6 +1479,33 @@ impl EffectHandler for DefaultHandler {
                 })?;
                 let policy = self.policy.clone();
                 crate::ws::dial_ws_actor(url, subprotocol, name, on_open, on_message, program, policy)
+            }
+            ("conc", "spawn_thread") => {
+                // #623 — the non-actor escape hatch. Run a zero-arg closure
+                // on a fresh detached OS thread carrying the caller's Policy,
+                // then return Unit immediately. Mirrors the per-thread VM that
+                // net.dial_ws / serve_ws_fn_actor build (the calling VM can't
+                // move its handler across threads). Reaches here because the
+                // VM's `conc` intercept exempts `spawn_thread` (see vm.rs).
+                // Errors/panics in the closure are logged to stderr and end
+                // the thread (detached: no join handle in v1).
+                let closure = match args.into_iter().next() {
+                    Some(c @ Value::Closure { .. }) => c,
+                    other => return Err(format!(
+                        "conc.spawn_thread(f): f must be a zero-arg closure, got {other:?}")),
+                };
+                let program = self.program.clone().ok_or_else(|| {
+                    "conc.spawn_thread requires a Program reference; use DefaultHandler::with_program".to_string()
+                })?;
+                let policy = self.policy.clone();
+                std::thread::spawn(move || {
+                    let handler = DefaultHandler::new(policy).with_program(Arc::clone(&program));
+                    let mut vm = Vm::with_handler(&program, Box::new(handler));
+                    if let Err(e) = vm.invoke_closure_value(closure, vec![]) {
+                        eprintln!("conc.spawn_thread: {e}");
+                    }
+                });
+                Ok(Value::Unit)
             }
             ("chat", "broadcast") => {
                 let registry = self.chat_registry.as_ref()

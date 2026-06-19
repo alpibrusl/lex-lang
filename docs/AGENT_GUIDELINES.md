@@ -258,8 +258,21 @@ fn use_counter() -> [concurrent] Int {
 
 `conc.spawn` / `conc.ask` / `conc.tell` are the actor primitives.
 Synchronous mailbox — handler runs on the caller's thread under a
-per-actor mutex. **Do not** try to spawn OS threads via FFI; you can't,
-and you don't need to.
+per-actor mutex. Reach for actors **first**: they are deterministic,
+replayable, and the right tool for message-passing.
+
+The one exception is `conc.spawn_thread(f)` (#623): it runs a zero-arg
+closure `f :: () -> [Eff] Unit` on a fresh **detached** OS thread and
+returns `Unit` immediately. Use it only when you genuinely need a
+long-running *blocking* background task to run concurrently with the
+foreground — the canonical case is a `net.dial_ws` client loop running
+alongside a `net.serve_fn` HTTP server (both block forever, so an actor
+can't host them). It is fire-and-forget: no join handle, the closure's
+effects are gated by the same `Policy`, and errors are logged to stderr.
+Do **not** use it as a general parallelism tool (use `list.par_map` for
+pure work) or as a substitute for actors (use `conc.spawn` for state +
+message passing). Spawning OS threads any *other* way (FFI, etc.) is
+still unsupported.
 
 ### 3.2 SQL: `std.sql` for SQLite and Postgres (MUST)
 
@@ -551,7 +564,7 @@ emit. Avoid.
 | Renaming params after publish | Different SigId; loses attestations | Don't |
 | Auto-retry on HTTP 503 from `lex serve` | Budget cap is intentional | Raise cap or refactor |
 | Mutation via FFI | No FFI; no mutation in user code | Build new values |
-| Spawning OS threads | Not supported; not needed | `std.conc` actors |
+| Spawning OS threads (FFI/raw) | Not supported | `std.conc` actors; `conc.spawn_thread` for a detached blocking task |
 | Bypassing the gate via `proc.exec` | Defeats the sandbox model | Don't; if you need OS access, declare `[proc]` explicitly |
 
 ---
