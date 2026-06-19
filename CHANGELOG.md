@@ -7,25 +7,85 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.9.11] — 2026-06-19
+
 ### Added
 
+- **`lex check` accumulates independent errors within a function body
+  (#566).** Type checking no longer bails at the first error in a body;
+  independent errors in sibling expressions are reported together in a single
+  pass, so agents can repair a whole function in one round instead of
+  recompiling once per diagnostic.
+- **Content-addressed blob store + `ref` namespace (M6.1a, #647).** A generic
+  content-addressed blob store with a `ref` namespace — the storage substrate
+  for upcoming artifact-handoff work.
+- **`std.crypto` ed25519 sign/verify (#643).** The first asymmetric-signature
+  surface in the stdlib: `ed25519_sign` / `ed25519_verify` / key generation.
 - **P-256 ECDSA (ES256) in `std.crypto` (#651).** Four new primitives complete
   the JWT/SD-JWT signing surface that `lex-jose` (and AP2 Checkout/Payment
-  Mandates) needs:
-  - `crypto.p256_generate() -> [random] Result[Bytes, Str]` — mint a fresh
-    secret key (32-byte scalar) from the OS RNG. Carries the same `[random]`
-    effect as `crypto.random`, so key minting stays visible to
-    `lex audit --effect random`. (The issue sketched `[env]`; `[random]` is the
-    dedicated OS-randomness effect in this codebase.)
-  - `crypto.p256_public_key(sk :: Bytes) -> Result[Bytes, Str]` — derive the
-    33-byte SEC1 compressed public point.
-  - `crypto.p256_sign(sk :: Bytes, msg :: Bytes) -> Result[Bytes, Str]` — sign
-    `msg` (SHA-256 applied internally, per ES256); returns a DER-encoded
-    signature.
-  - `crypto.p256_verify(pk :: Bytes, msg :: Bytes, sig :: Bytes) -> Bool`.
+  Mandates) needs: `p256_generate() -> [random] Result[Bytes, Str]` (mints a
+  32-byte scalar from the OS RNG, carrying the `[random]` effect so key minting
+  stays visible to `lex audit --effect random`), `p256_public_key` (33-byte
+  SEC1 compressed point), `p256_sign` (SHA-256 applied internally per ES256;
+  DER signature), and `p256_verify`. Keys/signatures are raw bytes; JWK/PEM
+  serialization is left to the downstream `lex-jose` package. Backed by the
+  RustCrypto `p256` crate.
+- **`std.crypto` x402 EVM signing primitives — secp256k1 + keccak256
+  (#655).** `keccak256` (Ethereum's Keccak padding, *not* SHA3-256) plus the
+  `secp256k1_*` sign/recover/verify surface (65-byte `r‖s‖v`, low-S per
+  EIP-2, uncompressed SEC1 keys). Unblocks the EVM payment path for the
+  forthcoming `lex-x402` package.
+- **`std.crypto` base58 encode/decode (#658).** `base58_encode` /
+  `base58_decode` (Bitcoin alphabet, no checksum) for the Solana x402 leg —
+  addresses, mints, and signatures.
 
-  Keys and signatures are raw bytes; JWK/PEM serialization is left to the
-  downstream `lex-jose` package. Backed by the RustCrypto `p256` crate.
+### Fixed
+
+- **`io.print` newline regression (#645).** `StdoutSink::print_line` had
+  stopped emitting the trailing newline; restored.
+- **`std.http` honors `timeout_ms` on a slow first response (#646).** The
+  client deadline previously only covered connect/headers, so a server slow to
+  send the first body byte could hang past the timeout.
+- **`net` drops bare TCP probes instead of logging a handshake error (#624).**
+  WebSocket listeners no longer emit a spurious handshake-error log line for
+  bare TCP port probes (health checks, scanners); the connection is dropped
+  quietly.
+- **`lex pkg` no longer reports a false version conflict between a git
+  dependency and a sibling path dependency (#637).** The resolver treated the
+  same package reached via a `git` dep and via a sibling `--path` dep as two
+  conflicting versions.
+- **`std.web` `esc()` hardening — single quotes (#553).** `esc()` now also
+  escapes single quotes, and the escaping contract is documented, closing an
+  attribute-context injection gap.
+
+### Dependencies
+
+- **regex 1.12.3 → 1.12.4 (#641).**
+
+## [0.9.10] — 2026-06-12
+
+### Added
+
+- **Supply-chain provenance for packages (#628, #629, #632, #633).**
+  `lex pkg publish` signs capability contracts and publishes them to the
+  registry leg; `--derive-grant` derives a contract's capability grant from
+  the package's typed effects; installs verify registry dependencies against
+  their signed contracts; docs gain a supply-chain provenance section with an
+  end-to-end demo.
+- **Transitive dependency resolution — `lex pkg install` (#634).** Install now
+  resolves the full transitive dependency closure rather than direct deps
+  only.
+- **Bearer-token auth for `lex op push/pull` (#630).**
+- **Durable attestations for capsule installs (#627).** `lex-os` capsule
+  installs are promoted into durable attestations; `ProducerTrust` is exported
+  to the capsule keyring (#626).
+- **CLI surface snapshots (#625, #626).** The `lex skill` / CLI surface is
+  snapshotted to keep the README and CLI reference in sync.
+
+### Fixed
+
+- **`lex vm` skips memoization on arena args (#621).**
+- **`str.slice` codepoint indices (#620).**
 
 ## [0.9.9] — 2026-06-08
 
