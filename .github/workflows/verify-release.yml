@@ -6,11 +6,18 @@ name: verify-release
 # asserts `lex --version` returns successfully.
 #
 # Intentionally NOT a gate on the release itself — it triggers on
-# `release: published`, so by the time it runs the artifacts are
-# already public. Failures surface as a red CI status on the tag,
-# not a blocked publish. The reasoning: a packaging regression that
-# slips past the build matrix is rare, and decoupling lets us iterate
-# on the verify logic without risking the release pipeline.
+# `release: published`, so a failure surfaces as a red CI status on
+# the tag, not a blocked publish. The reasoning: a packaging
+# regression that slips past the build matrix is rare, and decoupling
+# lets us iterate on the verify logic without risking the release
+# pipeline.
+#
+# Ordering note (#661): the GitHub Release can be *published* (UI /
+# `gh release create` at tag-push time) before `release.yml` has
+# finished cross-compiling and uploading the 5 platform tarballs
+# (~10–15 min). So this workflow must NOT assume the assets exist the
+# moment it runs — it polls for each asset with backoff and only fails
+# once they're genuinely absent past a generous deadline.
 #
 # Coverage:
 #   - x86_64-unknown-linux-gnu (native, free)
@@ -64,15 +71,48 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq qemu-user-static
 
-      - name: Download artifact + sha256
+      - name: Download artifact + sha256 (wait for assets)
         shell: bash
         run: |
           set -euo pipefail
           TAG="${{ steps.tag.outputs.tag }}"
           NAME="lex-${TAG}-${{ matrix.target }}"
           BASE="https://github.com/${{ github.repository }}/releases/download/${TAG}"
-          curl -sSLO --retry 3 "${BASE}/${NAME}.tar.gz"
-          curl -sSLO --retry 3 "${BASE}/${NAME}.tar.gz.sha256"
+
+          # #661: verify-release can start before release.yml has
+          # uploaded the tarballs (the release is published at tag-push
+          # time, the build takes ~10–15 min). Two failure modes to
+          # avoid:
+          #   1. failing on the first 404 (the asset just isn't up yet);
+          #   2. `curl -sSLO` (no -f) silently saving GitHub's "Not
+          #      Found" HTML *into* the .sha256 file, so `sha256sum -c`
+          #      later reports the misleading "no properly formatted
+          #      checksum lines found" instead of "asset missing".
+          # So: `curl -f` (HTTP errors → non-zero, nothing written) and
+          # poll with backoff until the asset appears or we hit a
+          # deadline comfortably past the build time.
+          fetch() {
+            local url="$1" out="$2"
+            local deadline=$(( SECONDS + 1200 ))   # 20 min
+            local delay=10
+            while true; do
+              if curl -fsSL --retry 3 --retry-all-errors -o "$out" "$url"; then
+                return 0
+              fi
+              if [ "$SECONDS" -ge "$deadline" ]; then
+                echo "::error::release asset not available after 20 min: ${url}"
+                echo "::error::the release.yml build may still be running or have failed — check its run for ${TAG}"
+                return 1
+              fi
+              echo "asset not ready yet (${url}); retrying in ${delay}s…"
+              sleep "$delay"
+              [ "$delay" -lt 80 ] && delay=$(( delay * 2 ))
+            done
+          }
+
+          fetch "${BASE}/${NAME}.tar.gz"        "${NAME}.tar.gz"
+          fetch "${BASE}/${NAME}.tar.gz.sha256" "${NAME}.tar.gz.sha256"
+
           sha256sum -c "${NAME}.tar.gz.sha256"
           tar -xzf "${NAME}.tar.gz"
           # Sanity-check the binary's architecture matches the target.
