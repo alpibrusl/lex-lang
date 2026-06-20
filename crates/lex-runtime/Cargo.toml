@@ -28,7 +28,7 @@ p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"]
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 # Keccak-256 (Ethereum padding, distinct from SHA3-256) for EIP-712 / address
 # derivation (#655).
-sha3 = "0.11"
+sha3 = "0.12"
 blake2 = "0.10"
 aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
