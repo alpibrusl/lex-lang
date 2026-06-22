@@ -68,8 +68,8 @@ impl TypeEnv {
         let mut sp_variants = IndexMap::new();
         sp_variants.insert("PStr".into(),   Some(Ty::str()));
         sp_variants.insert("PInt".into(),   Some(Ty::int()));
-        sp_variants.insert("PFloat".into(), Some(Ty::Con("Float".into(), vec![])));
-        sp_variants.insert("PBool".into(),  Some(Ty::Con("Bool".into(), vec![])));
+        sp_variants.insert("PFloat".into(), Some(Ty::float()));
+        sp_variants.insert("PBool".into(),  Some(Ty::bool()));
         sp_variants.insert("PNull".into(),  None);
         e.types.insert("SqlParam".into(), TypeDef {
             params: vec![],
