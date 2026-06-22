@@ -7,6 +7,21 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.9.12] — 2026-06-22
+
+### Fixed
+
+- **`SqlParam` `PFloat` / `PBool` now type-check (#669).** The builtin
+  `SqlParam` union registered its `PFloat` / `PBool` variants with the nominal
+  payload types `Ty::Con("Float")` / `Ty::Con("Bool")` instead of the
+  primitives `Ty::float()` / `Ty::bool()`. A `Float`/`Bool` value (e.g. the
+  literal `1.0`) is `Ty::Prim(...)`, which does not unify with the nominal
+  `Ty::Con(...)`, so `PFloat(1.0)` / `PBool(true)` failed type-checking with a
+  contradictory `expected Float, got Float` (the `Con` printed identically to
+  the `Prim`). `PStr` / `PInt` were unaffected because they already used the
+  primitive types. Now all `SqlParam` float/bool params type-check; callers no
+  longer need to stringify floats (`PStr(float.to_str(x))`) as a workaround.
+
 ## [0.9.11] — 2026-06-19
 
 ### Added
