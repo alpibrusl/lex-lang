@@ -393,6 +393,13 @@ fn route(
         // POST /v1/pkg/publish is handled in handle() before route()
         // (binary body), so it doesn't appear here.
         (Method::Get, "/v1/pkg") => pkg_list_handler(state),
+        // Owner-only visibility toggle (authed via the front door). Must
+        // precede the generic `/v1/pkg/{name}` arms; it's a PUT, so it
+        // can't collide with the GET/DELETE arms regardless.
+        (Method::Put, p) if p.starts_with("/v1/pkg/") && p.ends_with("/visibility") => {
+            let name = &p["/v1/pkg/".len()..p.len() - "/visibility".len()];
+            pkg_set_visibility_handler(state, name, body)
+        }
         (Method::Get, p) if p.starts_with("/v1/pkg/") && p.ends_with("/head") => {
             let name = &p["/v1/pkg/".len()..p.len() - "/head".len()];
             pkg_head_handler(state, name)
@@ -1529,6 +1536,20 @@ struct PkgRecord {
     ops: Vec<serde_json::Value>,
 }
 
+/// Whether a package is reachable without authentication.
+///
+/// Per-package (applies across all versions), GitHub-style: an org's
+/// store can hold a mix of public and private packages. Defaults to
+/// `Private`, so an index written before this field existed (or any
+/// freshly published package) is private until an owner opts in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Visibility {
+    #[default]
+    Private,
+    Public,
+}
+
 /// Index stored at `{store_root}/packages/{name}/index.json`.
 ///
 /// Tracks which versions have been published and which is "latest", so
@@ -1539,6 +1560,11 @@ struct PkgIndex {
     latest: Option<String>,
     /// All published versions, newest-last.
     versions: Vec<PkgVersionSummary>,
+    /// Public/private flag. `#[serde(default)]` keeps pre-existing
+    /// `index.json` files (which lack the field) deserializing as
+    /// `Private`.
+    #[serde(default)]
+    visibility: Visibility,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1576,8 +1602,188 @@ fn load_pkg_record(root: &std::path::Path, name: &str, version: &str) -> Option<
 
 fn load_latest_pkg_record(root: &std::path::Path, name: &str) -> Option<PkgRecord> {
     let index = load_pkg_index(root, name)?;
-    let latest = index.latest?;
+    let latest = index.latest.clone()?;
     load_pkg_record(root, name, &latest)
+}
+
+/// A package is public iff its index exists and is marked `Public`.
+/// A missing index (unknown package) is treated as private, so the
+/// public surface never distinguishes "private" from "does not exist".
+fn pkg_is_public(root: &std::path::Path, name: &str) -> bool {
+    load_pkg_index(root, name).map(|i| i.visibility) == Some(Visibility::Public)
+}
+
+/// Reject package/version path segments that could escape the
+/// `packages/` directory or otherwise aren't valid names. Mirrors the
+/// tenant-id guard's spirit (defense in depth — lex-hub validates the
+/// tenant, this validates the package/version).
+fn valid_pkg_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && s != "."
+        && s != ".."
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+#[derive(Deserialize)]
+struct VisibilityReq {
+    visibility: Visibility,
+}
+
+/// `PUT /v1/pkg/{name}/visibility` — set a package public or private.
+///
+/// Authorization is implicit: this runs against a single tenant's store,
+/// and the caller only reaches *this* store because the front door
+/// (lex-hub) authenticated their token and selected it. A caller can
+/// therefore only change visibility of packages they own.
+fn pkg_set_visibility_handler(
+    state: &State,
+    name: &str,
+    body: &str,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    if !valid_pkg_segment(name) {
+        return error_response(400, format!("invalid package name {name:?}"));
+    }
+    let req: VisibilityReq = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(e) => return error_response(400, format!("bad request: {e}")),
+    };
+    let mut index = match load_pkg_index(&state.root, name) {
+        Some(i) => i,
+        None => return error_response(404, format!("package {name:?} not found")),
+    };
+    index.visibility = req.visibility;
+    let bytes = serde_json::to_vec_pretty(&index).unwrap_or_default();
+    match std::fs::write(pkg_index_path(&state.root, name), bytes) {
+        Ok(()) => json_response(
+            200,
+            &serde_json::json!({ "name": name, "visibility": index.visibility }),
+        ),
+        Err(e) => error_response(500, format!("write index: {e}")),
+    }
+}
+
+/// Names of the tenant's PUBLIC packages, sorted. Pure (filesystem in,
+/// names out) so the visibility filter is unit-testable.
+fn public_pkg_names(root: &std::path::Path) -> Vec<String> {
+    list_pkg_names(root)
+        .into_iter()
+        .filter(|name| pkg_is_public(root, name))
+        .collect()
+}
+
+/// `GET /v1/public/<tenant>` (org page) — list only the tenant's PUBLIC
+/// packages (latest version of each). Private packages are omitted, so
+/// their existence is not revealed.
+fn public_pkg_list_handler(state: &State) -> Response<std::io::Cursor<Vec<u8>>> {
+    let packages: Vec<serde_json::Value> = public_pkg_names(&state.root)
+        .iter()
+        .filter_map(|name| {
+            let r = load_latest_pkg_record(&state.root, name)?;
+            Some(serde_json::json!({
+                "name": r.name,
+                "version": r.version,
+                "head_op": r.head_op,
+                "published_at": r.published_at,
+            }))
+        })
+        .collect();
+    json_response(200, &serde_json::json!({ "packages": packages }))
+}
+
+/// A resolved public read target. Separated from response formatting so
+/// the routing/guard logic is unit-testable without constructing HTTP
+/// responses. `Err(status)` is a guard failure (405 = non-GET,
+/// 404 = invalid/unknown route).
+#[derive(Debug, PartialEq, Eq)]
+enum PublicTarget {
+    List,
+    Latest(String),
+    Versions(String),
+    Head(String),
+    Version(String, String),
+    Archive(String, String),
+}
+
+impl PublicTarget {
+    /// The package name a target refers to, if any (`List` has none).
+    fn pkg_name(&self) -> Option<&str> {
+        match self {
+            PublicTarget::List => None,
+            PublicTarget::Latest(n)
+            | PublicTarget::Versions(n)
+            | PublicTarget::Head(n)
+            | PublicTarget::Version(n, _)
+            | PublicTarget::Archive(n, _) => Some(n),
+        }
+    }
+}
+
+/// Pure routing decision for `/v1/public/<tenant>` reads. `path` is the
+/// portion after the tenant (leading `/` ok). Enforces GET-only and
+/// per-segment name validation; does NOT consult the store (visibility
+/// is checked by the caller, which has store access).
+fn resolve_public(method: &Method, path: &str) -> Result<PublicTarget, u16> {
+    if !matches!(method, Method::Get) {
+        return Err(405);
+    }
+    let rest = path.trim_matches('/');
+    if rest.is_empty() {
+        return Ok(PublicTarget::List);
+    }
+    let segs: Vec<&str> = rest.split('/').collect();
+    if !segs.iter().all(|s| valid_pkg_segment(s)) {
+        return Err(404);
+    }
+    match segs.as_slice() {
+        [n] => Ok(PublicTarget::Latest(n.to_string())),
+        [n, "versions"] => Ok(PublicTarget::Versions(n.to_string())),
+        [n, "head"] => Ok(PublicTarget::Head(n.to_string())),
+        [n, v, "archive"] => Ok(PublicTarget::Archive(n.to_string(), v.to_string())),
+        [n, v] => Ok(PublicTarget::Version(n.to_string(), v.to_string())),
+        _ => Err(404),
+    }
+}
+
+/// Unauthenticated, read-only access to **public** packages in `state`'s
+/// store. `path` is the portion of the URL after `/v1/public/<tenant>`
+/// (with a leading `/`); lex-hub resolves `<tenant>` → store and calls
+/// this. Visibility gating, GET-only enforcement, and segment validation
+/// all live here so the whole public surface is auditable in one place.
+///
+/// Everything served here is package-scoped — manifests and the source
+/// archive of a public package's own publish — so it cannot leak code
+/// from a private package that happens to share content-addressed stages
+/// in the same store.
+pub fn route_public(
+    state: &State,
+    method: &Method,
+    path: &str,
+    _query: &str,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    let target = match resolve_public(method, path) {
+        Ok(t) => t,
+        Err(405) => return error_response(405, "public read is GET-only"),
+        Err(_) => return error_response(404, "not found"),
+    };
+    // The org listing already filters to public packages itself.
+    if let PublicTarget::List = target {
+        return public_pkg_list_handler(state);
+    }
+    // Single 404 for both "private" and "absent" — never reveal which.
+    if let Some(name) = target.pkg_name() {
+        if !pkg_is_public(&state.root, name) {
+            return error_response(404, format!("package {name:?} not found"));
+        }
+    }
+    match target {
+        PublicTarget::List => unreachable!("handled above"),
+        PublicTarget::Latest(n) => pkg_get_handler(state, &n),
+        PublicTarget::Versions(n) => pkg_versions_handler(state, &n),
+        PublicTarget::Head(n) => pkg_head_handler(state, &n),
+        PublicTarget::Version(n, v) => pkg_get_version_handler(state, &n, &v),
+        PublicTarget::Archive(n, v) => pkg_archive_handler(state, &n, &v),
+    }
 }
 
 fn save_pkg_record(
@@ -2013,5 +2219,112 @@ mod policy_ceiling_tests {
         assert!(got.allow_effects.is_empty(), "an empty ceiling grants nothing");
         assert!(got.allow_proc.is_empty());
         assert!(got.allow_fs_write.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod public_read_tests {
+    use super::*;
+
+    /// Write a minimal package (index + per-version record + an archive
+    /// blob) straight into a temp store, bypassing the publish pipeline.
+    fn seed_pkg(root: &std::path::Path, name: &str, version: &str) {
+        let record = PkgRecord {
+            name: name.to_string(),
+            version: version.to_string(),
+            head_op: Some(format!("op-{name}")),
+            published_at: 1,
+            function_names: vec![format!("{name}.f")],
+            ops: vec![],
+        };
+        save_pkg_record(root, &record, format!("ARCHIVE:{name}@{version}").as_bytes())
+            .expect("seed package");
+    }
+
+    #[test]
+    fn new_package_defaults_to_private() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_pkg(tmp.path(), "lex-schema", "0.9.2");
+        assert!(!pkg_is_public(tmp.path(), "lex-schema"));
+        // Unknown packages are also "not public" — never distinguished.
+        assert!(!pkg_is_public(tmp.path(), "does-not-exist"));
+    }
+
+    #[test]
+    fn set_visibility_round_trips_and_index_persists() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = State::open(tmp.path().to_path_buf()).unwrap();
+        seed_pkg(tmp.path(), "lex-schema", "0.9.2");
+
+        let _ = pkg_set_visibility_handler(&state, "lex-schema", r#"{"visibility":"public"}"#);
+        assert!(pkg_is_public(tmp.path(), "lex-schema"));
+        // The version list survives the index rewrite (we don't clobber it).
+        let idx = load_pkg_index(tmp.path(), "lex-schema").unwrap();
+        assert_eq!(idx.latest.as_deref(), Some("0.9.2"));
+        assert_eq!(idx.versions.len(), 1);
+
+        let _ = pkg_set_visibility_handler(&state, "lex-schema", r#"{"visibility":"private"}"#);
+        assert!(!pkg_is_public(tmp.path(), "lex-schema"));
+    }
+
+    #[test]
+    fn set_visibility_on_unknown_package_is_a_noop() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = State::open(tmp.path().to_path_buf()).unwrap();
+        // No package seeded → handler returns 404 and writes nothing.
+        let _ = pkg_set_visibility_handler(&state, "ghost", r#"{"visibility":"public"}"#);
+        assert!(load_pkg_index(tmp.path(), "ghost").is_none());
+    }
+
+    #[test]
+    fn public_listing_omits_private_packages() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = State::open(tmp.path().to_path_buf()).unwrap();
+        seed_pkg(tmp.path(), "pub-pkg", "1.0.0");
+        seed_pkg(tmp.path(), "priv-pkg", "1.0.0");
+        let _ = pkg_set_visibility_handler(&state, "pub-pkg", r#"{"visibility":"public"}"#);
+
+        let names = public_pkg_names(tmp.path());
+        assert_eq!(names, vec!["pub-pkg".to_string()]);
+    }
+
+    #[test]
+    fn resolve_public_maps_routes() {
+        let get = Method::Get;
+        assert_eq!(resolve_public(&get, "").unwrap(), PublicTarget::List);
+        assert_eq!(resolve_public(&get, "/").unwrap(), PublicTarget::List);
+        assert_eq!(
+            resolve_public(&get, "/lex-schema").unwrap(),
+            PublicTarget::Latest("lex-schema".into())
+        );
+        assert_eq!(
+            resolve_public(&get, "/lex-schema/versions").unwrap(),
+            PublicTarget::Versions("lex-schema".into())
+        );
+        assert_eq!(
+            resolve_public(&get, "/lex-schema/head").unwrap(),
+            PublicTarget::Head("lex-schema".into())
+        );
+        assert_eq!(
+            resolve_public(&get, "/lex-schema/0.9.2").unwrap(),
+            PublicTarget::Version("lex-schema".into(), "0.9.2".into())
+        );
+        assert_eq!(
+            resolve_public(&get, "/lex-schema/0.9.2/archive").unwrap(),
+            PublicTarget::Archive("lex-schema".into(), "0.9.2".into())
+        );
+    }
+
+    #[test]
+    fn resolve_public_rejects_bad_method_and_traversal() {
+        // Non-GET → 405.
+        assert_eq!(resolve_public(&Method::Put, "/lex-schema"), Err(405));
+        assert_eq!(resolve_public(&Method::Post, "").err(), Some(405));
+        // Path traversal / invalid segments → 404, never a filesystem touch.
+        assert_eq!(resolve_public(&Method::Get, "/.."), Err(404));
+        assert_eq!(resolve_public(&Method::Get, "/lex-schema/../etc"), Err(404));
+        assert_eq!(resolve_public(&Method::Get, "/a/b/c/d"), Err(404));
+        // Slashes elsewhere can't smuggle a deep path: each segment is checked.
+        assert!(resolve_public(&Method::Get, "/lex schema").is_err());
     }
 }
