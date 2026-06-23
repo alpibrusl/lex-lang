@@ -242,3 +242,49 @@ fn option_field_null_produces_none() {
     ]);
     assert_eq!(v, none(), "expected None for null bio, got {v:?}");
 }
+
+// ---- #682: std.yaml must wrap Option[T] fields like json/toml ----------
+//
+// Regression for #682: `yaml.parse_strict`/`parse_strict_typed` skipped
+// `apply_option_wrapping`, so Option[T] fields parsed from YAML were not
+// wrapped in Some/None (diverging from json and toml). These mirror the
+// #577 json tests above against the same logical inputs.
+
+const YAML_OPTION_SRC: &str = r#"
+import "std.yaml" as yaml
+
+type Profile = { name :: Str, bio :: Option[Str] }
+
+fn parse_profile(s :: Str) -> Result[Profile, Str] { yaml.parse(s) }
+
+fn get_bio(s :: Str) -> Option[Str] {
+  match parse_profile(s) {
+    Ok(p) => p.bio,
+    Err(_) => None,
+  }
+}
+"#;
+
+#[test]
+fn yaml_option_field_present_wraps_in_some() {
+    // A present value for an Option[Str] field must be wrapped in Some(...).
+    let v = run_typed(YAML_OPTION_SRC, "get_bio", vec![
+        Value::Str("name: Alice\nbio: developer\n".into()),
+    ]);
+    assert_eq!(v, some(Value::Str("developer".into())),
+        "expected Some(\"developer\") from YAML, got {v:?}");
+}
+
+#[test]
+fn yaml_option_field_absent_produces_none() {
+    // An absent (or null) Option[Str] field must produce None.
+    let v = run_typed(YAML_OPTION_SRC, "get_bio", vec![
+        Value::Str("name: Alice\n".into()),
+    ]);
+    assert_eq!(v, none(), "expected None for absent bio in YAML, got {v:?}");
+
+    let v2 = run_typed(YAML_OPTION_SRC, "get_bio", vec![
+        Value::Str("name: Alice\nbio: null\n".into()),
+    ]);
+    assert_eq!(v2, none(), "expected None for null bio in YAML, got {v2:?}");
+}
