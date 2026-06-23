@@ -6,7 +6,6 @@
 
 use lex_bytecode::vm::{EffectHandler, Vm};
 use lex_bytecode::{Program, Value};
-use smol_str::SmolStr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
