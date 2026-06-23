@@ -68,7 +68,8 @@ fn prims() -> Vec<Prim> {
         Prim {
             import: "import \"std.rand\" as rand",
             call: "rand.int_in(0, 1)",
-            effect: "rand",
+            // #677: rand.int_in now carries [random], not a separate [rand].
+            effect: "random",
             ret: "Int",
             int_ret: true,
         },
@@ -187,13 +188,13 @@ fn every_member_of_a_multi_effect_body_must_be_declared() {
     let import = "import \"std.time\" as time\nimport \"std.rand\" as rand";
     let body = "let a := time.now()\n  let b := rand.int_in(0, 1)\n  a + b";
 
-    // Honest: declares both effects.
+    // Honest: declares both effects. (#677: rand.int_in carries [random].)
     assert!(
-        checks(&format!("{import}\n{}", func("time, rand", "Int", body))),
+        checks(&format!("{import}\n{}", func("time, random", "Int", body))),
         "declaring both effects should check"
     );
     // Dropping either one, or both, must be rejected.
-    for missing in ["time", "rand", ""] {
+    for missing in ["time", "random", ""] {
         let src = format!("{import}\n{}", func(missing, "Int", body));
         assert!(
             !checks(&src),
@@ -209,7 +210,7 @@ fn every_member_of_a_multi_effect_body_must_be_declared() {
 const FUZZ_PRIMS: &[(&str, &str)] = &[
     ("time.now()", "time"),
     ("time.now_ms()", "time"),
-    ("rand.int_in(0, 1)", "rand"),
+    ("rand.int_in(0, 1)", "random"), // #677
 ];
 
 fn wrap_int(kind: usize, expr: &str) -> String {
@@ -263,7 +264,7 @@ fn composition_sweep_is_sound() {
                     used.push("time");
                 }
                 if used_rand {
-                    used.push("rand");
+                    used.push("random"); // #677: rand.int_in carries [random]
                 }
                 let honest = format!(
                     "{imports}fn f() -> [{}] Int {{\n  {body}\n}}\n",
@@ -273,7 +274,7 @@ fn composition_sweep_is_sound() {
 
                 // Every strict subset of the performed effects must be rejected.
                 let subsets: Vec<&[&str]> = match used.as_slice() {
-                    ["time", "rand"] => vec![&[], &["time"], &["rand"]],
+                    ["time", "random"] => vec![&[], &["time"], &["random"]],
                     _ => vec![&[]], // single effect: only the empty row is a strict subset
                 };
                 for sub in subsets {

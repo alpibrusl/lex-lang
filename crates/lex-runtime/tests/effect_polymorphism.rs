@@ -156,18 +156,32 @@ fn stamp_opt(o :: Option[Int]) -> [time] Option[Int] {
 
 #[test]
 fn effectful_list_map_runs_end_to_end() {
-    // Use rand.int_in (deterministic stub: midpoint of [lo, hi]) so
-    // we can assert exact output. Closure has [rand]; the surrounding
-    // fn declares [rand]; runtime runs under permissive policy.
+    // rand.int_in now draws honestly under [random] (#677), so assert each
+    // result lands in [0, hi] rather than an exact value. The point of this
+    // test is that an effectful closure threads its effect row through
+    // list.map end-to-end; the closure has [random], the surrounding fn
+    // declares [random], runtime runs under permissive policy.
     let src = r#"
 import "std.list" as list
 import "std.rand" as rand
-fn midpoints(xs :: List[Int]) -> [rand] List[Int] {
-  list.map(xs, fn (hi :: Int) -> [rand] Int { rand.int_in(0, hi) })
+fn draws(xs :: List[Int]) -> [random] List[Int] {
+  list.map(xs, fn (hi :: Int) -> [random] Int { rand.int_in(0, hi) })
 }
 "#;
-    // rand.int_in(0, 10) → 5; rand.int_in(0, 100) → 50; rand.int_in(0, 6) → 3
-    let r = run(src, "midpoints",
-        vec![Value::List(vec![Value::Int(10), Value::Int(100), Value::Int(6)].into())]);
-    assert_eq!(r, Value::List(vec![Value::Int(5), Value::Int(50), Value::Int(3)].into()));
+    let bounds = [10i64, 100, 6];
+    let r = run(src, "draws",
+        vec![Value::List(bounds.iter().map(|&n| Value::Int(n)).collect::<Vec<_>>().into())]);
+    match r {
+        Value::List(items) => {
+            assert_eq!(items.len(), bounds.len());
+            for (it, &hi) in items.iter().zip(bounds.iter()) {
+                match it {
+                    Value::Int(n) => assert!(*n >= 0 && *n <= hi,
+                        "rand.int_in(0, {hi}) returned {n}, out of range"),
+                    other => panic!("expected Int, got {other:?}"),
+                }
+            }
+        }
+        other => panic!("expected List, got {other:?}"),
+    }
 }
