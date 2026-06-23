@@ -26,7 +26,7 @@ use libfuzzer_sys::fuzz_target;
 const PRIMS: &[(&str, &str)] = &[
     ("time.now()", "time"),
     ("time.now_ms()", "time"),
-    ("rand.int_in(0, 1)", "rand"),
+    ("rand.int_in(0, 1)", "random"), // #677: rand.int_in carries [random]
 ];
 
 /// A tiny byte-driven chooser so the fuzzer's bytes map to structural
@@ -93,7 +93,7 @@ fuzz_target!(|data: &[u8]| {
         calls.push(call);
         match eff {
             "time" => used_time = true,
-            "rand" => used_rand = true,
+            "random" => used_rand = true,
             _ => unreachable!(),
         }
     }
@@ -116,7 +116,7 @@ fuzz_target!(|data: &[u8]| {
         used.push("time");
     }
     if used_rand {
-        used.push("rand");
+        used.push("random");
     }
 
     // Honest program: declare every performed effect. Must type-check —
@@ -132,9 +132,9 @@ fuzz_target!(|data: &[u8]| {
     // at least one). Each must be rejected — the dropped effect must not
     // escape.
     let subsets: &[&[&str]] = match used.as_slice() {
-        ["time", "rand"] => &[&[], &["time"], &["rand"]],
+        ["time", "random"] => &[&[], &["time"], &["random"]],
         ["time"] => &[&[]],
-        ["rand"] => &[&[]],
+        ["random"] => &[&[]],
         _ => &[],
     };
     for missing_row in subsets {

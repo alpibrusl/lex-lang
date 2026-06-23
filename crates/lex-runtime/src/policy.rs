@@ -86,7 +86,7 @@ impl Policy {
     pub fn permissive() -> Self {
         let mut s = BTreeSet::new();
         for k in [
-            "io", "net", "time", "rand", "llm", "proc", "panic",
+            "io", "net", "time", "llm", "proc", "panic",
             "fs_read", "fs_write", "budget",
             // #184: agent-runtime effects.
             "llm_local", "llm_cloud", "a2a", "mcp",
@@ -333,7 +333,7 @@ mod wildcard_tests {
     fn pure_and_unscoped_effects_are_clean() {
         assert!(Policy::pure().wildcard_scoped_grants().is_empty());
         let p = Policy {
-            allow_effects: effects(&["time", "rand", "panic"]),
+            allow_effects: effects(&["time", "random", "panic"]),
             ..Policy::default()
         };
         assert!(p.wildcard_scoped_grants().is_empty());

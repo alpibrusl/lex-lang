@@ -403,12 +403,17 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             Some(Ty::Record(fields))
         }
         "rand" => {
-            // rand.int_in(lo, hi) -> [rand] Int — currently a deterministic
-            // stub (midpoint) per spec §13; replaced when randomness lands.
+            // rand.int_in(lo, hi) -> [random] Int — honest uniform draw in
+            // [lo, hi] (inclusive) from the OS RNG (#677). Carries the same
+            // `[random]` effect as `crypto.random` rather than a separate
+            // `rand` effect, so a reviewer auditing `--effect random` sees
+            // every non-deterministic draw in one place. For deterministic,
+            // replayable randomness thread a seed through `std.random`
+            // instead; for cryptographic strength use `crypto.random`.
             let mut fields = IndexMap::new();
             fields.insert("int_in".into(), Ty::function(
                 vec![Ty::int(), Ty::int()],
-                EffectSet::singleton("rand"),
+                EffectSet::singleton("random"),
                 Ty::int(),
             ));
             Some(Ty::Record(fields))

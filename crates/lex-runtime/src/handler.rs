@@ -1043,6 +1043,11 @@ impl EffectHandler for DefaultHandler {
         // below, matching the `std.http` precedent.
         if kind == "redis" {
             self.ensure_kind_allowed("net")?;
+        } else if kind == "rand" {
+            // `std.rand.int_in` draws from the OS RNG → `[random]` effect,
+            // the same gate as `crypto.random` (#677). No separate `rand`
+            // effect grant exists.
+            self.ensure_kind_allowed("random")?;
         } else {
             self.ensure_kind_allowed(kind)?;
         }
@@ -1203,10 +1208,23 @@ impl EffectHandler for DefaultHandler {
                 Ok(Value::Unit)
             }
             ("rand", "int_in") => {
-                // Deterministic stub: midpoint of [lo, hi].
+                // Honest uniform draw in [lo, hi] inclusive from the OS RNG
+                // (#677), replacing the old deterministic midpoint stub.
+                // Same entropy source as `crypto.random`; gated `[random]`.
                 let lo = expect_int(args.first())?;
                 let hi = expect_int(args.get(1))?;
-                Ok(Value::Int((lo + hi) / 2))
+                if hi < lo {
+                    return Err(format!("rand.int_in: empty range [{lo}, {hi}]"));
+                }
+                use rand::{rngs::SysRng, TryRng};
+                // span fits in u128 even for the full i64 range; bias from
+                // the modulo over a 128-bit draw is < 2^-64 (negligible).
+                let span = (hi as i128 - lo as i128 + 1) as u128;
+                let mut buf = [0u8; 16];
+                SysRng.try_fill_bytes(&mut buf)
+                    .map_err(|e| format!("rand.int_in: OS RNG: {e}"))?;
+                let draw = (u128::from_le_bytes(buf) % span) as i128;
+                Ok(Value::Int((lo as i128 + draw) as i64))
             }
             // `env.get` returns `Option[Str]` — `None` for unset vars.
             // Per-var scoping (`[env(NAME)]`) arrives with #207's
