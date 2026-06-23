@@ -115,6 +115,14 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             let mut fields = IndexMap::new();
             fields.insert("to_str".into(), Ty::function(vec![Ty::int()], EffectSet::empty(), Ty::str()));
             fields.insert("to_float".into(), Ty::function(vec![Ty::int()], EffectSet::empty(), Ty::float()));
+            // Int scalar helpers (#681). math.{min,max,abs} are Float-only;
+            // these are the integer equivalents so Int callers don't have to
+            // round-trip through Float (which is lossy for large ints).
+            fields.insert("abs".into(), Ty::function(vec![Ty::int()], EffectSet::empty(), Ty::int()));
+            for name in &["min", "max"] {
+                fields.insert((*name).into(), Ty::function(
+                    vec![Ty::int(), Ty::int()], EffectSet::empty(), Ty::int()));
+            }
             Some(Ty::Record(fields))
         }
         "math" => {
@@ -2113,9 +2121,16 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
         "duration" => {
             let dur = || Ty::Con("Duration".into(), vec![]);
             let mut fields = IndexMap::new();
-            // seconds :: Duration -> Int  (truncates toward zero)
-            fields.insert("seconds".into(), Ty::function(
-                vec![dur()], EffectSet::empty(), Ty::int()));
+            // Scalar extraction from a Duration (nanoseconds under the
+            // hood). Each truncates toward zero. `seconds` shipped with
+            // #331; #681 rounds out the unit set so a Duration built in
+            // days via `datetime.duration_days` can be read back in the
+            // same units rather than only as seconds.
+            // millis / seconds / minutes / hours / days :: Duration -> Int
+            for name in &["millis", "seconds", "minutes", "hours", "days"] {
+                fields.insert((*name).into(), Ty::function(
+                    vec![dur()], EffectSet::empty(), Ty::int()));
+            }
             Some(Ty::Record(fields))
         }
         "process" => {
