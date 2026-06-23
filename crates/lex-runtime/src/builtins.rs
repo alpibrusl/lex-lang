@@ -1809,6 +1809,38 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                 Err(e) => Ok(http_decode_err_pure(format!("json parse: {e}"))),
             }
         }
+        // Compiler-emitted typed variant of http.json_body (#684): the
+        // type-checker rewrite injects the required-field list and the type
+        // schema derived from T (when T is a record), so a missing or
+        // wrong-typed field surfaces as a DecodeError instead of a later
+        // field-access panic — the same guarantee json.parse_strict gives,
+        // now on the most common API-decode path. Errors are HttpError
+        // (via http_decode_err_pure), matching json_body's error type.
+        ("http", "json_body_typed") => {
+            let resp = expect_record_pure(args.first())?;
+            let required = required_field_names(args.get(1))?;
+            let schema = extract_type_schema(args.get(2));
+            let body = match resp.get("body") {
+                Some(Value::Bytes(b)) => b.clone(),
+                _ => return Err("http.json_body: HttpResponse.body must be Bytes".into()),
+            };
+            let s = match std::str::from_utf8(&body) {
+                Ok(s) => s,
+                Err(e) => return Ok(http_decode_err_pure(format!("body not UTF-8: {e}"))),
+            };
+            match serde_json::from_str::<serde_json::Value>(s) {
+                Ok(j) => {
+                    if let Err(e) = check_required_fields(&j, &required) {
+                        return Ok(http_decode_err_pure(e));
+                    }
+                    if let Err(e) = validate_field_types(&j, &schema) {
+                        return Ok(http_decode_err_pure(e));
+                    }
+                    Ok(ok_v(apply_option_wrapping(json_to_value(&j), &j, &schema)))
+                }
+                Err(e) => Ok(http_decode_err_pure(format!("json parse: {e}"))),
+            }
+        }
         ("http", "text_body") => {
             let resp = expect_record_pure(args.first())?;
             let body = match resp.get("body") {
