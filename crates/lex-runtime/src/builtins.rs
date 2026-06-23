@@ -211,6 +211,10 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         // -- int / float --
         ("int", "to_str") => Ok(Value::Str(expect_int(args.first())?.to_string().into())),
         ("int", "to_float") => Ok(Value::Float(expect_int(args.first())? as f64)),
+        // Int scalar helpers (#681) — integer counterparts to math.{abs,min,max}.
+        ("int", "abs") => Ok(Value::Int(expect_int(args.first())?.abs())),
+        ("int", "min") => Ok(Value::Int(expect_int(args.first())?.min(expect_int(args.get(1))?))),
+        ("int", "max") => Ok(Value::Int(expect_int(args.first())?.max(expect_int(args.get(1))?))),
         ("float", "to_int") => Ok(Value::Int(expect_float(args.first())? as i64)),
         ("float", "to_str") => Ok(Value::Str(expect_float(args.first())?.to_string().into())),
         ("str", "to_float") => {
@@ -1739,11 +1743,13 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let b = expect_int(args.get(1))?;
             Ok(Value::Int(a.cmp(&b) as i64))
         }
-        // #331: Duration scalar extraction.
-        ("duration", "seconds") => {
-            let nanos = expect_int(args.first())?;
-            Ok(Value::Int(nanos / 1_000_000_000))
-        }
+        // #331: Duration scalar extraction (nanoseconds under the hood).
+        // #681 rounds out the unit set; each truncates toward zero.
+        ("duration", "millis")  => Ok(Value::Int(expect_int(args.first())? / 1_000_000)),
+        ("duration", "seconds") => Ok(Value::Int(expect_int(args.first())? / 1_000_000_000)),
+        ("duration", "minutes") => Ok(Value::Int(expect_int(args.first())? / 60_000_000_000)),
+        ("duration", "hours")   => Ok(Value::Int(expect_int(args.first())? / 3_600_000_000_000)),
+        ("duration", "days")    => Ok(Value::Int(expect_int(args.first())? / 86_400_000_000_000)),
 
         ("regex", "split") => {
             let pat = expect_str(args.first())?;
