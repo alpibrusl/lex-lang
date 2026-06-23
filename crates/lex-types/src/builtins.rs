@@ -1310,6 +1310,33 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::open_var(6),
                 Ty::Con("Result".into(), vec![Ty::Var(0), Ty::Var(2)]),
             ));
+            // result.unwrap_or :: Result[T, E], T -> T
+            // Eager fallback — the Ok payload, or the supplied default on
+            // Err. Mirrors option.unwrap_or (#679).
+            fields.insert("unwrap_or".into(), Ty::function(
+                vec![Ty::Con("Result".into(), vec![Ty::Var(0), Ty::Var(1)]), Ty::Var(0)],
+                EffectSet::empty(),
+                Ty::Var(0),
+            ));
+            // result.unwrap_or_else :: Result[T, E], (E) -> [Eff] T -> [Eff] T
+            // Lazy fallback — the closure runs only on Err and receives the
+            // error payload (effect-polymorphic on the closure). Mirrors
+            // option.unwrap_or_else (#679).
+            fields.insert("unwrap_or_else".into(), Ty::function(
+                vec![
+                    Ty::Con("Result".into(), vec![Ty::Var(0), Ty::Var(1)]),
+                    Ty::function(vec![Ty::Var(1)], EffectSet::open_var(7), Ty::Var(0)),
+                ],
+                EffectSet::open_var(7),
+                Ty::Var(0),
+            ));
+            // result.is_ok / is_err :: Result[T, E] -> Bool (#679)
+            fields.insert("is_ok".into(), Ty::function(
+                vec![Ty::Con("Result".into(), vec![Ty::Var(0), Ty::Var(1)])],
+                EffectSet::empty(), Ty::bool()));
+            fields.insert("is_err".into(), Ty::function(
+                vec![Ty::Con("Result".into(), vec![Ty::Var(0), Ty::Var(1)])],
+                EffectSet::empty(), Ty::bool()));
             Some(Ty::Record(fields))
         }
         "option" => {
@@ -1362,6 +1389,20 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 ],
                 EffectSet::open_var(4),
                 Ty::Con("Option".into(), vec![Ty::Var(0)]),
+            ));
+            // option.is_some / is_none :: Option[T] -> Bool (#679)
+            fields.insert("is_some".into(), Ty::function(
+                vec![Ty::Con("Option".into(), vec![Ty::Var(0)])],
+                EffectSet::empty(), Ty::bool()));
+            fields.insert("is_none".into(), Ty::function(
+                vec![Ty::Con("Option".into(), vec![Ty::Var(0)])],
+                EffectSet::empty(), Ty::bool()));
+            // option.ok_or :: Option[T], E -> Result[T, E]
+            // Cross from Option into Result, supplying the error for None (#679).
+            fields.insert("ok_or".into(), Ty::function(
+                vec![Ty::Con("Option".into(), vec![Ty::Var(0)]), Ty::Var(1)],
+                EffectSet::empty(),
+                Ty::Con("Result".into(), vec![Ty::Var(0), Ty::Var(1)]),
             ));
             Some(Ty::Record(fields))
         }

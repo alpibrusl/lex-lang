@@ -316,6 +316,17 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             Value::Variant { name, .. } => Ok(Value::Bool(name == "None")),
             other => Err(format!("option.is_none expected Option, got {other:?}")),
         },
+        // option.ok_or(opt, err): Some(x) -> Ok(x); None -> Err(err). (#679)
+        ("option", "ok_or") => {
+            let opt = first_arg(args)?;
+            let err_val = args.get(1).cloned().unwrap_or(Value::Unit);
+            match opt {
+                Value::Variant { name, args } if name == "Some" && !args.is_empty() =>
+                    Ok(ok_v(args[0].clone())),
+                Value::Variant { name, .. } if name == "None" => Ok(err_v(err_val)),
+                other => Err(format!("option.ok_or expected Option, got {other:?}")),
+            }
+        }
 
         // -- result --
         ("result", "is_ok") => match first_arg(args)? {
@@ -333,6 +344,19 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                 Value::Variant { name, args } if name == "Ok" && !args.is_empty() => Ok(args[0].clone()),
                 Value::Variant { name, .. } if name == "Err" => Ok(default),
                 other => Err(format!("result.unwrap_or expected Result, got {other:?}")),
+            }
+        }
+        // result.unwrap_or_else: lazy fallback over the Err payload. The
+        // closure call is emitted inline by the bytecode compiler
+        // (`emit_result_unwrap_or_else`); this arm is the interpreter
+        // fallback, with the thunk result pre-evaluated into args[1]. (#679)
+        ("result", "unwrap_or_else") => {
+            let res = first_arg(args)?;
+            match res {
+                Value::Variant { name, args } if name == "Ok" && !args.is_empty() => Ok(args[0].clone()),
+                Value::Variant { name, .. } if name == "Err" =>
+                    Ok(args.get(1).cloned().unwrap_or(Value::Unit)),
+                other => Err(format!("result.unwrap_or_else expected Result, got {other:?}")),
             }
         }
 
