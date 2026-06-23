@@ -11,6 +11,8 @@ bumps may carry breaking changes when justified).
 
 A stdlib-audit release. The minor bump (not a 0.9.x patch) is because three
 of the changes are **breaking**, per this changelog's pre-1.0 SemVer policy.
+All three are caught at `lex check` time — see
+[`docs/MIGRATING-0.10.md`](docs/MIGRATING-0.10.md) for the migration steps.
 
 ### Removed
 
