@@ -237,7 +237,7 @@ All three are caught at `lex check` time — see
   fall back to `[package].registry` in `lex.toml` and the
   `LEX_PUBLISH_TOKEN` env var respectively, keeping CI friction low.
 - **`Dependency::Registry` in `lex.toml`.** Consumers declare
-  `pkg = { registry = "https://lexhub.alpibru.com", version = "0.9.2" }`;
+  `pkg = { registry = "https://hub.lexlang.org", version = "0.9.2" }`;
   the resolver downloads and caches the source archive on first use under
   `~/.lex/packages/{name}-{version}/`.
 - **`lex pkg add --registry <url> --version <v>`.** Adds a registry

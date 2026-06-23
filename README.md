@@ -44,7 +44,7 @@ Multiple proposers race via `Candidate / Promote` without CAS contention. Per-se
 Hot functions are promoted from the bytecode interpreter to native code via Cranelift. The current backend is a phase-1 MVP covering an op subset (pure-int arithmetic; no closures/records yet). On that subset a steady-state micro-benchmark shows 84–194× over the interpreter — a *lower bound* for JIT ROI; real programs land between that and 1× ([`crates/lex-jit/benches`](crates/lex-jit/benches), [`docs/design/jit-roadmap.md`](docs/design/jit-roadmap.md)).
 
 **6. Package registry — publish and consume via LexHub.**
-`lex pkg publish` packs a `lex.toml` project and ships it to a registry. Consumers declare `{ registry = "…", version = "…" }` dependencies; the resolver downloads and caches the archive on first use. The canonical registry is [LexHub](https://lexhub.alpibru.com).
+`lex pkg publish` packs a `lex.toml` project and ships it to a registry. Consumers declare `{ registry = "…", version = "…" }` dependencies; the resolver downloads and caches the archive on first use. The canonical registry is [LexHub](https://hub.lexlang.org).
 
 ## Quickstart
 
@@ -92,7 +92,7 @@ lex pkg publish --token $LEX_PUBLISH_TOKEN   # registry = "..." in lex.toml
 
 ## Packages
 
-Packages published to [LexHub](https://lexhub.alpibru.com) — the canonical Lex package registry. Add them to `lex.toml` and run `lex pkg install`.
+Packages published to [LexHub](https://hub.lexlang.org) — the canonical Lex package registry. Add them to `lex.toml` and run `lex pkg install`.
 
 | Package | Version | What it is |
 |---|---|---|
@@ -101,7 +101,7 @@ Packages published to [LexHub](https://lexhub.alpibru.com) — the canonical Lex
 ```toml
 # lex.toml
 [dependencies]
-lex-schema = { registry = "https://lexhub.alpibru.com", version = "0.9.2" }
+lex-schema = { registry = "https://hub.lexlang.org", version = "0.9.2" }
 ```
 
 **Publishing your own package:**
@@ -213,4 +213,4 @@ Deferred: `flow.parallel_record` (needs row polymorphism), VCS tier-3 federation
 
 ---
 
-Built under the principles of [Trust Without Comprehension](https://alpibru.com/manifesto).
+Built under the principles of [Trust Without Comprehension](https://lexlang.org/manifesto).
