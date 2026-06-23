@@ -1232,31 +1232,12 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
 
             Some(Ty::Record(fields))
         }
-        "proc" => {
-            // Subprocess dispatch. Effect: [proc]. Returns a Result
-            // with a record on success carrying stdout / stderr /
-            // exit_code. The runtime allow-lists which binary
-            // basenames are spawnable — `cmd` is the program to
-            // run, `args` is the literal argv (no shell parsing).
-            //
-            // Read SECURITY.md before adding [proc] to a policy:
-            // it weakens the "we know what this fn does" claim.
-            let mut fields = IndexMap::new();
-            let mut result_rec = IndexMap::new();
-            result_rec.insert("stdout".into(), Ty::str());
-            result_rec.insert("stderr".into(), Ty::str());
-            result_rec.insert("exit_code".into(), Ty::int());
-            // spawn :: Str, List[Str] -> [proc] Result[{stdout, stderr, exit_code}, Str]
-            fields.insert("spawn".into(), Ty::function(
-                vec![Ty::str(), Ty::List(Box::new(Ty::str()))],
-                EffectSet::singleton("proc"),
-                Ty::Con("Result".into(), vec![
-                    Ty::Record(result_rec),
-                    Ty::str(),
-                ]),
-            ));
-            Some(Ty::Record(fields))
-        }
+        // `std.proc` was removed in favour of `std.process` (#678): its
+        // single op `proc.spawn(cmd, args)` was byte-for-byte equivalent to
+        // `process.run(cmd, args)` — same `[proc]` effect, same
+        // `{ stdout, stderr, exit_code }` result — and `std.process` is a
+        // strict superset (streaming spawn / read / wait / kill). Callers
+        // migrate `proc.spawn` → `process.run`.
         "json" => {
             let mut fields = IndexMap::new();
             // stringify :: T -> Str  (polymorphic on input)
@@ -3218,7 +3199,6 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "map" => "map",
         "set" => "set",
         "iter" => "iter",
-        "proc" => "proc",
         "crypto" => "crypto",
         "regex" => "regex",
         "parser" => "parser",
