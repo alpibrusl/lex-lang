@@ -83,7 +83,7 @@ parquet = { version = "58", default-features = false, features = ["arrow", "snap
 # compile. Found the hard way during the arrow-55→58 / polars-0.50→0.53
 # coordinated bump.
 polars = { version = "0.54", optional = true, default-features = false, features = ["lazy", "is_in", "csv", "performant", "strings", "temporal"] }
-lex-bytecode = { path = "../lex-bytecode", version = "0.9.6" }
+lex-bytecode = { path = "../lex-bytecode", version = "0.10.0" }
 smol_str = { workspace = true }
 
 [features]
@@ -102,7 +102,7 @@ df = ["dep:polars"]
 quic = ["dep:quinn", "dep:h3", "dep:h3-quinn", "dep:rustls", "dep:rustls-pemfile", "dep:rcgen"]
 
 [dev-dependencies]
-lex-syntax = { path = "../lex-syntax", version = "0.9.6" }
-lex-ast = { path = "../lex-ast", version = "0.9.6" }
-lex-types = { path = "../lex-types", version = "0.9.6" }
+lex-syntax = { path = "../lex-syntax", version = "0.10.0" }
+lex-ast = { path = "../lex-ast", version = "0.10.0" }
+lex-types = { path = "../lex-types", version = "0.10.0" }
 tempfile = "3"
