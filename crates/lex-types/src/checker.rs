@@ -254,11 +254,16 @@ fn rewrite_in_expr(
         match expr {
             a::CExpr::Call { callee, args } => {
                 if let a::CExpr::FieldAccess { field, .. } = callee.as_mut() {
-                    debug_assert_eq!(field, "parse",
-                        "rewrite_in_expr: only `.parse` calls should be in the table");
-                    // Use parse_strict_typed (internal, 3-arg) rather than the
-                    // public 2-arg parse_strict so direct callers aren't broken.
-                    *field = "parse_strict_typed".to_string();
+                    // Map each public decode op to its internal typed variant
+                    // (3-arg: source, required-fields, schema) so direct
+                    // callers of the public op aren't broken.
+                    let typed = match field.as_str() {
+                        "parse" => "parse_strict_typed",     // json / toml / yaml
+                        "json_body" => "json_body_typed",    // http (#684)
+                        other => unreachable!(
+                            "rewrite_in_expr: unexpected decode field `{other}`"),
+                    };
+                    *field = typed.to_string();
                 }
                 // Second argument: List[Str] of required field names.
                 args.push(a::CExpr::ListLit {
@@ -302,9 +307,17 @@ fn extract_record_fields_and_schema(
     let ok_ty = u.resolve(&args[0]);
     let unfolded = unfold_record_alias_static(env, ok_ty);
     if let Ty::Record(fields) = unfolded {
-        let names: Vec<String> = fields.keys().cloned().collect();
         let schema: Vec<(String, String)> = fields.iter()
             .map(|(k, v)| (k.clone(), ty_to_tag(u, v)))
+            .collect();
+        // Only non-Option fields are *required*: an `Option[T]` field is
+        // satisfied by absence (it decodes to `None`), so it must not be
+        // in the required list or an absent optional would wrongly fail
+        // `check_required_fields`. The schema still carries every field
+        // (for type validation + `apply_option_wrapping`).
+        let names: Vec<String> = schema.iter()
+            .filter(|(_, tag)| !tag.starts_with("Option["))
+            .map(|(k, _)| k.clone())
             .collect();
         Some((names, schema))
     } else {
@@ -549,16 +562,23 @@ impl Checker {
         false
     }
 
-    /// Whether `callee` is a `<alias>.parse` field access where
-    /// `<alias>` was imported from one of the stdlib modules whose
-    /// `parse` returns `Result[T, Str]` and whose `parse_strict`
-    /// shape exists for #168 enforcement (json / toml / yaml).
+    /// Whether `callee` is a stdlib decode call eligible for the #168 /
+    /// #322 required-field + type-schema rewrite. Two shapes qualify:
+    ///   - `<alias>.parse` for an alias bound to json / toml / yaml
+    ///     (returns `Result[T, Str]`), and
+    ///   - `<alias>.json_body` for an alias bound to http (#684) — the
+    ///     most common API-decode path, which returns
+    ///     `Result[T, HttpError]` and was previously unvalidated.
+    /// In both cases the rewrite only fires when the inferred `T` is a
+    /// record (see `extract_record_fields_and_schema`).
     fn is_module_parse_call(&self, callee: &a::CExpr) -> bool {
         if let a::CExpr::FieldAccess { value, field } = callee {
-            if field != "parse" { return false; }
             if let a::CExpr::Var { name } = value.as_ref() {
                 if let Some(module) = self.module_aliases.get(name) {
-                    return matches!(module.as_str(), "json" | "toml" | "yaml");
+                    return matches!(
+                        (module.as_str(), field.as_str()),
+                        ("json" | "toml" | "yaml", "parse") | ("http", "json_body")
+                    );
                 }
             }
         }
