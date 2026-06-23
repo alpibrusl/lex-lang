@@ -789,6 +789,7 @@ fn par_map_run<'a>(
     closure: Value,
     items: Vec<Value>,
     worker_handlers: Vec<Box<dyn EffectHandler + Send>>,
+    step_limit: u64,
 ) -> Result<Vec<Value>, VmError> {
     if items.is_empty() {
         return Ok(Vec::new());
@@ -825,6 +826,12 @@ fn par_map_run<'a>(
                 // auto-erased on the unsize coercion.
                 let handler_for_vm: Box<dyn EffectHandler + 'a> = handler;
                 let mut vm = Vm::with_handler(program, handler_for_vm);
+                // Inherit the parent VM's step limit instead of the default 10M
+                // cap. Otherwise a worker doing legitimately heavy work (e.g.
+                // parsing a large LLM response) panics with "step limit
+                // exceeded" even when the top-level run was launched uncapped
+                // (`--max-steps`/u64::MAX).
+                vm.set_step_limit(step_limit);
                 for (idx, item) in bucket {
                     let r = vm
                         .invoke_closure_value(closure.clone(), vec![item])
@@ -2257,7 +2264,7 @@ impl<'a> Vm<'a> {
                                 .unwrap_or_else(|| Box::new(DenyAllEffects)),
                         );
                     }
-                    let results = par_map_run(self.program, f, items.into_iter().collect(), worker_handlers)?;
+                    let results = par_map_run(self.program, f, items.into_iter().collect(), worker_handlers, self.step_limit)?;
                     self.stack.push(Value::List(results.into()));
                 }
                 Op::ListMap { node_id_idx: _ } => {
