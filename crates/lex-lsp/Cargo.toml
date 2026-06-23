@@ -25,12 +25,12 @@ serde_json.workspace = true
 # are rust-analyzer-team-maintained.
 lsp-server = "0.7"
 lsp-types = "0.97"
-lex-syntax = { path = "../lex-syntax", version = "0.9.6" }
-lex-ast = { path = "../lex-ast", version = "0.9.6" }
-lex-types = { path = "../lex-types", version = "0.9.6" }
+lex-syntax = { path = "../lex-syntax", version = "0.10.0" }
+lex-ast = { path = "../lex-ast", version = "0.10.0" }
+lex-types = { path = "../lex-types", version = "0.10.0" }
 # Phase 4 of #304: surface RepairHint attestations from the store.
-lex-vcs = { path = "../lex-vcs", version = "0.9.6" }
-lex-store = { path = "../lex-store", version = "0.9.6" }
+lex-vcs = { path = "../lex-vcs", version = "0.10.0" }
+lex-store = { path = "../lex-store", version = "0.10.0" }
 
 [dev-dependencies]
 tempfile = "3"

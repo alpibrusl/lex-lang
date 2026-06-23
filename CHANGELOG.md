@@ -7,6 +7,73 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-06-23
+
+A stdlib-audit release. The minor bump (not a 0.9.x patch) is because three
+of the changes are **breaking**, per this changelog's pre-1.0 SemVer policy.
+
+### Removed
+
+- **BREAKING — `std.proc` removed; use `std.process` (#678).** Its single op
+  `proc.spawn(cmd, args)` was byte-for-byte equivalent to `process.run` (same
+  `[proc]` effect, same `{ stdout, stderr, exit_code }` result, same
+  `--allow-proc` allow-list), and `std.process` is a strict superset (streaming
+  `spawn` / `read_*_line` / `wait` / `kill`). Migration is a drop-in rename
+  `proc.spawn` → `process.run`. The `[proc]` effect itself is unchanged.
+
+### Changed
+
+- **BREAKING — `rand.int_in` is now an honest random draw under `[random]`
+  (#677).** It previously declared `[rand]` but returned the deterministic
+  midpoint `(lo + hi) / 2`, silently feeding callers a constant. It now draws a
+  real uniform integer in `[lo, hi]` from the OS RNG and is gated by the same
+  `[random]` effect as `crypto.random` (the separate `rand` effect is gone). For
+  deterministic/replayable randomness use the seeded `std.random`; for
+  cryptographic strength use `crypto.random`.
+- **BREAKING — `http.stream_lines` returns `Stream[Str]` instead of
+  `Iter[Str]` (#683).** The old `Iter` was eager — it buffered the whole
+  response body before returning, so an SSE endpoint that holds the connection
+  open hung. It now returns a lazy `Stream[Str]` read line-by-line off the
+  socket (via ureq's `Body::into_reader()`); consume it with `std.stream`
+  (`stream.next` / `stream.collect`, effect `[stream]`).
+
+### Added
+
+- **`std.result` / `std.option` combinator parity (#679).** Added the missing
+  signatures/impls so the full set is callable: `result.unwrap_or`,
+  `result.unwrap_or_else`, `result.is_ok` / `is_err`, `option.is_some` /
+  `is_none`, and `option.ok_or` (crosses `Option` into `Result`).
+- **`std.int.{min,max,abs}` and `std.duration.{millis,minutes,hours,days}`
+  (#681).** Integer counterparts to the Float-only `math.{min,max,abs}` (no
+  lossy round-trip past 2^53), and the missing Duration unit extractors
+  (previously only `seconds`), restoring symmetry with `datetime`'s
+  `duration_*` constructors.
+- **`NET_SERVE_NAMED` strict lint (#680).** `lex check --strict` now flags the
+  name-based `net.serve` / `serve_tls` / `serve_ws` / `serve_with` /
+  `serve_quic` forms (handler passed as a runtime-looked-up `Str`, whose effect
+  row is invisible to the checker) and steers callers to the effect-polymorphic
+  closure variants (`serve_fn` / `serve_routed` / `serve_ws_fn` / …).
+- **`http.json_body[T]` is now validated (#684).** The type-checker rewrite
+  that turns `json.parse` into a strict, schema-checked decode now also covers
+  `http.json_body`, so a missing or wrong-typed field on an API response
+  surfaces as a `DecodeError` instead of a later field-access panic.
+
+### Fixed
+
+- **`std.yaml` Option-field decoding (#682).** `yaml.parse_strict` /
+  `parse_strict_typed` skipped the `apply_option_wrapping` pass that `json` and
+  `toml` run, so `Option[T]` fields parsed from YAML weren't wrapped in
+  `Some`/`None`. Now consistent across all three.
+- **Absent optional fields wrongly rejected (#684).** The shared decode-schema
+  extraction listed `Option[T]` fields as *required*, so an absent optional
+  field failed validation. Optional fields are now excluded from the required
+  set (across json / toml / yaml / http typed decoding).
+
+### Internal
+
+- `Nil` vs `Unit` naming in `lex-types` builtin doc-comments normalized to
+  `Unit` (#681).
+
 ## [0.9.14] — 2026-06-23
 
 ### Added

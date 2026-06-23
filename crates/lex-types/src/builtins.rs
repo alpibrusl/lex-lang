@@ -13,7 +13,7 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
     match name {
         "io" => {
             let mut fields = IndexMap::new();
-            // io.print(line :: Str) -> [io] Nil
+            // io.print(line :: Str) -> [io] Unit
             fields.insert("print".into(), Ty::function(
                 vec![Ty::str()],
                 EffectSet::singleton("io"),
@@ -2060,17 +2060,17 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                     Ty::Unit,
                 ));
             }
-            // set_level :: Str -> [io] Result[Nil, Str]
+            // set_level :: Str -> [io] Result[Unit, Str]
             fields.insert("set_level".into(), Ty::function(
                 vec![Ty::str()],
                 EffectSet::singleton("io"),
                 result_str(Ty::Unit)));
-            // set_format :: Str -> [io] Result[Nil, Str]
+            // set_format :: Str -> [io] Result[Unit, Str]
             fields.insert("set_format".into(), Ty::function(
                 vec![Ty::str()],
                 EffectSet::singleton("io"),
                 result_str(Ty::Unit)));
-            // set_sink :: Str -> [io, fs_write] Result[Nil, Str]
+            // set_sink :: Str -> [io, fs_write] Result[Unit, Str]
             fields.insert("set_sink".into(), Ty::function(
                 vec![Ty::str()],
                 EffectSet {
@@ -2204,7 +2204,7 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             // wait :: ProcessHandle -> [proc] ProcessExit
             fields.insert("wait".into(), Ty::function(
                 vec![ph()], EffectSet::singleton("proc"), exit_t()));
-            // kill :: ProcessHandle, Str -> [proc] Result[Nil, Str]
+            // kill :: ProcessHandle, Str -> [proc] Result[Unit, Str]
             fields.insert("kill".into(), Ty::function(
                 vec![ph(), Ty::str()],
                 EffectSet::singleton("proc"),
@@ -2286,7 +2286,7 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                     var: None,
                 },
                 Ty::Con("Result".into(), vec![kv_t(), Ty::str()])));
-            // close :: Kv -> [kv] Nil
+            // close :: Kv -> [kv] Unit
             fields.insert("close".into(), Ty::function(
                 vec![kv_t()],
                 EffectSet::singleton("kv"),
@@ -2296,12 +2296,12 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 vec![kv_t(), Ty::str()],
                 EffectSet::singleton("kv"),
                 Ty::Con("Option".into(), vec![Ty::bytes()])));
-            // put :: Kv, Str, Bytes -> [kv] Result[Nil, Str]
+            // put :: Kv, Str, Bytes -> [kv] Result[Unit, Str]
             fields.insert("put".into(), Ty::function(
                 vec![kv_t(), Ty::str(), Ty::bytes()],
                 EffectSet::singleton("kv"),
                 Ty::Con("Result".into(), vec![Ty::Unit, Ty::str()])));
-            // delete :: Kv, Str -> [kv] Result[Nil, Str]
+            // delete :: Kv, Str -> [kv] Result[Unit, Str]
             fields.insert("delete".into(), Ty::function(
                 vec![kv_t(), Ty::str()],
                 EffectSet::singleton("kv"),
@@ -2445,7 +2445,7 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             // process-wide registry (same pattern as Db in std.sql). All ops carry
             // [net] — Redis is a TCP service; no separate [redis] effect.
             //
-            // subscribe / psubscribe return Nil (= Unit) because they are blocking
+            // subscribe / psubscribe return Unit because they are blocking
             // infinite loops, consistent with net.serve_fn and ws.serve.
             //
             // subscribe/psubscribe open a *dedicated* connection internally —
@@ -2513,7 +2513,7 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::singleton("net"),
                 Ty::int()));
 
-            // subscribe :: ConnRedis, Str, (Str, Str ->[E] Unit) -> [net] Nil
+            // subscribe :: ConnRedis, Str, (Str, Str ->[E] Unit) -> [net] Unit
             // Blocking loop; handler receives (channel, message) on each message.
             // Uses a dedicated connection — Redis disallows non-Pub/Sub commands
             // on a subscribed connection. Handler carries an open effect row so
@@ -2525,9 +2525,9 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             fields.insert("subscribe".into(), Ty::function(
                 vec![conn_t(), Ty::str(), handler2],
                 EffectSet::singleton("net"),
-                Ty::Unit));  // Nil = Unit
+                Ty::Unit));  // Unit
 
-            // psubscribe :: ConnRedis, Str, (Str, Str, Str ->[E] Unit) -> [net] Nil
+            // psubscribe :: ConnRedis, Str, (Str, Str, Str ->[E] Unit) -> [net] Unit
             // Pattern-subscribe; handler receives (pattern, channel, message).
             // Handler carries an open effect row (same rationale as subscribe).
             let handler3 = Ty::function(
@@ -2537,7 +2537,7 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             fields.insert("psubscribe".into(), Ty::function(
                 vec![conn_t(), Ty::str(), handler3],
                 EffectSet::singleton("net"),
-                Ty::Unit));  // Nil = Unit
+                Ty::Unit));  // Unit
 
             // ---- List ----------------------------------------------------
 
