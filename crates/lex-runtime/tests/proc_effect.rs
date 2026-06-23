@@ -43,16 +43,19 @@ fn variant_args(v: &Value, expected_name: &str) -> Vec<Value> {
     }
 }
 
+// #678: `std.proc` was removed; the blocking-capture path is `process.run`,
+// which carries the same `[proc]` effect and returns the same
+// `{ stdout, stderr, exit_code }` record.
 const SRC: &str = r#"
-import "std.proc" as proc
+import "std.process" as process
 fn echo(args :: List[Str]) -> [proc] Result[{ stdout :: Str, stderr :: Str, exit_code :: Int }, Str] {
-  proc.spawn("echo", args)
+  process.run("echo", args)
 }
 fn forbidden() -> [proc] Result[{ stdout :: Str, stderr :: Str, exit_code :: Int }, Str] {
-  proc.spawn("/usr/bin/whoami", [])
+  process.run("/usr/bin/whoami", [])
 }
 fn falsy() -> [proc] Result[{ stdout :: Str, stderr :: Str, exit_code :: Int }, Str] {
-  proc.spawn("false", [])
+  process.run("false", [])
 }
 "#;
 
@@ -109,6 +112,23 @@ fn proc_spawn_propagates_non_zero_exit() {
         other => panic!("exit_code: {other:?}"),
     };
     assert_ne!(exit, 0, "false should exit non-zero");
+}
+
+#[test]
+fn std_proc_module_is_removed() {
+    // #678: `import "std.proc"` no longer resolves; callers use std.process.
+    let src = r#"
+import "std.proc" as proc
+fn f() -> [proc] Result[{ stdout :: Str, stderr :: Str, exit_code :: Int }, Str] {
+  proc.spawn("echo", [])
+}
+"#;
+    let prog = parse_source(src).expect("parse");
+    let stages = canonicalize_program(&prog);
+    assert!(
+        lex_types::check_program(&stages).is_err(),
+        "import \"std.proc\" should no longer type-check after #678"
+    );
 }
 
 #[test]

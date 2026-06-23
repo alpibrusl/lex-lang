@@ -1,7 +1,7 @@
 # An "agent dispatcher" that calls another CLI agent (claude-code,
 # cursor-cli, gemini-cli, ...) over stdout. The signature declares
 # `[proc]`, so the type checker rejects any body that tries to do
-# anything but `proc.spawn`. The runtime gates on which binary
+# anything but `process.run`. The runtime gates on which binary
 # basenames are spawnable via `--allow-proc`.
 #
 # This is the use case agents-orchestrating-agents need: a Lex
@@ -17,15 +17,15 @@
 #   even when [proc] itself is granted. Try:
 #     lex run --allow-effects proc --allow-proc echo \
 #       examples/agent_dispatcher.lex run "rm" "-rf" "/"
-#   → "proc.spawn: `rm` not in --allow-proc [\"echo\"]"
+#   → "process.run: `rm` not in --allow-proc [\"echo\"]"
 #
 #   Exit codes:
 #     0  — sub-binary returned 0 (success)
 #     non-zero (returned in `exit_code`) — sub-binary failed
-#     A `proc.spawn` not-allowed surfaces as Err(...), which we
+#     A `process.run` not-allowed surfaces as Err(...), which we
 #     return as the JSON output of `run`.
 
-import "std.proc" as proc
+import "std.process" as process
 import "std.list" as list
 import "std.str" as str
 import "std.int" as int
@@ -41,7 +41,7 @@ type Output = {
 # Result into a uniform Output record so a parent agent doesn't
 # have to pattern-match on Result + Record.
 fn run(cmd :: Str, args :: List[Str]) -> [proc] Output {
-  match proc.spawn(cmd, args) {
+  match process.run(cmd, args) {
     Ok(r) => {
       ok: r.exit_code == 0,
       exit_code: r.exit_code,
