@@ -7,6 +7,25 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.9.14] — 2026-06-23
+
+### Added
+
+- **Per-package visibility + unauthenticated public read (#673).** Packages
+  gain a `visibility` flag (`private` by default; `#[serde(default)]` so
+  existing `index.json` files and freshly published packages stay private
+  until an owner opts in). `PUT /v1/pkg/{name}/visibility` toggles it
+  (authorization is implicit — a request only reaches a tenant's store
+  because the front door authenticated the token and selected it). A new
+  `pub fn route_public(state, method, path, query)` serves GET-only,
+  visibility-gated, path-traversal-guarded access to a public package's
+  manifest / versions / head / per-version record / source archive, plus an
+  org listing that omits private packages. Everything served is
+  package-scoped (the package's own publish + archive), so it cannot leak a
+  private package's shared content-addressed stages. This is the lex-api
+  foundation for lex-hub's `/v1/public/<tenant>/...` surface (GitHub-style
+  public/private packages).
+
 ## [0.9.13] — 2026-06-23
 
 ### Added
