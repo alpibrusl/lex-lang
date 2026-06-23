@@ -564,13 +564,12 @@ impl Checker {
 
     /// Whether `callee` is a stdlib decode call eligible for the #168 /
     /// #322 required-field + type-schema rewrite. Two shapes qualify:
-    ///   - `<alias>.parse` for an alias bound to json / toml / yaml
-    ///     (returns `Result[T, Str]`), and
-    ///   - `<alias>.json_body` for an alias bound to http (#684) — the
-    ///     most common API-decode path, which returns
-    ///     `Result[T, HttpError]` and was previously unvalidated.
-    /// In both cases the rewrite only fires when the inferred `T` is a
-    /// record (see `extract_record_fields_and_schema`).
+    /// `<alias>.parse` for an alias bound to json / toml / yaml (returns
+    /// `Result[T, Str]`), and `<alias>.json_body` for an alias bound to
+    /// http (#684) — the most common API-decode path, which returns
+    /// `Result[T, HttpError]` and was previously unvalidated. In both
+    /// cases the rewrite only fires when the inferred `T` is a record
+    /// (see `extract_record_fields_and_schema`).
     fn is_module_parse_call(&self, callee: &a::CExpr) -> bool {
         if let a::CExpr::FieldAccess { value, field } = callee {
             if let a::CExpr::Var { name } = value.as_ref() {
