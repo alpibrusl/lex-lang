@@ -1518,6 +1518,7 @@ impl<'a> FnCompiler<'a> {
             ("option", "and_then") => self.emit_variant_map(args, "Some", false),
             ("option", "or_else") => self.emit_variant_or_else(args, "None", 0),
             ("option", "unwrap_or_else") => self.emit_option_unwrap_or_else(args),
+            ("result", "unwrap_or_else") => self.emit_result_unwrap_or_else(args),
             ("list", "map") => self.emit_list_map(args),
             ("list", "par_map") => self.emit_list_par_map(args),
             ("list", "sort_by") => self.emit_list_sort_by(args),
@@ -2557,6 +2558,57 @@ impl<'a> FnCompiler<'a> {
         self.emit(Op::CallClosure { arity: 0, node_id_idx: nid });
 
         // Patch jump-to-end from Some arm.
+        let end_target = self.code.len() as i32;
+        if let Op::Jump(off) = &mut self.code[j_end] {
+            *off = end_target - (j_end as i32 + 1);
+        }
+    }
+
+    /// `result.unwrap_or_else(res, f)` — lazy fallback over the Err payload.
+    ///   Ok(x)  → x        (unwrap; no wrapping)
+    ///   Err(e) → f(e)     (call closure with the error; result returned directly)
+    /// Sibling of `emit_option_unwrap_or_else`; differs only in matching on
+    /// `Ok` and forwarding the `Err` payload to a one-arg closure. (#679)
+    fn emit_result_unwrap_or_else(&mut self, args: &[a::CExpr]) {
+        let ok_idx = self.pool.variant("Ok");
+
+        self.compile_expr(&args[0], false);
+        let val_slot = self.alloc_local("__ruoe_val");
+        self.emit(Op::StoreLocal(val_slot));
+
+        self.compile_expr(&args[1], false);
+        let f_slot = self.alloc_local("__ruoe_f");
+        self.emit(Op::StoreLocal(f_slot));
+
+        // Test whether res is Ok.
+        //   load val ⇒ [v]
+        //   dup      ⇒ [v, v]
+        //   test     ⇒ [v, Bool]
+        //   jumpifnot → Err arm
+        self.emit(Op::LoadLocal(val_slot));
+        self.emit(Op::Dup);
+        self.emit(Op::TestVariant(ok_idx));
+        let j_err = self.code.len();
+        self.emit(Op::JumpIfNot(0));
+
+        // Ok arm: extract the payload from [v] left on the stack.
+        self.emit(Op::GetVariantArg(0));
+        let j_end = self.code.len();
+        self.emit(Op::Jump(0));
+
+        // Err arm: pop the [v] duplicate, call f with the Err payload.
+        let err_target = self.code.len() as i32;
+        if let Op::JumpIfNot(off) = &mut self.code[j_err] {
+            *off = err_target - (j_err as i32 + 1);
+        }
+        self.emit(Op::Pop);
+        self.emit(Op::LoadLocal(f_slot));
+        self.emit(Op::LoadLocal(val_slot));
+        self.emit(Op::GetVariantArg(0));
+        let nid = self.pool.node_id("n_ruoe");
+        self.emit(Op::CallClosure { arity: 1, node_id_idx: nid });
+
+        // Patch jump-to-end from Ok arm.
         let end_target = self.code.len() as i32;
         if let Op::Jump(off) = &mut self.code[j_end] {
             *off = end_target - (j_end as i32 + 1);
