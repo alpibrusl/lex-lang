@@ -3770,19 +3770,22 @@ fn err(v: Value) -> Value {
     Value::Variant { name: "Err".into(), args: vec![v] }
 }
 
-/// HTTP POST that buffers the full response body then yields it split into lines.
-/// Intended for LLM provider APIs (OpenAI, Anthropic, Google) that use SSE/NDJSON
-/// and close the connection after sending all events. Connection errors → `Err(Str)`.
+/// Streaming HTTP POST that yields the response body line-by-line as a lazy
+/// `Stream[Str]` (#683). Intended for LLM provider APIs and other SSE/NDJSON
+/// endpoints. Connection errors at request time → `Err(Str)`.
 ///
-/// CAUTION: ureq 3.3's `Body` does not implement `std::io::Read` and exposes no
-/// incremental read API. The entire response is buffered via `read_to_vec()` before
-/// splitting. This means the call blocks until the server closes the connection —
-/// endpoints that hold the connection open indefinitely will hang. True per-line
-/// streaming requires a future HTTP client upgrade.
-fn http_stream_lines_impl(_handler: &DefaultHandler, url: &str, headers_val: &Value, body: &str) -> Value {
+/// Truly incremental: ureq 3.3's `Body::into_reader()` gives a `BodyReader`
+/// (impl `io::Read`), so the returned `Stream[Str]` is a lazy line iterator
+/// directly over the socket. Each `stream.next` reads exactly the next line on
+/// demand — an endpoint that holds the connection open and emits events over
+/// time is consumed event-by-event instead of blocking until the server closes
+/// (the old `read_to_vec()` path buffered the whole body and hung on open-ended
+/// SSE). Because reads only happen when the consumer pulls, there's no extra
+/// buffering; a mid-stream read error / close simply ends the stream.
+fn http_stream_lines_impl(handler: &DefaultHandler, url: &str, headers_val: &Value, body: &str) -> Value {
     let body_bytes = body.as_bytes().to_vec();
-    // Use a 10-minute body-read timeout — local models (Ollama, vLLM) can take
-    // several minutes to generate long thinking traces before closing the stream.
+    // 10-minute body-read timeout — local models (Ollama, vLLM) can take
+    // several minutes between events on long thinking traces.
     let agent = http_stream_agent();
     let mut req = agent.post(url);
     if let Value::Map(headers) = headers_val {
@@ -3798,20 +3801,16 @@ fn http_stream_lines_impl(_handler: &DefaultHandler, url: &str, headers_val: &Va
     }
     match req.send(&body_bytes[..]) {
         Ok(resp) => {
-            let bytes = match resp.into_body().with_config().read_to_vec() {
-                Ok(b) => b,
-                Err(e) => return err(Value::Str(format!("http.stream_lines: body read: {e}").into())),
-            };
-            let raw_text = String::from_utf8_lossy(&bytes).into_owned();
-            let text = decode_unicode_escapes(&raw_text);
-            let items: std::collections::VecDeque<Value> = text.lines()
-                .map(|l| Value::Str(l.to_string().into()))
-                .collect();
-            let iter_val = Value::Variant {
-                name: "__IterEager".into(),
-                args: vec![Value::List(items), Value::Int(0)],
-            };
-            ok(iter_val)
+            use std::io::BufRead;
+            let reader = std::io::BufReader::new(resp.into_body().into_reader());
+            // Lazy: `map_while(ok)` stops at the first read error / EOF; the
+            // \uXXXX un-escaping preserves the pre-#683 decoded-text contract.
+            let lines = reader
+                .lines()
+                .map_while(Result::ok)
+                .map(|l| decode_unicode_escapes(&l));
+            let handle = handler.register_stream(lines);
+            ok(stream_handle_value(handle))
         }
         Err(e) => err(Value::Str(format!("http.stream_lines: {e}").into())),
     }
