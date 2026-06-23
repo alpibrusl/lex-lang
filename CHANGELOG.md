@@ -7,6 +7,19 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.9.13] — 2026-06-23
+
+### Added
+
+- **`str.char_at(s, i) -> Str` — O(1) single-char access (#674).** Reading a
+  string char-by-char previously meant `str.slice(s, i, i+1)`, whose codepoint
+  index resolves through `char_indices().nth(i)` — O(i) per char. Any hand-rolled
+  scanner (e.g. lex-schema's JSON parser) was therefore O(n²), and on multi-KB
+  inputs it exceeded the VM's 10M-step limit and panicked. `str.char_at` indexes
+  the UTF-8 bytes directly (O(1)) and returns the byte as a 1-char `Str` for
+  ASCII (`< 128`); out-of-range or a non-ASCII byte yields `""`. This lets
+  ASCII-oriented scanners run in O(n). Total — never panics.
+
 ## [0.9.12] — 2026-06-22
 
 ### Fixed
