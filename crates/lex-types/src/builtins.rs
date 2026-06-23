@@ -54,6 +54,8 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 Ty::Con("Option".into(), vec![Ty::float()])));
             fields.insert("concat".into(), Ty::function(vec![Ty::str(), Ty::str()], EffectSet::empty(), Ty::str()));
             fields.insert("len".into(), Ty::function(vec![Ty::str()], EffectSet::empty(), Ty::int()));
+            // char_at :: (Str, Int) -> Str  — O(1) single-char access; "" if out of range.
+            fields.insert("char_at".into(), Ty::function(vec![Ty::str(), Ty::int()], EffectSet::empty(), Ty::str()));
             fields.insert("split".into(), Ty::function(
                 vec![Ty::str(), Ty::str()],
                 EffectSet::empty(),

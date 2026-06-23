@@ -82,6 +82,27 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         // -- str --
         ("str", "is_empty") => Ok(Value::Bool(expect_str(args.first())?.is_empty())),
         ("str", "len") => Ok(Value::Int(expect_str(args.first())?.len() as i64)),
+        // O(1) single-char access. `str.slice(s, i, i+1)` resolves a codepoint
+        // index via `char_indices().nth(i)` — O(i) — so scanning a string
+        // char-by-char is O(n²). `char_at` indexes the UTF-8 bytes directly and
+        // returns the byte as a 1-char Str, letting ASCII-oriented scanners
+        // (e.g. the JSON parser, whose input is pre-sanitised to single bytes)
+        // run in O(n). Returns the char for ASCII bytes (< 128); out-of-range or
+        // a non-ASCII byte yields "" — total, never panics.
+        ("str", "char_at") => {
+            let s = expect_str(args.first())?;
+            let i = expect_int(args.get(1))?;
+            if i < 0 {
+                Ok(Value::Str("".into()))
+            } else {
+                match s.as_bytes().get(i as usize) {
+                    Some(&b) if b < 128 => {
+                        Ok(Value::Str((b as char).to_string().into()))
+                    }
+                    _ => Ok(Value::Str("".into())),
+                }
+            }
+        }
         ("str", "concat") => {
             let a = expect_str(args.first())?;
             let b = expect_str(args.get(1))?;
