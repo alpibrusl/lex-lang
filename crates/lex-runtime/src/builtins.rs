@@ -481,7 +481,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                     if let Err(e) = validate_field_types(&v, &schema) {
                         return Ok(err_v(Value::Str(e.into())));
                     }
-                    Ok(ok_v(json_to_value(&v)))
+                    Ok(ok_v(apply_option_wrapping(json_to_value(&v), &v, &schema)))
                 }
                 Err(e) => Ok(err_v(Value::Str(format!("{e}").into()))),
             }
@@ -498,7 +498,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                     if let Err(e) = validate_field_types(&v, &schema) {
                         return Ok(err_v(Value::Str(e.into())));
                     }
-                    Ok(ok_v(json_to_value(&v)))
+                    Ok(ok_v(apply_option_wrapping(json_to_value(&v), &v, &schema)))
                 }
                 Err(e) => Ok(err_v(Value::Str(format!("{e}").into()))),
             }
