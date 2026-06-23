@@ -2834,9 +2834,16 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::empty(),
                 result_he(Ty::str()),
             ));
-            // stream_lines :: Str, Map[Str, Str], Str -> [net] Result[Iter[Str], Str]
-            // Streaming HTTP POST; yields the response body line-by-line for
-            // SSE / NDJSON endpoints. Connection errors surface as Err(Str).
+            // stream_lines :: Str, Map[Str, Str], Str -> [net] Result[Stream[Str], Str]
+            // Streaming HTTP POST that yields the response body line-by-line
+            // for SSE / NDJSON endpoints. Returns a lazy `Stream[Str]` (#683):
+            // each `stream.next` pulls exactly one line off the socket as it
+            // arrives, so an endpoint that holds the connection open and emits
+            // events over time is consumed incrementally instead of blocking
+            // until close. Connection errors at request time surface as
+            // `Err(Str)`; a mid-stream read error / close ends the stream
+            // (next `stream.next` returns `None`). Consume with `std.stream`
+            // (`stream.next` / `stream.collect`), which carries `[stream]`.
             fields.insert("stream_lines".into(), Ty::function(
                 vec![
                     Ty::str(),
@@ -2845,7 +2852,7 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 ],
                 EffectSet::singleton("net"),
                 Ty::Con("Result".into(), vec![
-                    Ty::Con("Iter".into(), vec![Ty::str()]),
+                    Ty::Con("Stream".into(), vec![Ty::str()]),
                     Ty::str(),
                 ]),
             ));
