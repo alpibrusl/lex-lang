@@ -1019,6 +1019,30 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::singleton("concurrent"),
                 Ty::List(Box::new(Ty::str())),
             ));
+            // spawn_thread[Eff] :: (() -> [Eff] Unit) -> [concurrent, Eff] Unit
+            //
+            // #623 — the one deliberately *non-actor* primitive in this
+            // module. Runs the zero-arg closure on a fresh detached OS
+            // thread (same Policy as the caller) and returns Unit
+            // immediately; the closure executes concurrently with the
+            // caller. Unlike spawn/ask/tell (synchronous mailbox, #381),
+            // this is the escape hatch for long-running background tasks —
+            // e.g. a `net.dial_ws` loop alongside a foreground
+            // `net.serve_fn`. The closure's effect row `[Eff]` is
+            // propagated into the call row (unioned with `concurrent`),
+            // so effects stay honest and gated by the same Policy.
+            // Errors/panics in the closure are logged to stderr and end
+            // the thread (detached: no join handle in v1). See
+            // AGENT_GUIDELINES "concurrency".
+            fields.insert("spawn_thread".into(), Ty::function(
+                vec![Ty::Function {
+                    params: vec![],
+                    effects: EffectSet::open_var(0),
+                    ret: Box::new(Ty::Unit),
+                }],
+                EffectSet::open_var(0).union(&EffectSet::singleton("concurrent")),
+                Ty::Unit,
+            ));
             Some(Ty::Record(fields))
         }
         "arrow" => {
