@@ -516,10 +516,11 @@ fn render_type(t: &TypeExpr) -> String {
             parts.extend(fields.iter().map(|f| format!("{} :: {}", f.name, render_type(&f.ty))));
             format!("{{ {} }}", parts.join(", "))
         }
-        TypeExpr::Function { params, effects, ret } => {
+        TypeExpr::Function { params, effects, effect_row_var, ret } => {
             let parts: Vec<String> = params.iter().map(render_type).collect();
-            let eff = if effects.is_empty() { String::new() } else {
-                let names: Vec<&str> = effects.iter().map(|e| e.name.as_str()).collect();
+            let eff = if effects.is_empty() && effect_row_var.is_none() { String::new() } else {
+                let mut names: Vec<String> = effects.iter().map(|e| e.name.clone()).collect();
+                if let Some(v) = effect_row_var { names.push(format!("| {}", v)); }
                 format!("[{}] ", names.join(", "))
             };
             format!("({}) -> {}{}", parts.join(", "), eff, render_type(ret))

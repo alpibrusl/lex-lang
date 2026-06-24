@@ -55,6 +55,14 @@ pub struct FnDecl {
     pub type_params: Vec<String>,
     pub params: Vec<Param>,
     pub effects: Vec<Effect>,
+    /// Optional open-row tail on the declared effect row (effect-row poly):
+    /// `-> [io, net | E] T` names a row variable `E` (one of `type_params`)
+    /// standing for "plus any further effects", making the function
+    /// effect-row-polymorphic. `None` for the usual closed row. Serialized
+    /// only when present so pre-feature signatures (and their SigId content
+    /// hashes) stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_row_var: Option<String>,
     pub return_type: TypeExpr,
     pub body: Block,
     /// Optional `examples { call(a, b) => expected, ... }` block (#369).
@@ -108,6 +116,10 @@ pub enum TypeExpr {
     Function {
         params: Vec<TypeExpr>,
         effects: Vec<Effect>,
+        /// Open-row tail variable, e.g. the `E` in `(Int) -> [io | E] Int`.
+        /// See `FnDecl::effect_row_var`. Serialized only when present.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effect_row_var: Option<String>,
         ret: Box<TypeExpr>,
     },
     Union(Vec<UnionVariant>),
@@ -194,6 +206,10 @@ pub struct Lambda {
     pub params: Vec<Param>,
     pub return_type: TypeExpr,
     pub effects: Vec<Effect>,
+    /// Open-row tail variable on the lambda's declared effects. See
+    /// `FnDecl::effect_row_var`. Serialized only when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_row_var: Option<String>,
     pub body: Block,
 }
 

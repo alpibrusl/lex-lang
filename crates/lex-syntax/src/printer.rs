@@ -100,7 +100,7 @@ impl Printer {
             self.type_expr(&p.ty);
         }
         write!(self.out, ") -> ").unwrap();
-        self.effects(&fd.effects);
+        self.effects(&fd.effects, fd.effect_row_var.as_ref());
         self.type_expr(&fd.return_type);
         if fd.examples.is_empty() {
             write!(self.out, " ").unwrap();
@@ -136,8 +136,8 @@ impl Printer {
         write!(self.out, "  }}").unwrap();
     }
 
-    fn effects(&mut self, effects: &[Effect]) {
-        if effects.is_empty() { return; }
+    fn effects(&mut self, effects: &[Effect], tail: Option<&String>) {
+        if effects.is_empty() && tail.is_none() { return; }
         write!(self.out, "[").unwrap();
         for (i, e) in effects.iter().enumerate() {
             if i > 0 { write!(self.out, ", ").unwrap(); }
@@ -148,6 +148,13 @@ impl Printer {
                     EffectArg::Int(n) => write!(self.out, "({})", n).unwrap(),
                     EffectArg::Ident(s) => write!(self.out, "({})", s).unwrap(),
                 }
+            }
+        }
+        if let Some(v) = tail {
+            if effects.is_empty() {
+                write!(self.out, "| {}", v).unwrap();
+            } else {
+                write!(self.out, " | {}", v).unwrap();
             }
         }
         write!(self.out, "] ").unwrap();
@@ -195,14 +202,14 @@ impl Printer {
                 }
                 write!(self.out, ")").unwrap();
             }
-            TypeExpr::Function { params, effects, ret } => {
+            TypeExpr::Function { params, effects, effect_row_var, ret } => {
                 write!(self.out, "(").unwrap();
                 for (i, p) in params.iter().enumerate() {
                     if i > 0 { write!(self.out, ", ").unwrap(); }
                     self.type_expr(p);
                 }
                 write!(self.out, ") -> ").unwrap();
-                self.effects(effects);
+                self.effects(effects, effect_row_var.as_ref());
                 self.type_expr(ret);
             }
             TypeExpr::Union(variants) => {
@@ -380,7 +387,7 @@ impl Printer {
                     self.type_expr(&p.ty);
                 }
                 write!(self.out, ") -> ").unwrap();
-                self.effects(&l.effects);
+                self.effects(&l.effects, l.effect_row_var.as_ref());
                 self.type_expr(&l.return_type);
                 write!(self.out, " ").unwrap();
                 self.block(&l.body);

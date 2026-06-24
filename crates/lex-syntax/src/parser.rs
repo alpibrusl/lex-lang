@@ -524,11 +524,12 @@ impl<'a> Parser<'a> {
         if matches!(self.peek_skip_newlines(), Some(TokenKind::Arrow)) {
             self.skip_newlines();
             self.bump();
-            let effects = self.parse_effects()?;
+            let (effects, effect_row_var) = self.parse_effects()?;
             let ret = self.parse_type_expr()?;
             Ok(TypeExpr::Function {
                 params: args,
                 effects,
+                effect_row_var,
                 ret: Box::new(ret),
             })
         } else if args.len() == 1 {
@@ -560,11 +561,11 @@ impl<'a> Parser<'a> {
         }
         self.expect(&TokenKind::RParen, "after params")?;
         self.expect(&TokenKind::Arrow, "before return type")?;
-        let effects = self.parse_effects()?;
+        let (effects, effect_row_var) = self.parse_effects()?;
         let return_type = self.parse_type_expr()?;
         let examples = self.parse_examples_block()?;
         let body = self.parse_block()?;
-        Ok(FnDecl { name, type_params, params, effects, return_type, body, examples, leading_comments: Vec::new() })
+        Ok(FnDecl { name, type_params, params, effects, effect_row_var, return_type, body, examples, leading_comments: Vec::new() })
     }
 
     /// Parse an optional `examples { call(a, b) => expected, ... }` block
@@ -621,20 +622,33 @@ impl<'a> Parser<'a> {
         Ok(Param { name, ty })
     }
 
-    fn parse_effects(&mut self) -> Result<Vec<Effect>, ParseError> {
+    /// Parse an effect annotation `[a, b]`, optionally with an open-row tail
+    /// `[a, b | E]` (or `[| E]` for an empty concrete base). Returns the
+    /// concrete effects and the optional row-variable name.
+    fn parse_effects(&mut self) -> Result<(Vec<Effect>, Option<String>), ParseError> {
         if !self.eat(&TokenKind::LBracket) {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         }
         let mut out = Vec::new();
+        let mut tail = None;
         if !matches!(self.peek_skip_newlines(), Some(TokenKind::RBracket)) {
-            out.push(self.parse_effect()?);
-            while self.eat(&TokenKind::Comma) {
-                if matches!(self.peek_skip_newlines(), Some(TokenKind::RBracket)) { break; }
+            // `[| E]` — open row with no concrete lower bound.
+            if !matches!(self.peek_skip_newlines(), Some(TokenKind::Bar)) {
                 out.push(self.parse_effect()?);
+                while self.eat(&TokenKind::Comma) {
+                    if matches!(self.peek_skip_newlines(), Some(TokenKind::RBracket)) { break; }
+                    if matches!(self.peek_skip_newlines(), Some(TokenKind::Bar)) { break; }
+                    out.push(self.parse_effect()?);
+                }
+            }
+            // Optional open-row tail: `| E`.
+            self.skip_newlines();
+            if self.eat(&TokenKind::Bar) {
+                tail = Some(self.expect_ident("for effect row variable")?);
             }
         }
         self.expect(&TokenKind::RBracket, "after effects")?;
-        Ok(out)
+        Ok((out, tail))
     }
 
     fn parse_effect(&mut self) -> Result<Effect, ParseError> {
@@ -951,10 +965,10 @@ impl<'a> Parser<'a> {
         }
         self.expect(&TokenKind::RParen, "after lambda params")?;
         self.expect(&TokenKind::Arrow, "before lambda return type")?;
-        let effects = self.parse_effects()?;
+        let (effects, effect_row_var) = self.parse_effects()?;
         let return_type = self.parse_type_expr()?;
         let body = self.parse_block()?;
-        Ok(Expr::Lambda(Box::new(Lambda { params, effects, return_type, body })))
+        Ok(Expr::Lambda(Box::new(Lambda { params, effects, effect_row_var, return_type, body })))
     }
 
     fn parse_list_literal(&mut self) -> Result<Expr, ParseError> {

@@ -53,6 +53,7 @@ fn canonicalize_fn_decl(fd: &s::FnDecl) -> FnDecl {
             .map(|p| Param { name: p.name.clone(), ty: canonicalize_type(&p.ty) })
             .collect(),
         effects: fd.effects.iter().map(canonicalize_effect).collect(),
+        effect_row_var: fd.effect_row_var.clone(),
         return_type: canonicalize_type(&fd.return_type),
         body: canonicalize_block(&fd.body),
         examples: fd.examples.iter().map(canonicalize_example).collect(),
@@ -94,13 +95,14 @@ fn canonicalize_type(t: &s::TypeExpr) -> TypeExpr {
         s::TypeExpr::Tuple(items) => TypeExpr::Tuple {
             items: items.iter().map(canonicalize_type).collect(),
         },
-        s::TypeExpr::Function { params, effects, ret } => TypeExpr::Function {
+        s::TypeExpr::Function { params, effects, effect_row_var, ret } => TypeExpr::Function {
             params: params.iter().map(canonicalize_type).collect(),
             effects: {
                 let mut es: Vec<Effect> = effects.iter().map(canonicalize_effect).collect();
                 es.sort_by(|a, b| a.name.cmp(&b.name));
                 es
             },
+            effect_row_var: effect_row_var.clone(),
             ret: Box::new(canonicalize_type(ret)),
         },
         s::TypeExpr::RecordWithSpreads { spreads, fields } => {
@@ -335,6 +337,7 @@ fn canonicalize_expr(e: &s::Expr) -> CExpr {
                 es.sort_by(|a, b| a.name.cmp(&b.name));
                 es
             },
+            effect_row_var: l.effect_row_var.clone(),
             body: Box::new(canonicalize_block(&l.body)),
         },
     }

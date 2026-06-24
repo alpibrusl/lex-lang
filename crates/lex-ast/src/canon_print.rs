@@ -64,7 +64,7 @@ impl Printer {
             self.ty(&p.ty);
         }
         write!(self.out, ") -> ").unwrap();
-        self.effects(&fd.effects);
+        self.effects(&fd.effects, fd.effect_row_var.as_ref());
         self.ty(&fd.return_type);
         if !fd.examples.is_empty() {
             self.nl();
@@ -100,8 +100,8 @@ impl Printer {
         self.expr(&ex.expected);
     }
 
-    fn effects(&mut self, effects: &[Effect]) {
-        if effects.is_empty() { return; }
+    fn effects(&mut self, effects: &[Effect], tail: Option<&String>) {
+        if effects.is_empty() && tail.is_none() { return; }
         write!(self.out, "[").unwrap();
         for (i, e) in effects.iter().enumerate() {
             if i > 0 { write!(self.out, ", ").unwrap(); }
@@ -112,6 +112,13 @@ impl Printer {
                     EffectArg::Int { value } => write!(self.out, "({})", value).unwrap(),
                     EffectArg::Ident { value } => write!(self.out, "({})", value).unwrap(),
                 }
+            }
+        }
+        if let Some(v) = tail {
+            if effects.is_empty() {
+                write!(self.out, "| {}", v).unwrap();
+            } else {
+                write!(self.out, " | {}", v).unwrap();
             }
         }
         write!(self.out, "] ").unwrap();
@@ -159,14 +166,14 @@ impl Printer {
                 }
                 write!(self.out, ")").unwrap();
             }
-            TypeExpr::Function { params, effects, ret } => {
+            TypeExpr::Function { params, effects, effect_row_var, ret } => {
                 write!(self.out, "(").unwrap();
                 for (i, p) in params.iter().enumerate() {
                     if i > 0 { write!(self.out, ", ").unwrap(); }
                     self.ty(p);
                 }
                 write!(self.out, ") -> ").unwrap();
-                self.effects(effects);
+                self.effects(effects, effect_row_var.as_ref());
                 self.ty(ret);
             }
             TypeExpr::Union { variants } => {
@@ -306,7 +313,7 @@ impl Printer {
                 self.expr(value);
                 write!(self.out, ".{}", field).unwrap();
             }
-            CExpr::Lambda { params, return_type, effects, body } => {
+            CExpr::Lambda { params, return_type, effects, effect_row_var, body } => {
                 write!(self.out, "fn (").unwrap();
                 for (i, p) in params.iter().enumerate() {
                     if i > 0 { write!(self.out, ", ").unwrap(); }
@@ -314,7 +321,7 @@ impl Printer {
                     self.ty(&p.ty);
                 }
                 write!(self.out, ") -> ").unwrap();
-                self.effects(effects);
+                self.effects(effects, effect_row_var.as_ref());
                 self.ty(return_type);
                 write!(self.out, " ").unwrap();
                 self.expr_as_block(body);

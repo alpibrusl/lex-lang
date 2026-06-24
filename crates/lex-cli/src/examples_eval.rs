@@ -154,6 +154,7 @@ fn zero_arg_helper(name: &str, return_type: a::TypeExpr, body: a::CExpr) -> a::S
         type_params: Vec::new(),
         params: Vec::new(),
         effects: Vec::new(),
+        effect_row_var: None,
         return_type,
         body,
         examples: Vec::new(),

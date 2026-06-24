@@ -27,6 +27,12 @@ pub struct FnDecl {
     pub type_params: Vec<String>,
     pub params: Vec<Param>,
     pub effects: Vec<Effect>,
+    /// Open-row tail variable on the declared effect row (effect-row poly):
+    /// the `E` in `-> [io | E] T`, one of `type_params`. `None` for a closed
+    /// row. Serialized only when present so the canonical JSON (and the SigId
+    /// content hash derived from it) is unchanged for pre-feature functions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_row_var: Option<String>,
     pub return_type: TypeExpr,
     pub body: CExpr,
     /// Signature-level examples (#369). Empty when the source carried no
@@ -84,7 +90,7 @@ pub enum TypeExpr {
     Named { name: String, args: Vec<TypeExpr> },
     Record { fields: Vec<TypeField> },
     Tuple { items: Vec<TypeExpr> },
-    Function { params: Vec<TypeExpr>, effects: Vec<Effect>, ret: Box<TypeExpr> },
+    Function { params: Vec<TypeExpr>, effects: Vec<Effect>, #[serde(default, skip_serializing_if = "Option::is_none")] effect_row_var: Option<String>, ret: Box<TypeExpr> },
     Union { variants: Vec<UnionVariant> },
     /// Record type with spread bases (#363): `{ ...TypeName, extra :: Type }`.
     /// Kept in canonical form unresolved; type-checker expands to `Ty::Record`.
@@ -136,7 +142,7 @@ pub enum CExpr {
     TupleLit { items: Vec<CExpr> },
     ListLit { items: Vec<CExpr> },
     FieldAccess { value: Box<CExpr>, field: String },
-    Lambda { params: Vec<Param>, return_type: TypeExpr, effects: Vec<Effect>, body: Box<CExpr> },
+    Lambda { params: Vec<Param>, return_type: TypeExpr, effects: Vec<Effect>, #[serde(default, skip_serializing_if = "Option::is_none")] effect_row_var: Option<String>, body: Box<CExpr> },
     BinOp { op: String, lhs: Box<CExpr>, rhs: Box<CExpr> },
     UnaryOp { op: String, expr: Box<CExpr> },
     /// Tail position only; used for `?` desugaring.
