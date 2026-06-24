@@ -437,14 +437,25 @@ fn function_scheme(fd: &a::FnDecl, env: &TypeEnv) -> Scheme {
             }
             s
         },
-        var: None,
+        // Open-row tail on the function's own declared row: `-> [io | E] T`.
+        // Resolve `E` to its `type_params` index (shared id space with the
+        // type-var numbering; read back via the effect-subst map, so no
+        // collision with a same-indexed type param).
+        var: fd.effect_row_var
+            .as_ref()
+            .and_then(|n| fd.type_params.iter().position(|p| p == n))
+            .map(|i| i as u32),
     };
     let ty = Ty::Function { params, effects, ret: Box::new(ret) };
     let vars: Vec<TyVarId> = (0..fd.type_params.len() as u32).collect();
-    // User-declared functions don't carry effect-row variables today
-    // (the surface syntax has no `[E]` form for user types). Only
-    // stdlib HOFs do, and those are loaded via module_scope.
-    Scheme { vars, eff_vars: Vec::new(), ty }
+    // Generalize over any effect-row variable in the signature — a
+    // row-polymorphic parameter (`(Int) -> [io | E] Int`, like the stdlib
+    // HOFs) or the function's own open row (`-> [io | E] T`). Each is
+    // freshened per call site by `instantiate`, then bound to the caller's
+    // actual effects by `unify_effects`. Closed rows collect nothing, so
+    // their checking is unchanged.
+    let eff_vars = collect_eff_vars(&ty);
+    Scheme { vars, eff_vars, ty }
 }
 
 struct Checker {
@@ -475,6 +486,14 @@ struct Checker {
     /// error instead of stopping at the first (#566). Drained by
     /// `check_fn` after each body/example check.
     recovered_errors: Vec<TypeError>,
+    /// Effect-row variables in scope for the function currently being
+    /// checked: surface name (e.g. `E`) → the instantiated fresh effect-var
+    /// id allocated for it. Lets a row-polymorphic *lambda* inside the body
+    /// (`fn (r) -> [io | E] R { ... }`) resolve its tail `E` to the same id
+    /// as the enclosing function's signature, so effects flow through the
+    /// closure (e.g. into `net.serve_fn`) instead of being silently dropped.
+    /// Empty for closed-row functions.
+    eff_row_scope: IndexMap<String, u32>,
 }
 
 impl Checker {
@@ -487,6 +506,7 @@ impl Checker {
             pending_parse_calls: Vec::new(),
             fn_params: IndexMap::new(),
             recovered_errors: Vec::new(),
+            eff_row_scope: IndexMap::new(),
         }
     }
 
@@ -704,10 +724,23 @@ impl Checker {
     fn check_fn(&mut self, fd: &a::FnDecl) -> Result<Scheme, Vec<TypeError>> {
         // Instantiate fn's signature with fresh vars for its type params.
         let scheme = function_scheme(fd, &self.type_env);
-        let (param_tys, declared_effects, ret_ty) = match instantiate(&scheme, &mut self.u) {
+        let (inst_ty, eff_subst) = instantiate_with_eff(&scheme, &mut self.u);
+        let (param_tys, declared_effects, ret_ty) = match inst_ty {
             Ty::Function { params, effects, ret } => (params, effects, *ret),
             _ => unreachable!(),
         };
+
+        // Map this function's surface row-variable names to their freshly
+        // instantiated effect-var ids, so a row-polymorphic lambda in the
+        // body can join the enclosing row (see `eff_row_scope`). A type
+        // param at index `i` is a row var iff `i` was generalized as an
+        // effect var (`scheme.eff_vars`) and thus appears in `eff_subst`.
+        let saved_scope = std::mem::take(&mut self.eff_row_scope);
+        for (i, name) in fd.type_params.iter().enumerate() {
+            if let Some(fresh) = eff_subst.get(&(i as u32)) {
+                self.eff_row_scope.insert(name.clone(), *fresh);
+            }
+        }
 
         let mut locals: IndexMap<String, Ty> = IndexMap::new();
         for (p, t) in fd.params.iter().zip(param_tys.iter()) {
@@ -830,6 +863,9 @@ impl Checker {
 
         // Catch any errors recovered while checking example sub-expressions.
         errors.append(&mut self.recovered_errors);
+        // Restore the enclosing function's row-var scope (functions are
+        // checked one at a time, so this is just defensive symmetry).
+        self.eff_row_scope = saved_scope;
         if errors.is_empty() { Ok(scheme) } else { Err(errors) }
     }
 
@@ -962,9 +998,27 @@ impl Checker {
                     }),
                 }
             }
-            a::CExpr::Lambda { params, return_type, effects: l_effects, body } => {
+            a::CExpr::Lambda { params, return_type, effects: l_effects, effect_row_var: l_row_var, body } => {
                 let param_tys: Vec<Ty> = params.iter().map(|p| ty_from_canon_env(&p.ty, &[], &self.type_env)).collect();
                 let ret_ty = ty_from_canon_env(return_type, &[], &self.type_env);
+                // A row-polymorphic lambda (`fn (..) -> [io | E] ..`) resolves
+                // its tail `E` to the enclosing function's instantiated row-var
+                // id (recorded in `eff_row_scope`), so effects produced in the
+                // body — e.g. by calling a row-poly parameter — flow out through
+                // the closure's type (into `net.serve_fn` etc.) rather than
+                // being dropped. An unknown name is a plain error.
+                let row_var = match l_row_var {
+                    Some(name) => match self.eff_row_scope.get(name) {
+                        Some(id) => Some(*id),
+                        None => {
+                            return Err(TypeError::EffectNotDeclared {
+                                at_node: node_id.into(),
+                                effect: format!("unbound effect-row variable `{}`", name),
+                            });
+                        }
+                    },
+                    None => None,
+                };
                 let declared = EffectSet {
                     concrete: {
                         let mut s = std::collections::BTreeSet::new();
@@ -978,7 +1032,7 @@ impl Checker {
                         }
                         s
                     },
-                    var: None,
+                    var: row_var,
                 };
                 let mut inner_locals = locals.clone();
                 for (p, t) in params.iter().zip(param_tys.iter()) {
@@ -997,6 +1051,19 @@ impl Checker {
                                 effect: e.pretty(),
                             });
                         }
+                    }
+                }
+                // The body produced an open effect row (e.g. by calling a
+                // row-polymorphic parameter), but the lambda's declared row
+                // doesn't carry that same tail — without `| E` the extra
+                // effects would be silently dropped at the closure boundary.
+                // Require the lambda to declare the matching open row.
+                if let Some(iv) = inner_effs.var {
+                    if declared.var != Some(iv) {
+                        return Err(TypeError::EffectNotDeclared {
+                            at_node: node_id.into(),
+                            effect: "open effect row (annotate the lambda's effects with `| <row-var>`)".into(),
+                        });
                     }
                 }
                 Ok(Ty::function(param_tys, declared, ret_ty))
@@ -1417,11 +1484,20 @@ fn lit_type(l: &a::CLit) -> Ty {
 }
 
 fn instantiate(s: &Scheme, u: &mut Unifier) -> Ty {
+    instantiate_with_eff(s, u).0
+}
+
+/// Like `instantiate`, but also returns the effect-var substitution
+/// (scheme effect-var id → fresh id). `check_fn` uses it to map the
+/// function's surface row-variable names to their instantiated ids, so a
+/// row-polymorphic lambda in the body can join the same row.
+fn instantiate_with_eff(s: &Scheme, u: &mut Unifier) -> (Ty, IndexMap<u32, u32>) {
     let mut ty_subst = IndexMap::new();
     for v in &s.vars { ty_subst.insert(*v, u.fresh()); }
     let mut eff_subst = IndexMap::new();
     for v in &s.eff_vars { eff_subst.insert(*v, u.fresh_eff_id()); }
-    subst_vars(&s.ty, &ty_subst, &eff_subst)
+    let ty = subst_vars(&s.ty, &ty_subst, &eff_subst);
+    (ty, eff_subst)
 }
 
 fn subst_vars(

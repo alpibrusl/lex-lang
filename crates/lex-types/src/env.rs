@@ -389,7 +389,7 @@ pub fn ty_from_canon(t: &lex_ast::TypeExpr, params: &[String]) -> Ty {
             Ty::Record(m)
         }
         lex_ast::TypeExpr::Tuple { items } => Ty::Tuple(items.iter().map(|t| ty_from_canon(t, params)).collect()),
-        lex_ast::TypeExpr::Function { params: ps, effects, ret } => {
+        lex_ast::TypeExpr::Function { params: ps, effects, effect_row_var, ret } => {
             // Plumb effect args (#207).
             let effs = EffectSet {
                 concrete: {
@@ -404,7 +404,15 @@ pub fn ty_from_canon(t: &lex_ast::TypeExpr, params: &[String]) -> Ty {
                     }
                     s
                 },
-                var: None,
+                // Open-row tail: `[io | E]` where `E` is one of the enclosing
+                // type/fn's `params`. Resolve it to that param's index — the
+                // same id space as `Ty::Var(idx)`, but read back through the
+                // separate effect-substitution map at instantiation, so a
+                // type param and an effect-row param never collide.
+                var: effect_row_var
+                    .as_ref()
+                    .and_then(|name| params.iter().position(|p| p == name))
+                    .map(|i| i as u32),
             };
             Ty::Function {
                 params: ps.iter().map(|t| ty_from_canon(t, params)).collect(),

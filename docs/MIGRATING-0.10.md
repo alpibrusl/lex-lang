@@ -105,3 +105,11 @@ open-ended streams.
 `duration.millis` / `minutes` / `hours` / `days` (#681); and the
 `std.yaml` `Option[T]` decoding fix (#682). See `CHANGELOG.md` for the full
 list.
+
+- **Effect-row polymorphism (`[base | E]`).** Functions can now carry an open
+  effect-row tail naming a type parameter, so a generic helper or server
+  forwards a callback/handler's extra effects instead of fixing a concrete
+  row. Purely additive: closed rows are unchanged (still equality), and
+  existing content hashes (`lex hash`) are byte-identical. Adoption guide with
+  before/after in
+  [`docs/effect-row-polymorphism.md`](effect-row-polymorphism.md).

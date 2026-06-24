@@ -388,6 +388,7 @@ impl<'a> Mangler<'a> {
                 })
                 .collect(),
             effects: fd.effects,
+            effect_row_var: fd.effect_row_var,
             return_type: self.mangle_type_expr(fd.return_type),
             body: self.mangle_block(fd.body, &shadow),
             examples,
@@ -426,6 +427,7 @@ impl<'a> Mangler<'a> {
             TypeExpr::Function {
                 params,
                 effects,
+                effect_row_var,
                 ret,
             } => TypeExpr::Function {
                 params: params
@@ -433,6 +435,7 @@ impl<'a> Mangler<'a> {
                     .map(|t| self.mangle_type_expr(t))
                     .collect(),
                 effects,
+                effect_row_var,
                 ret: Box::new(self.mangle_type_expr(*ret)),
             },
             TypeExpr::Union(variants) => TypeExpr::Union(
@@ -620,6 +623,7 @@ impl<'a> Mangler<'a> {
                         .collect(),
                     return_type: self.mangle_type_expr(lambda.return_type),
                     effects: lambda.effects,
+                    effect_row_var: lambda.effect_row_var,
                     body: self.mangle_block(lambda.body, &lam_shadow),
                 }))
             }

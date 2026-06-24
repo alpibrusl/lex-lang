@@ -88,8 +88,8 @@ pub fn fold(e: CExpr) -> CExpr {
             value: Box::new(fold(*value)),
             field,
         },
-        CExpr::Lambda { params, return_type, effects, body } => CExpr::Lambda {
-            params, return_type, effects,
+        CExpr::Lambda { params, return_type, effects, effect_row_var, body } => CExpr::Lambda {
+            params, return_type, effects, effect_row_var,
             body: Box::new(fold(*body)),
         },
         CExpr::BinOp { op, lhs, rhs } => CExpr::BinOp {
