@@ -39,7 +39,8 @@ bumps may carry breaking changes when justified).
   closure that produces an open row but declares a closed one is rejected rather
   than silently dropping effects. Backward-compatible on the wire: the row tail
   is serialized only when present, so existing signatures and their SigId
-  content hashes are byte-identical.
+  content hashes are byte-identical. Adoption guide with before/after:
+  [`docs/effect-row-polymorphism.md`](docs/effect-row-polymorphism.md).
 
 ## [0.10.0] — 2026-06-23
 
