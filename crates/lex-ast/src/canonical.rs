@@ -15,6 +15,10 @@ use serde::{Deserialize, Serialize};
 /// stages (§3.12); each `fn` and `type` declaration becomes one stage.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "node")]
+// `FnDecl` is the dominant, near-always-present variant (every `fn` is one),
+// so the size skew is inherent and boxing it would just add an indirection on
+// the hot path. Matches the existing `#[allow]` on the merge-session enum.
+#[allow(clippy::large_enum_variant)]
 pub enum Stage {
     FnDecl(FnDecl),
     TypeDecl(TypeDecl),
