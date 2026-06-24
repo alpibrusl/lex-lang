@@ -7,47 +7,14 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
-### Added
+## [0.10.0] — 2026-06-25
 
-- **Effect-row polymorphism for user functions (`[base | E]`).** A function's
-  effect annotation may now carry an open-row tail naming a type parameter:
-
-  ```lex
-  fn run_http[E](
-    port :: Int,
-    dispatch :: (Request) -> [io, net, sql, concurrent, random,
-                              fs_read, fs_write, time, crypto, llm, proc | E] Response,
-  ) -> [io, net, sql, concurrent, random,
-        fs_read, fs_write, time, crypto, llm, proc | E] Nil {
-    let handler := fn (req :: Request) -> [io, net, ..., proc | E] Response { dispatch(req) }
-    net.serve_fn(port, handler)
-  }
-  ```
-
-  The row variable `E` stands for "plus any further effects". It generalizes at
-  the definition and binds per call site to the caller's actual effects — the
-  same mechanism the stdlib HOFs (`list.map`, `fold`, …) already used
-  internally, now expressible in user code. It works on **parameters**, a
-  function's **own row**, and **closures** (a lambda's `| E` resolves to the
-  enclosing function's row variable), so a generic server can forward an
-  effectful handler's effects — e.g. a robot agent's `actuate` — without the
-  framework hard-coding those effects.
-
-  The effect wall is unchanged for everything else: **closed** rows still unify
-  by equality (`[io]` rejects a `[io, time]` argument), open rows *propagate and
-  enforce* the extra effects (a caller that under-declares is rejected), and a
-  closure that produces an open row but declares a closed one is rejected rather
-  than silently dropping effects. Backward-compatible on the wire: the row tail
-  is serialized only when present, so existing signatures and their SigId
-  content hashes are byte-identical. Adoption guide with before/after:
-  [`docs/effect-row-polymorphism.md`](docs/effect-row-polymorphism.md).
-
-## [0.10.0] — 2026-06-23
-
-A stdlib-audit release. The minor bump (not a 0.9.x patch) is because three
-of the changes are **breaking**, per this changelog's pre-1.0 SemVer policy.
-All three are caught at `lex check` time — see
+A stdlib-audit release, headlined by **effect-row polymorphism** for user
+functions (`[base | E]`, see Added). The minor bump (not a 0.9.x patch) is
+because three of the stdlib changes are **breaking**, per this changelog's
+pre-1.0 SemVer policy. All three are caught at `lex check` time — see
 [`docs/MIGRATING-0.10.md`](docs/MIGRATING-0.10.md) for the migration steps.
+The effect-row feature is additive and needs no migration.
 
 ### Removed
 
@@ -76,6 +43,34 @@ All three are caught at `lex check` time — see
 
 ### Added
 
+- **Effect-row polymorphism for user functions (`[base | E]`).** A function's
+  effect annotation may now carry an open-row tail naming a type parameter:
+
+  ```lex
+  fn run_http[E](
+    port :: Int,
+    dispatch :: (Request) -> [io, net, sql, concurrent, random,
+                              fs_read, fs_write, time, crypto, llm, proc | E] Response,
+  ) -> [io, net, sql, concurrent, random,
+        fs_read, fs_write, time, crypto, llm, proc | E] Nil {
+    let handler := fn (req :: Request) -> [io, net, ..., proc | E] Response { dispatch(req) }
+    net.serve_fn(port, handler)
+  }
+  ```
+
+  The row variable `E` stands for "plus any further effects". It generalizes at
+  the definition and binds per call site to the caller's actual effects — the
+  same mechanism the stdlib HOFs (`list.map`, `fold`, …) already used
+  internally, now expressible in user code. It works on **parameters**, a
+  function's **own row**, and **closures** (a lambda's `| E` resolves to the
+  enclosing function's row variable), so a generic server can forward an
+  effectful handler's effects — e.g. a robot agent's `actuate` — without the
+  framework hard-coding those effects. This is purely **additive**: closed rows
+  still unify by equality (`[io]` rejects a `[io, time]` argument), open rows
+  *propagate and enforce* the extra effects (an under-declaring caller is
+  rejected), and the row tail is serialized only when present, so existing
+  signatures and their SigId content hashes are byte-identical. Adoption guide
+  with before/after: [`docs/effect-row-polymorphism.md`](docs/effect-row-polymorphism.md).
 - **`std.result` / `std.option` combinator parity (#679).** Added the missing
   signatures/impls so the full set is callable: `result.unwrap_or`,
   `result.unwrap_or_else`, `result.is_ok` / `is_err`, `option.is_some` /
