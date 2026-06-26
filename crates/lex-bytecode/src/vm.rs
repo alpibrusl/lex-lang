@@ -82,6 +82,18 @@ pub enum VmError {
         binding: String,
         reason: String,
     },
+    /// Integer division or modulo with a zero divisor (#696). Without
+    /// this guard the host `/`/`%` panics and takes the whole process
+    /// down — the crash report had a conformance harness compute a
+    /// rate over an empty set in teardown, far from any user-visible
+    /// division. Surfacing a catchable `VmError` instead keeps the
+    /// failure inside the language's error model. Float div/mod is
+    /// exempt: IEEE-754 yields inf/NaN rather than trapping.
+    #[error("integer {op} by zero")]
+    DivByZero {
+        /// `"division"` or `"modulo"` — names the offending operator.
+        op: &'static str,
+    },
 }
 
 /// Maximum simultaneous call frames. Defends against unbounded
@@ -2675,8 +2687,8 @@ impl<'a> Vm<'a> {
                 Op::IntAdd => self.bin_int(|a, b| Value::Int(a + b))?,
                 Op::IntSub => self.bin_int(|a, b| Value::Int(a - b))?,
                 Op::IntMul => self.bin_int(|a, b| Value::Int(a * b))?,
-                Op::IntDiv => self.bin_int(|a, b| Value::Int(a / b))?,
-                Op::IntMod => self.bin_int(|a, b| Value::Int(a % b))?,
+                Op::IntDiv => self.bin_int_divmod(false)?,
+                Op::IntMod => self.bin_int_divmod(true)?,
                 Op::IntNeg => {
                     let a = self.pop()?.as_int();
                     self.stack.push(Value::Int(-a));
@@ -2716,8 +2728,8 @@ impl<'a> Vm<'a> {
                 }
                 Op::NumSub => self.bin_num(|a, b| Value::Int(a - b), |a, b| Value::Float(a - b))?,
                 Op::NumMul => self.bin_num(|a, b| Value::Int(a * b), |a, b| Value::Float(a * b))?,
-                Op::NumDiv => self.bin_num(|a, b| Value::Int(a / b), |a, b| Value::Float(a / b))?,
-                Op::NumMod => self.bin_int(|a, b| Value::Int(a % b))?,
+                Op::NumDiv => self.num_divmod(false)?,
+                Op::NumMod => self.num_divmod(true)?,
                 Op::NumNeg => {
                     let v = self.pop()?;
                     match v {
@@ -3090,6 +3102,47 @@ impl<'a> Vm<'a> {
         let a = self.pop()?.as_int();
         self.stack.push(f(a, b));
         Ok(())
+    }
+    /// Guarded integer `/` (`is_mod == false`) or `%` (`is_mod == true`)
+    /// for `Op::IntDiv` / `Op::IntMod` (#696). A zero divisor raises
+    /// `VmError::DivByZero` instead of panicking the host. `wrapping_*`
+    /// also tames the only other panicking input, `i64::MIN / -1` (and
+    /// `i64::MIN % -1`), whose true result overflows `i64`: division
+    /// wraps to `i64::MIN`, modulo to `0`.
+    fn bin_int_divmod(&mut self, is_mod: bool) -> Result<(), VmError> {
+        let b = self.pop()?.as_int();
+        let a = self.pop()?.as_int();
+        if b == 0 {
+            return Err(VmError::DivByZero { op: if is_mod { "modulo" } else { "division" } });
+        }
+        let v = if is_mod { a.wrapping_rem(b) } else { a.wrapping_div(b) };
+        self.stack.push(Value::Int(v));
+        Ok(())
+    }
+    /// Guarded `/` / `%` for the overloaded `Op::NumDiv` / `Op::NumMod`,
+    /// which accept either both-`Int` or both-`Float` operands (#696).
+    /// Integers route through the same zero/overflow guards as
+    /// `bin_int_divmod`; floats keep IEEE-754 semantics (inf/NaN, no
+    /// trap). Mirrors the type checker, which only admits these two
+    /// operand shapes for `%` (int) and `/` (int or float).
+    fn num_divmod(&mut self, is_mod: bool) -> Result<(), VmError> {
+        let b = self.pop()?;
+        let a = self.pop()?;
+        match (a, b) {
+            (Value::Int(x), Value::Int(y)) => {
+                if y == 0 {
+                    return Err(VmError::DivByZero { op: if is_mod { "modulo" } else { "division" } });
+                }
+                let v = if is_mod { x.wrapping_rem(y) } else { x.wrapping_div(y) };
+                self.stack.push(Value::Int(v));
+                Ok(())
+            }
+            (Value::Float(x), Value::Float(y)) => {
+                self.stack.push(Value::Float(if is_mod { x % y } else { x / y }));
+                Ok(())
+            }
+            (a, b) => Err(VmError::TypeMismatch(format!("Num op: {a:?} {b:?}"))),
+        }
     }
     fn bin_float(&mut self, f: impl Fn(f64, f64) -> Value) -> Result<(), VmError> {
         let b = self.pop()?.as_float();

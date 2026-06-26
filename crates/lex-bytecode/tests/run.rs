@@ -668,3 +668,62 @@ fn pick(flag :: Int, r :: R) -> Int {
     assert_eq!(vm.call("pick", vec![Value::Int(0), mk()]).unwrap(), Value::Int(5));
     assert_eq!(vm.call("pick", vec![Value::Int(1), mk()]).unwrap(), Value::Int(0));
 }
+
+// --- #696: integer division/modulo by zero is a clean VmError, not a
+// host panic. The divisor is passed in as an argument so the value
+// cannot be constant-folded away at compile time — the guard has to
+// fire inside the VM run loop, the exact site (vm.rs IntDiv/IntMod)
+// that took the process down in the 0.10.0 crash report.
+
+#[test]
+fn int_div_by_zero_is_caught_not_panic() {
+    let src = "fn div(a :: Int, b :: Int) -> Int { a / b }\n";
+    let p = compile(src);
+    let mut vm = Vm::new(&p);
+    // Sanity: a real divisor still divides.
+    assert_eq!(vm.call("div", vec![Value::Int(7), Value::Int(2)]).unwrap(), Value::Int(3));
+    let err = vm
+        .call("div", vec![Value::Int(7), Value::Int(0)])
+        .expect_err("expected DivByZero, not a value");
+    match err {
+        VmError::DivByZero { op } => assert_eq!(op, "division"),
+        other => panic!("expected DivByZero, got {other:?}"),
+    }
+}
+
+#[test]
+fn int_mod_by_zero_is_caught_not_panic() {
+    let src = "fn rem(a :: Int, b :: Int) -> Int { a % b }\n";
+    let p = compile(src);
+    let mut vm = Vm::new(&p);
+    assert_eq!(vm.call("rem", vec![Value::Int(7), Value::Int(3)]).unwrap(), Value::Int(1));
+    let err = vm
+        .call("rem", vec![Value::Int(7), Value::Int(0)])
+        .expect_err("expected DivByZero, not a value");
+    match err {
+        VmError::DivByZero { op } => assert_eq!(op, "modulo"),
+        other => panic!("expected DivByZero, got {other:?}"),
+    }
+}
+
+#[test]
+fn int_div_min_by_neg_one_wraps_instead_of_panicking() {
+    // The second host-panic class: i64::MIN / -1 overflows i64 because
+    // the true quotient (2^63) is unrepresentable. The guard routes it
+    // through wrapping_div (-> i64::MIN) / wrapping_rem (-> 0) so it,
+    // too, can never abort the process.
+    let src = "fn div(a :: Int, b :: Int) -> Int { a / b }\n";
+    let p = compile(src);
+    let mut vm = Vm::new(&p);
+    assert_eq!(
+        vm.call("div", vec![Value::Int(i64::MIN), Value::Int(-1)]).unwrap(),
+        Value::Int(i64::MIN),
+    );
+    let src_mod = "fn rem(a :: Int, b :: Int) -> Int { a % b }\n";
+    let p = compile(src_mod);
+    let mut vm = Vm::new(&p);
+    assert_eq!(
+        vm.call("rem", vec![Value::Int(i64::MIN), Value::Int(-1)]).unwrap(),
+        Value::Int(0),
+    );
+}
