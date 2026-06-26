@@ -7,6 +7,10 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.10.1] — 2026-06-26
+
+A point release shipping the `std.vcs` content store effect.
+
 ### Added
 
 - **`std.vcs` — content-addressed blob store effect (#5).** A new `[vcs]`

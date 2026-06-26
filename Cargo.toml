@@ -24,7 +24,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.10.0"
+version = "0.10.1"
 edition = "2021"
 license = "EUPL-1.2"
 repository = "https://github.com/alpibrusl/lex-lang"
