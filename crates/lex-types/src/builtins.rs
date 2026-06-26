@@ -2318,6 +2318,50 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 Ty::List(Box::new(Ty::str()))));
             Some(Ty::Record(fields))
         }
+        "vcs" => {
+            // Content-addressed blob store (#5 / M6.1b). `put_blob` returns the
+            // lowercase hex SHA-256 of the content — the SAME id as
+            // `crypto.sha256_str`, so blobs are interchangeable with loom's
+            // SQLite-backed artifacts by id. `ref_set`/`ref_get` bind a name
+            // (namespace + key) to a blob sha, e.g. namespace "loom/sprint-{id}",
+            // key = node id (branch-per-sprint, #5). The on-disk layout matches
+            // lex-store's blob CAS (<root>/blobs, <root>/blobrefs).
+            //
+            // fs_write/fs_read appear in the effect rows so `lex audit` sees the
+            // disk touch; the store root is internal (~/.lex/store or
+            // $LEX_STORE_ROOT) so no user-path allowlist applies.
+            let mut fields = IndexMap::new();
+            let vcs_w = || EffectSet {
+                concrete: [crate::types::EffectKind::bare("vcs"),
+                           crate::types::EffectKind::bare("fs_write")]
+                    .into_iter().collect(),
+                var: None,
+            };
+            let vcs_r = || EffectSet {
+                concrete: [crate::types::EffectKind::bare("vcs"),
+                           crate::types::EffectKind::bare("fs_read")]
+                    .into_iter().collect(),
+                var: None,
+            };
+            let res = |ok: Ty| Ty::Con("Result".into(), vec![ok, Ty::str()]);
+
+            // put_blob :: Str -> [vcs, fs_write] Result[Str, Str]  (returns sha)
+            fields.insert("put_blob".into(), Ty::function(
+                vec![Ty::str()], vcs_w(), res(Ty::str())));
+            // get_blob :: Str -> [vcs, fs_read] Result[Str, Str]
+            fields.insert("get_blob".into(), Ty::function(
+                vec![Ty::str()], vcs_r(), res(Ty::str())));
+            // has_blob :: Str -> [vcs, fs_read] Bool
+            fields.insert("has_blob".into(), Ty::function(
+                vec![Ty::str()], vcs_r(), Ty::bool()));
+            // ref_set :: Str, Str, Str -> [vcs, fs_write] Result[Unit, Str]
+            fields.insert("ref_set".into(), Ty::function(
+                vec![Ty::str(), Ty::str(), Ty::str()], vcs_w(), res(Ty::Unit)));
+            // ref_get :: Str, Str -> [vcs, fs_read] Result[Str, Str]  (key -> sha)
+            fields.insert("ref_get".into(), Ty::function(
+                vec![Ty::str(), Ty::str()], vcs_r(), res(Ty::str())));
+            Some(Ty::Record(fields))
+        }
         "sql" => {
             // Embedded SQL (SQLite via rusqlite). The opaque `Db` type is
             // backed by an Int handle into a process-wide registry (#362).
@@ -3231,6 +3275,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "df" => "df",
         "redis" => "redis",
         "decimal" => "decimal",
+        "vcs" => "vcs",
         _ => return None,
     })
 }
