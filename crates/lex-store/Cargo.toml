@@ -22,9 +22,19 @@ hex.workspace = true
 # call sites compile.
 fs2 = "0.4"
 lex-ast = { path = "../lex-ast", version = "0.10.0" }
-lex-trace = { path = "../lex-trace", version = "0.10.0" }
+# Optional: lex-trace backs only save_trace/load_trace (the `trace` feature).
+# Gated so lower crates (e.g. lex-runtime) can depend on the blob/stage store
+# with `default-features = false` without forming a lex-store → lex-trace →
+# lex-runtime cycle.
+lex-trace = { path = "../lex-trace", version = "0.10.0", optional = true }
 lex-types = { path = "../lex-types", version = "0.10.0" }
 lex-vcs = { path = "../lex-vcs", version = "0.10.0" }
+
+[features]
+default = ["trace"]
+# Native run-trace store (Store::save_trace / load_trace). On by default for the
+# `lex` toolchain; turn off (default-features = false) to break the cycle above.
+trace = ["dep:lex-trace"]
 
 [dev-dependencies]
 lex-syntax = { path = "../lex-syntax", version = "0.10.0" }

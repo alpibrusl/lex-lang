@@ -2683,6 +2683,7 @@ dependencies = [
  "k256",
  "lex-ast",
  "lex-bytecode",
+ "lex-store",
  "lex-syntax",
  "lex-types",
  "md-5",

@@ -1591,37 +1591,40 @@ impl EffectHandler for DefaultHandler {
                 Ok(Value::List(keys.into()))
             }
             // ── std.vcs: content-addressed blob store (#5) ──
-            // Effect `vcs` is gated by the generic ensure_kind_allowed(kind)
-            // above. The on-disk layout exactly mirrors lex-store's blob CAS
-            // (<root>/blobs/<sha>, <root>/blobrefs/<ns>/<key>) so blobs written
-            // here are readable by the `lex` store tooling and vice-versa. We
-            // re-implement it locally rather than depend on lex-store, which
-            // would form a cycle (lex-store → lex-trace → lex-runtime). put_blob's
-            // sha == crypto.sha256_str(content), so vcs blobs and loom's SQLite
-            // artifacts share ids.
+            // Backed by lex-store's blob CAS (Store::put_blob/get_blob/
+            // set_blob_ref/get_blob_ref). Effect `vcs` is gated by the generic
+            // ensure_kind_allowed(kind) above. put_blob's sha ==
+            // crypto.sha256_str(content), so vcs blobs and loom's SQLite
+            // artifacts share ids. We depend on lex-store with the `trace`
+            // feature off to avoid a lex-store → lex-trace → lex-runtime cycle.
             ("vcs", "put_blob") => {
                 let content = expect_str(args.first())?.to_string();
-                match vcs_put_blob(&vcs_store_root(), &content) {
+                match lex_store::Store::open(vcs_store_root())
+                    .and_then(|s| s.put_blob(&content)) {
                     Ok(sha) => Ok(ok(Value::Str(sha.into()))),
                     Err(e)  => Ok(err(Value::Str(format!("vcs.put_blob: {e}").into()))),
                 }
             }
             ("vcs", "get_blob") => {
                 let sha = expect_str(args.first())?.to_string();
-                match vcs_get_blob(&vcs_store_root(), &sha) {
+                match lex_store::Store::open(vcs_store_root())
+                    .and_then(|s| s.get_blob(&sha)) {
                     Ok(content) => Ok(ok(Value::Str(content.into()))),
                     Err(e)      => Ok(err(Value::Str(format!("vcs.get_blob: {e}").into()))),
                 }
             }
             ("vcs", "has_blob") => {
                 let sha = expect_str(args.first())?.to_string();
-                Ok(Value::Bool(vcs_store_root().join("blobs").join(&sha).exists()))
+                let has = lex_store::Store::open(vcs_store_root())
+                    .map(|s| s.has_blob(&sha)).unwrap_or(false);
+                Ok(Value::Bool(has))
             }
             ("vcs", "ref_set") => {
                 let ns  = expect_str(args.first())?.to_string();
                 let key = expect_str(args.get(1))?.to_string();
                 let sha = expect_str(args.get(2))?.to_string();
-                match vcs_ref_set(&vcs_store_root(), &ns, &key, &sha) {
+                match lex_store::Store::open(vcs_store_root())
+                    .and_then(|s| s.set_blob_ref(&ns, &key, &sha)) {
                     Ok(())  => Ok(ok(Value::Unit)),
                     Err(e)  => Ok(err(Value::Str(format!("vcs.ref_set: {e}").into()))),
                 }
@@ -1629,7 +1632,8 @@ impl EffectHandler for DefaultHandler {
             ("vcs", "ref_get") => {
                 let ns  = expect_str(args.first())?.to_string();
                 let key = expect_str(args.get(1))?.to_string();
-                match vcs_ref_get(&vcs_store_root(), &ns, &key) {
+                match lex_store::Store::open(vcs_store_root())
+                    .and_then(|s| s.get_blob_ref(&ns, &key)) {
                     Ok(sha) => Ok(ok(Value::Str(sha.into()))),
                     Err(e)  => Ok(err(Value::Str(format!("vcs.ref_get: {e}").into()))),
                 }
@@ -3826,71 +3830,6 @@ fn vcs_store_root() -> std::path::PathBuf {
     home.join(".lex/store")
 }
 
-// Content-addressed blob store, layout-compatible with lex-store's blob CAS
-// (<root>/blobs/<sha>, <root>/blobrefs/<ns…>/<key>). Re-implemented here to
-// avoid a lex-store dependency cycle (lex-store → lex-trace → lex-runtime).
-fn vcs_put_blob(root: &std::path::Path, content: &str) -> Result<String, String> {
-    use sha2::{Digest, Sha256};
-    let sha = hex::encode(Sha256::digest(content.as_bytes()));
-    let dir = root.join("blobs");
-    let path = dir.join(&sha);
-    if path.exists() {
-        return Ok(sha); // idempotent dedup
-    }
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    // unique temp + atomic rename → safe for #6's parallel writers
-    let tmp = dir.join(format!(".{sha}.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, content.as_bytes()).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
-    Ok(sha)
-}
-
-fn vcs_get_blob(root: &std::path::Path, sha: &str) -> Result<String, String> {
-    match std::fs::read_to_string(root.join("blobs").join(sha)) {
-        Ok(s) => Ok(s),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Err(format!("unknown blob {sha}"))
-        }
-        Err(e) => Err(e.to_string()),
-    }
-}
-
-// Resolve <root>/blobrefs/<ns components…> with the same `..`/`/`/`\` traversal
-// rejection lex-store applies to namespace and key.
-fn vcs_ref_dir(root: &std::path::Path, namespace: &str, key: &str) -> Result<std::path::PathBuf, String> {
-    if key.contains('/') || key.contains('\\') || key.split('/').any(|c| c == "..") {
-        return Err(format!("invalid ref key `{key}`"));
-    }
-    let mut dir = root.join("blobrefs");
-    for comp in namespace.split('/') {
-        if comp == ".." || comp.contains('\\') {
-            return Err(format!("invalid ref namespace `{namespace}`"));
-        }
-        if !comp.is_empty() {
-            dir.push(comp);
-        }
-    }
-    Ok(dir)
-}
-
-fn vcs_ref_set(root: &std::path::Path, namespace: &str, key: &str, sha: &str) -> Result<(), String> {
-    let dir = vcs_ref_dir(root, namespace, key)?;
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    std::fs::write(dir.join(key), sha.as_bytes()).map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-fn vcs_ref_get(root: &std::path::Path, namespace: &str, key: &str) -> Result<String, String> {
-    let dir = vcs_ref_dir(root, namespace, key)?;
-    match std::fs::read_to_string(dir.join(key)) {
-        Ok(s) => Ok(s.trim().to_string()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Err(format!("unknown ref {namespace}/{key}"))
-        }
-        Err(e) => Err(e.to_string()),
-    }
-}
-
 /// Streaming HTTP POST that yields the response body line-by-line as a lazy
 /// `Stream[Str]` (#683). Intended for LLM provider APIs and other SSE/NDJSON
 /// endpoints. Connection errors at request time → `Err(Str)`.
@@ -5365,50 +5304,5 @@ mod unpack_response_tests {
         let v = Value::Int(7);
         let (status, _body, _headers) = unpack_response(&mut vm, &v);
         assert_eq!(status, 500);
-    }
-}
-
-#[cfg(test)]
-mod vcs_cas_tests {
-    use super::{vcs_put_blob, vcs_get_blob, vcs_ref_set, vcs_ref_get};
-
-    #[test]
-    fn put_then_get_roundtrips_and_dedups() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let sha1 = vcs_put_blob(root, "loom artifact").unwrap();
-        // sha is lowercase hex SHA-256 (== crypto.sha256_str)
-        assert_eq!(sha1.len(), 64);
-        assert!(sha1.chars().all(|c| c.is_ascii_hexdigit()));
-        // idempotent: same content → same sha, no error
-        let sha2 = vcs_put_blob(root, "loom artifact").unwrap();
-        assert_eq!(sha1, sha2);
-        assert_eq!(vcs_get_blob(root, &sha1).unwrap(), "loom artifact");
-        // on-disk layout matches lex-store (<root>/blobs/<sha>)
-        assert!(root.join("blobs").join(&sha1).exists());
-    }
-
-    #[test]
-    fn get_unknown_blob_errors() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(vcs_get_blob(dir.path(), "deadbeef").is_err());
-    }
-
-    #[test]
-    fn ref_set_get_roundtrips() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        vcs_ref_set(root, "loom/sprint-x", "build-node", "abc123").unwrap();
-        assert_eq!(vcs_ref_get(root, "loom/sprint-x", "build-node").unwrap(), "abc123");
-        assert!(root.join("blobrefs").join("loom").join("sprint-x").join("build-node").exists());
-    }
-
-    #[test]
-    fn rejects_path_traversal() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        assert!(vcs_ref_set(root, "loom/../escape", "k", "x").is_err());
-        assert!(vcs_ref_set(root, "loom", "../escape", "x").is_err());
-        assert!(vcs_ref_get(root, "ok", "a/b").is_err());
     }
 }
