@@ -7,6 +7,23 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added
+
+- **`std.vcs` — content-addressed blob store effect (#5).** A new `[vcs]`
+  effect exposing a small content-addressed store over the process store
+  (`~/.lex/store`, override via `$LEX_STORE_ROOT`):
+  - `vcs.put_blob(content) -> [vcs, fs_write] Result[Str, Str]` — store content,
+    returns its lowercase hex SHA-256. The id equals `crypto.sha256_str(content)`,
+    so blobs are interchangeable with externally-hashed artifacts. Idempotent
+    (dedup) and concurrency-safe (unique temp + atomic rename).
+  - `vcs.get_blob(sha)` / `vcs.has_blob(sha)` — read / probe by id.
+  - `vcs.ref_set(ns, key, sha)` / `vcs.ref_get(ns, key)` — a lightweight
+    `name → sha` namespace (e.g. `ns = "loom/sprint-{id}"`, `key = node id`),
+    with `..`/`/`/`\` path-traversal rejection.
+  On-disk layout (`<root>/blobs/<sha>`, `<root>/blobrefs/<ns…>/<key>`) matches
+  `lex-store`'s blob CAS, so blobs written via `std.vcs` are readable by the
+  store tooling and vice-versa.
+
 ## [0.10.0] — 2026-06-25
 
 A stdlib-audit release, headlined by **effect-row polymorphism** for user

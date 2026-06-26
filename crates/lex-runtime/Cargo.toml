@@ -84,6 +84,9 @@ parquet = { version = "58", default-features = false, features = ["arrow", "snap
 # coordinated bump.
 polars = { version = "0.54", optional = true, default-features = false, features = ["lazy", "is_in", "csv", "performant", "strings", "temporal"] }
 lex-bytecode = { path = "../lex-bytecode", version = "0.10.0" }
+# Blob/stage content store for std.vcs (#5). `default-features = false` drops the
+# `trace` feature (lex-trace) to avoid a lex-store → lex-trace → lex-runtime cycle.
+lex-store = { path = "../lex-store", default-features = false }
 smol_str = { workspace = true }
 
 [features]

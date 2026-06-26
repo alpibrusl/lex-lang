@@ -1590,6 +1590,54 @@ impl EffectHandler for DefaultHandler {
                 }
                 Ok(Value::List(keys.into()))
             }
+            // ── std.vcs: content-addressed blob store (#5) ──
+            // Backed by lex-store's blob CAS (Store::put_blob/get_blob/
+            // set_blob_ref/get_blob_ref). Effect `vcs` is gated by the generic
+            // ensure_kind_allowed(kind) above. put_blob's sha ==
+            // crypto.sha256_str(content), so vcs blobs and loom's SQLite
+            // artifacts share ids. We depend on lex-store with the `trace`
+            // feature off to avoid a lex-store → lex-trace → lex-runtime cycle.
+            ("vcs", "put_blob") => {
+                let content = expect_str(args.first())?.to_string();
+                match lex_store::Store::open(vcs_store_root())
+                    .and_then(|s| s.put_blob(&content)) {
+                    Ok(sha) => Ok(ok(Value::Str(sha.into()))),
+                    Err(e)  => Ok(err(Value::Str(format!("vcs.put_blob: {e}").into()))),
+                }
+            }
+            ("vcs", "get_blob") => {
+                let sha = expect_str(args.first())?.to_string();
+                match lex_store::Store::open(vcs_store_root())
+                    .and_then(|s| s.get_blob(&sha)) {
+                    Ok(content) => Ok(ok(Value::Str(content.into()))),
+                    Err(e)      => Ok(err(Value::Str(format!("vcs.get_blob: {e}").into()))),
+                }
+            }
+            ("vcs", "has_blob") => {
+                let sha = expect_str(args.first())?.to_string();
+                let has = lex_store::Store::open(vcs_store_root())
+                    .map(|s| s.has_blob(&sha)).unwrap_or(false);
+                Ok(Value::Bool(has))
+            }
+            ("vcs", "ref_set") => {
+                let ns  = expect_str(args.first())?.to_string();
+                let key = expect_str(args.get(1))?.to_string();
+                let sha = expect_str(args.get(2))?.to_string();
+                match lex_store::Store::open(vcs_store_root())
+                    .and_then(|s| s.set_blob_ref(&ns, &key, &sha)) {
+                    Ok(())  => Ok(ok(Value::Unit)),
+                    Err(e)  => Ok(err(Value::Str(format!("vcs.ref_set: {e}").into()))),
+                }
+            }
+            ("vcs", "ref_get") => {
+                let ns  = expect_str(args.first())?.to_string();
+                let key = expect_str(args.get(1))?.to_string();
+                match lex_store::Store::open(vcs_store_root())
+                    .and_then(|s| s.get_blob_ref(&ns, &key)) {
+                    Ok(sha) => Ok(ok(Value::Str(sha.into()))),
+                    Err(e)  => Ok(err(Value::Str(format!("vcs.ref_get: {e}").into()))),
+                }
+            }
             ("sql", "open") => {
                 let path = expect_str(args.first())?.to_string();
                 if path.starts_with("postgres://") || path.starts_with("postgresql://") {
@@ -3768,6 +3816,18 @@ fn ok(v: Value) -> Value {
 }
 fn err(v: Value) -> Value {
     Value::Variant { name: "Err".into(), args: vec![v] }
+}
+
+// Root of the process content store for std.vcs (#5). Matches the store-using
+// CLI commands (branch/op): $LEX_STORE_ROOT override, else ~/.lex/store.
+fn vcs_store_root() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("LEX_STORE_ROOT") {
+        return std::path::PathBuf::from(p);
+    }
+    let home = std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    home.join(".lex/store")
 }
 
 /// Streaming HTTP POST that yields the response body line-by-line as a lazy

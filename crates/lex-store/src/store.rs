@@ -772,16 +772,22 @@ impl Store {
 
     // ---- traces (§4.2 / M7) ----
 
+    // Native run-trace store — gated behind the `trace` feature (depends on
+    // lex-trace). Off when a lower crate (lex-runtime) depends on lex-store to
+    // avoid a dependency cycle; the blob/stage store below is unaffected.
+    #[cfg(feature = "trace")]
     fn trace_path(&self, run_id: &str) -> PathBuf {
         self.root.join("traces").join(run_id).join("trace.json")
     }
 
+    #[cfg(feature = "trace")]
     pub fn save_trace(&self, tree: &lex_trace::TraceTree) -> Result<String, StoreError> {
         let path = self.trace_path(&tree.run_id);
         write_canonical_json(&path, tree)?;
         Ok(tree.run_id.clone())
     }
 
+    #[cfg(feature = "trace")]
     pub fn load_trace(&self, run_id: &str) -> Result<lex_trace::TraceTree, StoreError> {
         let bytes = fs::read(self.trace_path(run_id))?;
         Ok(serde_json::from_slice(&bytes)?)
