@@ -7,6 +7,23 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.10.2] — 2026-06-27
+
+### Fixed
+
+- **`list.par_map` workers now inherit the parent's step limit** (#701). Worker
+  VMs were hard-capped at the 10M default and ignored `--max-steps`, so a
+  closure doing real work inside a par_map (e.g. parsing a large payload) could
+  spuriously trip `par_map worker: step limit exceeded` even when the run raised
+  the limit.
+
+### Changed
+
+- **`--max-steps 0` = unbounded** (#701). The opcode step counter is a DoS guard
+  for *untrusted* code (the agent-tool sandbox); `0` opts out of the cap
+  (`u64::MAX`) for trusted runs that shouldn't have to guess an opcode budget.
+  `--jit --max-steps 0` is now permitted (no finite cap for the JIT to bypass).
+
 ## [0.10.1] — 2026-06-26
 
 A point release shipping the `std.vcs` content store effect.
