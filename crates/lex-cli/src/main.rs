@@ -308,7 +308,7 @@ fn print_usage() {
     println!("  --allow-fs-read PATH        (repeatable) permit fs_read under PATH");
     println!("  --allow-fs-write PATH       (repeatable) permit fs_write under PATH");
     println!("  --budget N                  cap aggregate declared budget");
-    println!("  --max-steps N               cap VM opcode dispatches at N (DoS guard)");
+    println!("  --max-steps N               cap VM opcode dispatches at N (DoS guard; 0 = unbounded)");
 }
 
 fn read_source(path: &str) -> Result<String> {
@@ -747,7 +747,11 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         .with_program_args(f.program_args.clone());
     let mut vm = Vm::with_handler(&bc, Box::new(handler));
     if let Some(n) = f.max_steps {
-        vm.set_step_limit(n);
+        // `--max-steps 0` = unbounded (no opcode cap). The step counter is a
+        // DoS guard for *untrusted* code (the agent-tool sandbox); trusted runs
+        // shouldn't have to guess an opcode budget they can't estimate, so 0
+        // opts out explicitly. u64::MAX is effectively unbounded for any real run.
+        vm.set_step_limit(if n == 0 { u64::MAX } else { n });
     }
     // #465 / cursor[bot] medium-severity review on #608: JIT'd code
     // runs in native loops (the self-tail-call backward jump, any
@@ -760,7 +764,7 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     // architectural fix (pass the counter into JIT'd code, abort
     // via a multi-return ABI) is a separate slice; this is the
     // immediate guardrail.
-    if f.jit && f.max_steps.is_some() {
+    if f.jit && f.max_steps.is_some_and(|n| n != 0) {
         bail!(
             "--jit and --max-steps are mutually exclusive: the JIT \
              runs native loops that bypass the per-op step counter, so \
