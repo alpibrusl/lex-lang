@@ -164,7 +164,21 @@ Doing them first widens surface without closing the trust gap.
 
 ---
 
-## 6. One-sentence summary
+## 6. Per-repo tracking issues
+
+Each repo has a roadmap-anchor issue framing its slice of the three phases
+and cross-linking the existing work:
+
+| Repo | Tracking issue | Slice |
+|---|---|---|
+| lex-lang | alpibrusl/lex-lang#709 | Phase 1 — freeze the substrate contract |
+| lex-os | alpibrusl/lex-os#48 | Phase 1 perimeter hardening + Phase 2 distribution |
+| lex-os-manifest | alpibrusl/lex-os-manifest#1 | grant/budget type source for the control plane |
+| lex-spec | alpibrusl/lex-spec#11 | verify layer behind hosted verify-as-a-service |
+| lex-robot | alpibrusl/lex-robot#73 | Phase 2 — the platform kernel (identity/reputation/settlement) |
+| lex-loom | alpibrusl/lex-loom#68 | Phase 3 — flagship wedge + kernel adoption |
+
+## 7. One-sentence summary
 
 The language and runtime are ready; the **substrate contracts** and the
 **platform kernel** are not — and those, not more applications, are the
