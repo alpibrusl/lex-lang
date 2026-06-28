@@ -7,6 +7,8 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.10.4] — 2026-06-28
+
 ### Fixed
 
 - **`conc.ask`/`conc.tell` from inside a `net.serve` handler** (#698). The actor
