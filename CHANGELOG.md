@@ -7,6 +7,17 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`conc.ask`/`conc.tell` from inside a `net.serve` handler** (#698). The actor
+  handler's `(new_state, reply)` tuple is arena-allocated under the serve
+  worker's request scope, but `run_conc_op` only accepted a heap `Value::Tuple`,
+  so it rejected a valid arity-2 `ArenaTuple` with "handler must return a
+  2-tuple". It now materializes arena handles before the check — which also
+  correctly heap-owns `new_state`, since the actor cell outlives the request's
+  arena scope. Worked from `main` already; this fixes the `net.serve` worker
+  path. Regression test: `crates/lex-runtime/tests/conc_ask_in_serve.rs`.
+
 ## [0.10.3] — 2026-06-28
 
 ### Fixed
