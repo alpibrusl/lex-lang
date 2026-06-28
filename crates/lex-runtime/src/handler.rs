@@ -1699,7 +1699,7 @@ impl EffectHandler for DefaultHandler {
                         let pg = pg_param_refs(&params);
                         let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
                             pg.iter().map(|b| b.as_ref()).collect();
-                        match c.execute(stmt.as_str(), &refs) {
+                        match c.execute(pg_rewrite_placeholders(stmt.as_str()).as_str(), &refs) {
                             Ok(n)  => Ok(ok(Value::Int(n as i64))),
                             Err(e) => Ok(err(pg_err_to_sql_error(e, "sql.exec"))),
                         }
@@ -1877,7 +1877,7 @@ impl EffectHandler for DefaultHandler {
                         let pg = pg_param_refs(&params);
                         let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
                             pg.iter().map(|b| b.as_ref()).collect();
-                        match c.execute(stmt.as_str(), &refs) {
+                        match c.execute(pg_rewrite_placeholders(stmt.as_str()).as_str(), &refs) {
                             Ok(n)  => Ok(ok(Value::Int(n as i64))),
                             Err(e) => Ok(err(pg_err_to_sql_error(e, "sql.exec_tx"))),
                         }
@@ -4274,6 +4274,82 @@ fn sqlite_params(params: &[SqlParamValue]) -> Vec<rusqlite::types::Value> {
     }).collect()
 }
 
+/// Lex SQL is authored with SQLite-style `?` positional placeholders, but
+/// Postgres requires `$1, $2, …`. Rewrite each `?` placeholder to the matching
+/// `$n` so the same parameterized statement runs on both backends. Only `?`
+/// outside single-quoted string literals are treated as placeholders (a `?`
+/// inside a literal — or an escaped `''` — is left untouched).
+fn pg_rewrite_placeholders(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len() + 8);
+    let mut n: u32 = 0;
+    let mut in_str = false;
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                out.push(c);
+                if in_str {
+                    // A doubled '' is an escaped quote: stay inside the literal.
+                    if chars.peek() == Some(&'\'') {
+                        out.push(chars.next().unwrap());
+                    } else {
+                        in_str = false;
+                    }
+                } else {
+                    in_str = true;
+                }
+            }
+            '?' if !in_str => {
+                n += 1;
+                out.push('$');
+                out.push_str(&n.to_string());
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod pg_placeholder_tests {
+    use super::pg_rewrite_placeholders;
+
+    #[test]
+    fn rewrites_positional_placeholders() {
+        assert_eq!(
+            pg_rewrite_placeholders(
+                "INSERT INTO events(id, kind, parent, payload_json, ts_ms) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING"
+            ),
+            "INSERT INTO events(id, kind, parent, payload_json, ts_ms) VALUES ($1, $2, $3, $4, $5) ON CONFLICT(id) DO NOTHING"
+        );
+        assert_eq!(
+            pg_rewrite_placeholders("SELECT * FROM t WHERE a=? AND b=?"),
+            "SELECT * FROM t WHERE a=$1 AND b=$2"
+        );
+    }
+
+    #[test]
+    fn leaves_question_marks_inside_string_literals() {
+        assert_eq!(
+            pg_rewrite_placeholders("INSERT INTO t VALUES (?, 'lit?', ?)"),
+            "INSERT INTO t VALUES ($1, 'lit?', $2)"
+        );
+    }
+
+    #[test]
+    fn handles_escaped_quotes_in_literals() {
+        assert_eq!(
+            pg_rewrite_placeholders("UPDATE t SET note='it''s ok?' WHERE id=?"),
+            "UPDATE t SET note='it''s ok?' WHERE id=$1"
+        );
+    }
+
+    #[test]
+    fn no_placeholders_is_unchanged() {
+        assert_eq!(pg_rewrite_placeholders("SELECT 1"), "SELECT 1");
+    }
+}
+
 /// Box `SqlParamValue`s as `dyn ToSql + Sync` for Postgres binding.
 fn pg_param_refs(params: &[SqlParamValue]) -> Vec<Box<dyn postgres::types::ToSql + Sync>> {
     params.iter().map(|p| -> Box<dyn postgres::types::ToSql + Sync> {
@@ -4338,7 +4414,8 @@ fn sql_run_query_pg(
     let pg = pg_param_refs(params);
     let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
         pg.iter().map(|b| b.as_ref()).collect();
-    let rows = match client.query(stmt_str, &refs) {
+    let stmt_pg = pg_rewrite_placeholders(stmt_str);
+    let rows = match client.query(stmt_pg.as_str(), &refs) {
         Ok(r)  => r,
         Err(e) => return err(pg_err_to_sql_error(e, "sql.query")),
     };
@@ -4971,6 +5048,7 @@ fn pg_cursor_producer(
     };
     // Use a uniquely-named cursor so concurrent producers on
     // distinct Db handles don't collide on the cursor namespace.
+    let stmt_str = pg_rewrite_placeholders(&stmt_str);
     let cur_name = format!("__lex_cur_{}", next_cursor_handle());
     if let Err(e) = tx.execute(
         &format!("DECLARE \"{cur_name}\" NO SCROLL CURSOR FOR {stmt_str}"),
