@@ -7,6 +7,18 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.10.3] — 2026-06-28
+
+### Fixed
+
+- **Postgres `?` placeholders are now translated to `$1,$2,…`** (#703). The
+  Postgres backend passed parameterized statements through verbatim, so any
+  `sql.exec`/`sql.query` using `?` placeholders failed with `syntax error at or
+  near "?"` (only inline-value SQL worked). `pg_rewrite_placeholders` rewrites
+  each `?` placeholder — skipping those inside string literals and handling `''`
+  escapes — at every Postgres SQL site (`exec`, `exec_tx`, `query`, `query_tx`,
+  and the streaming cursor). SQLite paths are unchanged.
+
 ## [0.10.2] — 2026-06-27
 
 ### Fixed
