@@ -1022,6 +1022,16 @@ impl<'a> Vm<'a> {
                         // Call handler(state, msg) on this VM — full effect access.
                         let result = self.invoke_closure_value(closure_val, vec![state, msg])
                             .map_err(|e| format!("conc.{op}: handler error: {e:?}"))?;
+                        // #698: when `ask`/`tell` runs inside a `net.serve` worker, an
+                        // arena request-scope is active, so the handler's `(new_state,
+                        // reply)` tuple is allocated as a `Value::ArenaTuple` rather than
+                        // a heap `Value::Tuple` — and the bare match below would reject it.
+                        // Materialize arena handles into heap-owned form NOW, while the
+                        // producing scope is still active: the reply crosses back to the
+                        // caller and `new_state` persists in the actor cell beyond this
+                        // request's arena scope, so both must be heap-owned. Idempotent
+                        // (a no-op walk) when there are no arena handles, e.g. from `main`.
+                        let result = self.materialize_arena_handles(result);
                         // Expect (new_state, reply) tuple.
                         match result {
                             Value::Tuple(mut parts) if parts.len() == 2 => {
