@@ -753,53 +753,19 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         // opts out explicitly. u64::MAX is effectively unbounded for any real run.
         vm.set_step_limit(if n == 0 { u64::MAX } else { n });
     }
-    // #465 / cursor[bot] medium-severity review on #608: JIT'd code
-    // runs in native loops (the self-tail-call backward jump, any
-    // backward `Jump(-N)` in iterative loops) that do **not**
-    // increment `Vm::steps`, so an explicit `--max-steps` cap would
-    // be silently bypassed once a hot loop tiers up. The
-    // `set_step_limit` doc explicitly calls out untrusted code (the
-    // `agent-tool` sandbox) as the threat model — so refuse the
-    // combination rather than degrade the guarantee. The
-    // architectural fix (pass the counter into JIT'd code, abort
-    // via a multi-return ABI) is a separate slice; this is the
-    // immediate guardrail.
-    if f.jit && f.max_steps.is_some_and(|n| n != 0) {
-        bail!(
-            "--jit and --max-steps are mutually exclusive: the JIT \
-             runs native loops that bypass the per-op step counter, so \
-             an explicit step limit would not be honored. Drop one of \
-             the two flags."
-        );
-    }
     // #465: install the JIT tier as a hook on the Vm. Eligible
     // functions (pure-int arith subset) compile to native code on
     // first call; everything else flows through the interpreter
-    // unchanged. A construction failure (e.g. the `cranelift` feature
-    // was off) propagates the JitError as a user-visible run error
-    // rather than silently falling back, so a `--jit` invocation that
-    // can't actually JIT is loud.
+    // unchanged. JITed code now accounts loop iterations against
+    // the same `Vm::steps` counter the interpreter uses (the
+    // architectural fix that closed the bypass cursor[bot] flagged
+    // on #608/#609/#707), so `--jit` and `--max-steps` compose
+    // cleanly and the default 10M cap is honored on both paths.
+    // A construction failure (e.g. the `cranelift` feature was
+    // off) propagates the JitError as a user-visible run error
+    // rather than silently falling back, so a `--jit` invocation
+    // that can't actually JIT is loud.
     if f.jit {
-        // The explicit `--max-steps` bail above protects users who
-        // asked for a step cap. The default 10M cap (set by
-        // `Vm::new`) is preserved — JIT'd native code does bypass
-        // it (the architectural fix is a follow-up), but
-        // `JitTier::try_call` returns `None` for ineligible /
-        // arg-mismatched functions, in which case dispatch falls
-        // back to the interpreter and *does* increment `Vm::steps`.
-        // Cursor[bot]'s third-round review on #609 caught my prior
-        // over-correction: setting the cap to `u64::MAX` also
-        // disabled it for the interpreter-fallback path, so
-        // attacker-supplied ineligible Lex code (the easiest shape
-        // to write) lost its DoS guard. Keep the cap; surface the
-        // JIT-only bypass as a stderr warning instead.
-        eprintln!(
-            "warning: --jit lets eligible functions skip the per-op step \
-             counter. Ineligible functions still hit the default 10M cap \
-             (or `--max-steps`, which is mutually exclusive with --jit), \
-             but a JIT-eligible attacker-controlled hot loop can pin the \
-             CPU until the architectural fix lands."
-        );
         let tier = lex_jit::JitTier::new(&bc)
             .map_err(|e| anyhow!("--jit: constructing JIT tier: {e}"))?;
         vm.set_jit_hook(Some(Box::new(tier)));

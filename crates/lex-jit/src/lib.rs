@@ -195,7 +195,13 @@ mod stub {
         /// Unconstructible without the `cranelift` feature — the
         /// surface exists only so callers can name the type. Any
         /// invocation panics via `unreachable!`.
-        pub unsafe fn call(&self, _args: &[i64]) -> i64 {
+        pub unsafe fn call(
+            &self,
+            _args: &[i64],
+            _step_counter_ptr: *mut u64,
+            _step_limit: u64,
+            _aborted_out: *mut u8,
+        ) -> i64 {
             unreachable!("no JittedFn can be constructed without the `cranelift` feature")
         }
         pub fn arity(&self) -> u16 { 0 }

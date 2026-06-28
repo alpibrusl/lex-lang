@@ -99,11 +99,31 @@ impl JitContext {
         // Reset and rebuild the function. `make_context` is only
         // run once at construction; subsequent compiles reuse the
         // Context after `clear` + signature setup.
+        //
+        // Signature (#465 step-limit architectural fix):
+        //   fn(arg0, ..., argN-1,
+        //      step_counter_ptr: *mut u64,
+        //      step_limit:        u64,
+        //      aborted_out:       *mut u8) -> i64
+        //
+        // Hidden trailing params let JITed code account loop
+        // iterations against the VM's `--max-steps` cap and signal
+        // an abort via the out-pointer (single-return ABI; avoids
+        // the multi-return tuple-in-registers question). The
+        // wrapper checks `*aborted_out` and surfaces
+        // `VmError::Panic("step limit exceeded")` on set.
         self.ctx.func.clear();
         self.ctx.func.signature.call_conv = CallConv::SystemV;
         for _ in 0..f.arity {
             self.ctx.func.signature.params.push(AbiParam::new(types::I64));
         }
+        // step_counter_ptr — passed as *mut u64, typed as I64
+        // (Cranelift treats pointers as integers of pointer width).
+        self.ctx.func.signature.params.push(AbiParam::new(types::I64));
+        // step_limit
+        self.ctx.func.signature.params.push(AbiParam::new(types::I64));
+        // aborted_out — *mut u8 as I64
+        self.ctx.func.signature.params.push(AbiParam::new(types::I64));
         self.ctx.func.signature.returns.push(AbiParam::new(types::I64));
 
         Lowering::run(&mut self.ctx, &mut self.fbctx, f, consts)?;
@@ -140,8 +160,19 @@ impl JittedFn {
     }
 
     /// Invoke the JITed function. The caller must pass exactly
-    /// `self.arity()` arguments, all encoded as `i64` (Bool → 0/1,
-    /// Int → as-is). Returns the function's i64 result.
+    /// `self.arity()` arguments (all encoded as `i64`: Bool → 0/1,
+    /// Int → as-is), plus the three trailing hidden params used by
+    /// the step-limit architectural fix:
+    ///
+    /// - `step_counter_ptr` — `&mut self.steps` on the calling VM
+    /// - `step_limit` — the VM's `step_limit` value
+    /// - `aborted_out` — `&mut u8`; JITed code writes `1` if it
+    ///   exceeded `step_limit` and aborted. The wrapper checks
+    ///   this and surfaces `VmError::Panic("step limit exceeded")`
+    ///   instead of returning the (meaningless) sentinel result.
+    ///
+    /// Returns the function's i64 result on the happy path; on
+    /// abort, returns `0` and `*aborted_out` becomes `1`.
     ///
     /// # Safety
     ///
@@ -154,38 +185,51 @@ impl JittedFn {
     ///   intended pattern is to colocate the context and the
     ///   [`JittedFn`] in the same owning struct (e.g.
     ///   [`tier::JitVm`]).
-    pub unsafe fn call(&self, args: &[i64]) -> i64 {
+    /// - `step_counter_ptr` and `aborted_out` must be non-null and
+    ///   point at writable `u64` / `u8` storage that outlives the
+    ///   call.
+    pub unsafe fn call(
+        &self,
+        args: &[i64],
+        step_counter_ptr: *mut u64,
+        step_limit: u64,
+        aborted_out: *mut u8,
+    ) -> i64 {
         assert_eq!(args.len(), self.arity as usize, "JittedFn arity mismatch");
         let p = self.code_ptr;
         match self.arity {
             0 => {
-                let f: extern "C" fn() -> i64 = std::mem::transmute(p);
-                f()
+                let f: extern "C" fn(*mut u64, u64, *mut u8) -> i64 = std::mem::transmute(p);
+                f(step_counter_ptr, step_limit, aborted_out)
             }
             1 => {
-                let f: extern "C" fn(i64) -> i64 = std::mem::transmute(p);
-                f(args[0])
+                let f: extern "C" fn(i64, *mut u64, u64, *mut u8) -> i64 = std::mem::transmute(p);
+                f(args[0], step_counter_ptr, step_limit, aborted_out)
             }
             2 => {
-                let f: extern "C" fn(i64, i64) -> i64 = std::mem::transmute(p);
-                f(args[0], args[1])
+                let f: extern "C" fn(i64, i64, *mut u64, u64, *mut u8) -> i64 =
+                    std::mem::transmute(p);
+                f(args[0], args[1], step_counter_ptr, step_limit, aborted_out)
             }
             3 => {
-                let f: extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(p);
-                f(args[0], args[1], args[2])
+                let f: extern "C" fn(i64, i64, i64, *mut u64, u64, *mut u8) -> i64 =
+                    std::mem::transmute(p);
+                f(args[0], args[1], args[2], step_counter_ptr, step_limit, aborted_out)
             }
             4 => {
-                let f: extern "C" fn(i64, i64, i64, i64) -> i64 = std::mem::transmute(p);
-                f(args[0], args[1], args[2], args[3])
+                let f: extern "C" fn(i64, i64, i64, i64, *mut u64, u64, *mut u8) -> i64 =
+                    std::mem::transmute(p);
+                f(args[0], args[1], args[2], args[3], step_counter_ptr, step_limit, aborted_out)
             }
             5 => {
-                let f: extern "C" fn(i64, i64, i64, i64, i64) -> i64 = std::mem::transmute(p);
-                f(args[0], args[1], args[2], args[3], args[4])
+                let f: extern "C" fn(i64, i64, i64, i64, i64, *mut u64, u64, *mut u8) -> i64 =
+                    std::mem::transmute(p);
+                f(args[0], args[1], args[2], args[3], args[4], step_counter_ptr, step_limit, aborted_out)
             }
             6 => {
-                let f: extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64 =
+                let f: extern "C" fn(i64, i64, i64, i64, i64, i64, *mut u64, u64, *mut u8) -> i64 =
                     std::mem::transmute(p);
-                f(args[0], args[1], args[2], args[3], args[4], args[5])
+                f(args[0], args[1], args[2], args[3], args[4], args[5], step_counter_ptr, step_limit, aborted_out)
             }
             n => unreachable!("arity {n} should have been rejected at compile time"),
         }
@@ -321,6 +365,18 @@ struct Lowering<'a> {
     /// values to pop off the SSA stack and reassign into locals
     /// before jumping back to the entry block.
     arity: u16,
+    /// CLIF `Value`s for the trailing hidden params used by the
+    /// step-limit architectural fix. Captured once at function
+    /// entry; consumed by [`Lowering::emit_step_check`] at every
+    /// backward jump (loop iteration).
+    step_counter_ptr: ClifValue,
+    step_limit: ClifValue,
+    /// Shared "we exceeded the step limit" basic block. Writes
+    /// `*aborted_out = 1` and returns 0 (the abort sentinel; the
+    /// caller checks `*aborted_out` to distinguish from a legit
+    /// zero result). Created once in [`Lowering::run`] and
+    /// branched to from every backward jump.
+    abort_block: Block,
     /// Set true after a terminator; resets when we switch into the
     /// next block at its entry pc.
     terminated: bool,
@@ -377,9 +433,39 @@ impl<'a> Lowering<'a> {
             }
             locals.push(var);
         }
+        // Capture the three trailing hidden params (step counter
+        // pointer, step limit, aborted-out pointer) for use at
+        // every backward jump.
+        let arity = f.arity as usize;
+        let step_counter_ptr = arg_values[arity];
+        let step_limit = arg_values[arity + 1];
+        let aborted_out = arg_values[arity + 2];
+
+        // Shared abort block: writes 1 into `*aborted_out`, returns
+        // the sentinel result 0. Caller (the JitTier wrapper) reads
+        // `*aborted_out` and surfaces `VmError::Panic("step limit
+        // exceeded")` instead of the result.
+        let abort_block = builder.create_block();
         let (pc0_block, pc0_height) = blocks[&0];
         debug_assert_eq!(pc0_height, 0, "pc 0 entry height must be 0");
         builder.ins().jump(pc0_block, &[]);
+
+        // Populate the abort block now while we have the builder.
+        // Do NOT seal it yet — every backward jump in the lowering
+        // adds itself as a predecessor via `brif` (the
+        // step-counter check), and Cranelift's SSA frontend
+        // rejects predecessors on sealed blocks. `seal_all_blocks`
+        // at the end of `run` handles it.
+        builder.switch_to_block(abort_block);
+        let one_byte = builder.ins().iconst(types::I8, 1);
+        builder.ins().store(
+            cranelift_codegen::ir::MemFlags::trusted(),
+            one_byte,
+            aborted_out,
+            0,
+        );
+        let zero = builder.ins().iconst(types::I64, 0);
+        builder.ins().return_(&[zero]);
 
         let mut state = Lowering {
             builder,
@@ -389,6 +475,9 @@ impl<'a> Lowering<'a> {
             stack: Vec::new(),
             locals,
             arity: f.arity,
+            step_counter_ptr,
+            step_limit,
+            abort_block,
             terminated: true, // forces enter-block at pc 0
         };
 
@@ -529,7 +618,14 @@ impl<'a> Lowering<'a> {
                 let (target_block, target_height) = self.blocks[&t];
                 debug_assert_eq!(self.stack.len() as u32, target_height);
                 let args = values_to_block_args(&self.stack);
-                self.builder.ins().jump(target_block, args.iter());
+                if off < 0 {
+                    // Backward jump — loop iteration. Gate on the
+                    // step counter so an infinite loop honors
+                    // `--max-steps`.
+                    self.emit_step_check_branch(target_block, &args);
+                } else {
+                    self.builder.ins().jump(target_block, args.iter());
+                }
                 self.terminated = true;
             }
             Op::JumpIf(off) => self.emit_cond_jump(pc, off, true)?,
@@ -560,7 +656,10 @@ impl<'a> Lowering<'a> {
                 debug_assert!(self.stack.is_empty(), "tail call must leave SSA stack empty");
                 let (entry_block, entry_height) = self.blocks[&0];
                 debug_assert_eq!(entry_height, 0);
-                self.builder.ins().jump(entry_block, &[]);
+                // Self-tail-call is unconditionally a backward jump
+                // to the function entry — gate on the step counter
+                // so `sum_to(huge_n, 0)` honors `--max-steps`.
+                self.emit_step_check_branch(entry_block, &[]);
                 self.terminated = true;
             }
             other => return Err(JitError::UnsupportedOp(other)),
@@ -587,16 +686,92 @@ impl<'a> Lowering<'a> {
         debug_assert_eq!(self.stack.len() as u32, t_height);
         debug_assert_eq!(self.stack.len() as u32, ft_height);
         let args = values_to_block_args(&self.stack);
-        let (then_b, else_b) = if jump_if_true {
-            (target_block, ft_block)
+        // The target side is backward iff `off < 0`. If it is, we
+        // need to route the cond-taken path through a step check so
+        // an infinite conditional loop also aborts. Fall-through is
+        // always forward, so it doesn't need the check.
+        let target_is_backward = off < 0;
+        let cooked_target = if target_is_backward {
+            self.make_step_check_trampoline(target_block, &args)
         } else {
-            (ft_block, target_block)
+            target_block
         };
-        // brif args: (cond, then_block, then_args, else_block, else_args)
+        let (then_b, else_b) = if jump_if_true {
+            (cooked_target, ft_block)
+        } else {
+            (ft_block, cooked_target)
+        };
+        // brif args: (cond, then_block, then_args, else_block, else_args).
+        // When `target_is_backward`, `cooked_target`'s args are
+        // baked into the trampoline (which jumps to the real
+        // target with the right block-call args), so we pass `&[]`
+        // to that side; the forward fall-through still gets `args`.
+        let (then_args, else_args): (&[BlockArg], &[BlockArg]) = match (jump_if_true, target_is_backward) {
+            (true, true) => (&[], &args),     // then=cooked_target (backward), else=ft
+            (true, false) => (&args, &args),  // both forward
+            (false, true) => (&args, &[]),    // then=ft, else=cooked_target (backward)
+            (false, false) => (&args, &args), // both forward
+        };
         self.builder
             .ins()
-            .brif(cond, then_b, args.iter(), else_b, args.iter());
+            .brif(cond, then_b, then_args.iter(), else_b, else_args.iter());
         self.terminated = true;
         Ok(())
+    }
+
+    /// Emit the step-counter bump + check that gates every backward
+    /// edge in JITed code. On limit-exceeded, branches to the shared
+    /// `abort_block`; otherwise branches to `target_block` with
+    /// `args` as the block-call arguments.
+    ///
+    /// Inlined into the *current* block — assumes the caller is
+    /// about to emit a terminator and wants this to replace it on
+    /// the backward-jump path.
+    fn emit_step_check_branch(&mut self, target_block: Block, args: &[BlockArg]) {
+        let counter = self.builder.ins().load(
+            types::I64,
+            cranelift_codegen::ir::MemFlags::trusted(),
+            self.step_counter_ptr,
+            0,
+        );
+        let one = self.builder.ins().iconst(types::I64, 1);
+        let new_counter = self.builder.ins().iadd(counter, one);
+        self.builder.ins().store(
+            cranelift_codegen::ir::MemFlags::trusted(),
+            new_counter,
+            self.step_counter_ptr,
+            0,
+        );
+        let too_many = self.builder.ins().icmp(
+            IntCC::UnsignedGreaterThanOrEqual,
+            new_counter,
+            self.step_limit,
+        );
+        // brif too_many → abort_block (no args), else target_block (args)
+        self.builder
+            .ins()
+            .brif(too_many, self.abort_block, &[], target_block, args.iter());
+    }
+
+    /// Build a fresh block that, on entry, runs the step check and
+    /// then jumps to `target_block` with `args`. Returns the new
+    /// block. Used by `emit_cond_jump` when the conditional's
+    /// target side is backward.
+    ///
+    /// Not sealed here — the caller's `brif` adds the trampoline
+    /// as a successor (making this block a predecessor of the
+    /// trampoline) AFTER this returns. `seal_all_blocks` at the
+    /// end of `run` handles it; sealing the trampoline early would
+    /// trip Cranelift's "no predecessors after seal" assertion on
+    /// the next brif.
+    fn make_step_check_trampoline(&mut self, target_block: Block, args: &[BlockArg]) -> Block {
+        let trampoline = self.builder.create_block();
+        let saved_block = self.builder.current_block();
+        self.builder.switch_to_block(trampoline);
+        self.emit_step_check_branch(target_block, args);
+        if let Some(b) = saved_block {
+            self.builder.switch_to_block(b);
+        }
+        trampoline
     }
 }

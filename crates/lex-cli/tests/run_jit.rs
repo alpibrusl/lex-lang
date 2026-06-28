@@ -117,11 +117,15 @@ fn greet(p :: Person) -> Str {
 }
 
 #[test]
-fn jit_refuses_explicit_max_steps() {
-    // Security guard (cursor[bot] medium-severity review on #608):
-    // JIT'd code runs native loops that don't bump `Vm::steps`, so
-    // `--max-steps` would be silently bypassed. The CLI rejects the
-    // combination rather than degrade the documented DoS guard.
+fn jit_composes_with_max_steps() {
+    // Architectural fix landed: JITed code now accounts loop
+    // iterations against the same `Vm::steps` counter the
+    // interpreter uses, so `--jit` + `--max-steps` compose
+    // cleanly — the prior PRs (#608/#609/#707) refused or warned
+    // about the combination because the bypass was unfixable
+    // without the multi-return ABI rework. With that rework
+    // shipped, a leaf-arith function under `--jit --max-steps`
+    // works exactly like the interpreter would.
     let path = write_tempfile(
         "arith2.lex",
         r#"
@@ -130,7 +134,7 @@ fn double(n :: Int) -> Int {
 }
 "#,
     );
-    let (code, _out, err) = run(&[
+    let (code, out, err) = run(&[
         "run",
         "--jit",
         "--max-steps",
@@ -139,18 +143,52 @@ fn double(n :: Int) -> Int {
         "double",
         "21",
     ]);
-    assert_ne!(code, 0, "expected --jit + --max-steps to fail, succeeded: {err}");
+    assert_eq!(code, 0, "--jit --max-steps should succeed on a tiny fn: {err}");
+    assert!(out.trim().contains("42"), "expected 42, got {out:?}");
+}
+
+#[test]
+fn jit_honors_step_limit_in_native_loops() {
+    // The architectural fix's whole point: a JIT-eligible
+    // tail-recursive hot loop (`sum_to(huge_n, 0)`) used to spin
+    // in native code forever, bypassing `--max-steps`.  Now the
+    // lowering emits a counter bump + check at every backward
+    // edge, and aborts via `VmError::Panic("step limit exceeded
+    // in <fn> ... [JIT]")` when the limit is reached.
+    //
+    // We pick a step budget too small to complete `sum_to(1_000_000, 0)`
+    // and assert: nonzero exit + the JIT-side error message tag.
+    let path = write_tempfile(
+        "sum_to.lex",
+        r#"
+fn sum_to(n :: Int, acc :: Int) -> Int {
+  match n {
+    0 => acc,
+    _ => sum_to(n - 1, acc + n),
+  }
+}
+"#,
+    );
+    let (code, _out, err) = run(&[
+        "run",
+        "--jit",
+        "--max-steps",
+        "1000",
+        path.to_str().unwrap(),
+        "sum_to",
+        "1000000",
+        "0",
+    ]);
+    assert_ne!(code, 0, "expected step-limit abort, succeeded with: {err}");
     assert!(
-        err.contains("mutually exclusive"),
-        "expected error to explain the incompatibility, got: {err:?}"
+        err.contains("step limit exceeded") && err.contains("[JIT]"),
+        "expected JIT-tagged step-limit error, got: {err:?}"
     );
 }
 
 #[test]
 fn jit_composes_with_unrelated_flags() {
-    // Sanity: `--jit` alone works (no `--max-steps`). This is the
-    // common-path replacement for the prior test that combined
-    // `--jit --max-steps`, which is now rejected.
+    // Sanity smoke for `--jit` alone (no `--max-steps`).
     let path = write_tempfile(
         "arith3.lex",
         r#"
@@ -164,31 +202,4 @@ fn double(n :: Int) -> Int {
     ]);
     assert_eq!(code, 0, "--jit alone failed");
     assert!(out.trim().contains("42"), "expected 42, got {out:?}");
-}
-
-#[test]
-fn jit_warns_about_step_counter_bypass_for_eligible_code() {
-    // Cursor[bot]'s third-round finding on #609 caught that my
-    // prior fix over-corrected: setting `step_limit = u64::MAX`
-    // on `--jit` also disabled the cap for the interpreter-
-    // fallback path, so attacker-supplied ineligible Lex code
-    // (the easiest shape to write) lost its DoS guard. The
-    // current code keeps the default cap and warns that
-    // eligible/JIT'd code still bypasses it.
-    let path = write_tempfile(
-        "arith4.lex",
-        r#"
-fn ident(n :: Int) -> Int {
-  n
-}
-"#,
-    );
-    let (code, _out, err) = run(&[
-        "run", "--jit", path.to_str().unwrap(), "ident", "1",
-    ]);
-    assert_eq!(code, 0, "--jit alone failed: {err}");
-    assert!(
-        err.contains("step counter") || err.contains("step-counter"),
-        "expected stderr warning about step-counter bypass, got: {err:?}"
-    );
 }
