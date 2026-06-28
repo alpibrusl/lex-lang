@@ -74,7 +74,7 @@ redis = "1.2"
 arrow-array = "58"
 arrow-schema = "58"
 arrow-select = "58"
-arrow-arith = "58"
+arrow-arith = "59"
 arrow-cast = "58"
 arrow-csv = "58"
 parquet = { version = "58", default-features = false, features = ["arrow", "snap"] }
