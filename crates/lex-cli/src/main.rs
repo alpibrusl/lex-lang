@@ -781,26 +781,27 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     // can't actually JIT is loud.
     if f.jit {
         // The explicit `--max-steps` bail above protects users who
-        // asked for a step cap. But `Vm::new` *also* installs a
-        // default 10M cap that the JIT silently bypasses once a hot
-        // loop tiers up — cursor[bot]'s follow-up review on this PR
-        // called that out. Saturate the cap to `u64::MAX` so the VM
-        // state honestly reflects "no step counting under --jit"
-        // instead of pretending a guard exists, and print a stderr
-        // warning so interactive users notice. The architectural fix
-        // (in-JIT counter check via multi-return ABI) is the same
-        // for both the explicit-cap and default-cap cases and is
-        // filed as a follow-up.
-        vm.set_step_limit(u64::MAX);
+        // asked for a step cap. The default 10M cap (set by
+        // `Vm::new`) is preserved — JIT'd native code does bypass
+        // it (the architectural fix is a follow-up), but
+        // `JitTier::try_call` returns `None` for ineligible /
+        // arg-mismatched functions, in which case dispatch falls
+        // back to the interpreter and *does* increment `Vm::steps`.
+        // Cursor[bot]'s third-round review on #609 caught my prior
+        // over-correction: setting the cap to `u64::MAX` also
+        // disabled it for the interpreter-fallback path, so
+        // attacker-supplied ineligible Lex code (the easiest shape
+        // to write) lost its DoS guard. Keep the cap; surface the
+        // JIT-only bypass as a stderr warning instead.
         eprintln!(
-            "warning: --jit disables the VM step-limit DoS guard. \
-             JIT'd code runs native loops that bypass the per-op \
-             counter — do not pass untrusted Lex code to a host \
-             running with --jit unless you've sandboxed it some \
-             other way."
+            "warning: --jit lets eligible functions skip the per-op step \
+             counter. Ineligible functions still hit the default 10M cap \
+             (or `--max-steps`, which is mutually exclusive with --jit), \
+             but a JIT-eligible attacker-controlled hot loop can pin the \
+             CPU until the architectural fix lands."
         );
-        let tier =
-            lex_jit::JitTier::new(&bc).map_err(|e| anyhow!("--jit: constructing JIT tier: {e}"))?;
+        let tier = lex_jit::JitTier::new(&bc)
+            .map_err(|e| anyhow!("--jit: constructing JIT tier: {e}"))?;
         vm.set_jit_hook(Some(Box::new(tier)));
     }
     let recorder = lex_trace::Recorder::new();

@@ -167,13 +167,14 @@ fn double(n :: Int) -> Int {
 }
 
 #[test]
-fn jit_warns_about_step_limit_bypass() {
-    // Cursor[bot] follow-up: even without explicit `--max-steps`,
-    // `--jit` disables the VM's default step-limit DoS guard
-    // because JIT'd native loops don't bump the counter. We
-    // surface this as a stderr warning so interactive users see
-    // they've opted out of the guard; scripts that swallow stderr
-    // get the same opt-out but quietly.
+fn jit_warns_about_step_counter_bypass_for_eligible_code() {
+    // Cursor[bot]'s third-round finding on #609 caught that my
+    // prior fix over-corrected: setting `step_limit = u64::MAX`
+    // on `--jit` also disabled the cap for the interpreter-
+    // fallback path, so attacker-supplied ineligible Lex code
+    // (the easiest shape to write) lost its DoS guard. The
+    // current code keeps the default cap and warns that
+    // eligible/JIT'd code still bypasses it.
     let path = write_tempfile(
         "arith4.lex",
         r#"
@@ -187,7 +188,7 @@ fn ident(n :: Int) -> Int {
     ]);
     assert_eq!(code, 0, "--jit alone failed: {err}");
     assert!(
-        err.contains("step-limit") || err.contains("step limit"),
-        "expected stderr warning about step-limit bypass, got: {err:?}"
+        err.contains("step counter") || err.contains("step-counter"),
+        "expected stderr warning about step-counter bypass, got: {err:?}"
     );
 }
