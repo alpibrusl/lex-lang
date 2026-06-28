@@ -148,16 +148,22 @@ fn double(n :: Int) -> Int {
 }
 
 #[test]
-fn jit_honors_step_limit_in_native_loops() {
-    // The architectural fix's whole point: a JIT-eligible
-    // tail-recursive hot loop (`sum_to(huge_n, 0)`) used to spin
-    // in native code forever, bypassing `--max-steps`.  Now the
-    // lowering emits a counter bump + check at every backward
-    // edge, and aborts via `VmError::Panic("step limit exceeded
-    // in <fn> ... [JIT]")` when the limit is reached.
+fn jit_honors_step_limit_end_to_end() {
+    // The architectural fix's end-to-end guarantee: a hot loop
+    // hits `--max-steps` even with `--jit`. The Lex source
+    // compiler emits polymorphic `Num*` ops (not the typed
+    // `Int*` ones the MVP JIT accepts) for tail-recursive `match`
+    // patterns, so `sum_to` here lands on the interpreter path
+    // rather than the JIT one — but the cap fires either way,
+    // which is what the test is checking.
     //
-    // We pick a step budget too small to complete `sum_to(1_000_000, 0)`
-    // and assert: nonzero exit + the JIT-side error message tag.
+    // The JIT-SPECIFIC abort path is exercised separately, with
+    // hand-rolled `Int*` bytecode, in
+    // `crates/lex-jit/tests/jitvm_vs_vm.rs` (see
+    // `jit_self_tail_recursion_honors_step_limit`).  Keeping the
+    // CLI test compiler-shape-agnostic means it stays green when
+    // the Lex compiler eventually does type-lower to `Int*` and
+    // the JIT actually JITs `sum_to`.
     let path = write_tempfile(
         "sum_to.lex",
         r#"
@@ -181,8 +187,8 @@ fn sum_to(n :: Int, acc :: Int) -> Int {
     ]);
     assert_ne!(code, 0, "expected step-limit abort, succeeded with: {err}");
     assert!(
-        err.contains("step limit exceeded") && err.contains("[JIT]"),
-        "expected JIT-tagged step-limit error, got: {err:?}"
+        err.contains("step limit exceeded"),
+        "expected step-limit error from either JIT or interpreter path, got: {err:?}"
     );
 }
 
