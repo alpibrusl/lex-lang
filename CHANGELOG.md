@@ -7,6 +7,22 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Any tuple built inside a live `net.serve` request handler could crash
+  builtins that inspect its shape** (e.g. `map.from_list`), with `"element
+  must be a 2-tuple, got ArenaTuple"`. Such a tuple is arena-allocated under
+  the request scope, but pure builtins and the tracer only know the heap
+  `Tuple`/`Record`/`List` forms and have no arena access to resolve a handle
+  themselves. This hit ANY `GET` request whose handler builds a tuple from
+  request data and passes it to a shape-inspecting builtin — notably
+  `lex-web`'s `ctx.query_map`/`cookie_map` (`?query=params` and `Cookie:`
+  headers on every live server; #698's `conc.ask` was one earlier instance
+  of the same class). Fixed at the single choke point every effect/builtin
+  call passes through: `Op::EffectCall` now materializes arena handles in
+  its args before dispatch, gated on the arena slab being non-empty (a
+  free no-op outside `net.serve` handlers).
+
 ## [0.10.4] — 2026-06-28
 
 ### Fixed
