@@ -2620,6 +2620,26 @@ impl<'a> Vm<'a> {
                 Op::EffectCall { kind_idx, op_idx, arity, node_id_idx } => {
                     let mut args: Vec<Value> = (0..arity).map(|_| Value::Unit).collect();
                     for i in (0..arity as usize).rev() { args[i] = self.pop()?; }
+                    // An arg built inside a live request scope (e.g. a tuple
+                    // literal from a closure called while handling a
+                    // `net.serve` request) may be a `Value::ArenaTuple` /
+                    // `ArenaRecord` handle rather than its heap form. Every
+                    // pure builtin and effect handler downstream (map.from_list,
+                    // the tracer, …) pattern-matches on the heap Tuple/Record/
+                    // List shapes and has no arena access to resolve a handle
+                    // itself — so this is the single choke point where every
+                    // effect/builtin call's args must be materialized before
+                    // they cross that boundary (see `materialize_arena_handles`
+                    // and docs/design/arena-plumbing.md). Gated on the arena
+                    // slab being non-empty: if no request scope has allocated
+                    // anything yet, no arg can possibly hold an arena handle,
+                    // so this is a free no-op outside `net.serve` handlers.
+                    if !self.arena_slab.is_empty() {
+                        for a in args.iter_mut() {
+                            let v = std::mem::replace(a, Value::Unit);
+                            *a = self.materialize_arena_handles(v);
+                        }
+                    }
                     let kind = match &self.program.constants[kind_idx as usize] {
                         Const::Str(s) => s.clone(),
                         _ => return Err(VmError::TypeMismatch("expected Str const for effect kind".into())),
