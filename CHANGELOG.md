@@ -7,6 +7,8 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.10.5] — 2026-07-05
+
 ### Fixed
 
 - **Any tuple built inside a live `net.serve` request handler could crash
