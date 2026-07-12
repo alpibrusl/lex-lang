@@ -339,6 +339,47 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 vec![Ty::bytes(), Ty::int(), Ty::int()],
                 EffectSet::empty(), Ty::bytes(),
             ));
+            // concat/concat_all + fixed-width little-endian int encoders and
+            // decoders: the minimal primitive set needed to build/parse a
+            // binary wire format (e.g. a Solana transaction) from Lex without
+            // shelling out to another language's runtime. Round-tripping
+            // through Str (the only prior way to build a Bytes buffer) can't
+            // represent arbitrary byte sequences, so these were a hard
+            // blocker, not a nice-to-have.
+            fields.insert("concat".into(), Ty::function(
+                vec![Ty::bytes(), Ty::bytes()], EffectSet::empty(), Ty::bytes(),
+            ));
+            fields.insert("concat_all".into(), Ty::function(
+                vec![Ty::List(Box::new(Ty::bytes()))], EffectSet::empty(), Ty::bytes(),
+            ));
+            fields.insert("u8".into(), Ty::function(
+                vec![Ty::int()], EffectSet::empty(), Ty::bytes(),
+            ));
+            fields.insert("u16_le".into(), Ty::function(
+                vec![Ty::int()], EffectSet::empty(), Ty::bytes(),
+            ));
+            fields.insert("u32_le".into(), Ty::function(
+                vec![Ty::int()], EffectSet::empty(), Ty::bytes(),
+            ));
+            fields.insert("u64_le".into(), Ty::function(
+                vec![Ty::int()], EffectSet::empty(), Ty::bytes(),
+            ));
+            fields.insert("u8_at".into(), Ty::function(
+                vec![Ty::bytes(), Ty::int()], EffectSet::empty(),
+                Ty::Con("Result".into(), vec![Ty::int(), Ty::str()]),
+            ));
+            fields.insert("u16_le_at".into(), Ty::function(
+                vec![Ty::bytes(), Ty::int()], EffectSet::empty(),
+                Ty::Con("Result".into(), vec![Ty::int(), Ty::str()]),
+            ));
+            fields.insert("u32_le_at".into(), Ty::function(
+                vec![Ty::bytes(), Ty::int()], EffectSet::empty(),
+                Ty::Con("Result".into(), vec![Ty::int(), Ty::str()]),
+            ));
+            fields.insert("u64_le_at".into(), Ty::function(
+                vec![Ty::bytes(), Ty::int()], EffectSet::empty(),
+                Ty::Con("Result".into(), vec![Ty::int(), Ty::str()]),
+            ));
             Some(Ty::Record(fields))
         }
         "time" => {

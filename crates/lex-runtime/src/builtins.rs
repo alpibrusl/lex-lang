@@ -701,6 +701,84 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let b = expect_bytes(args.first())?;
             Ok(Value::Bool(b.is_empty()))
         }
+        ("bytes", "concat") => {
+            let a = expect_bytes(args.first())?;
+            let b = expect_bytes(args.get(1))?;
+            let mut out = a.clone();
+            out.extend_from_slice(b);
+            Ok(Value::Bytes(out))
+        }
+        ("bytes", "concat_all") => {
+            let items = match args.first() {
+                Some(Value::List(xs)) => xs,
+                other => return Err(format!("bytes.concat_all expects a List[Bytes], got {other:?}")),
+            };
+            let mut out = Vec::new();
+            for item in items {
+                match item {
+                    Value::Bytes(b) => out.extend_from_slice(b),
+                    other => return Err(format!("bytes.concat_all: list element is not Bytes, got {other:?}")),
+                }
+            }
+            Ok(Value::Bytes(out))
+        }
+        ("bytes", "u8") => {
+            let n = expect_int(args.first())?;
+            Ok(Value::Bytes(vec![n as u8]))
+        }
+        ("bytes", "u16_le") => {
+            let n = expect_int(args.first())?;
+            Ok(Value::Bytes((n as u16).to_le_bytes().to_vec()))
+        }
+        ("bytes", "u32_le") => {
+            let n = expect_int(args.first())?;
+            Ok(Value::Bytes((n as u32).to_le_bytes().to_vec()))
+        }
+        ("bytes", "u64_le") => {
+            let n = expect_int(args.first())?;
+            Ok(Value::Bytes((n as u64).to_le_bytes().to_vec()))
+        }
+        ("bytes", "u8_at") => {
+            let b = expect_bytes(args.first())?;
+            let off = expect_int(args.get(1))? as usize;
+            match b.get(off) {
+                Some(&byte) => Ok(ok_v(Value::Int(byte as i64))),
+                None => Ok(err_v(Value::Str(format!("bytes.u8_at: offset {off} out of range of {} bytes", b.len()).into()))),
+            }
+        }
+        ("bytes", "u16_le_at") => {
+            let b = expect_bytes(args.first())?;
+            let off = expect_int(args.get(1))? as usize;
+            match b.get(off..off + 2) {
+                Some(slice) => {
+                    let arr: [u8; 2] = slice.try_into().unwrap();
+                    Ok(ok_v(Value::Int(u16::from_le_bytes(arr) as i64)))
+                }
+                None => Ok(err_v(Value::Str(format!("bytes.u16_le_at: offset {off} out of range of {} bytes", b.len()).into()))),
+            }
+        }
+        ("bytes", "u32_le_at") => {
+            let b = expect_bytes(args.first())?;
+            let off = expect_int(args.get(1))? as usize;
+            match b.get(off..off + 4) {
+                Some(slice) => {
+                    let arr: [u8; 4] = slice.try_into().unwrap();
+                    Ok(ok_v(Value::Int(u32::from_le_bytes(arr) as i64)))
+                }
+                None => Ok(err_v(Value::Str(format!("bytes.u32_le_at: offset {off} out of range of {} bytes", b.len()).into()))),
+            }
+        }
+        ("bytes", "u64_le_at") => {
+            let b = expect_bytes(args.first())?;
+            let off = expect_int(args.get(1))? as usize;
+            match b.get(off..off + 8) {
+                Some(slice) => {
+                    let arr: [u8; 8] = slice.try_into().unwrap();
+                    Ok(ok_v(Value::Int(u64::from_le_bytes(arr) as i64)))
+                }
+                None => Ok(err_v(Value::Str(format!("bytes.u64_le_at: offset {off} out of range of {} bytes", b.len()).into()))),
+            }
+        }
 
         // -- math --
         // Matrices are stored as the F64Array fast-lane variant (a flat
@@ -3329,4 +3407,91 @@ fn argon2id_impl(args: &[Value]) -> Value {
         return err_v(Value::Str(format!("{op}: {e}").into()));
     }
     ok_v(Value::Bytes(out))
+}
+
+#[cfg(test)]
+mod bytes_builtin_tests {
+    use super::*;
+
+    fn call(op: &str, args: Vec<Value>) -> Result<Value, String> {
+        dispatch("bytes", op, &args)
+    }
+
+    #[test]
+    fn concat_appends_in_order() {
+        let a = Value::Bytes(b"AB".to_vec());
+        let b = Value::Bytes(b"CD".to_vec());
+        let got = call("concat", vec![a, b]).unwrap();
+        assert_eq!(got, Value::Bytes(b"ABCD".to_vec()));
+    }
+
+    #[test]
+    fn concat_all_joins_a_list_in_order() {
+        let items = Value::List(vec![
+            Value::Bytes(b"Hi".to_vec()),
+            Value::Bytes(b", ".to_vec()),
+            Value::Bytes(b"there".to_vec()),
+        ].into());
+        let got = call("concat_all", vec![items]).unwrap();
+        assert_eq!(got, Value::Bytes(b"Hi, there".to_vec()));
+    }
+
+    #[test]
+    fn concat_all_rejects_non_bytes_elements() {
+        let items = Value::List(vec![Value::Int(1)].into());
+        assert!(call("concat_all", vec![items]).is_err());
+    }
+
+    #[test]
+    fn u8_encodes_and_truncates_to_one_byte() {
+        let got = call("u8", vec![Value::Int(65)]).unwrap();
+        assert_eq!(got, Value::Bytes(vec![65]));
+        // Encoding is a wrapping truncation, matching Rust's `as u8` — the
+        // caller is responsible for keeping values in range; this isn't a
+        // validating encoder.
+        let wrapped = call("u8", vec![Value::Int(256 + 65)]).unwrap();
+        assert_eq!(wrapped, Value::Bytes(vec![65]));
+    }
+
+    #[test]
+    fn u16_le_round_trips() {
+        let encoded = call("u16_le", vec![Value::Int(258)]).unwrap();
+        assert_eq!(encoded, Value::Bytes(vec![2, 1]));
+        let decoded = call("u16_le_at", vec![encoded, Value::Int(0)]).unwrap();
+        assert_eq!(decoded, ok_v(Value::Int(258)));
+    }
+
+    #[test]
+    fn u32_le_round_trips() {
+        let encoded = call("u32_le", vec![Value::Int(70000)]).unwrap();
+        let decoded = call("u32_le_at", vec![encoded, Value::Int(0)]).unwrap();
+        assert_eq!(decoded, ok_v(Value::Int(70000)));
+    }
+
+    #[test]
+    fn u64_le_round_trips_beyond_u32_range() {
+        let n = 9_007_199_254_740_993_i64; // > u32::MAX, within i64
+        let encoded = call("u64_le", vec![Value::Int(n)]).unwrap();
+        let decoded = call("u64_le_at", vec![encoded, Value::Int(0)]).unwrap();
+        assert_eq!(decoded, ok_v(Value::Int(n)));
+    }
+
+    #[test]
+    fn decoders_report_out_of_range_offsets_as_err_not_panic() {
+        let one_byte = Value::Bytes(vec![5]);
+        let got = call("u16_le_at", vec![one_byte, Value::Int(0)]).unwrap();
+        match got {
+            Value::Variant { name, .. } => assert_eq!(name, "Err"),
+            other => panic!("expected an Err variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn u16_le_at_reads_at_a_nonzero_offset() {
+        // [pad byte, then the u16] -- confirms offset is honored, not
+        // just decoding from the start of the buffer.
+        let buf = Value::Bytes(vec![0xFF, 2, 1]);
+        let decoded = call("u16_le_at", vec![buf, Value::Int(1)]).unwrap();
+        assert_eq!(decoded, ok_v(Value::Int(258)));
+    }
 }
