@@ -7,6 +7,23 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.10.6] — 2026-07-14
+
+### Added
+
+- **`std.bytes` gains `concat`/`concat_all` and fixed-width integer
+  encode/decode** (`u8`/`u16_le`/`u32_le`/`u64_le` and their `_at` decoders)
+  (#715). Previously the only way to build an arbitrary binary buffer was
+  `from_str`/`to_str`, which only round-trip through UTF-8 text — any real
+  binary wire format (e.g. a Solana transaction) was unbuildable from pure
+  Lex without a second-language dependency.
+- **`crypto.ed25519_is_valid_point(bytes :: Bytes) -> Bool`** (#717): whether
+  `bytes` decompresses to a valid point on the Edwards25519 curve. Exposes
+  `ed25519-dalek`'s existing validity check (already a dependency for
+  `ed25519_sign`/`verify`) as a pure predicate — the primitive a Solana
+  Program Derived Address bump-seed search needs (a PDA is valid iff the
+  candidate is NOT a curve point).
+
 ## [0.10.5] — 2026-07-05
 
 ### Fixed
