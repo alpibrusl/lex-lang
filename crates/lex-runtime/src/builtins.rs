@@ -1284,6 +1284,15 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let sig = Signature::from_bytes(&sig_arr);
             Ok(Value::Bool(vk.verify(message, &sig).is_ok()))
         }
+        ("crypto", "ed25519_is_valid_point") => {
+            use ed25519_dalek::VerifyingKey;
+            let candidate = expect_bytes(args.first())?;
+            let arr: [u8; 32] = match candidate.as_slice().try_into() {
+                Ok(a) => a,
+                Err(_) => return Ok(Value::Bool(false)),
+            };
+            Ok(Value::Bool(VerifyingKey::from_bytes(&arr).is_ok()))
+        }
         // P-256 ECDSA / ES256 (#651). Backs the JWT/SD-JWT signing
         // primitives `lex-jose` needs for AP2 mandates. Key minting
         // (`p256_generate`) is effectful (`[random]`) and lives in the
@@ -3493,5 +3502,42 @@ mod bytes_builtin_tests {
         let buf = Value::Bytes(vec![0xFF, 2, 1]);
         let decoded = call("u16_le_at", vec![buf, Value::Int(1)]).unwrap();
         assert_eq!(decoded, ok_v(Value::Int(258)));
+    }
+}
+
+#[cfg(test)]
+mod ed25519_curve_tests {
+    use super::*;
+
+    fn call(op: &str, args: Vec<Value>) -> Result<Value, String> {
+        dispatch("crypto", op, &args)
+    }
+
+    #[test]
+    fn a_real_public_key_is_a_valid_point() {
+        use ed25519_dalek::SigningKey;
+        let seed = [7u8; 32];
+        let sk = SigningKey::from_bytes(&seed);
+        let pk = sk.verifying_key().to_bytes().to_vec();
+        let got = call("ed25519_is_valid_point", vec![Value::Bytes(pk)]).unwrap();
+        assert_eq!(got, Value::Bool(true));
+    }
+
+    #[test]
+    fn wrong_length_is_not_a_valid_point() {
+        let got = call("ed25519_is_valid_point", vec![Value::Bytes(vec![1, 2, 3])]).unwrap();
+        assert_eq!(got, Value::Bool(false));
+    }
+
+    #[test]
+    fn a_non_curve_point_is_rejected() {
+        // 31 bytes of 0x01 followed by a 0x00 sign/high byte does not
+        // decompress to a point on Edwards25519 -- exactly the kind of
+        // candidate a PDA bump search must reject to be sure the address
+        // has no known private key.
+        let mut candidate = [1u8; 32];
+        candidate[31] = 0;
+        let got = call("ed25519_is_valid_point", vec![Value::Bytes(candidate.to_vec())]).unwrap();
+        assert_eq!(got, Value::Bool(false));
     }
 }
