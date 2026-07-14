@@ -124,7 +124,23 @@ impl<'a> JitTier<'a> {
 }
 
 impl<'a> JitHook for JitTier<'a> {
-    fn try_call(&mut self, fn_id: u32, args: &[Value]) -> Result<Option<Value>, VmError> {
+    // `try_call` takes a raw pointer that we deref (via the
+    // JITed code's load/store and our own `*step_counter_ptr`
+    // read on abort). The trait itself is safe — see the
+    // `JitHook` docs in `lex-bytecode`: the dispatcher is
+    // responsible for providing a valid `&mut self.steps as *mut
+    // u64` from the same `&mut self` borrow it just took. Marking
+    // the trait `unsafe` would force every interpreter call site
+    // to use `unsafe { hook.try_call(...) }`, which obscures the
+    // common "no JIT installed" path. Allow + comment instead.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    fn try_call(
+        &mut self,
+        fn_id: u32,
+        args: &[Value],
+        step_counter_ptr: *mut u64,
+        step_limit: u64,
+    ) -> Result<Option<Value>, VmError> {
         let fid = fn_id as usize;
         if fid >= self.cache.len() {
             return Ok(None);
@@ -139,7 +155,30 @@ impl<'a> JitHook for JitTier<'a> {
         match &self.cache[fid] {
             CompileState::Compiled(jitted) => {
                 if let Some(unboxed) = unbox_args(args, jitted.arity()) {
-                    let r = unsafe { jitted.call(&unboxed) };
+                    // Run the native function with the VM's step
+                    // counter pointer; JITed code increments it at
+                    // every backward jump and signals an abort via
+                    // `aborted` if it would exceed `step_limit`.
+                    let mut aborted: u8 = 0;
+                    let r = unsafe {
+                        jitted.call(&unboxed, step_counter_ptr, step_limit, &mut aborted)
+                    };
+                    if aborted != 0 {
+                        // Surface the same error shape the
+                        // interpreter would on `step_limit`: the
+                        // dispatch loop raises `VmError::Panic`
+                        // (it doesn't have a dedicated variant for
+                        // step-limit). Match the interpreter's
+                        // `step limit exceeded in <fn_name>` message
+                        // so callers can grep either path the same
+                        // way.
+                        let fn_name = &self.program.functions[fid].name;
+                        let count = unsafe { *step_counter_ptr };
+                        return Err(VmError::Panic(format!(
+                            "step limit exceeded in `{fn_name}` ({} > {}) [JIT]",
+                            count, step_limit,
+                        )));
+                    }
                     Ok(Some(Value::Int(r)))
                 } else {
                     // Eligible but arg shape doesn't fit at the call

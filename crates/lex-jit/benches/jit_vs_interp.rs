@@ -154,7 +154,18 @@ fn bench_sum_loop(c: &mut Criterion) {
         });
 
         group.bench_function(format!("jit_raw/n={n}"), |b| {
-            b.iter(|| black_box(unsafe { jitted.call(&[black_box(n)]) }));
+            // The architectural fix added trailing step-counter +
+            // limit + aborted-out params. For raw-throughput
+            // bench we want effectively-infinite budget so the
+            // counter check is exercised at native speed but
+            // never aborts.
+            let mut steps: u64 = 0;
+            let mut aborted: u8 = 0;
+            b.iter(|| {
+                black_box(unsafe {
+                    jitted.call(&[black_box(n)], &mut steps, u64::MAX, &mut aborted)
+                })
+            });
         });
 
         // The tiered path — `JitVm::call`. Includes the wrapper's
@@ -207,9 +218,16 @@ fn bench_polynomial(c: &mut Criterion) {
     });
 
     group.bench_function("jit_raw", |b| {
+        let mut steps: u64 = 0;
+        let mut aborted: u8 = 0;
         b.iter(|| {
             black_box(unsafe {
-                jitted.call(&[black_box(7), black_box(11), black_box(13)])
+                jitted.call(
+                    &[black_box(7), black_box(11), black_box(13)],
+                    &mut steps,
+                    u64::MAX,
+                    &mut aborted,
+                )
             })
         });
     });
