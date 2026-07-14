@@ -898,7 +898,7 @@ dependencies = [
 
 [[package]]
 name = "conformance"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "anyhow",
  "indexmap",
@@ -981,7 +981,7 @@ dependencies = [
 
 [[package]]
 name = "core-compiler"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "indexmap",
  "lex-ast",
@@ -2534,7 +2534,7 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
 name = "lex-api"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "anyhow",
  "flate2",
@@ -2556,7 +2556,7 @@ dependencies = [
 
 [[package]]
 name = "lex-ast"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "indexmap",
  "lex-syntax",
@@ -2568,7 +2568,7 @@ dependencies = [
 
 [[package]]
 name = "lex-bytecode"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -2586,7 +2586,7 @@ dependencies = [
 
 [[package]]
 name = "lex-cli"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "acli",
  "anyhow",
@@ -2617,7 +2617,7 @@ dependencies = [
 
 [[package]]
 name = "lex-jit"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
@@ -2635,7 +2635,7 @@ dependencies = [
 
 [[package]]
 name = "lex-lsp"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "lex-ast",
  "lex-store",
@@ -2651,7 +2651,7 @@ dependencies = [
 
 [[package]]
 name = "lex-runtime"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -2720,7 +2720,7 @@ dependencies = [
 
 [[package]]
 name = "lex-search"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "hex",
  "lex-ast",
@@ -2737,7 +2737,7 @@ dependencies = [
 
 [[package]]
 name = "lex-store"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "fs2",
  "hex",
@@ -2756,7 +2756,7 @@ dependencies = [
 
 [[package]]
 name = "lex-syntax"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "flate2",
  "indexmap",
@@ -2773,7 +2773,7 @@ dependencies = [
 
 [[package]]
 name = "lex-trace"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "indexmap",
  "lex-ast",
@@ -2788,7 +2788,7 @@ dependencies = [
 
 [[package]]
 name = "lex-types"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "hex",
  "indexmap",
@@ -2802,7 +2802,7 @@ dependencies = [
 
 [[package]]
 name = "lex-vcs"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "ed25519-dalek",
  "getrandom 0.4.2",
@@ -5225,7 +5225,7 @@ dependencies = [
 
 [[package]]
 name = "spec-checker"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "indexmap",
  "lex-ast",
