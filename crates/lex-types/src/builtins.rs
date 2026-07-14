@@ -1814,6 +1814,16 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::empty(),
                 Ty::bool(),
             ));
+            // Whether `bytes` decompresses to a valid point on the Edwards25519
+            // curve (#93 follow-up: Solana Program Derived Address search --
+            // a PDA is valid iff the candidate 32 bytes are NOT a valid point,
+            // so callers try bump seeds until this returns false).
+            //   ed25519_is_valid_point(bytes :: Bytes) -> Bool
+            fields.insert("ed25519_is_valid_point".into(), Ty::function(
+                vec![Ty::bytes()],
+                EffectSet::empty(),
+                Ty::bool(),
+            ));
             // P-256 ECDSA / ES256 (#651). The JWT/SD-JWT signature
             // algorithm for AP2 agent keys; `lex-jose` builds the
             // token layer on top of these primitives. Key bytes are
