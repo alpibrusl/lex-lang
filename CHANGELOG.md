@@ -7,6 +7,22 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.10.7] — 2026-07-22
+
+### Fixed
+
+- **Postgres `float4`/`float8` param and column serialization mismatch**
+  (#725). `sql.exec`/`sql.query` bound every `PFloat` param — and read every
+  `real`/`float4` column — as `f64`, whose `ToSql`/`FromSql` impls only
+  accept `FLOAT8`. Any pack following the project's portable-DDL convention
+  (`TEXT / REAL / BIGINT` only, `REAL` = Postgres `float4`) hit
+  `error serializing parameter N` on write and `error deserializing column N`
+  on read the first time a `REAL` column was actually exercised against
+  Postgres — SQLite-only test coverage had masked it. `pg_param_refs` now
+  encodes to whichever width Postgres asks for instead of hardcoding `f64`;
+  `pg_row_to_lex_record` reads `FLOAT4` columns via `f32`. Not specific to
+  any one pack — shared by every Postgres call site.
+
 ## [0.10.6] — 2026-07-14
 
 ### Added
