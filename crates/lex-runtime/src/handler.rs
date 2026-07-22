@@ -4350,17 +4350,78 @@ mod pg_placeholder_tests {
     }
 }
 
+/// Lex's `PFloat` params are always `f64`, but a placeholder's Postgres
+/// parameter type is inferred from the column it binds to, and Lex SQL
+/// schemas commonly use `REAL` (float4) rather than `DOUBLE PRECISION`
+/// (float8). A plain `f64` only implements `ToSql` for float8, so binding
+/// it against a float4 parameter fails to serialize. This wrapper accepts
+/// either width and encodes to whichever one Postgres actually asked for.
+#[derive(Debug)]
+struct PgFloatParam(f64);
+
+impl postgres::types::ToSql for PgFloatParam {
+    fn to_sql(
+        &self,
+        ty: &postgres::types::Type,
+        out: &mut bytes::BytesMut,
+    ) -> Result<postgres::types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        use bytes::BufMut;
+        match *ty {
+            postgres::types::Type::FLOAT4 => out.put_f32(self.0 as f32),
+            _ => out.put_f64(self.0),
+        }
+        Ok(postgres::types::IsNull::No)
+    }
+
+    fn accepts(ty: &postgres::types::Type) -> bool {
+        matches!(*ty, postgres::types::Type::FLOAT4 | postgres::types::Type::FLOAT8)
+    }
+
+    postgres::types::to_sql_checked!();
+}
+
 /// Box `SqlParamValue`s as `dyn ToSql + Sync` for Postgres binding.
 fn pg_param_refs(params: &[SqlParamValue]) -> Vec<Box<dyn postgres::types::ToSql + Sync>> {
     params.iter().map(|p| -> Box<dyn postgres::types::ToSql + Sync> {
         match p {
             SqlParamValue::Text(s)    => Box::new(s.clone()),
             SqlParamValue::Integer(n) => Box::new(*n),
-            SqlParamValue::Real(f)    => Box::new(*f),
+            SqlParamValue::Real(f)    => Box::new(PgFloatParam(*f)),
             SqlParamValue::Bool(b)    => Box::new(*b),
             SqlParamValue::Null       => Box::new(Option::<String>::None),
         }
     }).collect()
+}
+
+#[cfg(test)]
+mod pg_float_param_tests {
+    use super::PgFloatParam;
+    use bytes::{Buf, BytesMut};
+    use postgres::types::{ToSql, Type};
+
+    #[test]
+    fn encodes_float4_as_4_bytes_matching_the_value() {
+        let mut out = BytesMut::new();
+        PgFloatParam(6.5).to_sql(&Type::FLOAT4, &mut out).unwrap();
+        assert_eq!(out.len(), 4);
+        assert_eq!(out.get_f32(), 6.5f32);
+    }
+
+    #[test]
+    fn encodes_float8_as_8_bytes_matching_the_value() {
+        let mut out = BytesMut::new();
+        PgFloatParam(6.5).to_sql(&Type::FLOAT8, &mut out).unwrap();
+        assert_eq!(out.len(), 8);
+        assert_eq!(out.get_f64(), 6.5f64);
+    }
+
+    #[test]
+    fn accepts_only_float4_and_float8() {
+        assert!(PgFloatParam::accepts(&Type::FLOAT4));
+        assert!(PgFloatParam::accepts(&Type::FLOAT8));
+        assert!(!PgFloatParam::accepts(&Type::TEXT));
+        assert!(!PgFloatParam::accepts(&Type::INT8));
+    }
 }
 
 /// Run a statement on SQLite and pack rows into `Value::List(Value::Record(...))`.
@@ -4433,7 +4494,9 @@ fn pg_row_to_lex_record(row: &postgres::Row) -> indexmap::IndexMap<String, Value
         let ty = col.type_();
         let val = if *ty == Type::INT2 || *ty == Type::INT4 || *ty == Type::INT8 {
             row.get::<_, Option<i64>>(i).map(Value::Int).unwrap_or(Value::Unit)
-        } else if *ty == Type::FLOAT4 || *ty == Type::FLOAT8 {
+        } else if *ty == Type::FLOAT4 {
+            row.get::<_, Option<f32>>(i).map(|f| Value::Float(f as f64)).unwrap_or(Value::Unit)
+        } else if *ty == Type::FLOAT8 {
             row.get::<_, Option<f64>>(i).map(Value::Float).unwrap_or(Value::Unit)
         } else if *ty == Type::BOOL {
             row.get::<_, Option<bool>>(i).map(Value::Bool).unwrap_or(Value::Unit)
