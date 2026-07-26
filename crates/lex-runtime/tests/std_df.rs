@@ -334,3 +334,54 @@ fn df_drop_nulls_empty_col_list_is_noop() {
     ).unwrap().unwrap();
     assert_eq!(nrows_of(unwrap_ok(r)), 6, "empty col list is a no-op");
 }
+
+/// The Polars-backed CSV reader behind `arrow.read_csv` (df feature):
+/// dtype normalisation to the v1 surface and null preservation.
+///
+/// The file exercises the three inference paths that differ from the
+/// old arrow-rs reader: a Boolean-inferred column (cast to Utf8), an
+/// Int64 column with a gap (null must survive so `df.filter_isnull`
+/// can see it), and plain Utf8/Float64 columns (untouched).
+#[test]
+fn df_read_csv_polars_normalises_dtypes_and_keeps_nulls() {
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mixed.csv");
+    let mut f = std::fs::File::create(&path).unwrap();
+    writeln!(f, "n,flag,name,score").unwrap();
+    writeln!(f, "1,true,alice,1.5").unwrap();
+    writeln!(f, ",false,bob,2.5").unwrap();
+    writeln!(f, "3,true,carol,3.5").unwrap();
+    drop(f);
+
+    let t = lex_runtime::df::read_csv_at_polars(&path).expect("read");
+    let rb = match &t {
+        Value::ArrowTable(rb) => rb.clone(),
+        other => panic!("expected ArrowTable, got {other:?}"),
+    };
+    assert_eq!(rb.num_rows(), 3);
+    let dtype_of = |name: &str| {
+        rb.schema()
+            .field_with_name(name)
+            .unwrap_or_else(|_| panic!("column {name} missing"))
+            .data_type()
+            .clone()
+    };
+    assert_eq!(dtype_of("n"), arrow_schema::DataType::Int64);
+    assert_eq!(dtype_of("flag"), arrow_schema::DataType::Utf8, "Boolean casts to Utf8");
+    assert_eq!(dtype_of("name"), arrow_schema::DataType::Utf8);
+    assert_eq!(dtype_of("score"), arrow_schema::DataType::Float64);
+
+    // The empty cell in `n` must survive as a null the df kernels can see.
+    let r = lex_runtime::df::dispatch("filter_isnull", &[t.clone(), Value::Str("n".into())])
+        .unwrap()
+        .unwrap();
+    assert_eq!(nrows_of(unwrap_ok(r)), 1, "one null row in n");
+
+    // And the reduction path still works over the normalised table.
+    let r = lex_runtime::df::dispatch("filter_eq_str", &[t, Value::Str("flag".into()), Value::Str("true".into())])
+        .unwrap()
+        .unwrap();
+    assert_eq!(nrows_of(unwrap_ok(r)), 2, "flag=true rows via the cast Utf8 column");
+}

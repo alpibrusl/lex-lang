@@ -486,6 +486,63 @@ fn left_join(args: &[Value]) -> Result<Value, String> {
     pack(out)
 }
 
+// ---------- I/O: the Polars-backed CSV reader behind arrow.read_csv ----------
+
+/// Read a CSV through Polars' parallel reader and hand back the usual
+/// `Value::ArrowTable`. This is what `arrow.read_csv` dispatches to
+/// when the `df` feature is on (the default for the `lex` toolchain):
+/// the arrow-rs CSV reader is single-threaded and was measured at
+/// ~10x the wall time of Polars' on a 1M-row file — it dominated
+/// every read-then-query pipeline (see lex-frame's bench/REPORT.md).
+///
+/// Contract is unchanged from the arrow-rs path: header row required,
+/// schema inferred from the first 100 rows, output columns normalised
+/// to the `std.arrow` v1 dtype surface (Int64 / Float64 / Utf8).
+/// Polars may infer types outside that surface (Boolean today;
+/// narrower ints defensively) — those are cast: ints widen to Int64,
+/// Float32 widens to Float64, everything else (Boolean, temporal)
+/// renders to Utf8. The old reader produced unusable columns for
+/// those inputs (present in the table, rejected by every kernel), so
+/// the cast is a strict upgrade, not a break.
+pub fn read_csv_at_polars(path: &std::path::Path) -> Result<Value, String> {
+    use polars::prelude::{CsvReadOptions, SerReader};
+
+    let df = CsvReadOptions::default()
+        .with_has_header(true)
+        .with_infer_schema_length(Some(100))
+        .try_into_reader_with_file_path(Some(path.to_path_buf()))
+        .map_err(|e| format!("arrow.read_csv: open `{}`: {e}", path.display()))?
+        .finish()
+        .map_err(|e| format!("arrow.read_csv: parse `{}`: {e}", path.display()))?;
+
+    // Normalise to the v1 dtype surface before crossing back to arrow.
+    let mut casts: Vec<Expr> = Vec::new();
+    for (name, dtype) in df.schema().iter() {
+        let target = match dtype {
+            PlDt::Int64 | PlDt::Float64 | PlDt::String => continue,
+            PlDt::Int8
+            | PlDt::Int16
+            | PlDt::Int32
+            | PlDt::UInt8
+            | PlDt::UInt16
+            | PlDt::UInt32
+            | PlDt::UInt64 => PlDt::Int64,
+            PlDt::Float32 => PlDt::Float64,
+            _ => PlDt::String,
+        };
+        casts.push(col(name.as_str()).cast(target));
+    }
+    let df = if casts.is_empty() {
+        df
+    } else {
+        df.lazy()
+            .with_columns(casts)
+            .collect()
+            .map_err(|e| format!("arrow.read_csv: dtype normalisation: {e}"))?
+    };
+    pack(df)
+}
+
 // ---------- helpers (mirror arrow.rs) ----------
 
 fn ok(v: Value) -> Value {
