@@ -1,6 +1,6 @@
 # lex
 
-Version: 0.9.7
+Version: 0.10.7
 ACLI version: 0.1.0
 
 ## Commands
@@ -154,4 +154,82 @@ Idempotent: false
 emit the AI-agent authoring contract (idiom rules) for this Lex toolchain
 
 Idempotent: true
+
+### init
+
+scaffold a new project (lex.toml, src/, tests/, CI)
+
+Idempotent: false
+
+### pkg
+
+package manager: init, add, install, list deps; publish/verify signed capability contracts
+
+Idempotent: false
+
+### fmt
+
+format .lex files; --check exits 1 if any need it
+
+Idempotent: false
+
+### ci
+
+run the full pipeline: pkg install, check --strict, fmt --check, test
+
+Idempotent: false
+
+### test
+
+run tests/test_*.lex files (calls run_all in each)
+
+Idempotent: true
+
+### keygen
+
+print a fresh Ed25519 keypair (hex) for signing stages
+
+Idempotent: false
+
+### canonical
+
+encode/decode the canonical wire form of an AST
+
+Idempotent: true
+
+### docs
+
+emit machine-readable API/workspace docs
+
+Idempotent: true
+
+### op
+
+inspect and sync the operation log (show|log|push|pull|repack|gc)
+
+Idempotent: false
+
+### plan
+
+list repair-candidate paths for a goal, cheapest-first, within budget
+
+Idempotent: true
+
+### repair
+
+apply a typed repair transform to a failed op; emits a RepairAttempt
+
+Idempotent: false
+
+### policy
+
+manage store policy.json (producer blocks + required attestations)
+
+Idempotent: false
+
+### producer-trust
+
+recompute per-tool trust from attestation history, or export a trusted-keys keyring above a score threshold
+
+Idempotent: false
 
