@@ -154,12 +154,18 @@ fn from_polars(df: &DataFrame) -> Result<RecordBatch, String> {
                 )
             }
             PlDt::String => {
-                let v: Vec<Option<String>> = s.str()
+                // Collect `Option<&str>` straight into the arrow buffer.
+                // The previous `x.map(|s| s.to_string())` detour allocated
+                // one heap String per row — ~300 ms of pure allocator
+                // traffic on a 1M-row × 3-string-column table, enough to
+                // eat the entire win of the parallel CSV reader on
+                // string-heavy files.
+                let arr: StringArray = s.str()
                     .map_err(|e| format!("df: column `{name}` as Utf8: {e}"))?
-                    .iter().map(|x| x.map(|s| s.to_string())).collect();
+                    .iter().collect();
                 (
                     Field::new(name, ArrowDt::Utf8, true),
-                    Arc::new(StringArray::from(v)),
+                    Arc::new(arr),
                 )
             }
             // UInt32 surfaces from `count` aggregations in Polars.
