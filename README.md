@@ -164,7 +164,7 @@ Tooling and runtime libraries that extend the Lex platform:
 **Pre-built binaries** for Linux (x86_64 / aarch64), macOS (x86_64 / aarch64), and Windows are on [GitHub Releases](https://github.com/alpibrusl/lex-lang/releases):
 
 ```sh
-tar -xzf lex-v0.9.8-x86_64-unknown-linux-gnu.tar.gz
+tar -xzf lex-v0.10.7-x86_64-unknown-linux-gnu.tar.gz
 mv lex /usr/local/bin/
 lex version
 ```
@@ -172,8 +172,8 @@ lex version
 **Container image** — multi-arch (`linux/amd64` + `linux/arm64`):
 
 ```sh
-docker run -p 4040:4040 -v lex-store:/data ghcr.io/alpibrusl/lex:v0.9.8
-docker run --rm -v "$(pwd):/work" -w /work ghcr.io/alpibrusl/lex:v0.9.8 check src/main.lex
+docker run -p 4040:4040 -v lex-store:/data ghcr.io/alpibrusl/lex:v0.10.7
+docker run --rm -v "$(pwd):/work" -w /work ghcr.io/alpibrusl/lex:v0.10.7 check src/main.lex
 ```
 
 **From source** — requires Rust 1.80+:
