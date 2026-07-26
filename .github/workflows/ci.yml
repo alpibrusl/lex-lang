@@ -64,6 +64,10 @@ jobs:
       # binary is enough.
       - run: cargo test -p lex-runtime --features quic --test net_serve_quic
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The README's install snippets are copy-pasted by newcomers; a stale
+      # version there hands them an old binary. Keep it pinned to Cargo.toml.
+      - name: README install version matches Cargo.toml
+        run: ./scripts/check-readme-version.sh
       # Manifesto demo: effects are machine-verifiable constraints. The
       # honest effect row type-checks; a [net] call under an [io]
       # signature is rejected. lex-cli is already compiled by the
