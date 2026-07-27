@@ -3,6 +3,7 @@ name = "lex-store"
 description = "Content-addressed on-disk store for Lex stages, branches, and traces."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

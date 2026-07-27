@@ -26,6 +26,17 @@ exclude = ["fuzz"]
 [workspace.package]
 version = "0.10.8"
 edition = "2021"
+# Minimum supported Rust. Determined empirically, not aspirationally: the
+# floor is `libsqlite3-sys` (via rusqlite → lex-runtime), whose *build
+# script* uses `cfg_select!`, stabilized in 1.95. It declares no
+# rust-version of its own, so `cargo metadata` reports a floor of 1.93
+# (cranelift/wasmtime) and only an actual build finds the real one.
+#
+# Declaring it here turns a confusing E0658 deep inside a C-binding crate
+# into cargo's own "requires rustc 1.95" message, before anything compiles.
+# Verified: `cargo check --workspace --all-targets` fails on 1.93 and
+# 1.94.1, passes on 1.95.0. Raise this only with the same evidence.
+rust-version = "1.95"
 license = "EUPL-1.2"
 repository = "https://github.com/alpibrusl/lex-lang"
 homepage = "https://github.com/alpibrusl/lex-lang"

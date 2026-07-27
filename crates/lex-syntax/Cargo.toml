@@ -3,6 +3,7 @@ name = "lex-syntax"
 description = "Tokenizer + parser for the Lex programming language."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

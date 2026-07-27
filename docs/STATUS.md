@@ -1,6 +1,7 @@
 # Status
 
-Full capability table for lex-lang v0.9.x.
+Full capability table for lex-lang. Applies to the current release; see
+[`CHANGELOG.md`](../CHANGELOG.md) for what changed in each version.
 
 ## Production-ready
 
