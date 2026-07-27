@@ -3,6 +3,7 @@ name = "spec-checker"
 description = "Property-based and runtime-gate checker for Lex specs."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

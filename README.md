@@ -5,6 +5,7 @@
 [![CI](https://github.com/alpibrusl/lex-lang/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/alpibrusl/lex-lang/actions/workflows/ci.yml)
 [![fuzz](https://github.com/alpibrusl/lex-lang/actions/workflows/fuzz.yml/badge.svg?branch=main)](https://github.com/alpibrusl/lex-lang/actions/workflows/fuzz.yml)
 [![License: EUPL-1.2](https://img.shields.io/badge/license-EUPL--1.2-blue.svg)](LICENSE)
+[![Rust 1.95+](https://img.shields.io/badge/rust-1.95%2B-orange.svg)](#install)
 
 **The contract layer agents emit into.** Lex is a typed-effect language built for the case where an LLM, not a human, is the primary author. Every function declares its effects; the type checker rejects any body that lies about what it touches, *before a byte runs*. The content-addressed AST and append-only operation log survive the next ten model upgrades.
 
@@ -167,7 +168,7 @@ docker run -p 4040:4040 -v lex-store:/data ghcr.io/alpibrusl/lex:v0.10.7
 docker run --rm -v "$(pwd):/work" -w /work ghcr.io/alpibrusl/lex:v0.10.7 check src/main.lex
 ```
 
-**From source** — builds on stable Rust (what CI uses):
+**From source** — requires Rust 1.95+ (declared as `rust-version`, so cargo tells you before it compiles anything):
 
 ```sh
 cargo build --release

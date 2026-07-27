@@ -3,6 +3,7 @@ name = "lex-lsp"
 description = "Language Server Protocol bridge for Lex — pipes lex-types' type-checker diagnostics to editor inline-error surfaces."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

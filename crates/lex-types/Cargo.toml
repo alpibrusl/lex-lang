@@ -3,6 +3,7 @@ name = "lex-types"
 description = "Type system + effect inference for Lex."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

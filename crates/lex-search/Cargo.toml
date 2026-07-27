@@ -3,6 +3,7 @@ name = "lex-search"
 description = "Semantic search over lex-store stages: three-index fusion (description / signature / examples)."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

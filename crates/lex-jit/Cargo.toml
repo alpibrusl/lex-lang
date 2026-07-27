@@ -3,6 +3,7 @@ name = "lex-jit"
 description = "Cranelift-backed JIT for a subset of Lex bytecode (#465 phase-1 MVP)."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
