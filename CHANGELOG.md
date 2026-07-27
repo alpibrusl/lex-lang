@@ -7,6 +7,8 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.10.8] — 2026-07-27
+
 ### Changed
 
 - **`arrow.read_csv` now uses Polars' parallel CSV reader** when the
