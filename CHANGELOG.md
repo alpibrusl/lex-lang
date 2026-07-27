@@ -7,6 +7,23 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Changed
+
+- **`arrow.read_csv` now uses Polars' parallel CSV reader** when the
+  `df` feature is on (the default for the `lex` toolchain). The
+  arrow-rs reader is single-threaded and dominated every
+  read-then-query pipeline: on a 1M-row file it accounted for
+  ~115 ms of a 153 ms `sum` and ~400-450 ms of every ~500 ms H2O
+  db-benchmark group-by cell measured in lex-frame's
+  `bench/REPORT.md`. Contract is unchanged (header row required,
+  schema inferred from the first 100 rows, `[fs_read]` effect and
+  path scoping); output dtypes are now always normalised to the
+  `std.arrow` v1 surface — narrower ints widen to `int64`,
+  `Float32` widens to `float64`, and Boolean/temporal inferences
+  render to `utf8`. Previously a Boolean-inferred column loaded but
+  was rejected by every kernel; now it's a usable string column.
+  `default-features = false` embedders keep the arrow-rs reader.
+
 ## [0.10.7] — 2026-07-22
 
 ### Fixed

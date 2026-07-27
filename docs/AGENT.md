@@ -330,7 +330,10 @@ Slicing (all zero-copy via `RecordBatch::slice` / `project`):
 
 I/O (effect-gated):
 - `read_csv :: Str -> [fs_read] Result[Table, Str]` — header row required;
-  schema inferred from the first 100 rows.
+  schema inferred from the first 100 rows. Runs on Polars' parallel
+  CSV reader in default builds (`df` feature); columns are always
+  normalised to the v1 dtype surface (narrower ints → `int64`,
+  `Float32` → `float64`, Boolean/temporal → `utf8`).
 
 ### `std.df`
 Polars-backed query ops over `arrow.Table` (#427). All pure — the Polars

@@ -401,10 +401,28 @@ fn drop_col(args: &[Value]) -> Result<Value, String> {
 /// targets; bigger inputs land in a streaming `read_csv_iter` slice
 /// later.
 ///
+/// With the `df` feature (default for the `lex` toolchain) the read
+/// goes through Polars' parallel CSV reader — same contract, ~10x
+/// less wall time on a 1M-row file (see `df::read_csv_at_polars`).
+/// The single-threaded arrow-rs reader below stays as the
+/// implementation for `default-features = false` embedders.
+///
 /// **Path checking is the caller's job.** This function takes an
 /// already-resolved `&Path`; the effect-handler dispatch verifies
 /// `policy.allow_fs_read` before calling here.
 pub fn read_csv_at(path: &Path) -> Result<Value, String> {
+    #[cfg(feature = "df")]
+    {
+        crate::df::read_csv_at_polars(path)
+    }
+    #[cfg(not(feature = "df"))]
+    {
+        read_csv_at_arrow_rs(path)
+    }
+}
+
+#[cfg_attr(feature = "df", allow(dead_code))]
+fn read_csv_at_arrow_rs(path: &Path) -> Result<Value, String> {
     let file =
         File::open(path).map_err(|e| format!("arrow.read_csv: open `{}`: {e}", path.display()))?;
     let (schema, _) = arrow_csv::reader::Format::default()

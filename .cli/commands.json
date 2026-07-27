@@ -1,6 +1,6 @@
 {
   "name": "lex",
-  "version": "0.9.7",
+  "version": "0.10.7",
   "acli_version": "0.1.0",
   "commands": [
     {
@@ -367,7 +367,7 @@
             {
               "name": "--kind",
               "type": "string",
-              "description": "attestation kind: type_check | spec | examples | diff_body | effect_audit | sandbox_run"
+              "description": "attestation kind: type_check | spec | examples | diff_body | effect_audit | sandbox_run | capsule_install"
             },
             {
               "name": "--result",
@@ -378,6 +378,25 @@
               "name": "--since",
               "type": "string",
               "description": "epoch seconds or YYYY-MM-DD; only attestations on or after this time"
+            },
+            {
+              "name": "--store",
+              "type": "string",
+              "description": "store root directory"
+            }
+          ],
+          "subcommands": [],
+          "idempotent": true
+        },
+        {
+          "name": "import-install",
+          "description": "promote lex-os capsule-install records into durable attestations (signer-keyed; feeds producer-trust)",
+          "arguments": [],
+          "options": [
+            {
+              "name": "--audit",
+              "type": "string",
+              "description": "lex-os audit log JSON (from `lex-os capsule install --audit-out`)"
             },
             {
               "name": "--store",
@@ -399,13 +418,18 @@
           "invocation": "lex attest filter --kind type_check --since 2026-05-01"
         },
         {
+          "description": "Promote capsule installs to attestations",
+          "invocation": "lex attest import-install --audit install.audit.json"
+        },
+        {
           "description": "Machine-readable",
           "invocation": "lex --output json attest filter --kind spec"
         }
       ],
       "see_also": [
         "stage",
-        "blame"
+        "blame",
+        "producer-trust"
       ]
     },
     {
@@ -1451,6 +1475,381 @@
         "skill",
         "introspect",
         "init"
+      ]
+    },
+    {
+      "name": "init",
+      "description": "scaffold a new project (lex.toml, src/, tests/, CI)",
+      "arguments": [
+        {
+          "name": "dir",
+          "type": "string",
+          "description": "target directory (default: current)",
+          "required": false
+        }
+      ],
+      "options": [],
+      "subcommands": [],
+      "idempotent": false,
+      "examples": [
+        {
+          "description": "Scaffold here",
+          "invocation": "lex init"
+        },
+        {
+          "description": "Into a dir",
+          "invocation": "lex init my-proj"
+        }
+      ],
+      "see_also": [
+        "pkg",
+        "agent-guidelines"
+      ]
+    },
+    {
+      "name": "pkg",
+      "description": "package manager: init, add, install, list deps; publish/verify signed capability contracts",
+      "arguments": [
+        {
+          "name": "subcommand",
+          "type": "enum[init|add|install|list|publish|verify]",
+          "description": "what to do",
+          "required": true
+        }
+      ],
+      "options": [],
+      "subcommands": [],
+      "idempotent": false,
+      "examples": [
+        {
+          "description": "Install deps",
+          "invocation": "lex pkg install"
+        },
+        {
+          "description": "Install, verifying each registry dep's signed contract against pinned publishers",
+          "invocation": "lex pkg install --trusted-keys keyring.json --require-contracts"
+        },
+        {
+          "description": "Add a path dep",
+          "invocation": "lex pkg add mylib --path ../mylib"
+        },
+        {
+          "description": "Publish with a contract whose grant is derived from the code's effects",
+          "invocation": "lex pkg publish --sign <key> --derive-grant --contract-out c.json --archive-out pkg.tar"
+        },
+        {
+          "description": "Verify a package against its contract",
+          "invocation": "lex pkg verify --archive pkg.tar --contract c.json --trusted-keys keyring.json"
+        }
+      ],
+      "see_also": [
+        "init",
+        "ci",
+        "keygen"
+      ]
+    },
+    {
+      "name": "fmt",
+      "description": "format .lex files; --check exits 1 if any need it",
+      "arguments": [
+        {
+          "name": "path",
+          "type": "string[]",
+          "description": "files or directories to format",
+          "required": true
+        }
+      ],
+      "options": [
+        {
+          "name": "--check",
+          "type": "bool",
+          "description": "don't write; exit 1 if any file is unformatted"
+        }
+      ],
+      "subcommands": [],
+      "idempotent": false,
+      "examples": [
+        {
+          "description": "Format src",
+          "invocation": "lex fmt src/"
+        },
+        {
+          "description": "Verify in CI",
+          "invocation": "lex fmt --check src/"
+        }
+      ],
+      "see_also": [
+        "check",
+        "ci"
+      ]
+    },
+    {
+      "name": "ci",
+      "description": "run the full pipeline: pkg install, check --strict, fmt --check, test",
+      "arguments": [],
+      "options": [
+        {
+          "name": "--no-fmt",
+          "type": "bool",
+          "description": "skip the fmt --check stage"
+        }
+      ],
+      "subcommands": [],
+      "idempotent": false,
+      "examples": [
+        {
+          "description": "Run the gate",
+          "invocation": "lex ci"
+        }
+      ],
+      "see_also": [
+        "check",
+        "fmt",
+        "test"
+      ]
+    },
+    {
+      "name": "test",
+      "description": "run tests/test_*.lex files (calls run_all in each)",
+      "arguments": [
+        {
+          "name": "dir",
+          "type": "string",
+          "description": "test directory (default: tests/)",
+          "required": false
+        }
+      ],
+      "options": [],
+      "subcommands": [],
+      "idempotent": true,
+      "examples": [
+        {
+          "description": "Run tests",
+          "invocation": "lex test"
+        }
+      ],
+      "see_also": [
+        "check",
+        "ci"
+      ]
+    },
+    {
+      "name": "keygen",
+      "description": "print a fresh Ed25519 keypair (hex) for signing stages",
+      "arguments": [],
+      "options": [],
+      "subcommands": [],
+      "idempotent": false,
+      "examples": [
+        {
+          "description": "Generate a key",
+          "invocation": "lex keygen"
+        }
+      ],
+      "see_also": [
+        "publish",
+        "store"
+      ]
+    },
+    {
+      "name": "canonical",
+      "description": "encode/decode the canonical wire form of an AST",
+      "arguments": [
+        {
+          "name": "subcommand",
+          "type": "enum[encode|decode]",
+          "description": "direction",
+          "required": true
+        }
+      ],
+      "options": [],
+      "subcommands": [],
+      "idempotent": true,
+      "examples": [
+        {
+          "description": "Encode",
+          "invocation": "lex canonical encode a.lex"
+        },
+        {
+          "description": "Decode",
+          "invocation": "lex canonical decode a.canon"
+        }
+      ],
+      "see_also": [
+        "parse",
+        "hash"
+      ]
+    },
+    {
+      "name": "docs",
+      "description": "emit machine-readable API/workspace docs",
+      "arguments": [
+        {
+          "name": "path",
+          "type": "string[]",
+          "description": "source files/dirs (omit with --for-agent)",
+          "required": false
+        }
+      ],
+      "options": [
+        {
+          "name": "--for-agent",
+          "type": "bool",
+          "description": "emit one JSON object describing the whole workspace"
+        }
+      ],
+      "subcommands": [],
+      "idempotent": true,
+      "examples": [
+        {
+          "description": "Workspace docs",
+          "invocation": "lex docs --for-agent"
+        },
+        {
+          "description": "Per-file",
+          "invocation": "lex docs src/"
+        }
+      ],
+      "see_also": [
+        "skill",
+        "introspect"
+      ]
+    },
+    {
+      "name": "op",
+      "description": "inspect and sync the operation log (show|log|push|pull|repack|gc)",
+      "arguments": [
+        {
+          "name": "subcommand",
+          "type": "enum[show|log|push|pull|repack|gc]",
+          "description": "what to do",
+          "required": true
+        }
+      ],
+      "options": [],
+      "subcommands": [],
+      "idempotent": false,
+      "examples": [
+        {
+          "description": "List ops",
+          "invocation": "lex op log"
+        },
+        {
+          "description": "Garbage-collect",
+          "invocation": "lex op gc --confirm"
+        }
+      ],
+      "see_also": [
+        "log",
+        "store"
+      ]
+    },
+    {
+      "name": "plan",
+      "description": "list repair-candidate paths for a goal, cheapest-first, within budget",
+      "arguments": [],
+      "options": [],
+      "subcommands": [],
+      "idempotent": true,
+      "examples": [
+        {
+          "description": "Plan repairs",
+          "invocation": "lex plan <goal>"
+        }
+      ],
+      "see_also": [
+        "repair",
+        "check"
+      ]
+    },
+    {
+      "name": "repair",
+      "description": "apply a typed repair transform to a failed op; emits a RepairAttempt",
+      "arguments": [
+        {
+          "name": "op_id",
+          "type": "string",
+          "description": "the failed operation to repair",
+          "required": true
+        }
+      ],
+      "options": [
+        {
+          "name": "--apply",
+          "type": "bool",
+          "description": "execute the transform (vs. preview)"
+        },
+        {
+          "name": "--transform",
+          "type": "string",
+          "description": "the typed transform as JSON"
+        }
+      ],
+      "subcommands": [],
+      "idempotent": false,
+      "examples": [
+        {
+          "description": "Apply a transform",
+          "invocation": "lex repair <op_id> --apply --transform '<json>'"
+        }
+      ],
+      "see_also": [
+        "plan",
+        "check"
+      ]
+    },
+    {
+      "name": "policy",
+      "description": "manage store policy.json (producer blocks + required attestations)",
+      "arguments": [
+        {
+          "name": "subcommand",
+          "type": "enum[block-producer|unblock-producer|require-attestation|unrequire-attestation|show]",
+          "description": "what to do",
+          "required": true
+        }
+      ],
+      "options": [],
+      "subcommands": [],
+      "idempotent": false,
+      "examples": [
+        {
+          "description": "Show policy",
+          "invocation": "lex policy show"
+        }
+      ],
+      "see_also": [
+        "attest",
+        "producer-trust"
+      ]
+    },
+    {
+      "name": "producer-trust",
+      "description": "recompute per-tool trust from attestation history, or export a trusted-keys keyring above a score threshold",
+      "arguments": [
+        {
+          "name": "subcommand",
+          "type": "enum[recompute|keyring]",
+          "description": "what to do",
+          "required": true
+        }
+      ],
+      "options": [],
+      "subcommands": [],
+      "idempotent": false,
+      "examples": [
+        {
+          "description": "Recompute a tool's trust",
+          "invocation": "lex producer-trust recompute --tool <id>"
+        },
+        {
+          "description": "Export a capsule keyring",
+          "invocation": "lex producer-trust keyring --min-trust 700 --out trusted.json"
+        }
+      ],
+      "see_also": [
+        "policy",
+        "attest"
       ]
     }
   ]
