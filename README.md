@@ -1,13 +1,10 @@
 # lex-lang
 
-[![CI](https://github.com/alpibrusl/lex-lang/actions/workflows/ci.yml/badge.svg)](https://github.com/alpibrusl/lex-lang/actions/workflows/ci.yml)
-
 **Part of the [Lex](https://lexlang.org) project** — Substrate · [Manifesto](https://lexlang.org/manifesto) · [All packages](https://lexlang.org)
 
 [![CI](https://github.com/alpibrusl/lex-lang/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/alpibrusl/lex-lang/actions/workflows/ci.yml)
 [![fuzz](https://github.com/alpibrusl/lex-lang/actions/workflows/fuzz.yml/badge.svg?branch=main)](https://github.com/alpibrusl/lex-lang/actions/workflows/fuzz.yml)
 [![License: EUPL-1.2](https://img.shields.io/badge/license-EUPL--1.2-blue.svg)](LICENSE)
-[![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](#building-from-source)
 
 **The contract layer agents emit into.** Lex is a typed-effect language built for the case where an LLM, not a human, is the primary author. Every function declares its effects; the type checker rejects any body that lies about what it touches, *before a byte runs*. The content-addressed AST and append-only operation log survive the next ten model upgrades.
 
@@ -90,28 +87,22 @@ lex pkg publish --token $LEX_PUBLISH_TOKEN   # registry = "..." in lex.toml
 | [`inbox_app.lex`](examples/inbox_app.lex) | Webhook router — adding a network call to the spam handler is a type error |
 | [`agent_dispatcher.lex`](examples/agent_dispatcher.lex) | `[proc]` effect with binary allow-list; typed argv |
 
-## Packages
+## Using packages
 
-Packages published to [LexHub](https://hub.lexlang.org) — the canonical Lex package registry. Add them to `lex.toml` and run `lex pkg install`.
-
-| Package | Version | What it is |
-|---|---|---|
-| [**lex-schema**](https://github.com/alpibrusl/lex-schema) | 0.9.2 | Pydantic-style runtime validation, codegen, and schema utilities. `required_str`, `optional_*`, `ModelSchema`, JSON validation. |
+Packages live on [LexHub](https://hub.lexlang.org), the canonical Lex registry — which is also where current version numbers live, so this README doesn't pin any.
 
 ```toml
-# lex.toml
+# lex.toml — check the registry for the version you want
 [dependencies]
-lex-schema = { registry = "https://hub.lexlang.org", version = "0.9.2" }
+lex-schema = { registry = "https://hub.lexlang.org", version = "…" }
 ```
-
-**Publishing your own package:**
 
 ```sh
-# lex.toml must have [package] name, version, and registry fields.
-lex pkg publish --token $LEX_PUBLISH_TOKEN
+lex pkg install                              # resolve and cache dependencies
+lex pkg publish --token $LEX_PUBLISH_TOKEN   # publish your own
 ```
 
-Tokens are issued by the LexHub operator. See [`lex-hub`](https://github.com/alpibrusl/lex-hub) for self-hosting.
+Publishing requires `[package]` name, version and registry fields in `lex.toml`. Tokens are issued by the LexHub operator.
 
 ## Supply-chain provenance
 
@@ -146,17 +137,17 @@ lex producer-trust keyring --min-trust 700 --out keyring.json   # earned trusted
 
 ## Ecosystem
 
-Tooling and runtime libraries that extend the Lex platform:
+Libraries and tooling built on Lex. [lexlang.org](https://lexlang.org) carries the full list; these are the ones most people want first.
 
 | Package | What it is |
 |---|---|
-| [**lex-hub**](https://github.com/alpibrusl/lex-hub) | Multi-tenant SaaS gateway — JWT auth, per-tenant stores, package registry host |
+| [**lex-schema**](https://github.com/alpibrusl/lex-schema) | Pydantic-style runtime validation, codegen and schema utilities |
+| [**lex-frame**](https://github.com/alpibrusl/lex-frame) | Column-oriented dataframes — immutable, `Result`-typed errors, provenance trail |
 | [**lex-agent**](https://github.com/alpibrusl/lex-agent) | Google Agent2Agent (A2A) protocol — AgentCard, JSON-RPC 2.0, SSE streaming |
 | [**lex-llm**](https://github.com/alpibrusl/lex-llm) | LLM-agent runtime — Anthropic / OpenAI / Google / Ollama, multi-step tool-call loop |
 | [**lex-spec**](https://github.com/alpibrusl/lex-spec) | Capability-precondition DSL — randomized property check + SMT-LIB export |
 | [**lex-trail**](https://github.com/alpibrusl/lex-trail) | Content-addressed event log — tamper-evident attestation chains and task replay |
 | [**lex-web**](https://github.com/alpibrusl/lex-web) | HTTP router — request-id correlation, gzip, structured access logs |
-| [**lex-queue**](https://github.com/alpibrusl/lex-queue) | Redis-backed work queue + pub/sub fan-out |
 | [**lex-code**](https://github.com/alpibrusl/lex-code) | Lex-native coding assistant — build / plan / spec / test / review agents |
 
 ## Install
@@ -176,7 +167,7 @@ docker run -p 4040:4040 -v lex-store:/data ghcr.io/alpibrusl/lex:v0.10.7
 docker run --rm -v "$(pwd):/work" -w /work ghcr.io/alpibrusl/lex:v0.10.7 check src/main.lex
 ```
 
-**From source** — requires Rust 1.80+:
+**From source** — builds on stable Rust (what CI uses):
 
 ```sh
 cargo build --release
@@ -185,21 +176,11 @@ cargo test --workspace
 
 ## Status
 
-The core language, sandbox, VCS, and registry are stable and exercised in CI; the Cranelift JIT is an MVP (see below). Key highlights:
+The core language, sandbox, VCS and registry are stable and exercised in CI. The Cranelift JIT is a phase-1 MVP covering an op subset.
 
-- Effect-typed sandbox — 7/7 adversarial blocks pre-execution
-- Content-addressed AST + typed Operation log (VCS tier-2)
-- Typed transforms: `ReplaceMatchArm`, `RenameLocal`, `InlineLet`, `ExtractFunction`
-- Closed repair loop: `lex repair --apply` + `RepairAttempt` attestation
-- JIT tier-up — Cranelift native compilation (phase-1 MVP, op subset), 84–194× on hot arithmetic paths
-- Trust lattice — effect-narrowing as subtyping + per-host net egress allowlist
-- Package registry — `lex pkg publish` + `GET /v1/pkg/{name}/{version}/archive`
-- `std.conc` actors, `std.sql` (SQLite + Postgres), `std.crypto`, `std.redis`, `std.http`
-- Multi-agent `Candidate / Promote` + per-session budget gate
-- `lex-lsp` language server (LSP — VS Code, Cursor, Zed, JetBrains, …), `lex-tea` web UI, MCP server (`lex serve --mcp`), ACLI compliance
-- Spec checker (randomized + SMT-LIB export), fuzz CI, conformance harness
+Deferred: `flow.parallel_record` (needs row polymorphism), VCS tier-3 federation, JIT slice 5, in-process Z3, store-native imports.
 
-Deferred: `flow.parallel_record` (needs row polymorphism), VCS tier-3 federation, JIT slice 5, in-process Z3, store-native imports. Full table: [`docs/STATUS.md`](docs/STATUS.md).
+**[`docs/STATUS.md`](docs/STATUS.md) is the capability table** — what's production-ready, what's partial, what's deferred. It is the one place that list is maintained.
 
 ## Docs
 

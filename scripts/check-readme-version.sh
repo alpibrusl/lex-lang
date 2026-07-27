@@ -31,4 +31,20 @@ else
   echo
   echo "Fix: update the install snippets in README.md to v$want."
 fi
+
+# No hardcoded dependency pins. A downstream package's version belongs on the
+# registry, which is the only place that can't go stale — a number copied into
+# this README drifts the moment that package releases, and nothing here can
+# detect it. The `lex` install snippets above are the exception: they're
+# checked against Cargo.toml, so they're allowed to carry a version.
+pins="$(grep -nE 'version[[:space:]]*=[[:space:]]*"[0-9]+\.[0-9]+' README.md || true)"
+if [ -n "$pins" ]; then
+  echo
+  echo "README.md pins a dependency version:"
+  echo "$pins"
+  echo
+  echo "Fix: drop the number and point at https://hub.lexlang.org instead."
+  status=1
+fi
+
 exit "$status"
