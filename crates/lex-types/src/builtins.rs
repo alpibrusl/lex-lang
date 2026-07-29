@@ -1153,6 +1153,12 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             fields.insert("drop_col".into(), Ty::function(
                 vec![table.clone(), str_t.clone()],
                 no_eff.clone(), res(table.clone())));
+            // arrow.rename_col :: Table, Str, Str -> Result[Table, Str]
+            // Schema-only rename (old name, new name); zero-copy — the
+            // underlying column arrays are untouched.
+            fields.insert("rename_col".into(), Ty::function(
+                vec![table.clone(), str_t.clone(), str_t.clone()],
+                no_eff.clone(), res(table.clone())));
 
             // -- I/O (effect-gated) --
             // arrow.read_csv :: Str -> [fs_read] Result[Table, Str]
@@ -1270,6 +1276,13 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                     vec![table.clone(), table.clone(), str_t.clone()],
                     no_eff.clone(), res(table.clone())));
             }
+            // df.cross_join :: Table, Table -> Result[Table, Str]
+            // Cartesian product; no join key. Clashing column names get
+            // Polars' default `_right` suffix on the right side, same
+            // as inner_join/left_join.
+            fields.insert("cross_join".into(), Ty::function(
+                vec![table.clone(), table.clone()],
+                no_eff.clone(), res(table.clone())));
 
             Some(Ty::Record(fields))
         }

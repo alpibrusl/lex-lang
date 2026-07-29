@@ -385,3 +385,63 @@ fn df_read_csv_polars_normalises_dtypes_and_keeps_nulls() {
         .unwrap();
     assert_eq!(nrows_of(unwrap_ok(r)), 2, "flag=true rows via the cast Utf8 column");
 }
+
+// ===== #731 (Phase A) — df.cross_join =====
+
+#[test]
+fn df_cross_join_row_count_is_product() {
+    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+
+    let lhs_schema = Schema::new(vec![Field::new("a", DataType::Int64, false)]);
+    let lhs = RecordBatch::try_new(
+        Arc::new(lhs_schema),
+        vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+    ).unwrap();
+    let rhs_schema = Schema::new(vec![Field::new("b", DataType::Int64, false)]);
+    let rhs = RecordBatch::try_new(
+        Arc::new(rhs_schema),
+        vec![Arc::new(Int64Array::from(vec![10, 20]))],
+    ).unwrap();
+
+    let r = lex_runtime::df::dispatch(
+        "cross_join",
+        &[Value::ArrowTable(Arc::new(lhs)), Value::ArrowTable(Arc::new(rhs))],
+    ).unwrap().unwrap();
+    let out = unwrap_ok(r);
+    if let Value::ArrowTable(t) = out {
+        assert_eq!(t.num_rows(), 6, "3x2 cartesian product");
+        assert_eq!(t.num_columns(), 2, "both source columns kept, no join key to drop");
+    } else {
+        panic!("expected ArrowTable, got {out:?}");
+    }
+}
+
+#[test]
+fn df_cross_join_clashing_column_gets_right_suffix() {
+    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+
+    let schema = Schema::new(vec![Field::new("x", DataType::Int64, false)]);
+    let lhs = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(Int64Array::from(vec![1, 2]))],
+    ).unwrap();
+    let rhs = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![Arc::new(Int64Array::from(vec![9]))],
+    ).unwrap();
+
+    let r = lex_runtime::df::dispatch(
+        "cross_join",
+        &[Value::ArrowTable(Arc::new(lhs)), Value::ArrowTable(Arc::new(rhs))],
+    ).unwrap().unwrap();
+    let out = unwrap_ok(r);
+    if let Value::ArrowTable(t) = out {
+        assert_eq!(t.num_rows(), 2);
+        assert!(t.schema().column_with_name("x").is_some());
+        assert!(t.schema().column_with_name("x_right").is_some(), "clashing right column gets _right suffix");
+    } else {
+        panic!("expected ArrowTable, got {out:?}");
+    }
+}
