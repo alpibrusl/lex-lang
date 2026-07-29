@@ -375,6 +375,32 @@ fn select_cols(args: &[Value]) -> Result<Value, String> {
     Ok(Value::ArrowTable(Arc::new(projected)))
 }
 
+fn rename_col(args: &[Value]) -> Result<Value, String> {
+    let t = expect_table(args.first())?;
+    let old_name = expect_str(args.get(1))?;
+    let new_name = expect_str(args.get(2))?;
+    let (idx, _) = t
+        .schema()
+        .column_with_name(old_name)
+        .ok_or_else(|| format!("rename_col: column `{old_name}` not found"))?;
+    let fields: Vec<Field> = t
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            if i == idx {
+                Field::new(new_name, f.data_type().clone(), f.is_nullable())
+            } else {
+                f.as_ref().clone()
+            }
+        })
+        .collect();
+    let renamed = RecordBatch::try_new(Arc::new(Schema::new(fields)), t.columns().to_vec())
+        .map_err(|e| format!("rename_col: {e}"))?;
+    Ok(Value::ArrowTable(Arc::new(renamed)))
+}
+
 fn drop_col(args: &[Value]) -> Result<Value, String> {
     let t = expect_table(args.first())?;
     let drop_name = expect_str(args.get(1))?;
@@ -622,6 +648,7 @@ pub fn dispatch(op: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "col_count" => lift_result(col_count(args)),
         "select_cols" => lift_result(select_cols(args)),
         "drop_col" => lift_result(drop_col(args)),
+        "rename_col" => lift_result(rename_col(args)),
         // -- bare-return introspection / slicing --
         "nrows" => nrows(args),
         "ncols" => ncols(args),

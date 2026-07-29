@@ -7,6 +7,23 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added
+
+- **`arrow.rename_col :: (Table, Str, Str) -> Result[Table, Str]`** —
+  schema-only column rename, zero-copy (the underlying column arrays
+  are untouched). Unknown source column is `Err`, not a panic.
+- **`df.cross_join :: (Table, Table) -> Result[Table, Str]`** —
+  Cartesian product of two tables, no join key. Clashing column
+  names get Polars' default `_right` suffix on the right side, same
+  as `inner_join`/`left_join`. Requires the `df` feature (default
+  for the `lex` toolchain); added the `polars` crate's `cross_join`
+  feature flag to enable it.
+
+  Both close two of the `FRAME_LEGACY_ONLY` gaps tracked in
+  alpibrusl/lex-frame#23 / alpibrusl/lex-lang#731 — neither needs
+  the still-missing arrow→`List[Value]` materializer, since renaming
+  is metadata-only and cross join has no predicate to evaluate.
+
 ## [0.10.8] — 2026-07-27
 
 ### Changed

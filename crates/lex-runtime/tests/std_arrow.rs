@@ -150,6 +150,53 @@ fn drop_unknown_is_err() -> Bool {
   }
 }
 
+# rename_col: names update, data (sum) is untouched, unknown source is Err.
+fn rename_then_sum() -> Int {
+  match build() {
+    Ok(t) => match arrow.rename_col(t, "x", "renamed") {
+      Ok(t2) => match arrow.col_sum_int(t2, "renamed") {
+        Ok(s) => s,
+        Err(_) => -1,
+      },
+      Err(_) => -2,
+    },
+    Err(_) => -3,
+  }
+}
+
+fn rename_keeps_ncols() -> Int {
+  match build() {
+    Ok(t) => match arrow.rename_col(t, "x", "renamed") {
+      Ok(t2) => arrow.ncols(t2),
+      Err(_) => -1,
+    },
+    Err(_) => -2,
+  }
+}
+
+fn rename_old_name_gone() -> Bool {
+  match build() {
+    Ok(t) => match arrow.rename_col(t, "x", "renamed") {
+      Ok(t2) => match arrow.col_sum_int(t2, "x") {
+        Ok(_) => false,
+        Err(_) => true,
+      },
+      Err(_) => false,
+    },
+    Err(_) => false,
+  }
+}
+
+fn rename_unknown_is_err() -> Bool {
+  match build() {
+    Ok(t) => match arrow.rename_col(t, "no_such", "y2") {
+      Ok(_) => false,
+      Err(_) => true,
+    },
+    Err(_) => false,
+  }
+}
+
 # Length-mismatch: x has 4 rows, z has 3.
 fn build_mismatch() -> Result[Table, Str] {
   let xs := list.cons(1, list.cons(2, list.cons(3, list.cons(4, []))))
@@ -184,6 +231,14 @@ fn arrow_slicing_and_projection() {
     assert_eq!(run(SRC_INT, "head_nrows", vec![]), Value::Int(2));
     assert_eq!(run(SRC_INT, "select_one_ncols", vec![]), Value::Int(1));
     assert_eq!(run(SRC_INT, "drop_unknown_is_err", vec![]), Value::Bool(true));
+}
+
+#[test]
+fn arrow_rename_col() {
+    assert_eq!(run(SRC_INT, "rename_then_sum", vec![]), Value::Int(100));
+    assert_eq!(run(SRC_INT, "rename_keeps_ncols", vec![]), Value::Int(2));
+    assert_eq!(run(SRC_INT, "rename_old_name_gone", vec![]), Value::Bool(true));
+    assert_eq!(run(SRC_INT, "rename_unknown_is_err", vec![]), Value::Bool(true));
 }
 
 #[test]

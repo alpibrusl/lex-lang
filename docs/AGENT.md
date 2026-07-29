@@ -327,6 +327,8 @@ Slicing (all zero-copy via `RecordBatch::slice` / `project`):
 - `slice :: (Table, Int, Int) -> Table`
 - `select_cols :: (Table, List[Str]) -> Result[Table, Str]`
 - `drop_col   :: (Table, Str) -> Result[Table, Str]`
+- `rename_col :: (Table, Str, Str) -> Result[Table, Str]` (old name, new
+  name) — schema-only rename, zero-copy
 
 I/O (effect-gated):
 - `read_csv :: Str -> [fs_read] Result[Table, Str]` — header row required;
@@ -353,6 +355,9 @@ Group + aggregate (one call):
 
 Joins:
 - `inner_join`, `left_join :: (Table, Table, Str) -> Result[Table, Str]`
+- `cross_join :: (Table, Table) -> Result[Table, Str]` — Cartesian
+  product, no join key; clashing column names get Polars' default
+  `_right` suffix on the right side
 
 ---
 

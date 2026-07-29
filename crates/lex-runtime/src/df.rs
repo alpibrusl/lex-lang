@@ -492,6 +492,18 @@ fn left_join(args: &[Value]) -> Result<Value, String> {
     pack(out)
 }
 
+fn cross_join(args: &[Value]) -> Result<Value, String> {
+    let lhs = expect_table(args.first())?;
+    let rhs = expect_table(args.get(1))?;
+    let l = to_polars(lhs)?;
+    let r = to_polars(rhs)?;
+    let out = l.lazy()
+        .cross_join(r.lazy(), None)
+        .collect()
+        .map_err(|e| format!("df.cross_join: {e}"))?;
+    pack(out)
+}
+
 // ---------- I/O: the Polars-backed CSV reader behind arrow.read_csv ----------
 
 /// Read a CSV through Polars' parallel reader and hand back the usual
@@ -586,6 +598,7 @@ pub fn dispatch(op: &str, args: &[Value]) -> Option<Result<Value, String>> {
         "group_by_agg"    => lift_result(group_by_agg(args)),
         "inner_join"      => lift_result(inner_join(args)),
         "left_join"       => lift_result(left_join(args)),
+        "cross_join"      => lift_result(cross_join(args)),
         _ => return None,
     })
 }
