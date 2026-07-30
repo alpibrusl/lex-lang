@@ -7,6 +7,8 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.10.9] — 2026-07-29
+
 ### Added
 
 - **`arrow.rename_col :: (Table, Str, Str) -> Result[Table, Str]`** —
