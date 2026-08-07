@@ -109,6 +109,7 @@ impl Policy {
             "fs_walk",     // std.fs directory traversal
             "concurrent",  // conc.spawn / conc.ask / conc.tell (#381)
             "crypto",      // std.crypto hashing / signing (#562, #582)
+            "vcs",         // std.vcs content-addressed blob store (lex-loom#198)
         ] {
             s.insert(k.to_string());
         }
