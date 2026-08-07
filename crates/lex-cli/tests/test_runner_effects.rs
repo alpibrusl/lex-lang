@@ -90,6 +90,51 @@ fn permissive_policy_allows_sql_effect_in_test_run() {
     );
 }
 
+fn write_vcs_test(dir: &std::path::Path) {
+    write(
+        dir,
+        "lex.toml",
+        "[package]\nname = \"vcs_repro\"\nversion = \"0.1.0\"\n",
+    );
+    // `vcs.put_blob` carries [vcs, fs_write] in the stdlib signature —
+    // found missing from `Policy::permissive()`'s effect list while
+    // fixing lex-loom#198 (every downstream consumer of `std.vcs`,
+    // e.g. lex-loom's content-addressed artifact mirror, failed this
+    // exact `lex test` gate).
+    write(
+        dir,
+        "tests/test_with_vcs.lex",
+        r#"import "std.vcs" as vcs
+
+fn run_all() -> [vcs, fs_write] Int {
+  match vcs.put_blob("hello from test_runner_effects.rs") {
+    Ok(_hash) => 0,
+    Err(_e) => 1,
+  }
+}
+"#,
+    );
+}
+
+#[test]
+fn permissive_policy_allows_vcs_effect_in_test_run() {
+    // lex-loom#198: a test file that hits `[vcs]` succeeds under the
+    // runner's default permissive policy, same contract as `[sql]`
+    // above (#399) — `vcs` was simply missing from the effect list.
+    let dir = unique_dir("vcs-permissive");
+    write_vcs_test(&dir);
+
+    let (code, stdout, stderr) = run_test_in(&dir, &[]);
+    assert_eq!(
+        code, 0,
+        "expected default permissive `lex test` to allow `[vcs]`.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("1 passed, 0 failed"),
+        "expected `1 passed, 0 failed`, got:\n{stdout}"
+    );
+}
+
 #[test]
 fn explicit_allow_effects_flag_overrides_permissive() {
     // --allow-effects sql,fs_write replaces the permissive default
