@@ -1,0 +1,58 @@
+name: tag
+
+# Create a release tag via the API. Exists because some contributor
+# environments can push branches but not tags (their git proxy blocks
+# refs/tags/* pushes) — this lets a release still be cut end-to-end:
+# merge the release PR, dispatch this workflow with the tag + merge
+# commit SHA, then dispatch release.yml / crates-io.yml with the new
+# tag as the ref.
+#
+# Note: the tag is created with GITHUB_TOKEN, and events from
+# GITHUB_TOKEN do not trigger other workflows — so release.yml does
+# NOT fire automatically from this tag. Dispatch it manually on the
+# tag ref (github.ref_name then resolves to the tag, same as a tag
+# push would).
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to create (e.g. v0.10.10)."
+        required: true
+      sha:
+        description: "Commit SHA the tag points at (e.g. the release PR's merge commit)."
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag }}"
+          SHA="${{ github.event.inputs.sha }}"
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "tag must look like vX.Y.Z, got: $TAG"; exit 1; }
+          [[ "$SHA" =~ ^[0-9a-f]{7,40}$ ]] || { echo "sha must be a hex commit id, got: $SHA"; exit 1; }
+
+      - name: Create tag ref
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const tag = context.payload.inputs.tag;
+            const sha = context.payload.inputs.sha;
+            // Resolve a short SHA to the full one and confirm it exists.
+            const commit = await github.rest.repos.getCommit({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: sha,
+            });
+            await github.rest.git.createRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: `refs/tags/${tag}`,
+              sha: commit.data.sha,
+            });
+            core.notice(`created ${tag} at ${commit.data.sha}`);
