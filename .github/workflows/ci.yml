@@ -25,7 +25,7 @@ jobs:
       # unaffected — env var is CI-scoped.
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       # std.arrow + std.df pull in arrow-rs + Polars, which roughly
       # doubles target/ to ~16 GB in debug. ubuntu-latest ships with
       # ~14 GB free; reclaim the preinstalled stacks we don't use

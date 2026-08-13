@@ -34,7 +34,7 @@ jobs:
   api-docs:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       # The lex-cli dep graph (lex-runtime → arrow-rs/Polars) inflates
       # target/; reclaim runner space the same way ci.yml does so the
       # debug build doesn't exhaust the disk.
