@@ -36,6 +36,47 @@ impl IoSink for CapturedSink {
     fn print_line(&mut self, s: &str) { self.lines.push(s.to_string()); }
 }
 
+/// Host boundary for the `[approval]` effect. `request` blocks until an
+/// operator answers — `Ok(answer)` on approve, `Err(reason)` on deny or
+/// timeout. Implementations decide what "blocks" means (a stdin prompt,
+/// an HTTP long-poll against a dashboard, ...); the effect handler only
+/// needs the synchronous result.
+pub trait ApprovalSink: Send {
+    fn request(&self, scope: &str, reason: &str) -> Result<String, String>;
+}
+
+/// Default sink: `approval.request` is granted by the type/effect
+/// system but there's no operator to ask, so every call is refused.
+/// Embedders that want the effect to actually work must call
+/// `with_approval_sink` — an unconfigured sink silently no-op'ing as
+/// "approved" would defeat the point of the effect.
+pub struct NullApprovalSink;
+impl ApprovalSink for NullApprovalSink {
+    fn request(&self, _scope: &str, _reason: &str) -> Result<String, String> {
+        Err("no ApprovalSink configured — call DefaultHandler::with_approval_sink".into())
+    }
+}
+
+/// Interactive sink for `lex run`: prints the reason to stdout, blocks
+/// on a stdin line. Empty input or a leading `n`/`N` denies; anything
+/// else is the approved answer text.
+pub struct StdinApprovalSink;
+impl ApprovalSink for StdinApprovalSink {
+    fn request(&self, scope: &str, reason: &str) -> Result<String, String> {
+        use std::io::Write;
+        print!("[approval:{scope}] {reason}  (blank/n to deny) > ");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).map_err(|e| e.to_string())?;
+        let answer = line.trim();
+        if answer.is_empty() || answer.eq_ignore_ascii_case("n") || answer.eq_ignore_ascii_case("no") {
+            Err("denied by operator".into())
+        } else {
+            Ok(answer.to_string())
+        }
+    }
+}
+
 /// `agent.cloud_stream` registry: per-handle producer iterators
 /// keyed by opaque handle id (#305 slice 3).
 pub type StreamRegistry =
@@ -102,6 +143,10 @@ pub struct DefaultHandler {
     /// Arguments passed after `--` in `lex run <file> -- [args...]`.
     /// Returned by `io.argv()` so Lex `main` functions can read CLI flags.
     pub program_args: Vec<String>,
+    /// Host boundary for `approval.request`. Defaults to
+    /// `NullApprovalSink` (always refuses) so a handler must opt in
+    /// via `with_approval_sink` before `[approval]` calls can succeed.
+    pub approval_sink: Box<dyn ApprovalSink>,
 }
 
 impl DefaultHandler {
@@ -125,7 +170,12 @@ impl DefaultHandler {
             arena_stack: Vec::new(),
             next_scope_id: 1,
             program_args: Vec::new(),
+            approval_sink: Box::new(NullApprovalSink),
         }
+    }
+
+    pub fn with_approval_sink(mut self, sink: Box<dyn ApprovalSink>) -> Self {
+        self.approval_sink = sink; self
     }
 
     /// Read-only access to the currently-active request arena, if
@@ -442,6 +492,32 @@ impl DefaultHandler {
         }
     }
 
+    /// `approval.request(scope, reason)` — scope allow-list mirrors
+    /// `process.spawn`'s `--allow-proc` basename check above: empty
+    /// `allow_approval` is a wildcard, non-empty requires an exact
+    /// match. On a match, blocks on `self.approval_sink`.
+    fn dispatch_approval(&mut self, op: &str, args: Vec<Value>) -> Result<Value, String> {
+        match op {
+            "request" => {
+                let scope = expect_str(args.first())?.to_string();
+                let reason = expect_str(args.get(1))?.to_string();
+                if !self.policy.allow_approval.is_empty()
+                    && !self.policy.allow_approval.iter().any(|a| a == &scope)
+                {
+                    return Ok(err(Value::Str(format!(
+                        "approval.request: scope `{scope}` not in --allow-approval {:?}",
+                        self.policy.allow_approval
+                    ).into())));
+                }
+                match self.approval_sink.request(&scope, &reason) {
+                    Ok(answer) => Ok(ok(Value::Str(answer.into()))),
+                    Err(reason) => Ok(err(Value::Str(reason.into()))),
+                }
+            }
+            other => Err(format!("unsupported approval.{other}")),
+        }
+    }
+
     fn dispatch_fs(&mut self, op: &str, args: Vec<Value>) -> Result<Value, String> {
         match op {
             "exists" => {
@@ -728,6 +804,10 @@ impl EffectHandler for DefaultHandler {
         if kind == "process" {
             self.ensure_kind_allowed("proc")?;
             return self.dispatch_process(op, args);
+        }
+        if kind == "approval" {
+            self.ensure_kind_allowed("approval")?;
+            return self.dispatch_approval(op, args);
         }
         if kind == "log" {
             // Emit ops are [log]; config ops are [io] (set_sink also

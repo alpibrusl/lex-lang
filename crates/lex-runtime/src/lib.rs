@@ -28,5 +28,8 @@ pub mod mcp_client;
 pub mod llm;
 
 pub use builtins::{call_pure_builtin, is_pure_call, is_pure_module, try_pure_builtin};
-pub use handler::{CapturedSink, DefaultHandler, IoSink, StdoutSink};
+pub use handler::{
+    ApprovalSink, CapturedSink, DefaultHandler, IoSink, NullApprovalSink, StdinApprovalSink,
+    StdoutSink,
+};
 pub use policy::{check_program, Policy, PolicyReport, PolicyViolation};

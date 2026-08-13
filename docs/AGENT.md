@@ -88,6 +88,7 @@ active `Policy`. Effect kinds that exist:
 | `random` | `random` | `crypto.random` |
 | `llm` | `complete` | LLM inference |
 | `budget` | (N) | annotated cost; checked against `--budget` |
+| `approval` | `request` | `std.approval.request(scope, reason)` blocks on an operator answer; scope checked against `--allow-approval` |
 
 Pure functions (no effect annotations) can run under `Policy::pure()`.
 

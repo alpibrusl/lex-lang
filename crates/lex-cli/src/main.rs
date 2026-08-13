@@ -307,6 +307,7 @@ fn print_usage() {
     println!("  --allow-effects k1,k2,...   permit these effect kinds");
     println!("  --allow-fs-read PATH        (repeatable) permit fs_read under PATH");
     println!("  --allow-fs-write PATH       (repeatable) permit fs_write under PATH");
+    println!("  --allow-approval SCOPE,...  comma-separated scopes [approval] may request");
     println!("  --budget N                  cap aggregate declared budget");
     println!("  --max-steps N               cap VM opcode dispatches at N (DoS guard; 0 = unbounded)");
 }
@@ -686,6 +687,7 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                 "allow_fs_read": policy.allow_fs_read.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
                 "allow_fs_write": policy.allow_fs_write.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
                 "allow_net_host": &policy.allow_net_host,
+                "allow_approval": &policy.allow_approval,
                 "budget": policy.budget,
             },
             "trace": f.trace,
@@ -1013,6 +1015,18 @@ fn parse_run_flags(args: &[String]) -> Result<RunFlags> {
                     .ok_or_else(|| anyhow!("--allow-proc needs a value"))?;
                 for name in val.split(',').filter(|s| !s.is_empty()) {
                     f.policy.allow_proc.push(name.to_string());
+                }
+                i += 2;
+            }
+            "--allow-approval" => {
+                // Comma-separated scopes the [approval] effect may
+                // request (e.g. "payment,deploy"). Empty --allow-effects
+                // approval + no --allow-approval = any scope (wildcard).
+                let val = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("--allow-approval needs a value"))?;
+                for scope in val.split(',').filter(|s| !s.is_empty()) {
+                    f.policy.allow_approval.push(scope.to_string());
                 }
                 i += 2;
             }
