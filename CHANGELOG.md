@@ -7,6 +7,45 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.10.10] — 2026-08-13
+
+### Added
+
+- **`[approval]` effect — human-in-the-loop host boundary** (#737).
+  `std.approval.request(scope :: Str, reason :: Str) -> [approval]
+  Result[Str, Str]` blocks on an operator decision before a risky
+  action proceeds: `Ok(answer)` on approve, `Err(reason)` on deny.
+  Gated like `net`/`proc`: bare `[approval]` in the declared type,
+  with the `scope` argument checked at call time against the new
+  `--allow-approval SCOPE,...` policy list (empty = wildcard, same
+  convention as `--allow-proc`). The blocking mechanism is pluggable
+  via a new `ApprovalSink` trait on `DefaultHandler`
+  (`with_approval_sink`); the default `NullApprovalSink` refuses
+  every request so the effect can't silently no-op as "approved"
+  without an operator wired in, and `StdinApprovalSink` covers
+  interactive `lex run` use. Inspired by etas-project/etas, where
+  approvals are first-class host boundaries; downstream, lex-llm#42
+  builds approval-gated agent tools on this.
+
+### Fixed
+
+- **JIT step-counter accounting — closes the `--max-steps` bypass**
+  (#710, #465). JITed native code now accounts loop iterations
+  (backward jumps, self-recursive tail calls) against the VM's step
+  counter and aborts cleanly at `step_limit` with the same
+  `step limit exceeded` error shape as the interpreter (tagged
+  `[JIT]`). `--jit` and `--max-steps` compose without bypass on
+  either path; the interim CLI bail and stderr warning from
+  #608/#609/#707 are removed. `JitHook::try_call` and
+  `JittedFn::call` grow step-counter/limit parameters (breaking for
+  external `JitHook` implementors).
+
+### Changed
+
+- Dependency bumps: sha3 0.11 → 0.12 (#664), getrandom 0.4.2 →
+  0.4.3 (#665), postgres 0.19.13 → 0.19.14 (#666), redis 1.2.2 →
+  1.2.4 (#668), actions/checkout 6 → 7 in CI (#663).
+
 ## [0.10.9] — 2026-07-29
 
 ### Added
