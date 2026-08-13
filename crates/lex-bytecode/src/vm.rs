@@ -1521,9 +1521,13 @@ impl<'a> Vm<'a> {
         // #465 JIT tier hook at the public entry — same contract as
         // the `Op::Call` dispatch arm. Pure-fn memo is not consulted
         // at this layer (memo is per-Op::Call); the hook fires
-        // unconditionally for refinement-clean calls.
+        // unconditionally for refinement-clean calls. Pass the step
+        // counter + limit so JITed loops can account against the
+        // VM's DoS guard (architectural fix; see jit_hook.rs).
         if let Some(mut hook) = self.jit_hook.take() {
-            let hook_result = hook.try_call(fn_id, &args);
+            let step_ptr = &mut self.steps as *mut u64;
+            let limit = self.step_limit;
+            let hook_result = hook.try_call(fn_id, &args, step_ptr, limit);
             self.jit_hook = Some(hook);
             if let Some(result) = hook_result? {
                 return Ok(result);
@@ -2472,7 +2476,9 @@ impl<'a> Vm<'a> {
                     // we hold `&mut hook`. Cheaper than cloning the
                     // args; the take/put is two pointer writes.
                     if let Some(mut hook) = self.jit_hook.take() {
-                        let hook_result = hook.try_call(fn_id, &self.stack[args_base..]);
+                        let step_ptr = &mut self.steps as *mut u64;
+                        let limit = self.step_limit;
+                        let hook_result = hook.try_call(fn_id, &self.stack[args_base..], step_ptr, limit);
                         self.jit_hook = Some(hook);
                         match hook_result? {
                             Some(result) => {
@@ -2563,7 +2569,9 @@ impl<'a> Vm<'a> {
                     // bubble the result up the same way Op::Return
                     // does.
                     if let Some(mut hook) = self.jit_hook.take() {
-                        let hook_result = hook.try_call(fn_id, &self.stack[args_base..]);
+                        let step_ptr = &mut self.steps as *mut u64;
+                        let limit = self.step_limit;
+                        let hook_result = hook.try_call(fn_id, &self.stack[args_base..], step_ptr, limit);
                         self.jit_hook = Some(hook);
                         if let Some(result) = hook_result? {
                             self.tracer.exit_call_tail();

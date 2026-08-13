@@ -126,15 +126,19 @@ fn tier_threshold_state_machine() {
 
     // Two warm-up calls below threshold — still Pending.
     let args = vec![Value::Int(1), Value::Int(2)];
+    // The architectural fix added two trailing args: step counter
+    // ptr + limit. The tier respects them on the JIT path; for
+    // this state-machine test we pass infinite-budget storage.
+    let mut steps: u64 = 0;
     for _ in 0..2 {
-        assert_eq!(tier.try_call(0, &args).unwrap(), None);
+        assert_eq!(tier.try_call(0, &args, &mut steps, u64::MAX).unwrap(), None);
     }
     assert_eq!(tier.cache_stats().pending, 1);
     assert_eq!(tier.cache_stats().compiled, 0);
 
     // Third call — threshold reached. The eligible function
     // compiles, and try_call returns Some(7) — the JIT result.
-    let r = tier.try_call(0, &args).unwrap();
+    let r = tier.try_call(0, &args, &mut steps, u64::MAX).unwrap();
     assert_eq!(r, Some(Value::Int(3)));
     assert_eq!(tier.cache_stats().compiled, 1);
     assert_eq!(tier.cache_stats().pending, 0);
@@ -178,8 +182,168 @@ fn ineligible_function_falls_through_to_interp() {
     // built from the same program reaches the same conclusion.
     let mut tier = JitTier::new(&prog).expect("JitTier::new");
     use lex_bytecode::jit_hook::JitHook;
-    let _ = tier.try_call(0, &[Value::Int(5), Value::Int(7)]);
+    let mut steps: u64 = 0;
+    let _ = tier.try_call(0, &[Value::Int(5), Value::Int(7)], &mut steps, u64::MAX);
     assert_eq!(tier.cache_stats().ineligible, 1);
+}
+
+// ---------------------------------------------------------------------------
+// 7. Step-limit accounting in JITed code (#465 architectural fix).
+//    The native back-edge increments the VM's step counter and aborts
+//    cleanly when the limit is reached, surfacing VmError::Panic with
+//    a `[JIT]`-tagged "step limit exceeded" message that matches the
+//    interpreter's wording.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn jit_self_tail_recursion_honors_step_limit() {
+    // sum_to(n, acc) — the canonical tail-recursive shape. With a
+    // tight step budget and a huge `n`, the JIT must abort before
+    // finishing instead of pinning the CPU.
+    let prog = mk_program(
+        vec![mk_fn(
+            "sum_to",
+            2,
+            2,
+            vec![
+                Op::LoadLocal(0),
+                Op::PushConst(0),
+                Op::IntEq,
+                Op::JumpIfNot(2),
+                Op::LoadLocal(1),
+                Op::Return,
+                Op::LoadLocal(0),
+                Op::PushConst(1),
+                Op::IntSub,
+                Op::LoadLocal(1),
+                Op::LoadLocal(0),
+                Op::IntAdd,
+                Op::TailCall { fn_id: 0, arity: 2, node_id_idx: 2 },
+            ],
+        )],
+        vec![
+            Const::Int(0),
+            Const::Int(1),
+            Const::NodeId("sum_to_rec".into()),
+        ],
+    );
+
+    use lex_bytecode::jit_hook::JitHook;
+    let mut tier = JitTier::new(&prog).expect("JitTier::new");
+    let mut steps: u64 = 0;
+    let step_limit: u64 = 100;
+    // Budget 100 iterations; sum_to(1_000_000, 0) needs ~1M.
+    let r = tier
+        .try_call(
+            0,
+            &[Value::Int(1_000_000), Value::Int(0)],
+            &mut steps,
+            step_limit,
+        )
+        .expect_err("expected step-limit abort");
+    let msg = format!("{r:?}");
+    assert!(
+        msg.contains("step limit exceeded") && msg.contains("[JIT]"),
+        "expected JIT-tagged step-limit error, got: {msg}"
+    );
+    assert!(
+        steps >= step_limit,
+        "counter should be >= limit on abort, got {steps} vs limit {step_limit}"
+    );
+}
+
+#[test]
+fn jit_backward_jump_loop_honors_step_limit() {
+    // Iterative `sum_loop` — uses backward `Jump(-N)` rather than
+    // a self-tail-call. Same accounting must apply.
+    let prog = mk_program(
+        vec![mk_fn(
+            "f",
+            1,
+            3,
+            vec![
+                Op::PushConst(0),     // i = 0
+                Op::StoreLocal(1),
+                Op::PushConst(0),     // acc = 0
+                Op::StoreLocal(2),
+                Op::LoadLocal(1),     // loop: i
+                Op::LoadLocal(0),     //       i n
+                Op::IntLt,            //       (i < n)
+                Op::JumpIfNot(9),     //       -> end if false
+                Op::LoadLocal(2),     //       acc
+                Op::LoadLocal(1),     //       acc i
+                Op::IntAdd,           //       acc+i
+                Op::StoreLocal(2),    //       acc =
+                Op::LoadLocal(1),     //       i
+                Op::PushConst(1),     //       i 1
+                Op::IntAdd,           //       i+1
+                Op::StoreLocal(1),    //       i =
+                Op::Jump(-13),        //       -> loop  (backward)
+                Op::LoadLocal(2),     // end: acc
+                Op::Return,
+            ],
+        )],
+        vec![Const::Int(0), Const::Int(1)],
+    );
+
+    use lex_bytecode::jit_hook::JitHook;
+    let mut tier = JitTier::new(&prog).expect("JitTier::new");
+    let mut steps: u64 = 0;
+    let r = tier
+        .try_call(0, &[Value::Int(1_000_000)], &mut steps, 100)
+        .expect_err("expected step-limit abort on backward Jump");
+    let msg = format!("{r:?}");
+    assert!(
+        msg.contains("step limit exceeded") && msg.contains("[JIT]"),
+        "expected JIT-tagged step-limit error, got: {msg}"
+    );
+}
+
+#[test]
+fn jit_completes_when_budget_is_sufficient() {
+    // Sanity for the abort path: with an ample budget, the same
+    // tail-recursive function returns the correct sum (1+...+10 = 55).
+    let prog = mk_program(
+        vec![mk_fn(
+            "sum_to",
+            2,
+            2,
+            vec![
+                Op::LoadLocal(0),
+                Op::PushConst(0),
+                Op::IntEq,
+                Op::JumpIfNot(2),
+                Op::LoadLocal(1),
+                Op::Return,
+                Op::LoadLocal(0),
+                Op::PushConst(1),
+                Op::IntSub,
+                Op::LoadLocal(1),
+                Op::LoadLocal(0),
+                Op::IntAdd,
+                Op::TailCall { fn_id: 0, arity: 2, node_id_idx: 2 },
+            ],
+        )],
+        vec![
+            Const::Int(0),
+            Const::Int(1),
+            Const::NodeId("sum_to_rec".into()),
+        ],
+    );
+    use lex_bytecode::jit_hook::JitHook;
+    let mut tier = JitTier::new(&prog).expect("JitTier::new");
+    let mut steps: u64 = 0;
+    let r = tier
+        .try_call(0, &[Value::Int(10), Value::Int(0)], &mut steps, 1_000)
+        .expect("should not abort")
+        .expect("should compile and run");
+    assert_eq!(r, Value::Int(55));
+    // Counter should reflect the ~10 backward-jump iterations
+    // (the JIT bumps once per loop trip).
+    assert!(
+        (1..=50).contains(&steps),
+        "step counter outside expected range: {steps}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -396,9 +560,11 @@ impl lex_bytecode::jit_hook::JitHook for JitTierShared {
         &mut self,
         fn_id: u32,
         args: &[Value],
+        step_counter_ptr: *mut u64,
+        step_limit: u64,
     ) -> Result<Option<Value>, lex_bytecode::vm::VmError> {
         // SAFETY: see JitTierShared::new.
-        unsafe { (*self.inner).try_call(fn_id, args) }
+        unsafe { (*self.inner).try_call(fn_id, args, step_counter_ptr, step_limit) }
     }
 }
 

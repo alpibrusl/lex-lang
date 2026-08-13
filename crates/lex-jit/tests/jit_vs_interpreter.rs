@@ -58,7 +58,14 @@ fn jit_and_call(program: &Program, args: &[i64]) -> i64 {
     );
     let mut ctx = JitContext::new().expect("JitContext init");
     let jitted = ctx.compile(0, f, &program.constants).expect("JIT compile");
-    unsafe { jitted.call(args) }
+    // Architectural fix: pass per-call step-counter storage with
+    // an effectively-infinite limit so these correctness tests
+    // (which don't care about the cap) never trip it.
+    let mut steps: u64 = 0;
+    let mut aborted: u8 = 0;
+    let r = unsafe { jitted.call(args, &mut steps, u64::MAX, &mut aborted) };
+    assert_eq!(aborted, 0, "unexpected JIT abort with infinite step budget");
+    r
 }
 
 fn assert_jit_matches(program: &Program, inputs: &[Vec<i64>]) {

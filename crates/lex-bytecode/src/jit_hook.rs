@@ -15,6 +15,30 @@
 //! `vm.jit_hook` stays `None` and the hook check is one branch
 //! on a null option (the optimizer should fold it).
 //!
+//! ## Step accounting (#465 architectural fix)
+//!
+//! `try_call` takes a raw pointer to the VM's step counter and
+//! the limit value. JITed code is expected to increment the
+//! counter at every backward jump it emits (loop headers, self-
+//! recursive tail calls) and abort cleanly when the counter
+//! reaches the limit — surfacing a `VmError::Panic("step limit
+//! exceeded")` to the dispatcher.
+//!
+//! Without this contract, JITed native loops bypass the
+//! interpreter's per-op step counter — the
+//! `set_step_limit`-as-DoS-guard story the interpreter
+//! documents would silently not hold under `--jit`. With it,
+//! `--max-steps` is honored on both paths (modulo coarser
+//! granularity in JIT: 1 step per loop iteration vs 1 step per
+//! op for the interpreter; same wall-clock bound to within a
+//! constant factor).
+//!
+//! The pointer is valid for the duration of the call — the
+//! dispatcher passes `&mut self.steps as *mut u64` from the same
+//! `&mut self` borrow it just took to invoke the hook. JITed
+//! code dereferences and mutates it; on return the dispatcher
+//! resumes seeing the updated value.
+//!
 //! ## Contract
 //!
 //! Implementations must be *observationally equivalent* to the
@@ -52,13 +76,29 @@ pub trait JitHook: Send {
     /// of the value stack — `args` is a borrowed view; do not
     /// mutate.
     ///
+    /// `step_counter_ptr` points at the VM's `steps: u64` field;
+    /// `step_limit` is the current cap. JITed code is expected
+    /// to atomically `*step_counter_ptr += 1` at every backward
+    /// jump (loop iteration) and abort if the new value would
+    /// meet or exceed `step_limit`, surfacing
+    /// `VmError::Panic("step limit exceeded")` so the dispatcher
+    /// can propagate the same shape it would have on the
+    /// interpreter path.
+    ///
     /// Return:
     /// - `Ok(Some(v))` — hook handled the call; the dispatcher
     ///   will pop `args.len()` values from the stack, push `v`,
     ///   emit the synthetic `exit_ok` trace event, and continue.
     /// - `Ok(None)` — hook declines; the dispatcher proceeds with
     ///   normal frame setup as if the hook weren't installed.
-    /// - `Err(e)` — JITed code raised an error. The dispatcher
+    /// - `Err(e)` — JITed code raised an error (typically
+    ///   `VmError::Panic("step limit exceeded")`). The dispatcher
     ///   surfaces it as the call's error.
-    fn try_call(&mut self, fn_id: u32, args: &[Value]) -> Result<Option<Value>, VmError>;
+    fn try_call(
+        &mut self,
+        fn_id: u32,
+        args: &[Value],
+        step_counter_ptr: *mut u64,
+        step_limit: u64,
+    ) -> Result<Option<Value>, VmError>;
 }
