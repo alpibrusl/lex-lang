@@ -50,6 +50,14 @@ pub struct Policy {
     /// is the *caller's* responsibility — see SECURITY.md's
     /// "argument injection" note.
     pub allow_proc: Vec<String>,
+    /// Per-scope allowlist on the `[approval]` effect. Empty = any
+    /// scope allowed once `approval` is granted (treat as a global
+    /// human-escalation escape hatch; only acceptable for trusted
+    /// code). Non-empty = `approval.request(scope, reason)` must
+    /// match `scope` against one of these entries — lets an operator
+    /// grant e.g. "payment approvals only" rather than a blanket
+    /// human-in-the-loop channel.
+    pub allow_approval: Vec<String>,
     pub budget: Option<u64>,
 }
 
@@ -79,6 +87,9 @@ impl Policy {
         }
         if self.allow_effects.contains("fs_write") && self.allow_fs_write.is_empty() {
             open.push("fs_write");
+        }
+        if self.allow_effects.contains("approval") && self.allow_approval.is_empty() {
+            open.push("approval");
         }
         open
     }
@@ -110,6 +121,7 @@ impl Policy {
             "concurrent",  // conc.spawn / conc.ask / conc.tell (#381)
             "crypto",      // std.crypto hashing / signing (#562, #582)
             "vcs",         // std.vcs content-addressed blob store (lex-loom#198)
+            "approval",    // std.approval human-in-the-loop host boundary
         ] {
             s.insert(k.to_string());
         }
@@ -119,6 +131,7 @@ impl Policy {
             allow_fs_write: Vec::new(),
             allow_net_host: Vec::new(),
             allow_proc: Vec::new(),
+            allow_approval: Vec::new(),
             budget: None,
         }
     }

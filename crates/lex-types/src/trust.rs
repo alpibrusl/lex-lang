@@ -435,6 +435,8 @@ pub fn effect_requirement(effect_name: &str) -> Option<(Dimension, Level)> {
         //   env, sql, random — bounded local resources
         //   chat, a2a, concurrent — inter-agent messaging, no OS boundary
         //   crypto — hashing/signing, no external access
+        //   approval — the operator decision *is* the safety gate; no
+        //     additional ProducerTrust dimension needed on top of it
         // All are safe under any grant; adding mappings would be over-broad.
         _ => Option::None,
     }

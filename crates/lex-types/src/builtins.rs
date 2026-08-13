@@ -2224,6 +2224,24 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             }
             Some(Ty::Record(fields))
         }
+        "approval" => {
+            // Human-in-the-loop host boundary. `request(scope, reason)`
+            // blocks until an operator answers via the configured
+            // `ApprovalSink` (default: reject — a handler must opt in
+            // with `with_approval_sink`, or `lex run` must be given an
+            // interactive one). `scope` selects the approval channel
+            // ("payment", "deploy", ...) and is checked at call time
+            // against `--allow-approval`, mirroring how `net`'s host
+            // arg is checked against `--allow-net-host` rather than
+            // being encoded in the declared effect type.
+            let mut fields = IndexMap::new();
+            // request :: Str, Str -> [approval] Result[Str, Str]
+            fields.insert("request".into(), Ty::function(
+                vec![Ty::str(), Ty::str()],
+                EffectSet::singleton("approval"),
+                Ty::Con("Result".into(), vec![Ty::str(), Ty::str()])));
+            Some(Ty::Record(fields))
+        }
         "process" => {
             // Streaming subprocess. The opaque `ProcessHandle` type
             // is an Int handle into a process-wide registry holding
@@ -3322,6 +3340,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "sql" => "sql",
         "fs" => "fs",
         "process" => "process",
+        "approval" => "approval",
         "datetime" => "datetime",
         "duration" => "duration",
         "log" => "log",

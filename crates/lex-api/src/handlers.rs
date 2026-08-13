@@ -150,6 +150,7 @@ fn clamp_policy(requested: Policy, ceiling: &Policy) -> Policy {
         allow_fs_write: ceiling.allow_fs_write.clone(),
         allow_net_host: ceiling.allow_net_host.clone(),
         allow_proc: ceiling.allow_proc.clone(),
+        allow_approval: ceiling.allow_approval.clone(),
         budget,
     }
 }
@@ -717,6 +718,7 @@ impl PolicyJson {
             allow_fs_write: self.allow_fs_write.into_iter().map(PathBuf::from).collect(),
             allow_net_host: Vec::new(),
             allow_proc: Vec::new(),
+            allow_approval: Vec::new(),
             budget: self.budget,
         }
     }
@@ -2163,6 +2165,7 @@ mod policy_ceiling_tests {
             allow_fs_write: vec![PathBuf::from("/")],
             allow_net_host: Vec::new(),
             allow_proc: Vec::new(),
+            allow_approval: Vec::new(),
             budget: None,
         }
     }
