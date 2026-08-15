@@ -38,7 +38,7 @@ jobs:
           [[ "$SHA" =~ ^[0-9a-f]{7,40}$ ]] || { echo "sha must be a hex commit id, got: $SHA"; exit 1; }
 
       - name: Create tag ref
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const tag = context.payload.inputs.tag;
