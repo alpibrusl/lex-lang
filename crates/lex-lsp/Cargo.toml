@@ -24,7 +24,7 @@ serde_json.workspace = true
 # request/response shape and avoids pulling tokio into the
 # workspace). `lsp-types` is the protocol-message schema. Both
 # are rust-analyzer-team-maintained.
-lsp-server = "0.7"
+lsp-server = "0.10"
 lsp-types = "0.97"
 lex-syntax = { path = "../lex-syntax", version = "0.10.0" }
 lex-ast = { path = "../lex-ast", version = "0.10.0" }
