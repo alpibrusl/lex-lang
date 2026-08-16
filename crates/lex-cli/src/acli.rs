@@ -128,6 +128,7 @@ fn commands() -> Vec<CommandInfo> {
         cmd_pkg(),
         cmd_fmt(),
         cmd_ci(),
+        cmd_doc_sync(),
         cmd_test(),
         cmd_keygen(),
         cmd_canonical(),
@@ -205,6 +206,31 @@ fn cmd_fmt() -> CommandInfo {
             ("Verify in CI", "lex fmt --check src/"),
         ])
         .with_see_also(vec!["check", "ci"])
+}
+
+fn cmd_doc_sync() -> CommandInfo {
+    CommandInfo::new(
+        "doc-sync",
+        "regenerate (or --check) generated doc regions declared in docsync.toml; drift fails --check naming each stale target",
+    )
+    .idempotent(true)
+    .add_option(
+        "--check",
+        "bool",
+        "verify instead of regenerate; non-zero exit on drift",
+        None,
+    )
+    .add_argument(
+        "manifest",
+        "path",
+        "manifest to use (default: docsync.toml in the current directory)",
+        false,
+    )
+    .with_examples(vec![
+        ("Regenerate all targets", "lex doc-sync"),
+        ("CI drift gate", "lex doc-sync --check"),
+    ])
+    .with_see_also(vec!["docs", "ci"])
 }
 
 fn cmd_ci() -> CommandInfo {
