@@ -25,24 +25,44 @@ use std::path::PathBuf;
 const LEX_DOCS_VERSION: u32 = 1;
 
 pub fn cmd_docs(fmt: &OutputFormat, args: &[String]) -> Result<()> {
-    let sub = args.first().ok_or_else(|| anyhow!(
-        "usage: lex docs <path>...        # API docs for source files/dirs\n\
+    let sub = args.first().ok_or_else(|| {
+        anyhow!(
+            "usage: lex docs <path>...        # API docs for source files/dirs\n\
          usage: lex docs --for-agent [--branch B] [--limit-recent N] [--store DIR]\n\
-         usage: lex docs --rules"))?;
+         usage: lex docs --rules\n\
+         usage: lex docs --effects        # effect-kind table from the runtime's single source"
+        )
+    })?;
+    if sub == "--effects" {
+        // The effect-kind quick reference, rendered from the runtime's
+        // KNOWN_EFFECTS single source. Consumed by docsync.toml to keep
+        // docs/AGENT.md's table current — see `lex doc-sync`.
+        println!("| kind | notes |");
+        println!("|---|---|");
+        for (kind, note) in lex_runtime::policy::KNOWN_EFFECTS {
+            println!("| `{kind}` | {note} |");
+        }
+        return Ok(());
+    }
     if sub == "--rules" {
         // #306 slice 2: enumerate every type-error rule with its
         // explanation. Stable kebab-case `rule_tag`s let LLM repair
         // flows cross-reference rules across runs.
         let rules: Vec<serde_json::Value> = lex_types::all_rules()
             .iter()
-            .map(|r| serde_json::json!({
-                "rule_tag": r.tag,
-                "rule_explanation": r.explanation,
-            }))
+            .map(|r| {
+                serde_json::json!({
+                    "rule_tag": r.tag,
+                    "rule_explanation": r.explanation,
+                })
+            })
             .collect();
         let data = serde_json::json!({ "rules": rules });
         acli::emit_or_text("docs", data, fmt, || {
-            println!("Lex type-error rules ({} total):", lex_types::all_rules().len());
+            println!(
+                "Lex type-error rules ({} total):",
+                lex_types::all_rules().len()
+            );
             for r in lex_types::all_rules() {
                 println!();
                 println!("  {}", r.tag);
@@ -68,24 +88,30 @@ pub fn cmd_docs(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     while let Some(a) = it.next() {
         match a.as_str() {
             "--branch" => {
-                branch = Some(it.next()
-                    .ok_or_else(|| anyhow!("--branch needs a value"))?.clone());
+                branch = Some(
+                    it.next()
+                        .ok_or_else(|| anyhow!("--branch needs a value"))?
+                        .clone(),
+                );
             }
             "--limit-recent" => {
-                limit_recent = it.next()
+                limit_recent = it
+                    .next()
                     .ok_or_else(|| anyhow!("--limit-recent needs N"))?
                     .parse()
                     .map_err(|e| anyhow!("--limit-recent: {e}"))?;
             }
             "--store" => {
-                root = Some(PathBuf::from(it.next()
-                    .ok_or_else(|| anyhow!("--store needs a path"))?));
+                root = Some(PathBuf::from(
+                    it.next().ok_or_else(|| anyhow!("--store needs a path"))?,
+                ));
             }
             other => anyhow::bail!("unexpected arg `{other}`"),
         }
     }
     let root = root.unwrap_or_else(|| {
-        let home = std::env::var("HOME").map(PathBuf::from)
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("."));
         home.join(".lex/store")
     });
@@ -174,11 +200,7 @@ pub struct AttentionItem {
     pub detail: Option<String>,
 }
 
-fn build_envelope(
-    store: &Store,
-    branch: &str,
-    limit_recent: usize,
-) -> Result<DocsEnvelope> {
+fn build_envelope(store: &Store, branch: &str, limit_recent: usize) -> Result<DocsEnvelope> {
     let branches = store.list_branches()?;
     let workspace = Workspace {
         lex_version: env!("CARGO_PKG_VERSION").into(),
@@ -190,9 +212,15 @@ fn build_envelope(
     let head = store.branch_head(branch).unwrap_or_default();
     let mut sigs: Vec<SigInfo> = Vec::with_capacity(head.len());
     for (sig_id, stage_id) in &head {
-        let Ok(ast) = store.get_ast(stage_id) else { continue };
-        let lex_ast::Stage::FnDecl(fd) = ast else { continue };
-        let effects: Vec<String> = fd.effects.iter()
+        let Ok(ast) = store.get_ast(stage_id) else {
+            continue;
+        };
+        let lex_ast::Stage::FnDecl(fd) = ast else {
+            continue;
+        };
+        let effects: Vec<String> = fd
+            .effects
+            .iter()
             .map(|e| match &e.arg {
                 Some(lex_ast::EffectArg::Int { value }) => format!("{}({})", e.name, value),
                 Some(lex_ast::EffectArg::Str { value }) => format!("{}({:?})", e.name, value),
@@ -200,14 +228,18 @@ fn build_envelope(
                 None => e.name.clone(),
             })
             .collect();
-        let budget = fd.effects.iter()
-            .filter_map(|e| if e.name == "budget" {
-                match &e.arg {
-                    Some(lex_ast::EffectArg::Int { value }) => Some(*value as u64),
-                    _ => None,
+        let budget = fd
+            .effects
+            .iter()
+            .filter_map(|e| {
+                if e.name == "budget" {
+                    match &e.arg {
+                        Some(lex_ast::EffectArg::Int { value }) => Some(*value as u64),
+                        _ => None,
+                    }
+                } else {
+                    None
                 }
-            } else {
-                None
             })
             .min();
         sigs.push(SigInfo {
@@ -237,16 +269,14 @@ fn build_envelope(
     })
 }
 
-fn collect_recent_activity(
-    store: &Store,
-    branch: &str,
-    limit: usize,
-) -> Result<Vec<RecentOp>> {
+fn collect_recent_activity(store: &Store, branch: &str, limit: usize) -> Result<Vec<RecentOp>> {
     let head_op = match store.get_branch(branch)? {
         Some(b) => b.head_op,
         None => return Ok(Vec::new()),
     };
-    let Some(head) = head_op else { return Ok(Vec::new()); };
+    let Some(head) = head_op else {
+        return Ok(Vec::new());
+    };
     let log = lex_vcs::OpLog::open(store.root())?;
     // `walk_back(_, Some(0))` still returns one record (the limit
     // check fires after the push). Pass `None` and truncate
@@ -274,46 +304,47 @@ fn collect_recent_activity(
 fn op_kind_tag(k: &lex_vcs::OperationKind) -> &'static str {
     use lex_vcs::OperationKind::*;
     match k {
-        AddFunction { .. }     => "add_function",
-        RemoveFunction { .. }  => "remove_function",
-        ModifyBody { .. }      => "modify_body",
-        RenameSymbol { .. }    => "rename_symbol",
+        AddFunction { .. } => "add_function",
+        RemoveFunction { .. } => "remove_function",
+        ModifyBody { .. } => "modify_body",
+        RenameSymbol { .. } => "rename_symbol",
         ChangeEffectSig { .. } => "change_effect_sig",
-        AddImport { .. }       => "add_import",
-        RemoveImport { .. }    => "remove_import",
-        AddType { .. }         => "add_type",
-        RemoveType { .. }      => "remove_type",
-        ModifyType { .. }      => "modify_type",
-        Merge { .. }           => "merge",
+        AddImport { .. } => "add_import",
+        RemoveImport { .. } => "remove_import",
+        AddType { .. } => "add_type",
+        RemoveType { .. } => "remove_type",
+        ModifyType { .. } => "modify_type",
+        Merge { .. } => "merge",
         ReplaceMatchArm { .. } => "replace_match_arm",
-        RenameLocal { .. }     => "rename_local",
-        InlineLet { .. }       => "inline_let",
-        Candidate { .. }       => "candidate",
-        Promote { .. }         => "promote",
+        RenameLocal { .. } => "rename_local",
+        InlineLet { .. } => "inline_let",
+        Candidate { .. } => "candidate",
+        Promote { .. } => "promote",
     }
 }
 
-fn collect_open_intents(
-    store: &Store,
-    recent: &[RecentOp],
-) -> Result<Vec<OpenIntent>> {
+fn collect_open_intents(store: &Store, recent: &[RecentOp]) -> Result<Vec<OpenIntent>> {
     use std::collections::BTreeMap;
     let log = lex_vcs::IntentLog::open(store.root())?;
     let mut buckets: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for op in recent {
         if let Some(id) = &op.intent_id {
-            buckets.entry(id.clone()).or_default().push(op.op_id.clone());
+            buckets
+                .entry(id.clone())
+                .or_default()
+                .push(op.op_id.clone());
         }
     }
     let mut out: Vec<OpenIntent> = Vec::with_capacity(buckets.len());
     for (intent_id, ops) in buckets {
-        let Some(intent) = log.get(&intent_id)? else { continue };
+        let Some(intent) = log.get(&intent_id)? else {
+            continue;
+        };
         out.push(OpenIntent {
             intent_id,
             prompt: intent.prompt,
             session_id: intent.session_id,
-            model: serde_json::to_value(&intent.model)
-                .unwrap_or(serde_json::Value::Null),
+            model: serde_json::to_value(&intent.model).unwrap_or(serde_json::Value::Null),
             produced_ops: ops,
         });
     }
@@ -359,15 +390,23 @@ fn collect_attention(
 }
 
 fn render_signature(fd: &lex_ast::FnDecl) -> String {
-    let params: Vec<String> = fd.params.iter()
-        .map(|p| format!("{} :: {}", p.name, render_type(&p.ty))).collect();
+    let params: Vec<String> = fd
+        .params
+        .iter()
+        .map(|p| format!("{} :: {}", p.name, render_type(&p.ty)))
+        .collect();
     let effects = if fd.effects.is_empty() {
         String::new()
     } else {
         let s: Vec<String> = fd.effects.iter().map(|e| e.name.clone()).collect();
         format!(" [{}]", s.join(", "))
     };
-    format!("({}) -> {}{}", params.join(", "), render_type(&fd.return_type), effects)
+    format!(
+        "({}) -> {}{}",
+        params.join(", "),
+        render_type(&fd.return_type),
+        effects
+    )
 }
 
 fn render_type(t: &lex_ast::TypeExpr) -> String {
@@ -383,8 +422,10 @@ fn render_type(t: &lex_ast::TypeExpr) -> String {
             format!("({})", inner.join(", "))
         }
         Record { fields } => {
-            let inner: Vec<String> = fields.iter()
-                .map(|f| format!("{}: {}", f.name, render_type(&f.ty))).collect();
+            let inner: Vec<String> = fields
+                .iter()
+                .map(|f| format!("{}: {}", f.name, render_type(&f.ty)))
+                .collect();
             format!("{{{}}}", inner.join(", "))
         }
         Function { params, ret, .. } => {
@@ -398,7 +439,11 @@ fn render_type(t: &lex_ast::TypeExpr) -> String {
         Refined { base, .. } => format!("{}{{…}}", render_type(base)),
         RecordWithSpreads { spreads, fields } => {
             let mut parts: Vec<String> = spreads.iter().map(|s| format!("...{}", s)).collect();
-            parts.extend(fields.iter().map(|f| format!("{}: {}", f.name, render_type(&f.ty))));
+            parts.extend(
+                fields
+                    .iter()
+                    .map(|f| format!("{}: {}", f.name, render_type(&f.ty))),
+            );
             format!("{{{}}}", parts.join(", "))
         }
     }
@@ -406,9 +451,10 @@ fn render_type(t: &lex_ast::TypeExpr) -> String {
 
 fn render_text(env: &DocsEnvelope) {
     println!("Lex workspace docs (v{})", env.lex_docs_version);
-    println!("  lex {} on branch `{}` (default: `{}`)",
-        env.workspace.lex_version, env.workspace.current_branch,
-        env.workspace.default_branch);
+    println!(
+        "  lex {} on branch `{}` (default: `{}`)",
+        env.workspace.lex_version, env.workspace.current_branch, env.workspace.default_branch
+    );
     println!("  branches: {}", env.workspace.branches.join(", "));
     println!();
     println!("Stdlib ({} sigs):", env.stdlib.sigs.len());
@@ -419,13 +465,22 @@ fn render_text(env: &DocsEnvelope) {
     println!("Recent activity ({} ops):", env.recent_activity.len());
     for op in &env.recent_activity {
         let sig = op.sig_id.as_deref().unwrap_or("-");
-        println!("  {} [{}] {}", &op.op_id[..12.min(op.op_id.len())], op.kind_tag, sig);
+        println!(
+            "  {} [{}] {}",
+            &op.op_id[..12.min(op.op_id.len())],
+            op.kind_tag,
+            sig
+        );
     }
     println!();
     println!("Open intents: {}", env.open_intents.len());
     for i in &env.open_intents {
-        println!("  {} \"{}\" ({} ops)",
-            &i.intent_id[..12.min(i.intent_id.len())], i.prompt, i.produced_ops.len());
+        println!(
+            "  {} \"{}\" ({} ops)",
+            &i.intent_id[..12.min(i.intent_id.len())],
+            i.prompt,
+            i.produced_ops.len()
+        );
     }
     println!();
     if !env.attention.is_empty() {
@@ -495,8 +550,8 @@ fn cmd_docs_source(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 
     let mut modules = Vec::with_capacity(files.len());
     for file in &files {
-        let src = std::fs::read_to_string(file)
-            .with_context(|| format!("reading {}", file.display()))?;
+        let src =
+            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
         let prog = lex_syntax::parse_source(&src)
             .map_err(|e| anyhow!("parse error in {}: {e:?}", file.display()))?;
 
@@ -515,8 +570,12 @@ fn cmd_docs_source(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         let stages = lex_ast::canonicalize_program(&prog);
         let mut functions = Vec::new();
         for stage in &stages {
-            let lex_ast::Stage::FnDecl(fd) = stage else { continue };
-            let examples = fd.examples.iter()
+            let lex_ast::Stage::FnDecl(fd) = stage else {
+                continue;
+            };
+            let examples = fd
+                .examples
+                .iter()
                 .map(|ex| lex_ast::print_example(&fd.name, ex))
                 .collect();
             functions.push(FnDoc {
@@ -570,7 +629,8 @@ fn clean_doc(lines: &[String]) -> Option<String> {
     if lines.is_empty() {
         return None;
     }
-    let cleaned: Vec<String> = lines.iter()
+    let cleaned: Vec<String> = lines
+        .iter()
         .map(|l| {
             let s = l.trim_start().trim_start_matches('#');
             s.strip_prefix(' ').unwrap_or(s).to_string()
@@ -582,7 +642,8 @@ fn clean_doc(lines: &[String]) -> Option<String> {
 /// Render a canonical fn's effect row as a list of strings, mirroring the
 /// parameterized-effect rendering used by the `--for-agent` envelope.
 fn effect_strings(fd: &lex_ast::FnDecl) -> Vec<String> {
-    fd.effects.iter()
+    fd.effects
+        .iter()
         .map(|e| match &e.arg {
             Some(lex_ast::EffectArg::Int { value }) => format!("{}({})", e.name, value),
             Some(lex_ast::EffectArg::Str { value }) => format!("{}({:?})", e.name, value),
@@ -594,7 +655,10 @@ fn effect_strings(fd: &lex_ast::FnDecl) -> Vec<String> {
 
 fn render_api_text(docs: &ApiDocs) {
     let pkg = docs.package.as_deref().unwrap_or("(no package)");
-    println!("API docs for {pkg} {} (schema v{})", docs.version, docs.lex_docs_version);
+    println!(
+        "API docs for {pkg} {} (schema v{})",
+        docs.version, docs.lex_docs_version
+    );
     for m in &docs.modules {
         println!();
         println!("{} ({} fn):", m.file, m.functions.len());
@@ -604,7 +668,11 @@ fn render_api_text(docs: &ApiDocs) {
             }
         }
         for f in &m.functions {
-            let sid = f.sig_id.as_deref().map(|s| &s[..12.min(s.len())]).unwrap_or("-");
+            let sid = f
+                .sig_id
+                .as_deref()
+                .map(|s| &s[..12.min(s.len())])
+                .unwrap_or("-");
             println!("  {}{}  [{}]", f.name, f.signature, sid);
             if let Some(doc) = &f.doc {
                 for line in doc.lines() {

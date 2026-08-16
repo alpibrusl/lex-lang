@@ -20,6 +20,7 @@ ureq = { version = "3.3", default-features = false, features = ["rustls", "platf
 flate2 = "1"
 tar = "0.4"
 tiny_http = "0.12"
+toml = "1"
 lex-syntax = { path = "../lex-syntax" }
 lex-ast = { path = "../lex-ast" }
 lex-types = { path = "../lex-types" }

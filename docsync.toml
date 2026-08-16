@@ -1,0 +1,8 @@
+# docsync.toml — generated documentation blocks (lex doc-sync / --check).
+# Each target's stdout-producing generator is the source of truth; CI runs
+# `lex doc-sync --check` so drift is a red build, never a discovery.
+
+[[block]]
+id = "effects"
+path = "docs/AGENT.md"
+command = "cargo run -q -p lex-cli -- docs --effects"

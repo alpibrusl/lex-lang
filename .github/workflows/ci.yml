@@ -68,6 +68,12 @@ jobs:
       # version there hands them an old binary. Keep it pinned to Cargo.toml.
       - name: README install version matches Cargo.toml
         run: ./scripts/check-readme-version.sh
+      # Generated doc regions must match their generators (lex doc-sync).
+      # docs/AGENT.md's effect table is rendered from the runtime's
+      # KNOWN_EFFECTS single source; drift is a red build with the fix in
+      # the message, never a discovery.
+      - name: Generated docs current (doc-sync --check)
+        run: cargo run -q -p lex-cli -- doc-sync --check
       # Manifesto demo: effects are machine-verifiable constraints. The
       # honest effect row type-checks; a [net] call under an [io]
       # signature is rejected. lex-cli is already compiled by the
