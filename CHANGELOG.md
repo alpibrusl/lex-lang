@@ -7,6 +7,39 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.10.11] — 2026-08-16
+
+### Added
+
+- **`lex doc-sync` — generated doc regions with a `--check` CI twin**
+  (#747). Reference material whose source of truth is code (effect
+  lists, builtin tables, event vocabularies) rots silently; now a
+  `docsync.toml` manifest declares each target — `[[file]]` for a
+  whole generated file (e.g. a downstream repo's `AGENTS.md` from
+  `lex agent-guidelines`), `[[block]]` for a marked region between
+  `docsync:begin ID` / `docsync:end ID` comments inside a hand-written
+  doc — and `lex doc-sync` regenerates while `lex doc-sync --check`
+  fails CI on drift, naming each stale target. Generators are
+  arbitrary shell commands, so Rust repos generate with `cargo run`,
+  Lex repos with `lex run`, TypeScript repos with `node` — one
+  mechanism for the whole ecosystem, shipped in the toolchain binary
+  every repo already installs.
+- **`lex docs --effects`** renders the effect-kind quick-reference
+  table from the runtime's new `KNOWN_EFFECTS` single source
+  (`lex-runtime/src/policy.rs`), which also feeds
+  `Policy::permissive()` — adding an effect is now one row in one
+  place (#399's "keep in sync" comment-rule retired).
+
+### Fixed
+
+- **`docs/AGENT.md`'s effect table had drifted badly** — it still
+  described the pre-0.10 `http.get`/`fs.read` effect model and was
+  missing `sql`, `vcs`, `proc`, `env`, `concurrent`, `crypto`,
+  `approval` and more. It is now a docsync block generated from
+  `KNOWN_EFFECTS` and checked in CI, with the section's stale
+  `-> Str [http.get]` signature example fixed to the current
+  `-> [net(...)] Str` form.
+
 ## [0.10.10] — 2026-08-13
 
 ### Added
