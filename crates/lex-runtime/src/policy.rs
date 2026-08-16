@@ -61,8 +61,57 @@ pub struct Policy {
     pub budget: Option<u64>,
 }
 
+/// Every effect kind the stdlib can declare, each with a one-line note.
+/// THE single source: `Policy::permissive` grants exactly these, and
+/// `lex docs --effects` renders this table for docs/AGENT.md's quick
+/// reference (kept current by `lex doc-sync --check` in CI). #399's
+/// "keep this set in sync with builtins.rs" used to be a comment-level
+/// rule enforced by nobody; adding an effect now means adding one row
+/// here, and the doc regenerates from it.
+pub const KNOWN_EFFECTS: &[(&str, &str)] = &[
+    ("io", "console / stdio"),
+    (
+        "net",
+        "sockets + outbound HTTP; scope to a host (`net(\"host\")`) where possible",
+    ),
+    ("time", "clocks — non-deterministic"),
+    ("llm", "LLM inference"),
+    ("proc", "subprocess execution"),
+    ("panic", "may abort"),
+    ("fs_read", "filesystem reads; scopable to a path"),
+    ("fs_write", "filesystem writes; scopable to a path"),
+    (
+        "budget",
+        "annotated cost `budget(N)`; checked against `--budget`",
+    ),
+    ("llm_local", "local model inference (#184)"),
+    ("llm_cloud", "cloud model inference (#184)"),
+    ("a2a", "agent-to-agent protocol calls (#184)"),
+    ("mcp", "MCP client calls (#184)"),
+    (
+        "env",
+        "environment-variable access (#216); flat `[env]` is the v1 surface",
+    ),
+    ("sql", "std.sql database access (#362, #379)"),
+    ("random", "crypto.random / crypto.random_str_hex (#382)"),
+    ("chat", "chat.broadcast / chat.send (#359)"),
+    ("log", "std.log structured logging"),
+    ("kv", "std.kv key-value store"),
+    ("stream", "std.stream"),
+    ("fs_walk", "std.fs directory traversal"),
+    ("concurrent", "conc.spawn / conc.ask / conc.tell (#381)"),
+    ("crypto", "std.crypto hashing / signing (#562, #582)"),
+    ("vcs", "std.vcs content-addressed blob store (lex-loom#198)"),
+    (
+        "approval",
+        "std.approval human-in-the-loop boundary; scope checked against `--allow-approval` (#737)",
+    ),
+];
+
 impl Policy {
-    pub fn pure() -> Self { Self::default() }
+    pub fn pure() -> Self {
+        Self::default()
+    }
 
     /// Report the granted *scoped* effects whose scope list is empty —
     /// i.e. the ones the runtime treats as unrestricted ("any"):
@@ -96,33 +145,7 @@ impl Policy {
 
     pub fn permissive() -> Self {
         let mut s = BTreeSet::new();
-        for k in [
-            "io", "net", "time", "llm", "proc", "panic",
-            "fs_read", "fs_write", "budget",
-            // #184: agent-runtime effects.
-            "llm_local", "llm_cloud", "a2a", "mcp",
-            // #216: env-var access. Per-var scoping (`[env(NAME)]`)
-            // arrives with the per-capability effect parameterization
-            // work (#207); the flat `[env]` is the v1 surface.
-            "env",
-            // #399: keep this set in sync with every effect declared
-            // in `crates/lex-types/src/builtins.rs`. The "permissive"
-            // contract is "everything stdlib knows about"; missing
-            // entries here cause valid stdlib calls to fail under
-            // `lex test` / `lex repl` / any other consumer that opts
-            // into the permissive policy.
-            "sql",         // std.sql (#362, #379)
-            "random",      // crypto.random / crypto.random_str_hex (#382)
-            "chat",        // chat.broadcast / chat.send (#359)
-            "log",         // std.log structured logging
-            "kv",          // std.kv key-value store
-            "stream",      // std.stream
-            "fs_walk",     // std.fs directory traversal
-            "concurrent",  // conc.spawn / conc.ask / conc.tell (#381)
-            "crypto",      // std.crypto hashing / signing (#562, #582)
-            "vcs",         // std.vcs content-addressed blob store (lex-loom#198)
-            "approval",    // std.approval human-in-the-loop host boundary
-        ] {
+        for (k, _) in KNOWN_EFFECTS {
             s.insert(k.to_string());
         }
         Self {
@@ -186,14 +209,20 @@ impl PolicyViolation {
 
 /// Walk the program's declared effects (gathered from fn signatures) and
 /// verify them against `policy`. Run before any execution.
-pub fn check_program(program: &Program, policy: &Policy) -> Result<PolicyReport, Vec<PolicyViolation>> {
+pub fn check_program(
+    program: &Program,
+    policy: &Policy,
+) -> Result<PolicyReport, Vec<PolicyViolation>> {
     let mut violations = Vec::new();
     let mut total_budget: u64 = 0;
     let mut declared_effects: IndexMap<String, Vec<DeclaredEffect>> = IndexMap::new();
 
     for f in &program.functions {
         for e in &f.effects {
-            declared_effects.entry(f.name.clone()).or_default().push(e.clone());
+            declared_effects
+                .entry(f.name.clone())
+                .or_default()
+                .push(e.clone());
 
             // Effect-kind allowlist (#207). A grant like `mcp:ocpp`
             // permits `[mcp("ocpp")]` only; bare `mcp` permits any
@@ -202,7 +231,9 @@ pub fn check_program(program: &Program, policy: &Policy) -> Result<PolicyReport,
             // format stays plain strings for backward compat.
             if !is_effect_allowed(&policy.allow_effects, e) {
                 violations.push(PolicyViolation::effect_not_allowed(
-                    &declared_effect_pretty(e), &f.name));
+                    &declared_effect_pretty(e),
+                    &f.name,
+                ));
                 continue;
             }
 
@@ -215,7 +246,8 @@ pub fn check_program(program: &Program, policy: &Policy) -> Result<PolicyReport,
                         &policy.allow_fs_write
                     };
                     if !path_under_any(path, allowlist) {
-                        violations.push(PolicyViolation::fs_path_not_allowed(&e.kind, path, &f.name));
+                        violations
+                            .push(PolicyViolation::fs_path_not_allowed(&e.kind, path, &f.name));
                     }
                 }
             }
@@ -223,7 +255,9 @@ pub fn check_program(program: &Program, policy: &Policy) -> Result<PolicyReport,
             // Budget aggregation.
             if e.kind == "budget" {
                 if let Some(EffectArg::Int(n)) = &e.arg {
-                    if *n >= 0 { total_budget = total_budget.saturating_add(*n as u64); }
+                    if *n >= 0 {
+                        total_budget = total_budget.saturating_add(*n as u64);
+                    }
                 }
             }
         }
@@ -236,7 +270,10 @@ pub fn check_program(program: &Program, policy: &Policy) -> Result<PolicyReport,
     }
 
     if violations.is_empty() {
-        Ok(PolicyReport { declared_effects, total_budget })
+        Ok(PolicyReport {
+            declared_effects,
+            total_budget,
+        })
     } else {
         Err(violations)
     }
@@ -285,10 +322,12 @@ pub fn is_effect_allowed(grants: &BTreeSet<String>, e: &DeclaredEffect) -> bool 
 fn grant_subsumes(grant: &str, e: &DeclaredEffect) -> bool {
     // Accept three forms: "name", "name:arg", "name(arg)".
     let (g_name, g_arg) = parse_grant(grant);
-    if g_name != e.kind { return false; }
+    if g_name != e.kind {
+        return false;
+    }
     match (g_arg, &e.arg) {
-        (None, _) => true,                                 // bare absorbs anything
-        (Some(_), None) => false,                          // specific can't grant bare
+        (None, _) => true,        // bare absorbs anything
+        (Some(_), None) => false, // specific can't grant bare
         (Some(g), Some(EffectArg::Str(d))) => g == d,
         // Int / Ident args have no CLI form in v1; only bare grants
         // satisfy them (handled by the (None, _) branch above).
@@ -325,8 +364,14 @@ mod wildcard_tests {
             ..Policy::default()
         };
         let open = p.wildcard_scoped_grants();
-        assert!(open.contains(&"proc"), "empty allow_proc + [proc] is wide open");
-        assert!(open.contains(&"fs_read"), "empty allow_fs_read + [fs_read] is wide open");
+        assert!(
+            open.contains(&"proc"),
+            "empty allow_proc + [proc] is wide open"
+        );
+        assert!(
+            open.contains(&"fs_read"),
+            "empty allow_fs_read + [fs_read] is wide open"
+        );
         // `time` has no scope and `net` wasn't granted.
         assert!(!open.contains(&"time"));
         assert!(!open.contains(&"net"));

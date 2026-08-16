@@ -71,24 +71,48 @@ Exit code is 0 on success, 1 on type errors.
 
 ## Effect system quick reference
 
-Functions declare effects in their signature:
+Functions declare effects in their signature, between the arrow and the
+return type — and narrow them where possible (`lex agent-guidelines` § 1):
 
 ```lex
-fn fetch_data(url :: Str) -> Str [http.get] { ... }
+fn fetch_data(url :: Str) -> [net("api.example.com")] Str { ... }
+fn save(report :: Str) -> [fs_write("/tmp/report.md")] Unit { ... }
 ```
 
-The effect kind (`http`) and operation (`get`) must both be permitted by the
-active `Policy`. Effect kinds that exist:
+Every effect a body performs must appear in the row and be permitted by the
+active `Policy`. The kinds that exist (generated from the runtime's
+`KNOWN_EFFECTS` single source — edit `crates/lex-runtime/src/policy.rs`,
+then `lex doc-sync`):
 
-| kind | operations | notes |
-|---|---|---|
-| `http` | `get`, `post`, `put`, `delete`, `patch` | outbound HTTP |
-| `fs` | `read`, `write` | filesystem access |
-| `time` | `now` | `datetime.now` — non-deterministic |
-| `random` | `random` | `crypto.random` |
-| `llm` | `complete` | LLM inference |
-| `budget` | (N) | annotated cost; checked against `--budget` |
-| `approval` | `request` | `std.approval.request(scope, reason)` blocks on an operator answer; scope checked against `--allow-approval` |
+<!-- docsync:begin effects -->
+| kind | notes |
+|---|---|
+| `io` | console / stdio |
+| `net` | sockets + outbound HTTP; scope to a host (`net("host")`) where possible |
+| `time` | clocks — non-deterministic |
+| `llm` | LLM inference |
+| `proc` | subprocess execution |
+| `panic` | may abort |
+| `fs_read` | filesystem reads; scopable to a path |
+| `fs_write` | filesystem writes; scopable to a path |
+| `budget` | annotated cost `budget(N)`; checked against `--budget` |
+| `llm_local` | local model inference (#184) |
+| `llm_cloud` | cloud model inference (#184) |
+| `a2a` | agent-to-agent protocol calls (#184) |
+| `mcp` | MCP client calls (#184) |
+| `env` | environment-variable access (#216); flat `[env]` is the v1 surface |
+| `sql` | std.sql database access (#362, #379) |
+| `random` | crypto.random / crypto.random_str_hex (#382) |
+| `chat` | chat.broadcast / chat.send (#359) |
+| `log` | std.log structured logging |
+| `kv` | std.kv key-value store |
+| `stream` | std.stream |
+| `fs_walk` | std.fs directory traversal |
+| `concurrent` | conc.spawn / conc.ask / conc.tell (#381) |
+| `crypto` | std.crypto hashing / signing (#562, #582) |
+| `vcs` | std.vcs content-addressed blob store (lex-loom#198) |
+| `approval` | std.approval human-in-the-loop boundary; scope checked against `--allow-approval` (#737) |
+<!-- docsync:end effects -->
 
 Pure functions (no effect annotations) can run under `Policy::pure()`.
 

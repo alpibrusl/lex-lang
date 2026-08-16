@@ -18,6 +18,7 @@ mod branch;
 mod capsule_contract;
 mod ci;
 mod diff;
+mod doc_sync;
 mod docs;
 mod examples_eval;
 mod fmt;
@@ -126,6 +127,7 @@ fn run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "log" => branch::cmd_log(fmt, &args[1..]),
         "op" => op::cmd_op(fmt, &args[1..]),
         "docs" => docs::cmd_docs(fmt, &args[1..]),
+        "doc-sync" => doc_sync::cmd_doc_sync(&args[1..]),
         "plan" => cmd_plan(fmt, &args[1..]),
         "repair" => cmd_repair(fmt, &args[1..]),
         "producer-trust" => cmd_producer_trust(fmt, &args[1..]),
@@ -191,6 +193,7 @@ fn print_usage() {
         "  fmt [--check] <file|dir>...        format .lex files; --check exits 1 if any need it"
     );
     println!("  ci [--no-fmt] [--src <d>] [--tests <d>]");
+    println!("  doc-sync [--check] [manifest]      regenerate (or verify) docsync.toml's generated doc targets");
     println!(
         "                                     run the full pipeline: pkg install, check --strict,"
     );
@@ -309,7 +312,9 @@ fn print_usage() {
     println!("  --allow-fs-write PATH       (repeatable) permit fs_write under PATH");
     println!("  --allow-approval SCOPE,...  comma-separated scopes [approval] may request");
     println!("  --budget N                  cap aggregate declared budget");
-    println!("  --max-steps N               cap VM opcode dispatches at N (DoS guard; 0 = unbounded)");
+    println!(
+        "  --max-steps N               cap VM opcode dispatches at N (DoS guard; 0 = unbounded)"
+    );
 }
 
 fn read_source(path: &str) -> Result<String> {
@@ -768,8 +773,8 @@ fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     // rather than silently falling back, so a `--jit` invocation
     // that can't actually JIT is loud.
     if f.jit {
-        let tier = lex_jit::JitTier::new(&bc)
-            .map_err(|e| anyhow!("--jit: constructing JIT tier: {e}"))?;
+        let tier =
+            lex_jit::JitTier::new(&bc).map_err(|e| anyhow!("--jit: constructing JIT tier: {e}"))?;
         vm.set_jit_hook(Some(Box::new(tier)));
     }
     let recorder = lex_trace::Recorder::new();
@@ -3805,9 +3810,11 @@ fn cmd_stage_decision(
 /// the supplied criteria. Designed for CI / dashboard queries
 /// that span the whole log rather than a single stage.
 fn cmd_attest(fmt: &OutputFormat, args: &[String]) -> Result<()> {
-    let sub = args
-        .first()
-        .ok_or_else(|| anyhow!("usage: lex attest {{filter|import-install|push|pull|retro-block|retro-unblock}} ..."))?;
+    let sub = args.first().ok_or_else(|| {
+        anyhow!(
+            "usage: lex attest {{filter|import-install|push|pull|retro-block|retro-unblock}} ..."
+        )
+    })?;
     let rest = &args[1..];
     if sub == "push" {
         return cmd_attest_push(fmt, rest);

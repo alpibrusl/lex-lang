@@ -41,6 +41,7 @@ description: "Invoke the `lex` CLI. Commands: parse, check, run, hash…"
 - `lex pkg` — package manager: init, add, install, list deps; publish/verify signed capability contracts
 - `lex fmt` — format .lex files; --check exits 1 if any need it
 - `lex ci` — run the full pipeline: pkg install, check --strict, fmt --check, test
+- `lex doc-sync` — regenerate (or --check) generated doc regions declared in docsync.toml; drift fails --check naming each stale target (idempotent)
 - `lex test` — run tests/test_*.lex files (calls run_all in each) (idempotent)
 - `lex keygen` — print a fresh Ed25519 keypair (hex) for signing stages
 - `lex canonical` — encode/decode the canonical wire form of an AST (idempotent)
@@ -831,6 +832,32 @@ lex ci
 ```
 
 **See also:** `lex check`, `lex fmt`, `lex test`
+
+## `lex doc-sync`
+
+regenerate (or --check) generated doc regions declared in docsync.toml; drift fails --check naming each stale target
+
+### Options
+
+- `----check` (bool) — verify instead of regenerate; non-zero exit on drift
+
+### Arguments
+
+- `manifest` (path, optional) — manifest to use (default: docsync.toml in the current directory)
+
+### Examples
+
+```bash
+# Regenerate all targets
+lex doc-sync
+```
+
+```bash
+# CI drift gate
+lex doc-sync --check
+```
+
+**See also:** `lex docs`, `lex ci`
 
 ## `lex test`
 
