@@ -307,7 +307,7 @@ mod tests {
         assert!(err.contains("fix: lex doc-sync"), "{err}");
 
         // Regenerate, then --check passes and content is right.
-        cmd_doc_sync(&[mpath.clone()]).unwrap();
+        cmd_doc_sync(std::slice::from_ref(&mpath)).unwrap();
         assert_eq!(fs::read_to_string(&whole).unwrap(), "fresh whole\n");
         assert_eq!(
             fs::read_to_string(&doc).unwrap(),
