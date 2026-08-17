@@ -112,6 +112,7 @@ then `lex doc-sync`):
 | `crypto` | std.crypto hashing / signing (#562, #582) |
 | `vcs` | std.vcs content-addressed blob store (lex-loom#198) |
 | `approval` | std.approval human-in-the-loop boundary; scope checked against `--allow-approval` (#737) |
+| `moe` | std.moe expert-store placement ops — pin/unpin/prefetch_hint/usage_snapshot/stats (lex-moe#25) |
 <!-- docsync:end effects -->
 
 Pure functions (no effect annotations) can run under `Policy::pure()`.
@@ -179,6 +180,7 @@ an exhaustive function list.
 | `std.agent` | `local_complete`, `cloud_complete`, `send_a2a`, `call_mcp`, `cloud_stream` |
 | `std.stream` | `next`, `collect` |
 | `std.decimal` | `decimal`, `zero`, `one`, `from_int`, `add`, `sub`, `mul`, `compare`, `is_zero`, `is_positive`, `is_negative`, `normalize`, `negate`, `abs`, `round_to`, `to_str`, `pow10` |
+| `std.moe` | `pin`, `unpin`, `prefetch_hint`, `usage_snapshot`, `stats` |
 <!-- docsync:end stdlib-index -->
 
 ### `std.str`
