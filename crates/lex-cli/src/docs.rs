@@ -30,7 +30,8 @@ pub fn cmd_docs(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             "usage: lex docs <path>...        # API docs for source files/dirs\n\
          usage: lex docs --for-agent [--branch B] [--limit-recent N] [--store DIR]\n\
          usage: lex docs --rules\n\
-         usage: lex docs --effects        # effect-kind table from the runtime's single source"
+         usage: lex docs --effects        # effect-kind table from the runtime's single source\n\
+         usage: lex docs --stdlib-index   # stdlib module/function index from the checker's builtin registry"
         )
     })?;
     if sub == "--effects" {
@@ -41,6 +42,26 @@ pub fn cmd_docs(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         println!("|---|---|");
         for (kind, note) in lex_runtime::policy::KNOWN_EFFECTS {
             println!("| `{kind}` | {note} |");
+        }
+        return Ok(());
+    }
+    if sub == "--stdlib-index" {
+        // The stdlib function index, rendered from the type-checker's
+        // builtin registry (#746) — the same definitions `lex check`
+        // resolves imports against, so the docs cannot say a function
+        // exists that the checker would reject. Consumed by docsync.toml
+        // for docs/AGENT.md's generated index; per-module prose there
+        // stays hand-written.
+        let env = lex_types::env::TypeEnv::default();
+        println!("| module | functions |");
+        println!("|---|---|");
+        for name in lex_types::builtins::MODULE_NAMES {
+            if let Some(lex_types::types::Ty::Record(fields)) =
+                lex_types::builtins::module_scope(name, &env)
+            {
+                let fns: Vec<String> = fields.keys().map(|k| format!("`{k}`")).collect();
+                println!("| `std.{name}` | {} |", fns.join(", "));
+            }
         }
         return Ok(());
     }

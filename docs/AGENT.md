@@ -120,11 +120,68 @@ Pure functions (no effect annotations) can run under `Policy::pure()`.
 
 ## Stdlib module summary
 
-Import modules with `import "std.X" as X`:
+Import modules with `import "std.X" as X`. The index below is generated
+from the type-checker's builtin registry — the same definitions
+`lex check` resolves imports against, so a function listed here is one
+the checker actually accepts (`lex doc-sync` regenerates it; CI fails on
+drift). The per-module notes that follow are hand-written semantics, not
+an exhaustive function list.
+
+<!-- docsync:begin stdlib-index -->
+| module | functions |
+|---|---|
+| `std.io` | `print`, `read`, `write`, `readline`, `argv` |
+| `std.str` | `is_empty`, `to_int`, `to_float`, `concat`, `len`, `char_at`, `split`, `join`, `starts_with`, `ends_with`, `contains`, `cmp`, `replace`, `trim`, `to_upper`, `to_lower`, `strip_prefix`, `strip_suffix`, `slice` |
+| `std.int` | `to_str`, `to_float`, `abs`, `min`, `max` |
+| `std.math` | `exp`, `log`, `log2`, `log10`, `sqrt`, `abs`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `floor`, `ceil`, `round`, `trunc`, `pow`, `atan2`, `min`, `max`, `zeros`, `ones`, `from_lists`, `from_flat`, `rows`, `cols`, `get`, `to_flat`, `transpose`, `matmul`, `scale`, `add`, `sub`, `sigmoid` |
+| `std.float` | `to_int`, `to_str` |
+| `std.list` | `map`, `par_map`, `sort_by`, `filter`, `fold`, `len`, `is_empty`, `range`, `head`, `tail`, `concat`, `reverse`, `cons`, `enumerate` |
+| `std.bytes` | `len`, `is_empty`, `eq`, `from_str`, `to_str`, `slice`, `concat`, `concat_all`, `u8`, `u16_le`, `u32_le`, `u64_le`, `u8_at`, `u16_le_at`, `u32_le_at`, `u64_le_at` |
+| `std.time` | `now`, `now_ms`, `now_str`, `mono_ns`, `sleep_ms`, `sleep` |
+| `std.rand` | `int_in` |
+| `std.random` | `seed`, `int`, `float`, `choose` |
+| `std.env` | `get` |
+| `std.net` | `get`, `post`, `serve`, `serve_tls`, `serve_ws`, `serve_ws_fn`, `serve_ws_fn_auth`, `serve_ws_fn_actor`, `dial_ws`, `dial_ws_actor`, `serve_fn`, `serve_routed`, `default_opts`, `serve_with`, `serve_fn_with`, `serve_routed_with`, `serve_quic`, `serve_quic_fn`, `serve_quic_routed` |
+| `std.tls` | `from_pem_files`, `self_signed` |
+| `std.chat` | `broadcast`, `send` |
+| `std.conc` | `spawn`, `ask`, `tell`, `register`, `lookup`, `unregister`, `registered` |
+| `std.arrow` | `from_int_columns`, `from_float_columns`, `from_str_columns`, `nrows`, `ncols`, `col_names`, `col_type`, `col_sum_int`, `col_sum_float`, `col_mean`, `col_min_int`, `col_max_int`, `col_count`, `head`, `tail`, `slice`, `select_cols`, `drop_col`, `rename_col`, `read_csv`, `read_parquet`, `read_parquet_cols`, `write_parquet`, `write_csv` |
+| `std.df` | `filter_eq_int`, `filter_gt_int`, `filter_lt_int`, `filter_eq_str`, `filter_in_str`, `filter_eq_float`, `filter_lt_float`, `filter_gt_float`, `filter_isnull`, `filter_notnull`, `drop_nulls`, `sort_by`, `group_by_agg`, `inner_join`, `left_join`, `cross_join` |
+| `std.json` | `stringify`, `parse`, `parse_strict` |
+| `std.result` | `map`, `and_then`, `map_err`, `or_else`, `unwrap_or`, `unwrap_or_else`, `is_ok`, `is_err` |
+| `std.option` | `map`, `and_then`, `unwrap_or`, `unwrap_or_else`, `or_else`, `is_some`, `is_none`, `ok_or` |
+| `std.tuple` | `fst`, `snd`, `third`, `len` |
+| `std.map` | `new`, `size`, `has`, `get`, `set`, `delete`, `keys`, `values`, `entries`, `from_list`, `merge`, `is_empty`, `fold` |
+| `std.set` | `new`, `size`, `has`, `add`, `delete`, `to_list`, `from_list`, `union`, `intersect`, `diff`, `is_empty`, `is_subset` |
+| `std.iter` | `from_list`, `unfold`, `next`, `is_empty`, `count`, `take`, `skip`, `to_list`, `collect`, `map`, `filter`, `fold` |
+| `std.flow` | `sequential`, `branch`, `retry`, `retry_with_backoff`, `parallel`, `parallel_list` |
+| `std.crypto` | `sha256`, `sha512`, `md5`, `blake2b`, `sha256_str`, `sha512_str`, `hmac_sha256`, `hmac_sha512`, `ed25519_public_key`, `ed25519_sign`, `ed25519_verify`, `ed25519_is_valid_point`, `p256_generate`, `p256_public_key`, `p256_sign`, `p256_verify`, `keccak256`, `secp256k1_generate`, `secp256k1_public_key`, `secp256k1_sign_digest`, `secp256k1_recover`, `secp256k1_verify`, `base64_encode`, `base64_decode`, `base64url_encode`, `base64url_decode`, `hex_encode`, `hex_decode`, `base58_encode`, `base58_decode`, `constant_time_eq`, `eq`, `eq_str`, `random`, `random_str_hex`, `aes_gcm_seal`, `chacha20_poly1305_seal`, `aes_gcm_open`, `chacha20_poly1305_open`, `pbkdf2_sha256`, `hkdf_sha256`, `argon2id` |
+| `std.deque` | `new`, `size`, `is_empty`, `push_back`, `push_front`, `pop_back`, `pop_front`, `peek_back`, `peek_front`, `from_list`, `to_list` |
+| `std.log` | `debug`, `info`, `warn`, `error`, `set_level`, `set_format`, `set_sink` |
+| `std.datetime` | `now`, `parse_iso`, `format_iso`, `parse`, `format`, `to_components`, `from_components`, `add`, `diff`, `duration_seconds`, `duration_minutes`, `duration_days`, `before`, `after`, `compare` |
+| `std.duration` | `millis`, `seconds`, `minutes`, `hours`, `days` |
+| `std.approval` | `request` |
+| `std.process` | `spawn`, `read_stdout_line`, `read_stderr_line`, `wait`, `kill`, `run` |
+| `std.fs` | `exists`, `is_file`, `is_dir`, `stat`, `list_dir`, `walk`, `glob`, `mkdir_p`, `remove`, `copy` |
+| `std.kv` | `open`, `close`, `get`, `put`, `delete`, `contains`, `list_prefix` |
+| `std.vcs` | `put_blob`, `get_blob`, `has_blob`, `ref_set`, `ref_get` |
+| `std.sql` | `open`, `close`, `exec`, `query`, `query_iter`, `begin`, `commit`, `rollback`, `exec_tx`, `query_tx`, `get_str`, `get_int`, `get_float`, `get_bool` |
+| `std.redis` | `connect`, `close`, `get`, `set`, `set_ex`, `del`, `exists`, `expire`, `publish`, `subscribe`, `psubscribe`, `lpush`, `rpush`, `brpop`, `llen`, `hset`, `hget`, `hdel`, `hgetall` |
+| `std.parser` | `char`, `string`, `digit`, `alpha`, `whitespace`, `eof`, `seq`, `alt`, `many`, `optional`, `map`, `and_then`, `run` |
+| `std.cli` | `flag`, `option`, `positional`, `spec`, `parse`, `envelope`, `describe`, `help` |
+| `std.regex` | `compile`, `is_match`, `is_match_str`, `find`, `find_all`, `replace`, `replace_all`, `split` |
+| `std.http` | `send`, `get`, `post`, `with_header`, `with_auth`, `with_query`, `with_timeout_ms`, `json_body`, `text_body`, `stream_lines` |
+| `std.yaml` | `parse`, `parse_strict`, `stringify` |
+| `std.dotenv` | `parse` |
+| `std.csv` | `parse`, `stringify` |
+| `std.test` | `assert_eq`, `assert_ne`, `assert_true`, `assert_false` |
+| `std.toml` | `parse`, `parse_strict`, `stringify` |
+| `std.agent` | `local_complete`, `cloud_complete`, `send_a2a`, `call_mcp`, `cloud_stream` |
+| `std.stream` | `next`, `collect` |
+| `std.decimal` | `decimal`, `zero`, `one`, `from_int`, `add`, `sub`, `mul`, `compare`, `is_zero`, `is_positive`, `is_negative`, `normalize`, `negate`, `abs`, `round_to`, `to_str`, `pow10` |
+<!-- docsync:end stdlib-index -->
 
 ### `std.str`
-`length`, `to_upper`, `to_lower`, `trim`, `split`, `contains`, `starts_with`,
-`ends_with`, `replace`, `concat`, `slice`, `index_of`, `cmp`
 
 String comparison operators (`<`, `<=`, `>`, `>=`, `==`, `!=`) work on `Str`
 via lexicographic order. `str.cmp(a, b)` returns `-1` / `0` / `1` in the
@@ -132,9 +189,6 @@ same order — use it when you need a three-way function value (e.g. as a
 sort-by closure); use the operators for boolean comparisons.
 
 `Str + Str` concatenates strings.
-
-### `std.int`
-`to_str`, `parse`, `abs`, `min`, `max`, `clamp`
 
 ### `std.decimal` (#574)
 Exact scaled-integer decimal arithmetic. Values are `{ coefficient :: Int, exponent :: Int }`
@@ -163,8 +217,6 @@ let rounded  := d.round_to(fee, -2, "HalfUp")  # 0.63
 ```
 
 ### `std.list`
-`map`, `filter`, `fold`, `length`, `head`, `tail`, `reverse`, `append`,
-`zip`, `flatten`, `any`, `all`, `find`, `cons`, `par_map`
 
 `list.cons(x, xs)` prepends `x` to `xs` — idiomatic O(n) builder with
 `list.cons` + `list.reverse`.
@@ -173,7 +225,6 @@ let rounded  := d.round_to(fee, -2, "HalfUp")  # 0.63
 `stringify`, `parse` — round-trips any Lex value through JSON.
 
 ### `std.datetime`
-`now` [time], `parse_iso`, `format_iso`, `diff`, `before`, `after`, `compare`
 
 `datetime.now` returns nanoseconds since epoch as `Int`.
 `datetime.parse_iso` returns `Result[Instant, Str]`.
@@ -183,13 +234,10 @@ let rounded  := d.round_to(fee, -2, "HalfUp")  # 0.63
 Set `LEX_TEST_NOW=<unix_seconds>` to pin the clock in tests (#350).
 
 ### `std.duration`
-`seconds`, `minutes`, `hours`, `days`
 
 `duration.seconds(d)` extracts total whole seconds from a `Duration`.
 
 ### `std.time`
-`now` [time], `now_ms` [time], `now_str` [time], `mono_ns` [time],
-`sleep_ms` [time], `sleep` [time]
 
 `time.sleep(d :: Duration)` blocks the calling thread for `d`. Pair with
 `datetime.duration_seconds` / `duration_minutes` / `duration_days` to
@@ -198,11 +246,9 @@ stalls the worker — same caveat as `LEX_NET_INLINE_VM=1`. Capped at 60s
 to bound runaway loops; use process-level scheduling for longer waits.
 
 ### `std.conc`
-`spawn` [concurrent], `ask` [concurrent], `tell` [concurrent],
-`register` [concurrent], `lookup` [concurrent], `unregister` [concurrent],
-`registered` [concurrent]
 
-Actors hold per-process state across messages. `spawn(init, handler)`
+All `std.conc` functions carry the `[concurrent]` effect. Actors hold
+per-process state across messages. `spawn(init, handler)`
 returns `Actor[S]`; `ask` / `tell` run `handler(state, msg)` on the
 caller's VM thread, serialised by the actor's internal mutex.
 
@@ -294,7 +340,8 @@ fn run(url :: Str) -> [net, time, concurrent] Result[Unit, Str] {
 ```
 
 ### `std.crypto`
-`hash`, `random` — `random` requires `[random]` effect.
+
+`crypto.random` requires the `[random]` effect; hashing and encoding are pure.
 
 Asymmetric signatures:
 - Ed25519: `ed25519_public_key`, `ed25519_sign`, `ed25519_verify` (raw 32-byte

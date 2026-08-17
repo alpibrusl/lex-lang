@@ -3362,3 +3362,50 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         _ => return None,
     })
 }
+
+/// Every module name `module_scope` resolves, in that function's match
+/// order. Adding a match arm there means adding the name HERE too —
+/// `lex docs --stdlib-index` renders docs/AGENT.md's generated stdlib
+/// index from this list, and `lex doc-sync --check` in CI fails when the
+/// docs drift from what this enumeration produces (#746).
+pub const MODULE_NAMES: &[&str] = &[
+    "io", "str", "int", "math", "float", "list", "bytes", "time", "rand", "random", "env", "net",
+    "tls", "chat", "conc", "arrow", "df", "json", "result", "option", "tuple", "map", "set",
+    "iter", "flow", "crypto", "deque", "log", "datetime", "duration", "approval", "process", "fs",
+    "kv", "vcs", "sql", "redis", "parser", "cli", "regex", "http", "yaml", "dotenv", "csv", "test",
+    "toml", "agent", "stream", "decimal",
+];
+
+#[cfg(test)]
+mod module_names_tests {
+    use super::*;
+    use crate::env::TypeEnv;
+
+    /// Every listed module must resolve to a non-empty record of
+    /// builtins — a typo'd or removed name here would silently drop a
+    /// module from the generated stdlib index.
+    #[test]
+    fn every_listed_module_resolves() {
+        let env = TypeEnv::default();
+        for name in MODULE_NAMES {
+            match module_scope(name, &env) {
+                Some(Ty::Record(fields)) => {
+                    assert!(!fields.is_empty(), "module `{name}` resolved to an empty record");
+                }
+                other => panic!("module `{name}` did not resolve to a record: {other:?}"),
+            }
+        }
+    }
+
+    /// The list and `module_for_import` must agree: everything listed
+    /// is reachable via `import "std.<name>"`.
+    #[test]
+    fn listed_modules_are_importable() {
+        for name in MODULE_NAMES {
+            assert!(
+                module_for_import(&format!("std.{name}")).is_some(),
+                "module `{name}` is listed but not importable as std.{name}"
+            );
+        }
+    }
+}

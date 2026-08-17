@@ -83,10 +83,12 @@ version locally, install the pinned one from
   cannot be the gate here (the binary is what we're changing).
 - **Builtin signatures live in `crates/lex-types/src/builtins.rs`.**
   Adding a new **effect** means one row in `KNOWN_EFFECTS`
-  (`crates/lex-runtime/src/policy.rs`) — `docs/AGENT.md`'s effect table
-  regenerates from it (`lex doc-sync`; CI runs `doc-sync --check`, see
-  `docsync.toml`). New stdlib fns still update `docs/AGENT.md`'s module
-  summary by hand until that table gets its own generator (#746).
+  (`crates/lex-runtime/src/policy.rs`); adding a new stdlib **module**
+  means a `module_scope` match arm plus its name in `MODULE_NAMES`
+  (same file). Both docs tables in `docs/AGENT.md` — the effect table
+  and the stdlib function index — regenerate from those sources via
+  `lex doc-sync`; CI runs `doc-sync --check` (see `docsync.toml`), so
+  drift is a red build, never a discovery (#746).
 - **`docs/AGENT_GUIDELINES.md` is the source of truth.** Don't fork
   the content into other docs; downstream repos should copy this
   file as `AGENTS.md`, not maintain a parallel one.

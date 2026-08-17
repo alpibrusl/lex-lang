@@ -291,6 +291,18 @@ fn cmd_docs() -> CommandInfo {
             "emit one JSON object describing the whole workspace",
             None,
         )
+        .add_option(
+            "--effects",
+            "bool",
+            "markdown effect-kind table from the runtime's KNOWN_EFFECTS single source",
+            None,
+        )
+        .add_option(
+            "--stdlib-index",
+            "bool",
+            "markdown stdlib module/function index from the checker's builtin registry",
+            None,
+        )
         .with_examples(vec![
             ("Workspace docs", "lex docs --for-agent"),
             ("Per-file", "lex docs src/"),
