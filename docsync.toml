@@ -6,3 +6,12 @@
 id = "effects"
 path = "docs/AGENT.md"
 command = "cargo run -q -p lex-cli -- docs --effects"
+
+# The stdlib module/function index in the agent reference — generated
+# from the type-checker's builtin registry (lex-types builtins.rs
+# MODULE_NAMES + module_scope), so the docs cannot list a function the
+# checker would reject (#746).
+[[block]]
+id = "stdlib-index"
+path = "docs/AGENT.md"
+command = "cargo run -q -p lex-cli -- docs --stdlib-index"
