@@ -106,6 +106,10 @@ pub const KNOWN_EFFECTS: &[(&str, &str)] = &[
         "approval",
         "std.approval human-in-the-loop boundary; scope checked against `--allow-approval` (#737)",
     ),
+    (
+        "moe",
+        "std.moe expert-store placement ops — pin/unpin/prefetch_hint/usage_snapshot/stats (lex-moe#25)",
+    ),
 ];
 
 impl Policy {

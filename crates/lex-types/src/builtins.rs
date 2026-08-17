@@ -2400,6 +2400,59 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 Ty::List(Box::new(Ty::str()))));
             Some(Ty::Record(fields))
         }
+        "moe" => {
+            // MoE expert-store placement ops (lex-moe#25). Native
+            // EffectHandler dispatch on the `moe` kind — see
+            // lex-moe's crates/moe-policy/src/lib.rs `MoeHost` for
+            // the Rust-side implementation these signatures describe.
+            // A single process-wide tier cache backs every op, so
+            // unlike `kv` there's no open/close handle to thread.
+            let usage_entry_t = || {
+                let mut f = IndexMap::new();
+                f.insert("hash".into(), Ty::str());
+                f.insert("size".into(), Ty::int());
+                f.insert("temp".into(), Ty::float());
+                f.insert("hits".into(), Ty::int());
+                f.insert("loads".into(), Ty::int());
+                Ty::Record(f)
+            };
+            let stats_t = || {
+                let mut f = IndexMap::new();
+                f.insert("hits".into(), Ty::int());
+                f.insert("misses".into(), Ty::int());
+                f.insert("prefetched".into(), Ty::int());
+                f.insert("evictions".into(), Ty::int());
+                f.insert("resident_bytes".into(), Ty::int());
+                Ty::Record(f)
+            };
+            let mut fields = IndexMap::new();
+            // pin(hash :: Str) -> [moe] Unit
+            fields.insert("pin".into(), Ty::function(
+                vec![Ty::str()],
+                EffectSet::singleton("moe"),
+                Ty::Unit));
+            // unpin(hash :: Str) -> [moe] Unit
+            fields.insert("unpin".into(), Ty::function(
+                vec![Ty::str()],
+                EffectSet::singleton("moe"),
+                Ty::Unit));
+            // prefetch_hint(hashes :: List[Str]) -> [moe] Int  (loads spawned)
+            fields.insert("prefetch_hint".into(), Ty::function(
+                vec![Ty::List(Box::new(Ty::str()))],
+                EffectSet::singleton("moe"),
+                Ty::int()));
+            // usage_snapshot() -> [moe] List[{hash, size, temp, hits, loads}]
+            fields.insert("usage_snapshot".into(), Ty::function(
+                vec![],
+                EffectSet::singleton("moe"),
+                Ty::List(Box::new(usage_entry_t()))));
+            // stats() -> [moe] {hits, misses, prefetched, evictions, resident_bytes}
+            fields.insert("stats".into(), Ty::function(
+                vec![],
+                EffectSet::singleton("moe"),
+                stats_t()));
+            Some(Ty::Record(fields))
+        }
         "vcs" => {
             // Content-addressed blob store (#5 / M6.1b). `put_blob` returns the
             // lowercase hex SHA-256 of the content — the SAME id as
@@ -3337,6 +3390,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "parser" => "parser",
         "deque" => "deque",
         "kv" => "kv",
+        "moe" => "moe",
         "sql" => "sql",
         "fs" => "fs",
         "process" => "process",
@@ -3373,7 +3427,7 @@ pub const MODULE_NAMES: &[&str] = &[
     "tls", "chat", "conc", "arrow", "df", "json", "result", "option", "tuple", "map", "set",
     "iter", "flow", "crypto", "deque", "log", "datetime", "duration", "approval", "process", "fs",
     "kv", "vcs", "sql", "redis", "parser", "cli", "regex", "http", "yaml", "dotenv", "csv", "test",
-    "toml", "agent", "stream", "decimal",
+    "toml", "agent", "stream", "decimal", "moe",
 ];
 
 #[cfg(test)]

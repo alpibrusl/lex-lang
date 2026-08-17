@@ -7,6 +7,20 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added
+
+- **`std.moe` — MoE expert-store placement ops** (downstream
+  `alpibrusl/lex-moe#25`). Five functions — `pin`, `unpin`,
+  `prefetch_hint`, `usage_snapshot`, `stats` — under a single
+  unscoped `[moe]` effect, type-checking Lex programs that drive
+  lex-moe's tier-cache engine (previously reachable only from
+  effectful Lex source via untyped native `EffectHandler` dispatch on
+  the `moe` kind). `usage_snapshot`/`stats` return anonymous records
+  shaped to match exactly what the downstream `MoeHost` handler
+  constructs at runtime. New `moe` row in `KNOWN_EFFECTS`
+  (`lex-runtime/src/policy.rs`); `docs/AGENT.md`'s effect table and
+  stdlib index regenerated via `lex doc-sync` to include it.
+
 ## [0.10.11] — 2026-08-16
 
 ### Added
