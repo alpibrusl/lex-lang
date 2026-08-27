@@ -102,6 +102,10 @@ fn helper_referenced_via_alias_from_test_file_runs() {
     // The test file imports a sibling helper file and calls into it via
     // the alias. The previous code path skipped the loader and so the
     // alias never expanded — failing at type-check.
+    //
+    // The fixture reports through `run_all`'s failure count rather than
+    // returning the computed value: since #757 a non-zero Int means "this many
+    // assertions failed", so a sentinel return would now read as 42 failures.
     let dir = unique_dir("helper-alias");
 
     write(
@@ -114,7 +118,13 @@ fn helper_referenced_via_alias_from_test_file_runs() {
         "tests/test_math.lex",
         r#"import "../src/math" as m
 
-fn run_all() -> Int { m.double(21) }
+fn run_all() -> Int {
+  if m.double(21) == 42 {
+    0
+  } else {
+    1
+  }
+}
 "#,
     );
 

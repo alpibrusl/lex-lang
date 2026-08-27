@@ -4562,8 +4562,7 @@ fn cmd_policy_session_budget(fmt: &OutputFormat, args: &[String]) -> Result<()> 
     let mut policy = lex_store::policy::load(&root)
         .map_err(|e| anyhow!("loading policy.json: {e}"))?
         .unwrap_or_default();
-    let action;
-    match sub.as_str() {
+    let action = match sub.as_str() {
         "set-default" => {
             let n: u64 = rest
                 .first()
@@ -4571,7 +4570,7 @@ fn cmd_policy_session_budget(fmt: &OutputFormat, args: &[String]) -> Result<()> 
                 .parse()
                 .map_err(|e| anyhow!("invalid N: {e}"))?;
             policy.session_budgets.default_cap = Some(n);
-            action = format!("set default_cap to {n}");
+            format!("set default_cap to {n}")
         }
         "set" => {
             let id = rest
@@ -4584,7 +4583,7 @@ fn cmd_policy_session_budget(fmt: &OutputFormat, args: &[String]) -> Result<()> 
                 .parse()
                 .map_err(|e| anyhow!("invalid N: {e}"))?;
             policy.session_budgets.overrides.insert(id.clone(), Some(n));
-            action = format!("set override `{id}` to {n}");
+            format!("set override `{id}` to {n}")
         }
         "unbounded" => {
             let id = rest
@@ -4592,21 +4591,21 @@ fn cmd_policy_session_budget(fmt: &OutputFormat, args: &[String]) -> Result<()> 
                 .ok_or_else(|| anyhow!("usage: lex policy session-budget unbounded <session_id>"))?
                 .clone();
             policy.session_budgets.overrides.insert(id.clone(), None);
-            action = format!("set override `{id}` to unbounded");
+            format!("set override `{id}` to unbounded")
         }
         "clear" => {
             let id = rest
                 .first()
                 .ok_or_else(|| anyhow!("usage: lex policy session-budget clear <session_id>"))?;
             policy.session_budgets.overrides.remove(id);
-            action = format!("cleared override `{id}`");
+            format!("cleared override `{id}`")
         }
         "clear-default" => {
             policy.session_budgets.default_cap = None;
-            action = "cleared default_cap".into();
+            "cleared default_cap".into()
         }
         other => bail!("unknown `session-budget` subcommand: {other}"),
-    }
+    };
     lex_store::policy::save(&root, &policy).map_err(|e| anyhow!("writing policy.json: {e}"))?;
     let action_for_text = action.clone();
     let data = serde_json::json!({
