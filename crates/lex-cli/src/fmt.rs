@@ -41,9 +41,23 @@ pub fn cmd_fmt(args: &[String]) -> Result<()> {
     let mut changed = Vec::new();
     let mut errors  = Vec::new();
 
+    let mut would_lose = Vec::new();
+
     for file in &files {
         match fmt_file(file) {
             Ok(Some(formatted)) => {
+                // The formatter prints from an AST that carries comments only on
+                // items, so a comment inside a function body — or between a
+                // variant type and what follows it — has nowhere to live and
+                // disappears (#755). Preserving them needs trivia on statements;
+                // until then the one thing that must never happen is losing a
+                // comment SILENTLY. So the output is checked against the input,
+                // and a file that would lose one is left exactly as it is.
+                let lost = lost_comments(&read_for_compare(file)?, &formatted);
+                if !lost.is_empty() {
+                    would_lose.push((file.clone(), lost));
+                    continue;
+                }
                 if check {
                     changed.push(file.clone());
                 } else {
@@ -57,6 +71,20 @@ pub fn cmd_fmt(args: &[String]) -> Result<()> {
         }
     }
 
+    for (f, lost) in &would_lose {
+        eprintln!(
+            "skipped {}: formatting it would delete {} comment(s), so it was left unchanged (lex-lang#755)",
+            f.display(),
+            lost.len()
+        );
+        for c in lost.iter().take(3) {
+            eprintln!("           {c}");
+        }
+        if lost.len() > 3 {
+            eprintln!("           … and {} more", lost.len() - 3);
+        }
+    }
+
     for e in &errors {
         eprintln!("error: {e}");
     }
@@ -67,6 +95,12 @@ pub fn cmd_fmt(args: &[String]) -> Result<()> {
         }
         if !changed.is_empty() {
             anyhow::bail!("{} file(s) need formatting (run `lex fmt` to fix)", changed.len());
+        }
+        if !would_lose.is_empty() {
+            anyhow::bail!(
+                "{} file(s) cannot be formatted without deleting comments (lex-lang#755)",
+                would_lose.len()
+            );
         }
         println!("all {} file(s) are formatted", files.len());
     } else {
@@ -87,6 +121,41 @@ pub fn cmd_fmt(args: &[String]) -> Result<()> {
         anyhow::bail!("{} file(s) had parse errors", errors.len());
     }
     Ok(())
+}
+
+/// Read a file for comparison against its formatted output.
+fn read_for_compare(path: &Path) -> Result<String> {
+    std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))
+}
+
+/// Comment lines present in `before` that are missing from `after`.
+///
+/// Compared as a multiset of trimmed `#` lines, so re-indenting a comment is not
+/// a loss but deleting one is. Deliberately ignores position: the formatter is
+/// allowed to move a comment, only not to drop it.
+fn lost_comments(before: &str, after: &str) -> Vec<String> {
+    use std::collections::BTreeMap;
+
+    fn tally(s: &str) -> BTreeMap<String, usize> {
+        let mut m = BTreeMap::new();
+        for line in s.lines() {
+            let t = line.trim();
+            if t.starts_with('#') {
+                *m.entry(t.to_string()).or_insert(0) += 1;
+            }
+        }
+        m
+    }
+
+    let (a, b) = (tally(before), tally(after));
+    let mut lost = Vec::new();
+    for (comment, n_before) in a {
+        let n_after = b.get(&comment).copied().unwrap_or(0);
+        for _ in n_after..n_before {
+            lost.push(comment.clone());
+        }
+    }
+    lost
 }
 
 /// Returns `Some(formatted)` if the file needs reformatting, `None` if already canonical.

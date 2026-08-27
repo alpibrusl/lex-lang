@@ -21,6 +21,55 @@ bumps may carry breaking changes when justified).
   (`lex-runtime/src/policy.rs`); `docs/AGENT.md`'s effect table and
   stdlib index regenerated via `lex doc-sync` to include it.
 
+## [0.10.12] — 2026-08-27
+
+A correctness release for the two tools every repo runs in CI: the test runner
+was passing suites that reported failures, and the formatter was deleting
+comments. Both were silent, which is what made them expensive.
+
+### Fixed
+
+- **`lex test` now fails a file that REPORTS failures, not only one that
+  raises** (#757). `run_all`'s return value was discarded, so a suite that
+  returned a failure count — the shape nearly every suite in the wild uses,
+  because `std.test.assert_*` returns a `Result` rather than aborting — was
+  reported `ok` however many assertions failed. A green run meant "the file
+  loaded", not "the assertions held". The value is now honoured in the three
+  shapes suites actually return: `Unit` (the documented convention, unchanged),
+  a non-zero `Int` failure count, and a `List` containing any `Err` — whose
+  message is surfaced rather than only counted. Anything else still passes, so
+  an unusual-but-deliberate `run_all` is not broken.
+
+  **This will turn suites red that were green**, which is the point: they were
+  green because nothing checked them. A fixture returning a sentinel `Int` now
+  reads as that many failures and should return `0` or `()` instead.
+
+- **`lex fmt` no longer deletes comments** (#755). The formatter prints from an
+  AST that carries comments only on items, so a comment inside a function body —
+  or between a variant type and what follows it — had nowhere to live and
+  vanished, with no warning and no diff to review. Formatting a file that would
+  lose a comment is now **refused**: the file is left exactly as it is, the skip
+  is reported with the comments at stake, and `lex fmt --check` exits non-zero
+  naming the reason.
+
+  This is a safety net, not the fix. Preserving in-body comments needs trivia
+  attached to statements, and #755 stays open for it — but nothing is silently
+  lost in the meantime, and the workaround (move the comment above the function,
+  where the formatter keeps it) is now discoverable instead of folklore.
+
+### Changed
+
+- **The `effect-row-mismatch` explanation no longer assumes the body is at
+  fault** (#756). It said to narrow the body and explicitly "do NOT broaden the
+  declared row" — actively misleading when the *expected* row is the larger one,
+  which happens when a dependency widens its own fixed record-field row. That is
+  a breaking change for every dependent, and unpinned git dependencies deliver it
+  without any commit of the dependent's own. The message now tells you to read
+  the expected/got pair and says which fix each direction calls for. Note that
+  effect-row polymorphism (`[base | E]`, 0.10.0) does **not** cover nominal
+  record fields, so widening the annotation to match remains the only fix
+  today — #756 tracks the underlying gap.
+
 ## [0.10.11] — 2026-08-16
 
 ### Added

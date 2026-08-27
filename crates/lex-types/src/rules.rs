@@ -178,7 +178,7 @@ remove the call that produces it via `ModifyBody` (preferred when the effect was
         ),
         "effect-row-mismatch" => (
             "ModifyBody",
-            "Narrow the closure body to use only the effects in the declared row; do NOT broaden the row.",
+            "Compare the expected and got rows: narrow the body if it grew an effect, or widen your annotation if a dependency widened its own fixed row (lex-lang#756).",
             "Effect rows are invariant: the declared row must match exactly, so the intuitive repair \
 (adding the missing effect to the declared row) is wrong when that row is fixed by a record field or \
 other annotation — e.g. `Skill.handle`, `Tool.execute`. Use `ModifyBody` to remove or replace the \
@@ -234,8 +234,12 @@ to match.";
 const EFFECT_ROW_MISMATCH: &str = "Two function types failed to unify because their effect rows differ. \
 Effect rows unify by equality, not subtyping: a concrete row must match exactly — a superset or subset \
 is rejected. This most often surfaces on record-field closures (e.g. `Skill.handle`, `Tool.execute`), \
-whose declared effect row is fixed by the record type. Fix by narrowing the function body so it uses \
-only the effects in the declared row — do NOT broaden the declared row to match the body.";
+whose declared effect row is fixed by the record type. Which fix is right depends on which side moved. \
+If your body grew an effect the row does not have, narrow the body. If the EXPECTED row is the larger \
+one, a library you depend on has widened its own fixed row — adding an effect to a published \
+record-field row is a breaking change for every dependent, and unpinned git dependencies deliver it \
+without any commit of yours (lex-lang#756). Then the fix is to match the library: widen your \
+annotation to the row it now declares. Read the expected/got pair before changing anything.";
 const UNKNOWN_IDENT: &str = "A name referenced in scope is not declared. Either the binding is missing, \
 the name is misspelled, or an `import` is missing. Check for typos first; then verify the relevant \
 `let`, parameter, or top-level `fn` is in scope.";

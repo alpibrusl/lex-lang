@@ -1,8 +1,13 @@
 //! `lex test` — run test_*.lex files.
 //!
-//! Convention: each test file exports `fn run_all() -> ()`. The runner
-//! compiles the file, calls `run_all`, and reports pass/fail per file.
-//! Exit 0 iff every file passes.
+//! Convention: each test file exports `run_all`. The runner compiles the file,
+//! calls it, and reports pass/fail per file. Exit 0 iff every file passes.
+//!
+//! A file fails if `run_all` raises, OR if it *returns* a failure — a non-zero
+//! `Int` count, or a `List` containing any `Err`. Honouring the return value is
+//! #757: discarding it silently passed suites that reported failures rather
+//! than aborting, which is most of them, because `std.test.assert_*` returns a
+//! `Result` instead of raising.
 //!
 //! Flags:
 //!   --allow-effects k1,k2,...  override the runner's permissive
@@ -134,7 +139,58 @@ fn run_one(path: &Path, explicit_effects: Option<&BTreeSet<String>>) -> Result<(
     let bc = std::sync::Arc::new(bc);
     let handler = DefaultHandler::new(policy).with_program(std::sync::Arc::clone(&bc));
     let mut vm = Vm::with_handler(&bc, Box::new(handler));
-    vm.call("run_all", vec![])
+    let returned = vm
+        .call("run_all", vec![])
         .map_err(|e| anyhow::anyhow!("runtime: {e}"))?;
-    Ok(())
+    interpret_result(returned)
+}
+
+/// Decide pass/fail from what `run_all` returned.
+///
+/// The documented convention is `fn run_all() -> ()` asserting or panicking, and
+/// for a long time the return value was simply discarded. That silently passed
+/// every file whose `run_all` *reported* failures instead of raising — which is
+/// the shape most suites in the wild actually use, since `std.test.assert_*`
+/// returns a `Result` rather than aborting. A green run then meant "the file
+/// loaded", not "the assertions held" (#757).
+///
+/// So the value is now honoured, in the three shapes suites actually return:
+///
+///   `Unit`                     — the documented convention; the file raised or
+///                                it passed
+///   `Int`                      — a failure count; non-zero fails
+///   `List[Result[_, _]]`       — the results themselves; any `Err` fails
+///
+/// Anything else passes, so an unusual-but-deliberate `run_all` is not broken by
+/// this. The point is to stop *silently* passing a file that said it failed.
+fn interpret_result(v: lex_bytecode::value::Value) -> Result<()> {
+    use lex_bytecode::value::Value;
+    match v {
+        Value::Int(0) | Value::Unit => Ok(()),
+        Value::Int(n) => anyhow::bail!(
+            "run_all reported {n} failing assertion(s) — run it directly to see which"
+        ),
+        Value::List(items) => {
+            let failed: Vec<String> = items
+                .iter()
+                .filter_map(|it| match it {
+                    Value::Variant { name, args } if name == "Err" => Some(
+                        args.first()
+                            .map(|a| match a {
+                                Value::Str(s) => s.to_string(),
+                                other => format!("{other:?}"),
+                            })
+                            .unwrap_or_else(|| "unspecified".into()),
+                    ),
+                    _ => None,
+                })
+                .collect();
+            if failed.is_empty() {
+                Ok(())
+            } else {
+                anyhow::bail!("{} assertion(s) failed: {}", failed.len(), failed.join("; "))
+            }
+        }
+        _ => Ok(()),
+    }
 }
