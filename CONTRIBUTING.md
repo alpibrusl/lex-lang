@@ -64,6 +64,29 @@ your change:
 - **No backwards-compatibility shims** for unused features.
 - **No throwaway feature flags** for one-off rollouts.
 
+## Auditing a package's tests
+
+`scripts/mutation-audit.sh` checks whether a lex package's tests can actually
+fail. It changes one operator at a time in a test file and requires the suite
+to notice.
+
+```
+scripts/mutation-audit.sh ../lex-trail ../lex-web
+```
+
+This exists because a green suite is not evidence of a working suite.
+[#757](https://github.com/alpibrusl/lex-lang/issues/757) shipped a runner that
+discarded `run_all`'s verdict, so failing suites reported `ok` for weeks. That
+is fixed, but the same failure mode recurs above the toolchain, where nothing
+here can see it — a test left out of the list `run_all` folds over never runs,
+and an existence helper written `fold(xs, false, acc or x == target)` answers
+"contains anything else" as readily as "contains the expected item". A
+fleet-wide run found both.
+
+Survivors are leads, not verdicts. Read each one: real weaknesses, dead helpers
+nothing calls, and disjunctions whose second branch no input reaches all show up
+the same way. Files are restored with `git checkout`, so commit before running.
+
 ## Submitting a pull request
 
 1. Make a branch (see naming above).
