@@ -142,7 +142,7 @@ an exhaustive function list.
 | `std.rand` | `int_in` |
 | `std.random` | `seed`, `int`, `float`, `choose` |
 | `std.env` | `get` |
-| `std.net` | `get`, `post`, `serve`, `serve_tls`, `serve_ws`, `serve_ws_fn`, `serve_ws_fn_auth`, `serve_ws_fn_actor`, `dial_ws`, `dial_ws_actor`, `serve_fn`, `serve_routed`, `default_opts`, `serve_with`, `serve_fn_with`, `serve_routed_with`, `serve_quic`, `serve_quic_fn`, `serve_quic_routed` |
+| `std.net` | `get`, `post`, `udp_open`, `udp_close`, `udp_send`, `udp_recv`, `udp_broadcast`, `udp_join_multicast`, `serve`, `serve_tls`, `serve_ws`, `serve_ws_fn`, `serve_ws_fn_auth`, `serve_ws_fn_actor`, `dial_ws`, `dial_ws_actor`, `serve_fn`, `serve_routed`, `default_opts`, `serve_with`, `serve_fn_with`, `serve_routed_with`, `serve_quic`, `serve_quic_fn`, `serve_quic_routed` |
 | `std.tls` | `from_pem_files`, `self_signed` |
 | `std.chat` | `broadcast`, `send` |
 | `std.conc` | `spawn`, `ask`, `tell`, `register`, `lookup`, `unregister`, `registered` |

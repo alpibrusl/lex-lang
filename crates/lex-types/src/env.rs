@@ -115,6 +115,23 @@ impl TypeEnv {
             kind: TypeDefKind::Alias(Ty::Record(ar_fields)),
         });
 
+        // UdpDatagram = { data :: Bytes, host :: Str, port :: Int } —
+        // what `net.udp_recv` hands back (#760).
+        //
+        // The sender's address is part of the value rather than something
+        // the caller has to ask for separately, because with UDP it is not
+        // optional detail: any host can send to an open socket, so a reply
+        // that does not carry who sent it cannot be safely acted on. A
+        // request/response caller must check it matches who they asked.
+        let mut dg_fields = IndexMap::new();
+        dg_fields.insert("data".into(), Ty::bytes());
+        dg_fields.insert("host".into(), Ty::str());
+        dg_fields.insert("port".into(), Ty::int());
+        e.types.insert("UdpDatagram".into(), TypeDef {
+            params: vec![],
+            kind: TypeDefKind::Alias(Ty::Record(dg_fields)),
+        });
+
         // Iter[T]: lazy positional iterator (#364). Backed at runtime by a
         // (List[T], Int) tuple; the Int is the current cursor index. All
         // iter.* operations are compiler-inlined so no effect is needed.
