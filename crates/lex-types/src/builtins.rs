@@ -534,6 +534,74 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::singleton("net"),
                 Ty::Con("Result".into(), vec![Ty::str(), Ty::str()]),
             ));
+            // ── UDP datagrams (#760) ──────────────────────────────────
+            // Everything else in this module is a stream, and almost
+            // everything is HTTP. That leaves every protocol built on
+            // datagrams unreachable from Lex: Wake-on-LAN (a broadcast),
+            // NTP, mDNS/DNS-SD and SSDP discovery (multicast), MAVLink,
+            // and the device protocols behind most consumer hardware.
+            //
+            // Socket-handle shaped rather than one-shot, following
+            // `sql.open`: an Int handle into a runtime registry. A
+            // request/response helper would have covered the motivating
+            // case in one call, but not listening — mDNS and game traffic
+            // need a socket that outlives a single exchange.
+            //
+            //   udp_open(port)                    -> Result[Int, Str]
+            //   udp_close(sock)                   -> Result[Unit, Str]
+            //   udp_send(sock, host, port, data)  -> Result[Int, Str]
+            //   udp_recv(sock, timeout_ms)        -> Result[UdpDatagram, Str]
+            //   udp_broadcast(sock, on)           -> Result[Unit, Str]
+            //   udp_join_multicast(sock, group)   -> Result[Unit, Str]
+            //
+            // `udp_open(0)` binds an ephemeral port. `udp_send` returns the
+            // byte count written. `udp_recv` blocks up to `timeout_ms` and
+            // reports a timeout as `Err`, never as an empty datagram — an
+            // empty UDP payload is legal and must stay distinguishable from
+            // nothing having arrived.
+            //
+            // POLICY: `udp_send` honours `--allow-net-host` against the
+            // DESTINATION, exactly as `net.get` does against a URL's host.
+            // Without that a datagram socket would be a hole straight
+            // through the one gate the rest of this module respects.
+            // Broadcast and multicast addresses have to be named in the
+            // allowlist like any other destination, which is the intended
+            // friction: sending to 255.255.255.255 is a larger capability
+            // than sending to one known host, and should have to be asked
+            // for.
+            fields.insert("udp_open".into(), Ty::function(
+                vec![Ty::int()],
+                EffectSet::singleton("net"),
+                Ty::Con("Result".into(), vec![Ty::int(), Ty::str()]),
+            ));
+            fields.insert("udp_close".into(), Ty::function(
+                vec![Ty::int()],
+                EffectSet::singleton("net"),
+                Ty::Con("Result".into(), vec![Ty::Unit, Ty::str()]),
+            ));
+            fields.insert("udp_send".into(), Ty::function(
+                vec![Ty::int(), Ty::str(), Ty::int(), Ty::bytes()],
+                EffectSet::singleton("net"),
+                Ty::Con("Result".into(), vec![Ty::int(), Ty::str()]),
+            ));
+            fields.insert("udp_recv".into(), Ty::function(
+                vec![Ty::int(), Ty::int()],
+                EffectSet::singleton("net"),
+                Ty::Con("Result".into(), vec![
+                    Ty::Con("UdpDatagram".into(), vec![]), Ty::str(),
+                ]),
+            ));
+            fields.insert("udp_broadcast".into(), Ty::function(
+                vec![Ty::int(), Ty::bool()],
+                EffectSet::singleton("net"),
+                Ty::Con("Result".into(), vec![Ty::Unit, Ty::str()]),
+            ));
+            fields.insert("udp_join_multicast".into(), Ty::function(
+                vec![Ty::int(), Ty::str()],
+                EffectSet::singleton("net"),
+                Ty::Con("Result".into(), vec![Ty::Unit, Ty::str()]),
+            ));
+
             // serve :: (Int, Str) -> [net] Unit  (blocks; never returns
             // under normal use). Handler's signature isn't carried in
             // the type system here — looked up by name at runtime.

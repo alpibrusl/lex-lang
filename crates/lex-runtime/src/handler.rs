@@ -700,6 +700,24 @@ impl DefaultHandler {
         }
     }
 
+    /// The `--allow-net-host` gate, applied to a datagram destination.
+    ///
+    /// `ensure_host_allowed` takes a URL; a UDP destination is already a
+    /// bare host, so this is the same check without the parse. Kept as its
+    /// own function so the error names the datagram rather than pretending
+    /// a URL was involved.
+    fn ensure_udp_dest_allowed(&self, host: &str) -> Result<(), String> {
+        if self.policy.allow_net_host.is_empty() { return Ok(()); }
+        if self.policy.allow_net_host.iter().any(|h| host == h) {
+            Ok(())
+        } else {
+            Err(format!(
+                "net.udp_send to `{host}` not in --allow-net-host {:?}",
+                self.policy.allow_net_host,
+            ))
+        }
+    }
+
     /// Enforce `--allow-net-host` against an outgoing URL. Empty
     /// allowlist = any host. Non-empty = the URL's host must match
     /// (substring; port-agnostic) at least one entry.
@@ -1334,6 +1352,134 @@ impl EffectHandler for DefaultHandler {
                 let body = expect_str(args.get(1))?.to_string();
                 self.ensure_host_allowed(&url)?;
                 Ok(http_request("POST", &url, Some(&body)))
+            }
+            // ── UDP datagrams (#760) ──────────────────────────────
+            ("net", "udp_open") => {
+                let port = match args.first() {
+                    Some(Value::Int(n)) if (0..=65535).contains(n) => *n as u16,
+                    _ => return Err("net.udp_open(port): port must be Int 0..=65535".into()),
+                };
+                let mut reg = udp_registry().lock().unwrap();
+                if reg.len() >= MAX_UDP_HANDLES {
+                    return Ok(err(Value::Str(format!(
+                        "net.udp_open: too many open sockets ({MAX_UDP_HANDLES}); \
+                         close them with net.udp_close"
+                    ).into())));
+                }
+                match std::net::UdpSocket::bind(("0.0.0.0", port)) {
+                    Ok(sock) => {
+                        let handle = next_udp_handle();
+                        reg.insert(handle, sock);
+                        Ok(ok(Value::Int(handle as i64)))
+                    }
+                    Err(e) => Ok(err(Value::Str(format!("net.udp_open: {e}").into()))),
+                }
+            }
+            ("net", "udp_close") => {
+                let handle = expect_int(args.first()).map_err(|e| format!("net.udp_close(sock): {e}"))?;
+                // Dropping the socket closes it. Idempotent on purpose: a
+                // double close is a caller being careful, not an error.
+                udp_registry().lock().unwrap().remove(&(handle as u64));
+                Ok(ok(Value::Unit))
+            }
+            ("net", "udp_send") => {
+                let handle = expect_int(args.first()).map_err(|e| format!("net.udp_send(sock, ...): {e}"))?;
+                let host = expect_str(args.get(1))?.to_string();
+                let port = match args.get(2) {
+                    Some(Value::Int(n)) if (0..=65535).contains(n) => *n as u16,
+                    _ => return Err("net.udp_send(sock, host, port, data): port must be Int 0..=65535".into()),
+                };
+                let data = match args.get(3) {
+                    Some(Value::Bytes(b)) => b.clone(),
+                    _ => return Err("net.udp_send(sock, host, port, data): data must be Bytes".into()),
+                };
+                // The same gate `net.get` applies to a URL's host, applied
+                // to the datagram's destination. Without this, `udp_send`
+                // would be a way around the only network policy this
+                // module has. Broadcast and multicast addresses are not
+                // special-cased: they must be allowlisted like anything
+                // else, which is the point.
+                if let Err(e) = self.ensure_udp_dest_allowed(&host) {
+                    return Ok(err(Value::Str(e.into())));
+                }
+                let res = with_udp(handle, "net.udp_send", |sock| {
+                    sock.send_to(&data, (host.as_str(), port))
+                        .map_err(|e| format!("net.udp_send: {e}"))
+                });
+                match res {
+                    Ok(n) => Ok(ok(Value::Int(n as i64))),
+                    Err(e) => Ok(err(Value::Str(e.into()))),
+                }
+            }
+            ("net", "udp_recv") => {
+                let handle = expect_int(args.first()).map_err(|e| format!("net.udp_recv(sock, ...): {e}"))?;
+                let timeout_ms = expect_int(args.get(1)).map_err(|e| format!("net.udp_recv(..., timeout_ms): {e}"))?;
+                if timeout_ms < 0 {
+                    return Err("net.udp_recv(sock, timeout_ms): timeout_ms must be >= 0".into());
+                }
+                let res = with_udp(handle, "net.udp_recv", |sock| {
+                    // 0 means "no timeout" to the OS, which would block
+                    // this thread forever. Callers asking for 0 want a
+                    // poll, so give them the shortest real timeout instead.
+                    let d = std::time::Duration::from_millis(
+                        if timeout_ms == 0 { 1 } else { timeout_ms as u64 });
+                    sock.set_read_timeout(Some(d))
+                        .map_err(|e| format!("net.udp_recv: setting timeout: {e}"))?;
+                    // 65507 is the largest payload IPv4/UDP can carry, so
+                    // this cannot truncate a legal datagram. recv_from
+                    // discards any excess rather than reporting it, which
+                    // would be a silent wrong answer.
+                    let mut buf = vec![0u8; 65_507];
+                    match sock.recv_from(&mut buf) {
+                        Ok((n, addr)) => {
+                            buf.truncate(n);
+                            Ok(udp_datagram_value(buf, addr))
+                        }
+                        Err(e) if matches!(e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) =>
+                            // Deliberately Err, not an empty datagram: a
+                            // zero-length UDP payload is legal, and the
+                            // caller must be able to tell "nothing came"
+                            // from "something empty came".
+                            Err(format!("net.udp_recv: timed out after {timeout_ms}ms")),
+                        Err(e) => Err(format!("net.udp_recv: {e}")),
+                    }
+                });
+                match res {
+                    Ok(v) => Ok(ok(v)),
+                    Err(e) => Ok(err(Value::Str(e.into()))),
+                }
+            }
+            ("net", "udp_broadcast") => {
+                let handle = expect_int(args.first()).map_err(|e| format!("net.udp_broadcast(sock, on): {e}"))?;
+                let on = matches!(args.get(1), Some(Value::Bool(true)));
+                let res = with_udp(handle, "net.udp_broadcast", |sock| {
+                    sock.set_broadcast(on)
+                        .map_err(|e| format!("net.udp_broadcast: {e}"))
+                });
+                match res {
+                    Ok(()) => Ok(ok(Value::Unit)),
+                    Err(e) => Ok(err(Value::Str(e.into()))),
+                }
+            }
+            ("net", "udp_join_multicast") => {
+                let handle = expect_int(args.first()).map_err(|e| format!("net.udp_join_multicast(sock, group): {e}"))?;
+                let group = expect_str(args.get(1))?.to_string();
+                let res = with_udp(handle, "net.udp_join_multicast", |sock| {
+                    let g: std::net::Ipv4Addr = group.parse().map_err(|_| format!(
+                        "net.udp_join_multicast: `{group}` is not an IPv4 address"))?;
+                    if !g.is_multicast() {
+                        return Err(format!(
+                            "net.udp_join_multicast: {g} is not a multicast address \
+                             (224.0.0.0/4)"));
+                    }
+                    sock.join_multicast_v4(&g, &std::net::Ipv4Addr::UNSPECIFIED)
+                        .map_err(|e| format!("net.udp_join_multicast: {e}"))
+                });
+                match res {
+                    Ok(()) => Ok(ok(Value::Unit)),
+                    Err(e) => Ok(err(Value::Str(e.into()))),
+                }
             }
             ("net", "serve") => {
                 let port = match args.first() {
@@ -5024,6 +5170,55 @@ fn expect_redis_handle(v: Option<&Value>) -> Result<u64, String> {
         None => Err("missing ConnRedis argument".into()),
     }
 }
+
+// ── UDP datagrams (#760) ─────────────────────────────────────────────
+//
+// Handle-based, mirroring `sql.open`: an Int index into a process-global
+// registry, because a socket has a lifetime the Lex value model has no
+// way to carry.
+//
+// Capped like the SQL registry. A leaked socket is a leaked file
+// descriptor, and a program that opens them in a loop should fail with a
+// message naming the cause rather than exhausting the process's fds and
+// failing somewhere unrelated.
+const MAX_UDP_HANDLES: usize = 256;
+
+fn udp_registry() -> &'static Mutex<std::collections::HashMap<u64, std::net::UdpSocket>> {
+    static REGISTRY: OnceLock<Mutex<std::collections::HashMap<u64, std::net::UdpSocket>>> =
+        OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn next_udp_handle() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    COUNTER.fetch_add(1, Ordering::SeqCst)
+}
+
+/// Run `f` against the socket behind `handle`.
+///
+/// The socket is used through the registry lock rather than cloned out of
+/// it, so a `udp_close` racing a `udp_recv` cannot pull the fd out from
+/// under a blocked read.
+fn with_udp<T>(
+    handle: i64,
+    op: &str,
+    f: impl FnOnce(&std::net::UdpSocket) -> Result<T, String>,
+) -> Result<T, String> {
+    let reg = udp_registry().lock().unwrap();
+    match reg.get(&(handle as u64)) {
+        Some(sock) => f(sock),
+        None => Err(format!("{op}: no open socket with handle {handle} (closed, or never opened?)")),
+    }
+}
+
+fn udp_datagram_value(data: Vec<u8>, addr: std::net::SocketAddr) -> Value {
+    let mut rec = indexmap::IndexMap::new();
+    rec.insert("data".into(), Value::Bytes(data));
+    rec.insert("host".into(), Value::Str(addr.ip().to_string().into()));
+    rec.insert("port".into(), Value::Int(i64::from(addr.port())));
+    Value::record_dynamic(rec)
+}
+
 
 /// Process-wide registry of open `Db` handles. Same shape as the kv
 /// and process registries: per-handle `Arc<Mutex<…>>` so dispatch
