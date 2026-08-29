@@ -1542,6 +1542,8 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         ("crypto", "aes_gcm_open") => Ok(aes_gcm_open_impl(args)),
         ("crypto", "chacha20_poly1305_seal") => Ok(chacha20_seal_impl(args)),
         ("crypto", "chacha20_poly1305_open") => Ok(chacha20_open_impl(args)),
+        ("crypto", "aes_cbc_encrypt_raw") => Ok(aes_cbc_impl(args, true)),
+        ("crypto", "aes_cbc_decrypt_raw") => Ok(aes_cbc_impl(args, false)),
         ("crypto", "pbkdf2_sha256") => Ok(pbkdf2_sha256_impl(args)),
         ("crypto", "hkdf_sha256")   => Ok(hkdf_sha256_impl(args)),
         ("crypto", "argon2id")      => Ok(argon2id_impl(args)),
@@ -3078,6 +3080,79 @@ fn aead_result(ciphertext: Vec<u8>, tag: Vec<u8>) -> Value {
 fn aead_err(msg: impl Into<String>) -> Value {
     let s: String = msg.into();
     err_v(Value::Str(s.into()))
+}
+
+/// AES-CBC, unauthenticated, for legacy protocol interop only (#760).
+///
+/// One function for both directions because everything except the final
+/// call is shared, and duplicating the validation is how the two drift.
+///
+/// Deliberately NOT authenticated: callers reaching this are speaking a
+/// wire format defined by somebody else (miio, Tuya, and friends), where
+/// adding a MAC is not an option. Anything with a choice wants
+/// `aes_gcm_seal`. See the note on the type declaration.
+fn aes_cbc_impl(args: &[Value], encrypt: bool) -> Value {
+    use aes::{Aes128, Aes192, Aes256};
+    use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
+
+    let op = if encrypt { "aes_cbc_encrypt_raw" } else { "aes_cbc_decrypt_raw" };
+    let pick = |i: usize, name: &str| -> Result<&Vec<u8>, String> {
+        match args.get(i) {
+            Some(Value::Bytes(b)) => Ok(b),
+            Some(other) => Err(format!("{op}: {name} must be Bytes, got {other:?}")),
+            None => Err(format!("{op}: missing {name} argument")),
+        }
+    };
+    let (key, iv, data) = match (pick(0, "key"), pick(1, "iv"), pick(2, "data")) {
+        (Ok(k), Ok(v), Ok(d)) => (k, v, d),
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return aead_err(e),
+    };
+    if iv.len() != 16 {
+        return aead_err(format!("{op}: iv must be exactly 16 bytes, got {}", iv.len()));
+    }
+    // A ciphertext that is not a whole number of blocks cannot have come
+    // from this cipher. Saying so beats letting the padding check fail
+    // later with a less specific message.
+    if !encrypt && (data.is_empty() || data.len() % 16 != 0) {
+        return aead_err(format!(
+            "{op}: ciphertext must be a non-zero multiple of the 16-byte block size, got {}",
+            data.len()
+        ));
+    }
+
+    // The three key lengths are three distinct types, so the match arms
+    // cannot be collapsed without boxing; the macro keeps them honest
+    // instead of inviting a copy-paste divergence between them.
+    macro_rules! run {
+        ($cipher:ty) => {
+            if encrypt {
+                type Enc = cbc::Encryptor<$cipher>;
+                Ok(Enc::new(key.as_slice().into(), iv.as_slice().into())
+                    .encrypt_padded_vec_mut::<Pkcs7>(data))
+            } else {
+                type Dec = cbc::Decryptor<$cipher>;
+                Dec::new(key.as_slice().into(), iv.as_slice().into())
+                    .decrypt_padded_vec_mut::<Pkcs7>(data)
+                    .map_err(|_| {
+                        // Deliberately terse and identical for every padding
+                        // failure. This mode is already a padding oracle by
+                        // construction; there is no reason to make it a more
+                        // articulate one.
+                        format!("{op}: invalid padding or wrong key/iv")
+                    })
+            }
+        };
+    }
+    let out: Result<Vec<u8>, String> = match key.len() {
+        16 => run!(Aes128),
+        24 => run!(Aes192),
+        32 => run!(Aes256),
+        n => Err(format!("{op}: key must be 16, 24, or 32 bytes, got {n}")),
+    };
+    match out {
+        Ok(bytes) => ok_v(Value::Bytes(bytes)),
+        Err(e) => aead_err(e),
+    }
 }
 
 fn aes_gcm_seal_impl(args: &[Value]) -> Value {

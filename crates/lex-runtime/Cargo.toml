@@ -32,6 +32,11 @@ k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"]
 sha3 = "0.12"
 blake2 = "0.10"
 aes-gcm = "0.10"
+# AES-CBC, unauthenticated, for speaking legacy device protocols only
+# (see crypto.aes_cbc_*_raw). `aes` is already in the tree via aes-gcm;
+# both are RustCrypto and share cipher 0.4.
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
 chacha20poly1305 = "0.10"
 pbkdf2 = { version = "0.13", default-features = false }
 hkdf = "0.13"

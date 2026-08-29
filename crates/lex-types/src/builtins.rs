@@ -2027,6 +2027,34 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 ));
             }
 
+            // AES-CBC, UNAUTHENTICATED (#760). Retained on the same footing
+            // as `md5` above: present because protocols someone else designed
+            // demand it, never because it is a good way to protect anything.
+            // New code wants `aes_gcm_seal`.
+            //
+            // The `_raw` suffix is deliberate and load-bearing. There is no
+            // MAC here, so ciphertext is malleable and decryption is a
+            // padding oracle for anyone who can feed it input. A name that
+            // sat naturally beside `aes_gcm_seal` would eventually be reached
+            // for by someone storing a secret, which is the failure this
+            // naming exists to make awkward.
+            //
+            //   aes_cbc_encrypt_raw(key, iv, plaintext)  -> Result[Bytes, Str]
+            //   aes_cbc_decrypt_raw(key, iv, ciphertext) -> Result[Bytes, Str]
+            //
+            // Key length selects the variant (16/24/32 -> AES-128/192/256),
+            // matching how `aes_gcm_seal` already infers from the key slice.
+            // The IV is always 16 bytes. Padding is PKCS#7, applied on
+            // encrypt and validated on decrypt — a bad pad is `Err`, not a
+            // panic and not silently-truncated plaintext.
+            for name in &["aes_cbc_encrypt_raw", "aes_cbc_decrypt_raw"] {
+                fields.insert((*name).into(), Ty::function(
+                    vec![Ty::bytes(), Ty::bytes(), Ty::bytes()],
+                    EffectSet::empty(),
+                    Ty::Con("Result".into(), vec![Ty::bytes(), Ty::str()]),
+                ));
+            }
+
             // KDFs: key-derivation functions (#382 KDF slice). All three
             // return `Result[Bytes, Str]` so caller-controlled inputs
             // (iteration count, output length, argon2id work factors)
