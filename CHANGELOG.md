@@ -7,6 +7,53 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.10.13] — 2026-08-29
+
+Two primitives that were missing rather than deferred: with neither, no
+protocol outside HTTP was reachable from Lex at all. Both land as narrow
+additions — no existing signature changes, no effect row widens (cf. #756).
+
+### Added
+
+- **`net.udp_*` — datagram sockets** (#760, #762). `udp_open`,
+  `udp_close`, `udp_send`, `udp_recv`, `udp_broadcast`,
+  `udp_join_multicast`, returning the new `UdpDatagram`
+  record (`{ data, host, port }`). `std.net` previously offered only
+  streams, and almost only HTTP, which left Wake-on-LAN, NTP,
+  mDNS/DNS-SD and SSDP discovery, MAVLink, and most consumer device
+  protocols unreachable.
+
+  Socket-handle shaped, mirroring `sql.open`: an Int into a bounded
+  runtime registry. `udp_send` honours `--allow-net-host` against the
+  **destination**, exactly as `net.get` does against a URL's host —
+  without that, a datagram socket would be a way around the only
+  network policy the module has. Broadcast and multicast addresses are
+  not special-cased and must be allowlisted like any other
+  destination; enabling `SO_BROADCAST` is not itself permission to
+  broadcast. A receive timeout is `Err`, never an empty datagram,
+  because a zero-length UDP payload is legal and the two must stay
+  distinguishable.
+
+- **`crypto.aes_cbc_encrypt_raw` / `crypto.aes_cbc_decrypt_raw`** (#760,
+  #761). Unauthenticated AES-CBC, PKCS#7, key length selecting the
+  variant (16/24/32) as `aes_gcm_seal` already does.
+
+  Not a new capability so much as an interop escape hatch: `std.crypto`
+  has had authenticated encryption for some time (`aes_gcm_seal`,
+  `chacha20_poly1305_seal`), and this exists only to speak wire formats
+  somebody else designed around raw CBC. Added on the same footing as
+  `md5` — present because protocols demand it, never because it is a
+  good way to protect anything. The `_raw` suffix is deliberate: there
+  is no MAC, so ciphertext is malleable and decryption is a padding
+  oracle, and a name that sat naturally beside `aes_gcm_seal` would
+  eventually be reached for by someone storing a secret.
+
+## [0.10.12] — 2026-08-27
+
+A correctness release for the two tools every repo runs in CI: the test runner
+was passing suites that reported failures, and the formatter was deleting
+comments. Both were silent, which is what made them expensive.
+
 ### Added
 
 - **`std.moe` — MoE expert-store placement ops** (downstream
@@ -20,12 +67,6 @@ bumps may carry breaking changes when justified).
   constructs at runtime. New `moe` row in `KNOWN_EFFECTS`
   (`lex-runtime/src/policy.rs`); `docs/AGENT.md`'s effect table and
   stdlib index regenerated via `lex doc-sync` to include it.
-
-## [0.10.12] — 2026-08-27
-
-A correctness release for the two tools every repo runs in CI: the test runner
-was passing suites that reported failures, and the formatter was deleting
-comments. Both were silent, which is what made them expensive.
 
 ### Fixed
 

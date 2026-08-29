@@ -24,7 +24,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.10.12"
+version = "0.10.13"
 edition = "2021"
 # Minimum supported Rust. Determined empirically, not aspirationally: the
 # floor is `libsqlite3-sys` (via rusqlite → lex-runtime), whose *build
