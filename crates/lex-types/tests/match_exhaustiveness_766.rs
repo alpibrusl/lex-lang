@@ -324,3 +324,107 @@ fn f(x :: Option[Int]) -> Int {
     let errs = check(src).unwrap_err();
     assert_eq!(errs[0].rule_tag(), "non-exhaustive-match");
 }
+
+// --- recursive types (reported on the PR: stack overflow) ------------
+//
+// A wildcard arm accepts every constructor but names none, so it must
+// never make the pass descend into a payload type. On a type that
+// contains itself, doing so recursed until the stack ran out and
+// aborted `lex check` on files with no hole at all.
+
+#[test]
+fn wildcard_arm_on_self_recursive_union_terminates() {
+    let src = r#"
+type Kind = Leaf(Int) | Pair((Kind, Kind)) | Many(List[Kind])
+
+fn depth(k :: Kind) -> Int {
+  match k {
+    Leaf(_) => 0,
+    _ => 1,
+  }
+}
+"#;
+    assert_ok(src);
+}
+
+#[test]
+fn all_arms_named_on_self_recursive_union_terminates() {
+    let src = r#"
+type Kind = Leaf(Int) | Pair((Kind, Kind))
+
+fn depth(k :: Kind) -> Int {
+  match k {
+    Leaf(_) => 0,
+    Pair(p) => 1,
+  }
+}
+"#;
+    assert_ok(src);
+}
+
+#[test]
+fn mutually_recursive_union_and_records_terminate() {
+    // The lex-schema shape: a union whose payloads reach back to it
+    // through a tuple and through a record whose field is a list.
+    let src = r#"
+type FieldKind = KStr | KBool | KArray((FieldKind, List[Int])) | KObject(ModelSchema)
+type Field = { name :: Str, kind :: FieldKind }
+type ModelSchema = { title :: Str, fields :: List[Field] }
+
+fn name(k :: FieldKind) -> Str {
+  match k {
+    KStr => "str",
+    KBool => "bool",
+    KArray(_, _) => "array",
+    KObject(sub) => sub.title,
+  }
+}
+
+fn is_array(k :: FieldKind) -> Bool {
+  match k {
+    KArray(_, _) => true,
+    _ => false,
+  }
+}
+
+fn first_field_kind(m :: ModelSchema) -> Str {
+  match m {
+    { title: t } => t,
+  }
+}
+"#;
+    assert_ok(src);
+}
+
+#[test]
+fn hole_inside_recursive_payload_is_still_found() {
+    let src = r#"
+type Kind = Leaf(Bool) | Pair((Kind, Kind))
+
+fn f(k :: Kind) -> Int {
+  match k {
+    Leaf(true) => 0,
+    Leaf(false) => 1,
+    Pair((Leaf(_), _)) => 2,
+  }
+}
+"#;
+    assert_eq!(missing(src), vec!["Pair(Pair(_), _)"]);
+}
+
+#[test]
+fn wildcard_row_inside_recursive_payload_covers_it() {
+    let src = r#"
+type Kind = Leaf(Bool) | Pair((Kind, Kind))
+
+fn f(k :: Kind) -> Int {
+  match k {
+    Leaf(true) => 0,
+    Leaf(false) => 1,
+    Pair((Leaf(_), rest)) => 2,
+    Pair(_) => 3,
+  }
+}
+"#;
+    assert_ok(src);
+}

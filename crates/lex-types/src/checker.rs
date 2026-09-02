@@ -1516,6 +1516,9 @@ impl Checker {
 /// remaining columns); past this many the extra rows say nothing new.
 const MAX_MISSING_WITNESSES: usize = 8;
 
+/// Alias-unfolding bound in `signature_of`; see there.
+const MAX_ALIAS_UNFOLDS: usize = 64;
+
 /// One column's constructor signature, as `missing_patterns` sees it.
 enum Signature {
     /// Named constructors, each with an optional payload column type.
@@ -1551,7 +1554,41 @@ impl Checker {
     /// Classify a column type into the constructor signature its
     /// patterns are checked against.
     fn signature_of(&self, ty: &Ty) -> Signature {
-        match self.u.resolve(ty) {
+        let mut ty = self.u.resolve(ty);
+        // Unfold alias chains iteratively. A well-formed program's
+        // chains are short; the bound only stops a cyclic alias from
+        // looping, in which case the type is treated as opaque.
+        let mut unfolds = 0;
+        while let Ty::Con(name, args) = &ty {
+            let Some(td) = self.type_env.types.get(name) else {
+                return Signature::Opaque;
+            };
+            if td.params.len() != args.len() {
+                return Signature::Opaque;
+            }
+            let mut subst = IndexMap::new();
+            for (i, a) in args.iter().enumerate() {
+                subst.insert(i as u32, a.clone());
+            }
+            match &td.kind {
+                TypeDefKind::Union(variants) => {
+                    return Signature::Ctors(
+                        variants.iter().map(|(v, payload)| {
+                            (v.clone(), payload.as_ref().map(|p| subst_vars(p, &subst, &IndexMap::new())))
+                        }).collect(),
+                    );
+                }
+                TypeDefKind::Alias(inner) => {
+                    unfolds += 1;
+                    if unfolds > MAX_ALIAS_UNFOLDS {
+                        return Signature::Opaque;
+                    }
+                    ty = self.u.resolve(&subst_vars(inner, &subst, &IndexMap::new()));
+                }
+                TypeDefKind::Opaque => return Signature::Opaque,
+            }
+        }
+        match ty {
             Ty::Never => Signature::Never,
             Ty::Prim(Prim::Bool) => Signature::Ctors(vec![
                 ("true".into(), None),
@@ -1566,31 +1603,24 @@ impl Checker {
                 fields: fs.into_iter().collect(),
                 kind: ProductKind::Record,
             },
-            Ty::Con(name, args) => {
-                let Some(td) = self.type_env.types.get(&name) else {
-                    return Signature::Opaque;
-                };
-                if td.params.len() != args.len() {
-                    return Signature::Opaque;
-                }
-                let mut subst = IndexMap::new();
-                for (i, a) in args.iter().enumerate() {
-                    subst.insert(i as u32, a.clone());
-                }
-                match &td.kind {
-                    TypeDefKind::Union(variants) => Signature::Ctors(
-                        variants.iter().map(|(v, payload)| {
-                            (v.clone(), payload.as_ref().map(|p| subst_vars(p, &subst, &IndexMap::new())))
-                        }).collect(),
-                    ),
-                    TypeDefKind::Alias(inner) => {
-                        let unfolded = subst_vars(inner, &subst, &IndexMap::new());
-                        self.signature_of(&unfolded)
-                    }
-                    TypeDefKind::Opaque => Signature::Opaque,
-                }
-            }
             _ => Signature::Opaque,
+        }
+    }
+
+    /// The constructor a pattern commits to at its head, if any. A
+    /// wildcard or binder commits to none: it accepts every
+    /// constructor but names none, so it never makes a signature
+    /// complete on its own. That distinction is what keeps the
+    /// usefulness recursion finite on recursive types: a column is
+    /// only ever specialised because some arm wrote a constructor
+    /// there, and arms have finite depth.
+    fn head_ctor(p: &a::Pattern) -> Option<&str> {
+        match p {
+            a::Pattern::PConstructor { name, .. } => Some(name.as_str()),
+            a::Pattern::PLiteral { value: a::CLit::Bool { value } } => Some(if *value { "true" } else { "false" }),
+            a::Pattern::PLiteral { value: a::CLit::Unit } => Some("()"),
+            a::Pattern::PTuple { items } if items.is_empty() => Some("()"),
+            _ => None,
         }
     }
 
@@ -1673,14 +1703,26 @@ impl Checker {
                 Some(ws.into_iter().map(|mut w| { w.insert(0, "_".into()); w }).collect())
             }
             Signature::Product { fields, kind } => {
-                let spec: Vec<Vec<a::Pattern>> = rows.iter().filter_map(|r| {
-                    let mut sub = Self::specialize_product(&r[0], &fields, kind)?;
-                    sub.extend_from_slice(&r[1..]);
-                    Some(sub)
-                }).collect();
-                let mut sub_tys: Vec<Ty> = fields.iter().map(|(_, t)| t.clone()).collect();
-                sub_tys.extend_from_slice(rest_tys);
-                let ws = self.missing_patterns(&spec, &sub_tys)?;
+                let ws: Vec<Vec<String>> = if rows.iter().all(|r| is_wild(&r[0])) {
+                    // No arm looks inside the product, so splitting
+                    // it into fields cannot change the answer, and on
+                    // a recursive type it would never bottom out. The
+                    // default matrix decides; the fields render as `_`.
+                    self.missing_patterns(&default_rows(rows), rest_tys)?.into_iter().map(|w| {
+                        let mut row = vec!["_".to_string(); fields.len()];
+                        row.extend(w);
+                        row
+                    }).collect()
+                } else {
+                    let spec: Vec<Vec<a::Pattern>> = rows.iter().filter_map(|r| {
+                        let mut sub = Self::specialize_product(&r[0], &fields, kind)?;
+                        sub.extend_from_slice(&r[1..]);
+                        Some(sub)
+                    }).collect();
+                    let mut sub_tys: Vec<Ty> = fields.iter().map(|(_, t)| t.clone()).collect();
+                    sub_tys.extend_from_slice(rest_tys);
+                    self.missing_patterns(&spec, &sub_tys)?
+                };
                 Some(ws.into_iter().map(|w| {
                     let (head, rest) = w.split_at(fields.len());
                     let rendered = match kind {
@@ -1699,14 +1741,16 @@ impl Checker {
                 }).collect())
             }
             Signature::Ctors(variants) => {
-                let missing: Vec<&(String, Option<Ty>)> = variants.iter().filter(|(name, payload)| {
-                    !rows.iter().any(|r| Self::specialize_ctor(&r[0], name, payload.is_some()).is_some())
+                let present: Vec<&str> = rows.iter().filter_map(|r| Self::head_ctor(&r[0])).collect();
+                let missing: Vec<&(String, Option<Ty>)> = variants.iter().filter(|(name, _)| {
+                    !present.iter().any(|p| p == name)
                 }).collect();
                 if missing.is_empty() {
                     // Complete signature: every variant is named by
-                    // some arm (or a wildcard stands in). Check each
-                    // variant's specialised matrix; the first one with
-                    // a hole yields the witnesses.
+                    // some arm. Check each variant's specialised
+                    // matrix (wildcard rows join each one with a `_`
+                    // payload); the first one with a hole yields the
+                    // witnesses.
                     for (name, payload) in &variants {
                         let spec: Vec<Vec<a::Pattern>> = rows.iter().filter_map(|r| {
                             let mut sub = Self::specialize_ctor(&r[0], name, payload.is_some())?;
@@ -1728,8 +1772,8 @@ impl Checker {
                     None
                 } else {
                     // Incomplete signature: any value built from a
-                    // missing variant can only be caught by a wildcard
-                    // row, so the default matrix decides.
+                    // variant no arm names can only be caught by a
+                    // wildcard row, so the default matrix decides.
                     let ws = self.missing_patterns(&default_rows(rows), rest_tys)?;
                     let mut out = Vec::new();
                     for (name, payload) in missing {
