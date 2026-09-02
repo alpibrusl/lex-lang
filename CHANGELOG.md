@@ -7,6 +7,24 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`lex check` now enforces match exhaustiveness** (#766). A `match`
+  missing arms for some values of its scrutinee's type passed the
+  checker as `ok` and panicked at runtime with `non-exhaustive match`;
+  the only case ever rejected was a `match` with no arms at all,
+  despite `docs/AGENT_GUIDELINES.md` §2.5 promising the checker
+  enforces it. The checker now runs a pattern-matrix usefulness check
+  over unions (built-in and user-defined, including generic payloads),
+  `Bool`, `Unit`, tuples, records (aliases unfolded), and nested
+  patterns; `Int`, `Str`, and other opaque scrutinees require a
+  wildcard or binder arm. The `non-exhaustive-match` error's `missing`
+  field lists the uncovered value shapes as pattern text
+  (`None`, `Some(false)`, `(None, false)`, `{ flag: false }`), capped
+  at eight. Code that relied on the gap will now fail `lex check`;
+  the fix is to add the listed arms, or `_ =>` when a catch-all is
+  intended.
+
 ## [0.10.13] — 2026-08-29
 
 Two primitives that were missing rather than deferred: with neither, no
