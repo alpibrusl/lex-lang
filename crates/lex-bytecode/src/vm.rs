@@ -124,6 +124,45 @@ pub const STACK_RECORD_BUDGET_SLOTS: u32 = 64;
 /// chance" against "don't pay the hash forever on always-miss code".
 const MEMO_WARMUP_CALLS: u32 = 64;
 
+/// Largest argument payload (Str / Bytes bytes plus one per nested
+/// value) a pure call may carry and still be memoized (#764). The
+/// memo key hashes every argument in full, so a call is charged the
+/// size of its arguments whether or not the cache ever hits. The
+/// adaptive gate above only retires a function that never hits; a
+/// scanner helper like `char_at(src, p)` over a 300 KB document
+/// hits once early (the same position is peeked twice), stays
+/// enabled, and then pays 300 KB of hashing per character, which
+/// turns a linear walk into a quadratic one. Calls over this budget
+/// take the plain path; nothing that large repeats often enough
+/// for the cache to pay for itself.
+const MEMO_MAX_ARG_BYTES: usize = 4096;
+
+/// Does hashing `args` cost more than `budget`? Stops walking as soon
+/// as the answer is yes, so the check itself is bounded by `budget`.
+fn memo_args_exceed(args: &[Value], budget: usize) -> bool {
+    fn walk(v: &Value, remaining: &mut usize) -> bool {
+        let cost = match v {
+            Value::Str(s) => s.len() + 1,
+            Value::Bytes(b) => b.len() + 1,
+            _ => 1,
+        };
+        if cost > *remaining {
+            return true;
+        }
+        *remaining -= cost;
+        match v {
+            Value::List(items) => items.iter().any(|x| walk(x, remaining)),
+            Value::Tuple(items) => items.iter().any(|x| walk(x, remaining)),
+            Value::Record { fields, .. } => fields.values().any(|x| walk(x, remaining)),
+            Value::Map(m) => m.values().any(|x| walk(x, remaining)),
+            Value::Variant { args, .. } => args.iter().any(|x| walk(x, remaining)),
+            _ => false,
+        }
+    }
+    let mut remaining = budget;
+    args.iter().any(|a| walk(a, &mut remaining))
+}
+
 /// Per-function adaptive-memoization state (#229 adaptive). `enabled`
 /// starts true; once a function reaches `MEMO_WARMUP_CALLS` cache
 /// probes with `hits == 0`, it flips to false and that function's
@@ -2436,6 +2475,8 @@ impl<'a> Vm<'a> {
                             // arena handle. The memo cache outlives the request arena,
                             // so hashing such a handle would dangle.
                             && !self.stack[args_base..].iter().any(|v| v.contains_arena_record())
+                            // #764: never pay more than a bounded hash per call.
+                            && !memo_args_exceed(&self.stack[args_base..], MEMO_MAX_ARG_BYTES)
                         {
                             Some((fn_id, hash_call_args(&self.stack[args_base..])))
                         } else {

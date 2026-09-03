@@ -3,6 +3,7 @@
 //! without policy gates (they have no observable side effects).
 
 use lex_bytecode::{MapKey, Value};
+use smol_str::SmolStr;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Mutex, OnceLock};
 
@@ -121,7 +122,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let items: std::collections::VecDeque<Value> = if sep.is_empty() {
                 s.chars().map(|c| Value::Str(c.to_string().into())).collect()
             } else {
-                s.split(sep.as_str()).map(|p| Value::Str(p.into())).collect()
+                s.split(sep).map(|p| Value::Str(p.into())).collect()
             };
             Ok(Value::List(items))
         }
@@ -141,22 +142,22 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         ("str", "starts_with") => {
             let s = expect_str(args.first())?;
             let prefix = expect_str(args.get(1))?;
-            Ok(Value::Bool(s.starts_with(prefix.as_str())))
+            Ok(Value::Bool(s.starts_with(prefix)))
         }
         ("str", "ends_with") => {
             let s = expect_str(args.first())?;
             let suffix = expect_str(args.get(1))?;
-            Ok(Value::Bool(s.ends_with(suffix.as_str())))
+            Ok(Value::Bool(s.ends_with(suffix)))
         }
         ("str", "contains") => {
             let s = expect_str(args.first())?;
             let needle = expect_str(args.get(1))?;
-            Ok(Value::Bool(s.contains(needle.as_str())))
+            Ok(Value::Bool(s.contains(needle)))
         }
         ("str", "cmp") => {
             let a = expect_str(args.first())?;
             let b = expect_str(args.get(1))?;
-            Ok(Value::Int(match a.as_str().cmp(b.as_str()) {
+            Ok(Value::Int(match a.cmp(b) {
                 std::cmp::Ordering::Less => -1,
                 std::cmp::Ordering::Equal => 0,
                 std::cmp::Ordering::Greater => 1,
@@ -166,7 +167,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let s = expect_str(args.first())?;
             let from = expect_str(args.get(1))?;
             let to = expect_str(args.get(2))?;
-            Ok(Value::Str(s.replace(from.as_str(), to.as_str()).into()))
+            Ok(Value::Str(s.replace(from, to).into()))
         }
         ("str", "trim") => Ok(Value::Str(expect_str(args.first())?.trim().into())),
         ("str", "to_upper") => Ok(Value::Str(expect_str(args.first())?.to_uppercase().into())),
@@ -174,7 +175,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         ("str", "strip_prefix") => {
             let s = expect_str(args.first())?;
             let prefix = expect_str(args.get(1))?;
-            Ok(match s.strip_prefix(prefix.as_str()) {
+            Ok(match s.strip_prefix(prefix) {
                 Some(rest) => some(Value::Str(rest.into())),
                 None => none(),
             })
@@ -182,7 +183,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         ("str", "strip_suffix") => {
             let s = expect_str(args.first())?;
             let suffix = expect_str(args.get(1))?;
-            Ok(match s.strip_suffix(suffix.as_str()) {
+            Ok(match s.strip_suffix(suffix) {
                 Some(rest) => some(Value::Str(rest.into())),
                 None => none(),
             })
@@ -201,11 +202,63 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                 return Err(format!(
                     "str.slice: reversed range [{lo_cp}..{hi_cp}]"));
             }
-            // Resolve codepoint indices to byte offsets in a single pass.
-            // Indices past the end clamp to s.len(), yielding an empty slice.
-            let lo_byte = s.char_indices().nth(lo_cp).map(|(b, _)| b).unwrap_or(s.len());
-            let hi_byte = s.char_indices().nth(hi_cp).map(|(b, _)| b).unwrap_or(s.len());
+            // Resolve codepoint indices to byte offsets through the
+            // forward-scan cursor (#764). Indices past the end clamp to
+            // s.len(), yielding an empty slice.
+            let sv = str_arg(args.first())?;
+            let lo_byte = cp_to_byte(sv, lo_cp);
+            let hi_byte = cp_to_byte(sv, hi_cp);
             Ok(Value::Str(s[lo_byte..hi_byte].into()))
+        }
+        // find :: (Str, Str, Int) -> Option[Int] — codepoint index of the
+        // first occurrence of `needle` at or after codepoint `from`, so a
+        // scanner can jump to the next delimiter in one builtin call
+        // instead of one `char_at` per character (#764, #768). Indices
+        // are codepoint positions, matching `str.slice`. `from` clamps
+        // to [0, len]; an empty needle matches at `from`.
+        ("str", "find") => {
+            let s = expect_str(args.first())?;
+            let needle = expect_str(args.get(1))?;
+            let from_cp = expect_int(args.get(2))?.max(0) as usize;
+            let sv = str_arg(args.first())?;
+            let from_byte = cp_to_byte(sv, from_cp);
+            if from_byte >= s.len() && !(from_byte == s.len() && needle.is_empty()) {
+                return Ok(none());
+            }
+            Ok(match s[from_byte..].find(needle) {
+                Some(off) => {
+                    let cp = from_cp + s[from_byte..from_byte + off].chars().count();
+                    remember_cursor(sv, cp, from_byte + off);
+                    some(Value::Int(cp as i64))
+                }
+                None => none(),
+            })
+        }
+        // find_any :: (Str, Str, Int) -> Option[Int] — codepoint index of
+        // the first char at or after `from` that occurs in `set`. The
+        // JSON-string case: `str.find_any(src, "\"\\", p)` locates the
+        // next quote or backslash in one call.
+        ("str", "find_any") => {
+            let s = expect_str(args.first())?;
+            let set = expect_str(args.get(1))?;
+            let from_cp = expect_int(args.get(2))?.max(0) as usize;
+            let sv = str_arg(args.first())?;
+            let from_byte = cp_to_byte(sv, from_cp);
+            if from_byte >= s.len() {
+                return Ok(none());
+            }
+            let hit = s[from_byte..]
+                .char_indices()
+                .enumerate()
+                .find(|(_, (_, c))| set.contains(*c));
+            Ok(match hit {
+                Some((n, (off, _))) => {
+                    let cp = from_cp + n;
+                    remember_cursor(sv, cp, from_byte + off);
+                    some(Value::Int(cp as i64))
+                }
+                None => none(),
+            })
         }
 
         // -- int / float --
@@ -679,7 +732,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         }
         ("bytes", "from_str") => {
             let s = expect_str(args.first())?;
-            Ok(Value::Bytes(s.into_bytes()))
+            Ok(Value::Bytes(s.as_bytes().to_vec()))
         }
         ("bytes", "to_str") => {
             let b = expect_bytes(args.first())?;
@@ -1730,14 +1783,14 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let s = expect_str(args.get(1))?;
             let rep = expect_str(args.get(2))?;
             let re = get_or_compile_regex(&pat).map_err(|e| format!("regex.replace: {e}"))?;
-            Ok(Value::Str(re.replace(&s, rep.as_str()).into_owned().into()))
+            Ok(Value::Str(re.replace(&s, rep).into_owned().into()))
         }
         ("regex", "replace_all") => {
             let pat = expect_str(args.first())?;
             let s = expect_str(args.get(1))?;
             let rep = expect_str(args.get(2))?;
             let re = get_or_compile_regex(&pat).map_err(|e| format!("regex.replace_all: {e}"))?;
-            Ok(Value::Str(re.replace_all(&s, rep.as_str()).into_owned().into()))
+            Ok(Value::Str(re.replace_all(&s, rep).into_owned().into()))
         }
         // -- datetime (pure ops; datetime.now is effectful and routes
         // through the handler under [time]) --
@@ -2369,9 +2422,70 @@ fn tuple_index(v: &Value, i: usize) -> Result<Value, String> {
     }
 }
 
-fn expect_str(v: Option<&Value>) -> Result<String, String> {
+/// The `Str` argument itself, for builtins that key the codepoint
+/// cursor on the string's identity.
+fn str_arg(v: Option<&Value>) -> Result<&SmolStr, String> {
     match v {
-        Some(Value::Str(s)) => Ok(s.to_string()),
+        Some(Value::Str(s)) => Ok(s),
+        Some(other) => Err(format!("expected Str, got {other:?}")),
+        None => Err("missing argument".into()),
+    }
+}
+
+thread_local! {
+    /// Forward-scan cursor for codepoint → byte resolution (#764):
+    /// the string most recently indexed by `str.slice` / `str.find*`,
+    /// with the last (codepoint, byte) position resolved in it. A
+    /// scanner that walks a string front to back resolves each index
+    /// from the previous one instead of from the start, so a full
+    /// walk is O(n) rather than O(n²). Holding a clone keeps the
+    /// heap allocation alive, so the pointer comparison in
+    /// `cp_to_byte` cannot alias a different string that later
+    /// reused the address. Inline (short) strings never hit the
+    /// cache — their data lives inside each copy — and never need it.
+    static CP_CURSOR: std::cell::RefCell<Option<(SmolStr, usize, usize)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Byte offset of codepoint index `cp` in `s`, clamped to `s.len()`.
+fn cp_to_byte(s: &SmolStr, cp: usize) -> usize {
+    CP_CURSOR.with(|cur| {
+        let mut cur = cur.borrow_mut();
+        let (start_cp, start_byte) = match &*cur {
+            Some((cached, ccp, cbyte))
+                if cached.as_ptr() == s.as_ptr() && cached.len() == s.len() && *ccp <= cp =>
+            {
+                (*ccp, *cbyte)
+            }
+            _ => (0, 0),
+        };
+        let byte = s[start_byte..]
+            .char_indices()
+            .nth(cp - start_cp)
+            .map(|(b, _)| start_byte + b)
+            .unwrap_or(s.len());
+        if byte < s.len() {
+            *cur = Some((s.clone(), cp, byte));
+        }
+        byte
+    })
+}
+
+/// Record a (codepoint, byte) position just resolved by other means.
+fn remember_cursor(s: &SmolStr, cp: usize, byte: usize) {
+    if byte < s.len() {
+        CP_CURSOR.with(|cur| *cur.borrow_mut() = Some((s.clone(), cp, byte)));
+    }
+}
+
+/// Borrow a `Str` argument. This must not copy: every `std.str`
+/// builtin goes through here, and a scanner that calls `str.char_at`
+/// once per character on a 300 KB document would otherwise copy
+/// 300 KB per call and turn a linear walk into a quadratic one
+/// (#764).
+fn expect_str(v: Option<&Value>) -> Result<&str, String> {
+    match v {
+        Some(Value::Str(s)) => Ok(s.as_str()),
         Some(other) => Err(format!("expected Str, got {other:?}")),
         None => Err("missing argument".into()),
     }

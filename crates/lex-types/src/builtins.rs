@@ -109,6 +109,16 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::empty(),
                 Ty::str(),
             ));
+            // find / find_any :: (Str, Str, Int) -> Option[Int] — codepoint
+            // index of the next needle / next char from a set, at or after
+            // a start index (#764).
+            for name in &["find", "find_any"] {
+                fields.insert((*name).into(), Ty::function(
+                    vec![Ty::str(), Ty::str(), Ty::int()],
+                    EffectSet::empty(),
+                    Ty::Con("Option".into(), vec![Ty::int()]),
+                ));
+            }
             Some(Ty::Record(fields))
         }
         "int" => {
