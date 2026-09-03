@@ -3,6 +3,7 @@
 //! without policy gates (they have no observable side effects).
 
 use lex_bytecode::{MapKey, Value};
+use smol_str::SmolStr;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Mutex, OnceLock};
 
@@ -121,7 +122,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let items: std::collections::VecDeque<Value> = if sep.is_empty() {
                 s.chars().map(|c| Value::Str(c.to_string().into())).collect()
             } else {
-                s.split(sep.as_str()).map(|p| Value::Str(p.into())).collect()
+                s.split(sep).map(|p| Value::Str(p.into())).collect()
             };
             Ok(Value::List(items))
         }
@@ -130,7 +131,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let sep = expect_str(args.get(1))?;
             let mut out = String::new();
             for (i, p) in parts.iter().enumerate() {
-                if i > 0 { out.push_str(&sep); }
+                if i > 0 { out.push_str(sep); }
                 match p {
                     Value::Str(s) => out.push_str(s),
                     other => return Err(format!("str.join element must be Str, got {other:?}")),
@@ -141,22 +142,22 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         ("str", "starts_with") => {
             let s = expect_str(args.first())?;
             let prefix = expect_str(args.get(1))?;
-            Ok(Value::Bool(s.starts_with(prefix.as_str())))
+            Ok(Value::Bool(s.starts_with(prefix)))
         }
         ("str", "ends_with") => {
             let s = expect_str(args.first())?;
             let suffix = expect_str(args.get(1))?;
-            Ok(Value::Bool(s.ends_with(suffix.as_str())))
+            Ok(Value::Bool(s.ends_with(suffix)))
         }
         ("str", "contains") => {
             let s = expect_str(args.first())?;
             let needle = expect_str(args.get(1))?;
-            Ok(Value::Bool(s.contains(needle.as_str())))
+            Ok(Value::Bool(s.contains(needle)))
         }
         ("str", "cmp") => {
             let a = expect_str(args.first())?;
             let b = expect_str(args.get(1))?;
-            Ok(Value::Int(match a.as_str().cmp(b.as_str()) {
+            Ok(Value::Int(match a.cmp(b) {
                 std::cmp::Ordering::Less => -1,
                 std::cmp::Ordering::Equal => 0,
                 std::cmp::Ordering::Greater => 1,
@@ -166,7 +167,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let s = expect_str(args.first())?;
             let from = expect_str(args.get(1))?;
             let to = expect_str(args.get(2))?;
-            Ok(Value::Str(s.replace(from.as_str(), to.as_str()).into()))
+            Ok(Value::Str(s.replace(from, to).into()))
         }
         ("str", "trim") => Ok(Value::Str(expect_str(args.first())?.trim().into())),
         ("str", "to_upper") => Ok(Value::Str(expect_str(args.first())?.to_uppercase().into())),
@@ -174,7 +175,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         ("str", "strip_prefix") => {
             let s = expect_str(args.first())?;
             let prefix = expect_str(args.get(1))?;
-            Ok(match s.strip_prefix(prefix.as_str()) {
+            Ok(match s.strip_prefix(prefix) {
                 Some(rest) => some(Value::Str(rest.into())),
                 None => none(),
             })
@@ -182,7 +183,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         ("str", "strip_suffix") => {
             let s = expect_str(args.first())?;
             let suffix = expect_str(args.get(1))?;
-            Ok(match s.strip_suffix(suffix.as_str()) {
+            Ok(match s.strip_suffix(suffix) {
                 Some(rest) => some(Value::Str(rest.into())),
                 None => none(),
             })
@@ -201,11 +202,63 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                 return Err(format!(
                     "str.slice: reversed range [{lo_cp}..{hi_cp}]"));
             }
-            // Resolve codepoint indices to byte offsets in a single pass.
-            // Indices past the end clamp to s.len(), yielding an empty slice.
-            let lo_byte = s.char_indices().nth(lo_cp).map(|(b, _)| b).unwrap_or(s.len());
-            let hi_byte = s.char_indices().nth(hi_cp).map(|(b, _)| b).unwrap_or(s.len());
+            // Resolve codepoint indices to byte offsets through the
+            // forward-scan cursor (#764). Indices past the end clamp to
+            // s.len(), yielding an empty slice.
+            let sv = str_arg(args.first())?;
+            let lo_byte = cp_to_byte(sv, lo_cp);
+            let hi_byte = cp_to_byte(sv, hi_cp);
             Ok(Value::Str(s[lo_byte..hi_byte].into()))
+        }
+        // find :: (Str, Str, Int) -> Option[Int] — codepoint index of the
+        // first occurrence of `needle` at or after codepoint `from`, so a
+        // scanner can jump to the next delimiter in one builtin call
+        // instead of one `char_at` per character (#764, #768). Indices
+        // are codepoint positions, matching `str.slice`. `from` clamps
+        // to [0, len]; an empty needle matches at `from`.
+        ("str", "find") => {
+            let s = expect_str(args.first())?;
+            let needle = expect_str(args.get(1))?;
+            let from_cp = expect_int(args.get(2))?.max(0) as usize;
+            let sv = str_arg(args.first())?;
+            let from_byte = cp_to_byte(sv, from_cp);
+            if from_byte >= s.len() && !(from_byte == s.len() && needle.is_empty()) {
+                return Ok(none());
+            }
+            Ok(match s[from_byte..].find(needle) {
+                Some(off) => {
+                    let cp = from_cp + s[from_byte..from_byte + off].chars().count();
+                    remember_cursor(sv, cp, from_byte + off);
+                    some(Value::Int(cp as i64))
+                }
+                None => none(),
+            })
+        }
+        // find_any :: (Str, Str, Int) -> Option[Int] — codepoint index of
+        // the first char at or after `from` that occurs in `set`. The
+        // JSON-string case: `str.find_any(src, "\"\\", p)` locates the
+        // next quote or backslash in one call.
+        ("str", "find_any") => {
+            let s = expect_str(args.first())?;
+            let set = expect_str(args.get(1))?;
+            let from_cp = expect_int(args.get(2))?.max(0) as usize;
+            let sv = str_arg(args.first())?;
+            let from_byte = cp_to_byte(sv, from_cp);
+            if from_byte >= s.len() {
+                return Ok(none());
+            }
+            let hit = s[from_byte..]
+                .char_indices()
+                .enumerate()
+                .find(|(_, (_, c))| set.contains(*c));
+            Ok(match hit {
+                Some((n, (off, _))) => {
+                    let cp = from_cp + n;
+                    remember_cursor(sv, cp, from_byte + off);
+                    some(Value::Int(cp as i64))
+                }
+                None => none(),
+            })
         }
 
         // -- int / float --
@@ -371,7 +424,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         }
         ("json", "parse") => {
             let s = expect_str(args.first())?;
-            match serde_json::from_str::<serde_json::Value>(&s) {
+            match serde_json::from_str::<serde_json::Value>(s) {
                 Ok(v) => Ok(ok_v(json_to_value(&v))),
                 Err(e) => Ok(err_v(Value::Str(format!("{e}").into()))),
             }
@@ -382,7 +435,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let s = expect_str(args.first())?;
             let required = required_field_names(args.get(1))?;
             let schema = extract_type_schema(args.get(2));
-            match serde_json::from_str::<serde_json::Value>(&s) {
+            match serde_json::from_str::<serde_json::Value>(s) {
                 Ok(v) => {
                     if let Err(e) = check_required_fields(&v, &required) {
                         return Ok(err_v(Value::Str(e.into())));
@@ -402,7 +455,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         // info-losing step) --
         ("toml", "parse") => {
             let s = expect_str(args.first())?;
-            match toml::from_str::<serde_json::Value>(&s) {
+            match toml::from_str::<serde_json::Value>(s) {
                 Ok(mut v) => {
                     unwrap_toml_datetime_markers(&mut v);
                     Ok(ok_v(json_to_value(&v)))
@@ -417,7 +470,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let s = expect_str(args.first())?;
             let required = required_field_names(args.get(1))?;
             let schema = extract_type_schema(args.get(2));
-            match serde_json::from_str::<serde_json::Value>(&s) {
+            match serde_json::from_str::<serde_json::Value>(s) {
                 Ok(v) => {
                     if let Err(e) = check_required_fields(&v, &required) {
                         return Ok(err_v(Value::Str(e.into())));
@@ -437,7 +490,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let s = expect_str(args.first())?;
             let required = required_field_names(args.get(1))?;
             let schema = extract_type_schema(args.get(2));
-            match toml::from_str::<serde_json::Value>(&s) {
+            match toml::from_str::<serde_json::Value>(s) {
                 Ok(mut v) => {
                     unwrap_toml_datetime_markers(&mut v);
                     if let Err(e) = check_required_fields(&v, &required) {
@@ -455,7 +508,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let s = expect_str(args.first())?;
             let required = required_field_names(args.get(1))?;
             let schema = extract_type_schema(args.get(2));
-            match toml::from_str::<serde_json::Value>(&s) {
+            match toml::from_str::<serde_json::Value>(s) {
                 Ok(mut v) => {
                     unwrap_toml_datetime_markers(&mut v);
                     if let Err(e) = check_required_fields(&v, &required) {
@@ -490,7 +543,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         // map keys when stringifying) surface as Result::Err.
         ("yaml", "parse") => {
             let s = expect_str(args.first())?;
-            match serde_yaml::from_str::<serde_json::Value>(&s) {
+            match serde_yaml::from_str::<serde_json::Value>(s) {
                 Ok(v)  => Ok(ok_v(json_to_value(&v))),
                 Err(e) => Ok(err_v(Value::Str(format!("{e}").into()))),
             }
@@ -501,7 +554,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let s = expect_str(args.first())?;
             let required = required_field_names(args.get(1))?;
             let schema = extract_type_schema(args.get(2));
-            match serde_yaml::from_str::<serde_json::Value>(&s) {
+            match serde_yaml::from_str::<serde_json::Value>(s) {
                 Ok(v) => {
                     if let Err(e) = check_required_fields(&v, &required) {
                         return Ok(err_v(Value::Str(e.into())));
@@ -518,7 +571,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let s = expect_str(args.first())?;
             let required = required_field_names(args.get(1))?;
             let schema = extract_type_schema(args.get(2));
-            match serde_yaml::from_str::<serde_json::Value>(&s) {
+            match serde_yaml::from_str::<serde_json::Value>(s) {
                 Ok(v) => {
                     if let Err(e) = check_required_fields(&v, &required) {
                         return Ok(err_v(Value::Str(e.into())));
@@ -551,7 +604,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             use std::collections::BTreeMap;
             use lex_bytecode::MapKey;
             let s = expect_str(args.first())?;
-            match parse_dotenv(&s) {
+            match parse_dotenv(s) {
                 Ok(map) => {
                     let mut bt: BTreeMap<MapKey, Value> = BTreeMap::new();
                     for (k, v) in map {
@@ -679,7 +732,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         }
         ("bytes", "from_str") => {
             let s = expect_str(args.first())?;
-            Ok(Value::Bytes(s.into_bytes()))
+            Ok(Value::Bytes(s.as_bytes().to_vec()))
         }
         ("bytes", "to_str") => {
             let b = expect_bytes(args.first())?;
@@ -1683,7 +1736,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         // ops don't re-compile on every call) --
         ("regex", "compile") => {
             let pat = expect_str(args.first())?;
-            match get_or_compile_regex(&pat) {
+            match get_or_compile_regex(pat) {
                 Ok(_) => Ok(ok_v(Value::Str(pat.into()))),
                 Err(e) => Ok(err_v(Value::Str(e.into()))),
             }
@@ -1691,8 +1744,8 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         ("regex", "is_match") => {
             let pat = expect_str(args.first())?;
             let s = expect_str(args.get(1))?;
-            let re = get_or_compile_regex(&pat).map_err(|e| format!("regex.is_match: {e}"))?;
-            Ok(Value::Bool(re.is_match(&s)))
+            let re = get_or_compile_regex(pat).map_err(|e| format!("regex.is_match: {e}"))?;
+            Ok(Value::Bool(re.is_match(s)))
         }
         // is_match_str :: Str, Str -> Bool
         // Compiles the first argument as a pattern on the fly (uses the shared
@@ -1701,16 +1754,16 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         ("regex", "is_match_str") => {
             let pat = expect_str(args.first())?;
             let s = expect_str(args.get(1))?;
-            match get_or_compile_regex(&pat) {
-                Ok(re) => Ok(Value::Bool(re.is_match(&s))),
+            match get_or_compile_regex(pat) {
+                Ok(re) => Ok(Value::Bool(re.is_match(s))),
                 Err(_) => Ok(Value::Bool(false)),
             }
         }
         ("regex", "find") => {
             let pat = expect_str(args.first())?;
             let s = expect_str(args.get(1))?;
-            let re = get_or_compile_regex(&pat).map_err(|e| format!("regex.find: {e}"))?;
-            match re.captures(&s) {
+            let re = get_or_compile_regex(pat).map_err(|e| format!("regex.find: {e}"))?;
+            match re.captures(s) {
                 Some(caps) => Ok(Value::Variant {
                     name: "Some".into(),
                     args: vec![match_value(&caps)],
@@ -1721,29 +1774,29 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         ("regex", "find_all") => {
             let pat = expect_str(args.first())?;
             let s = expect_str(args.get(1))?;
-            let re = get_or_compile_regex(&pat).map_err(|e| format!("regex.find_all: {e}"))?;
-            let items: std::collections::VecDeque<Value> = re.captures_iter(&s).map(|caps| match_value(&caps)).collect();
+            let re = get_or_compile_regex(pat).map_err(|e| format!("regex.find_all: {e}"))?;
+            let items: std::collections::VecDeque<Value> = re.captures_iter(s).map(|caps| match_value(&caps)).collect();
             Ok(Value::List(items))
         }
         ("regex", "replace") => {
             let pat = expect_str(args.first())?;
             let s = expect_str(args.get(1))?;
             let rep = expect_str(args.get(2))?;
-            let re = get_or_compile_regex(&pat).map_err(|e| format!("regex.replace: {e}"))?;
-            Ok(Value::Str(re.replace(&s, rep.as_str()).into_owned().into()))
+            let re = get_or_compile_regex(pat).map_err(|e| format!("regex.replace: {e}"))?;
+            Ok(Value::Str(re.replace(s, rep).into_owned().into()))
         }
         ("regex", "replace_all") => {
             let pat = expect_str(args.first())?;
             let s = expect_str(args.get(1))?;
             let rep = expect_str(args.get(2))?;
-            let re = get_or_compile_regex(&pat).map_err(|e| format!("regex.replace_all: {e}"))?;
-            Ok(Value::Str(re.replace_all(&s, rep.as_str()).into_owned().into()))
+            let re = get_or_compile_regex(pat).map_err(|e| format!("regex.replace_all: {e}"))?;
+            Ok(Value::Str(re.replace_all(s, rep).into_owned().into()))
         }
         // -- datetime (pure ops; datetime.now is effectful and routes
         // through the handler under [time]) --
         ("datetime", "parse_iso") => {
             let s = expect_str(args.first())?;
-            match chrono::DateTime::parse_from_rfc3339(&s) {
+            match chrono::DateTime::parse_from_rfc3339(s) {
                 Ok(dt) => Ok(ok_v(Value::Int(instant_from_chrono(dt)))),
                 Err(e) => Ok(err_v(Value::Str(format!("parse_iso: {e}").into()))),
             }
@@ -1755,7 +1808,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         ("datetime", "parse") => {
             let s = expect_str(args.first())?;
             let fmt = expect_str(args.get(1))?;
-            match chrono::NaiveDateTime::parse_from_str(&s, &fmt) {
+            match chrono::NaiveDateTime::parse_from_str(s, fmt) {
                 Ok(naive) => {
                     use chrono::TimeZone;
                     match chrono::Utc.from_local_datetime(&naive).single() {
@@ -1770,7 +1823,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let n = expect_int(args.first())?;
             let fmt = expect_str(args.get(1))?;
             let dt = chrono_from_instant(n);
-            Ok(Value::Str(dt.format(&fmt).to_string().into()))
+            Ok(Value::Str(dt.format(fmt).to_string().into()))
         }
         ("datetime", "to_components") => {
             let n = expect_int(args.first())?;
@@ -1843,8 +1896,8 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         ("regex", "split") => {
             let pat = expect_str(args.first())?;
             let s = expect_str(args.get(1))?;
-            let re = get_or_compile_regex(&pat).map_err(|e| format!("regex.split: {e}"))?;
-            let parts: std::collections::VecDeque<Value> = re.split(&s).map(|p| Value::Str(p.into())).collect();
+            let re = get_or_compile_regex(pat).map_err(|e| format!("regex.split: {e}"))?;
+            let parts: std::collections::VecDeque<Value> = re.split(s).map(|p| Value::Str(p.into())).collect();
             Ok(Value::List(parts))
         }
 
@@ -1854,7 +1907,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let req = expect_record_pure(args.first())?.clone();
             let k = expect_str(args.get(1))?;
             let v = expect_str(args.get(2))?;
-            Ok(Value::record_interned(http_set_header(req, &k, &v)))
+            Ok(Value::record_interned(http_set_header(req, k, v)))
         }
         ("http", "with_auth") => {
             let req = expect_record_pure(args.first())?.clone();
@@ -1949,20 +2002,20 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let name = expect_str(args.first())?;
             let short = opt_str(args.get(1));
             let help = expect_str(args.get(2))?;
-            Ok(value_from_json(crate::cli::flag_spec(&name, short.as_deref(), &help)))
+            Ok(value_from_json(crate::cli::flag_spec(name, short.as_deref(), help)))
         }
         ("cli", "option") => {
             let name = expect_str(args.first())?;
             let short = opt_str(args.get(1));
             let help = expect_str(args.get(2))?;
             let default = opt_str(args.get(3));
-            Ok(value_from_json(crate::cli::option_spec(&name, short.as_deref(), &help, default.as_deref())))
+            Ok(value_from_json(crate::cli::option_spec(name, short.as_deref(), help, default.as_deref())))
         }
         ("cli", "positional") => {
             let name = expect_str(args.first())?;
             let help = expect_str(args.get(1))?;
             let required = expect_bool(args.get(2))?;
-            Ok(value_from_json(crate::cli::positional_spec(&name, &help, required)))
+            Ok(value_from_json(crate::cli::positional_spec(name, help, required)))
         }
         ("cli", "spec") => {
             let name = expect_str(args.first())?;
@@ -1971,7 +2024,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                 .iter().map(value_to_json).collect();
             let subs: Vec<serde_json::Value> = expect_list(args.get(3))?
                 .iter().map(value_to_json).collect();
-            Ok(value_from_json(crate::cli::build_spec(&name, &help, arg_specs, subs)))
+            Ok(value_from_json(crate::cli::build_spec(name, help, arg_specs, subs)))
         }
         ("cli", "parse") => {
             let spec = value_to_json(args.first().unwrap_or(&Value::Unit));
@@ -1989,7 +2042,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let ok = expect_bool(args.first())?;
             let cmd = expect_str(args.get(1))?;
             let data = value_to_json(args.get(2).unwrap_or(&Value::Unit));
-            Ok(value_from_json(crate::cli::envelope(ok, &cmd, data)))
+            Ok(value_from_json(crate::cli::envelope(ok, cmd, data)))
         }
         ("cli", "describe") => {
             let spec = value_to_json(args.first().unwrap_or(&Value::Unit));
@@ -2096,7 +2149,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let (c, e)   = expect_decimal(args.first())?;
             let target_e = expect_int(args.get(1))?;
             let mode     = expect_str(args.get(2))?;
-            Ok(make_decimal(decimal_round(c, e, target_e, &mode)?, target_e))
+            Ok(make_decimal(decimal_round(c, e, target_e, mode)?, target_e))
         }
         ("decimal", "to_str") => {
             let (c, e) = expect_decimal(args.first())?;
@@ -2369,9 +2422,70 @@ fn tuple_index(v: &Value, i: usize) -> Result<Value, String> {
     }
 }
 
-fn expect_str(v: Option<&Value>) -> Result<String, String> {
+/// The `Str` argument itself, for builtins that key the codepoint
+/// cursor on the string's identity.
+fn str_arg(v: Option<&Value>) -> Result<&SmolStr, String> {
     match v {
-        Some(Value::Str(s)) => Ok(s.to_string()),
+        Some(Value::Str(s)) => Ok(s),
+        Some(other) => Err(format!("expected Str, got {other:?}")),
+        None => Err("missing argument".into()),
+    }
+}
+
+thread_local! {
+    /// Forward-scan cursor for codepoint → byte resolution (#764):
+    /// the string most recently indexed by `str.slice` / `str.find*`,
+    /// with the last (codepoint, byte) position resolved in it. A
+    /// scanner that walks a string front to back resolves each index
+    /// from the previous one instead of from the start, so a full
+    /// walk is O(n) rather than O(n²). Holding a clone keeps the
+    /// heap allocation alive, so the pointer comparison in
+    /// `cp_to_byte` cannot alias a different string that later
+    /// reused the address. Inline (short) strings never hit the
+    /// cache — their data lives inside each copy — and never need it.
+    static CP_CURSOR: std::cell::RefCell<Option<(SmolStr, usize, usize)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Byte offset of codepoint index `cp` in `s`, clamped to `s.len()`.
+fn cp_to_byte(s: &SmolStr, cp: usize) -> usize {
+    CP_CURSOR.with(|cur| {
+        let mut cur = cur.borrow_mut();
+        let (start_cp, start_byte) = match &*cur {
+            Some((cached, ccp, cbyte))
+                if cached.as_ptr() == s.as_ptr() && cached.len() == s.len() && *ccp <= cp =>
+            {
+                (*ccp, *cbyte)
+            }
+            _ => (0, 0),
+        };
+        let byte = s[start_byte..]
+            .char_indices()
+            .nth(cp - start_cp)
+            .map(|(b, _)| start_byte + b)
+            .unwrap_or(s.len());
+        if byte < s.len() {
+            *cur = Some((s.clone(), cp, byte));
+        }
+        byte
+    })
+}
+
+/// Record a (codepoint, byte) position just resolved by other means.
+fn remember_cursor(s: &SmolStr, cp: usize, byte: usize) {
+    if byte < s.len() {
+        CP_CURSOR.with(|cur| *cur.borrow_mut() = Some((s.clone(), cp, byte)));
+    }
+}
+
+/// Borrow a `Str` argument. This must not copy: every `std.str`
+/// builtin goes through here, and a scanner that calls `str.char_at`
+/// once per character on a 300 KB document would otherwise copy
+/// 300 KB per call and turn a linear walk into a quadratic one
+/// (#764).
+fn expect_str(v: Option<&Value>) -> Result<&str, String> {
+    match v {
+        Some(Value::Str(s)) => Ok(s.as_str()),
         Some(other) => Err(format!("expected Str, got {other:?}")),
         None => Err("missing argument".into()),
     }

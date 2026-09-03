@@ -7,7 +7,36 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added
+
+- **`str.find(s, needle, from) -> Option[Int]` and
+  `str.find_any(s, set, from) -> Option[Int]`** (#764, #768). The
+  codepoint index of the next occurrence of `needle`, or of the next
+  character that occurs in `set`, at or after codepoint `from`. A
+  scanner can now jump to the next delimiter in one builtin call
+  instead of one `str.char_at` per character; lex-schema's JSON
+  string loop, which spends 40 to 80 VM steps per character, is the
+  motivating case. Indices are codepoint positions, matching
+  `str.slice`, so the result slices directly.
+
 ### Fixed
+
+- **Character-level scans in Lex were quadratic** (#764). Every
+  `std.str` builtin copied its whole string argument before looking
+  at it, so `str.char_at` on a 300 KB document copied 300 KB per
+  call, and `str.slice` resolved each codepoint index from the start
+  of the string. The argument is now borrowed, and `str.slice` /
+  `str.find*` resolve a forward scan from the previous position, so
+  walking a string front to back is O(n). Parsing a 132 KB JSON
+  document with lex-schema went from 190 s to under a second in a
+  debug build. Random or backward indexing keeps its previous cost.
+- **Pure-function memoization no longer hashes unbounded arguments**
+  (#764). The memo key hashes every argument in full on every call,
+  and the adaptive gate only retires a function that never hits. A
+  helper like `char_at(src, p)` over a large document hits once
+  early, stays memoized, and then hashes the whole document per
+  character. Calls whose arguments carry more than 4 KB of string or
+  bytes payload now skip the cache, so the per-call cost is bounded.
 
 - **`lex check` now enforces match exhaustiveness** (#766). A `match`
   missing arms for some values of its scrutinee's type passed the

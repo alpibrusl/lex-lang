@@ -132,7 +132,7 @@ an exhaustive function list.
 | module | functions |
 |---|---|
 | `std.io` | `print`, `read`, `write`, `readline`, `argv` |
-| `std.str` | `is_empty`, `to_int`, `to_float`, `concat`, `len`, `char_at`, `split`, `join`, `starts_with`, `ends_with`, `contains`, `cmp`, `replace`, `trim`, `to_upper`, `to_lower`, `strip_prefix`, `strip_suffix`, `slice` |
+| `std.str` | `is_empty`, `to_int`, `to_float`, `concat`, `len`, `char_at`, `split`, `join`, `starts_with`, `ends_with`, `contains`, `cmp`, `replace`, `trim`, `to_upper`, `to_lower`, `strip_prefix`, `strip_suffix`, `slice`, `find`, `find_any` |
 | `std.int` | `to_str`, `to_float`, `abs`, `min`, `max` |
 | `std.math` | `exp`, `log`, `log2`, `log10`, `sqrt`, `abs`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `floor`, `ceil`, `round`, `trunc`, `pow`, `atan2`, `min`, `max`, `zeros`, `ones`, `from_lists`, `from_flat`, `rows`, `cols`, `get`, `to_flat`, `transpose`, `matmul`, `scale`, `add`, `sub`, `sigmoid` |
 | `std.float` | `to_int`, `to_str` |
