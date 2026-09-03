@@ -9,6 +9,12 @@ bumps may carry breaking changes when justified).
 
 ### Added
 
+- **`str.is_ascii(s) -> Bool`** (#768). One native pass, one VM step.
+  A scanner that needs single-byte input (lex-schema's JSON parser
+  collapses multi-byte chars to `?` before parsing) can skip its
+  per-character sanitising pass on the common case instead of
+  spending VM steps on every character of a large document.
+
 - **`str.find(s, needle, from) -> Option[Int]` and
   `str.find_any(s, set, from) -> Option[Int]`** (#764, #768). The
   codepoint index of the next occurrence of `needle`, or of the next

@@ -210,6 +210,12 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let hi_byte = cp_to_byte(sv, hi_cp);
             Ok(Value::Str(s[lo_byte..hi_byte].into()))
         }
+        // is_ascii :: Str -> Bool — one native pass, one VM step. Lets a
+        // scanner that needs single-byte input (lex-schema's JSON parser
+        // collapses multi-byte chars before parsing) skip its per-char
+        // sanitising pass on the common case instead of paying VM steps
+        // for every character of a large document (#768).
+        ("str", "is_ascii") => Ok(Value::Bool(expect_str(args.first())?.is_ascii())),
         // find :: (Str, Str, Int) -> Option[Int] — codepoint index of the
         // first occurrence of `needle` at or after codepoint `from`, so a
         // scanner can jump to the next delimiter in one builtin call
