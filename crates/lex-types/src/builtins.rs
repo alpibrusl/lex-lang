@@ -109,6 +109,8 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::empty(),
                 Ty::str(),
             ));
+            // is_ascii :: Str -> Bool — every byte < 128 (#768).
+            fields.insert("is_ascii".into(), Ty::function(vec![Ty::str()], EffectSet::empty(), Ty::bool()));
             // find / find_any :: (Str, Str, Int) -> Option[Int] — codepoint
             // index of the next needle / next char from a set, at or after
             // a start index (#764).

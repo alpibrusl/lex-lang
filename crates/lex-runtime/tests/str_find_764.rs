@@ -44,6 +44,7 @@ import "std.str" as str
 import "std.list" as list
 
 fn find(s :: Str, n :: Str, from :: Int) -> Option[Int] { str.find(s, n, from) }
+fn is_ascii(s :: Str) -> Bool { str.is_ascii(s) }
 fn find_any(s :: Str, set :: Str, from :: Int) -> Option[Int] { str.find_any(s, set, from) }
 fn slice(s :: Str, lo :: Int, hi :: Int) -> Str { str.slice(s, lo, hi) }
 
@@ -109,6 +110,16 @@ fn find_returns_first_index_at_or_after_from() {
     assert_eq!(run(SRC, "find", vec![s(src), s(""), Value::Int(2)]).unwrap(), some(Value::Int(2)));
     assert_eq!(run(SRC, "find", vec![s(src), s(""), Value::Int(6)]).unwrap(), some(Value::Int(6)));
     assert_eq!(run(SRC, "find", vec![s(""), s("x"), Value::Int(0)]).unwrap(), none());
+}
+
+#[test]
+fn is_ascii_is_true_only_for_all_ascii_input() {
+    assert_eq!(run(SRC, "is_ascii", vec![s("")]).unwrap(), Value::Bool(true));
+    assert_eq!(run(SRC, "is_ascii", vec![s("plain ascii, \t\n 0x7f: \x7f")]).unwrap(), Value::Bool(true));
+    assert_eq!(run(SRC, "is_ascii", vec![s("héllo")]).unwrap(), Value::Bool(false));
+    assert_eq!(run(SRC, "is_ascii", vec![s("✓")]).unwrap(), Value::Bool(false));
+    let big = format!("{}é", "a".repeat(100_000));
+    assert_eq!(run(SRC, "is_ascii", vec![s(&big)]).unwrap(), Value::Bool(false));
 }
 
 #[test]
