@@ -131,7 +131,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let sep = expect_str(args.get(1))?;
             let mut out = String::new();
             for (i, p) in parts.iter().enumerate() {
-                if i > 0 { out.push_str(&sep); }
+                if i > 0 { out.push_str(sep); }
                 match p {
                     Value::Str(s) => out.push_str(s),
                     other => return Err(format!("str.join element must be Str, got {other:?}")),
@@ -424,7 +424,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         }
         ("json", "parse") => {
             let s = expect_str(args.first())?;
-            match serde_json::from_str::<serde_json::Value>(&s) {
+            match serde_json::from_str::<serde_json::Value>(s) {
                 Ok(v) => Ok(ok_v(json_to_value(&v))),
                 Err(e) => Ok(err_v(Value::Str(format!("{e}").into()))),
             }
@@ -435,7 +435,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let s = expect_str(args.first())?;
             let required = required_field_names(args.get(1))?;
             let schema = extract_type_schema(args.get(2));
-            match serde_json::from_str::<serde_json::Value>(&s) {
+            match serde_json::from_str::<serde_json::Value>(s) {
                 Ok(v) => {
                     if let Err(e) = check_required_fields(&v, &required) {
                         return Ok(err_v(Value::Str(e.into())));
@@ -455,7 +455,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         // info-losing step) --
         ("toml", "parse") => {
             let s = expect_str(args.first())?;
-            match toml::from_str::<serde_json::Value>(&s) {
+            match toml::from_str::<serde_json::Value>(s) {
                 Ok(mut v) => {
                     unwrap_toml_datetime_markers(&mut v);
                     Ok(ok_v(json_to_value(&v)))
@@ -470,7 +470,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let s = expect_str(args.first())?;
             let required = required_field_names(args.get(1))?;
             let schema = extract_type_schema(args.get(2));
-            match serde_json::from_str::<serde_json::Value>(&s) {
+            match serde_json::from_str::<serde_json::Value>(s) {
                 Ok(v) => {
                     if let Err(e) = check_required_fields(&v, &required) {
                         return Ok(err_v(Value::Str(e.into())));
@@ -490,7 +490,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let s = expect_str(args.first())?;
             let required = required_field_names(args.get(1))?;
             let schema = extract_type_schema(args.get(2));
-            match toml::from_str::<serde_json::Value>(&s) {
+            match toml::from_str::<serde_json::Value>(s) {
                 Ok(mut v) => {
                     unwrap_toml_datetime_markers(&mut v);
                     if let Err(e) = check_required_fields(&v, &required) {
@@ -508,7 +508,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let s = expect_str(args.first())?;
             let required = required_field_names(args.get(1))?;
             let schema = extract_type_schema(args.get(2));
-            match toml::from_str::<serde_json::Value>(&s) {
+            match toml::from_str::<serde_json::Value>(s) {
                 Ok(mut v) => {
                     unwrap_toml_datetime_markers(&mut v);
                     if let Err(e) = check_required_fields(&v, &required) {
@@ -543,7 +543,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         // map keys when stringifying) surface as Result::Err.
         ("yaml", "parse") => {
             let s = expect_str(args.first())?;
-            match serde_yaml::from_str::<serde_json::Value>(&s) {
+            match serde_yaml::from_str::<serde_json::Value>(s) {
                 Ok(v)  => Ok(ok_v(json_to_value(&v))),
                 Err(e) => Ok(err_v(Value::Str(format!("{e}").into()))),
             }
@@ -554,7 +554,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let s = expect_str(args.first())?;
             let required = required_field_names(args.get(1))?;
             let schema = extract_type_schema(args.get(2));
-            match serde_yaml::from_str::<serde_json::Value>(&s) {
+            match serde_yaml::from_str::<serde_json::Value>(s) {
                 Ok(v) => {
                     if let Err(e) = check_required_fields(&v, &required) {
                         return Ok(err_v(Value::Str(e.into())));
@@ -571,7 +571,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let s = expect_str(args.first())?;
             let required = required_field_names(args.get(1))?;
             let schema = extract_type_schema(args.get(2));
-            match serde_yaml::from_str::<serde_json::Value>(&s) {
+            match serde_yaml::from_str::<serde_json::Value>(s) {
                 Ok(v) => {
                     if let Err(e) = check_required_fields(&v, &required) {
                         return Ok(err_v(Value::Str(e.into())));
@@ -604,7 +604,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             use std::collections::BTreeMap;
             use lex_bytecode::MapKey;
             let s = expect_str(args.first())?;
-            match parse_dotenv(&s) {
+            match parse_dotenv(s) {
                 Ok(map) => {
                     let mut bt: BTreeMap<MapKey, Value> = BTreeMap::new();
                     for (k, v) in map {
@@ -1736,7 +1736,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         // ops don't re-compile on every call) --
         ("regex", "compile") => {
             let pat = expect_str(args.first())?;
-            match get_or_compile_regex(&pat) {
+            match get_or_compile_regex(pat) {
                 Ok(_) => Ok(ok_v(Value::Str(pat.into()))),
                 Err(e) => Ok(err_v(Value::Str(e.into()))),
             }
@@ -1744,8 +1744,8 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         ("regex", "is_match") => {
             let pat = expect_str(args.first())?;
             let s = expect_str(args.get(1))?;
-            let re = get_or_compile_regex(&pat).map_err(|e| format!("regex.is_match: {e}"))?;
-            Ok(Value::Bool(re.is_match(&s)))
+            let re = get_or_compile_regex(pat).map_err(|e| format!("regex.is_match: {e}"))?;
+            Ok(Value::Bool(re.is_match(s)))
         }
         // is_match_str :: Str, Str -> Bool
         // Compiles the first argument as a pattern on the fly (uses the shared
@@ -1754,16 +1754,16 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         ("regex", "is_match_str") => {
             let pat = expect_str(args.first())?;
             let s = expect_str(args.get(1))?;
-            match get_or_compile_regex(&pat) {
-                Ok(re) => Ok(Value::Bool(re.is_match(&s))),
+            match get_or_compile_regex(pat) {
+                Ok(re) => Ok(Value::Bool(re.is_match(s))),
                 Err(_) => Ok(Value::Bool(false)),
             }
         }
         ("regex", "find") => {
             let pat = expect_str(args.first())?;
             let s = expect_str(args.get(1))?;
-            let re = get_or_compile_regex(&pat).map_err(|e| format!("regex.find: {e}"))?;
-            match re.captures(&s) {
+            let re = get_or_compile_regex(pat).map_err(|e| format!("regex.find: {e}"))?;
+            match re.captures(s) {
                 Some(caps) => Ok(Value::Variant {
                     name: "Some".into(),
                     args: vec![match_value(&caps)],
@@ -1774,29 +1774,29 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         ("regex", "find_all") => {
             let pat = expect_str(args.first())?;
             let s = expect_str(args.get(1))?;
-            let re = get_or_compile_regex(&pat).map_err(|e| format!("regex.find_all: {e}"))?;
-            let items: std::collections::VecDeque<Value> = re.captures_iter(&s).map(|caps| match_value(&caps)).collect();
+            let re = get_or_compile_regex(pat).map_err(|e| format!("regex.find_all: {e}"))?;
+            let items: std::collections::VecDeque<Value> = re.captures_iter(s).map(|caps| match_value(&caps)).collect();
             Ok(Value::List(items))
         }
         ("regex", "replace") => {
             let pat = expect_str(args.first())?;
             let s = expect_str(args.get(1))?;
             let rep = expect_str(args.get(2))?;
-            let re = get_or_compile_regex(&pat).map_err(|e| format!("regex.replace: {e}"))?;
-            Ok(Value::Str(re.replace(&s, rep).into_owned().into()))
+            let re = get_or_compile_regex(pat).map_err(|e| format!("regex.replace: {e}"))?;
+            Ok(Value::Str(re.replace(s, rep).into_owned().into()))
         }
         ("regex", "replace_all") => {
             let pat = expect_str(args.first())?;
             let s = expect_str(args.get(1))?;
             let rep = expect_str(args.get(2))?;
-            let re = get_or_compile_regex(&pat).map_err(|e| format!("regex.replace_all: {e}"))?;
-            Ok(Value::Str(re.replace_all(&s, rep).into_owned().into()))
+            let re = get_or_compile_regex(pat).map_err(|e| format!("regex.replace_all: {e}"))?;
+            Ok(Value::Str(re.replace_all(s, rep).into_owned().into()))
         }
         // -- datetime (pure ops; datetime.now is effectful and routes
         // through the handler under [time]) --
         ("datetime", "parse_iso") => {
             let s = expect_str(args.first())?;
-            match chrono::DateTime::parse_from_rfc3339(&s) {
+            match chrono::DateTime::parse_from_rfc3339(s) {
                 Ok(dt) => Ok(ok_v(Value::Int(instant_from_chrono(dt)))),
                 Err(e) => Ok(err_v(Value::Str(format!("parse_iso: {e}").into()))),
             }
@@ -1808,7 +1808,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         ("datetime", "parse") => {
             let s = expect_str(args.first())?;
             let fmt = expect_str(args.get(1))?;
-            match chrono::NaiveDateTime::parse_from_str(&s, &fmt) {
+            match chrono::NaiveDateTime::parse_from_str(s, fmt) {
                 Ok(naive) => {
                     use chrono::TimeZone;
                     match chrono::Utc.from_local_datetime(&naive).single() {
@@ -1823,7 +1823,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let n = expect_int(args.first())?;
             let fmt = expect_str(args.get(1))?;
             let dt = chrono_from_instant(n);
-            Ok(Value::Str(dt.format(&fmt).to_string().into()))
+            Ok(Value::Str(dt.format(fmt).to_string().into()))
         }
         ("datetime", "to_components") => {
             let n = expect_int(args.first())?;
@@ -1896,8 +1896,8 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         ("regex", "split") => {
             let pat = expect_str(args.first())?;
             let s = expect_str(args.get(1))?;
-            let re = get_or_compile_regex(&pat).map_err(|e| format!("regex.split: {e}"))?;
-            let parts: std::collections::VecDeque<Value> = re.split(&s).map(|p| Value::Str(p.into())).collect();
+            let re = get_or_compile_regex(pat).map_err(|e| format!("regex.split: {e}"))?;
+            let parts: std::collections::VecDeque<Value> = re.split(s).map(|p| Value::Str(p.into())).collect();
             Ok(Value::List(parts))
         }
 
@@ -1907,7 +1907,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let req = expect_record_pure(args.first())?.clone();
             let k = expect_str(args.get(1))?;
             let v = expect_str(args.get(2))?;
-            Ok(Value::record_interned(http_set_header(req, &k, &v)))
+            Ok(Value::record_interned(http_set_header(req, k, v)))
         }
         ("http", "with_auth") => {
             let req = expect_record_pure(args.first())?.clone();
@@ -2002,20 +2002,20 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let name = expect_str(args.first())?;
             let short = opt_str(args.get(1));
             let help = expect_str(args.get(2))?;
-            Ok(value_from_json(crate::cli::flag_spec(&name, short.as_deref(), &help)))
+            Ok(value_from_json(crate::cli::flag_spec(name, short.as_deref(), help)))
         }
         ("cli", "option") => {
             let name = expect_str(args.first())?;
             let short = opt_str(args.get(1));
             let help = expect_str(args.get(2))?;
             let default = opt_str(args.get(3));
-            Ok(value_from_json(crate::cli::option_spec(&name, short.as_deref(), &help, default.as_deref())))
+            Ok(value_from_json(crate::cli::option_spec(name, short.as_deref(), help, default.as_deref())))
         }
         ("cli", "positional") => {
             let name = expect_str(args.first())?;
             let help = expect_str(args.get(1))?;
             let required = expect_bool(args.get(2))?;
-            Ok(value_from_json(crate::cli::positional_spec(&name, &help, required)))
+            Ok(value_from_json(crate::cli::positional_spec(name, help, required)))
         }
         ("cli", "spec") => {
             let name = expect_str(args.first())?;
@@ -2024,7 +2024,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                 .iter().map(value_to_json).collect();
             let subs: Vec<serde_json::Value> = expect_list(args.get(3))?
                 .iter().map(value_to_json).collect();
-            Ok(value_from_json(crate::cli::build_spec(&name, &help, arg_specs, subs)))
+            Ok(value_from_json(crate::cli::build_spec(name, help, arg_specs, subs)))
         }
         ("cli", "parse") => {
             let spec = value_to_json(args.first().unwrap_or(&Value::Unit));
@@ -2042,7 +2042,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let ok = expect_bool(args.first())?;
             let cmd = expect_str(args.get(1))?;
             let data = value_to_json(args.get(2).unwrap_or(&Value::Unit));
-            Ok(value_from_json(crate::cli::envelope(ok, &cmd, data)))
+            Ok(value_from_json(crate::cli::envelope(ok, cmd, data)))
         }
         ("cli", "describe") => {
             let spec = value_to_json(args.first().unwrap_or(&Value::Unit));
@@ -2149,7 +2149,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let (c, e)   = expect_decimal(args.first())?;
             let target_e = expect_int(args.get(1))?;
             let mode     = expect_str(args.get(2))?;
-            Ok(make_decimal(decimal_round(c, e, target_e, &mode)?, target_e))
+            Ok(make_decimal(decimal_round(c, e, target_e, mode)?, target_e))
         }
         ("decimal", "to_str") => {
             let (c, e) = expect_decimal(args.first())?;
