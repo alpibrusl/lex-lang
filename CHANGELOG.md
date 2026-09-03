@@ -7,6 +7,13 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.10.14] — 2026-09-03
+
+Closes out #768: `std.str` scans are linear and a scanner can now tell
+whether it can skip multibyte handling entirely. Together these are
+what unblocks lex-schema's JSON parser rewrite (alpibrusl/lex-schema#31),
+which needs both `str.find_any` and `str.is_ascii`.
+
 ### Added
 
 - **`str.is_ascii(s) -> Bool`** (#768). One native pass, one VM step.
