@@ -20,7 +20,6 @@ budget=2500
 allow=(
   "crates/lex-cli/src/main.rs"            # #779
   "crates/lex-runtime/src/builtins.rs"    # #778
-  "crates/lex-runtime/src/handler.rs"     # #779
   "crates/lex-store/src/store.rs"         # #779
   "crates/lex-types/src/builtins.rs"      # #778
 )
@@ -35,6 +34,12 @@ is_allowed() {
 
 status=0
 checked=0
+for a in "${allow[@]}"; do
+  if [ ! -f "$a" ]; then
+    echo "$a is allow-listed but does not exist; remove it from the allow-list in $0"
+    status=1
+  fi
+done
 while IFS= read -r f; do
   checked=$((checked + 1))
   n="$(wc -l < "$f")"

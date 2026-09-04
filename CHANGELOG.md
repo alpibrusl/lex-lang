@@ -17,6 +17,13 @@ bumps may carry breaking changes when justified).
   unchanged. CI now runs `scripts/check-file-sizes.sh`, which fails
   when a file under `crates/*/src` exceeds 2,500 lines without an
   allow-list entry naming its tracking issue.
+- **lex-runtime `handler.rs` split per effect family (#779).** The
+  5,700-line file is now `handler/{mod,dispatch,approval,fs,proc,
+  logging,udp,kv,redis_store,sql,llm,http_serve,http_client}.rs`:
+  `dispatch.rs` holds the `EffectHandler` impl (the `(kind, op)`
+  router), each family module holds its registries, helpers and
+  `DefaultHandler` methods. Code moves only; `lex_runtime::handler::*`
+  public items and the crate-root re-exports are unchanged.
 
 ## [0.10.15] — 2026-09-04
 
