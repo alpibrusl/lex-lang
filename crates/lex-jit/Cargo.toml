@@ -28,7 +28,7 @@ cranelift = [
 lex-bytecode = { path = "../lex-bytecode", version = "0.10.0" }
 thiserror.workspace = true
 
-cranelift-codegen = { version = "0.132", optional = true }
+cranelift-codegen = { version = "0.134", optional = true }
 cranelift-frontend = { version = "0.132", optional = true }
 cranelift-jit = { version = "0.132", optional = true }
 cranelift-module = { version = "0.132", optional = true }
