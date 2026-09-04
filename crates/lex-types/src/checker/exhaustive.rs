@@ -8,16 +8,16 @@
 //! Lex pattern text for the `missing` field of the error.
 //!
 //! The column type decides the constructor signature:
-//!   * a union type    → its variants (payload becomes one sub-column);
-//!   * `Bool`          → `true` / `false`;
-//!   * `Unit`          → `()`;
-//!   * a tuple         → one constructor with one sub-column per item;
-//!   * a record        → one constructor with one sub-column per field
-//!                       (record aliases are unfolded first);
-//!   * `Never`         → no values, so any matrix is exhaustive;
-//!   * anything else   → opaque (`Int`, `Str`, `List[..]`, functions,
-//!                       unresolved type variables): only a wildcard or
-//!                       a binder covers it.
+//!
+//! * a union type: its variants (payload becomes one sub-column);
+//! * `Bool`: `true` / `false`;
+//! * `Unit`: `()`;
+//! * a tuple: one constructor with one sub-column per item;
+//! * a record: one constructor with one sub-column per field (record
+//!   aliases are unfolded first);
+//! * `Never`: no values, so any matrix is exhaustive;
+//! * anything else: opaque (`Int`, `Str`, `List[..]`, functions,
+//!   unresolved type variables): only a wildcard or a binder covers it.
 //!
 //! Rows are owned pattern clones. The matrices are tiny (one row per
 //! arm) and specialisation needs to synthesise patterns (a wildcard for
