@@ -15,3 +15,12 @@ command = "cargo run -q -p lex-cli -- docs --effects"
 id = "stdlib-index"
 path = "docs/AGENT.md"
 command = "cargo run -q -p lex-cli -- docs --stdlib-index"
+
+# Per-builtin reference for the modules declared in
+# lex-types/src/stdlib_spec.rs (#778): the signature, index convention
+# and notes are the definition the checker and the runtime dispatch
+# table are built from.
+[[block]]
+id = "stdlib-spec"
+path = "docs/AGENT.md"
+command = "cargo run -q -p lex-cli -- docs --stdlib-spec"

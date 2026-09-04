@@ -11,6 +11,12 @@ use std::sync::{Mutex, OnceLock};
 /// path (no side effects, no policy gate needed). Used by the effect
 /// handler to decide whether to consume `args` by value.
 pub fn is_pure_call(kind: &str, op: &str) -> bool {
+    // Declared modules (#778): the catalogue says whether a builtin is
+    // effect-free; `VmNative` entries (the list higher-order functions)
+    // never reach dispatch but are pure, as before.
+    if let Some(def) = lex_types::stdlib_spec::lookup(kind, op) {
+        return def.kind != lex_types::stdlib_spec::BuiltinKind::Effect;
+    }
     if !is_pure_module(kind) { return false; }
     !matches!(
         (kind, op),
@@ -40,19 +46,13 @@ pub fn is_pure_call(kind: &str, op: &str) -> bool {
 /// Callers must first verify `is_pure_call(kind, op)` to ensure args
 /// ownership is only transferred for known-pure ops.
 ///
-/// `list.cons` is handled here with move semantics so the tail `Vec<Value>`
-/// is extended without cloning each element (#405).
+/// Declared builtins (#778) take the argument vector by value, so
+/// `list.cons` extends its tail without cloning each element (#405).
 pub fn call_pure_builtin(kind: &str, op: &str, args: Vec<Value>) -> Result<Value, String> {
-    if (kind, op) == ("list", "cons") {
-        let mut it = args.into_iter();
-        let head = it.next().unwrap_or(Value::Unit);
-        let mut tail = match it.next() {
-            Some(Value::List(v)) => v,
-            Some(other) => return Err(format!("list.cons: expected List, got {other:?}")),
-            None => lex_bytecode::List::new(),
-        };
-        tail.push_front(head);
-        return Ok(Value::List(tail));
+    // Declared modules (#778): one by-value implementation per builtin,
+    // so `list.cons` moves its tail here and on the borrowed path alike.
+    if let Some(f) = crate::stdlib::lookup(kind, op) {
+        return f(args);
     }
     dispatch(kind, op, &args)
 }
@@ -79,193 +79,12 @@ pub fn is_pure_module(kind: &str) -> bool {
 }
 
 fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
+    // Declared modules (#778) live in `crate::stdlib`; the table takes
+    // owned args, so the borrowed path clones once here.
+    if let Some(f) = crate::stdlib::lookup(kind, op) {
+        return f(args.to_vec());
+    }
     match (kind, op) {
-        // -- str --
-        ("str", "is_empty") => Ok(Value::Bool(expect_str(args.first())?.is_empty())),
-        ("str", "len") => Ok(Value::Int(expect_str(args.first())?.len() as i64)),
-        // O(1) single-char access. `str.slice(s, i, i+1)` resolves a codepoint
-        // index via `char_indices().nth(i)` — O(i) — so scanning a string
-        // char-by-char is O(n²). `char_at` indexes the UTF-8 bytes directly and
-        // returns the byte as a 1-char Str, letting ASCII-oriented scanners
-        // (e.g. the JSON parser, whose input is pre-sanitised to single bytes)
-        // run in O(n). Returns the char for ASCII bytes (< 128); out-of-range or
-        // a non-ASCII byte yields "" — total, never panics.
-        ("str", "char_at") => {
-            let s = expect_str(args.first())?;
-            let i = expect_int(args.get(1))?;
-            if i < 0 {
-                Ok(Value::Str("".into()))
-            } else {
-                match s.as_bytes().get(i as usize) {
-                    Some(&b) if b < 128 => {
-                        Ok(Value::Str((b as char).to_string().into()))
-                    }
-                    _ => Ok(Value::Str("".into())),
-                }
-            }
-        }
-        ("str", "concat") => {
-            let a = expect_str(args.first())?;
-            let b = expect_str(args.get(1))?;
-            Ok(Value::Str(format!("{a}{b}").into()))
-        }
-        ("str", "to_int") => {
-            let s = expect_str(args.first())?;
-            match s.parse::<i64>() {
-                Ok(n) => Ok(some(Value::Int(n))),
-                Err(_) => Ok(none()),
-            }
-        }
-        ("str", "split") => {
-            let s = expect_str(args.first())?;
-            let sep = expect_str(args.get(1))?;
-            let items: std::collections::VecDeque<Value> = if sep.is_empty() {
-                s.chars().map(|c| Value::Str(c.to_string().into())).collect()
-            } else {
-                s.split(sep).map(|p| Value::Str(p.into())).collect()
-            };
-            Ok(Value::List(items.into()))
-        }
-        ("str", "join") => {
-            let parts = expect_list(args.first())?;
-            let sep = expect_str(args.get(1))?;
-            let mut out = String::new();
-            for (i, p) in parts.iter().enumerate() {
-                if i > 0 { out.push_str(sep); }
-                match p {
-                    Value::Str(s) => out.push_str(s),
-                    other => return Err(format!("str.join element must be Str, got {other:?}")),
-                }
-            }
-            Ok(Value::Str(out.into()))
-        }
-        ("str", "starts_with") => {
-            let s = expect_str(args.first())?;
-            let prefix = expect_str(args.get(1))?;
-            Ok(Value::Bool(s.starts_with(prefix)))
-        }
-        ("str", "ends_with") => {
-            let s = expect_str(args.first())?;
-            let suffix = expect_str(args.get(1))?;
-            Ok(Value::Bool(s.ends_with(suffix)))
-        }
-        ("str", "contains") => {
-            let s = expect_str(args.first())?;
-            let needle = expect_str(args.get(1))?;
-            Ok(Value::Bool(s.contains(needle)))
-        }
-        ("str", "cmp") => {
-            let a = expect_str(args.first())?;
-            let b = expect_str(args.get(1))?;
-            Ok(Value::Int(match a.cmp(b) {
-                std::cmp::Ordering::Less => -1,
-                std::cmp::Ordering::Equal => 0,
-                std::cmp::Ordering::Greater => 1,
-            }))
-        }
-        ("str", "replace") => {
-            let s = expect_str(args.first())?;
-            let from = expect_str(args.get(1))?;
-            let to = expect_str(args.get(2))?;
-            Ok(Value::Str(s.replace(from, to).into()))
-        }
-        ("str", "trim") => Ok(Value::Str(expect_str(args.first())?.trim().into())),
-        ("str", "to_upper") => Ok(Value::Str(expect_str(args.first())?.to_uppercase().into())),
-        ("str", "to_lower") => Ok(Value::Str(expect_str(args.first())?.to_lowercase().into())),
-        ("str", "strip_prefix") => {
-            let s = expect_str(args.first())?;
-            let prefix = expect_str(args.get(1))?;
-            Ok(match s.strip_prefix(prefix) {
-                Some(rest) => some(Value::Str(rest.into())),
-                None => none(),
-            })
-        }
-        ("str", "strip_suffix") => {
-            let s = expect_str(args.first())?;
-            let suffix = expect_str(args.get(1))?;
-            Ok(match s.strip_suffix(suffix) {
-                Some(rest) => some(Value::Str(rest.into())),
-                None => none(),
-            })
-        }
-        ("str", "slice") => {
-            // Half-open codepoint-index slice. `lo` and `hi` are Unicode
-            // scalar value (codepoint) indices, not byte offsets. Out-of-range
-            // indices clamp to the codepoint count, mirroring Python's `s[lo:hi]`
-            // semantics. Reversed ranges error as a caller logic bug. (#620)
-            let s = expect_str(args.first())?;
-            let lo_i = expect_int(args.get(1))?;
-            let hi_i = expect_int(args.get(2))?;
-            let lo_cp = lo_i.max(0) as usize;
-            let hi_cp = hi_i.max(0) as usize;
-            if lo_cp > hi_cp {
-                return Err(format!(
-                    "str.slice: reversed range [{lo_cp}..{hi_cp}]"));
-            }
-            // Resolve codepoint indices to byte offsets through the
-            // forward-scan cursor (#764). Indices past the end clamp to
-            // s.len(), yielding an empty slice.
-            let sv = str_arg(args.first())?;
-            let lo_byte = cp_to_byte(sv, lo_cp);
-            let hi_byte = cp_to_byte(sv, hi_cp);
-            Ok(Value::Str(s[lo_byte..hi_byte].into()))
-        }
-        // is_ascii :: Str -> Bool — one native pass, one VM step. Lets a
-        // scanner that needs single-byte input (lex-schema's JSON parser
-        // collapses multi-byte chars before parsing) skip its per-char
-        // sanitising pass on the common case instead of paying VM steps
-        // for every character of a large document (#768).
-        ("str", "is_ascii") => Ok(Value::Bool(expect_str(args.first())?.is_ascii())),
-        // find :: (Str, Str, Int) -> Option[Int] — codepoint index of the
-        // first occurrence of `needle` at or after codepoint `from`, so a
-        // scanner can jump to the next delimiter in one builtin call
-        // instead of one `char_at` per character (#764, #768). Indices
-        // are codepoint positions, matching `str.slice`. `from` clamps
-        // to [0, len]; an empty needle matches at `from`.
-        ("str", "find") => {
-            let s = expect_str(args.first())?;
-            let needle = expect_str(args.get(1))?;
-            let from_cp = expect_int(args.get(2))?.max(0) as usize;
-            let sv = str_arg(args.first())?;
-            let from_byte = cp_to_byte(sv, from_cp);
-            if from_byte >= s.len() && !(from_byte == s.len() && needle.is_empty()) {
-                return Ok(none());
-            }
-            Ok(match s[from_byte..].find(needle) {
-                Some(off) => {
-                    let cp = from_cp + s[from_byte..from_byte + off].chars().count();
-                    remember_cursor(sv, cp, from_byte + off);
-                    some(Value::Int(cp as i64))
-                }
-                None => none(),
-            })
-        }
-        // find_any :: (Str, Str, Int) -> Option[Int] — codepoint index of
-        // the first char at or after `from` that occurs in `set`. The
-        // JSON-string case: `str.find_any(src, "\"\\", p)` locates the
-        // next quote or backslash in one call.
-        ("str", "find_any") => {
-            let s = expect_str(args.first())?;
-            let set = expect_str(args.get(1))?;
-            let from_cp = expect_int(args.get(2))?.max(0) as usize;
-            let sv = str_arg(args.first())?;
-            let from_byte = cp_to_byte(sv, from_cp);
-            if from_byte >= s.len() {
-                return Ok(none());
-            }
-            let hit = s[from_byte..]
-                .char_indices()
-                .enumerate()
-                .find(|(_, (_, c))| set.contains(*c));
-            Ok(match hit {
-                Some((n, (off, _))) => {
-                    let cp = from_cp + n;
-                    remember_cursor(sv, cp, from_byte + off);
-                    some(Value::Int(cp as i64))
-                }
-                None => none(),
-            })
-        }
 
         // -- int / float --
         ("int", "to_str") => Ok(Value::Str(expect_int(args.first())?.to_string().into())),
@@ -276,61 +95,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         ("int", "max") => Ok(Value::Int(expect_int(args.first())?.max(expect_int(args.get(1))?))),
         ("float", "to_int") => Ok(Value::Int(expect_float(args.first())? as i64)),
         ("float", "to_str") => Ok(Value::Str(expect_float(args.first())?.to_string().into())),
-        ("str", "to_float") => {
-            let s = expect_str(args.first())?;
-            match s.parse::<f64>() {
-                Ok(f) => Ok(some(Value::Float(f))),
-                Err(_) => Ok(none()),
-            }
-        }
 
-        // -- list --
-        ("list", "len") => Ok(Value::Int(expect_list(args.first())?.len() as i64)),
-        ("list", "is_empty") => Ok(Value::Bool(expect_list(args.first())?.is_empty())),
-        ("list", "head") => {
-            let xs = expect_list(args.first())?;
-            match xs.front() {
-                Some(v) => Ok(some(v.clone())),
-                None => Ok(none()),
-            }
-        }
-        ("list", "tail") => {
-            let xs = expect_list(args.first())?;
-            if xs.is_empty() { Ok(Value::List(std::collections::VecDeque::new().into())) }
-            else { Ok(Value::List(xs.iter().skip(1).cloned().collect::<std::collections::VecDeque<_>>().into())) }
-        }
-        ("list", "range") => {
-            let lo = expect_int(args.first())?;
-            let hi = expect_int(args.get(1))?;
-            Ok(Value::List((lo..hi).map(Value::Int).collect::<std::collections::VecDeque<_>>().into()))
-        }
-        ("list", "concat") => {
-            let mut out = expect_list(args.first())?.clone();
-            out.extend(expect_list(args.get(1))?.iter().cloned());
-            Ok(Value::List(out.into()))
-        }
-        ("list", "reverse") => {
-            let out = expect_list(args.first())?.clone();
-            let rev: std::collections::VecDeque<Value> = out.into_iter().rev().collect();
-            Ok(Value::List(rev.into()))
-        }
-        // #334: cons — prepend a single element to a list.
-        // (fast path via call_pure_builtin; this branch handles the
-        // borrow-based dispatch path which must clone)
-        ("list", "cons") => {
-            let head = args.first().cloned().unwrap_or(Value::Unit);
-            let mut out: std::collections::VecDeque<Value> =
-                expect_list(args.get(1))?.iter().cloned().collect();
-            out.push_front(head);
-            Ok(Value::List(out.into()))
-        }
-        ("list", "enumerate") => {
-            let xs = expect_list(args.first())?;
-            let pairs = xs.iter().cloned().enumerate()
-                .map(|(i, v)| Value::Tuple(vec![Value::Int(i as i64), v]))
-                .collect::<std::collections::VecDeque<_>>();
-            Ok(Value::List(pairs.into()))
-        }
 
         // -- tuple --
         // Per §11.1: fst, snd, third for 2- and 3-tuples. Index out of
@@ -2430,7 +2195,7 @@ fn tuple_index(v: &Value, i: usize) -> Result<Value, String> {
 
 /// The `Str` argument itself, for builtins that key the codepoint
 /// cursor on the string's identity.
-fn str_arg(v: Option<&Value>) -> Result<&SmolStr, String> {
+pub(crate) fn str_arg(v: Option<&Value>) -> Result<&SmolStr, String> {
     match v {
         Some(Value::Str(s)) => Ok(s),
         Some(other) => Err(format!("expected Str, got {other:?}")),
@@ -2461,7 +2226,7 @@ thread_local! {
 /// behind it must not rescan the whole prefix for the chunk start
 /// (#774; that pattern made lex-schema's string parsing quadratic
 /// in the document even after #769).
-fn cp_to_byte(s: &SmolStr, cp: usize) -> usize {
+pub(crate) fn cp_to_byte(s: &SmolStr, cp: usize) -> usize {
     CP_CURSOR.with(|cur| {
         let mut cur = cur.borrow_mut();
         let cached = match &*cur {
@@ -2500,7 +2265,7 @@ fn cp_to_byte(s: &SmolStr, cp: usize) -> usize {
 }
 
 /// Record a (codepoint, byte) position just resolved by other means.
-fn remember_cursor(s: &SmolStr, cp: usize, byte: usize) {
+pub(crate) fn remember_cursor(s: &SmolStr, cp: usize, byte: usize) {
     if byte < s.len() {
         CP_CURSOR.with(|cur| *cur.borrow_mut() = Some((s.clone(), cp, byte)));
     }
@@ -2511,7 +2276,7 @@ fn remember_cursor(s: &SmolStr, cp: usize, byte: usize) {
 /// once per character on a 300 KB document would otherwise copy
 /// 300 KB per call and turn a linear walk into a quadratic one
 /// (#764).
-fn expect_str(v: Option<&Value>) -> Result<&str, String> {
+pub(crate) fn expect_str(v: Option<&Value>) -> Result<&str, String> {
     match v {
         Some(Value::Str(s)) => Ok(s.as_str()),
         Some(other) => Err(format!("expected Str, got {other:?}")),
@@ -2519,7 +2284,7 @@ fn expect_str(v: Option<&Value>) -> Result<&str, String> {
     }
 }
 
-fn expect_int(v: Option<&Value>) -> Result<i64, String> {
+pub(crate) fn expect_int(v: Option<&Value>) -> Result<i64, String> {
     match v {
         Some(Value::Int(n)) => Ok(*n),
         Some(other) => Err(format!("expected Int, got {other:?}")),
@@ -2535,7 +2300,7 @@ fn expect_float(v: Option<&Value>) -> Result<f64, String> {
     }
 }
 
-fn expect_list(v: Option<&Value>) -> Result<&std::collections::VecDeque<Value>, String> {
+pub(crate) fn expect_list(v: Option<&Value>) -> Result<&std::collections::VecDeque<Value>, String> {
     match v {
         Some(Value::List(xs)) => Ok(xs),
         Some(other) => Err(format!("expected List, got {other:?}")),
@@ -2559,8 +2324,8 @@ fn expect_deque(v: Option<&Value>) -> Result<&std::collections::VecDeque<Value>,
     }
 }
 
-fn some(v: Value) -> Value { Value::Variant { name: "Some".into(), args: vec![v] } }
-fn none() -> Value { Value::Variant { name: "None".into(), args: Vec::new() } }
+pub(crate) fn some(v: Value) -> Value { Value::Variant { name: "Some".into(), args: vec![v] } }
+pub(crate) fn none() -> Value { Value::Variant { name: "None".into(), args: Vec::new() } }
 fn ok_v(v: Value) -> Value { Value::Variant { name: "Ok".into(), args: vec![v] } }
 fn err_v(v: Value) -> Value { Value::Variant { name: "Err".into(), args: vec![v] } }
 

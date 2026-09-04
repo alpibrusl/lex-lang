@@ -303,6 +303,12 @@ fn cmd_docs() -> CommandInfo {
             "markdown stdlib module/function index from the checker's builtin registry",
             None,
         )
+        .add_option(
+            "--stdlib-spec",
+            "bool",
+            "markdown per-builtin signature and notes table for the declaratively defined stdlib modules",
+            None,
+        )
         .with_examples(vec![
             ("Workspace docs", "lex docs --for-agent"),
             ("Per-file", "lex docs src/"),

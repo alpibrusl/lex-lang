@@ -16,6 +16,7 @@
 pub mod arena;
 pub mod arrow;
 pub mod builtins;
+mod stdlib;
 #[cfg(feature = "df")]
 pub mod df;
 pub mod cli;

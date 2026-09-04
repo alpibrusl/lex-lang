@@ -7,6 +7,22 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Changed
+
+- **Declarative builtins, first modules (#778).** `std.str` and
+  `std.list` are now defined once each in
+  `lex_types::stdlib_spec::BUILTINS`: a `BuiltinDef` carries the
+  signature in Lex type syntax (parsed by the real parser), whether it
+  is pure, VM-lowered or effectful, its index convention (bytes for
+  `str.len` / `str.char_at`, codepoints for `str.slice` / `str.find` /
+  `str.find_any`) and a doc line. The type-checker's module scope, the
+  runtime's purity answer and dispatch table (`lex-runtime/src/stdlib/`,
+  one by-value implementation per builtin, so `list.cons` no longer has
+  two arms) and a new generated reference in `docs/AGENT.md`
+  (`lex docs --stdlib-spec`, checked by `lex doc-sync --check`) all
+  derive from it. No builtin changes behaviour; the other modules keep
+  their hand-written tables until they migrate.
+
 ## [0.10.15] — 2026-09-04
 
 Closes out #774, the last superlinear path #768 identified: lists are

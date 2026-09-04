@@ -31,7 +31,8 @@ pub fn cmd_docs(fmt: &OutputFormat, args: &[String]) -> Result<()> {
          usage: lex docs --for-agent [--branch B] [--limit-recent N] [--store DIR]\n\
          usage: lex docs --rules\n\
          usage: lex docs --effects        # effect-kind table from the runtime's single source\n\
-         usage: lex docs --stdlib-index   # stdlib module/function index from the checker's builtin registry"
+         usage: lex docs --stdlib-index   # stdlib module/function index from the checker's builtin registry
+         usage: lex docs --stdlib-spec    # per-builtin signature/notes table for the declaratively defined modules"
         )
     })?;
     if sub == "--effects" {
@@ -65,6 +66,34 @@ pub fn cmd_docs(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         }
         return Ok(());
     }
+    if sub == "--stdlib-spec" {
+        // Per-builtin reference for the modules declared in
+        // `lex_types::stdlib_spec` (#778): signature, index convention
+        // and notes come from the same definition the checker and the
+        // runtime use, so the three cannot disagree. Consumed by
+        // docsync.toml for docs/AGENT.md.
+        use lex_types::stdlib_spec::{declared_modules, defs_for, BuiltinKind, IndexConvention};
+        println!("| builtin | signature | indices | notes |");
+        println!("|---|---|---|---|");
+        for m in declared_modules() {
+            for d in defs_for(m) {
+                let idx = match d.index {
+                    IndexConvention::None => "",
+                    IndexConvention::Byte => "bytes",
+                    IndexConvention::Codepoint => "codepoints",
+                };
+                let mut notes = d.doc.to_string();
+                if let Some(c) = d.complexity {
+                    notes.push_str(&format!(" Cost: {c}."));
+                }
+                if d.kind == BuiltinKind::VmNative {
+                    notes.push_str(" Lowered by the compiler.");
+                }
+                println!("| `{}.{}` | `{}` | {idx} | {} |", d.module, d.name, d.ty, notes.replace('|', "\\|"));
+            }
+        }
+        return Ok(());
+    }
     if sub == "--rules" {
         // #306 slice 2: enumerate every type-error rule with its
         // explanation. Stable kebab-case `rule_tag`s let LLM repair
@@ -94,7 +123,7 @@ pub fn cmd_docs(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     }
     if sub.starts_with("--") && sub != "--for-agent" {
         anyhow::bail!(
-            "unknown `lex docs` flag `{sub}`. supported: `lex docs <path>...`, `--for-agent`, `--rules`"
+            "unknown `lex docs` flag `{sub}`. supported: `lex docs <path>...`, `--for-agent`, `--rules`, `--effects`, `--stdlib-index`, `--stdlib-spec`"
         );
     }
     if sub != "--for-agent" {
