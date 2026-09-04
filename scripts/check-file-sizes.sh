@@ -18,7 +18,6 @@ budget=2500
 # Remove an entry once the file is under budget; add one only with an
 # issue reference.
 allow=(
-  "crates/lex-cli/src/main.rs"            # #779
   "crates/lex-runtime/src/builtins.rs"    # #778
   "crates/lex-store/src/store.rs"         # #779
   "crates/lex-types/src/builtins.rs"      # #778

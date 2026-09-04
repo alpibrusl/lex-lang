@@ -819,7 +819,7 @@ Implementation footprint:
   bundles Cranelift's 30-odd crates; binary size grows by a few MB.
   Future: could be gated behind a `jit` cargo feature if size-
   sensitive distributions need to opt out.
-- `crates/lex-cli/src/main.rs` — `RunFlags::jit: bool`, parsed from
+- `crates/lex-cli/src/run.rs` — `RunFlags::jit: bool`, parsed from
   `--jit`. Tier installation is one block after `Vm::with_handler`:
 
   ```rust

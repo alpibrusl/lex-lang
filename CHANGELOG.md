@@ -24,6 +24,13 @@ bumps may carry breaking changes when justified).
   router), each family module holds its registries, helpers and
   `DefaultHandler` methods. Code moves only; `lex_runtime::handler::*`
   public items and the crate-root re-exports are unchanged.
+- **lex-cli `main.rs` split per subcommand group (#779).** The
+  6,100-line file keeps argument parsing, `lex parse` / `lex check` and
+  shared loaders (820 lines); `run`, `canonical`, `plan`, `repair`,
+  `trust`, `blame`, `store`, `stage`, `attest`, `policy`, `replay`,
+  `serve`, `spec` and `agent_tool` each get a module, and the store
+  resolver (#772) lives in `store_root.rs`, imported by every
+  store-backed command. Code moves only; no CLI surface change.
 
 ## [0.10.15] — 2026-09-04
 
