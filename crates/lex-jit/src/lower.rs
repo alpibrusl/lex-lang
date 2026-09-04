@@ -249,7 +249,7 @@ unsafe impl Sync for JittedFn {}
 /// Only meaningful for ops in the MVP subset.
 fn op_height_delta(op: &Op) -> (u32, u32) {
     match op {
-        Op::PushConst(_) | Op::LoadLocal(_) => (0, 1),
+        Op::PushConst(_) | Op::LoadLocal(_) | Op::TakeLocal(_) => (0, 1),
         Op::Pop | Op::StoreLocal(_) => (1, 0),
         Op::IntAdd | Op::IntSub | Op::IntMul | Op::IntDiv | Op::IntMod
         | Op::IntEq | Op::IntLt | Op::IntLe
@@ -554,7 +554,9 @@ impl<'a> Lowering<'a> {
             Op::Pop => {
                 self.pop(pc)?;
             }
-            Op::LoadLocal(i) => {
+            // A move-out load (#774) reads the same SSA var; for the
+            // scalar types the JIT handles, move and clone coincide.
+            Op::LoadLocal(i) | Op::TakeLocal(i) => {
                 let var = self.locals[i as usize];
                 let v = self.builder.use_var(var);
                 self.stack.push(v);

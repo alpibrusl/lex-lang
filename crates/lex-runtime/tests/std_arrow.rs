@@ -363,7 +363,7 @@ fn arrow_kernels_match_native_arrow_directly() {
     // col_names.
     let r = lex_runtime::arrow::dispatch("col_names", std::slice::from_ref(&table)).unwrap().unwrap();
     let names: VecDeque<Value> = match r {
-        Value::List(v) => v,
+        Value::List(v) => v.into_inner(),
         other => panic!("expected List, got {other:?}"),
     };
     assert_eq!(names, VecDeque::from(vec![Value::Str("x".into())]));

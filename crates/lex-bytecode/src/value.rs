@@ -84,7 +84,9 @@ pub enum Value {
     Str(SmolStr),
     Bytes(Vec<u8>),
     Unit,
-    List(VecDeque<Value>),
+    /// Shared, copy-on-write list (#774): a clone is a refcount bump,
+    /// and a mutation through `DerefMut` copies only when shared.
+    List(List),
     Tuple(Vec<Value>),
     /// Record literal. `shape_id` is the `Program::record_shapes`
     /// index of the field-name vec the record was built from
@@ -340,6 +342,110 @@ impl MapKey {
     }
 }
 
+/// A list value: `VecDeque<Value>` behind an `Arc`, copy-on-write.
+///
+/// Before #774 every `Value::List` held its `VecDeque` by value, so
+/// passing a list to a function (the VM clones a local onto the
+/// operand stack) deep-copied every element, and accumulating a list
+/// one element at a time was O(n²). Now a clone shares the buffer;
+/// `DerefMut` goes through `Arc::make_mut`, which mutates in place
+/// when the list has one owner and copies first otherwise. Together
+/// with the compiler's move-out of a local's last read
+/// (`Op::TakeLocal`), an accumulator threaded through a fold or a
+/// tail call reaches `list.cons` uniquely owned and grows in place.
+///
+/// `Deref<Target = VecDeque<Value>>`, so reads (`iter`, `len`,
+/// indexing, `front`) are unchanged; construct with `.into()` from a
+/// `Vec` or `VecDeque`, or `collect()`.
+#[derive(Clone, Default)]
+pub struct List(Arc<VecDeque<Value>>);
+
+impl List {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_capacity(n: usize) -> Self {
+        List(Arc::new(VecDeque::with_capacity(n)))
+    }
+
+    /// The buffer, without copying when this is the only owner.
+    pub fn into_inner(self) -> VecDeque<Value> {
+        Arc::try_unwrap(self.0).unwrap_or_else(|shared| (*shared).clone())
+    }
+
+    /// True when no other `List` shares the buffer, so a mutation
+    /// will not copy.
+    pub fn is_unique(&self) -> bool {
+        Arc::strong_count(&self.0) == 1
+    }
+}
+
+impl std::ops::Deref for List {
+    type Target = VecDeque<Value>;
+    fn deref(&self) -> &VecDeque<Value> {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for List {
+    fn deref_mut(&mut self) -> &mut VecDeque<Value> {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
+impl std::fmt::Debug for List {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl PartialEq for List {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || *self.0 == *other.0
+    }
+}
+
+impl From<VecDeque<Value>> for List {
+    fn from(v: VecDeque<Value>) -> Self {
+        List(Arc::new(v))
+    }
+}
+
+impl From<Vec<Value>> for List {
+    fn from(v: Vec<Value>) -> Self {
+        List(Arc::new(VecDeque::from(v)))
+    }
+}
+
+impl FromIterator<Value> for List {
+    fn from_iter<I: IntoIterator<Item = Value>>(iter: I) -> Self {
+        List(Arc::new(iter.into_iter().collect()))
+    }
+}
+
+impl Extend<Value> for List {
+    fn extend<I: IntoIterator<Item = Value>>(&mut self, iter: I) {
+        Arc::make_mut(&mut self.0).extend(iter)
+    }
+}
+
+impl IntoIterator for List {
+    type Item = Value;
+    type IntoIter = std::collections::vec_deque::IntoIter<Value>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.into_inner().into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a List {
+    type Item = &'a Value;
+    type IntoIter = std::collections::vec_deque::Iter<'a, Value>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
 impl Value {
     pub fn as_int(&self) -> i64 {
         match self { Value::Int(n) => *n, other => panic!("expected Int, got {other:?}") }
@@ -541,7 +647,7 @@ impl Value {
                 else { Value::Unit }
             }
             J::String(s) => Value::Str(s.as_str().into()),
-            J::Array(items) => Value::List(items.iter().map(Value::from_json).collect::<VecDeque<_>>()),
+            J::Array(items) => Value::List(items.iter().map(Value::from_json).collect()),
             J::Object(map) => {
                 if let (Some(J::String(name)), Some(J::Array(args))) =
                     (map.get("$variant"), map.get("args"))

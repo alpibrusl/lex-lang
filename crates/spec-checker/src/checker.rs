@@ -203,7 +203,7 @@ fn sample(ty: &SpecType, rng: &mut DetRng) -> Value {
             for _ in 0..len {
                 out.push_back(sample(element, rng));
             }
-            Value::List(out)
+            Value::List(out.into())
         }
         // #208 slice 3: random sampling over user-defined ADTs needs
         // a variant table that the spec language doesn't carry. The

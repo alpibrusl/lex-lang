@@ -338,7 +338,7 @@ pub(crate) fn list_builtin(func: &str, args: &[Value]) -> Option<Result<Value, S
                 Value::List(xs) => Some(if xs.is_empty() {
                     Err("tail: empty list".into())
                 } else {
-                    Ok(Value::List(xs.iter().skip(1).cloned().collect::<std::collections::VecDeque<_>>()))
+                    Ok(Value::List(xs.iter().skip(1).cloned().collect::<std::collections::VecDeque<_>>().into()))
                 }),
                 _ => None,
             }
@@ -753,7 +753,7 @@ mod tests {
 
     /// Build a `Value::List` from a slice of values.
     fn lst(items: &[Value]) -> Value {
-        Value::List(items.iter().cloned().collect::<std::collections::VecDeque<_>>())
+        Value::List(items.iter().cloned().collect())
     }
 
     #[test]

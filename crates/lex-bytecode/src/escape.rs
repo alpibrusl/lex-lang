@@ -448,7 +448,7 @@ fn step(
             }
         }
 
-        Op::LoadLocal(i) => {
+        Op::LoadLocal(i) | Op::TakeLocal(i) => {
             let slot = s.locals.get(*i as usize).cloned().unwrap_or(Slot::Other);
             s.stack.push(slot);
         }

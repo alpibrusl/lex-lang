@@ -153,6 +153,7 @@ fn stack_delta(op: &Op) -> i32 {
 
         // Locals
         Op::LoadLocal(_)  =>  1,
+        Op::TakeLocal(_)  =>  1,
         Op::StoreLocal(_) => -1,
 
         // Record / tuple / list construction
