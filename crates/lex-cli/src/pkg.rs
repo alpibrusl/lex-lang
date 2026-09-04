@@ -57,6 +57,11 @@ version = "0.1.0"
 [dependencies]
 # lex-schema = {{ path = "../lex-schema" }}
 # lex-schema = {{ git = "https://github.com/alpibrusl/lex-schema", tag = "v1.0.0" }}
+
+[store]
+# Where `lex branch` / `publish` / `merge` keep this project's stages,
+# branches, and traces when no --store is given. Relative to this file.
+# path = ".lex/store"
 "#
     );
     std::fs::write(toml_path, content)?;

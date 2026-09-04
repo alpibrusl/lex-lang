@@ -24,11 +24,7 @@ fn open_store(args_iter: &mut dyn Iterator<Item = String>) -> Result<(Store, Vec
             rest.push(a);
         }
     }
-    let root = root.unwrap_or_else(|| {
-        let home = std::env::var("HOME").map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("."));
-        home.join(".lex/store")
-    });
+    let root = root.unwrap_or_else(crate::default_store_root_pub);
     let store = Store::open(&root)
         .map_err(|e| anyhow!("open store at {}: {e}", root.display()))?;
     Ok((store, rest))

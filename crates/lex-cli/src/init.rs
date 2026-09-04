@@ -4,6 +4,7 @@
 //!   lex.toml                   package manifest
 //!   src/main.lex               entry-point stub (with an `examples { }` block)
 //!   tests/test_main.lex        test stub (`run_all` returns 0)
+//!   .gitignore                 ignores the project store (`.lex/store/`)
 //!   .github/workflows/lex.yml  GitHub Actions CI workflow
 //!   AGENTS.md                  cold-start guide for AI assistants
 //!
@@ -37,6 +38,7 @@ pub fn cmd_init(args: &[String]) -> Result<()> {
         ("tests/test_main.lex",         test_lex),
         (".github/workflows/lex.yml",   ci_yml),
         ("AGENTS.md",                   agents_md),
+        (".gitignore",                  gitignore),
     ];
 
     for (rel, gen) in files {
@@ -76,8 +78,20 @@ version = "0.1.0"
 [dependencies]
 # lex-schema = {{ path = "../lex-schema" }}
 # lex-schema = {{ git = "https://github.com/alpibrusl/lex-schema" }}
+
+[store]
+# Where `lex branch` / `publish` / `merge` keep this project's stages,
+# branches, and traces when no --store is given. Relative to this file.
+# path = ".lex/store"
 "#
     )
+}
+
+fn gitignore(_name: &str) -> String {
+    "# lex-vcs project store (branches, published stages, traces): local state,\n\
+     # scoped to this project by lex.toml. Pass --store to put it elsewhere.\n\
+     .lex/store/\n"
+        .to_string()
 }
 
 fn main_lex(_name: &str) -> String {

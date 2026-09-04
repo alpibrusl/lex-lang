@@ -130,12 +130,7 @@ pub fn cmd_docs(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             other => anyhow::bail!("unexpected arg `{other}`"),
         }
     }
-    let root = root.unwrap_or_else(|| {
-        let home = std::env::var("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("."));
-        home.join(".lex/store")
-    });
+    let root = root.unwrap_or_else(crate::default_store_root_pub);
     let store = Store::open(&root)?;
     let current_branch = branch.unwrap_or_else(|| store.current_branch());
 

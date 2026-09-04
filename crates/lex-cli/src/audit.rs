@@ -777,8 +777,9 @@ fn cmd_audit_semantic(fmt: &OutputFormat, opts: &AuditOpts) -> Result<()> {
     Ok(())
 }
 
+/// Same resolution as every other store-touching command (#772): an
+/// audit's attestations belong in the project's store, not a private
+/// `./.lex` that nothing else reads.
 fn default_store_root() -> PathBuf {
-    std::env::var("LEX_STORE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(".lex"))
+    crate::default_store_root_pub()
 }

@@ -463,6 +463,20 @@ Git dependencies are cloned to `~/.lex/packages/` on first use (override with `$
 
 Manage with `lex pkg init / add / list`.
 
+The same `lex.toml` scopes the **store** (branches, published stages,
+traces) that `lex branch`, `publish`, `merge`, `op`, `store`, and
+`run --trace` use when no `--store` is given: `[store] path` if
+declared (relative to the manifest), else `.lex/store` beside it.
+`LEX_STORE` overrides both. Only outside any project does lex fall
+back to the machine-wide `~/.lex/store`, and it says so on stderr,
+because that store is shared by every project without a manifest.
+`lex init` ignores `.lex/store/` for you.
+
+```toml
+[store]
+path = ".lex/store"   # the default; any path relative to lex.toml
+```
+
 ---
 
 ## `lex test` — test runner

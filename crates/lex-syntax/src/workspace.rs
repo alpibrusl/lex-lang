@@ -49,6 +49,20 @@ pub struct Manifest {
     pub package: Option<PackageMeta>,
     #[serde(default)]
     pub dependencies: HashMap<String, Dependency>,
+    /// `[store]` — where store-touching commands (`lex branch`,
+    /// `publish`, `merge`, `op`, `store`, ...) keep this project's
+    /// stages, branches, and traces when no `--store` is given (#772).
+    #[serde(default)]
+    pub store: Option<StoreSection>,
+}
+
+/// `[store]` table of `lex.toml`.
+#[derive(Debug, Default, Deserialize)]
+pub struct StoreSection {
+    /// Store root, relative to the manifest's directory (an absolute
+    /// path is used as is). Defaults to `.lex/store` when absent.
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
