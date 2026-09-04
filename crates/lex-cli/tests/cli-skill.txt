@@ -920,6 +920,7 @@ emit machine-readable API/workspace docs
 - `----for-agent` (bool) — emit one JSON object describing the whole workspace
 - `----effects` (bool) — markdown effect-kind table from the runtime's KNOWN_EFFECTS single source
 - `----stdlib-index` (bool) — markdown stdlib module/function index from the checker's builtin registry
+- `----stdlib-spec` (bool) — markdown per-builtin signature and notes table for the declaratively defined stdlib modules
 
 ### Arguments
 
