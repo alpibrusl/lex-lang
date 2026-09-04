@@ -129,6 +129,7 @@ pub(crate) fn op_supported(op: &Op, consts: &[Const]) -> bool {
         ),
         Op::Pop
         | Op::LoadLocal(_)
+        | Op::TakeLocal(_)
         | Op::StoreLocal(_)
         | Op::IntAdd
         | Op::IntSub

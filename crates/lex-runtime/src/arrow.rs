@@ -91,7 +91,7 @@ fn decode_columns_list(list: &VecDeque<Value>) -> Result<Vec<(&str, &VecDeque<Va
                 ))
             }
         };
-        out.push((name, values));
+        out.push((name, &**values));
     }
     Ok(out)
 }
@@ -218,7 +218,7 @@ fn col_names(args: &[Value]) -> Result<Value, String> {
         .iter()
         .map(|f| Value::Str(f.name().as_str().into()))
         .collect();
-    Ok(Value::List(names))
+    Ok(Value::List(names.into()))
 }
 
 fn col_type(args: &[Value]) -> Result<Value, String> {

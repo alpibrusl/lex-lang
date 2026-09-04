@@ -16,7 +16,7 @@ pub mod jit_hook;
 pub use compiler::compile_program;
 pub use op::{Const, Op};
 pub use program::{Function, Program};
-pub use value::{MapKey, Value};
+pub use value::{List, MapKey, Value};
 pub use vm::{Vm, VmError, MAX_CALL_DEPTH};
 pub use verify::{verify_program, StackError};
 pub use escape::{analyze_program as analyze_escapes, EscapeReport, EscapeSite, Policy, SiteKind};

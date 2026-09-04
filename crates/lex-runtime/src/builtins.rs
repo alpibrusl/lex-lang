@@ -49,7 +49,7 @@ pub fn call_pure_builtin(kind: &str, op: &str, args: Vec<Value>) -> Result<Value
         let mut tail = match it.next() {
             Some(Value::List(v)) => v,
             Some(other) => return Err(format!("list.cons: expected List, got {other:?}")),
-            None => std::collections::VecDeque::new(),
+            None => lex_bytecode::List::new(),
         };
         tail.push_front(head);
         return Ok(Value::List(tail));
@@ -124,7 +124,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             } else {
                 s.split(sep).map(|p| Value::Str(p.into())).collect()
             };
-            Ok(Value::List(items))
+            Ok(Value::List(items.into()))
         }
         ("str", "join") => {
             let parts = expect_list(args.first())?;
@@ -296,23 +296,23 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
         }
         ("list", "tail") => {
             let xs = expect_list(args.first())?;
-            if xs.is_empty() { Ok(Value::List(std::collections::VecDeque::new())) }
-            else { Ok(Value::List(xs.iter().skip(1).cloned().collect::<std::collections::VecDeque<_>>())) }
+            if xs.is_empty() { Ok(Value::List(std::collections::VecDeque::new().into())) }
+            else { Ok(Value::List(xs.iter().skip(1).cloned().collect::<std::collections::VecDeque<_>>().into())) }
         }
         ("list", "range") => {
             let lo = expect_int(args.first())?;
             let hi = expect_int(args.get(1))?;
-            Ok(Value::List((lo..hi).map(Value::Int).collect::<std::collections::VecDeque<_>>()))
+            Ok(Value::List((lo..hi).map(Value::Int).collect::<std::collections::VecDeque<_>>().into()))
         }
         ("list", "concat") => {
             let mut out = expect_list(args.first())?.clone();
             out.extend(expect_list(args.get(1))?.iter().cloned());
-            Ok(Value::List(out))
+            Ok(Value::List(out.into()))
         }
         ("list", "reverse") => {
             let out = expect_list(args.first())?.clone();
             let rev: std::collections::VecDeque<Value> = out.into_iter().rev().collect();
-            Ok(Value::List(rev))
+            Ok(Value::List(rev.into()))
         }
         // #334: cons — prepend a single element to a list.
         // (fast path via call_pure_builtin; this branch handles the
@@ -322,14 +322,14 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let mut out: std::collections::VecDeque<Value> =
                 expect_list(args.get(1))?.iter().cloned().collect();
             out.push_front(head);
-            Ok(Value::List(out))
+            Ok(Value::List(out.into()))
         }
         ("list", "enumerate") => {
             let xs = expect_list(args.first())?;
             let pairs = xs.iter().cloned().enumerate()
                 .map(|(i, v)| Value::Tuple(vec![Value::Int(i as i64), v]))
                 .collect::<std::collections::VecDeque<_>>();
-            Ok(Value::List(pairs))
+            Ok(Value::List(pairs.into()))
         }
 
         // -- tuple --
@@ -639,12 +639,12 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                         let row: std::collections::VecDeque<Value> = rec.iter()
                             .map(|f| Value::Str(f.into()))
                             .collect();
-                        rows.push_back(Value::List(row));
+                        rows.push_back(Value::List(row.into()));
                     }
                     Err(e) => return Ok(err_v(Value::Str(format!("csv.parse: {e}").into()))),
                 }
             }
-            Ok(ok_v(Value::List(rows)))
+            Ok(ok_v(Value::List(rows.into())))
         }
         ("csv", "stringify") => {
             // List[List[Str]] → CSV string. Mixed-type rows are
@@ -1782,7 +1782,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let s = expect_str(args.get(1))?;
             let re = get_or_compile_regex(pat).map_err(|e| format!("regex.find_all: {e}"))?;
             let items: std::collections::VecDeque<Value> = re.captures_iter(s).map(|caps| match_value(&caps)).collect();
-            Ok(Value::List(items))
+            Ok(Value::List(items.into()))
         }
         ("regex", "replace") => {
             let pat = expect_str(args.first())?;
@@ -1904,7 +1904,7 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
             let s = expect_str(args.get(1))?;
             let re = get_or_compile_regex(pat).map_err(|e| format!("regex.split: {e}"))?;
             let parts: std::collections::VecDeque<Value> = re.split(s).map(|p| Value::Str(p.into())).collect();
-            Ok(Value::List(parts))
+            Ok(Value::List(parts.into()))
         }
 
         // -- http (builders + decoders; wire ops live in the
@@ -2351,7 +2351,7 @@ fn match_value(caps: &regex::Captures) -> Value {
             )
         })
         .collect();
-    rec.insert("groups".into(), Value::List(groups));
+    rec.insert("groups".into(), Value::List(groups.into()));
     Value::record_dynamic(rec)
 }
 
@@ -2454,22 +2454,44 @@ thread_local! {
 }
 
 /// Byte offset of codepoint index `cp` in `s`, clamped to `s.len()`.
+///
+/// Resolves from the cursor when that is closer than the start of
+/// the string, in either direction: a scanner that finds the next
+/// delimiter (moving the cursor forward) and then slices the chunk
+/// behind it must not rescan the whole prefix for the chunk start
+/// (#774; that pattern made lex-schema's string parsing quadratic
+/// in the document even after #769).
 fn cp_to_byte(s: &SmolStr, cp: usize) -> usize {
     CP_CURSOR.with(|cur| {
         let mut cur = cur.borrow_mut();
-        let (start_cp, start_byte) = match &*cur {
+        let cached = match &*cur {
             Some((cached, ccp, cbyte))
-                if cached.as_ptr() == s.as_ptr() && cached.len() == s.len() && *ccp <= cp =>
+                if cached.as_ptr() == s.as_ptr() && cached.len() == s.len() =>
             {
-                (*ccp, *cbyte)
+                Some((*ccp, *cbyte))
             }
-            _ => (0, 0),
+            _ => None,
         };
-        let byte = s[start_byte..]
-            .char_indices()
-            .nth(cp - start_cp)
-            .map(|(b, _)| start_byte + b)
-            .unwrap_or(s.len());
+        let byte = match cached {
+            Some((ccp, cbyte)) if ccp <= cp => s[cbyte..]
+                .char_indices()
+                .nth(cp - ccp)
+                .map(|(b, _)| cbyte + b)
+                .unwrap_or(s.len()),
+            // Behind the cursor and nearer to it than to the start:
+            // walk back one char boundary at a time.
+            Some((ccp, cbyte)) if ccp - cp < cp => {
+                let mut b = cbyte;
+                for _ in 0..(ccp - cp) {
+                    b -= 1;
+                    while b > 0 && !s.is_char_boundary(b) {
+                        b -= 1;
+                    }
+                }
+                b
+            }
+            _ => s.char_indices().nth(cp).map(|(b, _)| b).unwrap_or(s.len()),
+        };
         if byte < s.len() {
             *cur = Some((s.clone(), cp, byte));
         }

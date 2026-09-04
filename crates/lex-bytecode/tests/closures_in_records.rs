@@ -116,7 +116,7 @@ fn named_fn_passed_directly_as_hof_arg() {
     let v = run(FN_AS_HOF_ARG, "entry", vec![]);
     match v {
         Value::List(items) => {
-            assert_eq!(items, vec![Value::Int(2), Value::Int(4), Value::Int(6)]);
+            assert_eq!(items, vec![Value::Int(2), Value::Int(4), Value::Int(6)].into());
         }
         other => panic!("expected List, got {other:?}"),
     }

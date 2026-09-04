@@ -225,6 +225,10 @@ pub fn compute_body_hash(
             Op::AllocStackTuple { arity }
             | Op::AllocArenaTuple { arity } =>
                 serde_json::to_vec(&Op::MakeTuple(*arity)).expect("Op serialization must succeed"),
+            // #774: a move-out load hashes as the plain load it
+            // replaced, so closure identity is invariant under the
+            // last-load pass.
+            Op::TakeLocal(i) => serde_json::to_vec(&Op::LoadLocal(*i)).expect("Op serialization must succeed"),
             Op::IntAdd   | Op::FloatAdd => serde_json::to_vec(&Op::NumAdd).unwrap(),
             Op::IntSub   | Op::FloatSub => serde_json::to_vec(&Op::NumSub).unwrap(),
             Op::IntMul   | Op::FloatMul => serde_json::to_vec(&Op::NumMul).unwrap(),

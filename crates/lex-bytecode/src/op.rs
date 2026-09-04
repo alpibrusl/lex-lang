@@ -29,6 +29,17 @@ pub enum Op {
     // locals
     LoadLocal(u16),
     StoreLocal(u16),
+    /// Move a local out of its slot (leaving `Unit`) instead of
+    /// cloning it (#774). The compiler rewrites the last `LoadLocal`
+    /// of each slot in a function body to this, which is sound
+    /// because bytecode is emitted in evaluation order and has no
+    /// backward jumps: nothing that runs later can read the slot.
+    /// The payoff is uniqueness at the consumer: a list accumulator
+    /// arriving at `list.cons` (or any builtin that mutates its
+    /// argument) has a refcount of one, so the copy-on-write `List`
+    /// mutates in place and element-by-element accumulation is
+    /// O(n) instead of O(n²). Hashes as `LoadLocal` in `body_hash`.
+    TakeLocal(u16),
 
     // constructors / pattern matching
     /// Builds a record by interning its field-name shape in

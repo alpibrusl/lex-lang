@@ -92,7 +92,7 @@ fn collect_items() -> List[Int] {
             Value::Int(2),
             Value::Int(3),
             Value::Int(4),
-        ]))
+        ]).into())
     );
 }
 

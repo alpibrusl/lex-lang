@@ -210,7 +210,7 @@ fn drains_all_rows_in_order() {
     let expected: Vec<Value> = (0..5)
         .map(|i| Value::Str(format!("r{i}").into()))
         .collect();
-    assert_eq!(list, expected);
+    assert_eq!(list, expected.into());
 }
 
 #[test]
@@ -262,7 +262,7 @@ fn early_termination_does_not_block_on_remaining_rows() {
             Value::Str("r0".into()),
             Value::Str("r1".into()),
             Value::Str("r2".into()),
-        ]
+        ].into()
     );
 }
 

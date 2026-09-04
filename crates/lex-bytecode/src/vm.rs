@@ -1679,6 +1679,17 @@ impl<'a> Vm<'a> {
                     let v = self.locals_storage[base + i as usize].clone();
                     self.stack.push(v);
                 }
+                Op::TakeLocal(i) => {
+                    // Last read of this slot in the body (#774): move,
+                    // don't clone, so the value reaches its consumer
+                    // uniquely owned.
+                    let base = self.frames[frame_idx].locals_start;
+                    let v = std::mem::replace(
+                        &mut self.locals_storage[base + i as usize],
+                        Value::Unit,
+                    );
+                    self.stack.push(v);
+                }
                 Op::StoreLocal(i) => {
                     let v = self.pop()?;
                     let base = self.frames[frame_idx].locals_start;
@@ -2289,7 +2300,7 @@ impl<'a> Vm<'a> {
                     }
                     keyed.sort_by(|(ka, _), (kb, _)| compare_sort_keys(ka, kb));
                     let sorted: VecDeque<Value> = keyed.into_iter().map(|(_, v)| v).collect();
-                    self.stack.push(Value::List(sorted));
+                    self.stack.push(Value::List(sorted.into()));
                 }
                 Op::ParallelMap { node_id_idx: _ } => {
                     // #305 slice 1: pop (xs, f) and apply f to each
@@ -2352,7 +2363,7 @@ impl<'a> Vm<'a> {
                     for item in items {
                         out.push_back(self.invoke_closure_1(f.clone(), item)?);
                     }
-                    self.stack.push(Value::List(out));
+                    self.stack.push(Value::List(out.into()));
                 }
                 Op::ListFilter { node_id_idx: _ } => {
                     // #464: native filter. Pred is applied to a clone
@@ -2376,7 +2387,7 @@ impl<'a> Vm<'a> {
                             out.push_back(item);
                         }
                     }
-                    self.stack.push(Value::List(out));
+                    self.stack.push(Value::List(out.into()));
                 }
                 Op::ListFold { node_id_idx: _ } => {
                     // #464: native left-fold. `acc` is threaded by

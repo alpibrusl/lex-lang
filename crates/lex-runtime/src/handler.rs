@@ -4314,23 +4314,23 @@ impl DefaultHandler {
     fn dispatch_stream_collect(&mut self, args: Vec<Value>) -> Value {
         let handle = match args.first().and_then(stream_handle_id) {
             Some(h) => h,
-            None => return Value::List(std::collections::VecDeque::new()),
+            None => return Value::List(std::collections::VecDeque::new().into()),
         };
         let mut iter = {
             let mut streams = match self.streams.lock() {
                 Ok(g) => g,
-                Err(_) => return Value::List(std::collections::VecDeque::new()),
+                Err(_) => return Value::List(std::collections::VecDeque::new().into()),
             };
             match streams.remove(&handle) {
                 Some(it) => it,
-                None => return Value::List(std::collections::VecDeque::new()),
+                None => return Value::List(std::collections::VecDeque::new().into()),
             }
         };
         let mut out: std::collections::VecDeque<Value> = std::collections::VecDeque::new();
         for chunk in iter.by_ref() {
             out.push_back(Value::Str(chunk.into()));
         }
-        Value::List(out)
+        Value::List(out.into())
     }
 
     /// Register a producer iterator and return its handle id. The
@@ -4709,7 +4709,7 @@ fn sql_run_query_pg(
     let out: std::collections::VecDeque<Value> = rows.iter().map(|row| {
         Value::record_dynamic(pg_row_to_lex_record(row))
     }).collect();
-    ok(Value::List(out))
+    ok(Value::List(out.into()))
 }
 
 /// Convert a Postgres row to a Lex record, mapping column types to Lex values.

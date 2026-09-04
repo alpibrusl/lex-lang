@@ -615,7 +615,7 @@ fn build_headers_value(req: &tungstenite::handshake::server::Request) -> Value {
         rec.insert("value".into(), Value::Str(v.into()));
         items.push_back(Value::record_dynamic(rec));
     }
-    Value::List(items)
+    Value::List(items.into())
 }
 
 fn build_unauthorized_response(

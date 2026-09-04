@@ -144,7 +144,7 @@ fn run_capture_exit_for_failing_command() {
     let v = run_with_policy(
         SRC,
         "run_capture_exit",
-        vec![Value::Str("false".into()), Value::List(std::collections::VecDeque::new())],
+        vec![Value::Str("false".into()), Value::List(std::collections::VecDeque::new().into())],
         policy_with_proc(),
     );
     assert_eq!(v, Value::Int(1));
@@ -155,7 +155,7 @@ fn run_capture_exit_for_succeeding_command() {
     let v = run_with_policy(
         SRC,
         "run_capture_exit",
-        vec![Value::Str("true".into()), Value::List(std::collections::VecDeque::new())],
+        vec![Value::Str("true".into()), Value::List(std::collections::VecDeque::new().into())],
         policy_with_proc(),
     );
     assert_eq!(v, Value::Int(0));

@@ -156,6 +156,18 @@ fn cursor_does_not_serve_backward_or_cross_string_lookups() {
 }
 
 #[test]
+fn cursor_resolves_a_short_backward_hop_across_multibyte_chars() {
+    // find lands the cursor on the delimiter; the chunk slice then
+    // starts a few codepoints behind it, across non-ASCII chars.
+    let src = format!("{}é✓ö,tail{}", "a".repeat(40), "b".repeat(40));
+    // codepoints: 0..40 'a', 40 'é', 41 '✓', 42 'ö', 43 ','
+    assert_eq!(run(SRC, "find", vec![s(&src), s(","), Value::Int(0)]).unwrap(), some(Value::Int(43)));
+    assert_eq!(run(SRC, "slice", vec![s(&src), Value::Int(40), Value::Int(43)]).unwrap(), s("é✓ö"));
+    assert_eq!(run(SRC, "slice", vec![s(&src), Value::Int(41), Value::Int(42)]).unwrap(), s("✓"));
+    assert_eq!(run(SRC, "slice", vec![s(&src), Value::Int(39), Value::Int(41)]).unwrap(), s("aé"));
+}
+
+#[test]
 fn slice_walk_is_linear() {
     let n = 200_000;
     let src = "a".repeat(n);

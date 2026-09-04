@@ -238,7 +238,7 @@ fn df_filter_in_str() {
 #[test]
 fn df_filter_in_str_empty_list_is_empty_result() {
     let t = make_mixed_batch();
-    let needles = Value::List(std::collections::VecDeque::new());
+    let needles = Value::List(std::collections::VecDeque::new().into());
     let r = lex_runtime::df::dispatch(
         "filter_in_str",
         &[t, Value::Str("g".into()), needles],
@@ -328,7 +328,7 @@ fn df_drop_nulls() {
 #[test]
 fn df_drop_nulls_empty_col_list_is_noop() {
     let t = make_mixed_batch();
-    let empty_cols = Value::List(std::collections::VecDeque::new());
+    let empty_cols = Value::List(std::collections::VecDeque::new().into());
     let r = lex_runtime::df::dispatch(
         "drop_nulls", &[t, empty_cols],
     ).unwrap().unwrap();

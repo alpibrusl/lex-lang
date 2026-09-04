@@ -7,6 +7,31 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Building a list element by element is O(n), not O(n²)** (#774).
+  `Value::List` is now a shared, copy-on-write buffer (an `Arc` around
+  the `VecDeque`), so passing a list to a function or reading it from
+  a local is a refcount bump rather than a deep copy, and mutation
+  copies only when the list has more than one owner. The compiler
+  turns the last read of each local in a function body into a
+  move-out (`Op::TakeLocal`), which is sound because bytecode is
+  emitted in evaluation order with only forward jumps, so a list
+  accumulator threaded through a `fold` closure, a tail call, or a
+  `let` reaches `list.cons` uniquely owned and grows in place.
+  Accumulating 200,000 elements now takes 0.4 s in a debug build
+  where 16,000 took 8.9 s. `body_hash` treats the move-out as the
+  plain load it replaced, so closure identity is unchanged. Escape
+  hatch: `LEX_NO_TAKE_LOCALS=1`.
+- **`str.slice` resolves short backward hops from its cursor** (#774).
+  The forward-scan cursor from #769 rescanned from the start of the
+  string whenever an index fell behind it, which is exactly what a
+  scanner does when it finds the next delimiter and then slices the
+  chunk before it. With both fixes, lex-schema's JSON parser is linear
+  in the document: a 528 KB array of 16,000 strings parses in 1.5 s
+  (88 s before) and a 1.9 MB array of 16,000 tool-shaped objects in
+  16 s (a 475 KB one took 222 s before).
+
 ### Changed
 
 - **The store is scoped to the project by default** (#772). Every
