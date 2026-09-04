@@ -574,7 +574,7 @@ fn cmd_publish() -> CommandInfo {
     .add_option(
         "--store",
         "string",
-        "store root directory (default: ~/.lex/store)",
+        "store root directory (default: [store] path or .lex/store under the nearest lex.toml; ~/.lex/store outside any project)",
         None,
     )
     .add_option(

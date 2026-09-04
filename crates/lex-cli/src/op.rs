@@ -42,11 +42,7 @@ fn parse_store(args: &[String]) -> (PathBuf, Vec<String>) {
             rest.push(a.clone());
         }
     }
-    let root = root.unwrap_or_else(|| {
-        let home = std::env::var("HOME").map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("."));
-        home.join(".lex/store")
-    });
+    let root = root.unwrap_or_else(crate::default_store_root_pub);
     (root, rest)
 }
 

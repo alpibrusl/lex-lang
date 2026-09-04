@@ -189,7 +189,7 @@ publish each stage in a file to the store as Draft
 
 ### Options
 
-- `----store` (string) — store root directory (default: ~/.lex/store)
+- `----store` (string) — store root directory (default: [store] path or .lex/store under the nearest lex.toml; ~/.lex/store outside any project)
 - `----activate` (bool) — transition published stages to Active
 
 ### Arguments

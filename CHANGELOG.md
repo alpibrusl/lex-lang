@@ -7,6 +7,24 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Changed
+
+- **The store is scoped to the project by default** (#772). Every
+  store-touching command (`lex branch`, `publish`, `merge`, `op`,
+  `store`, `run --trace`, `diff`, `audit --store`, `serve`) used to
+  fall back to `$HOME/.lex/store` whenever `--store` was omitted, so
+  two unrelated projects on one machine silently shared one branch
+  namespace and one `main`. Resolution is now: `--store`, then
+  `LEX_STORE`, then `[store] path` in the nearest `lex.toml` above the
+  working directory (relative to the manifest), then
+  `<project>/.lex/store` when the manifest declares nothing, and only
+  outside any project the global `$HOME/.lex/store`, with one line on
+  stderr saying so. `lex audit` used to default to `./.lex` on its own;
+  it now resolves like everything else. `lex init` writes a
+  `.gitignore` for `.lex/store/`, and both `lex init` and `lex pkg
+  init` document the `[store]` section. Existing global-store data is
+  untouched; set `LEX_STORE` or pass `--store` to keep using it.
+
 ## [0.10.14] — 2026-09-03
 
 Closes out #768: `std.str` scans are linear and a scanner can now tell

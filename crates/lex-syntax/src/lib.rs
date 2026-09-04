@@ -10,7 +10,7 @@ pub mod loader;
 pub mod workspace;
 
 pub use loader::{load_program, load_program_from_str, LoadError};
-pub use workspace::{find_manifest, Manifest, PackageError};
+pub use workspace::{find_manifest, Manifest, PackageError, StoreSection};
 pub use parser::{parse, parse_with_src, ParseError};
 pub use printer::print_program;
 pub use syntax::*;
