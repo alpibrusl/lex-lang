@@ -11,7 +11,7 @@ phase).
 ## Method
 
 Added an env-gated instrumentation hook to `Op::GetField` in
-`crates/lex-bytecode/src/vm.rs`. With `LEX_IC_STATS=1` set, every
+`crates/lex-bytecode/src/vm/dispatch.rs`. With `LEX_IC_STATS=1` set, every
 field access records `(fn_id, site_idx) -> shape_id -> hit_count`
 into a process-global map. On `Vm::drop`, dumps a TSV to
 `$LEX_IC_STATS_OUT.$PID` (or stderr).
