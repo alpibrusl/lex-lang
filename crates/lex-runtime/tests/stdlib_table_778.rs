@@ -67,7 +67,7 @@ fn borrowed_and_owned_entry_points_agree() {
     assert_eq!(xs, list(vec![Value::Int(2), Value::Int(3)]));
 
     let t_owned = call("list", "tail", vec![xs.clone()]);
-    let t_borrowed = try_pure_builtin("list", "tail", &[xs.clone()]).unwrap().unwrap();
+    let t_borrowed = try_pure_builtin("list", "tail", std::slice::from_ref(&xs)).unwrap().unwrap();
     assert_eq!(t_owned, t_borrowed);
     assert_eq!(t_owned, list(vec![Value::Int(3)]));
     assert_eq!(call("list", "tail", vec![list(vec![])]), list(vec![]));
