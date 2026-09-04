@@ -156,7 +156,7 @@ Libraries and tooling built on Lex. [lexlang.org](https://lexlang.org) carries t
 **Pre-built binaries** for Linux (x86_64 / aarch64), macOS (x86_64 / aarch64), and Windows are on [GitHub Releases](https://github.com/alpibrusl/lex-lang/releases):
 
 ```sh
-tar -xzf lex-v0.10.14-x86_64-unknown-linux-gnu.tar.gz
+tar -xzf lex-v0.10.15-x86_64-unknown-linux-gnu.tar.gz
 mv lex /usr/local/bin/
 lex version
 ```
@@ -164,8 +164,8 @@ lex version
 **Container image** — multi-arch (`linux/amd64` + `linux/arm64`):
 
 ```sh
-docker run -p 4040:4040 -v lex-store:/data ghcr.io/alpibrusl/lex:v0.10.14
-docker run --rm -v "$(pwd):/work" -w /work ghcr.io/alpibrusl/lex:v0.10.14 check src/main.lex
+docker run -p 4040:4040 -v lex-store:/data ghcr.io/alpibrusl/lex:v0.10.15
+docker run --rm -v "$(pwd):/work" -w /work ghcr.io/alpibrusl/lex:v0.10.15 check src/main.lex
 ```
 
 **From source** — requires Rust 1.95+ (declared as `rust-version`, so cargo tells you before it compiles anything):

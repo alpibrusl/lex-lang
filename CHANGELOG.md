@@ -7,6 +7,14 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.10.15] — 2026-09-04
+
+Closes out #774, the last superlinear path #768 identified: lists are
+now shared and copy-on-write, and the compiler moves a local out on its
+last read instead of cloning it. Also scopes the `lex-vcs` store to the
+project by default (#772), closing a real cross-project data-isolation
+gap.
+
 ### Fixed
 
 - **Building a list element by element is O(n), not O(n²)** (#774).
