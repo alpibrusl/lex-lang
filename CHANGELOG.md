@@ -9,6 +9,16 @@ bumps may carry breaking changes when justified).
 
 ### Changed
 
+- **Checker side tables are keyed by NodeId, not by address (#777).**
+  `ProgramTypes.parse_required_fields` / `parse_type_schemas` are now
+  keyed by `lex_types::ParseSite { stage, node }` (stage index plus the
+  canonical `n_0.i.j` path) instead of `&CExpr as usize`. The
+  `parse` → `parse_strict_typed` rewrite is exposed as
+  `lex_types::rewrite_parse_calls(&mut stages, &pt)` and applies to any
+  structurally identical copy of the checked stages (a clone, a
+  serialised round-trip), where the old pointer keys silently matched
+  nothing. `check_and_rewrite_program` is unchanged for callers; no
+  Lex-level behaviour changes.
 - **lex-bytecode split along its seams (#779).** `compiler.rs` is now
   `compiler/{mod,constpool,free_vars,lowering,liveness,peephole}.rs`
   and `vm.rs` is `vm/{mod,dispatch,memo,closures,native_list}.rs`.
