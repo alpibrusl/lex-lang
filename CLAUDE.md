@@ -81,14 +81,22 @@ version locally, install the pinned one from
 - **Type-checker / runtime changes go through `cargo test` first.**
   The Rust crates under `crates/` are the compiler; `lex check`
   cannot be the gate here (the binary is what we're changing).
-- **Builtin signatures live in `crates/lex-types/src/builtins.rs`.**
+- **Builtins are declared once.** For the modules already migrated
+  to the catalogue (`std.str`, `std.list`; #778) a builtin is one
+  `BuiltinDef` in `crates/lex-types/src/stdlib_spec.rs` (signature in
+  Lex syntax, purity, index convention, doc) plus one implementation
+  row in `crates/lex-runtime/src/stdlib/<module>.rs`; a runtime test
+  fails if the two sets differ. The remaining modules still keep their
+  signatures in `crates/lex-types/src/builtins.rs` and their dispatch
+  arms in `crates/lex-runtime/src/builtins.rs` until they migrate.
   Adding a new **effect** means one row in `KNOWN_EFFECTS`
   (`crates/lex-runtime/src/policy.rs`); adding a new stdlib **module**
   means a `module_scope` match arm plus its name in `MODULE_NAMES`
-  (same file). Both docs tables in `docs/AGENT.md` — the effect table
-  and the stdlib function index — regenerate from those sources via
-  `lex doc-sync`; CI runs `doc-sync --check` (see `docsync.toml`), so
-  drift is a red build, never a discovery (#746).
+  (same file). The docs tables in `docs/AGENT.md` — the effect table,
+  the stdlib function index and the declared-builtin reference —
+  regenerate from those sources via `lex doc-sync`; CI runs
+  `doc-sync --check` (see `docsync.toml`), so drift is a red build,
+  never a discovery (#746).
 - **`docs/AGENT_GUIDELINES.md` is the source of truth.** Don't fork
   the content into other docs; downstream repos should copy this
   file as `AGENTS.md`, not maintain a parallel one.

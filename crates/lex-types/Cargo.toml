@@ -19,6 +19,4 @@ hex.workspace = true
 thiserror.workspace = true
 indexmap.workspace = true
 lex-ast = { path = "../lex-ast", version = "0.10.0" }
-
-[dev-dependencies]
 lex-syntax = { path = "../lex-syntax", version = "0.10.0" }

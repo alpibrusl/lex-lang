@@ -183,6 +183,55 @@ an exhaustive function list.
 | `std.moe` | `pin`, `unpin`, `prefetch_hint`, `usage_snapshot`, `stats` |
 <!-- docsync:end stdlib-index -->
 
+#### Declared builtins
+
+The modules below are defined declaratively in
+`crates/lex-types/src/stdlib_spec.rs` (#778): one definition per builtin
+gives the checker its signature, the runtime its dispatch entry, and this
+table its row. The *indices* column says which unit a builtin's integer
+positions count, since `std.str` mixes both.
+
+<!-- docsync:begin stdlib-spec -->
+| builtin | signature | indices | notes |
+|---|---|---|---|
+| `str.is_empty` | `(Str) -> Bool` |  | `true` when the string has no bytes. |
+| `str.to_int` | `(Str) -> Option[Int]` |  | Parse a decimal integer (optional leading `-`); `None` on any other input. |
+| `str.to_float` | `(Str) -> Option[Float]` |  | Parse a float literal; `None` on any other input. |
+| `str.concat` | `(Str, Str) -> Str` |  | Concatenate two strings; `a + b` is the same operation. |
+| `str.len` | `(Str) -> Int` | bytes | Length in UTF-8 bytes, not characters: `str.len("é")` is 2. Cost: O(1). |
+| `str.char_at` | `(Str, Int) -> Str` | bytes | The byte at a byte index as a one-character string for ASCII bytes; `""` for a non-ASCII byte or an index out of range. Never fails. Cost: O(1). |
+| `str.split` | `(Str, Str) -> List[Str]` |  | Split on a separator; an empty separator splits into characters. |
+| `str.join` | `(List[Str], Str) -> Str` |  | Join the elements with a separator; fails if an element is not a `Str`. |
+| `str.starts_with` | `(Str, Str) -> Bool` |  | `true` when the first string begins with the second. |
+| `str.ends_with` | `(Str, Str) -> Bool` |  | `true` when the first string ends with the second. |
+| `str.contains` | `(Str, Str) -> Bool` |  | `true` when the second string occurs anywhere in the first. |
+| `str.cmp` | `(Str, Str) -> Int` |  | Three-way byte-order comparison: `-1`, `0` or `1`. Use the comparison operators for a `Bool` (#440). |
+| `str.replace` | `(Str, Str, Str) -> Str` |  | Replace every non-overlapping occurrence of the second string with the third. |
+| `str.trim` | `(Str) -> Str` |  | Strip leading and trailing Unicode whitespace. |
+| `str.to_upper` | `(Str) -> Str` |  | Unicode uppercase. |
+| `str.to_lower` | `(Str) -> Str` |  | Unicode lowercase. |
+| `str.strip_prefix` | `(Str, Str) -> Option[Str]` |  | The remainder after a prefix, or `None` when the prefix is absent. |
+| `str.strip_suffix` | `(Str, Str) -> Option[Str]` |  | The remainder before a suffix, or `None` when the suffix is absent. |
+| `str.slice` | `(Str, Int, Int) -> Str` | codepoints | Half-open range of codepoint indices `[lo, hi)`; indices clamp to the codepoint count and a reversed range fails (#620). Cost: O(distance from the previous slice or find on the same string) (#764). |
+| `str.is_ascii` | `(Str) -> Bool` |  | `true` when every byte is below 128; one native pass (#768). Cost: O(len). |
+| `str.find` | `(Str, Str, Int) -> Option[Int]` | codepoints | Codepoint index of the first occurrence of the needle at or after `from`; `from` clamps to the string and an empty needle matches at `from` (#764). Cost: O(distance scanned). |
+| `str.find_any` | `(Str, Str, Int) -> Option[Int]` | codepoints | Codepoint index of the first character at or after `from` that occurs in the set string (#764). Cost: O(distance scanned). |
+| `list.map` | `(List[a], (a) -> [| E] b) -> [| E] List[b]` |  | Apply the closure to every element; the closure's effects flow to the call. Lowered by the compiler. |
+| `list.par_map` | `(List[a], (a) -> [| E] b) -> [| E] List[b]` |  | `map` on a worker pool capped by `LEX_PAR_MAX_CONCURRENCY` (#305). Lowered by the compiler. |
+| `list.sort_by` | `(List[a], (a) -> [| E] b) -> [| E] List[a]` |  | Stable sort by the key the closure derives; `Int`, `Float` and `Str` keys order natively, other shapes keep their input order (#338). Cost: O(n log n). Lowered by the compiler. |
+| `list.filter` | `(List[a], (a) -> [| E] Bool) -> [| E] List[a]` |  | Keep the elements the closure accepts. Lowered by the compiler. |
+| `list.fold` | `(List[a], b, (b, a) -> [| E] b) -> [| E] b` |  | Left fold from the initial accumulator. Lowered by the compiler. |
+| `list.len` | `(List[a]) -> Int` |  | Number of elements. Cost: O(1). |
+| `list.is_empty` | `(List[a]) -> Bool` |  | `true` when the list has no elements. Cost: O(1). |
+| `list.range` | `(Int, Int) -> List[Int]` |  | Integers from `lo` up to but excluding `hi`; empty when `hi <= lo`. |
+| `list.head` | `(List[a]) -> Option[a]` |  | The first element, or `None` for an empty list. Cost: O(1). |
+| `list.tail` | `(List[a]) -> List[a]` |  | Every element but the first; empty for an empty list. Cost: O(1) when the list is uniquely owned, otherwise O(n) (#774). |
+| `list.concat` | `(List[a], List[a]) -> List[a]` |  | The first list followed by the second. |
+| `list.reverse` | `(List[a]) -> List[a]` |  | Elements in reverse order. |
+| `list.cons` | `(a, List[a]) -> List[a]` |  | Prepend one element (#334). Cost: amortised O(1). |
+| `list.enumerate` | `(List[a]) -> List[(Int, a)]` |  | Pair every element with its zero-based index. |
+<!-- docsync:end stdlib-spec -->
+
 ### `std.str`
 
 String comparison operators (`<`, `<=`, `>`, `>=`, `==`, `!=`) work on `Str`

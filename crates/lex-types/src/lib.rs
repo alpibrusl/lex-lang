@@ -9,6 +9,7 @@ pub mod error;
 pub mod position;
 pub mod rules;
 pub mod builtins;
+pub mod stdlib_spec;
 pub mod checker;
 pub mod discharge;
 pub mod trust;
