@@ -7,6 +7,19 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Changed
+
+- **Checker side tables are keyed by NodeId, not by address (#777).**
+  `ProgramTypes.parse_required_fields` / `parse_type_schemas` are now
+  keyed by `lex_types::ParseSite { stage, node }` (stage index plus the
+  canonical `n_0.i.j` path) instead of `&CExpr as usize`. The
+  `parse` → `parse_strict_typed` rewrite is exposed as
+  `lex_types::rewrite_parse_calls(&mut stages, &pt)` and applies to any
+  structurally identical copy of the checked stages (a clone, a
+  serialised round-trip), where the old pointer keys silently matched
+  nothing. `check_and_rewrite_program` is unchanged for callers; no
+  Lex-level behaviour changes.
+
 ## [0.10.15] — 2026-09-04
 
 Closes out #774, the last superlinear path #768 identified: lists are

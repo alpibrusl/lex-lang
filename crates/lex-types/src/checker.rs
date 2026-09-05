@@ -15,24 +15,42 @@ use std::collections::{BTreeMap, HashMap};
 /// return type. Used by the `parse` → `parse_strict_typed` rewrite (#322).
 type FieldSchema = (Vec<String>, Vec<(String, String)>);
 
+/// Stable identity of a call site inside a checked program (#777).
+///
+/// `stage` is the index of the enclosing stage in the slice handed to
+/// [`check_program`]; `node` is the positional [`a::NodeId`] path of
+/// the call expression within that stage (`n_0.<i>...`, see
+/// `lex_ast::ids`). Both survive cloning, serialisation and re-walking
+/// the AST, unlike the raw `*const CExpr` addresses the checker used
+/// to key its side tables by — so a [`ProgramTypes`] can be applied
+/// to a *copy* of the stages it was computed from, and the same key
+/// can be reported in diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ParseSite {
+    pub stage: usize,
+    pub node: a::NodeId,
+}
+
 /// Result of checking a whole program.
 pub struct ProgramTypes {
     pub fn_signatures: IndexMap<String, Scheme>,
     pub type_env: TypeEnv,
     /// For #168: per-call required-fields map for `module.parse(s)`
     /// calls whose inferred result type is `Result[Record{...}, _]`.
-    /// Keyed by `&CExpr as *const _ as usize` so callers can do an
-    /// O(1) pointer-equality lookup during a separate AST rewrite
-    /// pass. Empty unless any matching call sites were found.
+    /// Keyed by the call's [`ParseSite`] (stage index + NodeId), so
+    /// the table stays valid for any structurally identical copy of
+    /// the checked stages (#777). Empty unless any matching call
+    /// sites were found.
     ///
     /// See [`check_and_rewrite_program`] for the function that
-    /// populates this and applies the rewrite in one step.
-    pub parse_required_fields: HashMap<usize, Vec<String>>,
+    /// populates this and applies the rewrite in one step, and
+    /// [`rewrite_parse_calls`] to apply it to a separate copy.
+    pub parse_required_fields: HashMap<ParseSite, Vec<String>>,
     /// For #322: per-call type schema alongside the field names.
     /// Each entry is a `Vec<(field_name, type_tag)>` parallel to
     /// `parse_required_fields`. Used by the rewrite pass to inject
     /// the third argument to `parse_strict`.
-    pub parse_type_schemas: HashMap<usize, Vec<(String, String)>>,
+    pub parse_type_schemas: HashMap<ParseSite, Vec<(String, String)>>,
 }
 
 /// Variant of [`check_program`] that stamps a source [`Position`]
@@ -121,8 +139,18 @@ fn check_program_inner(
     // [`check_program_with_positions`] wrapper can stamp the
     // function's source position onto a [`PositionedError`].
     let mut signatures = IndexMap::new();
-    for stage in stages {
+    // #777: the parse-call side tables are keyed by (stage index,
+    // NodeId) rather than by expression address, so each FnDecl's
+    // NodeId map is computed up front. The walk is skipped entirely
+    // when no import could produce a rewritable call.
+    let wants_parse_sites = tcx.has_parse_capable_imports();
+    for (stage_idx, stage) in stages.iter().enumerate() {
         if let a::Stage::FnDecl(fd) = stage {
+            tcx.stage_ids = if wants_parse_sites {
+                Some((stage_idx, a::expr_ids(stage)))
+            } else {
+                None
+            };
             match tcx.check_fn(fd) {
                 Ok(scheme) => { signatures.insert(fd.name.clone(), scheme); }
                 Err(es) => {
@@ -131,6 +159,7 @@ fn check_program_inner(
             }
         }
     }
+    tcx.stage_ids = None;
 
     if errors.is_empty() {
         // #168: walk pending parse-call records and resolve each
@@ -140,10 +169,10 @@ fn check_program_inner(
         // of {json, toml, yaml} via the import pass.
         let mut parse_required_fields = HashMap::new();
         let mut parse_type_schemas = HashMap::new();
-        for (call_ptr, ret_ty) in &tcx.pending_parse_calls {
+        for (site, ret_ty) in &tcx.pending_parse_calls {
             if let Some((fields, schema)) = extract_record_fields_and_schema(&tcx.u, &tcx.type_env, ret_ty) {
-                parse_required_fields.insert(*call_ptr, fields);
-                parse_type_schemas.insert(*call_ptr, schema);
+                parse_required_fields.insert(site.clone(), fields);
+                parse_type_schemas.insert(site.clone(), schema);
             }
         }
         Ok(ProgramTypes {
@@ -165,42 +194,65 @@ fn check_program_inner(
 pub fn check_and_rewrite_program(
     stages: &mut [a::Stage],
 ) -> Result<ProgramTypes, Vec<TypeError>> {
-    // Borrow as immutable for the type-check pass — the side-table
-    // it produces is keyed by `*const CExpr as usize`, and the Vec
-    // backing storage doesn't move between this borrow and the
-    // mutable one below.
     let pt = check_program(&*stages)?;
-    if !pt.parse_required_fields.is_empty() {
-        rewrite_parse_calls(stages, &pt.parse_required_fields, &pt.parse_type_schemas);
-    }
+    rewrite_parse_calls(stages, &pt);
     Ok(pt)
 }
 
-/// Walk `stages` mutably and, for every `CExpr::Call` whose
-/// pointer (cast to `usize`) is a key in `required`, rewrite it
-/// from `module.parse(s)` into `module.parse_strict(s, [...], [...])`.
+/// Apply the `parse` → `parse_strict_typed` / `json_body` →
+/// `json_body_typed` rewrite recorded in `pt` to `stages`.
 ///
-/// Assumptions:
+/// `stages` must be structurally identical to the slice `pt` was
+/// computed from — the same stages in the same order — but need not
+/// be the same allocation: the side tables are keyed by
+/// [`ParseSite`] (stage index + NodeId), so a deep clone, or a copy
+/// that round-tripped through serialisation, rewrites identically
+/// (#777). [`check_and_rewrite_program`] is the one-step form.
 ///
-/// - The `usize` keys come from the same physical AST passed
-///   here. This is true when called from
-///   [`check_and_rewrite_program`].
-/// - Every key corresponds to a call whose callee is
-///   `FieldAccess(_, "parse")`. The type-checker only inserts
-///   keys when this holds, so we panic if the assumption is
-///   violated — that's a checker bug, not a user error.
-fn rewrite_parse_calls(
-    stages: &mut [a::Stage],
-    required: &HashMap<usize, Vec<String>>,
-    schemas: &HashMap<usize, Vec<(String, String)>>,
-) {
-    for stage in stages.iter_mut() {
+/// Every recorded site names a call whose callee is a `FieldAccess`
+/// on a decode op. The type-checker only records sites when this
+/// holds, so a mismatch is a checker bug and panics rather than
+/// silently skipping the rewrite.
+pub fn rewrite_parse_calls(stages: &mut [a::Stage], pt: &ProgramTypes) {
+    if pt.parse_required_fields.is_empty() {
+        return;
+    }
+    for (stage_idx, stage) in stages.iter_mut().enumerate() {
+        if !pt.parse_required_fields.keys().any(|s| s.stage == stage_idx) {
+            continue;
+        }
+        // Resolve this stage's NodeIds to addresses *in this AST*,
+        // then hand the address-keyed tables to the walk below. The
+        // map holds raw pointers only (no borrow), so the mutable
+        // walk that follows is fine.
+        let ptr_of: HashMap<a::NodeId, usize> = a::expr_ids(&*stage)
+            .into_iter()
+            .map(|(p, id)| (id, p as usize))
+            .collect();
+        let resolve = |site: &ParseSite| -> Option<usize> {
+            (site.stage == stage_idx).then(|| {
+                *ptr_of.get(&site.node).unwrap_or_else(|| panic!(
+                    "rewrite_parse_calls: {:?} names no expression in stage {stage_idx}; \
+                     the stages differ from the ones that were type-checked",
+                    site.node))
+            })
+        };
+        let required: HashMap<usize, Vec<String>> = pt.parse_required_fields.iter()
+            .filter_map(|(site, f)| resolve(site).map(|p| (p, f.clone())))
+            .collect();
+        let schemas: HashMap<usize, Vec<(String, String)>> = pt.parse_type_schemas.iter()
+            .filter_map(|(site, s)| resolve(site).map(|p| (p, s.clone())))
+            .collect();
         if let a::Stage::FnDecl(fd) = stage {
-            rewrite_in_expr(&mut fd.body, required, schemas);
+            rewrite_in_expr(&mut fd.body, &required, &schemas);
         }
     }
 }
 
+/// Address-keyed inner walk for [`rewrite_parse_calls`]. `required`
+/// and `schemas` are keyed by `&CExpr as *const _ as usize` and must
+/// have been resolved against *this* `expr` tree (the caller does
+/// that per stage from the NodeId-keyed tables).
 fn rewrite_in_expr(
     expr: &mut a::CExpr,
     required: &HashMap<usize, Vec<String>>,
@@ -467,13 +519,20 @@ struct Checker {
     /// to recognise `cfg.parse(...)` as a stdlib parse call.
     module_aliases: IndexMap<String, String>,
     /// For #168: every `<alias>.parse(s)` call where alias is in
-    /// `module_aliases` and maps to {json, toml, yaml}, recorded
-    /// here as `(call_pointer_as_usize, return_type_var)`. After
-    /// the whole program type-checks, we walk this and resolve
-    /// each return type through the unifier — at that point any
-    /// `Result[Manifest, _]` constraints from match patterns or
-    /// let-annotations have settled.
-    pending_parse_calls: Vec<(usize, Ty)>,
+    /// `module_aliases` and maps to {json, toml, yaml} (or
+    /// `http.json_body`, #684), recorded here as
+    /// `(call_site, return_type_var)`. After the whole program
+    /// type-checks, we walk this and resolve each return type
+    /// through the unifier — at that point any `Result[Manifest, _]`
+    /// constraints from match patterns or let-annotations have
+    /// settled.
+    pending_parse_calls: Vec<(ParseSite, Ty)>,
+    /// #777: NodeId map for the FnDecl stage currently being checked,
+    /// `(stage index, &CExpr address → NodeId)`. Set by
+    /// `check_program_inner` before each `check_fn` when the program
+    /// imports a decode-capable module, `None` otherwise. Used only to
+    /// translate a parse call's address into a stable [`ParseSite`].
+    stage_ids: Option<(usize, HashMap<*const a::CExpr, a::NodeId>)>,
     /// Per-function param list, retained so call-site discharge can
     /// see refinement predicates (#209 slice 2). The main `globals`
     /// scheme strips refinements (`Refined` unifies as its base);
@@ -504,6 +563,7 @@ impl Checker {
             globals: IndexMap::new(),
             module_aliases: IndexMap::new(),
             pending_parse_calls: Vec::new(),
+            stage_ids: None,
             fn_params: IndexMap::new(),
             recovered_errors: Vec::new(),
             eff_row_scope: IndexMap::new(),
@@ -590,6 +650,24 @@ impl Checker {
     /// `Result[T, HttpError]` and was previously unvalidated. In both
     /// cases the rewrite only fires when the inferred `T` is a record
     /// (see `extract_record_fields_and_schema`).
+    /// True when some import alias resolves to a module with a
+    /// rewritable decode op (see `is_module_parse_call`). Gates the
+    /// per-FnDecl NodeId walk in `check_program_inner` (#777).
+    fn has_parse_capable_imports(&self) -> bool {
+        self.module_aliases.values()
+            .any(|m| matches!(m.as_str(), "json" | "toml" | "yaml" | "http"))
+    }
+
+    /// Stable [`ParseSite`] for `call_expr`, which must belong to the
+    /// FnDecl currently being checked. `None` when the call has no
+    /// NodeId — the only such expressions are inside `examples {}`
+    /// blocks, which the rewrite pass never touched anyway.
+    fn parse_site_of(&self, call_expr: &a::CExpr) -> Option<ParseSite> {
+        let (stage, ids) = self.stage_ids.as_ref()?;
+        let node = ids.get(&(call_expr as *const a::CExpr))?.clone();
+        Some(ParseSite { stage: *stage, node })
+    }
+
     fn is_module_parse_call(&self, callee: &a::CExpr) -> bool {
         if let a::CExpr::FieldAccess { value, field } = callee {
             if let a::CExpr::Var { name } = value.as_ref() {
@@ -1209,15 +1287,15 @@ impl Checker {
         locals: &mut IndexMap<String, Ty>,
         effs: &mut EffectSet,
     ) -> Result<Ty, TypeError> {
-        // #168: snapshot the call's address before the recursive
-        // descent so we can later rewrite this exact node. Pointer
-        // identity is only meaningful while the AST stays put,
-        // which it does until check_program returns and the AST
-        // is handed back to the caller. `is_module_parse_call`
-        // recognises `<alias>.parse` where alias was bound to one
-        // of {json, toml, yaml} during the import pass.
-        let parse_call_ptr = if self.is_module_parse_call(callee) {
-            Some(call_expr as *const a::CExpr as usize)
+        // #168: identify the call before the recursive descent so we
+        // can later rewrite this exact node. The identity is a stable
+        // (stage, NodeId) pair rather than the expression's address
+        // (#777), so the resulting table can be applied to any copy
+        // of the checked stages. `is_module_parse_call` recognises
+        // `<alias>.parse` where alias was bound to one of {json,
+        // toml, yaml} during the import pass.
+        let parse_site = if self.is_module_parse_call(callee) {
+            self.parse_site_of(call_expr)
         } else {
             None
         };
@@ -1276,8 +1354,8 @@ impl Checker {
                 // unification has settled — match-pattern annotations
                 // and let-type-annotations may bind T after this
                 // point.
-                if let Some(ptr) = parse_call_ptr {
-                    self.pending_parse_calls.push((ptr, (*ret).clone()));
+                if let Some(site) = parse_site {
+                    self.pending_parse_calls.push((site, (*ret).clone()));
                 }
                 Ok(*ret)
             }
