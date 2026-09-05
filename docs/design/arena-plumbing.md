@@ -101,7 +101,7 @@ defers until inlining lands (#465 phase 1). Doing it bottom-up like
 > enumerable set: `spawn` / `ParallelMap` / channel-send (value
 > outlives the request on a worker thread), closure captures stored
 > in module-level / global state, and the pure-fn memo cache
-> (`vm.rs:146`, outlives every request). Everything built in the
+> (`vm/memo.rs`, outlives every request). Everything built in the
 > `[net_*]` frame that touches none of these is arena-routable.
 
 This is both more tractable than a bottom-up lattice and a better fit
@@ -160,7 +160,7 @@ both.
   panic guard. This is strictly more work than StackRecord and is the
   main place Route A is not a free copy-paste of #464.
 - **Worker-thread lifetime split.** `spawn_for_worker` clone-handlers
-  get a *fresh empty* `arena_stack` by design (`handler.rs:83-95`),
+  get a *fresh empty* `arena_stack` by design (`handler/dispatch.rs`, `spawn_for_worker`),
   because worker allocations outlive the spawning request. Any value
   handed to a worker (`spawn`/`ParallelMap`/channel) must therefore be
   a heap value, never an arena handle — this is one of the slice-1
@@ -472,7 +472,7 @@ architecture obstacle**:
 
 `build_hyper_response` and the `unpack_response` it calls live
 **outside** the `tokio::task::spawn_blocking` closure where `vm`
-lives (`handler.rs:2329` / `:2493` / `:2754`). By the time the
+lives (the `serve_http_*` functions in `handler/http_serve.rs`). By the time the
 hyper-response is built, the vm has been dropped. So a vm-aware
 `unpack_response` requires either:
 
@@ -502,7 +502,7 @@ request but cumulative on a hot path.
 
 The recommended Option 1 from the 2026-06-05 entry is now on `main`.
 The full slab-direct serializer path is live across all five
-handler dispatch sites in `crates/lex-runtime/src/handler.rs`:
+handler dispatch sites in `crates/lex-runtime/src/handler/http_serve.rs`:
 
 - **`unpack_response`** rewritten to `fn unpack_response(vm: &mut
   Vm, v: &Value) -> (u16, ResponseBodyOut, Vec<(String, String)>)`.

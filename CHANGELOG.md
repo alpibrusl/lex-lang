@@ -9,6 +9,44 @@ bumps may carry breaking changes when justified).
 
 ### Changed
 
+- **Checker side tables are keyed by NodeId, not by address (#777).**
+  `ProgramTypes.parse_required_fields` / `parse_type_schemas` are now
+  keyed by `lex_types::ParseSite { stage, node }` (stage index plus the
+  canonical `n_0.i.j` path) instead of `&CExpr as usize`. The
+  `parse` → `parse_strict_typed` rewrite is exposed as
+  `lex_types::rewrite_parse_calls(&mut stages, &pt)` and applies to any
+  structurally identical copy of the checked stages (a clone, a
+  serialised round-trip), where the old pointer keys silently matched
+  nothing. `check_and_rewrite_program` is unchanged for callers; no
+  Lex-level behaviour changes.
+- **lex-types `checker.rs` split (#779).** `checker/mod.rs` keeps
+  inference and effect checking; `checker/exhaustive.rs` holds the
+  #766 match-exhaustiveness pass and `checker/parse_strict.rs` the
+  `parse` → `parse_strict_typed` rewrite with its `ParseSite` tables.
+  Code moves only; `lex_types::{check_program, check_and_rewrite_program,
+  rewrite_parse_calls, ParseSite, ProgramTypes}` are unchanged.
+- **lex-bytecode split along its seams (#779).** `compiler.rs` is now
+  `compiler/{mod,constpool,free_vars,lowering,liveness,peephole}.rs`
+  and `vm.rs` is `vm/{mod,dispatch,memo,closures,native_list}.rs`.
+  Code moves only: no behaviour, `body_hash`, or closure-identity
+  change; `lex_bytecode::{compile_program, Vm, ...}` re-exports are
+  unchanged. CI now runs `scripts/check-file-sizes.sh`, which fails
+  when a file under `crates/*/src` exceeds 2,500 lines without an
+  allow-list entry naming its tracking issue.
+- **lex-runtime `handler.rs` split per effect family (#779).** The
+  5,700-line file is now `handler/{mod,dispatch,approval,fs,proc,
+  logging,udp,kv,redis_store,sql,llm,http_serve,http_client}.rs`:
+  `dispatch.rs` holds the `EffectHandler` impl (the `(kind, op)`
+  router), each family module holds its registries, helpers and
+  `DefaultHandler` methods. Code moves only; `lex_runtime::handler::*`
+  public items and the crate-root re-exports are unchanged.
+- **lex-cli `main.rs` split per subcommand group (#779).** The
+  6,100-line file keeps argument parsing, `lex parse` / `lex check` and
+  shared loaders (820 lines); `run`, `canonical`, `plan`, `repair`,
+  `trust`, `blame`, `store`, `stage`, `attest`, `policy`, `replay`,
+  `serve`, `spec` and `agent_tool` each get a module, and the store
+  resolver (#772) lives in `store_root.rs`, imported by every
+  store-backed command. Code moves only; no CLI surface change.
 - **Declarative builtins, first modules (#778).** `std.str` and
   `std.list` are now defined once each in
   `lex_types::stdlib_spec::BUILTINS`: a `BuiltinDef` carries the

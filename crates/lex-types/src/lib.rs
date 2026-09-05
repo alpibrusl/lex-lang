@@ -15,7 +15,8 @@ pub mod discharge;
 pub mod trust;
 
 pub use checker::{
-    check_and_rewrite_program, check_program, check_program_with_positions, ProgramTypes,
+    check_and_rewrite_program, check_program, check_program_with_positions, rewrite_parse_calls,
+    ParseSite, ProgramTypes,
 };
 pub use error::{PositionedError, TypeError};
 pub use position::{byte_to_line_col, Position};

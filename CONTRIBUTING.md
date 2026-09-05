@@ -94,7 +94,8 @@ the same way. Files are restored with `git checkout`, so commit before running.
    first lines (e.g. `parser: cap recursion depth at 96`).
 3. Open the PR. Use the template in `.github/PULL_REQUEST_TEMPLATE.md`.
 4. CI runs build + test + clippy + fuzz on parser/AST/type-checker
-   touches. All must be green.
+   touches, plus `scripts/check-file-sizes.sh` (no source file over
+   2,500 lines unless allow-listed there, see #779). All must be green.
 5. Review happens on the PR. Push fixes as new commits — squash
    happens at merge time.
 

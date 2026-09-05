@@ -68,6 +68,11 @@ jobs:
       # version there hands them an old binary. Keep it pinned to Cargo.toml.
       - name: README install version matches Cargo.toml
         run: ./scripts/check-readme-version.sh
+      # Very large source files hide duplicated logic (#772, #774). A
+      # file over the line budget is a red build unless it is on the
+      # allow-list in the script, which shrinks as #779 splits land.
+      - name: Source files within line budget
+        run: ./scripts/check-file-sizes.sh
       # Generated doc regions must match their generators (lex doc-sync).
       # docs/AGENT.md's effect table is rendered from the runtime's
       # KNOWN_EFFECTS single source; drift is a red build with the fix in

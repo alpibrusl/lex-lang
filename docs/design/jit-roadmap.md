@@ -173,7 +173,7 @@ Native frames must map back to bytecode state for two reasons:
    carry the originating NodeId so the recorder can attribute
    events correctly.
 2. **Runtime error reporting.** `VmError` carries `fn_name` +
-   binding context (`crates/lex-bytecode/src/vm.rs:30-36`).
+   binding context (`VmError` in `crates/lex-bytecode/src/vm/mod.rs`).
    Native code that hits an `expect("Int")` panic — say, type
    speculation failed — has to surface as the right
    `VmError::TypeMismatch` with the right NodeId, not a raw
@@ -819,7 +819,7 @@ Implementation footprint:
   bundles Cranelift's 30-odd crates; binary size grows by a few MB.
   Future: could be gated behind a `jit` cargo feature if size-
   sensitive distributions need to opt out.
-- `crates/lex-cli/src/main.rs` — `RunFlags::jit: bool`, parsed from
+- `crates/lex-cli/src/run.rs` — `RunFlags::jit: bool`, parsed from
   `--jit`. Tier installation is one block after `Vm::with_handler`:
 
   ```rust
