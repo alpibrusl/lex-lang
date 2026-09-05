@@ -243,8 +243,8 @@ tail-called function gets its own arena view.
 - `Op::AllocStackRecord { shape_idx, field_count }` (op.rs)
 - `Value::StackRecord { shape_id, slab_start, field_count }` (value.rs)
 - VM arena (`stack_record_arena`) with per-frame start markers and
-  budget (vm.rs)
-- Compiler pass `apply_escape_lowering` (compiler.rs) — consults
+  budget (vm/mod.rs, vm/dispatch.rs)
+- Compiler pass `apply_escape_lowering` (compiler/lowering.rs) — consults
   `escape::build_escape_index` and rewrites non-escaping
   `MakeRecord` sites in place
 - Body-hash invariance: `AllocStackRecord` decodes as the legacy

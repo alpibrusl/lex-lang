@@ -25,6 +25,14 @@ bumps may carry breaking changes when justified).
   `parse` → `parse_strict_typed` rewrite with its `ParseSite` tables.
   Code moves only; `lex_types::{check_program, check_and_rewrite_program,
   rewrite_parse_calls, ParseSite, ProgramTypes}` are unchanged.
+- **lex-bytecode split along its seams (#779).** `compiler.rs` is now
+  `compiler/{mod,constpool,free_vars,lowering,liveness,peephole}.rs`
+  and `vm.rs` is `vm/{mod,dispatch,memo,closures,native_list}.rs`.
+  Code moves only: no behaviour, `body_hash`, or closure-identity
+  change; `lex_bytecode::{compile_program, Vm, ...}` re-exports are
+  unchanged. CI now runs `scripts/check-file-sizes.sh`, which fails
+  when a file under `crates/*/src` exceeds 2,500 lines without an
+  allow-list entry naming its tracking issue.
 
 ## [0.10.15] — 2026-09-04
 

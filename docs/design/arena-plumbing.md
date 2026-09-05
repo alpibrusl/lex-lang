@@ -101,7 +101,7 @@ defers until inlining lands (#465 phase 1). Doing it bottom-up like
 > enumerable set: `spawn` / `ParallelMap` / channel-send (value
 > outlives the request on a worker thread), closure captures stored
 > in module-level / global state, and the pure-fn memo cache
-> (`vm.rs:146`, outlives every request). Everything built in the
+> (`vm/memo.rs`, outlives every request). Everything built in the
 > `[net_*]` frame that touches none of these is arena-routable.
 
 This is both more tractable than a bottom-up lattice and a better fit
