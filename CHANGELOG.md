@@ -19,6 +19,12 @@ bumps may carry breaking changes when justified).
   serialised round-trip), where the old pointer keys silently matched
   nothing. `check_and_rewrite_program` is unchanged for callers; no
   Lex-level behaviour changes.
+- **lex-types `checker.rs` split (#779).** `checker/mod.rs` keeps
+  inference and effect checking; `checker/exhaustive.rs` holds the
+  #766 match-exhaustiveness pass and `checker/parse_strict.rs` the
+  `parse` → `parse_strict_typed` rewrite with its `ParseSite` tables.
+  Code moves only; `lex_types::{check_program, check_and_rewrite_program,
+  rewrite_parse_calls, ParseSite, ProgramTypes}` are unchanged.
 - **lex-bytecode split along its seams (#779).** `compiler.rs` is now
   `compiler/{mod,constpool,free_vars,lowering,liveness,peephole}.rs`
   and `vm.rs` is `vm/{mod,dispatch,memo,closures,native_list}.rs`.
