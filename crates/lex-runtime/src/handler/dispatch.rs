@@ -926,6 +926,57 @@ impl EffectHandler for DefaultHandler {
                     program, policy, registry,
                 )
             }
+            ("net", "serve_ws_fn_actor_with") => {
+                // serve_ws_fn_actor_with(port, subprotocol, name_of,
+                //                        on_message, opts)  — #719
+                //
+                // Same server, with the bind interface named in the
+                // source. `opts` is the record `net.default_opts()`
+                // returns; only `host` is read here, because `http2`
+                // and `inline_vm` describe an HTTP server and mean
+                // nothing to a websocket listener. Sharing the record
+                // rather than minting a WS-specific one is what the
+                // issue asked for, and it keeps one `ServeOpts` in the
+                // language instead of two that differ by two fields.
+                let port = match args.first() {
+                    Some(Value::Int(n)) if (0..=65535).contains(n) => *n as u16,
+                    _ => return Err("net.serve_ws_fn_actor_with(port, subprotocol, name_of, on_message, opts): port must be Int 0..=65535".into()),
+                };
+                let subprotocol = expect_str(args.get(1))?.to_string();
+                // Decoded with the same reader `net.serve_*_with` uses,
+                // so the two families cannot drift on what an opts
+                // record means.
+                let opts = match args.get(4) {
+                    Some(v) => crate::handler::http_serve::decode_serve_opts(v)
+                        .map_err(|e| format!("net.serve_ws_fn_actor_with: {e} — use net.default_opts()"))?,
+                    None => return Err("net.serve_ws_fn_actor_with(port, subprotocol, name_of, on_message, opts): opts is required — use net.default_opts()".into()),
+                };
+                // An opts record whose host is blank is a caller who set
+                // the field and meant nothing by it; fall back rather
+                // than binding "".
+                let host = if opts.host.trim().is_empty() {
+                    crate::ws::ws_bind_host()
+                } else {
+                    opts.host.clone()
+                };
+                let mut it = args.into_iter().skip(2);
+                let name_of_closure = match it.next() {
+                    Some(c @ Value::Closure { .. }) => c,
+                    _ => return Err("net.serve_ws_fn_actor_with(port, subprotocol, name_of, on_message, opts): name_of must be a closure".into()),
+                };
+                let on_message_closure = match it.next() {
+                    Some(c @ Value::Closure { .. }) => c,
+                    _ => return Err("net.serve_ws_fn_actor_with(port, subprotocol, name_of, on_message, opts): on_message must be a closure".into()),
+                };
+                let program = self.program.clone()
+                    .ok_or_else(|| "net.serve_ws_fn_actor_with requires a Program reference; use DefaultHandler::with_program".to_string())?;
+                let policy = self.policy.clone();
+                let registry = Arc::new(crate::ws::ChatRegistry::default());
+                crate::ws::serve_ws_fn_actor_on(
+                    host, port, subprotocol, name_of_closure, on_message_closure,
+                    program, policy, registry,
+                )
+            }
             ("net", "serve_ws_fn_actor") => {
                 // serve_ws_fn_actor(port, subprotocol, name_of, on_message)
                 let port = match args.first() {
