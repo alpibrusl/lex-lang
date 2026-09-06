@@ -10,7 +10,8 @@ use super::*;
 pub(super) fn cmd_attest(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let sub = args.first().ok_or_else(|| {
         anyhow!(
-            "usage: lex attest {{filter|import-install|push|pull|retro-block|retro-unblock}} ..."
+            "usage: lex attest \
+             {{filter|import-install|import-apply|push|pull|retro-block|retro-unblock}} ..."
         )
     })?;
     let rest = &args[1..];
@@ -122,6 +123,7 @@ pub(super) fn cmd_attest(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             Ok(())
         }
         "import-install" => cmd_attest_import_install(fmt, rest),
+        "import-apply" => cmd_attest_import_apply(fmt, rest),
         "retro-block" => cmd_attest_retro_block(fmt, rest),
         "retro-unblock" => cmd_attest_retro_unblock(fmt, rest),
         other => bail!("unknown `lex attest` subcommand: {other}"),
@@ -241,6 +243,243 @@ pub(super) fn cmd_attest_import_install(fmt: &OutputFormat, args: &[String]) -> 
         println!(
             "→ imported {count} capsule-install attestation(s) ({already_present} already present)"
         );
+    });
+    Ok(())
+}
+
+/// `lex attest import-apply --audit <gate-audit.json> --gate <label>
+/// --accepted <event-kind> [--refused <event-kind>] [--signer <id>]
+/// [--store DIR]` (#790). Promotes a capability gate's decisions into
+/// the durable attestation graph, keyed under whoever authorised them,
+/// so `ProducerTrust` scores a pipeline identity or an agent key on its
+/// real track record instead of a configured allowlist.
+///
+/// Mirrors [`cmd_attest_import_install`]: same audit-log shape (the
+/// array of `{seq, prev_hash, event, hash}` entries a lex-os
+/// `Chain<E>` writes), same signer-keyed convention, same
+/// content-addressed idempotency, and the chain is likewise *not*
+/// re-verified here — promotion records what the gate decided;
+/// verifying the chain stays with the gate's own `audit verify`.
+///
+/// # The promotion contract
+///
+/// lex-lang does not know any gate's event vocabulary, so the caller
+/// names the kinds (`--accepted`, `--refused`) and a promotable event
+/// must carry three fields lex-lang *does* name:
+///
+/// - `artifact_sha256` — the bytes the decision was reached about.
+/// - `manifest` — the ceiling it was checked against.
+/// - `signer` — who authorised it, or `--signer` on the command line.
+///
+/// `subject` is optional and human-facing. A matched event missing any
+/// required field is a hard error, never a skip: minting a record with
+/// an empty `artifact_sha256` would produce evidence that matches any
+/// plan, which is the failure this whole gate exists to prevent.
+///
+/// # Why `--refused` exists
+///
+/// Producer trust is `passed / (passed + failed)`. Importing only
+/// acceptances would score every submitter 1.0 for ever and make the
+/// signal worthless, so refusals import as the same kind with
+/// `AttestationResult::Failed` and a submitter earns its score by
+/// having both on the record. It is optional because a gate that keeps
+/// refusals in a separate log, or none at all, should still be able to
+/// promote what it has.
+pub(super) fn cmd_attest_import_apply(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let (root, rest, _, _) = parse_store_flag(args);
+    let mut audit_path: Option<PathBuf> = None;
+    let mut gate: Option<String> = None;
+    let mut accepted_kind: Option<String> = None;
+    let mut refused_kind: Option<String> = None;
+    let mut cli_signer: Option<String> = None;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--audit" => {
+                audit_path = rest.get(i + 1).map(PathBuf::from);
+                i += 2;
+            }
+            "--gate" => {
+                gate = rest.get(i + 1).cloned();
+                i += 2;
+            }
+            "--accepted" => {
+                accepted_kind = rest.get(i + 1).cloned();
+                i += 2;
+            }
+            "--refused" => {
+                refused_kind = rest.get(i + 1).cloned();
+                i += 2;
+            }
+            "--signer" => {
+                cli_signer = rest.get(i + 1).cloned();
+                i += 2;
+            }
+            other => bail!("unexpected arg `{other}`"),
+        }
+    }
+    const USAGE: &str = "usage: lex attest import-apply --audit <gate-audit.json> \
+         --gate <label> --accepted <event-kind> [--refused <event-kind>] \
+         [--signer <id>] [--store DIR]";
+    let audit_path = audit_path.ok_or_else(|| anyhow!("{USAGE}"))?;
+    let gate = gate.ok_or_else(|| anyhow!("lex attest import-apply: --gate required\n{USAGE}"))?;
+    let accepted_kind = accepted_kind
+        .ok_or_else(|| anyhow!("lex attest import-apply: --accepted required\n{USAGE}"))?;
+    // Naming one kind twice would import each acceptance as both a
+    // pass and a failure, halving the signer's score for succeeding.
+    if refused_kind.as_deref() == Some(accepted_kind.as_str()) {
+        bail!("--accepted and --refused name the same event kind `{accepted_kind}`");
+    }
+
+    let raw = std::fs::read_to_string(&audit_path)
+        .with_context(|| format!("reading audit log {}", audit_path.display()))?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing audit log {} as JSON", audit_path.display()))?;
+    let entries = parsed.as_array().ok_or_else(|| {
+        anyhow!(
+            "audit log {} is not a JSON array of entries",
+            audit_path.display()
+        )
+    })?;
+
+    let store =
+        Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
+    let log = store.attestation_log()?;
+
+    let mut imported: Vec<serde_json::Value> = Vec::new();
+    let mut already_present = 0usize;
+    let mut accepted_count = 0usize;
+    let mut refused_count = 0usize;
+    // Every kind the log actually contains, so a caller who named the
+    // wrong `--accepted` sees why nothing landed instead of reading
+    // "imported 0" as "this gate accepted nothing".
+    let mut kinds_present: std::collections::BTreeSet<String> = Default::default();
+
+    for entry in entries {
+        let event = &entry["event"];
+        let Some(kind) = event["kind"].as_str() else {
+            continue;
+        };
+        kinds_present.insert(kind.to_string());
+        let result = if kind == accepted_kind {
+            accepted_count += 1;
+            lex_vcs::AttestationResult::Passed
+        } else if Some(kind) == refused_kind.as_deref() {
+            refused_count += 1;
+            lex_vcs::AttestationResult::Failed {
+                detail: event["reason"]
+                    .as_str()
+                    .unwrap_or("refused by the gate")
+                    .to_string(),
+            }
+        } else {
+            continue;
+        };
+
+        // A matched event that can't be fully attributed is a hard
+        // error. Skipping it would drop a refusal from a signer's
+        // record — which is exactly the direction that flatters them.
+        let missing = |field: &str| {
+            anyhow!(
+                "`{kind}` event in {} is missing `{field}`. A promotable \
+                 event carries `artifact_sha256` (the decided bytes), \
+                 `manifest` (the ceiling it was checked against) and \
+                 `signer` (or pass --signer); `subject` is optional",
+                audit_path.display()
+            )
+        };
+        let artifact_sha256 = event["artifact_sha256"]
+            .as_str()
+            .ok_or_else(|| missing("artifact_sha256"))?;
+        if artifact_sha256.len() != 64
+            || !artifact_sha256
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        {
+            bail!(
+                "`{kind}` event carries `artifact_sha256` = `{artifact_sha256}`, \
+                 which is not a lowercase-hex SHA-256; an acceptance names \
+                 exact bytes or it names nothing"
+            );
+        }
+        let manifest = event["manifest"].as_str().ok_or_else(|| missing("manifest"))?;
+        let signer = match (event["signer"].as_str(), cli_signer.as_deref()) {
+            (Some(in_log), Some(on_cli)) if in_log != on_cli => bail!(
+                "`{kind}` event is signed by `{in_log}` but --signer says \
+                 `{on_cli}`; refusing to re-attribute a decision"
+            ),
+            (Some(in_log), _) => in_log,
+            (None, Some(on_cli)) => on_cli,
+            (None, None) => {
+                bail!(
+                    "`{kind}` event carries no `signer` and no --signer was given; \
+                     an unattributed decision is not evidence about anyone"
+                )
+            }
+        };
+        let subject = event["subject"].as_str().unwrap_or("").to_string();
+
+        let producer = lex_vcs::ProducerDescriptor {
+            tool: signer.to_string(),
+            version: format!("lex-gate-{gate}"),
+            model: None,
+        };
+        let attestation = lex_vcs::Attestation::new(
+            signer.to_string(),
+            None,
+            None,
+            lex_vcs::AttestationKind::PlanApply {
+                gate: gate.clone(),
+                subject: subject.clone(),
+                artifact_sha256: artifact_sha256.to_string(),
+                signer: signer.to_string(),
+                manifest: manifest.to_string(),
+            },
+            result.clone(),
+            producer,
+            None,
+        );
+        let existed = log.get(&attestation.attestation_id)?.is_some();
+        log.put(&attestation)?;
+        if existed {
+            already_present += 1;
+        }
+        imported.push(serde_json::json!({
+            "attestation_id": attestation.attestation_id,
+            "gate": gate,
+            "subject": subject,
+            "artifact_sha256": artifact_sha256,
+            "signer": signer,
+            "manifest": manifest,
+            "result": attestation_result_tag(&result),
+            "already_present": existed,
+        }));
+    }
+
+    let count = imported.len();
+    let kinds: Vec<String> = kinds_present.into_iter().collect();
+    let data = serde_json::json!({
+        "audit_log": audit_path.display().to_string(),
+        "gate": gate,
+        "imported": count,
+        "accepted": accepted_count,
+        "refused": refused_count,
+        "already_present": already_present,
+        "event_kinds_present": kinds,
+        "attestations": imported,
+    });
+    let printable = kinds.join(", ");
+    acli::emit_or_text("attest", data, fmt, move || {
+        println!(
+            "→ imported {count} plan-apply attestation(s): \
+             {accepted_count} accepted, {refused_count} refused \
+             ({already_present} already present)"
+        );
+        if count == 0 {
+            // "Nothing matched" and "this gate decided nothing" are
+            // different facts, and the caller needs to know which.
+            println!("  event kinds present in this log: {printable}");
+        }
     });
     Ok(())
 }
@@ -716,5 +955,6 @@ pub(super) fn attestation_kind_tag(k: &lex_vcs::AttestationKind) -> &'static str
         ProducerTrust { .. } => "producer_trust",
         TrustWaived { .. } => "trust_waived",
         CapsuleInstall { .. } => "capsule_install",
+        PlanApply { .. } => "plan_apply",
     }
 }

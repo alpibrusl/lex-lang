@@ -324,6 +324,58 @@ pub enum AttestationKind {
         /// requires)`, pretty-printed.
         effective_grant: String,
     },
+    /// A plan-shaped decision a capability gate reached, promoted into
+    /// durable evidence by `lex attest import-apply` (#790).
+    ///
+    /// Two gates emit this fact today — `lex-iac` between `terraform
+    /// plan` and `terraform apply`, and `lex-k8s` at Kubernetes
+    /// admission — and both emit the *same* fact: a plan-shaped
+    /// artifact, checked against a manifest, decided under a signer.
+    /// The name is deliberately generic. An `InfraApply` variant would
+    /// have pushed the Kubernetes gate into minting a near-duplicate,
+    /// and a duplicate discriminant splits one producer's track record
+    /// across two kinds. Whatever differs between the gates lives in
+    /// the `gate` and `subject` fields, which are payload rather than
+    /// identity-by-variant.
+    ///
+    /// Stored under `stage_id == signer` **and** `produced_by.tool ==
+    /// signer`, the convention [`Self::CapsuleInstall`] /
+    /// [`Self::ProducerBlock`] / [`Self::ProducerTrust`] use — get it
+    /// wrong and `recompute_producer_trust`, which scores
+    /// `produced_by.tool`, silently never sees these records.
+    ///
+    /// # Refusals are part of the record
+    ///
+    /// [`AttestationResult`] carries the verdict, so a refused decision
+    /// is this same kind with `Failed { detail }`. That is not an
+    /// afterthought: producer trust is `passed / (passed + failed)`, so
+    /// a corpus of acceptances only would score every submitter 1.0 and
+    /// mean nothing. A submitter loses trust by having its refusals on
+    /// the record next to its acceptances.
+    PlanApply {
+        /// Which gate decided — `terraform`, `kubernetes`, … Free-form,
+        /// and in the payload rather than the discriminant so a third
+        /// gate needs no schema change here.
+        gate: String,
+        /// What was decided about, in the gate's own vocabulary: a
+        /// workspace, a namespaced pod name. Human-facing; may be empty
+        /// when the gate names nothing.
+        subject: String,
+        /// Hex SHA-256 of the artifact's bytes — the plan or spec the
+        /// decision was actually reached about. Load-bearing: an
+        /// acceptance authorises *these* bytes, so a substituted plan
+        /// must not match. Never empty; the importer refuses an event
+        /// without it rather than minting evidence that matches
+        /// anything.
+        artifact_sha256: ContentHash,
+        /// The identity the decision was made under — a CI pipeline
+        /// key, a ServiceAccount, an agent key. Duplicated from
+        /// `stage_id` / `produced_by.tool` for clarity in the JSON.
+        signer: String,
+        /// The manifest the artifact was checked against: the ceiling
+        /// in force at decision time.
+        manifest: String,
+    },
 }
 
 /// Walk a tool's `ProducerBlock` / `ProducerUnblock` attestations
