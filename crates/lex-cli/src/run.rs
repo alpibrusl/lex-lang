@@ -172,6 +172,11 @@ pub(super) fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         let store = lex_store::Store::open(default_store_root())?;
         let (root_out, root_err) = match &result {
             Ok(v) => (Some(value_to_json(v)), None),
+            // A deliberate `exit(0)` is a successful run that chose to
+            // stop, so it records no error. A non-zero one is the
+            // program reporting failure, and the trace should say so —
+            // that is the whole point of being able to set the status.
+            Err(lex_bytecode::vm::VmError::ProcessExit(0)) => (None, None),
             Err(e) => (None, Some(format!("{e}"))),
         };
         let tree = trace_handle.finalize(
@@ -199,7 +204,9 @@ pub(super) fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                     root_target: func.clone(),
                 },
                 match &result {
-                    Ok(_) => lex_vcs::AttestationResult::Passed,
+                    Ok(_) | Err(lex_bytecode::vm::VmError::ProcessExit(0)) => {
+                        lex_vcs::AttestationResult::Passed
+                    }
                     Err(e) => lex_vcs::AttestationResult::Failed {
                         detail: format!("{e}"),
                     },
@@ -221,7 +228,9 @@ pub(super) fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         // `lex run` interacts with today. Empty for the common case
         // where the program doesn't commit ops.
         let att_result = match &result {
-            Ok(_) => lex_vcs::AttestationResult::Passed,
+            Ok(_) | Err(lex_bytecode::vm::VmError::ProcessExit(0)) => {
+                lex_vcs::AttestationResult::Passed
+            }
             Err(e) => lex_vcs::AttestationResult::Failed {
                 detail: format!("{e}"),
             },
@@ -243,6 +252,23 @@ pub(super) fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         if !matches!(fmt, OutputFormat::Json) {
             eprintln!("trace saved: {id}");
         }
+    }
+    // #754: a deliberate exit, honoured only now — after the trace was
+    // finalised, the `Trace` attestation written and committed ops
+    // recorded above. A run that exits is still a run that happened,
+    // and it leaves the same evidence as one that returned.
+    //
+    // `--output json` still gets an envelope: a pipeline reading the
+    // JSON should not have to infer from a missing document that the
+    // program chose to stop.
+    if let Err(lex_bytecode::vm::VmError::ProcessExit(code)) = &result {
+        let code = *code;
+        let data = match &trace_id {
+            Some(id) => serde_json::json!({ "exit_code": code, "trace_id": id }),
+            None => serde_json::json!({ "exit_code": code }),
+        };
+        acli::emit_or_text("run", data, fmt, || {});
+        std::process::exit(code);
     }
     let r = result.map_err(|e| anyhow!("runtime: {e}"))?;
     let result_json = value_to_json(&r);

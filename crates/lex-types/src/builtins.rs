@@ -2207,6 +2207,28 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 vec![ph(), Ty::str()],
                 EffectSet::singleton("proc"),
                 result_str(Ty::Unit)));
+            // exit :: Int -> [proc_exit] Unit
+            //
+            // Sets the status `lex run` terminates with, so a Lex
+            // program can be called by a shell script for its verdict
+            // (#754). Its own effect kind rather than `proc`: running a
+            // subprocess and ending your caller's process are different
+            // authorities, and a program allowed to shell out should not
+            // thereby be allowed to decide what its invoker sees.
+            //
+            // The declared return is `Unit` because the language has no
+            // bottom type; nothing after a successful `exit` runs. The
+            // call unwinds the VM rather than terminating the process
+            // where it stands, so `lex run` still finalises its trace
+            // and writes its attestations before exiting — a program
+            // that exits is still a run that happened.
+            //
+            // Only the *first* exit is honoured. A program that calls
+            // exit twice has already stopped at the first.
+            fields.insert("exit".into(), Ty::function(
+                vec![Ty::int()],
+                EffectSet::singleton("proc_exit"),
+                Ty::Unit));
             // run :: Str, List[Str] -> [proc] Result[ProcessOutput, Str]
             // Blocking convenience that captures stdout/stderr fully
             // and returns once the child exits. For programs that

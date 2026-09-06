@@ -69,6 +69,36 @@ impl EffectHandler for DefaultHandler {
         // effect kinds (distinct from the module name `fs`); the
         // policy check uses the per-op kind, not the module's.
         if kind == "process" {
+            // `exit` carries its own effect kind (#754). Spawning a
+            // subprocess and ending your caller's process are different
+            // authorities: a program granted `proc` to shell out should
+            // not thereby decide what its invoker sees. Same split, and
+            // the same reasoning, as `fs` → `fs_walk` / `fs_write`.
+            if op == "exit" {
+                self.ensure_kind_allowed("proc_exit")?;
+                let code = match args.first() {
+                    Some(Value::Int(n)) => *n,
+                    other => {
+                        return Err(format!(
+                            "process.exit expects an Int status, got {other:?}"
+                        ))
+                    }
+                };
+                // Clamped, not wrapped. A shell sees status & 0xff, so
+                // `exit(256)` would arrive as 0 — a program signalling
+                // failure that reads as success is the one outcome this
+                // must never produce.
+                let code = code.clamp(0, 255) as i64;
+                // First writer wins: the program stopped at the first
+                // exit, so a later one cannot restate the verdict.
+                let _ = self.requested_exit.compare_exchange(
+                    crate::handler::NO_EXIT,
+                    code,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+                return Ok(Value::Unit);
+            }
             self.ensure_kind_allowed("proc")?;
             return self.dispatch_process(op, args);
         }
@@ -1723,6 +1753,13 @@ impl EffectHandler for DefaultHandler {
     ///   route into the same chat dispatch layer.
     /// - `program`: cloned `Arc<Program>` so `net.serve` (if a
     ///   worker invokes it) sees the same compiled program.
+    fn take_exit(&mut self) -> Option<i32> {
+        match self.requested_exit.load(Ordering::SeqCst) {
+            crate::handler::NO_EXIT => None,
+            code => Some(code as i32),
+        }
+    }
+
     fn spawn_for_worker(&self) -> Option<Box<dyn lex_bytecode::vm::EffectHandler + Send>> {
         let mut fresh = DefaultHandler::new(self.policy.clone());
         // Share the budget pool atomically — slice 2's correctness
@@ -1739,6 +1776,9 @@ impl EffectHandler for DefaultHandler {
         fresh.streams = std::sync::Arc::clone(&self.streams);
         fresh.next_stream_id = std::sync::Arc::clone(&self.next_stream_id);
         fresh.program_args = self.program_args.clone();
+        // #754: an exit called inside parallel work has to reach the
+        // VM that returns, not die with the worker's handler.
+        fresh.requested_exit = std::sync::Arc::clone(&self.requested_exit);
         Some(Box::new(fresh))
     }
 }

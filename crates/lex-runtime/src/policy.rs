@@ -77,6 +77,10 @@ pub const KNOWN_EFFECTS: &[(&str, &str)] = &[
     ("time", "clocks — non-deterministic"),
     ("llm", "LLM inference"),
     ("proc", "subprocess execution"),
+    (
+        "proc_exit",
+        "std.process.exit — sets this process's exit status (#754)",
+    ),
     ("panic", "may abort"),
     ("fs_read", "filesystem reads; scopable to a path"),
     ("fs_write", "filesystem writes; scopable to a path"),

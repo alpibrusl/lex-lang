@@ -75,6 +75,18 @@ pub enum VmError {
     UnknownFunction(String),
     #[error("effect handler error: {0}")]
     Effect(String),
+    /// The program called `std.process.exit(code)` (#754).
+    ///
+    /// Not a failure — a deliberate signal — but it travels the error
+    /// channel because that is the VM's only unwind path, and unwinding
+    /// is the point: the alternative is calling `std::process::exit`
+    /// inside the handler, which would terminate the process where it
+    /// stands and silently skip everything `lex run` does *after* the
+    /// call returns (finalising the trace, writing the `Trace`
+    /// attestation, recording committed ops). A run that exits is still
+    /// a run that happened, and it should leave the same evidence.
+    #[error("process exit requested: {0}")]
+    ProcessExit(i32),
     #[error("call stack overflow: recursion depth exceeded ({0})")]
     CallStackOverflow(u32),
     /// Refinement predicate failed at a call boundary (#209 slice 3).
@@ -135,6 +147,22 @@ pub trait EffectHandler {
     /// handlers and pure-only runs are unaffected.
     fn note_call_budget(&mut self, _budget_cost: u64) -> Result<(), String> {
         Ok(())
+    }
+
+    /// Has the program asked to terminate, and with what status (#754)?
+    ///
+    /// Checked by the VM after every effect dispatch. A handler that
+    /// supports `std.process.exit` records the requested code and
+    /// returns it here **once**; the VM then unwinds with
+    /// [`VmError::ProcessExit`].
+    ///
+    /// A hook rather than a richer error type on `dispatch` for the
+    /// same reason `note_call_budget` is one: the default impl keeps
+    /// every existing handler compiling and behaving exactly as before.
+    /// Signalling through the `String` error channel was the
+    /// alternative, and a sentinel string is not a contract.
+    fn take_exit(&mut self) -> Option<i32> {
+        None
     }
 
     /// Enter a per-request allocation scope (#463 scaffolding).

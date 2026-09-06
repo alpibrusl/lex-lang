@@ -1130,6 +1130,16 @@ impl<'a> Vm<'a> {
                     match result {
                         Ok(v) => {
                             self.tracer.exit_ok(&v);
+                            // #754: `std.process.exit` records its code on
+                            // the handler rather than returning it, because
+                            // the dispatch channel carries a `Value` and an
+                            // exit is not a value. Checked here, right after
+                            // the call that could have set it, so the unwind
+                            // starts at the exact op that asked for it and
+                            // the trace records the call before the exit.
+                            if let Some(code) = self.handler.take_exit() {
+                                return Err(VmError::ProcessExit(code));
+                            }
                             self.stack.push(v);
                         }
                         Err(e) => {
