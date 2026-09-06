@@ -880,6 +880,9 @@ fn kind_short(k: &AttestationKind) -> String {
         AttestationKind::CapsuleInstall { artifact, signer, .. } => {
             format!("CapsuleInstall({artifact} by {signer:.12}…)")
         }
+        AttestationKind::PlanApply { gate, subject, signer, .. } => {
+            format!("PlanApply({gate}:{subject} by {signer:.12}…)")
+        }
         AttestationKind::TrustWaived { producer, kind_tag, .. } => {
             format!("TrustWaived({producer}/{kind_tag})")
         }

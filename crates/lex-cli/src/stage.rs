@@ -119,6 +119,11 @@ pub(super) fn cmd_stage(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                     } => {
                         format!("CapsuleInstall({artifact} by {signer:.12}…)")
                     }
+                    lex_vcs::AttestationKind::PlanApply {
+                        gate, subject, signer, ..
+                    } => {
+                        format!("PlanApply({gate}:{subject} by {signer:.12}…)")
+                    }
                 };
                 let result = match &a.result {
                     lex_vcs::AttestationResult::Passed => "passed".to_string(),

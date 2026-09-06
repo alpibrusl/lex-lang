@@ -648,7 +648,7 @@ fn cmd_attest() -> CommandInfo {
     .add_option(
         "--kind",
         "string",
-        "attestation kind: type_check | spec | examples | diff_body | effect_audit | sandbox_run | capsule_install",
+        "attestation kind: type_check | spec | examples | diff_body | effect_audit | sandbox_run | capsule_install | plan_apply",
         None,
     )
     .add_option("--result", "string", "passed | failed | inconclusive", None)
@@ -671,6 +671,42 @@ fn cmd_attest() -> CommandInfo {
         None,
     )
     .add_option("--store", "string", "store root directory", None);
+    let import_apply = CommandInfo::new(
+        "import-apply",
+        "promote a capability gate's plan decisions into durable attestations (signer-keyed; feeds producer-trust). A promotable event carries `artifact_sha256`, `manifest` and `signer` (or pass --signer); `subject` is optional",
+    )
+    .idempotent(true)
+    .add_option(
+        "--audit",
+        "string",
+        "gate audit log JSON (the array of {seq, prev_hash, event, hash} entries a lex-os chain writes)",
+        None,
+    )
+    .add_option(
+        "--gate",
+        "string",
+        "which gate decided: terraform | kubernetes | ... recorded in the payload, not the kind",
+        None,
+    )
+    .add_option(
+        "--accepted",
+        "string",
+        "event kind that means accepted; imported as result=passed",
+        None,
+    )
+    .add_option(
+        "--refused",
+        "string",
+        "event kind that means refused; imported as result=failed so producer trust is not vacuously 1.0",
+        None,
+    )
+    .add_option(
+        "--signer",
+        "string",
+        "identity to attribute decisions to when the events carry no `signer`",
+        None,
+    )
+    .add_option("--store", "string", "store root directory", None);
     let mut info = CommandInfo::new(
         "attest",
         "cross-stage attestation queries (CI / dashboards)",
@@ -689,12 +725,17 @@ fn cmd_attest() -> CommandInfo {
             "lex attest import-install --audit install.audit.json",
         ),
         (
+            "Promote gate decisions, acceptances and refusals alike",
+            "lex attest import-apply --audit iac.audit.json --gate terraform \
+             --accepted plan_accepted --refused plan_refused",
+        ),
+        (
             "Machine-readable",
             "lex --output json attest filter --kind spec",
         ),
     ])
     .with_see_also(vec!["stage", "blame", "producer-trust"]);
-    info.subcommands = vec![filter, import_install];
+    info.subcommands = vec![filter, import_install, import_apply];
     info
 }
 
