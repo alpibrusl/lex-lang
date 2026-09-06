@@ -64,6 +64,20 @@ pub enum TokenKind {
     #[regex(r"[0-9][0-9_]*\.[0-9][0-9_]*([eE][+-]?[0-9]+)?", |lex| lex.slice().replace('_', "").parse::<f64>().ok())]
     Float(f64),
 
+    // Hex (0x1F) and binary (0b1010) integer literals. Underscores allowed
+    // for readability, matching the decimal literal's own `_` grouping.
+    // Without these, `0x80` lexed as `Int(0)` immediately followed by
+    // `Ident("x80")` (`x80` matches the identifier pattern below) --
+    // silently wrong rather than a lex error, so a call like
+    // `bytes.singleton(0x80)` failed downstream in the parser with a
+    // confusing "expected RParen, got Ident" instead of naming the real
+    // problem. Reproduced live: an agent writing RLP encoding (where
+    // `0x80`-style byte constants are the natural idiom) hit exactly this.
+    // Logos resolves the ambiguity with plain decimal Int by longest-match:
+    // "0x80" (len 4) always beats "0" (len 1) for the same input, so this
+    // needs no explicit priority to win.
+    #[regex(r"0[xX][0-9a-fA-F][0-9a-fA-F_]*", |lex| i64::from_str_radix(&lex.slice()[2..].replace('_', ""), 16).ok())]
+    #[regex(r"0[bB][01][01_]*", |lex| i64::from_str_radix(&lex.slice()[2..].replace('_', ""), 2).ok())]
     #[regex(r"[0-9][0-9_]*", |lex| lex.slice().replace('_', "").parse::<i64>().ok(), priority = 3)]
     Int(i64),
 
