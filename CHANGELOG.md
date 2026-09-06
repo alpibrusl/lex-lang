@@ -7,6 +7,25 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.10.16] — 2026-09-06
+
+Adds hex and binary integer literals (#792), fixes a real correctness
+gap in the checker's parse-rewrite side tables (#777), and migrates
+the first two stdlib modules onto a declarative builtin catalogue
+(#778) — plus the file-size-driven splits that made room for it
+(#779).
+
+### Added
+
+- **Hex (`0x1F`) and binary (`0b1010`) integer literals (#792).**
+  `0x80` previously lexed as `Int(0)` followed by `Ident("x80")` — the
+  decimal regex matched only the leading `0` and the identifier regex
+  greedily took the rest — surfacing as a confusing parser error
+  ("expected RParen, got Ident") rather than a clear lexer-level
+  failure. Both forms accept `_` as a digit separator and lower to the
+  same `Int(i64)` token as decimal. `lex fmt` reprints a hex/binary
+  literal back as decimal — the value survives, the notation doesn't.
+
 ### Changed
 
 - **Checker side tables are keyed by NodeId, not by address (#777).**
