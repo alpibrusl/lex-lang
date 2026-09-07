@@ -7,6 +7,8 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.10.17] — 2026-09-07
+
 ### Fixed
 
 - **`lex test` on an empty (or missing) test directory exited 0.**
