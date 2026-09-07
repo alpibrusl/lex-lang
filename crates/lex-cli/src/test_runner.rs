@@ -54,10 +54,20 @@ pub fn cmd_test(_fmt: &::acli::OutputFormat, args: &[String]) -> Result<()> {
     }
     let dir = dir.unwrap_or_else(|| PathBuf::from("tests"));
 
+    // An empty (or missing) test directory is not a pass: the same
+    // "an unmet-because-unevaluable check counts as unmet" rule
+    // `task_spec.lex` (lex-code) already applies to a spec with zero
+    // criteria — "all of nothing succeeded" is vacuously true and
+    // exactly the wrong answer. Before this, exit 0 here meant a caller
+    // that shells out to `lex test` to gate on "the suite passes" (a
+    // CI script, or a coding agent's own mechanical verify step) could
+    // not tell "everything passed" from "nothing ran yet", including
+    // the literal case that mattered live: a fix-loop agent's build
+    // stage produced nothing, `lex test` reported success anyway, and
+    // the loop stopped instead of retrying.
     let entries = collect_test_files(&dir)?;
     if entries.is_empty() {
-        println!("no test_*.lex files found in {}", dir.display());
-        return Ok(());
+        anyhow::bail!("no test_*.lex files found in {}", dir.display());
     }
 
     let mut pass = 0usize;
