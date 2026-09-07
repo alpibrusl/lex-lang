@@ -7,6 +7,18 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`lex test` on an empty (or missing) test directory exited 0.**
+  Zero `test_*.lex` files found now fails the command instead of
+  silently passing — the same "an unmet-because-unevaluable check
+  counts as unmet" rule lex-code's `task_spec.lex` already applies to
+  a spec with zero criteria. Found live: a coding agent's own
+  mechanical verify step (`lex test`, gating a build-fix retry loop on
+  a real subprocess exit code rather than the agent's self-report)
+  couldn't tell "the suite passes" from "nothing was built yet" —
+  a build stage that produced no test file at all read as success.
+
 ## [0.10.16] — 2026-09-06
 
 Adds hex and binary integer literals (#792), fixes a real correctness
