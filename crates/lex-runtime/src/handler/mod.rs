@@ -7,7 +7,7 @@
 use lex_bytecode::vm::{EffectHandler, Vm};
 use lex_bytecode::{Program, Value};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -69,6 +69,10 @@ impl IoSink for CapturedSink {
 pub type StreamRegistry =
     std::collections::HashMap<String, Box<dyn Iterator<Item = String> + Send>>;
 
+/// `requested_exit`'s "nothing requested" value. Outside the `i32`
+/// range on purpose, so no real exit status can collide with it.
+pub const NO_EXIT: i64 = i64::MIN;
+
 pub struct DefaultHandler {
     policy: Policy,
     pub sink: Box<dyn IoSink>,
@@ -127,6 +131,19 @@ pub struct DefaultHandler {
     /// finds and removes the matching entry. Plain `u64`, not
     /// shared — each handler instance has its own counter.
     next_scope_id: u64,
+    /// The status `std.process.exit` asked to terminate with (#754).
+    ///
+    /// `Arc`-shared for the same reason `budget_remaining` is: a
+    /// `par_map` worker gets a cloned handler, and an exit called from
+    /// a worker has to reach the VM that will actually return. Held
+    /// per-handler instead, an exit inside parallel work would be
+    /// dropped on the floor — the failure mode being that a program
+    /// signalling failure silently exits 0.
+    ///
+    /// [`NO_EXIT`] means "not requested". The first writer wins, so a
+    /// racing second exit cannot overwrite the status the program
+    /// already stopped with.
+    pub requested_exit: Arc<AtomicI64>,
     /// Arguments passed after `--` in `lex run <file> -- [args...]`.
     /// Returned by `io.argv()` so Lex `main` functions can read CLI flags.
     pub program_args: Vec<String>,
@@ -156,6 +173,7 @@ impl DefaultHandler {
             next_stream_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             arena_stack: Vec::new(),
             next_scope_id: 1,
+            requested_exit: Arc::new(AtomicI64::new(NO_EXIT)),
             program_args: Vec::new(),
             approval_sink: Box::new(NullApprovalSink),
         }

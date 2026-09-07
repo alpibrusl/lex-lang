@@ -92,6 +92,7 @@ then `lex doc-sync`):
 | `time` | clocks — non-deterministic |
 | `llm` | LLM inference |
 | `proc` | subprocess execution |
+| `proc_exit` | std.process.exit — sets this process's exit status (#754) |
 | `panic` | may abort |
 | `fs_read` | filesystem reads; scopable to a path |
 | `fs_write` | filesystem writes; scopable to a path |
@@ -142,7 +143,7 @@ an exhaustive function list.
 | `std.rand` | `int_in` |
 | `std.random` | `seed`, `int`, `float`, `choose` |
 | `std.env` | `get` |
-| `std.net` | `get`, `post`, `udp_open`, `udp_close`, `udp_send`, `udp_recv`, `udp_broadcast`, `udp_join_multicast`, `serve`, `serve_tls`, `serve_ws`, `serve_ws_fn`, `serve_ws_fn_auth`, `serve_ws_fn_actor`, `dial_ws`, `dial_ws_actor`, `serve_fn`, `serve_routed`, `default_opts`, `serve_with`, `serve_fn_with`, `serve_routed_with`, `serve_quic`, `serve_quic_fn`, `serve_quic_routed` |
+| `std.net` | `get`, `post`, `udp_open`, `udp_close`, `udp_send`, `udp_recv`, `udp_broadcast`, `udp_join_multicast`, `serve`, `serve_tls`, `serve_ws`, `serve_ws_fn`, `serve_ws_fn_auth`, `serve_ws_fn_actor_with`, `serve_ws_fn_actor`, `dial_ws`, `dial_ws_actor`, `serve_fn`, `serve_routed`, `default_opts`, `serve_with`, `serve_fn_with`, `serve_routed_with`, `serve_quic`, `serve_quic_fn`, `serve_quic_routed` |
 | `std.tls` | `from_pem_files`, `self_signed` |
 | `std.chat` | `broadcast`, `send` |
 | `std.conc` | `spawn`, `ask`, `tell`, `register`, `lookup`, `unregister`, `registered` |
@@ -162,7 +163,7 @@ an exhaustive function list.
 | `std.datetime` | `now`, `parse_iso`, `format_iso`, `parse`, `format`, `to_components`, `from_components`, `add`, `diff`, `duration_seconds`, `duration_minutes`, `duration_days`, `before`, `after`, `compare` |
 | `std.duration` | `millis`, `seconds`, `minutes`, `hours`, `days` |
 | `std.approval` | `request` |
-| `std.process` | `spawn`, `read_stdout_line`, `read_stderr_line`, `wait`, `kill`, `run` |
+| `std.process` | `spawn`, `read_stdout_line`, `read_stderr_line`, `wait`, `kill`, `exit`, `run` |
 | `std.fs` | `exists`, `is_file`, `is_dir`, `stat`, `list_dir`, `walk`, `glob`, `mkdir_p`, `remove`, `copy` |
 | `std.kv` | `open`, `close`, `get`, `put`, `delete`, `contains`, `list_prefix` |
 | `std.vcs` | `put_blob`, `get_blob`, `has_blob`, `ref_set`, `ref_get` |

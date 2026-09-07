@@ -85,6 +85,30 @@ pub fn chat_send(reg: &Arc<ChatRegistry>, conn_id: u64, body: &str) -> bool {
 
 /// Bind a WebSocket server. Blocks; returns Unit on shutdown (the
 /// process is normally killed before that).
+/// The interface the `net.serve_ws*` family binds to (#719).
+///
+/// All four WS servers bound `127.0.0.1` unconditionally, so a
+/// containerised deployment could not accept cross-container
+/// connections at all — ev-fleet's lex-csms was running a `socat`
+/// sidecar to republish the loopback listener on the container
+/// interface.
+///
+/// `LEX_WS_HOST` is the same escape hatch the legacy HTTP path already
+/// uses for its own options (`ServeOpts::from_env`, alongside
+/// `LEX_NET_INLINE_VM` and `LEX_NET_HTTP2`): it fixes an existing
+/// deployment without touching the program or its signatures.
+///
+/// The default stays `127.0.0.1`. Widening what an existing program
+/// listens on, on upgrade and without anybody asking, is not a bug fix
+/// — a server that was only ever reachable from localhost must not
+/// silently become reachable from the network.
+pub fn ws_bind_host() -> String {
+    std::env::var("LEX_WS_HOST")
+        .ok()
+        .filter(|h| !h.trim().is_empty())
+        .unwrap_or_else(|| "127.0.0.1".to_string())
+}
+
 pub fn serve_ws(
     port: u16,
     handler_name: String,
@@ -92,9 +116,10 @@ pub fn serve_ws(
     policy: Policy,
     registry: Arc<ChatRegistry>,
 ) -> Result<Value, String> {
-    let listener = TcpListener::bind(("127.0.0.1", port))
-        .map_err(|e| format!("net.serve_ws bind {port}: {e}"))?;
-    eprintln!("net.serve_ws: listening on ws://127.0.0.1:{port}");
+    let host = ws_bind_host();
+    let listener = TcpListener::bind((host.as_str(), port))
+        .map_err(|e| format!("net.serve_ws bind {host}:{port}: {e}"))?;
+    eprintln!("net.serve_ws: listening on ws://{host}:{port}");
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(s) => s,
@@ -330,9 +355,10 @@ pub fn serve_ws_fn(
             ));
         }
     }
-    let listener = TcpListener::bind(("127.0.0.1", port))
-        .map_err(|e| format!("net.serve_ws_fn bind {port}: {e}"))?;
-    eprintln!("net.serve_ws_fn: listening on ws://127.0.0.1:{port}");
+    let host = ws_bind_host();
+    let listener = TcpListener::bind((host.as_str(), port))
+        .map_err(|e| format!("net.serve_ws_fn bind {host}:{port}: {e}"))?;
+    eprintln!("net.serve_ws_fn: listening on ws://{host}:{port}");
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(s) => s,
@@ -480,9 +506,10 @@ pub fn serve_ws_fn_auth(
             ));
         }
     }
-    let listener = TcpListener::bind(("127.0.0.1", port))
-        .map_err(|e| format!("net.serve_ws_fn_auth bind {port}: {e}"))?;
-    eprintln!("net.serve_ws_fn_auth: listening on ws://127.0.0.1:{port}");
+    let host = ws_bind_host();
+    let listener = TcpListener::bind((host.as_str(), port))
+        .map_err(|e| format!("net.serve_ws_fn_auth bind {host}:{port}: {e}"))?;
+    eprintln!("net.serve_ws_fn_auth: listening on ws://{host}:{port}");
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(s) => s,
@@ -737,7 +764,39 @@ fn run_loop_fn(
 // native bridge only accepts `Value::Str`; binary frames need a tagged
 // message type (`WsOut::Text(Str) | WsOut::Binary(List[Int])`) that the
 // native handler can match on. Filed as a follow-up.
+/// `net.serve_ws_fn_actor` — binds the host from the environment.
+#[allow(clippy::too_many_arguments)]
 pub fn serve_ws_fn_actor(
+    port: u16,
+    subprotocol: String,
+    name_of_closure: Value,
+    on_message_closure: Value,
+    program: Arc<Program>,
+    policy: Policy,
+    registry: Arc<ChatRegistry>,
+) -> Result<Value, String> {
+    serve_ws_fn_actor_on(
+        ws_bind_host(),
+        port,
+        subprotocol,
+        name_of_closure,
+        on_message_closure,
+        program,
+        policy,
+        registry,
+    )
+}
+
+/// The same server with the bind interface named outright (#719).
+///
+/// `net.serve_ws_fn_actor_with(port, sub, name_of, on_message, opts)`
+/// lands here with `opts.host`. Explicit beats environmental: a program
+/// that means to listen on `0.0.0.0` should say so in its source, where
+/// a reader and a reviewer can see it, rather than depend on how it
+/// happens to be launched.
+#[allow(clippy::too_many_arguments)]
+pub fn serve_ws_fn_actor_on(
+    host: String,
     port: u16,
     subprotocol: String,
     name_of_closure: Value,
@@ -756,9 +815,9 @@ pub fn serve_ws_fn_actor(
             ));
         }
     }
-    let listener = TcpListener::bind(("127.0.0.1", port))
-        .map_err(|e| format!("net.serve_ws_fn_actor bind {port}: {e}"))?;
-    eprintln!("net.serve_ws_fn_actor: listening on ws://127.0.0.1:{port}");
+    let listener = TcpListener::bind((host.as_str(), port))
+        .map_err(|e| format!("net.serve_ws_fn_actor bind {host}:{port}: {e}"))?;
+    eprintln!("net.serve_ws_fn_actor: listening on ws://{host}:{port}");
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(s) => s,

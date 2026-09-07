@@ -12,7 +12,7 @@ description: "Invoke the `lex` CLI. Commands: parse, check, run, hash…"
 
 - `lex parse` — print canonical AST as JSON (idempotent)
 - `lex check` — type-check; exit 0 or print errors (idempotent)
-- `lex run` — execute fn under capability policy (args parsed as JSON)
+- `lex run` — execute fn under capability policy (args parsed as JSON); the program's own exit status when it calls std.process.exit
 - `lex hash` — print canonical SigId/StageId hashes for each function (idempotent)
 - `lex blame` — show each fn's stage history from the store (idempotent)
 - `lex publish` — publish each stage in a file to the store as Draft
@@ -98,7 +98,7 @@ lex check app.lex && lex run app.lex main
 
 ## `lex run`
 
-execute fn under capability policy (args parsed as JSON)
+execute fn under capability policy (args parsed as JSON); the program's own exit status when it calls std.process.exit
 
 ### Options
 
@@ -125,6 +125,11 @@ lex run app.lex main
 ```bash
 # Run with fs read scope
 lex run --allow-fs-read /tmp app.lex load "/tmp/x.json"
+```
+
+```bash
+# Let the program set the shell's exit status (std.process.exit)
+lex run --allow-effects proc_exit check.lex verify
 ```
 
 **See also:** `lex check`, `lex replay`, `lex trace`

@@ -535,6 +535,63 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             // registers an `ActorHandler::Native` bridge in the conc
             // registry; lookups from non-WS callers are themselves
             // `[concurrent]` effects.
+            // serve_ws_fn_actor_with[Eff] ::
+            //   (Int, Str,
+            //    (WsConn) -> Str,
+            //    (WsConn, WsMessage) -> [Eff] WsAction,
+            //    ServeOpts)
+            //   -> [net, concurrent, Eff] Unit
+            //
+            // `serve_ws_fn_actor` with the bind interface named in the
+            // source (#719). Every WS server bound `127.0.0.1`
+            // unconditionally, so a containerised deployment could not
+            // accept cross-container connections without a `socat`
+            // sidecar republishing the loopback listener.
+            //
+            // The opts record is the one `net.default_opts()` already
+            // returns, per the issue's own suggestion — only `host` is
+            // read, since `http2` and `inline_vm` describe an HTTP
+            // server and mean nothing to a websocket listener. One
+            // `ServeOpts` in the language beats two that differ by two
+            // fields.
+            //
+            // The other three WS servers honour `LEX_WS_HOST` but have
+            // no `_with` variant yet; adding one is a hand-written
+            // builtin today, and `std.net` has not migrated to the
+            // declarative catalogue (#778) where it would be a row.
+            fields.insert("serve_ws_fn_actor_with".into(), Ty::function(
+                vec![
+                    Ty::int(),
+                    Ty::str(), // subprotocol
+                    Ty::function(
+                        vec![Ty::Con("WsConn".into(), vec![])],
+                        EffectSet::empty(),
+                        Ty::str(),
+                    ),
+                    Ty::function(
+                        vec![
+                            Ty::Con("WsConn".into(), vec![]),
+                            Ty::Con("WsMessage".into(), vec![]),
+                        ],
+                        EffectSet::open_var(0),
+                        Ty::Con("WsAction".into(), vec![]),
+                    ),
+                    {
+                        // The same shape `serve_opts_t()` builds below;
+                        // spelled out here because that helper is
+                        // declared further down this arm.
+                        let mut fs = IndexMap::new();
+                        fs.insert("http2".into(),     Ty::bool());
+                        fs.insert("inline_vm".into(), Ty::bool());
+                        fs.insert("host".into(),      Ty::str());
+                        Ty::Record(fs)
+                    },
+                ],
+                EffectSet::open_var(0)
+                    .union(&EffectSet::singleton("net"))
+                    .union(&EffectSet::singleton("concurrent")),
+                Ty::Unit,
+            ));
             fields.insert("serve_ws_fn_actor".into(), Ty::function(
                 vec![
                     Ty::int(),
@@ -2207,6 +2264,28 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 vec![ph(), Ty::str()],
                 EffectSet::singleton("proc"),
                 result_str(Ty::Unit)));
+            // exit :: Int -> [proc_exit] Unit
+            //
+            // Sets the status `lex run` terminates with, so a Lex
+            // program can be called by a shell script for its verdict
+            // (#754). Its own effect kind rather than `proc`: running a
+            // subprocess and ending your caller's process are different
+            // authorities, and a program allowed to shell out should not
+            // thereby be allowed to decide what its invoker sees.
+            //
+            // The declared return is `Unit` because the language has no
+            // bottom type; nothing after a successful `exit` runs. The
+            // call unwinds the VM rather than terminating the process
+            // where it stands, so `lex run` still finalises its trace
+            // and writes its attestations before exiting — a program
+            // that exits is still a run that happened.
+            //
+            // Only the *first* exit is honoured. A program that calls
+            // exit twice has already stopped at the first.
+            fields.insert("exit".into(), Ty::function(
+                vec![Ty::int()],
+                EffectSet::singleton("proc_exit"),
+                Ty::Unit));
             // run :: Str, List[Str] -> [proc] Result[ProcessOutput, Str]
             // Blocking convenience that captures stdout/stderr fully
             // and returns once the child exits. For programs that

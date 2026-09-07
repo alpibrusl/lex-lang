@@ -487,7 +487,7 @@ fn cmd_check() -> CommandInfo {
 fn cmd_run() -> CommandInfo {
     CommandInfo::new(
         "run",
-        "execute fn under capability policy (args parsed as JSON)",
+        "execute fn under capability policy (args parsed as JSON); the program's own exit status when it calls std.process.exit",
     )
     .idempotent(false)
     .add_argument("file", "string", "path to a .lex file", true)
@@ -529,6 +529,10 @@ fn cmd_run() -> CommandInfo {
         (
             "Run with fs read scope",
             "lex run --allow-fs-read /tmp app.lex load \"/tmp/x.json\"",
+        ),
+        (
+            "Let the program set the shell's exit status (std.process.exit)",
+            "lex run --allow-effects proc_exit check.lex verify",
         ),
     ])
     .with_see_also(vec!["check", "replay", "trace"])

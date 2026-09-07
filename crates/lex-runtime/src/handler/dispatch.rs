@@ -69,6 +69,36 @@ impl EffectHandler for DefaultHandler {
         // effect kinds (distinct from the module name `fs`); the
         // policy check uses the per-op kind, not the module's.
         if kind == "process" {
+            // `exit` carries its own effect kind (#754). Spawning a
+            // subprocess and ending your caller's process are different
+            // authorities: a program granted `proc` to shell out should
+            // not thereby decide what its invoker sees. Same split, and
+            // the same reasoning, as `fs` → `fs_walk` / `fs_write`.
+            if op == "exit" {
+                self.ensure_kind_allowed("proc_exit")?;
+                let code = match args.first() {
+                    Some(Value::Int(n)) => *n,
+                    other => {
+                        return Err(format!(
+                            "process.exit expects an Int status, got {other:?}"
+                        ))
+                    }
+                };
+                // Clamped, not wrapped. A shell sees status & 0xff, so
+                // `exit(256)` would arrive as 0 — a program signalling
+                // failure that reads as success is the one outcome this
+                // must never produce.
+                let code = code.clamp(0, 255) as i64;
+                // First writer wins: the program stopped at the first
+                // exit, so a later one cannot restate the verdict.
+                let _ = self.requested_exit.compare_exchange(
+                    crate::handler::NO_EXIT,
+                    code,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+                return Ok(Value::Unit);
+            }
             self.ensure_kind_allowed("proc")?;
             return self.dispatch_process(op, args);
         }
@@ -893,6 +923,57 @@ impl EffectHandler for DefaultHandler {
                 let registry = Arc::new(crate::ws::ChatRegistry::default());
                 crate::ws::serve_ws_fn_auth(
                     port, subprotocol, auth_closure, handler_closure,
+                    program, policy, registry,
+                )
+            }
+            ("net", "serve_ws_fn_actor_with") => {
+                // serve_ws_fn_actor_with(port, subprotocol, name_of,
+                //                        on_message, opts)  — #719
+                //
+                // Same server, with the bind interface named in the
+                // source. `opts` is the record `net.default_opts()`
+                // returns; only `host` is read here, because `http2`
+                // and `inline_vm` describe an HTTP server and mean
+                // nothing to a websocket listener. Sharing the record
+                // rather than minting a WS-specific one is what the
+                // issue asked for, and it keeps one `ServeOpts` in the
+                // language instead of two that differ by two fields.
+                let port = match args.first() {
+                    Some(Value::Int(n)) if (0..=65535).contains(n) => *n as u16,
+                    _ => return Err("net.serve_ws_fn_actor_with(port, subprotocol, name_of, on_message, opts): port must be Int 0..=65535".into()),
+                };
+                let subprotocol = expect_str(args.get(1))?.to_string();
+                // Decoded with the same reader `net.serve_*_with` uses,
+                // so the two families cannot drift on what an opts
+                // record means.
+                let opts = match args.get(4) {
+                    Some(v) => crate::handler::http_serve::decode_serve_opts(v)
+                        .map_err(|e| format!("net.serve_ws_fn_actor_with: {e} — use net.default_opts()"))?,
+                    None => return Err("net.serve_ws_fn_actor_with(port, subprotocol, name_of, on_message, opts): opts is required — use net.default_opts()".into()),
+                };
+                // An opts record whose host is blank is a caller who set
+                // the field and meant nothing by it; fall back rather
+                // than binding "".
+                let host = if opts.host.trim().is_empty() {
+                    crate::ws::ws_bind_host()
+                } else {
+                    opts.host.clone()
+                };
+                let mut it = args.into_iter().skip(2);
+                let name_of_closure = match it.next() {
+                    Some(c @ Value::Closure { .. }) => c,
+                    _ => return Err("net.serve_ws_fn_actor_with(port, subprotocol, name_of, on_message, opts): name_of must be a closure".into()),
+                };
+                let on_message_closure = match it.next() {
+                    Some(c @ Value::Closure { .. }) => c,
+                    _ => return Err("net.serve_ws_fn_actor_with(port, subprotocol, name_of, on_message, opts): on_message must be a closure".into()),
+                };
+                let program = self.program.clone()
+                    .ok_or_else(|| "net.serve_ws_fn_actor_with requires a Program reference; use DefaultHandler::with_program".to_string())?;
+                let policy = self.policy.clone();
+                let registry = Arc::new(crate::ws::ChatRegistry::default());
+                crate::ws::serve_ws_fn_actor_on(
+                    host, port, subprotocol, name_of_closure, on_message_closure,
                     program, policy, registry,
                 )
             }
@@ -1723,6 +1804,13 @@ impl EffectHandler for DefaultHandler {
     ///   route into the same chat dispatch layer.
     /// - `program`: cloned `Arc<Program>` so `net.serve` (if a
     ///   worker invokes it) sees the same compiled program.
+    fn take_exit(&mut self) -> Option<i32> {
+        match self.requested_exit.load(Ordering::SeqCst) {
+            crate::handler::NO_EXIT => None,
+            code => Some(code as i32),
+        }
+    }
+
     fn spawn_for_worker(&self) -> Option<Box<dyn lex_bytecode::vm::EffectHandler + Send>> {
         let mut fresh = DefaultHandler::new(self.policy.clone());
         // Share the budget pool atomically — slice 2's correctness
@@ -1739,6 +1827,9 @@ impl EffectHandler for DefaultHandler {
         fresh.streams = std::sync::Arc::clone(&self.streams);
         fresh.next_stream_id = std::sync::Arc::clone(&self.next_stream_id);
         fresh.program_args = self.program_args.clone();
+        // #754: an exit called inside parallel work has to reach the
+        // VM that returns, not die with the worker's handler.
+        fresh.requested_exit = std::sync::Arc::clone(&self.requested_exit);
         Some(Box::new(fresh))
     }
 }
