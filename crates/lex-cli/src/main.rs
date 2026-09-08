@@ -51,7 +51,7 @@ use ::acli::OutputFormat;
 use anyhow::{anyhow, bail, Context, Result};
 use lex_ast::{canonicalize_program, stage_canonical_hash_hex, stage_id, Stage};
 use lex_bytecode::{compile_program, vm::Vm, Value};
-use lex_runtime::{check_program as check_policy, DefaultHandler, Policy};
+use lex_runtime::{check_program as check_policy, DefaultHandler, Policy, StdinApprovalSink};
 use run::POLICY_FLAG_USAGE as POLICY_USAGE;
 use lex_store::Store;
 use lex_syntax::syntax::Program as SynProgram;

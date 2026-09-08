@@ -96,9 +96,20 @@ pub(super) fn cmd_run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     }
 
     let bc = std::sync::Arc::new(bc);
+    // `DefaultHandler::new` defaults to `NullApprovalSink`, which refuses
+    // every `approval.request` unconditionally — correct for an embedder
+    // with no operator to ask, but `lex run` is the interactive CLI: an
+    // agent built on it (e.g. a tool carrying `approval_scope`) needs a
+    // real human on the other end of that block. `StdinApprovalSink`
+    // prints the reason and blocks on a stdin line; piped/redirected
+    // stdin (a background or non-interactive invocation) hits EOF and
+    // reads as blank, which the sink already treats as a deny — the
+    // fail-closed behavior for exactly that case, not a special-cased
+    // bypass.
     let handler = DefaultHandler::new(f.policy.clone())
         .with_program(std::sync::Arc::clone(&bc))
-        .with_program_args(f.program_args.clone());
+        .with_program_args(f.program_args.clone())
+        .with_approval_sink(Box::new(StdinApprovalSink));
     let mut vm = Vm::with_handler(&bc, Box::new(handler));
     if let Some(n) = f.max_steps {
         // `--max-steps 0` = unbounded (no opcode cap). The step counter is a
