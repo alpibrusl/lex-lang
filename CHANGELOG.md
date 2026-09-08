@@ -7,6 +7,8 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.10.18] — 2026-09-08
+
 ### Fixed
 
 - **Every CLI option was advertised to agents with a doubled `--`
