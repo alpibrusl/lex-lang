@@ -7,6 +7,20 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Every CLI option was advertised to agents with a doubled `--`
+  prefix.** `lex skill` rendered `` `----allow-effects` `` and `lex
+  introspect --output json` published `"name": "--allow-effects"`.
+  ACLI option names are bare — the SDK's own tests use
+  `add_option("file", ...)` and the skill renderer is what makes them
+  flags — but all 93 of this CLI's options were declared `"--foo"`.
+  The snapshot test could not catch it: regenerating a snapshot makes
+  whatever it produced the expected output, so the wrong rendering was
+  simply frozen in. There is now a test on the *shape* instead, and
+  `acli` itself normalizes a stray prefix (alpibrusl/acli#45) so no
+  consumer can reintroduce this.
+
 ### Added
 
 - **`lex check` accepts the policy flags, so effect drift fails the

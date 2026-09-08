@@ -1,6 +1,6 @@
 {
   "name": "lex",
-  "version": "0.10.7",
+  "version": "0.10.17",
   "acli_version": "0.1.0",
   "commands": [
     {
@@ -34,7 +34,7 @@
     },
     {
       "name": "check",
-      "description": "type-check; exit 0 or print errors",
+      "description": "type-check; given policy flags, also verify the declared effects fit inside them (exit 2 = type errors, 3 = policy violations)",
       "arguments": [
         {
           "name": "file",
@@ -43,7 +43,38 @@
           "required": true
         }
       ],
-      "options": [],
+      "options": [
+        {
+          "name": "allow-effects",
+          "type": "string",
+          "description": "comma-separated effect kinds the program may declare"
+        },
+        {
+          "name": "allow-fs-read",
+          "type": "string",
+          "description": "filesystem path tree readable by fs_read"
+        },
+        {
+          "name": "allow-fs-write",
+          "type": "string",
+          "description": "filesystem path tree writable by fs_write"
+        },
+        {
+          "name": "allow-net-host",
+          "type": "string",
+          "description": "permit net effects to this host (accepted for symmetry with `run`; matched at call time, not statically)"
+        },
+        {
+          "name": "budget",
+          "type": "int",
+          "description": "cap aggregate declared budget"
+        },
+        {
+          "name": "strict",
+          "type": "bool",
+          "description": "also run lint passes and the bytecode stack verifier"
+        }
+      ],
       "subcommands": [],
       "idempotent": true,
       "examples": [
@@ -54,6 +85,10 @@
         {
           "description": "Check before running",
           "invocation": "lex check app.lex && lex run app.lex main"
+        },
+        {
+          "description": "Fail the build when the code outgrows its effect allowlist",
+          "invocation": "lex check --allow-effects io,net app.lex"
         }
       ],
       "see_also": [
@@ -63,7 +98,7 @@
     },
     {
       "name": "run",
-      "description": "execute fn under capability policy (args parsed as JSON)",
+      "description": "execute fn under capability policy (args parsed as JSON); the program's own exit status when it calls std.process.exit",
       "arguments": [
         {
           "name": "file",
@@ -86,32 +121,32 @@
       ],
       "options": [
         {
-          "name": "--allow-effects",
+          "name": "allow-effects",
           "type": "string",
           "description": "comma-separated effect kinds to permit"
         },
         {
-          "name": "--allow-fs-read",
+          "name": "allow-fs-read",
           "type": "string",
           "description": "filesystem path tree readable by fs_read"
         },
         {
-          "name": "--allow-fs-write",
+          "name": "allow-fs-write",
           "type": "string",
           "description": "filesystem path tree writable by fs_write"
         },
         {
-          "name": "--allow-net-host",
+          "name": "allow-net-host",
           "type": "string",
           "description": "permit net effects to this host"
         },
         {
-          "name": "--budget",
+          "name": "budget",
           "type": "int",
           "description": "cap aggregate declared budget"
         },
         {
-          "name": "--max-steps",
+          "name": "max-steps",
           "type": "int",
           "description": "cap VM opcode dispatches (DoS guard)"
         }
@@ -126,6 +161,10 @@
         {
           "description": "Run with fs read scope",
           "invocation": "lex run --allow-fs-read /tmp app.lex load \"/tmp/x.json\""
+        },
+        {
+          "description": "Let the program set the shell's exit status (std.process.exit)",
+          "invocation": "lex run --allow-effects proc_exit check.lex verify"
         }
       ],
       "see_also": [
@@ -176,12 +215,12 @@
       ],
       "options": [
         {
-          "name": "--store",
+          "name": "store",
           "type": "string",
           "description": "store root directory"
         },
         {
-          "name": "--with-evidence",
+          "name": "with-evidence",
           "type": "bool",
           "description": "attach attestations to each history entry"
         }
@@ -223,12 +262,12 @@
       ],
       "options": [
         {
-          "name": "--store",
+          "name": "store",
           "type": "string",
-          "description": "store root directory (default: ~/.lex/store)"
+          "description": "store root directory (default: [store] path or .lex/store under the nearest lex.toml; ~/.lex/store outside any project)"
         },
         {
-          "name": "--activate",
+          "name": "activate",
           "type": "bool",
           "description": "transition published stages to Active"
         }
@@ -262,7 +301,7 @@
           "arguments": [],
           "options": [
             {
-              "name": "--store",
+              "name": "store",
               "type": "string",
               "description": "store root directory"
             }
@@ -283,7 +322,7 @@
           ],
           "options": [
             {
-              "name": "--store",
+              "name": "store",
               "type": "string",
               "description": "store root directory"
             }
@@ -321,12 +360,12 @@
       ],
       "options": [
         {
-          "name": "--store",
+          "name": "store",
           "type": "string",
           "description": "store root directory"
         },
         {
-          "name": "--attestations",
+          "name": "attestations",
           "type": "bool",
           "description": "list attestations instead of stage info"
         }
@@ -365,22 +404,22 @@
           "arguments": [],
           "options": [
             {
-              "name": "--kind",
+              "name": "kind",
               "type": "string",
-              "description": "attestation kind: type_check | spec | examples | diff_body | effect_audit | sandbox_run | capsule_install"
+              "description": "attestation kind: type_check | spec | examples | diff_body | effect_audit | sandbox_run | capsule_install | plan_apply"
             },
             {
-              "name": "--result",
+              "name": "result",
               "type": "string",
               "description": "passed | failed | inconclusive"
             },
             {
-              "name": "--since",
+              "name": "since",
               "type": "string",
               "description": "epoch seconds or YYYY-MM-DD; only attestations on or after this time"
             },
             {
-              "name": "--store",
+              "name": "store",
               "type": "string",
               "description": "store root directory"
             }
@@ -394,12 +433,51 @@
           "arguments": [],
           "options": [
             {
-              "name": "--audit",
+              "name": "audit",
               "type": "string",
               "description": "lex-os audit log JSON (from `lex-os capsule install --audit-out`)"
             },
             {
-              "name": "--store",
+              "name": "store",
+              "type": "string",
+              "description": "store root directory"
+            }
+          ],
+          "subcommands": [],
+          "idempotent": true
+        },
+        {
+          "name": "import-apply",
+          "description": "promote a capability gate's plan decisions into durable attestations (signer-keyed; feeds producer-trust). A promotable event carries `artifact_sha256`, `manifest` and `signer` (or pass --signer); `subject` is optional",
+          "arguments": [],
+          "options": [
+            {
+              "name": "audit",
+              "type": "string",
+              "description": "gate audit log JSON (the array of {seq, prev_hash, event, hash} entries a lex-os chain writes)"
+            },
+            {
+              "name": "gate",
+              "type": "string",
+              "description": "which gate decided: terraform | kubernetes | ... recorded in the payload, not the kind"
+            },
+            {
+              "name": "accepted",
+              "type": "string",
+              "description": "event kind that means accepted; imported as result=passed"
+            },
+            {
+              "name": "refused",
+              "type": "string",
+              "description": "event kind that means refused; imported as result=failed so producer trust is not vacuously 1.0"
+            },
+            {
+              "name": "signer",
+              "type": "string",
+              "description": "identity to attribute decisions to when the events carry no `signer`"
+            },
+            {
+              "name": "store",
               "type": "string",
               "description": "store root directory"
             }
@@ -420,6 +498,10 @@
         {
           "description": "Promote capsule installs to attestations",
           "invocation": "lex attest import-install --audit install.audit.json"
+        },
+        {
+          "description": "Promote gate decisions, acceptances and refusals alike",
+          "invocation": "lex attest import-apply --audit iac.audit.json --gate terraform --accepted plan_accepted --refused plan_refused"
         },
         {
           "description": "Machine-readable",
@@ -488,7 +570,7 @@
       ],
       "options": [
         {
-          "name": "--override",
+          "name": "override",
           "type": "string",
           "description": "NODE=JSON override (repeatable)"
         }
@@ -549,12 +631,12 @@
       "arguments": [],
       "options": [
         {
-          "name": "--port",
+          "name": "port",
           "type": "int",
           "description": "TCP port (default: 7000)"
         },
         {
-          "name": "--store",
+          "name": "store",
           "type": "string",
           "description": "store root directory"
         }
@@ -619,17 +701,17 @@
           ],
           "options": [
             {
-              "name": "--source",
+              "name": "source",
               "type": "string",
               "description": "source file to verify against"
             },
             {
-              "name": "--trials",
+              "name": "trials",
               "type": "string",
               "description": "randomized trial count (default 1000)"
             },
             {
-              "name": "--store",
+              "name": "store",
               "type": "string",
               "description": "if set, persist a Spec attestation against the target stage"
             }
@@ -674,52 +756,52 @@
       "arguments": [],
       "options": [
         {
-          "name": "--allow-effects",
+          "name": "allow-effects",
           "type": "string",
           "description": "permitted effect kinds"
         },
         {
-          "name": "--request",
+          "name": "request",
           "type": "string",
           "description": "natural-language request"
         },
         {
-          "name": "--body",
+          "name": "body",
           "type": "string",
           "description": "inline tool body"
         },
         {
-          "name": "--body-file",
+          "name": "body-file",
           "type": "string",
           "description": "tool body in a file"
         },
         {
-          "name": "--spec",
+          "name": "spec",
           "type": "string",
           "description": "spec file for behavioral verification"
         },
         {
-          "name": "--examples",
+          "name": "examples",
           "type": "string",
           "description": "JSON examples for behavioral checking"
         },
         {
-          "name": "--diff-body",
+          "name": "diff-body",
           "type": "string",
           "description": "differential evaluation: alternate body"
         },
         {
-          "name": "--diff-body-file",
+          "name": "diff-body-file",
           "type": "string",
           "description": "differential evaluation: alternate body file"
         },
         {
-          "name": "--store",
+          "name": "store",
           "type": "string",
           "description": "if set, persist verification attestations against the tool stage"
         },
         {
-          "name": "--json",
+          "name": "json",
           "type": "bool",
           "description": "machine-readable output"
         }
@@ -760,7 +842,7 @@
           "arguments": [],
           "options": [
             {
-              "name": "--port",
+              "name": "port",
               "type": "int",
               "description": "TCP port"
             }
@@ -793,32 +875,32 @@
       ],
       "options": [
         {
-          "name": "--effect",
+          "name": "effect",
           "type": "string",
           "description": "effect kind filter"
         },
         {
-          "name": "--call",
+          "name": "call",
           "type": "string",
           "description": "called-function filter"
         },
         {
-          "name": "--host",
+          "name": "host",
           "type": "string",
           "description": "hostname filter (literal)"
         },
         {
-          "name": "--kind",
+          "name": "kind",
           "type": "string",
           "description": "AST node kind filter"
         },
         {
-          "name": "--json",
+          "name": "json",
           "type": "bool",
           "description": "machine-readable output"
         },
         {
-          "name": "--store",
+          "name": "store",
           "type": "string",
           "description": "with --effect, persist EffectAudit attestations against each scanned stage"
         }
@@ -865,7 +947,7 @@
       ],
       "options": [
         {
-          "name": "--json",
+          "name": "json",
           "type": "bool",
           "description": "structured JSON output"
         }
@@ -912,12 +994,12 @@
       ],
       "options": [
         {
-          "name": "--output",
+          "name": "output",
           "type": "string",
           "description": "write merged source to a file"
         },
         {
-          "name": "--json",
+          "name": "json",
           "type": "bool",
           "description": "emit conflicts as JSON"
         }
@@ -951,7 +1033,7 @@
           "arguments": [],
           "options": [
             {
-              "name": "--store",
+              "name": "store",
               "type": "string",
               "description": "store root"
             }
@@ -972,7 +1054,7 @@
           ],
           "options": [
             {
-              "name": "--store",
+              "name": "store",
               "type": "string",
               "description": "store root"
             }
@@ -993,17 +1075,17 @@
           ],
           "options": [
             {
-              "name": "--from",
+              "name": "from",
               "type": "string",
               "description": "parent branch (default: main)"
             },
             {
-              "name": "--predicate",
+              "name": "predicate",
               "type": "string",
               "description": "JSON expression matching lex_vcs::Predicate; creates a saved query rather than a snapshot"
             },
             {
-              "name": "--store",
+              "name": "store",
               "type": "string",
               "description": "store root"
             }
@@ -1024,7 +1106,7 @@
           ],
           "options": [
             {
-              "name": "--store",
+              "name": "store",
               "type": "string",
               "description": "store root"
             }
@@ -1045,7 +1127,7 @@
           ],
           "options": [
             {
-              "name": "--store",
+              "name": "store",
               "type": "string",
               "description": "store root"
             }
@@ -1059,7 +1141,7 @@
           "arguments": [],
           "options": [
             {
-              "name": "--store",
+              "name": "store",
               "type": "string",
               "description": "store root"
             }
@@ -1080,7 +1162,7 @@
           ],
           "options": [
             {
-              "name": "--store",
+              "name": "store",
               "type": "string",
               "description": "store root"
             }
@@ -1101,17 +1183,17 @@
           ],
           "options": [
             {
-              "name": "--since-fork",
+              "name": "since-fork",
               "type": "bool",
               "description": "limit to ops since the fork from --vs (or `parent`)"
             },
             {
-              "name": "--vs",
+              "name": "vs",
               "type": "string",
               "description": "compare against this branch (default: <name>'s parent)"
             },
             {
-              "name": "--store",
+              "name": "store",
               "type": "string",
               "description": "store root"
             }
@@ -1132,12 +1214,12 @@
           ],
           "options": [
             {
-              "name": "--on",
+              "name": "on",
               "type": "string",
               "description": "destination branch (default: current)"
             },
             {
-              "name": "--store",
+              "name": "store",
               "type": "string",
               "description": "store root"
             }
@@ -1190,17 +1272,17 @@
       ],
       "options": [
         {
-          "name": "--commit",
+          "name": "commit",
           "type": "bool",
           "description": "apply a clean merge to dst (refused if conflicts)"
         },
         {
-          "name": "--json",
+          "name": "json",
           "type": "bool",
           "description": "emit the merge report as JSON"
         },
         {
-          "name": "--store",
+          "name": "store",
           "type": "string",
           "description": "store root directory"
         }
@@ -1235,17 +1317,17 @@
           "arguments": [],
           "options": [
             {
-              "name": "--src",
+              "name": "src",
               "type": "string",
               "description": "source branch (theirs)"
             },
             {
-              "name": "--dst",
+              "name": "dst",
               "type": "string",
               "description": "destination branch (ours)"
             },
             {
-              "name": "--store",
+              "name": "store",
               "type": "string",
               "description": "store root directory"
             }
@@ -1266,7 +1348,7 @@
           ],
           "options": [
             {
-              "name": "--store",
+              "name": "store",
               "type": "string",
               "description": "store root directory"
             }
@@ -1287,12 +1369,12 @@
           ],
           "options": [
             {
-              "name": "--file",
+              "name": "file",
               "type": "string",
               "description": "JSON array of {conflict_id, resolution}"
             },
             {
-              "name": "--store",
+              "name": "store",
               "type": "string",
               "description": "store root directory"
             }
@@ -1313,7 +1395,7 @@
           ],
           "options": [
             {
-              "name": "--store",
+              "name": "store",
               "type": "string",
               "description": "store root directory"
             }
@@ -1359,7 +1441,7 @@
       ],
       "options": [
         {
-          "name": "--store",
+          "name": "store",
           "type": "string",
           "description": "store root"
         }
@@ -1450,7 +1532,7 @@
       "arguments": [],
       "options": [
         {
-          "name": "--version-only",
+          "name": "version-only",
           "type": "bool",
           "description": "print only the toolchain version"
         }
@@ -1561,7 +1643,7 @@
       ],
       "options": [
         {
-          "name": "--check",
+          "name": "check",
           "type": "bool",
           "description": "don't write; exit 1 if any file is unformatted"
         }
@@ -1589,7 +1671,7 @@
       "arguments": [],
       "options": [
         {
-          "name": "--no-fmt",
+          "name": "no-fmt",
           "type": "bool",
           "description": "skip the fmt --check stage"
         }
@@ -1606,6 +1688,41 @@
         "check",
         "fmt",
         "test"
+      ]
+    },
+    {
+      "name": "doc-sync",
+      "description": "regenerate (or --check) generated doc regions declared in docsync.toml; drift fails --check naming each stale target",
+      "arguments": [
+        {
+          "name": "manifest",
+          "type": "path",
+          "description": "manifest to use (default: docsync.toml in the current directory)",
+          "required": false
+        }
+      ],
+      "options": [
+        {
+          "name": "check",
+          "type": "bool",
+          "description": "verify instead of regenerate; non-zero exit on drift"
+        }
+      ],
+      "subcommands": [],
+      "idempotent": true,
+      "examples": [
+        {
+          "description": "Regenerate all targets",
+          "invocation": "lex doc-sync"
+        },
+        {
+          "description": "CI drift gate",
+          "invocation": "lex doc-sync --check"
+        }
+      ],
+      "see_also": [
+        "docs",
+        "ci"
       ]
     },
     {
@@ -1693,9 +1810,24 @@
       ],
       "options": [
         {
-          "name": "--for-agent",
+          "name": "for-agent",
           "type": "bool",
           "description": "emit one JSON object describing the whole workspace"
+        },
+        {
+          "name": "effects",
+          "type": "bool",
+          "description": "markdown effect-kind table from the runtime's KNOWN_EFFECTS single source"
+        },
+        {
+          "name": "stdlib-index",
+          "type": "bool",
+          "description": "markdown stdlib module/function index from the checker's builtin registry"
+        },
+        {
+          "name": "stdlib-spec",
+          "type": "bool",
+          "description": "markdown per-builtin signature and notes table for the declaratively defined stdlib modules"
         }
       ],
       "subcommands": [],
@@ -1775,12 +1907,12 @@
       ],
       "options": [
         {
-          "name": "--apply",
+          "name": "apply",
           "type": "bool",
           "description": "execute the transform (vs. preview)"
         },
         {
-          "name": "--transform",
+          "name": "transform",
           "type": "string",
           "description": "the typed transform as JSON"
         }
