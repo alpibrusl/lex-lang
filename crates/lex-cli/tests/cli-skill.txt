@@ -11,7 +11,7 @@ description: "Invoke the `lex` CLI. Commands: parse, check, run, hash…"
 ## Available commands
 
 - `lex parse` — print canonical AST as JSON (idempotent)
-- `lex check` — type-check; exit 0 or print errors (idempotent)
+- `lex check` — type-check; given policy flags, also verify the declared effects fit inside them (exit 2 = type errors, 3 = policy violations) (idempotent)
 - `lex run` — execute fn under capability policy (args parsed as JSON); the program's own exit status when it calls std.process.exit
 - `lex hash` — print canonical SigId/StageId hashes for each function (idempotent)
 - `lex blame` — show each fn's stage history from the store (idempotent)
@@ -76,7 +76,16 @@ cat hello.lex | lex parse -
 
 ## `lex check`
 
-type-check; exit 0 or print errors
+type-check; given policy flags, also verify the declared effects fit inside them (exit 2 = type errors, 3 = policy violations)
+
+### Options
+
+- `----allow-effects` (string) — comma-separated effect kinds the program may declare
+- `----allow-fs-read` (string) — filesystem path tree readable by fs_read
+- `----allow-fs-write` (string) — filesystem path tree writable by fs_write
+- `----allow-net-host` (string) — permit net effects to this host (accepted for symmetry with `run`; matched at call time, not statically)
+- `----budget` (int) — cap aggregate declared budget
+- `----strict` (bool) — also run lint passes and the bytecode stack verifier
 
 ### Arguments
 
@@ -92,6 +101,11 @@ lex check hello.lex
 ```bash
 # Check before running
 lex check app.lex && lex run app.lex main
+```
+
+```bash
+# Fail the build when the code outgrows its effect allowlist
+lex check --allow-effects io,net app.lex
 ```
 
 **See also:** `lex parse`, `lex run`

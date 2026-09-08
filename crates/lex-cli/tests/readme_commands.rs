@@ -299,3 +299,4 @@ fn cli_skill_is_in_sync() {
          Regenerate: UPDATE_CLI_SKILL=1 cargo test -p lex-cli --test readme_commands cli_skill_is_in_sync"
     );
 }
+

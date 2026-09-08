@@ -310,6 +310,69 @@ pub(super) struct RunFlags {
     pub(super) jit: bool,
 }
 
+/// Parse one policy flag out of `args` at `i`, into `policy`.
+///
+/// `Ok(Some(next))` means `args[i]` was a policy flag and its value was
+/// consumed; `Ok(None)` means it was not one, and the caller should go
+/// on to handle it.
+///
+/// Shared by `lex run` and `lex check` deliberately. The point of
+/// `lex check --allow-effects ...` as a build gate is that it decides
+/// under the same policy `lex run` will enforce; two parsers would
+/// eventually disagree about what a flag means, and a gate that
+/// disagrees with the runtime is worse than no gate — it passes the
+/// build and the program still dies at load time.
+pub(super) fn parse_policy_flag(
+    policy: &mut Policy,
+    args: &[String],
+    i: usize,
+) -> Result<Option<usize>> {
+    let flag = args[i].as_str();
+    // Every policy flag takes exactly one value, hence the uniform i + 2.
+    let val = || -> Result<&String> {
+        args.get(i + 1)
+            .ok_or_else(|| anyhow!("{flag} needs a value"))
+    };
+    match flag {
+        "--allow-effects" => {
+            policy.allow_effects = val()?
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect::<BTreeSet<_>>();
+        }
+        "--allow-fs-read" => policy.allow_fs_read.push(PathBuf::from(val()?)),
+        "--allow-fs-write" => policy.allow_fs_write.push(PathBuf::from(val()?)),
+        "--allow-net-host" => policy.allow_net_host.push(val()?.clone()),
+        "--allow-proc" => {
+            // Comma-separated binary basenames the [proc] effect
+            // is allowed to spawn. Read SECURITY.md before granting.
+            for name in val()?.split(',').filter(|s| !s.is_empty()) {
+                policy.allow_proc.push(name.to_string());
+            }
+        }
+        "--allow-approval" => {
+            // Comma-separated scopes the [approval] effect may
+            // request (e.g. "payment,deploy"). Granting approval in
+            // --allow-effects with no --allow-approval = any scope.
+            for scope in val()?.split(',').filter(|s| !s.is_empty()) {
+                policy.allow_approval.push(scope.to_string());
+            }
+        }
+        "--budget" => {
+            policy.budget = Some(val()?.parse().context("--budget must be an integer")?);
+        }
+        _ => return Ok(None),
+    }
+    Ok(Some(i + 2))
+}
+
+/// The policy flags, for usage strings. Kept next to the parser so a
+/// new flag shows up in both places or neither.
+pub(super) const POLICY_FLAG_USAGE: &str =
+    "[--allow-effects a,b] [--allow-fs-read DIR] [--allow-fs-write DIR] \
+[--allow-net-host HOST] [--allow-proc BIN] [--allow-approval SCOPE] [--budget N]";
+
 pub(super) fn parse_run_flags(args: &[String]) -> Result<RunFlags> {
     let mut f = RunFlags {
         policy: Policy::pure(),
@@ -318,69 +381,11 @@ pub(super) fn parse_run_flags(args: &[String]) -> Result<RunFlags> {
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
+        if let Some(next) = parse_policy_flag(&mut f.policy, args, i)? {
+            i = next;
+            continue;
+        }
         match a.as_str() {
-            "--allow-effects" => {
-                let val = args
-                    .get(i + 1)
-                    .ok_or_else(|| anyhow!("--allow-effects needs a value"))?;
-                f.policy.allow_effects = val
-                    .split(',')
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-                    .collect::<BTreeSet<_>>();
-                i += 2;
-            }
-            "--allow-fs-read" => {
-                let val = args
-                    .get(i + 1)
-                    .ok_or_else(|| anyhow!("--allow-fs-read needs a value"))?;
-                f.policy.allow_fs_read.push(PathBuf::from(val));
-                i += 2;
-            }
-            "--allow-fs-write" => {
-                let val = args
-                    .get(i + 1)
-                    .ok_or_else(|| anyhow!("--allow-fs-write needs a value"))?;
-                f.policy.allow_fs_write.push(PathBuf::from(val));
-                i += 2;
-            }
-            "--allow-net-host" => {
-                let val = args
-                    .get(i + 1)
-                    .ok_or_else(|| anyhow!("--allow-net-host needs a value"))?;
-                f.policy.allow_net_host.push(val.clone());
-                i += 2;
-            }
-            "--allow-proc" => {
-                // Comma-separated binary basenames the [proc] effect
-                // is allowed to spawn. Read SECURITY.md before granting.
-                let val = args
-                    .get(i + 1)
-                    .ok_or_else(|| anyhow!("--allow-proc needs a value"))?;
-                for name in val.split(',').filter(|s| !s.is_empty()) {
-                    f.policy.allow_proc.push(name.to_string());
-                }
-                i += 2;
-            }
-            "--allow-approval" => {
-                // Comma-separated scopes the [approval] effect may
-                // request (e.g. "payment,deploy"). Empty --allow-effects
-                // approval + no --allow-approval = any scope (wildcard).
-                let val = args
-                    .get(i + 1)
-                    .ok_or_else(|| anyhow!("--allow-approval needs a value"))?;
-                for scope in val.split(',').filter(|s| !s.is_empty()) {
-                    f.policy.allow_approval.push(scope.to_string());
-                }
-                i += 2;
-            }
-            "--budget" => {
-                let val = args
-                    .get(i + 1)
-                    .ok_or_else(|| anyhow!("--budget needs a value"))?;
-                f.policy.budget = Some(val.parse().context("--budget must be an integer")?);
-                i += 2;
-            }
             "--max-steps" => {
                 let val = args
                     .get(i + 1)

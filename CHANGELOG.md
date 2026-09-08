@@ -7,6 +7,41 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added
+
+- **`lex check` accepts the policy flags, so effect drift fails the
+  build instead of the first request (#799).** `lex check
+  --allow-effects io,net src/main.lex` now runs the same
+  `check_program` the runtime runs at load time, and exits 3 if the
+  program declares an effect the policy does not grant.
+
+  The effect system always knew this statically; nothing asked it at
+  build time. Every caller of the policy checker was a *runtime* entry
+  point (`run`, `replay`, `repl`, `test`, `agent-tool`), so a service
+  whose Dockerfile carried `--allow-effects io,net,sql` and whose code
+  grew one more effect built green, shipped, and died at load time on
+  the first request. Found deploying `lex-gateway` and `lex-docs` into
+  a Kubernetes cluster, where the allowlist had drifted from the code
+  and nothing could have said so before the pod started. A Dockerfile
+  can now hold the allowlist once — `RUN lex check --allow-effects
+  "$LEX_EFFECTS" src/main.lex` next to the `CMD lex run` that uses it.
+
+  The check is opt-in on the flag's *presence*, not on the policy's
+  contents: `Policy::pure()` is the empty allowlist, so keying off the
+  value would make a deliberate `--allow-effects ""` ("this must stay
+  pure") indistinguishable from passing no flags at all. `run` and
+  `check` share one flag parser for the same reason — a gate that
+  disagrees with the runtime about what a flag means passes the build
+  and lets the program die anyway.
+
+  Only the declaration-time half of a policy is decidable: effect
+  kinds, literal fs paths, and the budget total. `--allow-net-host`,
+  `--allow-proc` and `--allow-approval` are matched at call time
+  against runtime values, so they are accepted — a Dockerfile should
+  be able to hand `check` the same flag string it hands `run` — but
+  not verified. Checking them from declarations would make `check`
+  stricter than `run` and fail builds that would have worked.
+
 ## [0.10.17] — 2026-09-07
 
 ### Fixed

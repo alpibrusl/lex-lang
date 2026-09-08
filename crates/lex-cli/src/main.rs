@@ -52,6 +52,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use lex_ast::{canonicalize_program, stage_canonical_hash_hex, stage_id, Stage};
 use lex_bytecode::{compile_program, vm::Vm, Value};
 use lex_runtime::{check_program as check_policy, DefaultHandler, Policy};
+use run::POLICY_FLAG_USAGE as POLICY_USAGE;
 use lex_store::Store;
 use lex_syntax::syntax::Program as SynProgram;
 use lex_syntax::{load_program, load_program_from_str};
@@ -442,8 +443,29 @@ fn cmd_check(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let mut from_canonical = false;
     let mut strict = false;
     let mut path: Option<&str> = None;
-    for a in args {
-        match a.as_str() {
+    // The effect policy to check the program against, and whether the
+    // caller asked for that check at all.
+    //
+    // Opt-in, and the flag's *presence* is what opts in — not a
+    // non-default policy. `Policy::pure()` is the empty allowlist, so a
+    // deliberate `--allow-effects ""` ("this program must stay pure")
+    // is indistinguishable from "no flags given" by value alone, and
+    // treating the two the same would either break every existing
+    // `lex check` in the wild or silently skip the strictest check
+    // anyone can ask for.
+    let mut policy = Policy::pure();
+    let mut policy_given = false;
+    let usage = || {
+        format!("usage: lex check [--from-canonical] [--strict] {POLICY_USAGE} <file>")
+    };
+    let mut i = 0;
+    while i < args.len() {
+        if let Some(next) = run::parse_policy_flag(&mut policy, args, i)? {
+            policy_given = true;
+            i = next;
+            continue;
+        }
+        match args[i].as_str() {
             "--from-canonical" => {
                 from_canonical = true;
             }
@@ -452,15 +474,15 @@ fn cmd_check(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             }
             other if !other.starts_with("--") => {
                 if path.is_some() {
-                    bail!("usage: lex check [--from-canonical] [--strict] <file>");
+                    bail!("{}", usage());
                 }
                 path = Some(other);
             }
-            other => bail!("unknown flag `{other}` for `lex check`"),
+            other => bail!("unknown flag `{other}` for `lex check`\n{}", usage()),
         }
+        i += 1;
     }
-    let path =
-        path.ok_or_else(|| anyhow!("usage: lex check [--from-canonical] [--strict] <file>"))?;
+    let path = path.ok_or_else(|| anyhow!("{}", usage()))?;
     let stages = load_stages(path, from_canonical)?;
 
     // #306 slice 1: when checking a `.lex` source file (not a
@@ -530,6 +552,61 @@ fn cmd_check(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                 std::process::exit(2);
             }
 
+            // The effect-policy wall. Does the program's declared
+            // effect footprint fit inside the policy it will be run
+            // under? This calls the very function the runtime calls at
+            // load time, which is the whole point: a Dockerfile that
+            // runs `lex check --allow-effects "$EFFECTS" src/main.lex`
+            // turns "the allowlist drifted away from the code" from a
+            // crash on the first request into a failed build.
+            //
+            // Only the declaration-time half of a policy is decidable
+            // here — effect kinds, scoped fs paths, and the budget
+            // total. The scope lists for net hosts, proc binaries and
+            // approval scopes are matched at *call* time against
+            // runtime values, so they are accepted (a Dockerfile should
+            // be able to hand `check` the same flag string it hands
+            // `run`, unedited) but not verified. Checking them here
+            // from declared arguments would make `check` stricter than
+            // `run` and fail builds that would have worked, which is
+            // the one way a gate like this loses its users.
+            let bytecode = (policy_given || strict).then(|| compile_program(&stages));
+            if policy_given {
+                if let Err(violations) = check_policy(bytecode.as_ref().unwrap(), &policy) {
+                    let arr: Vec<serde_json::Value> = violations
+                        .iter()
+                        .map(|v| serde_json::to_value(v).unwrap())
+                        .collect();
+                    let data = serde_json::json!({
+                        "ok": false,
+                        "phase": "policy",
+                        "violations": arr,
+                    });
+                    acli::emit_or_text("check", data, fmt, || {
+                        for v in &violations {
+                            // `PolicyViolation`'s Display drops `at`, and
+                            // `at` is the function name — the one thing a
+                            // reader needs to go fix it. Without it a
+                            // program with four offending functions prints
+                            // the same line four times.
+                            match &v.at {
+                                Some(at) => eprintln!("{v} (at `{at}`)"),
+                                None => eprintln!("{v}"),
+                            }
+                        }
+                        eprintln!(
+                            "the program declares effects the policy does not grant; \
+widen the policy or narrow the program"
+                        );
+                    });
+                    // Exit 3, the same code `lex run` uses for the same
+                    // failure, so a caller can tell "the policy is too
+                    // narrow" (3) from "the code does not type-check"
+                    // (2) without parsing output.
+                    std::process::exit(3);
+                }
+            }
+
             // --strict: run AST lint passes + bytecode stack verifier (#347 A2).
             // Warnings are non-fatal but exit 1 so CI can enforce them.
             let mut lint_warnings = if strict && !from_canonical && path != "-" {
@@ -546,8 +623,7 @@ fn cmd_check(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             // Compiles the type-checked program and verifies that every branch
             // merge point has a consistent stack depth — catching PConstructor
             // stack leaks that the type checker cannot see.
-            if strict {
-                let bytecode = compile_program(&stages);
+            if let Some(bytecode) = bytecode.as_ref().filter(|_| strict) {
                 for err in lex_bytecode::verify_program(&bytecode.functions) {
                     lint_warnings.push(lint::LintWarning {
                         code: "STACK_DEPTH",
@@ -570,6 +646,7 @@ fn cmd_check(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                 "required_fs_read": summary.fs_read,
                 "required_fs_write": summary.fs_write,
                 "required_net_host": summary.net_host,
+                "policy_checked": policy_given,
                 "warnings": lint_warnings,
             });
             acli::emit_or_text("check", data, fmt, || {

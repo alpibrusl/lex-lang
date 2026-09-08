@@ -471,17 +471,58 @@ fn cmd_parse() -> CommandInfo {
 }
 
 fn cmd_check() -> CommandInfo {
-    CommandInfo::new("check", "type-check; exit 0 or print errors")
-        .idempotent(true)
-        .add_argument("file", "string", "path to a .lex file", true)
-        .with_examples(vec![
-            ("Type-check a file", "lex check hello.lex"),
-            (
-                "Check before running",
-                "lex check app.lex && lex run app.lex main",
-            ),
-        ])
-        .with_see_also(vec!["parse", "run"])
+    CommandInfo::new(
+        "check",
+        "type-check; given policy flags, also verify the declared effects fit inside them (exit 2 = type errors, 3 = policy violations)",
+    )
+    .idempotent(true)
+    .add_argument("file", "string", "path to a .lex file", true)
+    // The policy options `lex run` takes, accepted here so a build can
+    // decide, statically, whether the run would be permitted. Same
+    // spelling and same checker as `run`, deliberately.
+    .add_option(
+        "--allow-effects",
+        "string",
+        "comma-separated effect kinds the program may declare",
+        None,
+    )
+    .add_option(
+        "--allow-fs-read",
+        "string",
+        "filesystem path tree readable by fs_read",
+        None,
+    )
+    .add_option(
+        "--allow-fs-write",
+        "string",
+        "filesystem path tree writable by fs_write",
+        None,
+    )
+    .add_option(
+        "--allow-net-host",
+        "string",
+        "permit net effects to this host (accepted for symmetry with `run`; matched at call time, not statically)",
+        None,
+    )
+    .add_option("--budget", "int", "cap aggregate declared budget", None)
+    .add_option(
+        "--strict",
+        "bool",
+        "also run lint passes and the bytecode stack verifier",
+        None,
+    )
+    .with_examples(vec![
+        ("Type-check a file", "lex check hello.lex"),
+        (
+            "Check before running",
+            "lex check app.lex && lex run app.lex main",
+        ),
+        (
+            "Fail the build when the code outgrows its effect allowlist",
+            "lex check --allow-effects io,net app.lex",
+        ),
+    ])
+    .with_see_also(vec!["parse", "run"])
 }
 
 fn cmd_run() -> CommandInfo {
