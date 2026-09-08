@@ -1,6 +1,6 @@
 # lex
 
-Version: 0.10.7
+Version: 0.10.17
 ACLI version: 0.1.0
 
 ## Commands
@@ -13,13 +13,13 @@ Idempotent: true
 
 ### check
 
-type-check; exit 0 or print errors
+type-check; given policy flags, also verify the declared effects fit inside them (exit 2 = type errors, 3 = policy violations)
 
 Idempotent: true
 
 ### run
 
-execute fn under capability policy (args parsed as JSON)
+execute fn under capability policy (args parsed as JSON); the program's own exit status when it calls std.process.exit
 
 Idempotent: false
 
@@ -178,6 +178,12 @@ Idempotent: false
 run the full pipeline: pkg install, check --strict, fmt --check, test
 
 Idempotent: false
+
+### doc-sync
+
+regenerate (or --check) generated doc regions declared in docsync.toml; drift fails --check naming each stale target
+
+Idempotent: true
 
 ### test
 

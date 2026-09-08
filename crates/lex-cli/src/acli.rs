@@ -196,7 +196,7 @@ fn cmd_fmt() -> CommandInfo {
         .idempotent(false)
         .add_argument("path", "string[]", "files or directories to format", true)
         .add_option(
-            "--check",
+            "check",
             "bool",
             "don't write; exit 1 if any file is unformatted",
             None,
@@ -215,7 +215,7 @@ fn cmd_doc_sync() -> CommandInfo {
     )
     .idempotent(true)
     .add_option(
-        "--check",
+        "check",
         "bool",
         "verify instead of regenerate; non-zero exit on drift",
         None,
@@ -239,7 +239,7 @@ fn cmd_ci() -> CommandInfo {
         "run the full pipeline: pkg install, check --strict, fmt --check, test",
     )
     .idempotent(false)
-    .add_option("--no-fmt", "bool", "skip the fmt --check stage", None)
+    .add_option("no-fmt", "bool", "skip the fmt --check stage", None)
     .with_examples(vec![("Run the gate", "lex ci")])
     .with_see_also(vec!["check", "fmt", "test"])
 }
@@ -286,25 +286,25 @@ fn cmd_docs() -> CommandInfo {
             false,
         )
         .add_option(
-            "--for-agent",
+            "for-agent",
             "bool",
             "emit one JSON object describing the whole workspace",
             None,
         )
         .add_option(
-            "--effects",
+            "effects",
             "bool",
             "markdown effect-kind table from the runtime's KNOWN_EFFECTS single source",
             None,
         )
         .add_option(
-            "--stdlib-index",
+            "stdlib-index",
             "bool",
             "markdown stdlib module/function index from the checker's builtin registry",
             None,
         )
         .add_option(
-            "--stdlib-spec",
+            "stdlib-spec",
             "bool",
             "markdown per-builtin signature and notes table for the declaratively defined stdlib modules",
             None,
@@ -353,12 +353,12 @@ fn cmd_repair() -> CommandInfo {
     .idempotent(false)
     .add_argument("op_id", "string", "the failed operation to repair", true)
     .add_option(
-        "--apply",
+        "apply",
         "bool",
         "execute the transform (vs. preview)",
         None,
     )
-    .add_option("--transform", "string", "the typed transform as JSON", None)
+    .add_option("transform", "string", "the typed transform as JSON", None)
     .with_examples(vec![(
         "Apply a transform",
         "lex repair <op_id> --apply --transform '<json>'",
@@ -403,7 +403,7 @@ fn cmd_agent_guidelines() -> CommandInfo {
     )
     .idempotent(true)
     .add_option(
-        "--version-only",
+        "version-only",
         "bool",
         "print only the toolchain version",
         None,
@@ -471,17 +471,58 @@ fn cmd_parse() -> CommandInfo {
 }
 
 fn cmd_check() -> CommandInfo {
-    CommandInfo::new("check", "type-check; exit 0 or print errors")
-        .idempotent(true)
-        .add_argument("file", "string", "path to a .lex file", true)
-        .with_examples(vec![
-            ("Type-check a file", "lex check hello.lex"),
-            (
-                "Check before running",
-                "lex check app.lex && lex run app.lex main",
-            ),
-        ])
-        .with_see_also(vec!["parse", "run"])
+    CommandInfo::new(
+        "check",
+        "type-check; given policy flags, also verify the declared effects fit inside them (exit 2 = type errors, 3 = policy violations)",
+    )
+    .idempotent(true)
+    .add_argument("file", "string", "path to a .lex file", true)
+    // The policy options `lex run` takes, accepted here so a build can
+    // decide, statically, whether the run would be permitted. Same
+    // spelling and same checker as `run`, deliberately.
+    .add_option(
+        "allow-effects",
+        "string",
+        "comma-separated effect kinds the program may declare",
+        None,
+    )
+    .add_option(
+        "allow-fs-read",
+        "string",
+        "filesystem path tree readable by fs_read",
+        None,
+    )
+    .add_option(
+        "allow-fs-write",
+        "string",
+        "filesystem path tree writable by fs_write",
+        None,
+    )
+    .add_option(
+        "allow-net-host",
+        "string",
+        "permit net effects to this host (accepted for symmetry with `run`; matched at call time, not statically)",
+        None,
+    )
+    .add_option("budget", "int", "cap aggregate declared budget", None)
+    .add_option(
+        "strict",
+        "bool",
+        "also run lint passes and the bytecode stack verifier",
+        None,
+    )
+    .with_examples(vec![
+        ("Type-check a file", "lex check hello.lex"),
+        (
+            "Check before running",
+            "lex check app.lex && lex run app.lex main",
+        ),
+        (
+            "Fail the build when the code outgrows its effect allowlist",
+            "lex check --allow-effects io,net app.lex",
+        ),
+    ])
+    .with_see_also(vec!["parse", "run"])
 }
 
 fn cmd_run() -> CommandInfo {
@@ -494,32 +535,32 @@ fn cmd_run() -> CommandInfo {
     .add_argument("fn", "string", "function name to invoke", true)
     .add_argument("args", "string[]", "JSON-encoded positional args", false)
     .add_option(
-        "--allow-effects",
+        "allow-effects",
         "string",
         "comma-separated effect kinds to permit",
         None,
     )
     .add_option(
-        "--allow-fs-read",
+        "allow-fs-read",
         "string",
         "filesystem path tree readable by fs_read",
         None,
     )
     .add_option(
-        "--allow-fs-write",
+        "allow-fs-write",
         "string",
         "filesystem path tree writable by fs_write",
         None,
     )
     .add_option(
-        "--allow-net-host",
+        "allow-net-host",
         "string",
         "permit net effects to this host",
         None,
     )
-    .add_option("--budget", "int", "cap aggregate declared budget", None)
+    .add_option("budget", "int", "cap aggregate declared budget", None)
     .add_option(
-        "--max-steps",
+        "max-steps",
         "int",
         "cap VM opcode dispatches (DoS guard)",
         None,
@@ -559,9 +600,9 @@ fn cmd_blame() -> CommandInfo {
     CommandInfo::new("blame", "show each fn's stage history from the store")
         .idempotent(true)
         .add_argument("file", "string", "path to a .lex file", true)
-        .add_option("--store", "string", "store root directory", None)
+        .add_option("store", "string", "store root directory", None)
         .add_option(
-            "--with-evidence",
+            "with-evidence",
             "bool",
             "attach attestations to each history entry",
             None,
@@ -582,13 +623,13 @@ fn cmd_publish() -> CommandInfo {
     .idempotent(false)
     .add_argument("file", "string", "path to a .lex file", true)
     .add_option(
-        "--store",
+        "store",
         "string",
         "store root directory (default: [store] path or .lex/store under the nearest lex.toml; ~/.lex/store outside any project)",
         None,
     )
     .add_option(
-        "--activate",
+        "activate",
         "bool",
         "transition published stages to Active",
         None,
@@ -603,11 +644,11 @@ fn cmd_publish() -> CommandInfo {
 fn cmd_store() -> CommandInfo {
     let list = CommandInfo::new("list", "list SigIds in the store")
         .idempotent(true)
-        .add_option("--store", "string", "store root directory", None);
+        .add_option("store", "string", "store root directory", None);
     let get = CommandInfo::new("get", "print metadata + canonical AST for a StageId")
         .idempotent(true)
         .add_argument("stage", "string", "StageId hex", true)
-        .add_option("--store", "string", "store root directory", None);
+        .add_option("store", "string", "store root directory", None);
     let mut info = CommandInfo::new("store", "browse the content-addressed code store")
         .with_examples(vec![
             ("List sigs", "lex store list"),
@@ -625,9 +666,9 @@ fn cmd_stage() -> CommandInfo {
     )
     .idempotent(true)
     .add_argument("stage_id", "string", "StageId hex", true)
-    .add_option("--store", "string", "store root directory", None)
+    .add_option("store", "string", "store root directory", None)
     .add_option(
-        "--attestations",
+        "attestations",
         "bool",
         "list attestations instead of stage info",
         None,
@@ -650,67 +691,67 @@ fn cmd_attest() -> CommandInfo {
     )
     .idempotent(true)
     .add_option(
-        "--kind",
+        "kind",
         "string",
         "attestation kind: type_check | spec | examples | diff_body | effect_audit | sandbox_run | capsule_install | plan_apply",
         None,
     )
-    .add_option("--result", "string", "passed | failed | inconclusive", None)
+    .add_option("result", "string", "passed | failed | inconclusive", None)
     .add_option(
-        "--since",
+        "since",
         "string",
         "epoch seconds or YYYY-MM-DD; only attestations on or after this time",
         None,
     )
-    .add_option("--store", "string", "store root directory", None);
+    .add_option("store", "string", "store root directory", None);
     let import_install = CommandInfo::new(
         "import-install",
         "promote lex-os capsule-install records into durable attestations (signer-keyed; feeds producer-trust)",
     )
     .idempotent(true)
     .add_option(
-        "--audit",
+        "audit",
         "string",
         "lex-os audit log JSON (from `lex-os capsule install --audit-out`)",
         None,
     )
-    .add_option("--store", "string", "store root directory", None);
+    .add_option("store", "string", "store root directory", None);
     let import_apply = CommandInfo::new(
         "import-apply",
         "promote a capability gate's plan decisions into durable attestations (signer-keyed; feeds producer-trust). A promotable event carries `artifact_sha256`, `manifest` and `signer` (or pass --signer); `subject` is optional",
     )
     .idempotent(true)
     .add_option(
-        "--audit",
+        "audit",
         "string",
         "gate audit log JSON (the array of {seq, prev_hash, event, hash} entries a lex-os chain writes)",
         None,
     )
     .add_option(
-        "--gate",
+        "gate",
         "string",
         "which gate decided: terraform | kubernetes | ... recorded in the payload, not the kind",
         None,
     )
     .add_option(
-        "--accepted",
+        "accepted",
         "string",
         "event kind that means accepted; imported as result=passed",
         None,
     )
     .add_option(
-        "--refused",
+        "refused",
         "string",
         "event kind that means refused; imported as result=failed so producer trust is not vacuously 1.0",
         None,
     )
     .add_option(
-        "--signer",
+        "signer",
         "string",
         "identity to attribute decisions to when the events carry no `signer`",
         None,
     )
-    .add_option("--store", "string", "store root directory", None);
+    .add_option("store", "string", "store root directory", None);
     let mut info = CommandInfo::new(
         "attest",
         "cross-stage attestation queries (CI / dashboards)",
@@ -759,7 +800,7 @@ fn cmd_replay() -> CommandInfo {
         .add_argument("fn", "string", "function name", true)
         .add_argument("args", "string[]", "JSON-encoded positional args", false)
         .add_option(
-            "--override",
+            "override",
             "string",
             "NODE=JSON override (repeatable)",
             None,
@@ -786,8 +827,8 @@ fn cmd_diff() -> CommandInfo {
 fn cmd_serve() -> CommandInfo {
     CommandInfo::new("serve", "start the agent API HTTP server")
         .idempotent(false)
-        .add_option("--port", "int", "TCP port (default: 7000)", None)
-        .add_option("--store", "string", "store root directory", None)
+        .add_option("port", "int", "TCP port (default: 7000)", None)
+        .add_option("store", "string", "store root directory", None)
         .with_examples(vec![
             ("Start with defaults", "lex serve"),
             ("Pin port + store", "lex serve --port 8080 --store /var/lex"),
@@ -818,15 +859,15 @@ fn cmd_spec() -> CommandInfo {
     let check = CommandInfo::new("check", "check a Spec against a Lex source")
         .idempotent(true)
         .add_argument("spec", "string", "spec file", true)
-        .add_option("--source", "string", "source file to verify against", None)
+        .add_option("source", "string", "source file to verify against", None)
         .add_option(
-            "--trials",
+            "trials",
             "string",
             "randomized trial count (default 1000)",
             None,
         )
         .add_option(
-            "--store",
+            "store",
             "string",
             "if set, persist a Spec attestation against the target stage",
             None,
@@ -850,41 +891,41 @@ fn cmd_agent_tool() -> CommandInfo {
         "have an LLM emit a Lex tool body, run it under declared effects",
     )
     .idempotent(false)
-    .add_option("--allow-effects", "string", "permitted effect kinds", None)
-    .add_option("--request", "string", "natural-language request", None)
-    .add_option("--body", "string", "inline tool body", None)
-    .add_option("--body-file", "string", "tool body in a file", None)
+    .add_option("allow-effects", "string", "permitted effect kinds", None)
+    .add_option("request", "string", "natural-language request", None)
+    .add_option("body", "string", "inline tool body", None)
+    .add_option("body-file", "string", "tool body in a file", None)
     .add_option(
-        "--spec",
+        "spec",
         "string",
         "spec file for behavioral verification",
         None,
     )
     .add_option(
-        "--examples",
+        "examples",
         "string",
         "JSON examples for behavioral checking",
         None,
     )
     .add_option(
-        "--diff-body",
+        "diff-body",
         "string",
         "differential evaluation: alternate body",
         None,
     )
     .add_option(
-        "--diff-body-file",
+        "diff-body-file",
         "string",
         "differential evaluation: alternate body file",
         None,
     )
     .add_option(
-        "--store",
+        "store",
         "string",
         "if set, persist verification attestations against the tool stage",
         None,
     )
-    .add_option("--json", "bool", "machine-readable output", None)
+    .add_option("json", "bool", "machine-readable output", None)
     .with_examples(vec![
         (
             "Run with allow-list",
@@ -908,7 +949,7 @@ fn cmd_tool_registry() -> CommandInfo {
         "HTTP service to register Lex tools and invoke them",
     )
     .idempotent(false)
-    .add_option("--port", "int", "TCP port", None);
+    .add_option("port", "int", "TCP port", None);
     let mut info = CommandInfo::new("tool-registry", "runtime tool registration over HTTP")
         .with_examples(vec![("Run on default port", "lex tool-registry serve")])
         .with_see_also(vec!["serve", "agent-tool"]);
@@ -923,13 +964,13 @@ fn cmd_audit() -> CommandInfo {
     )
     .idempotent(true)
     .add_argument("paths", "string[]", "files / directories to scan", false)
-    .add_option("--effect", "string", "effect kind filter", None)
-    .add_option("--call", "string", "called-function filter", None)
-    .add_option("--host", "string", "hostname filter (literal)", None)
-    .add_option("--kind", "string", "AST node kind filter", None)
-    .add_option("--json", "bool", "machine-readable output", None)
+    .add_option("effect", "string", "effect kind filter", None)
+    .add_option("call", "string", "called-function filter", None)
+    .add_option("host", "string", "hostname filter (literal)", None)
+    .add_option("kind", "string", "AST node kind filter", None)
+    .add_option("json", "bool", "machine-readable output", None)
     .add_option(
-        "--store",
+        "store",
         "string",
         "with --effect, persist EffectAudit attestations against each scanned stage",
         None,
@@ -956,7 +997,7 @@ fn cmd_ast_diff() -> CommandInfo {
     .idempotent(true)
     .add_argument("file_a", "string", "left source file", true)
     .add_argument("file_b", "string", "right source file", true)
-    .add_option("--json", "bool", "structured JSON output", None)
+    .add_option("json", "bool", "structured JSON output", None)
     .with_examples(vec![
         ("Compare two versions", "lex ast-diff a.lex b.lex"),
         ("Machine-readable", "lex ast-diff --json a.lex b.lex"),
@@ -973,8 +1014,8 @@ fn cmd_ast_merge() -> CommandInfo {
     .add_argument("base", "string", "common ancestor source", true)
     .add_argument("ours", "string", "our side", true)
     .add_argument("theirs", "string", "their side", true)
-    .add_option("--output", "string", "write merged source to a file", None)
-    .add_option("--json", "bool", "emit conflicts as JSON", None)
+    .add_option("output", "string", "write merged source to a file", None)
+    .add_option("json", "bool", "emit conflicts as JSON", None)
     .with_examples(vec![
         (
             "Merge three versions",
@@ -991,52 +1032,52 @@ fn cmd_ast_merge() -> CommandInfo {
 fn cmd_branch() -> CommandInfo {
     let list = CommandInfo::new("list", "list branches in the store")
         .idempotent(true)
-        .add_option("--store", "string", "store root", None);
+        .add_option("store", "string", "store root", None);
     let show = CommandInfo::new("show", "show a branch's head map")
         .idempotent(true)
         .add_argument("name", "string", "branch name", true)
-        .add_option("--store", "string", "store root", None);
+        .add_option("store", "string", "store root", None);
     let create = CommandInfo::new("create", "create a branch (snapshot or predicate-defined)").idempotent(false)
         .add_argument("name", "string", "branch name", true)
-        .add_option("--from", "string", "parent branch (default: main)", None)
+        .add_option("from", "string", "parent branch (default: main)", None)
         .add_option(
-            "--predicate",
+            "predicate",
             "string",
             "JSON expression matching lex_vcs::Predicate; creates a saved query rather than a snapshot",
             None,
         )
-        .add_option("--store", "string", "store root", None);
+        .add_option("store", "string", "store root", None);
     let delete = CommandInfo::new("delete", "delete a non-current, non-default branch")
         .idempotent(false)
         .add_argument("name", "string", "branch name", true)
-        .add_option("--store", "string", "store root", None);
+        .add_option("store", "string", "store root", None);
     let use_b = CommandInfo::new("use", "set the current branch")
         .idempotent(false)
         .add_argument("name", "string", "branch name", true)
-        .add_option("--store", "string", "store root", None);
+        .add_option("store", "string", "store root", None);
     let current = CommandInfo::new("current", "print the current branch")
         .idempotent(true)
-        .add_option("--store", "string", "store root", None);
+        .add_option("store", "string", "store root", None);
     let log = CommandInfo::new("log", "print the merge journal of a branch")
         .idempotent(true)
         .add_argument("name", "string", "branch name (default: current)", false)
-        .add_option("--store", "string", "store root", None);
+        .add_option("store", "string", "store root", None);
     let peek = CommandInfo::new("peek", "list ops on another branch without switching to it")
         .idempotent(true)
         .add_argument("name", "string", "branch to inspect", true)
         .add_option(
-            "--since-fork",
+            "since-fork",
             "bool",
             "limit to ops since the fork from --vs (or `parent`)",
             None,
         )
         .add_option(
-            "--vs",
+            "vs",
             "string",
             "compare against this branch (default: <name>'s parent)",
             None,
         )
-        .add_option("--store", "string", "store root", None);
+        .add_option("store", "string", "store root", None);
     let overlay = CommandInfo::new(
         "overlay",
         "preview a merge: project current branch as if <other> were merged in",
@@ -1049,12 +1090,12 @@ fn cmd_branch() -> CommandInfo {
         true,
     )
     .add_option(
-        "--on",
+        "on",
         "string",
         "destination branch (default: current)",
         None,
     )
-    .add_option("--store", "string", "store root", None);
+    .add_option("store", "string", "store root", None);
     let mut info = CommandInfo::new(
         "branch",
         "snapshot branches in lex-store (tier-1 agent-native VC)",
@@ -1085,7 +1126,7 @@ fn cmd_log() -> CommandInfo {
     )
     .idempotent(true)
     .add_argument("name", "string", "branch name (default: current)", false)
-    .add_option("--store", "string", "store root", None)
+    .add_option("store", "string", "store root", None)
     .with_examples(vec![
         ("Log of the current branch", "lex log"),
         (
@@ -1105,13 +1146,13 @@ fn cmd_store_merge() -> CommandInfo {
     .add_argument("src", "string", "source branch", true)
     .add_argument("dst", "string", "destination branch", true)
     .add_option(
-        "--commit",
+        "commit",
         "bool",
         "apply a clean merge to dst (refused if conflicts)",
         None,
     )
-    .add_option("--json", "bool", "emit the merge report as JSON", None)
-    .add_option("--store", "string", "store root directory", None)
+    .add_option("json", "bool", "emit the merge report as JSON", None)
+    .add_option("store", "string", "store root directory", None)
     .with_examples(vec![
         ("Preview a merge", "lex store-merge feature main"),
         (
@@ -1128,9 +1169,9 @@ fn cmd_merge() -> CommandInfo {
         "open a stateful merge session and surface conflicts",
     )
     .idempotent(false)
-    .add_option("--src", "string", "source branch (theirs)", None)
-    .add_option("--dst", "string", "destination branch (ours)", None)
-    .add_option("--store", "string", "store root directory", None);
+    .add_option("src", "string", "source branch (theirs)", None)
+    .add_option("dst", "string", "destination branch (ours)", None)
+    .add_option("store", "string", "store root directory", None);
     let status = CommandInfo::new("status", "print remaining conflicts for a session")
         .idempotent(true)
         .add_argument(
@@ -1139,21 +1180,21 @@ fn cmd_merge() -> CommandInfo {
             "session id from `lex merge start`",
             true,
         )
-        .add_option("--store", "string", "store root directory", None);
+        .add_option("store", "string", "store root directory", None);
     let resolve = CommandInfo::new("resolve", "submit batched per-conflict resolutions")
         .idempotent(false)
         .add_argument("merge_id", "string", "session id", true)
         .add_option(
-            "--file",
+            "file",
             "string",
             "JSON array of {conflict_id, resolution}",
             None,
         )
-        .add_option("--store", "string", "store root directory", None);
+        .add_option("store", "string", "store root directory", None);
     let commit = CommandInfo::new("commit", "finalize the merge and advance dst's head")
         .idempotent(false)
         .add_argument("merge_id", "string", "session id", true)
-        .add_option("--store", "string", "store root directory", None);
+        .add_option("store", "string", "store root directory", None);
     let mut info = CommandInfo::new(
         "merge",
         "stateful agent-driven merge (CLI mirror of /v1/merge/*)",

@@ -11,7 +11,7 @@ description: "Invoke the `lex` CLI. Commands: parse, check, run, hash…"
 ## Available commands
 
 - `lex parse` — print canonical AST as JSON (idempotent)
-- `lex check` — type-check; exit 0 or print errors (idempotent)
+- `lex check` — type-check; given policy flags, also verify the declared effects fit inside them (exit 2 = type errors, 3 = policy violations) (idempotent)
 - `lex run` — execute fn under capability policy (args parsed as JSON); the program's own exit status when it calls std.process.exit
 - `lex hash` — print canonical SigId/StageId hashes for each function (idempotent)
 - `lex blame` — show each fn's stage history from the store (idempotent)
@@ -76,7 +76,16 @@ cat hello.lex | lex parse -
 
 ## `lex check`
 
-type-check; exit 0 or print errors
+type-check; given policy flags, also verify the declared effects fit inside them (exit 2 = type errors, 3 = policy violations)
+
+### Options
+
+- `--allow-effects` (string) — comma-separated effect kinds the program may declare
+- `--allow-fs-read` (string) — filesystem path tree readable by fs_read
+- `--allow-fs-write` (string) — filesystem path tree writable by fs_write
+- `--allow-net-host` (string) — permit net effects to this host (accepted for symmetry with `run`; matched at call time, not statically)
+- `--budget` (int) — cap aggregate declared budget
+- `--strict` (bool) — also run lint passes and the bytecode stack verifier
 
 ### Arguments
 
@@ -94,6 +103,11 @@ lex check hello.lex
 lex check app.lex && lex run app.lex main
 ```
 
+```bash
+# Fail the build when the code outgrows its effect allowlist
+lex check --allow-effects io,net app.lex
+```
+
 **See also:** `lex parse`, `lex run`
 
 ## `lex run`
@@ -102,12 +116,12 @@ execute fn under capability policy (args parsed as JSON); the program's own exit
 
 ### Options
 
-- `----allow-effects` (string) — comma-separated effect kinds to permit
-- `----allow-fs-read` (string) — filesystem path tree readable by fs_read
-- `----allow-fs-write` (string) — filesystem path tree writable by fs_write
-- `----allow-net-host` (string) — permit net effects to this host
-- `----budget` (int) — cap aggregate declared budget
-- `----max-steps` (int) — cap VM opcode dispatches (DoS guard)
+- `--allow-effects` (string) — comma-separated effect kinds to permit
+- `--allow-fs-read` (string) — filesystem path tree readable by fs_read
+- `--allow-fs-write` (string) — filesystem path tree writable by fs_write
+- `--allow-net-host` (string) — permit net effects to this host
+- `--budget` (int) — cap aggregate declared budget
+- `--max-steps` (int) — cap VM opcode dispatches (DoS guard)
 
 ### Arguments
 
@@ -162,8 +176,8 @@ show each fn's stage history from the store
 
 ### Options
 
-- `----store` (string) — store root directory
-- `----with-evidence` (bool) — attach attestations to each history entry
+- `--store` (string) — store root directory
+- `--with-evidence` (bool) — attach attestations to each history entry
 
 ### Arguments
 
@@ -194,8 +208,8 @@ publish each stage in a file to the store as Draft
 
 ### Options
 
-- `----store` (string) — store root directory (default: [store] path or .lex/store under the nearest lex.toml; ~/.lex/store outside any project)
-- `----activate` (bool) — transition published stages to Active
+- `--store` (string) — store root directory (default: [store] path or .lex/store under the nearest lex.toml; ~/.lex/store outside any project)
+- `--activate` (bool) — transition published stages to Active
 
 ### Arguments
 
@@ -239,8 +253,8 @@ print stage info, or list attestations for a stage
 
 ### Options
 
-- `----store` (string) — store root directory
-- `----attestations` (bool) — list attestations instead of stage info
+- `--store` (string) — store root directory
+- `--attestations` (bool) — list attestations instead of stage info
 
 ### Arguments
 
@@ -321,7 +335,7 @@ re-execute with effect overrides keyed by NodeId
 
 ### Options
 
-- `----override` (string) — NODE=JSON override (repeatable)
+- `--override` (string) — NODE=JSON override (repeatable)
 
 ### Arguments
 
@@ -368,8 +382,8 @@ start the agent API HTTP server
 
 ### Options
 
-- `----port` (int) — TCP port (default: 7000)
-- `----store` (string) — store root directory
+- `--port` (int) — TCP port (default: 7000)
+- `--store` (string) — store root directory
 
 ### Examples
 
@@ -426,16 +440,16 @@ have an LLM emit a Lex tool body, run it under declared effects
 
 ### Options
 
-- `----allow-effects` (string) — permitted effect kinds
-- `----request` (string) — natural-language request
-- `----body` (string) — inline tool body
-- `----body-file` (string) — tool body in a file
-- `----spec` (string) — spec file for behavioral verification
-- `----examples` (string) — JSON examples for behavioral checking
-- `----diff-body` (string) — differential evaluation: alternate body
-- `----diff-body-file` (string) — differential evaluation: alternate body file
-- `----store` (string) — if set, persist verification attestations against the tool stage
-- `----json` (bool) — machine-readable output
+- `--allow-effects` (string) — permitted effect kinds
+- `--request` (string) — natural-language request
+- `--body` (string) — inline tool body
+- `--body-file` (string) — tool body in a file
+- `--spec` (string) — spec file for behavioral verification
+- `--examples` (string) — JSON examples for behavioral checking
+- `--diff-body` (string) — differential evaluation: alternate body
+- `--diff-body-file` (string) — differential evaluation: alternate body file
+- `--store` (string) — if set, persist verification attestations against the tool stage
+- `--json` (bool) — machine-readable output
 
 ### Examples
 
@@ -475,12 +489,12 @@ structural code search by effect / call / hostname / AST kind
 
 ### Options
 
-- `----effect` (string) — effect kind filter
-- `----call` (string) — called-function filter
-- `----host` (string) — hostname filter (literal)
-- `----kind` (string) — AST node kind filter
-- `----json` (bool) — machine-readable output
-- `----store` (string) — with --effect, persist EffectAudit attestations against each scanned stage
+- `--effect` (string) — effect kind filter
+- `--call` (string) — called-function filter
+- `--host` (string) — hostname filter (literal)
+- `--kind` (string) — AST node kind filter
+- `--json` (bool) — machine-readable output
+- `--store` (string) — with --effect, persist EffectAudit attestations against each scanned stage
 
 ### Arguments
 
@@ -511,7 +525,7 @@ AST-native diff: added/removed/renamed/modified fns + body patches
 
 ### Options
 
-- `----json` (bool) — structured JSON output
+- `--json` (bool) — structured JSON output
 
 ### Arguments
 
@@ -538,8 +552,8 @@ three-way structural merge with structured JSON conflicts
 
 ### Options
 
-- `----output` (string) — write merged source to a file
-- `----json` (bool) — emit conflicts as JSON
+- `--output` (string) — write merged source to a file
+- `--json` (bool) — emit conflicts as JSON
 
 ### Arguments
 
@@ -595,9 +609,9 @@ three-way merge between two branches in the store
 
 ### Options
 
-- `----commit` (bool) — apply a clean merge to dst (refused if conflicts)
-- `----json` (bool) — emit the merge report as JSON
-- `----store` (string) — store root directory
+- `--commit` (bool) — apply a clean merge to dst (refused if conflicts)
+- `--json` (bool) — emit the merge report as JSON
+- `--store` (string) — store root directory
 
 ### Arguments
 
@@ -652,7 +666,7 @@ show the merge journal of a branch (top-level alias for `lex branch log`)
 
 ### Options
 
-- `----store` (string) — store root
+- `--store` (string) — store root
 
 ### Arguments
 
@@ -720,7 +734,7 @@ emit the AI-agent authoring contract (idiom rules) for this Lex toolchain
 
 ### Options
 
-- `----version-only` (bool) — print only the toolchain version
+- `--version-only` (bool) — print only the toolchain version
 
 ### Examples
 
@@ -806,7 +820,7 @@ format .lex files; --check exits 1 if any need it
 
 ### Options
 
-- `----check` (bool) — don't write; exit 1 if any file is unformatted
+- `--check` (bool) — don't write; exit 1 if any file is unformatted
 
 ### Arguments
 
@@ -832,7 +846,7 @@ run the full pipeline: pkg install, check --strict, fmt --check, test
 
 ### Options
 
-- `----no-fmt` (bool) — skip the fmt --check stage
+- `--no-fmt` (bool) — skip the fmt --check stage
 
 ### Examples
 
@@ -849,7 +863,7 @@ regenerate (or --check) generated doc regions declared in docsync.toml; drift fa
 
 ### Options
 
-- `----check` (bool) — verify instead of regenerate; non-zero exit on drift
+- `--check` (bool) — verify instead of regenerate; non-zero exit on drift
 
 ### Arguments
 
@@ -927,10 +941,10 @@ emit machine-readable API/workspace docs
 
 ### Options
 
-- `----for-agent` (bool) — emit one JSON object describing the whole workspace
-- `----effects` (bool) — markdown effect-kind table from the runtime's KNOWN_EFFECTS single source
-- `----stdlib-index` (bool) — markdown stdlib module/function index from the checker's builtin registry
-- `----stdlib-spec` (bool) — markdown per-builtin signature and notes table for the declaratively defined stdlib modules
+- `--for-agent` (bool) — emit one JSON object describing the whole workspace
+- `--effects` (bool) — markdown effect-kind table from the runtime's KNOWN_EFFECTS single source
+- `--stdlib-index` (bool) — markdown stdlib module/function index from the checker's builtin registry
+- `--stdlib-spec` (bool) — markdown per-builtin signature and notes table for the declaratively defined stdlib modules
 
 ### Arguments
 
@@ -991,8 +1005,8 @@ apply a typed repair transform to a failed op; emits a RepairAttempt
 
 ### Options
 
-- `----apply` (bool) — execute the transform (vs. preview)
-- `----transform` (string) — the typed transform as JSON
+- `--apply` (bool) — execute the transform (vs. preview)
+- `--transform` (string) — the typed transform as JSON
 
 ### Arguments
 

@@ -10,5 +10,8 @@ lex attest filter --kind type_check --since 2026-05-01
 # Promote capsule installs to attestations
 lex attest import-install --audit install.audit.json
 
+# Promote gate decisions, acceptances and refusals alike
+lex attest import-apply --audit iac.audit.json --gate terraform --accepted plan_accepted --refused plan_refused
+
 # Machine-readable
 lex --output json attest filter --kind spec

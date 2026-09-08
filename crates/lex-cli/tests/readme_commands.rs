@@ -299,3 +299,35 @@ fn cli_skill_is_in_sync() {
          Regenerate: UPDATE_CLI_SKILL=1 cargo test -p lex-cli --test readme_commands cli_skill_is_in_sync"
     );
 }
+
+/// Option names given to `CommandInfo::add_option` are **bare** — `acli`'s
+/// skill renderer is what prepends `--` (and normalizes `_` to `-`), the
+/// way the SDK's own tests use it: `add_option("file", …)`.
+///
+/// Every option in this CLI used to be declared as `"--file"`, so the
+/// generated skill file advertised `----file` to agents and `lex
+/// introspect --output json` published `"name": "--file"`. A snapshot
+/// test does not catch that on its own: regenerating the snapshot makes
+/// the wrong output the expected output. This asserts the shape instead.
+#[test]
+fn option_names_are_not_double_prefixed() {
+    let skill = run_stdout(&["skill"]);
+    let bad: Vec<&str> = skill
+        .lines()
+        .filter(|l| l.trim_start().starts_with("- `---"))
+        .collect();
+    assert!(
+        bad.is_empty(),
+        "options rendered with a doubled `--` prefix — pass bare names to \
+         add_option() in acli.rs (`\"file\"`, not `\"--file\"`): {bad:?}"
+    );
+
+    // The same declaration feeds the machine-readable surface, where the
+    // name is emitted verbatim rather than decorated.
+    let json = run_stdout(&["--output", "json", "introspect"]);
+    assert!(
+        !json.contains("\"name\": \"--") && !json.contains("\"name\":\"--"),
+        "`lex introspect` publishes option names with a `--` prefix; \
+         ACLI wants the bare name"
+    );
+}

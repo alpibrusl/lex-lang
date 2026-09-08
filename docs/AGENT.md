@@ -35,6 +35,38 @@ write program.lex
 Always run `lex check` before `lex run`. The type checker catches most mistakes;
 the runtime only sees what the compiler emits.
 
+### Checking against the policy you will run under
+
+`lex check` takes the same `--allow-*` flags as `lex run`, and with any
+of them present it also verifies that the effects the program declares
+fit inside that policy:
+
+```
+lex check --allow-effects io,net,sql src/main.lex   # exit 3 if they do not
+```
+
+Use it wherever the allowlist is written down away from the code — a
+Dockerfile, a systemd unit, a Kubernetes manifest. Those drift: the
+program grows an effect, the allowlist does not, the build stays green
+and the process dies at load time on its first request. Asserting the
+two agree costs one line:
+
+```dockerfile
+ENV LEX_EFFECTS="io,net,sql,time,log,env"
+RUN lex check --allow-effects "$LEX_EFFECTS" src/main.lex
+CMD lex run --allow-effects "$LEX_EFFECTS" src/main.lex main
+```
+
+Exit codes are `2` for type errors and `3` for policy violations, so a
+caller can tell "the code is wrong" from "the policy is too narrow".
+
+Only what a *declaration* can settle is checked: effect kinds, literal
+`fs_read`/`fs_write` paths, and the total declared budget.
+`--allow-net-host`, `--allow-proc` and `--allow-approval` are matched at
+call time against runtime values — they are accepted here, so you can
+pass `run`'s exact flag string unedited, but passing them proves
+nothing.
+
 ---
 
 ## `lex check` error envelope
