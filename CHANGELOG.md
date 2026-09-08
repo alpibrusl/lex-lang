@@ -7,6 +7,38 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added
+
+- **`lex pkg install` checks a dependency's declared toolchain floor
+  (#803).** A package states the toolchain it needs as `lex = "0.10.15"`
+  in its manifest. Packages across this org have declared that for a
+  long time and **nothing read it** — `PackageMeta` had no such field,
+  so serde dropped it silently. A dependency that had moved onto a
+  newer stdlib installed without complaint into a project pinned
+  older.
+
+  The cost of that showed up in lex-gateway: `lex check` failing on 24
+  of 35 files with `unknown_field: is_ascii`, `at_node: "n_0"` — no
+  file, no line, and no mention of the dependency or the toolchain.
+  `lex-schema` had moved onto `str.is_ascii` (new in 0.10.14) while the
+  consuming repo still pinned 0.10.11, and the one fact that explained
+  it was sitting unread in `lex-schema/lex.toml`. Install now says so:
+
+  ```
+  error: 1 installed package(s) need a newer toolchain than the lex 0.10.18 running here:
+    lex-schema requires lex >= 0.10.15
+  ```
+
+  Refuses rather than warns, because a floor is a stated requirement
+  and this codebase's rule is refuse-don't-downgrade;
+  `--ignore-lex-floor` installs anyway for someone mid-upgrade, and
+  still reports what it stepped over. A floor that is not
+  `MAJOR.MINOR.PATCH` is reported as unchecked rather than assumed
+  either way — treating it as met would quietly defeat the check, and
+  as violated would fail installs that were fine. Manifests without the
+  field are unaffected.
+
+
 ## [0.10.18] — 2026-09-08
 
 ### Fixed

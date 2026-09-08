@@ -798,6 +798,11 @@ lex pkg install --trusted-keys keyring.json --require-contracts
 ```
 
 ```bash
+# Install anyway when a dependency declares a newer toolchain floor
+lex pkg install --ignore-lex-floor
+```
+
+```bash
 # Add a path dep
 lex pkg add mylib --path ../mylib
 ```

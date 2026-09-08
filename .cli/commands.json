@@ -1612,6 +1612,10 @@
           "invocation": "lex pkg install --trusted-keys keyring.json --require-contracts"
         },
         {
+          "description": "Install anyway when a dependency declares a newer toolchain floor",
+          "invocation": "lex pkg install --ignore-lex-floor"
+        },
+        {
           "description": "Add a path dep",
           "invocation": "lex pkg add mylib --path ../mylib"
         },

@@ -75,6 +75,41 @@ pub struct PackageMeta {
     /// Default registry URL for `lex pkg publish` when `--registry` is not supplied.
     #[serde(default)]
     pub registry: Option<String>,
+    /// Minimum toolchain this package needs, as `lex = "0.10.15"`.
+    ///
+    /// Packages across the org have declared this for a long time; until
+    /// #803 nothing read it, because serde silently drops unknown fields.
+    /// A dependency that had moved onto a newer stdlib installed without
+    /// complaint into a project pinned older, and the mismatch surfaced
+    /// as `unknown_field` errors naming a function nobody in the
+    /// consuming repo had written.
+    #[serde(default)]
+    pub lex: Option<String>,
+}
+
+/// Parse a `MAJOR.MINOR.PATCH` version into comparable parts.
+///
+/// Deliberately not a semver crate: these are toolchain pins written by
+/// hand in `lex.toml`, always three numeric components, and a
+/// dependency that spells its floor some other way should be skipped
+/// rather than guessed at.
+pub fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
+    let mut it = v.trim().trim_start_matches('v').split('.');
+    let major = it.next()?.parse().ok()?;
+    let minor = it.next()?.parse().ok()?;
+    let patch = it.next()?.parse().ok()?;
+    if it.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+/// Does `running` satisfy a declared `floor`?
+///
+/// `None` when either side is unparseable — the caller should say so
+/// rather than treat "cannot tell" as either satisfied or violated.
+pub fn satisfies_floor(running: &str, floor: &str) -> Option<bool> {
+    Some(parse_version(running)? >= parse_version(floor)?)
 }
 
 #[derive(Debug, Deserialize)]
@@ -423,4 +458,62 @@ pub enum PackageError {
 
     #[error("I/O error at {path}: {detail}")]
     Io { path: String, detail: String },
+}
+
+#[cfg(test)]
+mod floor_tests {
+    use super::{parse_version, satisfies_floor};
+
+    #[test]
+    fn parses_plain_and_v_prefixed() {
+        assert_eq!(parse_version("0.10.18"), Some((0, 10, 18)));
+        assert_eq!(parse_version("v0.10.18"), Some((0, 10, 18)));
+        assert_eq!(parse_version("  1.2.3 "), Some((1, 2, 3)));
+    }
+
+    #[test]
+    fn refuses_what_it_cannot_read_rather_than_guessing() {
+        // A floor it cannot parse must be reported as unknown, never
+        // silently treated as met (which would defeat the check) or as
+        // violated (which would fail working installs).
+        for bad in ["nightly", "0.10", "0.10.18.1", "", "0.x.1", "1.2.3-rc1"] {
+            assert_eq!(parse_version(bad), None, "should not parse: {bad}");
+            assert_eq!(satisfies_floor("0.10.18", bad), None);
+            assert_eq!(satisfies_floor(bad, "0.10.18"), None);
+        }
+    }
+
+    #[test]
+    fn compares_by_component_not_lexically() {
+        // The case that motivated #803: 0.10.11 < 0.10.15, though a
+        // string comparison says otherwise ("0.10.11" > "0.10.15" is
+        // false, but "0.10.9" > "0.10.15" is true lexically).
+        assert_eq!(satisfies_floor("0.10.11", "0.10.15"), Some(false));
+        assert_eq!(satisfies_floor("0.10.18", "0.10.15"), Some(true));
+        assert_eq!(satisfies_floor("0.10.9", "0.10.15"), Some(false));
+        assert_eq!(satisfies_floor("0.9.20", "0.10.0"), Some(false));
+    }
+
+    #[test]
+    fn an_exactly_met_floor_is_met() {
+        assert_eq!(satisfies_floor("0.10.15", "0.10.15"), Some(true));
+    }
+
+    #[test]
+    fn the_field_is_read_from_a_manifest() {
+        // Before #803 this field existed in every lex.toml in the org and
+        // was dropped on the floor by serde, so assert it survives parsing.
+        let m: super::Manifest = toml::from_str(
+            "[package]\nname = \"p\"\nversion = \"0.1.0\"\nlex = \"0.10.15\"\n",
+        )
+        .expect("parse");
+        assert_eq!(m.package.unwrap().lex.as_deref(), Some("0.10.15"));
+    }
+
+    #[test]
+    fn a_manifest_without_the_field_still_parses() {
+        let m: super::Manifest =
+            toml::from_str("[package]\nname = \"p\"\nversion = \"0.1.0\"\n").expect("parse");
+        assert_eq!(m.package.unwrap().lex, None);
+    }
 }
