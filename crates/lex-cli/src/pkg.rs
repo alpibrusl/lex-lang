@@ -176,6 +176,7 @@ fn cmd_install(args: &[String]) -> Result<()> {
 
     let mut trusted_keys: Option<String> = None;
     let mut require_contracts = false;
+    let mut ignore_lex_floor = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -186,6 +187,11 @@ fn cmd_install(args: &[String]) -> Result<()> {
                 })?);
             }
             "--require-contracts" => require_contracts = true,
+            // Escape hatch for someone mid-upgrade who knows the floor
+            // is violated and wants the install anyway. Not the default:
+            // a declared floor is a stated requirement, and installing
+            // past one silently is what made #803 hard to diagnose.
+            "--ignore-lex-floor" => ignore_lex_floor = true,
             other => bail!("unknown flag `{other}`"),
         }
         i += 1;
@@ -225,6 +231,12 @@ fn cmd_install(args: &[String]) -> Result<()> {
 
     let mut errors: Vec<String> = Vec::new();
     let mut total = 0usize;
+    // (package, its declared floor) for packages needing more toolchain
+    // than is running. Collected across the whole closure rather than
+    // failing at the first, so one run reports every package to fix.
+    let mut floor_violations: Vec<(String, String)> = Vec::new();
+    let mut floor_unreadable: Vec<(String, String)> = Vec::new();
+    let running = env!("CARGO_PKG_VERSION");
 
     while let Some((name, importer_dir, direct)) = queue.pop_front() {
         let dummy = importer_dir.join("__install_probe__.lex");
@@ -301,6 +313,25 @@ fn cmd_install(args: &[String]) -> Result<()> {
                 if pkg_toml.exists() {
                     match lex_syntax::Manifest::load(&pkg_toml) {
                         Ok(dep_manifest) => {
+                            // #803: the package states the toolchain it
+                            // needs. Compare it to the one running now,
+                            // while the package's name is still in hand —
+                            // otherwise the mismatch is only felt later,
+                            // as type errors in the consuming repo naming
+                            // stdlib functions nobody there wrote.
+                            if let Some(floor) =
+                                dep_manifest.package.as_ref().and_then(|p| p.lex.as_deref())
+                            {
+                                match lex_syntax::workspace::satisfies_floor(running, floor) {
+                                    Some(true) => {}
+                                    Some(false) => {
+                                        floor_violations.push((name.clone(), floor.to_string()));
+                                    }
+                                    None => {
+                                        floor_unreadable.push((name.clone(), floor.to_string()));
+                                    }
+                                }
+                            }
                             for (trans_name, trans_dep) in &dep_manifest.dependencies {
                                 let new_id = dep_identity(trans_dep, pkg_dir);
                                 match seen.get(trans_name) {
@@ -352,6 +383,39 @@ fn cmd_install(args: &[String]) -> Result<()> {
                 eprintln!("    {e}");
                 errors.push(format!("{name}: {e}"));
             }
+        }
+    }
+
+    for (pkg, floor) in &floor_unreadable {
+        eprintln!(
+            "  warning: `{pkg}` declares lex = \"{floor}\", which is not a \
+             MAJOR.MINOR.PATCH version; its floor was not checked"
+        );
+    }
+
+    if !floor_violations.is_empty() {
+        let detail = floor_violations
+            .iter()
+            .map(|(pkg, floor)| format!("  {pkg} requires lex >= {floor}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if ignore_lex_floor {
+            eprintln!("warning: installing past {} unmet toolchain floor(s), \
+                       running lex {running}:\n{detail}", floor_violations.len());
+        } else {
+            errors.push(format!("{} unmet toolchain floor(s)", floor_violations.len()));
+            eprintln!(
+                "error: {} installed package(s) need a newer toolchain than the \
+                 lex {running} running here:\n{detail}\n\n\
+                 These are declared floors, not guesses. Installing past one \
+                 tends to surface later as type errors naming stdlib functions \
+                 this repo never wrote. Fix by raising this project's toolchain \
+                 pin, or by pinning the dependency to a revision that still \
+                 supports lex {running} (git deps without a `rev` follow their \
+                 default branch, so they move under you). \
+                 `--ignore-lex-floor` installs anyway.",
+                floor_violations.len()
+            );
         }
     }
 
