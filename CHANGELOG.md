@@ -7,6 +7,23 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.11.2] — 2026-09-09
+
+### Fixed
+
+- **`pkg_publish_handler` rebuilt its function-set snapshot from disk on
+  every file in the archive, not just once (#813 follow-up).** Fixing
+  0.11.1's `compute_diff` hashing bug alone wasn't enough at real scale:
+  a tenant with 110,605 accumulated ops still took ~48 minutes to
+  publish a 21-file package, because `branch_head` — an O(N)-per-call,
+  unmemoized walk of the branch's entire op history — was called once
+  per file, plus a disk fetch per live function each time. Fixed by
+  computing the snapshot once and updating it in memory from each
+  file's own diff report afterward. Turned out to be a correctness fix
+  too: a multi-file publish that touched the same name in two files
+  could get its diff rejected outright by the store instead of just
+  running slowly.
+
 ## [0.11.1] — 2026-09-09
 
 ### Fixed
