@@ -1890,6 +1890,30 @@ fn pkg_publish_handler(state: &State, body: &[u8]) -> Response<std::io::Cursor<V
     let mut final_head_op: Option<String> = None;
     let mut all_function_names: Vec<String> = Vec::new();
 
+    // `old_fns` mirrors the branch's current function set. It used to be
+    // rebuilt from scratch on every loop iteration via `branch_head` (an
+    // O(N)-per-call, unmemoized walk of the *entire* branch op history —
+    // see that function's own doc comment) plus a `get_ast` disk fetch for
+    // every resulting entry — O(files * (history_size + live_fn_count))
+    // overall. On a tenant with 110k+ accumulated ops this took tens of
+    // minutes even after fixing compute_diff's quadratic hashing (#813):
+    // fixing that alone wasn't enough at this scale. Computing it once
+    // here and then applying each file's own already-computed `report`
+    // (added/removed/renamed/modified) to it in memory afterward keeps it
+    // exactly in sync with what the store now holds, at O(history_size)
+    // total instead of O(files * history_size).
+    let old_head = match store.branch_head(&branch) {
+        Ok(h) => h,
+        Err(e) => return error_response(500, format!("branch_head: {e}")),
+    };
+    let mut old_fns: BTreeMap<String, lex_ast::FnDecl> = old_head.values()
+        .filter_map(|stg| store.get_ast(stg).ok())
+        .filter_map(|s| match s {
+            lex_ast::Stage::FnDecl(fd) => Some((fd.name.clone(), fd)),
+            _ => None,
+        })
+        .collect();
+
     for lex_path in &lex_files {
         let prog = match load_program(lex_path) {
             Ok(p) => p,
@@ -1904,17 +1928,6 @@ fn pkg_publish_handler(state: &State, body: &[u8]) -> Response<std::io::Cursor<V
             );
         }
 
-        let old_head = match store.branch_head(&branch) {
-            Ok(h) => h,
-            Err(e) => return error_response(500, format!("branch_head: {e}")),
-        };
-        let old_fns: BTreeMap<String, lex_ast::FnDecl> = old_head.values()
-            .filter_map(|stg| store.get_ast(stg).ok())
-            .filter_map(|s| match s {
-                lex_ast::Stage::FnDecl(fd) => Some((fd.name.clone(), fd)),
-                _ => None,
-            })
-            .collect();
         let new_fns: BTreeMap<String, lex_ast::FnDecl> = stages.iter()
             .filter_map(|s| match s {
                 lex_ast::Stage::FnDecl(fd) => Some((fd.name.clone(), fd.clone())),
@@ -1953,6 +1966,28 @@ fn pkg_publish_handler(state: &State, body: &[u8]) -> Response<std::io::Cursor<V
                 }
                 if let Some(h) = outcome.head_op {
                     final_head_op = Some(h);
+                }
+                // Keep `old_fns` in sync with what the store now holds,
+                // using the diff we already computed above instead of
+                // re-reading it back from disk.
+                for a in &report.added {
+                    if let Some(fd) = new_fns.get(&a.name) {
+                        old_fns.insert(a.name.clone(), fd.clone());
+                    }
+                }
+                for r in &report.removed {
+                    old_fns.remove(&r.name);
+                }
+                for ren in &report.renamed {
+                    old_fns.remove(&ren.from);
+                    if let Some(fd) = new_fns.get(&ren.to) {
+                        old_fns.insert(ren.to.clone(), fd.clone());
+                    }
+                }
+                for m in &report.modified {
+                    if let Some(fd) = new_fns.get(&m.name) {
+                        old_fns.insert(m.name.clone(), fd.clone());
+                    }
                 }
             }
             Err(lex_store::StoreError::TypeError(errs)) => {
