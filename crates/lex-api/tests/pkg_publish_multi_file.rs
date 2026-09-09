@@ -177,3 +177,85 @@ fn multi_file_publish_sees_earlier_files_own_update_in_same_request() {
         modify_ops.len(), ops,
     );
 }
+
+/// Each file's diff used to be computed as "this file's functions" vs.
+/// the ENTIRE branch function set — so for a multi-file package, every
+/// file's diff spuriously reported every function defined in every
+/// OTHER file of the same package as "removed" (it's not defined in
+/// *this* file). `store.publish_program` would dutifully emit a
+/// `remove_function` op for it. This is what actually hit production:
+/// lex-schema's 21-file publish removed a function that a later file in
+/// the same request still legitimately modified, and the store's own
+/// consistency check rejected the resulting diff outright (500:
+/// "old_name_to_sig has no entry").
+///
+/// Reproduces the minimal shape: `helper` already exists (published in
+/// v1). v2 is a single request with two files — `a.lex` (processed
+/// first, alphabetically) doesn't mention `helper` at all; `b.lex`
+/// legitimately redefines it. `helper` must survive: no
+/// `remove_function` op anywhere in the response, and `b.lex`'s change
+/// must land as a `modify_body`, not get miscounted as a fresh `add`.
+#[test]
+fn multi_file_publish_does_not_spuriously_remove_a_name_owned_by_another_file() {
+    let (srv, _tmp) = start_server();
+
+    let src_v1 = concat!(
+        "fn helper() -> Int\n",
+        "  examples {\n",
+        "    helper() => 1,\n",
+        "  }\n",
+        "{ 1 }\n",
+    );
+    let archive_v1 = pkg_archive("multi2", "0.1.0", &[("lib.lex", src_v1)]);
+    let (status, body) = post_bytes(&srv.addr, "/v1/pkg/publish", &archive_v1);
+    assert_eq!(status, 200, "v1 publish must succeed, got: {body}");
+
+    let src_other = concat!(
+        "fn other() -> Int\n",
+        "  examples {\n",
+        "    other() => 2,\n",
+        "  }\n",
+        "{ 2 }\n",
+    );
+    let src_helper_v2 = concat!(
+        "fn helper() -> Int\n",
+        "  examples {\n",
+        "    helper() => 3,\n",
+        "  }\n",
+        "{ 3 }\n",
+    );
+    let archive_v2 = pkg_archive("multi2", "0.2.0", &[("a.lex", src_other), ("b.lex", src_helper_v2)]);
+    let (status, body) = post_bytes(&srv.addr, "/v1/pkg/publish", &archive_v2);
+    assert_eq!(status, 200, "v2 publish must succeed (helper must not be spuriously removed), got: {body}");
+
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON response");
+    let ops = parsed["ops"].as_array().expect("ops array in publish response");
+
+    let remove_ops: Vec<&serde_json::Value> = ops.iter()
+        .filter(|op| op["kind"]["op"] == "remove_function")
+        .collect();
+    assert!(
+        remove_ops.is_empty(),
+        "expected no remove_function ops -- `helper` is untouched by file a.lex \
+         and legitimately modified by b.lex, not removed. Got: {:#?}",
+        remove_ops,
+    );
+
+    let modify_ops: Vec<&serde_json::Value> = ops.iter()
+        .filter(|op| op["kind"]["op"] == "modify_body")
+        .collect();
+    assert_eq!(
+        modify_ops.len(), 1,
+        "expected exactly one modify_body op for helper's 1->3 change, got: {:#?}",
+        ops,
+    );
+
+    let add_ops: Vec<&serde_json::Value> = ops.iter()
+        .filter(|op| op["kind"]["op"] == "add_function")
+        .collect();
+    assert_eq!(
+        add_ops.len(), 1,
+        "expected exactly one add_function op for `other`, got: {:#?}",
+        ops,
+    );
+}

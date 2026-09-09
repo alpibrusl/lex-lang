@@ -1914,6 +1914,28 @@ fn pkg_publish_handler(state: &State, body: &[u8]) -> Response<std::io::Cursor<V
         })
         .collect();
 
+    // Load, canonicalize, and type-check every file up front so we know the
+    // *whole package's* function set before diffing any single file against
+    // the branch. Each file's own diff must only be compared against
+    // functions genuinely absent from the entire package being published —
+    // not just absent from that one file. The per-file loop below used to
+    // diff each file against `old_fns` directly: for a package with more
+    // than one file, every file's diff spuriously reported every OTHER
+    // file's functions as "removed" (they're not defined in *this* file),
+    // and `store.publish_program` would dutifully emit RemoveFunction ops
+    // for them. Once two files both got processed this way, the second
+    // file to actually touch one of those "removed" names hit the store's
+    // own consistency check and failed outright ("old_name_to_sig has no
+    // entry") — a real publish of lex-schema's 21 files hit this on
+    // `flatten_cli_result` the moment the #813 performance fixes let a
+    // real multi-file publish reach this code path for the first time.
+    struct FileUnit {
+        path: PathBuf,
+        stages: Vec<lex_ast::Stage>,
+        new_fns: BTreeMap<String, lex_ast::FnDecl>,
+    }
+    let mut units: Vec<FileUnit> = Vec::new();
+    let mut all_new_fns_union: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for lex_path in &lex_files {
         let prog = match load_program(lex_path) {
             Ok(p) => p,
@@ -1927,13 +1949,20 @@ fn pkg_publish_handler(state: &State, body: &[u8]) -> Response<std::io::Cursor<V
                 serde_json::to_value(&errs).unwrap(),
             );
         }
-
         let new_fns: BTreeMap<String, lex_ast::FnDecl> = stages.iter()
             .filter_map(|s| match s {
                 lex_ast::Stage::FnDecl(fd) => Some((fd.name.clone(), fd.clone())),
                 _ => None,
             })
             .collect();
+        all_new_fns_union.extend(new_fns.keys().cloned());
+        units.push(FileUnit { path: lex_path.clone(), stages, new_fns });
+    }
+
+    for unit in &units {
+        let lex_path = &unit.path;
+        let stages = &unit.stages;
+        let new_fns = &unit.new_fns;
 
         for name in new_fns.keys() {
             if !all_function_names.contains(name) {
@@ -1941,7 +1970,16 @@ fn pkg_publish_handler(state: &State, body: &[u8]) -> Response<std::io::Cursor<V
             }
         }
 
-        let report = lex_vcs::compute_diff(&old_fns, &new_fns, false);
+        // Diff this file against the branch's function set minus anything
+        // owned by another file in this same archive (defined somewhere in
+        // the package, not defined here) — that's not this file's business
+        // to report as removed or modified; whichever file actually
+        // defines it will correctly diff it against its own prior state.
+        let old_fns_for_file: BTreeMap<String, lex_ast::FnDecl> = old_fns.iter()
+            .filter(|(name, _)| !all_new_fns_union.contains(*name) || new_fns.contains_key(*name))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let report = lex_vcs::compute_diff(&old_fns_for_file, new_fns, false);
 
         let file_key = lex_path
             .strip_prefix(tmp.path())
@@ -1951,14 +1989,14 @@ fn pkg_publish_handler(state: &State, body: &[u8]) -> Response<std::io::Cursor<V
         let mut new_imports = lex_vcs::ImportMap::new();
         {
             let entry = new_imports.entry(file_key).or_default();
-            for s in &stages {
+            for s in stages {
                 if let lex_ast::Stage::Import(im) = s {
                     entry.insert(im.reference.clone());
                 }
             }
         }
 
-        match store.publish_program(&branch, &stages, &report, &new_imports, false) {
+        match store.publish_program(&branch, stages, &report, &new_imports, false) {
             Ok(outcome) => {
                 let ops_json = serde_json::to_value(&outcome.ops).unwrap_or_default();
                 if let serde_json::Value::Array(arr) = ops_json {
