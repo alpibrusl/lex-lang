@@ -7,6 +7,23 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.11.3] — 2026-09-09
+
+### Fixed
+
+- **`pkg_publish_handler` spuriously removed functions owned by other
+  files in the same package.** Each file's diff was computed against
+  the *entire* branch function set, so every file's diff reported
+  every function defined in every other file of the same package as
+  "removed" — `store.publish_program` dutifully emitted a
+  `remove_function` op for it. Silent when nothing else touched that
+  name afterward; a hard `500` ("old_name_to_sig has no entry") when a
+  later file in the same request legitimately modified it — which is
+  exactly what a real 21-file publish hit the moment 0.11.1/0.11.2's
+  performance fixes let it reach this code path for the first time.
+  Fixed by parsing every file up front and excluding branch functions
+  owned by another file in the archive from each file's own diff.
+
 ## [0.11.2] — 2026-09-09
 
 ### Fixed
