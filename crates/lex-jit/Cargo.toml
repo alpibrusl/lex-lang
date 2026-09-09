@@ -25,7 +25,7 @@ cranelift = [
 ]
 
 [dependencies]
-lex-bytecode = { path = "../lex-bytecode", version = "0.10.0" }
+lex-bytecode = { path = "../lex-bytecode", version = "0.11.0" }
 thiserror.workspace = true
 
 cranelift-codegen = { version = "0.132", optional = true }
@@ -35,10 +35,10 @@ cranelift-module = { version = "0.132", optional = true }
 cranelift-native = { version = "0.132", optional = true }
 
 [dev-dependencies]
-lex-bytecode = { path = "../lex-bytecode", version = "0.10.0" }
-lex-syntax = { path = "../lex-syntax", version = "0.10.0" }
-lex-ast = { path = "../lex-ast", version = "0.10.0" }
-lex-types = { path = "../lex-types", version = "0.10.0" }
+lex-bytecode = { path = "../lex-bytecode", version = "0.11.0" }
+lex-syntax = { path = "../lex-syntax", version = "0.11.0" }
+lex-ast = { path = "../lex-ast", version = "0.11.0" }
+lex-types = { path = "../lex-types", version = "0.11.0" }
 indexmap.workspace = true
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
