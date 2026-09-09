@@ -7,6 +7,70 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-09-09
+
+### Changed
+
+- **BREAKING: a trust level is only accepted on a dimension that gives
+  it a meaning (#808).** `Grant`'s three axes share one `Level` enum.
+  Sharing a vocabulary is not sharing a meaning, and nothing enforced
+  the difference: `Grant::new` never checked the pairing and
+  `Grant::narrow` compares `rank()` alone. So `exec: Allowlist` parsed,
+  outranked `Sandboxed`, narrowed cleanly under `exec: Full`, and
+  resolved to a sandbox — while naming nothing.
+
+  The harm was specific rather than untidy. `trust.rs`'s own doc table
+  claimed rank 2 read as `= full` on exec. It did not: nothing requires
+  exec above rank 1 (`effect_requirement` maps `proc` to `Sandboxed`),
+  so the only thing rank 2 ever changed was lex-os's isolation floor,
+  where `Full` demands a microVM and everything else gets gVisor. An
+  author following the documented table asked for full-exec semantics
+  and received a **weaker boundary than full exec requires**. The table
+  is corrected alongside the enforcement.
+
+  Accepted levels are now: filesystem `None`/`ReadOnly`/`ReadWrite`/
+  `Full`, network `None`/`Loopback`/`Allowlist`/`Full`, exec
+  `None`/`Sandboxed`/`Full` (`Dimension::levels`). `Grant::try_new`
+  refuses anything else with `TrustError::LevelNotOnDimension`, naming
+  the dimension and listing what it accepts, in the **JSON** spelling
+  rather than the lowercase prose one.
+
+  **What breaks:** a manifest whose grant names a level outside its
+  dimension's set no longer deserializes. Such a grant was already
+  meaningless, and was silently receiving a weaker isolation floor than
+  it appeared to ask for, so the refusal is the fix rather than a
+  regression. All 21 grants committed across lex-os, lex-iac and
+  lex-k8s were checked: none is affected.
+
+  `Grant::new` stays unvalidated by design, and now documents why —
+  `tests/trust_lattice.rs` proves the lattice properties the safety
+  argument rests on by enumerating all 7×7×7 grants, and validating in
+  the structural constructor would leave that suite unable to state its
+  own claim. Authored grants go through `try_new` or serde.
+
+  Falls out of this: once each dimension takes only its own levels,
+  every accepted level has a distinct rank, so aliasing disappears and
+  `Grant::content_id` becomes injective over valid grants rather than
+  merely stable.
+
+- **BREAKING: a grant refuses unknown keys.** `Grant` now deserializes
+  through a wire type carrying `deny_unknown_fields`, so an authored
+  grant naming a fourth dimension is refused instead of having it
+  silently dropped — which previously let an author believe they had
+  declared something they had not (alpibrusl/lex-os#101, one level
+  down).
+
+### Fixed
+
+- **`lex run` could never approve anything (#807).**
+  `DefaultHandler::new` defaults to `NullApprovalSink`, which refuses
+  every `approval.request` unconditionally — correct for an embedder
+  with no operator to ask, and wrong for the interactive CLI, which
+  never wired the sink meant for it. A tool carrying `approval_scope`
+  was therefore not "ask a human" but "always refuse", with no way to
+  approve regardless of what stdin contained. Found live while building
+  lex-code's first tool to use `approval_scope`.
+
 ### Added
 
 - **`lex pkg install` checks a dependency's declared toolchain floor

@@ -22,14 +22,14 @@ hex.workspace = true
 # transitive dep via tempfile; promoting to direct so the lock
 # call sites compile.
 fs2 = "0.4"
-lex-ast = { path = "../lex-ast", version = "0.10.0" }
+lex-ast = { path = "../lex-ast", version = "0.11.0" }
 # Optional: lex-trace backs only save_trace/load_trace (the `trace` feature).
 # Gated so lower crates (e.g. lex-runtime) can depend on the blob/stage store
 # with `default-features = false` without forming a lex-store → lex-trace →
 # lex-runtime cycle.
-lex-trace = { path = "../lex-trace", version = "0.10.0", optional = true }
-lex-types = { path = "../lex-types", version = "0.10.0" }
-lex-vcs = { path = "../lex-vcs", version = "0.10.0" }
+lex-trace = { path = "../lex-trace", version = "0.11.0", optional = true }
+lex-types = { path = "../lex-types", version = "0.11.0" }
+lex-vcs = { path = "../lex-vcs", version = "0.11.0" }
 
 [features]
 default = ["trace"]
@@ -38,5 +38,5 @@ default = ["trace"]
 trace = ["dep:lex-trace"]
 
 [dev-dependencies]
-lex-syntax = { path = "../lex-syntax", version = "0.10.0" }
+lex-syntax = { path = "../lex-syntax", version = "0.11.0" }
 tempfile = "3"
