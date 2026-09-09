@@ -7,6 +7,18 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.11.1] — 2026-09-09
+
+### Fixed
+
+- **`compute_diff`'s rename-detection loop recomputed each candidate's
+  body hash on every outer-loop iteration (#813).** `pkg_publish_handler`
+  calls `compute_diff` once per uploaded file with the "old" side sized
+  to a tenant's *entire* historical function set — an unmemoized
+  `O(|old| * |new|)` hashing loop there hung a production `lex-hub`
+  server for 38+ minutes on a real publish. Fixed by precomputing each
+  candidate's hash once instead of redoing it per pair.
+
 ## [0.11.0] — 2026-09-09
 
 ### Changed
