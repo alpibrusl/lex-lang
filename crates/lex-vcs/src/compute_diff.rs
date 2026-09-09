@@ -9,7 +9,7 @@ use crate::diff_report::{
     AddRemove, BodyPatch, DiffReport, EffectChanges, Modified, Renamed,
 };
 use lex_ast::{stage_canonical_hash_hex, CExpr, Effect, EffectArg, FnDecl, Stage, TypeExpr};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Compute a structural diff between two named fn-decl maps.
 ///
@@ -32,22 +32,33 @@ pub fn compute_diff(
     // has a body whose canonical-AST hash matches (modulo the fn
     // name itself). sig_id over the FnDecl with name normalized
     // serves as the structural-identity key.
+    //
+    // `body_hash` clones the FnDecl and does a full canonical
+    // serialize + SHA-256 — not O(1). The naive nested loop below
+    // used to recompute `body_hash(fb)` on every outer (`only_a`)
+    // iteration even though `fb` never changes, making this
+    // O(|only_a| * |only_b|) hashes instead of O(|only_a| + |only_b|).
+    // Harmless at the tiny scale these sets used to have, but
+    // `pkg_publish_handler` calls this once per uploaded file with
+    // `only_a` sized to the *entire* tenant's historical function
+    // set — that combination hung the server for 38+ minutes on a
+    // real publish (alpibrusl/lex-lang#813). Precomputing each
+    // `only_b` hash once turns the nested loop into O(1) lookups.
+    let mut hash_to_bs: HashMap<String, Vec<&String>> = HashMap::new();
+    for &bn in &only_b {
+        hash_to_bs.entry(body_hash(&b[bn])).or_default().push(bn);
+    }
     let mut renamed_pairs: Vec<(String, String)> = Vec::new();
     let mut consumed_a: BTreeSet<String> = BTreeSet::new();
     let mut consumed_b: BTreeSet<String> = BTreeSet::new();
     for &an in &only_a {
         let fa = &a[an];
         let fa_norm_id = body_hash(fa);
-        for &bn in &only_b {
-            if consumed_b.contains(bn) { continue; }
-            let fb = &b[bn];
-            if body_hash(fb) == fa_norm_id {
-                renamed_pairs.push((an.clone(), bn.clone()));
-                consumed_a.insert(an.clone());
-                consumed_b.insert(bn.clone());
-                break;
-            }
-        }
+        let Some(candidates) = hash_to_bs.get(&fa_norm_id) else { continue };
+        let Some(&bn) = candidates.iter().find(|bn| !consumed_b.contains(**bn)) else { continue };
+        renamed_pairs.push((an.clone(), bn.clone()));
+        consumed_a.insert(an.clone());
+        consumed_b.insert(bn.clone());
     }
 
     for &n in &only_a {
