@@ -49,6 +49,32 @@ impl Dimension {
     }
 }
 
+impl Dimension {
+    /// The levels that carry a meaning on this dimension.
+    ///
+    /// The vocabulary is shared across dimensions deliberately — it is
+    /// small and the ordering is what matters — but sharing a
+    /// vocabulary is not sharing a meaning. `Loopback` says nothing
+    /// about a filesystem, and `ReadWrite` says nothing about a
+    /// process. Accepting one anyway does not merely look untidy: it
+    /// ranks, so it narrows, satisfies effect checks, and resolves to a
+    /// sandbox — all while naming nothing.
+    pub fn levels(self) -> &'static [Level] {
+        match self {
+            Dimension::Filesystem => {
+                &[Level::None, Level::ReadOnly, Level::ReadWrite, Level::Full]
+            }
+            Dimension::Network => &[Level::None, Level::Loopback, Level::Allowlist, Level::Full],
+            Dimension::Exec => &[Level::None, Level::Sandboxed, Level::Full],
+        }
+    }
+
+    /// Does `level` mean anything on this dimension?
+    pub fn permits_level(self, level: Level) -> bool {
+        self.levels().contains(&level)
+    }
+}
+
 impl fmt::Display for Dimension {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -67,12 +93,24 @@ impl fmt::Display for Dimension {
 /// |------|------------|-----------|------------|
 /// | 0    | none       | none      | none       |
 /// | 1    | read-only  | loopback  | sandboxed  |
-/// | 2    | read-write | allowlist | (= full)   |
+/// | 2    | read-write | allowlist | *(none)*   |
 /// | 3    | full       | full      | full       |
 ///
 /// `Sandboxed` aliases rank 1 for exec; `Allowlist` aliases rank 2 for
 /// network. They are distinct enum variants for legibility but compare
 /// purely by [`Level::rank`].
+///
+/// **Exec has no rank-2 level**, and this table used to claim rank 2
+/// read as `= full` there. It did not: nothing requires exec above
+/// rank 1 ([`effect_requirement`] maps `proc` to `Sandboxed`), so the
+/// only thing rank 2 changed was lex-os's isolation floor, which gives
+/// rank 2 a *gVisor* boundary while `Full` demands a microVM. An author
+/// following the old table asked for full-exec semantics and received a
+/// weaker boundary than full exec requires.
+///
+/// A level is therefore only accepted on a dimension that gives it a
+/// meaning — see [`Dimension::permits_level`] — so the gap is a refusal
+/// rather than a silently weaker box (alpibrusl/lex-lang#808).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Level {
     /// rank 0 — the effect is *physically absent* from the box.
@@ -142,6 +180,27 @@ impl Level {
     }
 }
 
+impl Level {
+    /// The spelling this level has **in a manifest**.
+    ///
+    /// Distinct from [`Level::as_str`], which is the lowercase prose
+    /// form used in messages about a grant. A refusal is read by
+    /// whoever is writing the JSON, so quoting `sandboxed` at them when
+    /// the parser wants `Sandboxed` would send them round again — the
+    /// exact loop these refusals exist to end.
+    pub fn json_name(self) -> &'static str {
+        match self {
+            Level::None => "None",
+            Level::ReadOnly => "ReadOnly",
+            Level::Sandboxed => "Sandboxed",
+            Level::Loopback => "Loopback",
+            Level::ReadWrite => "ReadWrite",
+            Level::Allowlist => "Allowlist",
+            Level::Full => "Full",
+        }
+    }
+}
+
 impl fmt::Display for Level {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -155,10 +214,35 @@ impl fmt::Display for Level {
 /// dangerous config — `sudo` + open internet, design doc §3) as the
 /// extremes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "GrantWire")]
 pub struct Grant {
     pub filesystem: Level,
     pub network: Level,
     pub exec: Level,
+}
+
+/// The deserialization shape of a [`Grant`], so that an authored grant
+/// is validated on the way in rather than trusted.
+///
+/// A manifest is written to be machine-checked, not read line by line,
+/// which puts the whole weight of catching a wrong grant here. Two
+/// things are refused: a key nobody defined (silently dropping it would
+/// mean an author believes they declared something they did not), and a
+/// level that means nothing on the dimension it names.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GrantWire {
+    filesystem: Level,
+    network: Level,
+    exec: Level,
+}
+
+impl TryFrom<GrantWire> for Grant {
+    type Error = TrustError;
+
+    fn try_from(w: GrantWire) -> Result<Self, Self::Error> {
+        Grant::try_new(w.filesystem, w.network, w.exec)
+    }
 }
 
 /// Why a requested grant was refused. The runtime contract is
@@ -192,11 +276,64 @@ pub enum TrustError {
         "unscoped `[net]` cannot be proven within the egress allowlist — scope it to a host, e.g. `net(\"results.demo.internal\")`"
     )]
     NetUnscoped,
+    #[error(
+        "`{level}` is not one of {dimension}'s levels — {dimension} accepts {allowed}"
+    )]
+    LevelNotOnDimension {
+        dimension: Dimension,
+        level: Level,
+        allowed: String,
+    },
 }
 
 impl Grant {
+    /// Construct a grant from any three levels, without checking that
+    /// each means something on the dimension it names.
+    ///
+    /// Deliberately unvalidated, and not an oversight. The lattice
+    /// properties the safety argument rests on — that `leq` is a partial
+    /// order, that `narrow` accepts exactly the narrowing pairs, that
+    /// narrowing never unlocks a rejected effect set — are properties of
+    /// the *ordering*, and `tests/trust_lattice.rs` proves them by
+    /// enumerating all 7x7x7 grants. Refusing the axis-inappropriate
+    /// ones here would leave that suite unable to state its own claim.
+    ///
+    /// So this is the structural constructor, for in-tree callers whose
+    /// levels are literals a reviewer can see. Anything **authored** —
+    /// parsed from a manifest, or built from values chosen at runtime —
+    /// goes through [`Grant::try_new`], which refuses a level that names
+    /// nothing on its dimension (#808); deserialization already does.
     pub fn new(filesystem: Level, network: Level, exec: Level) -> Self {
         Self { filesystem, network, exec }
+    }
+
+    /// Construct a grant, refusing any level that carries no meaning on
+    /// the dimension it names.
+    ///
+    /// `exec: Allowlist` is the case worth naming: it parsed, it ranked
+    /// above `Sandboxed`, it narrowed cleanly under `exec: Full`, and it
+    /// resolved to a *weaker* isolation floor than the full-exec reading
+    /// it looked like. Refusing beats every one of those (#808).
+    pub fn try_new(filesystem: Level, network: Level, exec: Level) -> Result<Self, TrustError> {
+        for (dim, level) in [
+            (Dimension::Filesystem, filesystem),
+            (Dimension::Network, network),
+            (Dimension::Exec, exec),
+        ] {
+            if !dim.permits_level(level) {
+                return Err(TrustError::LevelNotOnDimension {
+                    dimension: dim,
+                    level,
+                    allowed: dim
+                        .levels()
+                        .iter()
+                        .map(|l| format!("`{}`", l.json_name()))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                });
+            }
+        }
+        Ok(Self { filesystem, network, exec })
     }
 
     /// Deny everything — the lattice bottom. The default starting point
@@ -695,16 +832,41 @@ mod tests {
     }
 
     #[test]
-    fn content_id_is_stable_and_alias_insensitive() {
-        // Sandboxed and ReadOnly share a rank, so an exec=Sandboxed
-        // grant and an exec=ReadOnly grant address identically.
-        let g1 = Grant::new(Level::None, Level::None, Level::Sandboxed);
-        let g2 = Grant::new(Level::None, Level::None, Level::ReadOnly);
-        assert_eq!(g1.content_id(), g2.content_id());
+    fn content_id_is_stable_and_addresses_authority_not_spelling() {
+        // This test used to demonstrate alias-insensitivity with
+        // `exec: ReadOnly` vs `exec: Sandboxed` — two spellings of rank
+        // 1 that addressed identically. `exec: ReadOnly` is no longer a
+        // grant anyone can write (#808), so the demonstration is gone
+        // along with the confusion it was accommodating: within each
+        // dimension every accepted level now has a distinct rank, which
+        // `every_valid_level_has_a_distinct_rank_on_its_dimension`
+        // pins. Since `content_id` hashes ranks, it is now injective
+        // over valid grants rather than merely stable.
+        let g = Grant::new(Level::None, Level::None, Level::Sandboxed);
+
         // Different authority -> different id.
         assert_ne!(Grant::bottom().content_id(), Grant::top().content_id());
         // Stable across calls.
-        assert_eq!(g1.content_id(), g1.content_id());
-        assert_eq!(g1.content_id().0.len(), 64);
+        assert_eq!(g.content_id(), g.content_id());
+        assert_eq!(g.content_id().0.len(), 64);
+    }
+
+    /// The property that replaced aliasing, and the reason the old test
+    /// changed: a shared vocabulary is fine as long as each dimension
+    /// takes at most one spelling per rank. Two would mean a grant had
+    /// two names, and a name is what a record refers to.
+    #[test]
+    fn every_valid_level_has_a_distinct_rank_on_its_dimension() {
+        for d in Dimension::ALL {
+            let mut ranks: Vec<u8> = d.levels().iter().map(|l| l.rank()).collect();
+            let before = ranks.len();
+            ranks.sort_unstable();
+            ranks.dedup();
+            assert_eq!(
+                ranks.len(),
+                before,
+                "{d} accepts two levels of the same rank, so one grant has two spellings"
+            );
+        }
     }
 }
