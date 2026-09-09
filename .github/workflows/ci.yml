@@ -68,6 +68,13 @@ jobs:
       # version there hands them an old binary. Keep it pinned to Cargo.toml.
       - name: README install version matches Cargo.toml
         run: ./scripts/check-readme-version.sh
+      # The crates.io publish order is a hand-maintained list that has to
+      # agree with the dependency graph. It did not, and nothing noticed
+      # for three releases, because publishing only fails on a *new*
+      # version — a re-run of an already-published one skips every crate
+      # and looks green.
+      - name: crates.io publish order matches the dependency graph
+        run: ./scripts/check-publish-order.sh
       # Very large source files hide duplicated logic (#772, #774). A
       # file over the line budget is a red build unless it is on the
       # allow-list in the script, which shrinks as #779 splits land.

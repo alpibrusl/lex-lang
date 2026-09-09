@@ -78,15 +78,29 @@ jobs:
           # through) into a fixable retry rather than a wedge
           # where re-running fails on every crate that already
           # landed.
+          # Topological order over NORMAL dependencies, which is not
+          # the order this list had. `lex-runtime` depends on
+          # `lex-store`, which depends on `lex-trace` and `lex-vcs`, so
+          # publishing lex-runtime fifth could never work: it failed with
+          # `failed to select a version for the requirement
+          # lex-store = "^X"` every time a new version was tagged, which
+          # is why v0.10.13, v0.10.16 and v0.10.17 all failed here and
+          # v0.11.0 stopped after four crates. Derive it, don't guess it:
+          #
+          #   cargo metadata --no-deps  ->  toposort on kind != "dev"
+          #
+          # `lex-trace` dev-depends on `lex-runtime`, closing a cycle no
+          # order can satisfy; that dev-dependency carries no `version`
+          # so cargo strips it from the published manifest.
           for crate in \
             lex-syntax \
             lex-ast \
             lex-types \
             lex-bytecode \
-            lex-runtime \
             lex-trace \
             lex-vcs \
             lex-store \
+            lex-runtime \
             lex-api \
             spec-checker
           do

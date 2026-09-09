@@ -22,4 +22,9 @@ lex-ast = { path = "../lex-ast", version = "0.11.0" }
 
 [dev-dependencies]
 lex-syntax = { path = "../lex-syntax", version = "0.11.0" }
-lex-runtime = { path = "../lex-runtime", version = "0.11.0" }
+# No `version`, deliberately: lex-runtime depends on lex-store, which
+# depends on lex-trace, so a versioned dev-dependency here closes a cycle
+# that cannot be published in any order. Cargo strips a path-only
+# dev-dependency from the published manifest, which is the documented way
+# to break exactly this.
+lex-runtime = { path = "../lex-runtime" }
