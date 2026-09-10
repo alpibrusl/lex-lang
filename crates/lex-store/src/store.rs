@@ -159,7 +159,68 @@ impl Store {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(root.join("stages"))?;
         fs::create_dir_all(root.join("traces"))?;
-        Ok(Self { root })
+        let store = Self { root };
+        store.ensure_stage_index();
+        Ok(store)
+    }
+
+    /// One-time migration for a store that predates the reverse
+    /// index (#822): if `stage_index.jsonl` doesn't exist yet, build
+    /// it now in a single pass instead of leaving every subsequent
+    /// `lookup_lifecycle` call to discover its own entry via the
+    /// slow per-call scan-and-backfill fallback.
+    ///
+    /// That per-call fallback is fine for the rare individual miss
+    /// it was designed for, but pathological as a *bulk* cold-start
+    /// strategy: on a tenant with a few thousand functions it means
+    /// redoing an O(total sigs) scan from scratch for *each* of a
+    /// few thousand cold entries — O(total sigs²) — which measured
+    /// as a near-stall (page-cache thrashing) on a memory-
+    /// constrained host. A single pass over `list_sigs()` is
+    /// O(total sigs) total.
+    ///
+    /// Runs once per `Store::open` call — which, in a long-lived
+    /// server (lex-hub caches one `Store` per tenant for the life of
+    /// the process), means once per tenant per process lifetime, not
+    /// once per request. For a store that already has the index (the
+    /// steady state after the first run on any given host) this is a
+    /// single cheap file-existence check. Best-effort like the rest
+    /// of the index: any failure here just leaves the slower per-call
+    /// fallback as the only path, never breaks correctness.
+    fn ensure_stage_index(&self) {
+        if self.stage_index_path().exists() {
+            return;
+        }
+        let _ = self.rebuild_stage_index();
+    }
+
+    /// Build (or top up) the reverse index in one pass over every
+    /// SigId in the store, rather than relying on `lookup_lifecycle`
+    /// to discover entries one at a time. Safe to call at any time,
+    /// including on a partially-built index (e.g. one left behind by
+    /// an interrupted request that was populating it lazily): already-
+    /// indexed stage_ids are skipped, so this only does the work that
+    /// remains. Returns the number of newly-added entries.
+    pub fn rebuild_stage_index(&self) -> Result<usize, StoreError> {
+        // A sig's lifecycle can list the same stage_id more than once
+        // (Draft, then later Active, then Deprecated all carry the
+        // same stage_id with a different status) -- track newly-seen
+        // keys locally too, not just what was already on disk at the
+        // start, so a repeated stage_id within one sig's transitions
+        // doesn't get appended to the index more than once.
+        let mut existing = self.load_stage_index();
+        let mut added = 0usize;
+        for sig in self.list_sigs()? {
+            let Ok(life) = self.read_lifecycle(&sig) else { continue };
+            for t in &life.transitions {
+                if !existing.contains_key(&t.stage_id) {
+                    self.append_stage_index_entry(&t.stage_id, &sig);
+                    existing.insert(t.stage_id.clone(), sig.clone());
+                    added += 1;
+                }
+            }
+        }
+        Ok(added)
     }
 
     pub fn root(&self) -> &Path {
