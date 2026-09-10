@@ -7,6 +7,28 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.11.4] — 2026-09-10
+
+### Fixed
+
+- **`pkg_publish_handler` collapsed distinct SigIds sharing a bare
+  name (#818).** A real package legitimately declaring multiple
+  functions with the same name in different files — e.g. three
+  unrelated `validate` helpers with different signatures — used to
+  get silently collapsed to one `FnDecl` per name (in
+  `pkg_publish_handler`, and independently in
+  `publish_program_signed`'s own `old_name_to_sig`), corrupting the
+  diff for whichever functions lost the collision: a hard `500` when
+  a later file's own change hit the wrong (or since-superseded)
+  SigId, or a silently mis-tracked add/remove when it didn't. `SigId`
+  already disambiguates these correctly by full signature — the fix
+  makes `DiffReport` entries carry their own resolved SigId directly
+  instead of re-deriving one from a name-keyed lookup, and groups the
+  branch's function set by name so each file's declaration resolves
+  against the right candidate (or is correctly reported as new when
+  none matches). No changes to SigId/StageId/OpId or the op-log
+  format.
+
 ## [0.11.3] — 2026-09-09
 
 ### Fixed
