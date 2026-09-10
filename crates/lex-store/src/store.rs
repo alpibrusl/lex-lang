@@ -142,6 +142,13 @@ pub struct CandidateInfo {
     pub intent_id: Option<lex_vcs::IntentId>,
 }
 
+/// One line of `stage_index.jsonl`. See `Store::lookup_lifecycle`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct StageIndexEntry {
+    stage_id: String,
+    sig_id: String,
+}
+
 pub struct Store {
     root: PathBuf,
 }
@@ -392,6 +399,10 @@ impl Store {
                 reason: None,
             });
             self.write_lifecycle(&sig, &life)?;
+            // Register the new stage_id's owning sig up front so a
+            // later `lookup_lifecycle` (e.g. `get_ast`) never needs
+            // to fall back to a full tenant-wide scan for it.
+            self.append_stage_index_entry(&stage_id, &sig);
         }
         Ok(stage_id)
     }
@@ -811,11 +822,89 @@ impl Store {
 
     // ---- internals ----
 
+    /// `<root>/stage_index.jsonl` — an append-only, best-effort
+    /// reverse index (`StageId` -> owning `SigId`), one JSON object
+    /// per line. Backs `lookup_lifecycle`'s fast path; see its doc
+    /// comment. Not a second source of truth: every entry is
+    /// reconstructible from `stages/<sig>/lifecycle.json`, so a
+    /// missing, truncated, or entirely absent index file only costs
+    /// a slower lookup (the pre-existing full scan), never
+    /// correctness — matching this module's "filesystem is the
+    /// source of truth" stance (see the module doc comment) rather
+    /// than introducing an actual second database.
+    fn stage_index_path(&self) -> PathBuf {
+        self.root.join("stage_index.jsonl")
+    }
+
+    /// Best-effort load of the whole reverse index into memory.
+    /// Tolerates a missing file (no index yet) and a corrupt or
+    /// torn last line (a crash mid-append under the single-writer
+    /// Tier-1 assumption) by skipping lines that don't parse,
+    /// rather than failing the lookup that triggered the load.
+    fn load_stage_index(&self) -> std::collections::BTreeMap<String, String> {
+        let mut out = std::collections::BTreeMap::new();
+        let Ok(raw) = fs::read_to_string(self.stage_index_path()) else {
+            return out;
+        };
+        for line in raw.lines() {
+            if let Ok(entry) = serde_json::from_str::<StageIndexEntry>(line) {
+                out.insert(entry.stage_id, entry.sig_id);
+            }
+        }
+        out
+    }
+
+    /// Best-effort append of one new `(stage_id, sig_id)` pair.
+    /// Failure (e.g. a read-only filesystem) only costs a future
+    /// full scan for this stage_id, never correctness, so it's
+    /// swallowed rather than propagated.
+    fn append_stage_index_entry(&self, stage_id: &str, sig: &str) {
+        use std::io::Write;
+        let entry = StageIndexEntry { stage_id: stage_id.into(), sig_id: sig.into() };
+        let Ok(line) = serde_json::to_string(&entry) else { return };
+        if let Ok(mut f) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.stage_index_path())
+        {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+
+    /// Find which SigId owns a StageId, and that sig's lifecycle.
+    ///
+    /// Before the reverse index (#822): a full scan over *every*
+    /// SigId in the tenant (`list_sigs()`, not scoped to the
+    /// package being looked at), reading and parsing each one's
+    /// `lifecycle.json` until a match turned up. `get_ast` — called
+    /// once per pre-existing function when building a publish
+    /// request's `old_fns_by_name` (`lex-api/src/handlers.rs`) —
+    /// calls this once per function, so a tenant with a few thousand
+    /// published functions turned a single publish into millions of
+    /// individual file reads; measured at roughly an hour on the
+    /// `alpibrusl` tenant's ~2,400-function store.
+    ///
+    /// Now: check the persisted reverse index first (one sequential
+    /// file read instead of up to N separate ones). A miss — the
+    /// index doesn't exist yet, or this stage_id predates it — falls
+    /// back to the full scan and backfills the index so the next
+    /// lookup for the same stage_id is fast.
     fn lookup_lifecycle(&self, stage_id: &str) -> Result<(String, Lifecycle), StoreError> {
-        // Walk every SigId, find which one contains this StageId.
+        let index = self.load_stage_index();
+        if let Some(sig) = index.get(stage_id) {
+            if let Ok(life) = self.read_lifecycle(sig) {
+                if life.transitions.iter().any(|t| t.stage_id == stage_id) {
+                    return Ok((sig.clone(), life));
+                }
+            }
+            // Index entry is stale or wrong (shouldn't happen in
+            // practice — sig ownership of a stage_id is permanent).
+            // Fall through to the full scan below rather than trust it.
+        }
         for sig in self.list_sigs()? {
             if let Ok(life) = self.read_lifecycle(&sig) {
                 if life.transitions.iter().any(|t| t.stage_id == stage_id) {
+                    self.append_stage_index_entry(stage_id, &sig);
                     return Ok((sig, life));
                 }
             }
