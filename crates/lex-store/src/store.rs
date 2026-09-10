@@ -165,10 +165,13 @@ impl Store {
     }
 
     /// One-time migration for a store that predates the reverse
-    /// index (#822): if `stage_index.jsonl` doesn't exist yet, build
-    /// it now in a single pass instead of leaving every subsequent
-    /// `lookup_lifecycle` call to discover its own entry via the
-    /// slow per-call scan-and-backfill fallback.
+    /// index (#822), or whose previous rebuild pass never finished
+    /// (e.g. the process was killed or its client disconnected
+    /// mid-request — server-side work keeps running either way, but
+    /// a *restart* genuinely stops it): build the index in a single
+    /// pass instead of leaving every subsequent `lookup_lifecycle`
+    /// call to discover its own entry via the slow per-call scan-
+    /// and-backfill fallback.
     ///
     /// That per-call fallback is fine for the rare individual miss
     /// it was designed for, but pathological as a *bulk* cold-start
@@ -179,19 +182,39 @@ impl Store {
     /// constrained host. A single pass over `list_sigs()` is
     /// O(total sigs) total.
     ///
+    /// Gated on a dedicated completion marker
+    /// (`stage_index.complete`), NOT on `stage_index.jsonl`'s mere
+    /// existence — a partially-built index file (left behind by an
+    /// interrupted rebuild, lazy or bulk) must still trigger a
+    /// re-run so the remaining entries get backfilled in one more
+    /// cheap O(total sigs) pass, not silently be mistaken for
+    /// "already done" and fall back to the slow per-call path for
+    /// whatever's left. `rebuild_stage_index` already skips entries
+    /// it finds present, so re-running it against a partial index
+    /// only does the work that remains. The marker is written only
+    /// after a full pass returns `Ok`, so a failed pass (e.g. an I/O
+    /// error partway through `list_sigs`) is retried on the next
+    /// open rather than being marked done.
+    ///
     /// Runs once per `Store::open` call — which, in a long-lived
     /// server (lex-hub caches one `Store` per tenant for the life of
     /// the process), means once per tenant per process lifetime, not
-    /// once per request. For a store that already has the index (the
-    /// steady state after the first run on any given host) this is a
+    /// once per request. Once the marker exists (the steady state
+    /// after the first successful run on any given host) this is a
     /// single cheap file-existence check. Best-effort like the rest
     /// of the index: any failure here just leaves the slower per-call
     /// fallback as the only path, never breaks correctness.
     fn ensure_stage_index(&self) {
-        if self.stage_index_path().exists() {
+        if self.stage_index_complete_marker_path().exists() {
             return;
         }
-        let _ = self.rebuild_stage_index();
+        if self.rebuild_stage_index().is_ok() {
+            let _ = fs::write(self.stage_index_complete_marker_path(), "");
+        }
+    }
+
+    fn stage_index_complete_marker_path(&self) -> PathBuf {
+        self.root.join("stage_index.complete")
     }
 
     /// Build (or top up) the reverse index in one pass over every
