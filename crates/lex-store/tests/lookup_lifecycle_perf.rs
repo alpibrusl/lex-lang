@@ -212,3 +212,116 @@ fn reopening_a_store_with_a_partial_index_and_no_marker_finishes_the_rebuild() {
          expected the interrupted rebuild to be resumed and finished on open, not left partial"
     );
 }
+
+/// The bug this caught in production (#825): `stage_index.jsonl` can
+/// only record what a full scan *finds* -- a stage_id that's
+/// genuinely orphaned (referenced by the branch's current head, but
+/// missing from every sig's lifecycle -- real data on the `alpibrusl`
+/// tenant, ~27% of its live functions) can never be indexed by the
+/// bulk rebuild. Every `get_ast` call for one of those redid the full
+/// O(total sigs) scan, found nothing, and gave up -- forever, on
+/// every single call, since nothing remembered the failure. Measured
+/// directly: 3,664 old_fns_by_name lookups against the real tenant
+/// data, 988 of them for orphaned stage_ids, took 358s locally (and
+/// 40+ minutes in production) almost entirely from re-scanning for
+/// the same permanently-missing entries over and over.
+#[test]
+fn repeated_lookups_of_a_permanently_missing_stage_id_stay_fast() {
+    let (store, _tmp) = fresh();
+    for i in 0..FN_COUNT {
+        store.publish(&make_stage(i)).unwrap();
+    }
+
+    let ghost = "sha256-of-something-that-was-never-published";
+    // First call: genuinely not found anywhere, must still fail --
+    // and must cache that fact.
+    assert!(store.get_ast(ghost).is_err());
+
+    // FN_COUNT repeats of the SAME missing lookup: without caching
+    // the negative result, each one redoes a full O(FN_COUNT) scan --
+    // O(FN_COUNT^2) overall, the same shape as the bug this test
+    // guards against.
+    let start = Instant::now();
+    for _ in 0..FN_COUNT {
+        assert!(store.get_ast(ghost).is_err());
+    }
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed.as_secs_f64() < 8.0,
+        "{FN_COUNT} repeated lookups of one permanently-missing stage_id took {elapsed:?}; \
+         expected the negative result to be cached after the first full scan, not rescanned every call"
+    );
+}
+
+#[test]
+fn get_asts_bulk_matches_individual_get_ast_calls() {
+    let (store, _tmp) = fresh();
+    let mut ids = Vec::new();
+    for i in 0..30 {
+        ids.push(store.publish(&make_stage(i)).unwrap());
+    }
+    // Interleave a few permanently-missing ids, matching the real
+    // production shape (a mix of resolvable and orphaned entries).
+    let mut lookup_ids = ids.clone();
+    for i in 0..5 {
+        lookup_ids.insert(i * 5, format!("ghost-{i}"));
+    }
+
+    let individual: Vec<Option<Stage>> = lookup_ids.iter()
+        .map(|id| store.get_ast(id).ok())
+        .collect();
+    let bulk: Vec<Option<Stage>> = store.get_asts_bulk(&lookup_ids)
+        .into_iter()
+        .map(|r| r.ok())
+        .collect();
+
+    assert_eq!(individual, bulk, "get_asts_bulk must return the exact same results, in the same order, as calling get_ast individually");
+    assert_eq!(bulk.iter().filter(|s| s.is_some()).count(), 30, "sanity: all 30 real stage_ids should resolve");
+}
+
+/// The remaining cost after the negative-cache fix (#825): every
+/// `get_ast` call re-reads and re-parses the *entire* index file, so
+/// a loop of N calls costs O(index size x N) even when every call is
+/// individually an index hit. Measured directly against real
+/// production data: 87.6s for 3,664 calls against a ~14k-line index.
+/// `get_asts_bulk` loads the index once for the whole batch instead.
+#[test]
+fn get_asts_bulk_is_faster_than_a_get_ast_loop_at_scale() {
+    const N: usize = 3_000;
+    let (store, _tmp) = fresh();
+    let mut ids = Vec::with_capacity(N);
+    for i in 0..N {
+        ids.push(store.publish(&make_stage(i)).unwrap());
+    }
+    // Mirror production's ~27% orphaned-lookup ratio so both paths
+    // pay the same one-time negative-cache population cost first.
+    let mut lookup_ids = ids.clone();
+    for i in 0..(N / 4) {
+        lookup_ids.push(format!("ghost-{i}"));
+    }
+    // Prime the negative cache for the ghosts once, outside the
+    // timed sections, so both timings below measure steady-state
+    // (index-hit-only) cost, not the one-time full-scan cost that's
+    // already covered by the tests above.
+    for i in 0..(N / 4) {
+        let _ = store.get_ast(&format!("ghost-{i}"));
+    }
+
+    let start_individual = Instant::now();
+    for id in &lookup_ids {
+        let _ = store.get_ast(id);
+    }
+    let individual_elapsed = start_individual.elapsed();
+
+    let start_bulk = Instant::now();
+    let _ = store.get_asts_bulk(&lookup_ids);
+    let bulk_elapsed = start_bulk.elapsed();
+
+    assert!(
+        bulk_elapsed.as_secs_f64() * 3.0 < individual_elapsed.as_secs_f64(),
+        "get_asts_bulk ({bulk_elapsed:?}) should be at least 3x faster than \
+         an equivalent get_ast loop ({individual_elapsed:?}) at N={N} lookups \
+         against a similarly-sized index"
+    );
+}

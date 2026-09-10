@@ -1912,9 +1912,16 @@ fn pkg_publish_handler(state: &State, body: &[u8]) -> Response<std::io::Cursor<V
         Ok(h) => h,
         Err(e) => return error_response(500, format!("branch_head: {e}")),
     };
+    // `get_asts_bulk` loads the store's reverse index once for this
+    // whole batch instead of once per call (#825's follow-up) --
+    // `old_head` alone can be several thousand entries, and a
+    // per-call `get_ast` loop re-reads and re-parses the entire index
+    // file on every single one.
+    let old_stage_ids: Vec<String> = old_head.values().cloned().collect();
     let mut old_fns_by_name: BTreeMap<String, Vec<lex_ast::FnDecl>> = BTreeMap::new();
-    for fd in old_head.values()
-        .filter_map(|stg| store.get_ast(stg).ok())
+    for fd in store.get_asts_bulk(&old_stage_ids)
+        .into_iter()
+        .filter_map(|r| r.ok())
         .filter_map(|s| match s { lex_ast::Stage::FnDecl(fd) => Some(fd), _ => None })
     {
         old_fns_by_name.entry(fd.name.clone()).or_default().push(fd);
@@ -2250,9 +2257,13 @@ fn pkg_delete_handler(state: &State, name: &str) -> Response<std::io::Cursor<Vec
         Err(e) => return error_response(500, format!("branch_head: {e}")),
     };
 
-    // Build old_fns from this package's function names that are still on the branch.
-    let old_fns: BTreeMap<String, lex_ast::FnDecl> = head.values()
-        .filter_map(|stage_id| store.get_ast(stage_id).ok())
+    // Build old_fns from this package's function names that are still on
+    // the branch. `get_asts_bulk` loads the reverse index once for the
+    // whole tenant-wide `head` rather than once per stage_id (#825).
+    let head_stage_ids: Vec<String> = head.values().cloned().collect();
+    let old_fns: BTreeMap<String, lex_ast::FnDecl> = store.get_asts_bulk(&head_stage_ids)
+        .into_iter()
+        .filter_map(|r| r.ok())
         .filter_map(|s| match s {
             lex_ast::Stage::FnDecl(fd)
                 if record.function_names.contains(&fd.name) => Some((fd.name.clone(), fd)),
