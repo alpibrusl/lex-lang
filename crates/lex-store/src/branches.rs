@@ -40,6 +40,15 @@ pub enum CasFailed {
 
 pub const DEFAULT_BRANCH: &str = "main";
 
+/// Persisted, best-effort cache of `branch_head`'s computed view,
+/// keyed on the head it was computed for. See `Store::branch_head`'s
+/// doc comment for the incremental-replay design this backs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HeadSnapshot {
+    head_op: OpId,
+    map: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Branch {
     pub name: String,
@@ -173,19 +182,55 @@ impl Store {
         Ok(Some(b))
     }
 
+    fn head_snapshot_path(&self, name: &str) -> PathBuf {
+        self.branches_dir().join(format!("{name}.head_snapshot.json"))
+    }
+
+    /// Best-effort read of the persisted snapshot for `name`. Any
+    /// failure (missing file, corrupt/partial JSON from an unclean
+    /// shutdown) is treated as "no snapshot" rather than an error —
+    /// this is a pure performance optimization, so losing it must
+    /// never break correctness, only fall back to a full walk.
+    fn load_head_snapshot(&self, name: &str) -> Option<HeadSnapshot> {
+        let raw = fs::read_to_string(self.head_snapshot_path(name)).ok()?;
+        serde_json::from_str(&raw).ok()
+    }
+
+    /// Best-effort write; a failure here (e.g. read-only filesystem)
+    /// only costs a future full walk, so it's swallowed rather than
+    /// propagated. Not atomic against a concurrent writer or a crash
+    /// mid-write — same tradeoff `set_branch_head_op`'s own
+    /// `fs::write` already makes for `branch_path`, and a torn write
+    /// just fails `load_head_snapshot`'s parse on next read.
+    fn save_head_snapshot(&self, name: &str, head_op: &OpId, map: &BTreeMap<String, String>) {
+        let snap = HeadSnapshot { head_op: head_op.clone(), map: map.clone() };
+        if let Ok(s) = serde_json::to_string(&snap) {
+            let _ = fs::write(self.head_snapshot_path(name), s);
+        }
+    }
+
     /// Computed view: walk the op log from the branch head and
     /// replay each transition into a SigId → StageId map.
     ///
-    /// PERF: O(N) per call where N is the number of ops on this
-    /// branch's history. Each call: re-opens the op log (a `mkdir
-    /// -p ops/` syscall), BFS-walks the full ancestor set, allocates
-    /// a `BTreeSet<OpId>` + `Vec<OperationRecord>` + `BTreeMap`,
-    /// reverses, then linearly replays. No memoization. Tier-1 size
-    /// (a few hundred ops per branch) makes this acceptable; if
-    /// hotter consumers land (e.g. an HTTP-served `branch_head`),
-    /// memoize per-(branch_name, head_op) — the head_op tail of the
-    /// cache key is a content-addressed hash, so cache invalidation
-    /// is free.
+    /// Backed by a persisted snapshot (`<branch>.head_snapshot.json`)
+    /// keyed on the head it was computed for. Steady state — this
+    /// call's head_op matches the last call's — replays only the ops
+    /// since the snapshot instead of the whole history: O(ops since
+    /// the last call) instead of O(total branch history). Falls back
+    /// to a full walk (and refreshes the snapshot) whenever there's no
+    /// snapshot yet, or the snapshot's op isn't actually an ancestor
+    /// of the new head (a branch reset, or history reordered by a
+    /// merge) — see `OpLog::walk_forward_since`'s own doc comment.
+    ///
+    /// This existed as a genuine, measured bottleneck before the
+    /// snapshot: a single call over a tenant with 110k+ accumulated
+    /// ops took on the order of an hour, dominated by one disk read
+    /// per ancestor op in the full BFS walk (alpibrusl/lex-lang#813's
+    /// follow-up). Every consumer that used to call this once per
+    /// file in a multi-file publish (fixed separately, also #813) now
+    /// calls it once per publish request — but "once" was still a full
+    /// walk over the *entire* history every time, since nothing
+    /// persisted the result between calls.
     pub fn branch_head(&self, name: &str) -> Result<BTreeMap<String, String>, StoreError> {
         let b = match self.get_branch(name)? {
             Some(b) => b,
@@ -194,10 +239,28 @@ impl Store {
         };
         let Some(head) = b.head_op else { return Ok(BTreeMap::new()); };
         let log = OpLog::open(self.root())?;
+
+        if let Some(snap) = self.load_head_snapshot(name) {
+            if snap.head_op == head {
+                return Ok(snap.map);
+            }
+            if let Some(new_records) = log.walk_forward_since(&head, &snap.head_op)? {
+                let mut map = snap.map;
+                for rec in &new_records {
+                    apply_transition(&mut map, &rec.produces);
+                }
+                self.save_head_snapshot(name, &head, &map);
+                return Ok(map);
+            }
+            // Snapshot's op isn't an ancestor of the new head — fall
+            // through to a full walk below, which also refreshes it.
+        }
+
         let mut map = BTreeMap::new();
         for rec in log.walk_forward(&head, None)? {
             apply_transition(&mut map, &rec.produces);
         }
+        self.save_head_snapshot(name, &head, &map);
         Ok(map)
     }
 
@@ -604,5 +667,84 @@ impl Store {
             write_branch_atomic(&self.branch_path(dst), &b)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod branch_head_snapshot_tests {
+    use super::*;
+    use lex_vcs::{Operation, OperationKind};
+    use std::collections::BTreeSet;
+
+    fn add(store: &Store, sig: &str, stg: &str) -> OpId {
+        let parent = store.get_branch(DEFAULT_BRANCH).unwrap().and_then(|b| b.head_op);
+        let op = Operation::new(
+            OperationKind::AddFunction {
+                sig_id: sig.into(),
+                stage_id: stg.into(),
+                effects: BTreeSet::new(),
+                budget_cost: None,
+            },
+            parent.into_iter().collect::<Vec<_>>(),
+        );
+        let transition = StageTransition::Create { sig_id: sig.into(), stage_id: stg.into() };
+        store.apply_operation(DEFAULT_BRANCH, op, transition).unwrap()
+    }
+
+    /// The fallback this exercises can't be reached through the public
+    /// API alone: `apply_operation`'s CAS retry always rebuilds a
+    /// single-parent op's `parents` to match the *current* head, so
+    /// there is no ordinary way to advance a branch to an op that
+    /// doesn't descend from its own history. `set_branch_head_op`
+    /// (crate-internal) is what a real reset/rebase operation would
+    /// eventually call, so this directly forces that same shape: a
+    /// head whose ancestry does NOT include the op the persisted
+    /// snapshot was computed for.
+    #[test]
+    fn branch_head_falls_back_to_full_walk_when_snapshot_predates_a_reset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+
+        add(&store, "fn::a", "stage_a");
+        add(&store, "fn::b", "stage_b");
+        let snapshotted = store.branch_head(DEFAULT_BRANCH).unwrap();
+        assert_eq!(snapshotted.len(), 2, "sanity: snapshot covers both ops");
+
+        // Force the branch onto a disconnected, single-op history —
+        // the snapshot's op is not among its ancestors.
+        let reset_op = Operation::new(
+            OperationKind::AddFunction {
+                sig_id: "fn::reset_only".into(),
+                stage_id: "stage_reset".into(),
+                effects: BTreeSet::new(),
+                budget_cost: None,
+            },
+            Vec::new(), // no parents: a fresh root, unrelated to fn::a/fn::b
+        );
+        let reset_op_id = reset_op.op_id();
+        let reset_record = lex_vcs::OperationRecord::new(
+            reset_op,
+            StageTransition::Create {
+                sig_id: "fn::reset_only".into(),
+                stage_id: "stage_reset".into(),
+            },
+        );
+        let log = OpLog::open(store.root()).unwrap();
+        log.put(&reset_record).unwrap();
+        store.set_branch_head_op(DEFAULT_BRANCH, reset_op_id).unwrap();
+
+        let after_reset = store.branch_head(DEFAULT_BRANCH).unwrap();
+        assert_eq!(
+            after_reset.len(), 1,
+            "stale snapshot must not be reused across a non-ancestor head change: {after_reset:?}"
+        );
+        assert_eq!(after_reset.get("fn::reset_only"), Some(&"stage_reset".to_string()));
+        assert!(!after_reset.contains_key("fn::a"));
+        assert!(!after_reset.contains_key("fn::b"));
+
+        // A repeat call must now hit the (correctly refreshed) snapshot
+        // and still agree.
+        let again = store.branch_head(DEFAULT_BRANCH).unwrap();
+        assert_eq!(after_reset, again);
     }
 }
