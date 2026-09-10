@@ -7,6 +7,25 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+## [0.11.5] — 2026-09-10
+
+### Fixed
+
+- **`pkg_publish_handler`'s removal cleanup (added in 0.11.4) risked
+  deleting an unrelated package's functions.** The cleanup's branch
+  view is scoped to the whole tenant, not to the package being
+  published — confirmed against real production data, where one
+  tenant hosts multiple independent packages. Every other package's
+  functions would sit unclaimed by the current package's files and
+  get reported as removed on every publish. No damage occurred (the
+  specific run that surfaced this failed atomically before applying
+  anything), but the cleanup pass has been removed entirely rather
+  than patched: nothing tracks which package owns a branch function,
+  so there's no reliable way to tell a genuine removal from another
+  package's untouched function. A deleted function's stage is now
+  left un-removed (unreferenced, not destructively touched) until
+  package-scoped ownership is tracked as a real feature.
+
 ## [0.11.4] — 2026-09-10
 
 ### Fixed
