@@ -348,3 +348,73 @@ fn multi_file_publish_disambiguates_same_name_different_signature_functions() {
         add_ops,
     );
 }
+
+/// `pkg_publish_handler`'s branch is scoped to the whole TENANT, not to
+/// one package -- confirmed in production, where `lex-schema` and
+/// `lex-ocpi` share a tenant. An earlier version of this handler's fix
+/// for #818 added a "genuinely removed" cleanup pass that treated every
+/// branch function no file in the CURRENT archive claimed as deleted --
+/// which, on a tenant hosting more than one package, meant every other
+/// package's functions (never claimed by this package's own files) got
+/// spuriously targeted for removal on every single publish. Caught
+/// before it shipped further (a stale SigId made the cleanup's own
+/// `diff_to_ops` call fail atomically before applying anything, so nothing
+/// was actually lost), but the design itself was wrong and the pass was
+/// removed rather than patched -- there's no package-scoped ownership
+/// tracked anywhere to safely resurrect it.
+///
+/// This proves the fixed behavior directly: publish package "alpha",
+/// then a completely unrelated package "bravo" under the SAME tenant --
+/// bravo's publish must produce only its own op, nothing naming alpha's
+/// function. Then republish alpha itself with a changed body: it must
+/// show up as `modify_body` (proving its original function is still
+/// live and resolvable on the branch), not `add_function` (which would
+/// mean bravo's publish had wiped it out first).
+#[test]
+fn publishing_one_package_never_touches_an_unrelated_package_in_the_same_tenant() {
+    let (srv, _tmp) = start_server();
+
+    let alpha_v1 = "fn only_in_alpha() -> Int { 1 }\n";
+    let archive_alpha_v1 = pkg_archive("alpha", "0.1.0", &[("lib.lex", alpha_v1)]);
+    let (status, body) = post_bytes(&srv.addr, "/v1/pkg/publish", &archive_alpha_v1);
+    assert_eq!(status, 200, "alpha v1 publish must succeed, got: {body}");
+
+    let bravo_src = "fn only_in_bravo() -> Int { 2 }\n";
+    let archive_bravo = pkg_archive("bravo", "0.1.0", &[("lib.lex", bravo_src)]);
+    let (status, body) = post_bytes(&srv.addr, "/v1/pkg/publish", &archive_bravo);
+    assert_eq!(status, 200, "bravo publish must succeed, got: {body}");
+
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON response");
+    let ops = parsed["ops"].as_array().expect("ops array in publish response");
+    assert_eq!(
+        ops.len(), 1,
+        "bravo's publish must produce exactly its own one add_function op \
+         and touch nothing belonging to alpha, got: {:#?}",
+        ops,
+    );
+    assert_eq!(
+        ops[0]["kind"]["op"], "add_function",
+        "expected bravo's own add_function, got: {:#?}", ops[0],
+    );
+
+    // Republish alpha with a changed body. If bravo's publish had
+    // spuriously removed alpha's function (the bug this test guards
+    // against), this would show up as a fresh `add_function` instead.
+    let alpha_v2 = "fn only_in_alpha() -> Int { 1 + 1 }\n";
+    let archive_alpha_v2 = pkg_archive("alpha", "0.2.0", &[("lib.lex", alpha_v2)]);
+    let (status, body) = post_bytes(&srv.addr, "/v1/pkg/publish", &archive_alpha_v2);
+    assert_eq!(status, 200, "alpha v2 publish must succeed, got: {body}");
+
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON response");
+    let ops = parsed["ops"].as_array().expect("ops array in publish response");
+    assert_eq!(
+        ops.len(), 1,
+        "expected exactly one op for alpha's changed body, got: {:#?}",
+        ops,
+    );
+    assert_eq!(
+        ops[0]["kind"]["op"], "modify_body",
+        "alpha's function must still be live and resolvable as a modification \
+         (bravo's publish must not have removed it) -- got: {:#?}", ops[0],
+    );
+}

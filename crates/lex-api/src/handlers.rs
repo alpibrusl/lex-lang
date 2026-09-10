@@ -2091,43 +2091,25 @@ fn pkg_publish_handler(state: &State, body: &[u8]) -> Response<std::io::Cursor<V
         }
     }
 
-    // Whatever remains in `old_fns_by_name` was never claimed by any
-    // file in this archive — genuinely removed from the package. Emit
-    // one final removal-only publish (mirroring `pkg_yank_handler`'s own
-    // empty-stages pattern below). Each entry carries its own
-    // `old_sig_id` computed directly from the FnDecl being removed, so
-    // this is safe even when several removed functions share a bare
-    // name.
-    //
-    // Note: this reports a same-request rename (a name disappearing
-    // from every file while a same-bodied function appears under a new
-    // name) as a separate Remove + Add rather than one tracked
-    // RenameSymbol op — a minor lineage-fidelity trade-off, not a
-    // correctness issue, and no worse than the pre-existing behavior for
-    // renames that already spanned files.
-    let leftover: Vec<lex_ast::FnDecl> = old_fns_by_name.into_values().flatten().collect();
-    if !leftover.is_empty() {
-        let removed_report = lex_vcs::DiffReport {
-            removed: leftover.iter().map(|fd| lex_vcs::diff_report::AddRemove {
-                name: fd.name.clone(),
-                signature: lex_vcs::render_signature(fd),
-                old_sig_id: lex_ast::sig_id(&lex_ast::Stage::FnDecl(fd.clone())),
-            }).collect(),
-            ..Default::default()
-        };
-        match store.publish_program(&branch, &[], &removed_report, &lex_vcs::ImportMap::new(), false) {
-            Ok(outcome) => {
-                let ops_json = serde_json::to_value(&outcome.ops).unwrap_or_default();
-                if let serde_json::Value::Array(arr) = ops_json {
-                    all_ops.extend(arr);
-                }
-                if let Some(h) = outcome.head_op {
-                    final_head_op = Some(h);
-                }
-            }
-            Err(e) => return write_error_response("publish_program (removals)", e),
-        }
-    }
+    // Deliberately no "genuinely removed" cleanup pass here. Whatever
+    // remains in `old_fns_by_name` was never claimed by any file in
+    // THIS archive — but the branch this walks is scoped to the whole
+    // TENANT, not to this one package: a tenant that has ever published
+    // more than one package (confirmed in production — `lex-schema` and
+    // `lex-ocpi` share a tenant) has every other package's functions
+    // sitting in `old_fns_by_name` too, forever unclaimed by any file in
+    // *this* package's own archive. An earlier version of this handler
+    // treated all such leftovers as "removed" and would have emitted
+    // RemoveFunction ops for a completely unrelated package's functions
+    // on every single publish. Caught before it shipped (`diff_to_ops`
+    // failed atomically on a stale SigId before applying anything, so
+    // no data was actually lost) — see alpibrusl/lex-lang#818's
+    // follow-up. Nothing here currently tracks which package "owns" a
+    // given branch function, so there's no reliable way to tell a
+    // genuine same-package removal from another package's untouched
+    // function; leaving a deleted function's stage un-removed (it just
+    // sits there, unreferenced) is the safe default until package-scoped
+    // ownership is tracked, not silently deleting a stranger's data.
 
     // Reject re-publish of the same (name, version) to keep the op log stable.
     if load_pkg_record(&state.root, &pkg_name, &pkg_version).is_some() {
