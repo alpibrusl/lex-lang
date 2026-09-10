@@ -67,6 +67,7 @@ pub fn compute_diff(
         report.removed.push(AddRemove {
             name: n.clone(),
             signature: render_signature(fd),
+            old_sig_id: lex_ast::sig_id(&Stage::FnDecl(fd.clone())),
         });
     }
     for &n in &only_b {
@@ -75,14 +76,17 @@ pub fn compute_diff(
         report.added.push(AddRemove {
             name: n.clone(),
             signature: render_signature(fd),
+            old_sig_id: None,
         });
     }
     for (an, bn) in &renamed_pairs {
+        let fa = &a[an];
         let fd = &b[bn];
         report.renamed.push(Renamed {
             from: an.clone(),
             to: bn.clone(),
             signature: render_signature(fd),
+            old_sig_id: lex_ast::sig_id(&Stage::FnDecl(fa.clone())).unwrap_or_default(),
         });
     }
 
@@ -108,6 +112,7 @@ pub fn compute_diff(
             signature_changed: sig_a != sig_b,
             effect_changes,
             body_patches: patches,
+            old_sig_id: lex_ast::sig_id(&Stage::FnDecl(fa.clone())).unwrap_or_default(),
         });
     }
     report

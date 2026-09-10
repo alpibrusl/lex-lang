@@ -116,11 +116,12 @@ pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 
     if dry_run {
         // Compute the op kinds for the dry-run preview using diff_to_ops
-        // directly, without persisting anything.
-        let old_name_to_sig: BTreeMap<String, String> = old_head
-            .iter()
-            .filter_map(|(sig, stg)| store.get_metadata(stg).ok().map(|m| (m.name, sig.clone())))
-            .collect();
+        // directly, without persisting anything. `report` already
+        // carries each entry's own resolved `old_sig_id` (computed by
+        // `compute_diff` directly from the old FnDecl), so there's no
+        // separate name-keyed sig lookup to build here — see
+        // `diff_report`'s doc comments for why that used to be a bug
+        // (#818).
         let old_effects: BTreeMap<String, BTreeSet<String>> = old_head
             .iter()
             .filter_map(|(sig, stg)| {
@@ -138,7 +139,6 @@ pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         let old_imports = store.derive_imports_from_oplog(&branch)?;
         let op_kinds = lex_vcs::diff_to_ops(lex_vcs::DiffInputs {
             old_head: &old_head,
-            old_name_to_sig: &old_name_to_sig,
             old_effects: &old_effects,
             old_imports: &old_imports,
             new_stages: &stages,
