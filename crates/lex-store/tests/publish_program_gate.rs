@@ -128,6 +128,7 @@ fn publish_program_emits_typecheck_attestation_per_added_op() {
         added: vec![lex_vcs::diff_report::AddRemove {
             name: "factorial".into(),
             signature: "fn factorial(Int) -> Int".into(),
+            old_sig_id: None,
         }],
         ..Default::default()
     };

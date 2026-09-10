@@ -21,11 +21,11 @@ pub type ImportMap = BTreeMap<String, BTreeSet<ModuleRef>>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DiffMappingError {
-    #[error("diff mentions removed/modified name `{0}` but old_name_to_sig has no entry")]
+    #[error("diff mentions removed/modified name `{0}` but no old_sig_id was resolved for it")]
     MissingOldSigForName(String),
     #[error("diff mentions added/renamed name `{0}` but new_stages has no matching stage")]
     MissingNewStageForName(String),
-    #[error("sig `{0}` is in old_name_to_sig but not in old_head")]
+    #[error("sig `{0}` is in the diff's old_sig_id but not in old_head")]
     MissingOldHeadForSig(SigId),
     #[error("stage for `{0}` produces no sig_id (likely an Import that slipped through)")]
     NoSigIdForStage(String),
@@ -37,9 +37,6 @@ pub enum DiffMappingError {
 pub struct DiffInputs<'a> {
     /// Current head SigId → StageId map.
     pub old_head: &'a BTreeMap<SigId, StageId>,
-    /// Map of fn/type *name* → its SigId at the current head. The
-    /// caller assembles this by walking the old stages or the metadata.
-    pub old_name_to_sig: &'a BTreeMap<String, SigId>,
     /// Effect set per sig at the current head.
     pub old_effects: &'a BTreeMap<SigId, EffectSet>,
     /// Per-file imports at the current head.
@@ -48,7 +45,14 @@ pub struct DiffInputs<'a> {
     pub new_stages: &'a [Stage],
     /// Per-file imports of the new program.
     pub new_imports: &'a ImportMap,
-    /// AST-diff between old and new sources, by name.
+    /// AST-diff between old and new sources, by name. Each removed/
+    /// renamed/modified entry carries its own resolved `old_sig_id`
+    /// (see `diff_report`'s doc comments) rather than this module
+    /// re-deriving one from a name-keyed lookup: a bare function name
+    /// is not unique across a package's files (#818 — e.g. two files
+    /// legitimately both declaring a local `validate` helper with
+    /// different signatures), so a `name -> SigId` map here would
+    /// silently collapse distinct functions onto one SigId.
     pub diff: &'a DiffReport,
 }
 
@@ -95,7 +99,7 @@ pub fn diff_to_ops(inputs: DiffInputs<'_>) -> Result<Vec<OperationKind>, DiffMap
 
     // 2. Removed → RemoveFunction / RemoveType.
     for r in &inputs.diff.removed {
-        let Some(sig) = inputs.old_name_to_sig.get(&r.name) else {
+        let Some(sig) = r.old_sig_id.as_ref() else {
             return Err(DiffMappingError::MissingOldSigForName(r.name.clone()));
         };
         let Some(last) = inputs.old_head.get(sig) else {
@@ -148,9 +152,7 @@ pub fn diff_to_ops(inputs: DiffInputs<'_>) -> Result<Vec<OperationKind>, DiffMap
 
     // 4. Renamed → RenameSymbol.
     for r in &inputs.diff.renamed {
-        let Some(from_sig) = inputs.old_name_to_sig.get(&r.from) else {
-            return Err(DiffMappingError::MissingOldSigForName(r.from.clone()));
-        };
+        let from_sig = &r.old_sig_id;
         let Some(stage) = new_by_name.get(r.to.as_str()) else {
             return Err(DiffMappingError::MissingNewStageForName(r.to.clone()));
         };
@@ -169,9 +171,7 @@ pub fn diff_to_ops(inputs: DiffInputs<'_>) -> Result<Vec<OperationKind>, DiffMap
 
     // 5. Modified → ChangeEffectSig | ModifyBody | ModifyType.
     for m in &inputs.diff.modified {
-        let Some(sig) = inputs.old_name_to_sig.get(&m.name) else {
-            return Err(DiffMappingError::MissingOldSigForName(m.name.clone()));
-        };
+        let sig = &m.old_sig_id;
         let Some(from_id) = inputs.old_head.get(sig) else {
             return Err(DiffMappingError::MissingOldHeadForSig(sig.clone()));
         };
@@ -259,7 +259,6 @@ mod tests {
     #[test]
     fn empty_diff_yields_no_ops() {
         let head: BTreeMap<SigId, StageId> = BTreeMap::new();
-        let n2s: BTreeMap<String, SigId> = BTreeMap::new();
         let eff: BTreeMap<SigId, EffectSet> = BTreeMap::new();
         let oi: ImportMap = ImportMap::new();
         let ni: ImportMap = ImportMap::new();
@@ -267,7 +266,6 @@ mod tests {
         let d = dr();
         let ops = diff_to_ops(DiffInputs {
             old_head: &head,
-            old_name_to_sig: &n2s,
             old_effects: &eff,
             old_imports: &oi,
             new_stages: &stages,
@@ -291,14 +289,13 @@ mod tests {
 
         let mut head = BTreeMap::new();
         head.insert("parse-old-sig".to_string(), to_stage.clone());
-        let mut n2s = BTreeMap::new();
-        n2s.insert("parse".to_string(), "parse-old-sig".to_string());
 
         let mut diff = dr();
         diff.renamed.push(Renamed {
             from: "parse".into(),
             to: "parse_int".into(),
             signature: "fn parse_int(s :: Str) -> Int".into(),
+            old_sig_id: "parse-old-sig".into(),
         });
 
         let eff = BTreeMap::new();
@@ -306,7 +303,6 @@ mod tests {
         let ni = ImportMap::new();
         let ops = diff_to_ops(DiffInputs {
             old_head: &head,
-            old_name_to_sig: &n2s,
             old_effects: &eff,
             old_imports: &oi,
             new_stages: &[parse_int],
@@ -336,8 +332,6 @@ mod tests {
 
         let mut head = BTreeMap::new();
         head.insert(sig.clone(), "old-stage-id".to_string());
-        let mut n2s = BTreeMap::new();
-        n2s.insert("fac".to_string(), sig.clone());
 
         let mut diff = dr();
         diff.modified.push(Modified {
@@ -347,13 +341,14 @@ mod tests {
             signature_changed: false,
             effect_changes: EffectChanges::default(),
             body_patches: Vec::new(),
+            old_sig_id: sig.clone(),
         });
 
         let eff = BTreeMap::new();
         let oi = ImportMap::new();
         let ni = ImportMap::new();
         let ops = diff_to_ops(DiffInputs {
-            old_head: &head, old_name_to_sig: &n2s, old_effects: &eff,
+            old_head: &head, old_effects: &eff,
             old_imports: &oi, new_stages: &[fac], new_imports: &ni, diff: &diff,
         }).expect("ok");
         assert_eq!(ops.len(), 1);
@@ -373,13 +368,12 @@ mod tests {
         new_imports.insert("main.lex".into(),
             std::iter::once("std.io".to_string()).collect());
         let head = BTreeMap::new();
-        let n2s = BTreeMap::new();
         let eff = BTreeMap::new();
         let oi = ImportMap::new();
         let stages: Vec<Stage> = Vec::new();
         let diff = dr();
         let ops = diff_to_ops(DiffInputs {
-            old_head: &head, old_name_to_sig: &n2s, old_effects: &eff,
+            old_head: &head, old_effects: &eff,
             old_imports: &oi, new_stages: &stages, new_imports: &new_imports, diff: &diff,
         }).expect("ok");
         assert_eq!(ops.len(), 1);
@@ -395,18 +389,21 @@ mod tests {
     #[test]
     fn missing_old_sig_for_removed_name_errors() {
         let head: BTreeMap<SigId, StageId> = BTreeMap::new();
-        let n2s: BTreeMap<String, SigId> = BTreeMap::new(); // empty — diff says "ghost" was removed
         let eff: BTreeMap<SigId, EffectSet> = BTreeMap::new();
         let oi = ImportMap::new();
         let ni = ImportMap::new();
         let stages: Vec<Stage> = Vec::new();
         let mut diff = dr();
+        // No `old_sig_id` was resolved for this removal — the caller
+        // (e.g. a hand-assembled report, or a bug in the resolver)
+        // failed to find the old side.
         diff.removed.push(crate::diff_report::AddRemove {
             name: "ghost".into(),
             signature: "fn ghost() -> Int".into(),
+            old_sig_id: None,
         });
         let err = diff_to_ops(DiffInputs {
-            old_head: &head, old_name_to_sig: &n2s, old_effects: &eff,
+            old_head: &head, old_effects: &eff,
             old_imports: &oi, new_stages: &stages, new_imports: &ni, diff: &diff,
         }).unwrap_err();
         match err {
@@ -485,8 +482,6 @@ mod tests {
 
         let mut head = BTreeMap::new();
         head.insert(sig.clone(), from_stage_id.clone());
-        let mut n2s = BTreeMap::new();
-        n2s.insert("weather".to_string(), sig.clone());
         let mut eff = BTreeMap::new();
         eff.insert(sig.clone(), effect_set(&bare_stage.effects));
 
@@ -503,6 +498,7 @@ mod tests {
                 added: vec!["net(\"wttr.in\")".into()],
                 removed: vec!["net".into()],
             },
+            old_sig_id: sig.clone(),
         });
 
         let oi = ImportMap::new();
@@ -510,7 +506,6 @@ mod tests {
         let new_stage = Stage::FnDecl(scoped_stage);
         let ops = diff_to_ops(DiffInputs {
             old_head: &head,
-            old_name_to_sig: &n2s,
             old_effects: &eff,
             old_imports: &oi,
             new_stages: &[new_stage],

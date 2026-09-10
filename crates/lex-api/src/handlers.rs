@@ -1890,52 +1890,109 @@ fn pkg_publish_handler(state: &State, body: &[u8]) -> Response<std::io::Cursor<V
     let mut final_head_op: Option<String> = None;
     let mut all_function_names: Vec<String> = Vec::new();
 
-    // `old_fns` mirrors the branch's current function set. It used to be
-    // rebuilt from scratch on every loop iteration via `branch_head` (an
-    // O(N)-per-call, unmemoized walk of the *entire* branch op history —
-    // see that function's own doc comment) plus a `get_ast` disk fetch for
-    // every resulting entry — O(files * (history_size + live_fn_count))
-    // overall. On a tenant with 110k+ accumulated ops this took tens of
-    // minutes even after fixing compute_diff's quadratic hashing (#813):
-    // fixing that alone wasn't enough at this scale. Computing it once
-    // here and then applying each file's own already-computed `report`
-    // (added/removed/renamed/modified) to it in memory afterward keeps it
-    // exactly in sync with what the store now holds, at O(history_size)
-    // total instead of O(files * history_size).
+    // `old_fns_by_name` mirrors the branch's current function set,
+    // GROUPED by name rather than collapsed to one entry per name. Two
+    // files in the same package can legitimately declare a local helper
+    // with the same name but a different signature (#818 — e.g. three
+    // unrelated `validate` functions across `field.lex`/`schema.lex`/
+    // `validator.lex` in a real published package). `SigId` already
+    // disambiguates them correctly — it hashes the full signature, not
+    // just the name — so the bug was ever collapsing multiple SigIds
+    // sharing a name down to one `FnDecl`, silently discarding the
+    // others and corrupting later diffs against them.
+    //
+    // Building this once here (rather than re-deriving it on every loop
+    // iteration) is also what fixed #813's performance issue: `branch_head`
+    // is an O(N)-per-call, unmemoized walk of the *entire* branch op
+    // history, and `get_ast` is a disk fetch per live function —
+    // O(files * (history_size + live_fn_count)) overall on a tenant with
+    // 110k+ accumulated ops, tens of minutes even after fixing
+    // `compute_diff`'s quadratic hashing alone.
     let old_head = match store.branch_head(&branch) {
         Ok(h) => h,
         Err(e) => return error_response(500, format!("branch_head: {e}")),
     };
-    let mut old_fns: BTreeMap<String, lex_ast::FnDecl> = old_head.values()
+    let mut old_fns_by_name: BTreeMap<String, Vec<lex_ast::FnDecl>> = BTreeMap::new();
+    for fd in old_head.values()
         .filter_map(|stg| store.get_ast(stg).ok())
-        .filter_map(|s| match s {
-            lex_ast::Stage::FnDecl(fd) => Some((fd.name.clone(), fd)),
-            _ => None,
-        })
-        .collect();
+        .filter_map(|s| match s { lex_ast::Stage::FnDecl(fd) => Some(fd), _ => None })
+    {
+        old_fns_by_name.entry(fd.name.clone()).or_default().push(fd);
+    }
+    // Names successfully published by an EARLIER file within this same
+    // request, grouped by name like `old_fns_by_name` (for the same
+    // reason: two files can publish two structurally different
+    // functions under one shared name in the same request). Kept
+    // separate from `old_fns_by_name` so a name published here is never
+    // swept up by the final "genuinely removed" pass below just because
+    // no later file also happens to reference it.
+    let mut published_this_request: BTreeMap<String, Vec<lex_ast::FnDecl>> = BTreeMap::new();
 
-    // Load, canonicalize, and type-check every file up front so we know the
-    // *whole package's* function set before diffing any single file against
-    // the branch. Each file's own diff must only be compared against
-    // functions genuinely absent from the entire package being published —
-    // not just absent from that one file. The per-file loop below used to
-    // diff each file against `old_fns` directly: for a package with more
-    // than one file, every file's diff spuriously reported every OTHER
-    // file's functions as "removed" (they're not defined in *this* file),
-    // and `store.publish_program` would dutifully emit RemoveFunction ops
-    // for them. Once two files both got processed this way, the second
-    // file to actually touch one of those "removed" names hit the store's
-    // own consistency check and failed outright ("old_name_to_sig has no
-    // entry") — a real publish of lex-schema's 21 files hit this on
-    // `flatten_cli_result` the moment the #813 performance fixes let a
-    // real multi-file publish reach this code path for the first time.
+    // A name-independent fingerprint of a function's *contract*
+    // (effects, param types, return type, examples — everything SigId
+    // hashes except the name). Used only to disambiguate when multiple
+    // candidates share a bare name: if this file's own declaration
+    // structurally matches exactly one of them, that's unambiguously
+    // the same evolving function; otherwise it's a new, unrelated
+    // declaration that happens to reuse a name used elsewhere.
+    fn structural_key(fd: &lex_ast::FnDecl) -> Option<String> {
+        let mut anon = fd.clone();
+        anon.name = String::new();
+        lex_ast::sig_id(&lex_ast::Stage::FnDecl(anon))
+    }
+
+    // Look up (and consume) the candidate in `map[name]` that matches
+    // `new_fd`'s identity.
+    //
+    // `single_candidate_always_matches` controls what happens when
+    // there's exactly one candidate: `true` treats it as unambiguous
+    // (preserves today's behavior for the common, non-colliding case,
+    // including signature-changing modifications — safe only when the
+    // candidate pool for this name is COMPLETE and won't grow further,
+    // as `old_fns_by_name` is: built once, up front, from the whole
+    // branch). `false` always requires an exact structural match even
+    // with one candidate — required for `published_this_request`, whose
+    // pool for a name grows incrementally as files are processed: "one
+    // candidate so far" doesn't mean "no ambiguity", a not-yet-processed
+    // file could still publish a second, differently-signed function
+    // under the same name (exactly what happens with three files each
+    // declaring their own local `validate`).
+    //
+    // Either way, several candidates always require an exact structural
+    // match to disambiguate; no match means this is a distinct,
+    // unrelated declaration reusing a name used elsewhere — returns
+    // `None` rather than guessing and mis-attributing history.
+    fn take_matching(
+        map: &mut BTreeMap<String, Vec<lex_ast::FnDecl>>,
+        name: &str,
+        new_fd: &lex_ast::FnDecl,
+        single_candidate_always_matches: bool,
+    ) -> Option<lex_ast::FnDecl> {
+        let candidates = map.get_mut(name)?;
+        let idx = match candidates.len() {
+            0 => return None,
+            1 if single_candidate_always_matches => 0,
+            _ => {
+                let want = structural_key(new_fd);
+                candidates.iter().position(|c| structural_key(c) == want)?
+            }
+        };
+        let matched = candidates.remove(idx);
+        if candidates.is_empty() {
+            map.remove(name);
+        }
+        Some(matched)
+    }
+
+    // Load, canonicalize, and type-check every file up front so we know
+    // the whole package's function set before diffing any single file
+    // against the branch.
     struct FileUnit {
         path: PathBuf,
         stages: Vec<lex_ast::Stage>,
         new_fns: BTreeMap<String, lex_ast::FnDecl>,
     }
     let mut units: Vec<FileUnit> = Vec::new();
-    let mut all_new_fns_union: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for lex_path in &lex_files {
         let prog = match load_program(lex_path) {
             Ok(p) => p,
@@ -1955,7 +2012,6 @@ fn pkg_publish_handler(state: &State, body: &[u8]) -> Response<std::io::Cursor<V
                 _ => None,
             })
             .collect();
-        all_new_fns_union.extend(new_fns.keys().cloned());
         units.push(FileUnit { path: lex_path.clone(), stages, new_fns });
     }
 
@@ -1970,15 +2026,22 @@ fn pkg_publish_handler(state: &State, body: &[u8]) -> Response<std::io::Cursor<V
             }
         }
 
-        // Diff this file against the branch's function set minus anything
-        // owned by another file in this same archive (defined somewhere in
-        // the package, not defined here) — that's not this file's business
-        // to report as removed or modified; whichever file actually
-        // defines it will correctly diff it against its own prior state.
-        let old_fns_for_file: BTreeMap<String, lex_ast::FnDecl> = old_fns.iter()
-            .filter(|(name, _)| !all_new_fns_union.contains(*name) || new_fns.contains_key(*name))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        // Resolve each of this file's own declarations against a
+        // name-and-signature-aware candidate pool: first whatever an
+        // EARLIER file in this same request already published under
+        // this name (several files can each own a differently-signed
+        // function sharing a name — `published_this_request` groups by
+        // name for exactly that reason), then the true original branch
+        // state. See `take_matching`'s own doc comment for the
+        // disambiguation rule.
+        let mut old_fns_for_file: BTreeMap<String, lex_ast::FnDecl> = BTreeMap::new();
+        for (name, new_fd) in new_fns {
+            let resolved = take_matching(&mut published_this_request, name, new_fd, false)
+                .or_else(|| take_matching(&mut old_fns_by_name, name, new_fd, true));
+            if let Some(fd) = resolved {
+                old_fns_for_file.insert(name.clone(), fd);
+            }
+        }
         let report = lex_vcs::compute_diff(&old_fns_for_file, new_fns, false);
 
         let file_key = lex_path
@@ -2005,33 +2068,64 @@ fn pkg_publish_handler(state: &State, body: &[u8]) -> Response<std::io::Cursor<V
                 if let Some(h) = outcome.head_op {
                     final_head_op = Some(h);
                 }
-                // Keep `old_fns` in sync with what the store now holds,
-                // using the diff we already computed above instead of
-                // re-reading it back from disk.
-                for a in &report.added {
-                    if let Some(fd) = new_fns.get(&a.name) {
-                        old_fns.insert(a.name.clone(), fd.clone());
-                    }
-                }
-                for r in &report.removed {
-                    old_fns.remove(&r.name);
-                }
-                for ren in &report.renamed {
-                    old_fns.remove(&ren.from);
-                    if let Some(fd) = new_fns.get(&ren.to) {
-                        old_fns.insert(ren.to.clone(), fd.clone());
-                    }
-                }
-                for m in &report.modified {
-                    if let Some(fd) = new_fns.get(&m.name) {
-                        old_fns.insert(m.name.clone(), fd.clone());
-                    }
+                // `old_fns_for_file`'s names are always a subset of
+                // `new_fns`'s (built only from names present in this
+                // file), so `report.removed`/`report.renamed` are
+                // structurally always empty here — a genuine removal or
+                // rename can only be identified once we know the WHOLE
+                // package's declarations, handled once after this loop.
+                // Record every one of this file's own declarations
+                // (added, modified, *or* unchanged) as this request's
+                // current version of that name, so a LATER file that
+                // also touches it — whether to actually change it or
+                // just to re-diff against it — resolves correctly
+                // instead of finding nothing and misreporting an Add.
+                for (name, fd) in new_fns {
+                    published_this_request.entry(name.clone()).or_default().push(fd.clone());
                 }
             }
             Err(lex_store::StoreError::TypeError(errs)) => {
                 return error_with_detail(422, "type errors", serde_json::to_value(&errs).unwrap());
             }
             Err(e) => return write_error_response("publish_program", e),
+        }
+    }
+
+    // Whatever remains in `old_fns_by_name` was never claimed by any
+    // file in this archive — genuinely removed from the package. Emit
+    // one final removal-only publish (mirroring `pkg_yank_handler`'s own
+    // empty-stages pattern below). Each entry carries its own
+    // `old_sig_id` computed directly from the FnDecl being removed, so
+    // this is safe even when several removed functions share a bare
+    // name.
+    //
+    // Note: this reports a same-request rename (a name disappearing
+    // from every file while a same-bodied function appears under a new
+    // name) as a separate Remove + Add rather than one tracked
+    // RenameSymbol op — a minor lineage-fidelity trade-off, not a
+    // correctness issue, and no worse than the pre-existing behavior for
+    // renames that already spanned files.
+    let leftover: Vec<lex_ast::FnDecl> = old_fns_by_name.into_values().flatten().collect();
+    if !leftover.is_empty() {
+        let removed_report = lex_vcs::DiffReport {
+            removed: leftover.iter().map(|fd| lex_vcs::diff_report::AddRemove {
+                name: fd.name.clone(),
+                signature: lex_vcs::render_signature(fd),
+                old_sig_id: lex_ast::sig_id(&lex_ast::Stage::FnDecl(fd.clone())),
+            }).collect(),
+            ..Default::default()
+        };
+        match store.publish_program(&branch, &[], &removed_report, &lex_vcs::ImportMap::new(), false) {
+            Ok(outcome) => {
+                let ops_json = serde_json::to_value(&outcome.ops).unwrap_or_default();
+                if let serde_json::Value::Array(arr) = ops_json {
+                    all_ops.extend(arr);
+                }
+                if let Some(h) = outcome.head_op {
+                    final_head_op = Some(h);
+                }
+            }
+            Err(e) => return write_error_response("publish_program (removals)", e),
         }
     }
 

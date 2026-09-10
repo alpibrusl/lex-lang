@@ -259,3 +259,92 @@ fn multi_file_publish_does_not_spuriously_remove_a_name_owned_by_another_file() 
         ops,
     );
 }
+
+/// The bug that actually hit production (#818): `pkg_publish_handler`
+/// collapsed the branch's function set to one `FnDecl` per bare NAME
+/// before diffing, even though `SigId` (which drives real identity)
+/// already correctly disambiguates functions by their full signature,
+/// not just their name. A real package (`lex-schema`) legitimately
+/// declares three unrelated `validate` functions with different
+/// signatures across `field.lex`, `schema.lex`, and `validator.lex` --
+/// each file's own local helper, a completely normal pattern with no
+/// language-level uniqueness requirement on top-level names across
+/// files. Republishing all three (only one of them actually changed)
+/// used to corrupt the diff: whichever two lost the name collision
+/// were misdiagnosed, at best mis-tracked, at worst rejected outright
+/// by the store's own consistency check.
+///
+/// This reproduces the minimal shape with three files, three `validate`
+/// functions with three different signatures, republished with only
+/// one body actually changed: the publish must succeed, with exactly
+/// one `modify_body` op (the one that changed) and zero
+/// `remove_function`/`add_function` ops (the other two are unchanged
+/// and must be recognized as such, not as removed-and-re-added).
+#[test]
+fn multi_file_publish_disambiguates_same_name_different_signature_functions() {
+    let (srv, _tmp) = start_server();
+
+    // No `examples {}` blocks here on purpose: examples are part of
+    // SigId's own hash (alongside effects/params/return type), so
+    // field_v2 changing its example value to match a changed body would
+    // ALSO change its structural key -- exercising a different, already
+    //-understood trade-off (see this test module's doc comment) rather
+    // than what this test means to demonstrate. A pure body change with
+    // an unchanged signature must never affect structural matching.
+    let field_v1 = "fn validate(x :: Int) -> Int { x }\n";
+    let schema_v1 = "fn validate(x :: Str) -> Str { x }\n";
+    let validator_v1 = "fn validate(x :: Bool) -> Bool { x }\n";
+    let archive_v1 = pkg_archive("threevalidate", "0.1.0", &[
+        ("field.lex", field_v1),
+        ("schema.lex", schema_v1),
+        ("validator.lex", validator_v1),
+    ]);
+    let (status, body) = post_bytes(&srv.addr, "/v1/pkg/publish", &archive_v1);
+    assert_eq!(status, 200, "v1 publish (three same-name, different-signature functions) must succeed, got: {body}");
+
+    // v2: republish all three files, only field.lex's body actually
+    // changes (Int -> Int, x -> x + 1). schema.lex and validator.lex are
+    // byte-for-byte the same as v1.
+    let field_v2 = "fn validate(x :: Int) -> Int { x + 1 }\n";
+    let archive_v2 = pkg_archive("threevalidate", "0.2.0", &[
+        ("field.lex", field_v2),
+        ("schema.lex", schema_v1),
+        ("validator.lex", validator_v1),
+    ]);
+    let (status, body) = post_bytes(&srv.addr, "/v1/pkg/publish", &archive_v2);
+    assert_eq!(status, 200, "v2 publish must succeed -- the three `validate`s must be correctly disambiguated by signature, got: {body}");
+
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON response");
+    let ops = parsed["ops"].as_array().expect("ops array in publish response");
+
+    let modify_ops: Vec<&serde_json::Value> = ops.iter()
+        .filter(|op| op["kind"]["op"] == "modify_body")
+        .collect();
+    assert_eq!(
+        modify_ops.len(), 1,
+        "expected exactly one modify_body op (field.lex's validate changed; \
+         schema.lex's and validator.lex's did not), got: {:#?}",
+        ops,
+    );
+
+    let remove_ops: Vec<&serde_json::Value> = ops.iter()
+        .filter(|op| op["kind"]["op"] == "remove_function")
+        .collect();
+    assert!(
+        remove_ops.is_empty(),
+        "expected no remove_function ops -- all three `validate`s are still \
+         declared in v2, just correctly disambiguated by signature. Got: {:#?}",
+        remove_ops,
+    );
+
+    let add_ops: Vec<&serde_json::Value> = ops.iter()
+        .filter(|op| op["kind"]["op"] == "add_function")
+        .collect();
+    assert!(
+        add_ops.is_empty(),
+        "expected no add_function ops -- schema.lex's and validator.lex's \
+         `validate` already existed from v1 and are unchanged in v2, they \
+         must not be mistaken for new declarations. Got: {:#?}",
+        add_ops,
+    );
+}

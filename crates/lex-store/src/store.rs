@@ -889,12 +889,16 @@ impl Store {
             return Err(StoreError::TypeError(errors));
         }
 
-        // Build old-side views from the current branch.
+        // Build old-side views from the current branch. There used to be
+        // an `old_name_to_sig: BTreeMap<String, SigId>` built here too,
+        // keyed by bare function name — but a bare name is not unique
+        // across a package's files (#818: two files can legitimately
+        // both declare a local `validate` helper with different
+        // signatures), so a name-keyed map silently collapsed distinct
+        // SigIds onto one. `diff` now carries each entry's own resolved
+        // `old_sig_id` directly (see `diff_report`'s doc comments), so
+        // `diff_to_ops` no longer needs this lookup at all.
         let old_head = self.branch_head(branch)?;
-        let old_name_to_sig: BTreeMap<String, String> = old_head
-            .iter()
-            .filter_map(|(sig, stg)| self.get_metadata(stg).ok().map(|m| (m.name, sig.clone())))
-            .collect();
         let old_effects: BTreeMap<String, BTreeSet<String>> = old_head
             .iter()
             .filter_map(|(sig, stg)| {
@@ -913,7 +917,6 @@ impl Store {
 
         let op_kinds = lex_vcs::diff_to_ops(lex_vcs::DiffInputs {
             old_head: &old_head,
-            old_name_to_sig: &old_name_to_sig,
             old_effects: &old_effects,
             old_imports: &old_imports,
             new_stages: stages,
