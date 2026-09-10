@@ -145,13 +145,19 @@ fn reopening_a_store_with_legacy_data_bulk_rebuilds_instead_of_relying_on_lazy_f
             ids.push(store.publish(&make_stage(i)).unwrap());
         }
     }
-    // Simulate data published before the index existed at all.
+    // Simulate data published before the index existed at all: no
+    // index file AND no completion marker (the marker from the
+    // `fresh()` open above, made while the store was still empty,
+    // would otherwise wrongly tell the next open "nothing to do").
     let index_path = tmp.path().join("stage_index.jsonl");
+    let marker_path = tmp.path().join("stage_index.complete");
     std::fs::remove_file(&index_path).unwrap();
+    std::fs::remove_file(&marker_path).unwrap();
 
     let start = Instant::now();
     let store = Store::open(tmp.path()).unwrap();
     assert!(index_path.exists(), "Store::open should rebuild a missing index up front");
+    assert!(marker_path.exists(), "Store::open should mark the rebuild complete");
     for stage_id in &ids {
         let _ = store.get_ast(stage_id).unwrap();
     }
@@ -161,5 +167,48 @@ fn reopening_a_store_with_legacy_data_bulk_rebuilds_instead_of_relying_on_lazy_f
         elapsed.as_secs_f64() < 8.0,
         "open + {FN_COUNT} get_ast calls against reopened legacy data took {elapsed:?}; \
          expected a one-pass bulk rebuild on open, not the O(N^2) lazy per-call fallback"
+    );
+}
+
+/// The scenario this caught in production: an earlier bulk-rebuild
+/// pass was interrupted (a server restart, a killed process) partway
+/// through, leaving `stage_index.jsonl` on disk with *some* entries
+/// but not all, and critically no completion marker. Gating solely
+/// on the index file's existence (rather than a marker written only
+/// after a full pass completes) would treat that partial file as
+/// "already done" and fall back to the slow per-call path for
+/// whatever's left -- silently reproducing the exact O(N^2) cost this
+/// fix exists to avoid, just for a smaller remaining N.
+#[test]
+fn reopening_a_store_with_a_partial_index_and_no_marker_finishes_the_rebuild() {
+    let tmp = TempDir::new().unwrap();
+    let mut ids = Vec::with_capacity(FN_COUNT);
+    {
+        let store = Store::open(tmp.path()).unwrap();
+        for i in 0..FN_COUNT {
+            ids.push(store.publish(&make_stage(i)).unwrap());
+        }
+    }
+    // Truncate the index down to a handful of entries and remove the
+    // marker -- exactly what an interrupted rebuild leaves behind.
+    let index_path = tmp.path().join("stage_index.jsonl");
+    let marker_path = tmp.path().join("stage_index.complete");
+    let content = std::fs::read_to_string(&index_path).unwrap();
+    let partial: String = content.lines().take(5).map(|l| format!("{l}\n")).collect();
+    std::fs::write(&index_path, partial).unwrap();
+    std::fs::remove_file(&marker_path).unwrap();
+
+    let start = Instant::now();
+    let store = Store::open(tmp.path()).unwrap();
+    assert!(marker_path.exists(), "Store::open should finish the interrupted rebuild and mark it complete");
+    for stage_id in &ids {
+        let _ = store.get_ast(stage_id).unwrap();
+    }
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed.as_secs_f64() < 8.0,
+        "open + {FN_COUNT} get_ast calls against a partially-rebuilt index took {elapsed:?}; \
+         expected the interrupted rebuild to be resumed and finished on open, not left partial"
     );
 }
