@@ -123,3 +123,43 @@ fn old_fns_by_name_style_workload_stays_fast() {
          expected the reverse index to keep this well under a full tenant-wide scan per call"
     );
 }
+
+/// The lazy per-lookup fallback (the fix above) is fine for an
+/// occasional individual miss, but pathological as a *bulk*
+/// cold-start strategy: reopening a store that has thousands of
+/// pre-existing functions but no index yet (legacy data, or an
+/// index file lost some other way) would otherwise mean every one
+/// of those functions rediscovers itself the slow way -- O(total
+/// sigs) per miss, O(total sigs^2) overall for an `old_fns_by_name`-
+/// shaped workload right after reopening. `Store::open` now runs a
+/// single O(total sigs) bulk pass (`rebuild_stage_index`) up front
+/// whenever the index file is missing, so this scenario stays fast
+/// too.
+#[test]
+fn reopening_a_store_with_legacy_data_bulk_rebuilds_instead_of_relying_on_lazy_fallback() {
+    let tmp = TempDir::new().unwrap();
+    let mut ids = Vec::with_capacity(FN_COUNT);
+    {
+        let store = Store::open(tmp.path()).unwrap();
+        for i in 0..FN_COUNT {
+            ids.push(store.publish(&make_stage(i)).unwrap());
+        }
+    }
+    // Simulate data published before the index existed at all.
+    let index_path = tmp.path().join("stage_index.jsonl");
+    std::fs::remove_file(&index_path).unwrap();
+
+    let start = Instant::now();
+    let store = Store::open(tmp.path()).unwrap();
+    assert!(index_path.exists(), "Store::open should rebuild a missing index up front");
+    for stage_id in &ids {
+        let _ = store.get_ast(stage_id).unwrap();
+    }
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed.as_secs_f64() < 8.0,
+        "open + {FN_COUNT} get_ast calls against reopened legacy data took {elapsed:?}; \
+         expected a one-pass bulk rebuild on open, not the O(N^2) lazy per-call fallback"
+    );
+}
