@@ -11,6 +11,7 @@ use crate::model::*;
 use lex_ast::{sig_id, stage_id, Stage};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -148,6 +149,11 @@ struct StageIndexEntry {
     stage_id: String,
     sig_id: String,
 }
+
+/// Sentinel `sig_id` value recording "a full scan already established
+/// this stage_id exists nowhere in the store" (#825). Never a real
+/// sig — sig directory names are never empty.
+const MISSING_STAGE_MARKER: &str = "";
 
 pub struct Store {
     root: PathBuf,
@@ -621,6 +627,93 @@ impl Store {
         Ok(serde_json::from_slice(&bytes)?)
     }
 
+    /// Bulk variant of [`Self::get_ast`] for callers resolving many
+    /// stage_ids at once (e.g. `pkg_publish_handler`'s `old_head`
+    /// scan over every live function in a tenant, once per publish
+    /// request). `get_ast` in a loop calls `lookup_lifecycle` once
+    /// per stage_id, and `lookup_lifecycle`'s index-hit path reads
+    /// and re-parses the *entire* `stage_index.jsonl` on every single
+    /// call — fine for one call, but O(index size × N) for N calls in
+    /// a row, which dominates once the index itself is large (#825's
+    /// follow-up: still correct and far better than the pre-index
+    /// full-tenant-scan-per-call behavior, but the per-call reparse
+    /// is itself a real, measured cost — 87.6s for 3,664 calls against
+    /// a ~14k-line index on the alpibrusl tenant).
+    ///
+    /// This loads the index once for the whole batch and keeps it in
+    /// memory across all `stage_ids`, only touching disk again to
+    /// append genuinely new entries (a positive backfill or a
+    /// negative "not found anywhere" cache, same as the single-call
+    /// path) — never to re-read what's already loaded.
+    ///
+    /// Returns results in the same order as `stage_ids`, `Err` for
+    /// anything that fails to resolve (mirroring `get_ast`'s error
+    /// semantics per call).
+    pub fn get_asts_bulk(&self, stage_ids: &[String]) -> Vec<Result<Stage, StoreError>> {
+        let mut index = self.load_stage_index();
+        let mut sigs_cache: BTreeMap<String, Option<Lifecycle>> = BTreeMap::new();
+        let mut all_sigs: Option<Vec<String>> = None;
+
+        stage_ids
+            .iter()
+            .map(|stage_id| {
+                self.lookup_lifecycle_bulk(stage_id, &mut index, &mut sigs_cache, &mut all_sigs)
+                    .and_then(|sig| {
+                        let bytes = self.read_stage_canonical_bytes(&sig, stage_id)?;
+                        Ok(serde_json::from_slice(&bytes)?)
+                    })
+            })
+            .collect()
+    }
+
+    /// Shared implementation behind [`Self::get_asts_bulk`]: identical
+    /// logic to [`Self::lookup_lifecycle`], but reads and writes the
+    /// caller-supplied `index` map instead of reloading it from disk
+    /// on every call, and memoizes `read_lifecycle` per sig and the
+    /// `list_sigs()` full-scan list across the whole batch. Disk
+    /// writes for newly-discovered entries (positive or negative)
+    /// still happen immediately, same as the single-call path — only
+    /// the repeated *reads* are batched away.
+    fn lookup_lifecycle_bulk(
+        &self,
+        stage_id: &str,
+        index: &mut BTreeMap<String, String>,
+        sigs_cache: &mut BTreeMap<String, Option<Lifecycle>>,
+        all_sigs: &mut Option<Vec<String>>,
+    ) -> Result<String, StoreError> {
+        if let Some(sig) = index.get(stage_id) {
+            if sig == MISSING_STAGE_MARKER {
+                return Err(StoreError::UnknownStage(stage_id.into()));
+            }
+            let life = sigs_cache
+                .entry(sig.clone())
+                .or_insert_with(|| self.read_lifecycle(sig).ok());
+            if let Some(life) = life {
+                if life.transitions.iter().any(|t| t.stage_id == stage_id) {
+                    return Ok(sig.clone());
+                }
+            }
+        }
+        if all_sigs.is_none() {
+            *all_sigs = Some(self.list_sigs()?);
+        }
+        for sig in all_sigs.as_ref().unwrap() {
+            let life = sigs_cache
+                .entry(sig.clone())
+                .or_insert_with(|| self.read_lifecycle(sig).ok());
+            if let Some(life) = life {
+                if life.transitions.iter().any(|t| t.stage_id == stage_id) {
+                    self.append_stage_index_entry(stage_id, sig);
+                    index.insert(stage_id.to_string(), sig.clone());
+                    return Ok(sig.clone());
+                }
+            }
+        }
+        self.append_stage_index_entry(stage_id, MISSING_STAGE_MARKER);
+        index.insert(stage_id.to_string(), MISSING_STAGE_MARKER.to_string());
+        Err(StoreError::UnknownStage(stage_id.into()))
+    }
+
     /// Read the canonical bytes of a stage, walking back through
     /// any delta chain (#261 slice 3). The recursion ends at a
     /// `<stage_id>.ast.json` file (a full snapshot) or, in the
@@ -976,6 +1069,22 @@ impl Store {
     fn lookup_lifecycle(&self, stage_id: &str) -> Result<(String, Lifecycle), StoreError> {
         let index = self.load_stage_index();
         if let Some(sig) = index.get(stage_id) {
+            if sig == MISSING_STAGE_MARKER {
+                // A previous full scan already established this
+                // stage_id exists nowhere in the store. Re-scanning
+                // would find nothing again -- see #825: a genuinely
+                // orphaned reference (e.g. from data predating some
+                // store migration) is looked up on *every* call that
+                // needs it, forever, so without this negative cache
+                // it silently costs a full O(total sigs) scan each
+                // time, indistinguishable from the positive case at
+                // the call site. Measured directly: on the alpibrusl
+                // tenant, 988 of 3,664 branch-head entries are
+                // orphaned this way, turning one `pkg publish`'s
+                // old_fns_by_name build into ~16M wasted lifecycle
+                // reads.
+                return Err(StoreError::UnknownStage(stage_id.into()));
+            }
             if let Ok(life) = self.read_lifecycle(sig) {
                 if life.transitions.iter().any(|t| t.stage_id == stage_id) {
                     return Ok((sig.clone(), life));
@@ -993,6 +1102,15 @@ impl Store {
                 }
             }
         }
+        // Genuinely not found anywhere: cache that fact so the next
+        // lookup for this exact stage_id is an index hit, not another
+        // full scan. Safe even if this stage_id somehow gets a real
+        // sig later (content-addressed publish is idempotent, so
+        // "later" only means "a byte-identical stage republished
+        // under a real sig") — `append_stage_index_entry`'s later,
+        // real entry is a later line in the file, and `load_stage_index`
+        // folds duplicate keys last-write-wins, so the real entry wins.
+        self.append_stage_index_entry(stage_id, MISSING_STAGE_MARKER);
         Err(StoreError::UnknownStage(stage_id.into()))
     }
 
