@@ -386,6 +386,59 @@ impl OpLog {
         Ok(all)
     }
 
+    /// Like [`Self::walk_forward`], but bounded: walk from `head` back
+    /// toward genesis and stop as soon as `since` is reached, without
+    /// visiting `since`'s own parents or including `since` itself in the
+    /// result. Returns oldest-first, suitable for incrementally
+    /// extending a transition map already computed as of `since`.
+    ///
+    /// Returns `Ok(None)` if `since` is never reached (not an ancestor
+    /// of `head` — e.g. after a branch reset or a merge that reordered
+    /// history): callers should fall back to a full `walk_forward` in
+    /// that case, since there is nothing valid to incrementally extend.
+    ///
+    /// This is the piece `walk_forward` itself doesn't provide: its own
+    /// `limit` truncates the *result* after a full walk_back to genesis
+    /// has already completed (see its body above), so it can't turn an
+    /// O(N)-in-total-history walk into an O(ops since a checkpoint) one.
+    /// `head == since` returns `Ok(Some(vec![]))` without touching the
+    /// op log at all.
+    pub fn walk_forward_since(
+        &self,
+        head: &OpId,
+        since: &OpId,
+    ) -> io::Result<Option<Vec<OperationRecord>>> {
+        if head == since {
+            return Ok(Some(Vec::new()));
+        }
+        let mut out = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut frontier: VecDeque<OpId> = VecDeque::from([head.clone()]);
+        let mut found = false;
+        while let Some(id) = frontier.pop_back() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            if id == *since {
+                found = true;
+                continue; // boundary: don't include it, don't descend into its parents
+            }
+            if let Some(rec) = self.get(&id)? {
+                for p in &rec.op.parents {
+                    if !seen.contains(p) {
+                        frontier.push_front(p.clone());
+                    }
+                }
+                out.push(rec);
+            }
+        }
+        if !found {
+            return Ok(None);
+        }
+        out.reverse();
+        Ok(Some(out))
+    }
+
     /// Common ancestor of two op_ids in the DAG.
     ///
     /// On tree-shaped histories and chain merges this is the
@@ -616,6 +669,80 @@ mod tests {
         let walked = log.walk_forward(&b.op_id, None).unwrap();
         let ids: Vec<_> = walked.iter().map(|r| r.op_id.as_str()).collect();
         assert_eq!(ids, vec![a.op_id.as_str(), b.op_id.as_str()]);
+    }
+
+    #[test]
+    fn walk_forward_since_returns_only_ops_after_the_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = OpLog::open(tmp.path()).unwrap();
+        let a = add_op();
+        log.put(&a).unwrap();
+        let b = modify_op(&a.op_id, "fac::Int->Int", "abc123", "def456");
+        log.put(&b).unwrap();
+        let c = modify_op(&b.op_id, "fac::Int->Int", "def456", "789aaa");
+        log.put(&c).unwrap();
+
+        // Everything strictly after `a`: b, c, oldest-first.
+        let since_a = log.walk_forward_since(&c.op_id, &a.op_id).unwrap().unwrap();
+        let ids: Vec<_> = since_a.iter().map(|r| r.op_id.as_str()).collect();
+        assert_eq!(ids, vec![b.op_id.as_str(), c.op_id.as_str()]);
+
+        // Everything strictly after `b`: just c.
+        let since_b = log.walk_forward_since(&c.op_id, &b.op_id).unwrap().unwrap();
+        let ids: Vec<_> = since_b.iter().map(|r| r.op_id.as_str()).collect();
+        assert_eq!(ids, vec![c.op_id.as_str()]);
+    }
+
+    #[test]
+    fn walk_forward_since_head_equals_since_returns_empty_without_touching_the_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = OpLog::open(tmp.path()).unwrap();
+        let a = add_op();
+        log.put(&a).unwrap();
+
+        // Deliberately pass an op_id that was never `put` -- if this
+        // took the "walk and look for it" path it would return `None`
+        // (not found). The `head == since` fast path must short-circuit
+        // before ever touching the log.
+        let ghost = "never-written-anywhere".to_string();
+        let result = log.walk_forward_since(&ghost, &ghost).unwrap();
+        assert_eq!(result, Some(Vec::new()));
+    }
+
+    #[test]
+    fn walk_forward_since_returns_none_when_boundary_is_not_an_ancestor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = OpLog::open(tmp.path()).unwrap();
+        let a = add_op();
+        log.put(&a).unwrap();
+        // A second root with different content (distinct sig_id), so it
+        // gets a different content-addressed op_id and shares no
+        // history with `a` -- `add_op()` alone is parameterless and
+        // would collide with itself.
+        let op = Operation::new(
+            OperationKind::AddFunction {
+                sig_id: "unrelated::Str->Str".into(),
+                stage_id: "zzz999".into(),
+                effects: BTreeSet::new(),
+                budget_cost: None,
+            },
+            [],
+        );
+        let unrelated = OperationRecord::new(
+            op,
+            StageTransition::Create {
+                sig_id: "unrelated::Str->Str".into(),
+                stage_id: "zzz999".into(),
+            },
+        );
+        log.put(&unrelated).unwrap();
+        assert_ne!(a.op_id, unrelated.op_id, "test setup must produce two distinct ops");
+
+        let result = log.walk_forward_since(&a.op_id, &unrelated.op_id).unwrap();
+        assert_eq!(
+            result, None,
+            "unrelated op_id is not an ancestor of `a` -- callers must fall back to a full walk"
+        );
     }
 
     #[test]
