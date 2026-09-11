@@ -158,50 +158,74 @@ fn pkg_archive(name: &str, version: &str, src_files: &[(&str, &str)]) -> Vec<u8>
     enc.finish().unwrap()
 }
 
+/// A package is now loaded as ONE unit and every declaration carries its
+/// file's mangling prefix (#828), so the scenario this test was written
+/// for — two files in one request publishing under the SAME bare name,
+/// where the second file's diff had to see the first's just-published
+/// update rather than stale branch state — cannot arise: two files
+/// declaring `counter` declare two differently-named functions.
+///
+/// What still has to hold, and is what this now pins: a function
+/// modified in place across publishes reads as a modification of the
+/// same function, not as a fresh add, and declaring the same bare name
+/// in a second file does not disturb it.
 #[test]
-fn multi_file_publish_sees_earlier_files_own_update_in_same_request() {
+fn modifying_a_function_in_place_is_one_modify_not_an_add() {
     let (srv, _tmp) = start_server();
 
-    let src_v1 = concat!(
-        "fn counter() -> Int\n",
-        "  examples {\n",
-        "    counter() => 1,\n",
-        "  }\n",
-        "{ 1 }\n",
-    );
-    let archive_v1 = pkg_archive("multi", "0.1.0", &[("lib.lex", src_v1)]);
+    let counter = |n: u8| -> String {
+        format!(
+            "fn counter() -> Int\n  examples {{\n    counter() => {n},\n  }}\n{{ {n} }}\n"
+        )
+    };
+
+    let v1 = counter(1);
+    let archive_v1 = pkg_archive("multi", "0.1.0", &[("a.lex", v1.as_str())]);
     let (status, body) = post_bytes(&srv.addr, "/v1/pkg/publish", &archive_v1);
     assert_eq!(status, 200, "v1 publish must succeed, got: {body}");
 
-    // v2: two files in ONE request, both redefining `counter` to the
-    // SAME new body. File "a" is processed first — its diff against
-    // the pre-request snapshot (body 1) sees a real change and emits
-    // one modify_body op. File "b" is processed next — if the
-    // snapshot correctly reflects file "a"'s just-published update
-    // (body 2), file "b"'s diff sees no change (2 == 2) and emits
-    // nothing further for `counter`.
-    let src_v2 = concat!(
-        "fn counter() -> Int\n",
-        "  examples {\n",
-        "    counter() => 2,\n",
-        "  }\n",
-        "{ 2 }\n",
+    // Same file, same name, new body — plus a SECOND file that declares
+    // its own `counter`. The edit to `a.lex`'s function is one
+    // modify_body; `b.lex`'s is a different function entirely, so it is
+    // an add, and neither is mistaken for the other.
+    let v2 = counter(2);
+    let archive_v2 = pkg_archive(
+        "multi",
+        "0.2.0",
+        &[("a.lex", v2.as_str()), ("b.lex", v2.as_str())],
     );
-    let archive_v2 = pkg_archive("multi", "0.2.0", &[("a.lex", src_v2), ("b.lex", src_v2)]);
     let (status, body) = post_bytes(&srv.addr, "/v1/pkg/publish", &archive_v2);
     assert_eq!(status, 200, "v2 publish must succeed, got: {body}");
 
     let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON response");
     let ops = parsed["ops"].as_array().expect("ops array in publish response");
-    let modify_ops: Vec<&serde_json::Value> = ops.iter()
-        .filter(|op| op["kind"]["op"] == "modify_body")
-        .collect();
+    let of_kind = |k: &str| -> Vec<&serde_json::Value> {
+        ops.iter().filter(|op| op["kind"]["op"] == k).collect()
+    };
     assert_eq!(
-        modify_ops.len(), 1,
-        "expected exactly one modify_body op (file a's diff sees the real \
-         1->2 change; file b's diff should see its own already-published \
-         2 and emit nothing) -- got {} modify_body ops: {:#?}",
-        modify_ops.len(), ops,
+        of_kind("modify_body").len(), 1,
+        "a.lex's `counter` changed 1 -> 2 in place: exactly one modify_body, got: {ops:#?}",
+    );
+    assert_eq!(
+        of_kind("add_function").len(), 1,
+        "b.lex's `counter` is its own function under its own prefix: one add_function, \
+         got: {ops:#?}",
+    );
+    assert!(
+        of_kind("remove_function").is_empty(),
+        "nothing was removed, got: {ops:#?}",
+    );
+
+    // The two `counter`s really are distinct published names.
+    let (status, body) = get(&srv.addr, "/v1/pkg/multi/0.2.0");
+    assert_eq!(status, 200, "record must be readable, got: {body}");
+    let rec: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    let names: Vec<&str> = rec["function_names"].as_array().unwrap()
+        .iter().map(|v| v.as_str().unwrap()).collect();
+    assert_eq!(names.len(), 2, "two distinct functions, got: {names:?}");
+    assert!(
+        names.iter().all(|n| n.ends_with(".counter")) && names[0] != names[1],
+        "both are prefix-mangled `counter`s under different prefixes, got: {names:?}",
     );
 }
 
@@ -216,26 +240,20 @@ fn multi_file_publish_sees_earlier_files_own_update_in_same_request() {
 /// consistency check rejected the resulting diff outright (500:
 /// "old_name_to_sig has no entry").
 ///
-/// Reproduces the minimal shape: `helper` already exists (published in
-/// v1). v2 is a single request with two files — `a.lex` (processed
-/// first, alphabetically) doesn't mention `helper` at all; `b.lex`
-/// legitimately redefines it. `helper` must survive: no
-/// `remove_function` op anywhere in the response, and `b.lex`'s change
-/// must land as a `modify_body`, not get miscounted as a fresh `add`.
+/// Reproduces the minimal shape: `b.lex` owns `helper` and keeps owning
+/// it across both versions, while `a.lex` never mentions it. `helper`
+/// must survive: no `remove_function` anywhere, and `b.lex`'s edit lands
+/// as a `modify_body`, not as a fresh add.
+///
+/// (Before #828 the two versions could put `helper` in *different* files
+/// and still be one function, because a file's own declarations were
+/// published under their bare names. Now a declaration belongs to its
+/// file, so "the same function" means the same file — moving a function
+/// between files is a new function plus an orphan, which is the
+/// documented cost of the single-pass load.)
 #[test]
 fn multi_file_publish_does_not_spuriously_remove_a_name_owned_by_another_file() {
     let (srv, _tmp) = start_server();
-
-    let src_v1 = concat!(
-        "fn helper() -> Int\n",
-        "  examples {\n",
-        "    helper() => 1,\n",
-        "  }\n",
-        "{ 1 }\n",
-    );
-    let archive_v1 = pkg_archive("multi2", "0.1.0", &[("lib.lex", src_v1)]);
-    let (status, body) = post_bytes(&srv.addr, "/v1/pkg/publish", &archive_v1);
-    assert_eq!(status, 200, "v1 publish must succeed, got: {body}");
 
     let src_other = concat!(
         "fn other() -> Int\n",
@@ -244,6 +262,17 @@ fn multi_file_publish_does_not_spuriously_remove_a_name_owned_by_another_file() 
         "  }\n",
         "{ 2 }\n",
     );
+    let src_helper_v1 = concat!(
+        "fn helper() -> Int\n",
+        "  examples {\n",
+        "    helper() => 1,\n",
+        "  }\n",
+        "{ 1 }\n",
+    );
+    let archive_v1 = pkg_archive("multi2", "0.1.0", &[("b.lex", src_helper_v1)]);
+    let (status, body) = post_bytes(&srv.addr, "/v1/pkg/publish", &archive_v1);
+    assert_eq!(status, 200, "v1 publish must succeed, got: {body}");
+
     let src_helper_v2 = concat!(
         "fn helper() -> Int\n",
         "  examples {\n",
@@ -609,3 +638,145 @@ fn duplicate_version_publish_leaves_the_op_log_untouched() {
     );
 }
 
+
+
+// ── #828: one pass over the package, not one per importing file ──────────────
+
+/// The shape that made this expensive, in miniature: one shared file
+/// (`error.lex`) imported by every other file in the package.
+///
+/// `pkg_publish_handler` used to load each top-level file independently,
+/// and each of those loads flattened in the whole local-import closure —
+/// so `error.lex`'s declarations were canonicalized, type-checked,
+/// diffed, and run through `publish_program` once per importing file. On
+/// the real 21-file `lex-schema` package, whose `error.lex` is imported
+/// by 17 of its files, that was 2,239 `FnDecl`s processed for 693
+/// distinct names, and 21 separate `publish_program` calls each reading
+/// every live function on the branch (#828).
+///
+/// Pinned here by counting what reaches the store: one `add_function` per
+/// declaration in the package, no more.
+#[test]
+fn each_declaration_is_published_exactly_once_however_many_files_import_it() {
+    let (srv, _tmp) = start_server();
+
+    let shared = concat!(
+        "fn code_one() -> Str\n  examples {\n    code_one() => \"one\",\n  }\n{ \"one\" }\n",
+        "fn code_two() -> Str\n  examples {\n    code_two() => \"two\",\n  }\n{ \"two\" }\n",
+        "fn code_three() -> Str\n  examples {\n    code_three() => \"three\",\n  }\n{ \"three\" }\n",
+    );
+    // Five importers, each with one declaration of its own: 3 + 5 = 8
+    // declarations in the package, and `error.lex` reached five times.
+    let importer = |n: &str| -> String {
+        format!(
+            "import \"./error\" as e\nfn use_{n}() -> Str\n  examples {{\n    use_{n}() => \"one\",\n  }}\n{{ e.code_one() }}\n"
+        )
+    };
+    let bodies: Vec<String> = ["a", "b", "c", "d", "f"].iter().map(|n| importer(n)).collect();
+    let mut files: Vec<(&str, &str)> = vec![("error.lex", shared)];
+    for (name, body) in [("a.lex", 0), ("b.lex", 1), ("c.lex", 2), ("d.lex", 3), ("f.lex", 4)] {
+        files.push((name, bodies[body].as_str()));
+    }
+
+    let (status, body) = post_bytes(
+        &srv.addr,
+        "/v1/pkg/publish",
+        &pkg_archive("dense", "0.1.0", &files),
+    );
+    assert_eq!(status, 200, "publish must succeed, got: {body}");
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON response");
+    let ops = parsed["ops"].as_array().expect("ops array in publish response");
+    let adds: Vec<&serde_json::Value> = ops.iter()
+        .filter(|op| op["kind"]["op"] == "add_function")
+        .collect();
+    assert_eq!(
+        adds.len(), 8,
+        "8 declarations in the package means 8 add_function ops; a per-importing-file \
+         load re-published `error.lex`'s three functions once per importer. Got {}: {:#?}",
+        adds.len(), ops,
+    );
+
+    // And the published name set holds each declaration once.
+    let (status, body) = get(&srv.addr, "/v1/pkg/dense/0.1.0");
+    assert_eq!(status, 200, "record must be readable, got: {body}");
+    let rec: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    let names: Vec<String> = rec["function_names"].as_array().unwrap()
+        .iter().map(|v| v.as_str().unwrap().to_string()).collect();
+    let unique: std::collections::BTreeSet<&String> = names.iter().collect();
+    assert_eq!(unique.len(), names.len(), "no name is published twice, got: {names:?}");
+    assert_eq!(names.len(), 8, "one name per declaration, got: {names:?}");
+    let from_shared: Vec<&String> = names.iter().filter(|n| n.starts_with("error_")).collect();
+    assert_eq!(
+        from_shared.len(), 3,
+        "`error.lex`'s three functions appear once each, not once per importer, got: {names:?}",
+    );
+    // Nothing is published under a bare source-level name any more: every
+    // declaration belongs to the file it was declared in.
+    assert!(
+        names.iter().all(|n| n.contains('.')),
+        "every published name carries its file's prefix, got: {names:?}",
+    );
+}
+
+/// Imports stay attributed to the file that declares them. A flattened
+/// per-file load could not tell a file's own imports from those of
+/// everything it imported, so every importer of a file that used
+/// `std.str` looked like it imported `std.str` itself.
+#[test]
+fn imports_are_attributed_to_the_file_that_declares_them() {
+    let (srv, _tmp) = start_server();
+
+    let files: Vec<(&str, &str)> = vec![
+        (
+            "helper.lex",
+            "import \"std.str\" as str\nfn shout(s :: Str) -> Str\n  examples {\n    shout(\"a\") => \"A\",\n  }\n{ str.to_upper(s) }\n",
+        ),
+        (
+            "main.lex",
+            "import \"./helper\" as h\nfn go() -> Str\n  examples {\n    go() => \"A\",\n  }\n{ h.shout(\"a\") }\n",
+        ),
+    ];
+    let (status, body) = post_bytes(
+        &srv.addr,
+        "/v1/pkg/publish",
+        &pkg_archive("attrib", "0.1.0", &files),
+    );
+    assert_eq!(status, 200, "publish must succeed, got: {body}");
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON response");
+    let ops = parsed["ops"].as_array().expect("ops array");
+    let import_files: Vec<&str> = ops.iter()
+        .filter(|op| op["kind"]["op"] == "add_import")
+        .map(|op| op["kind"]["in_file"].as_str().unwrap_or("?"))
+        .collect();
+    assert_eq!(
+        import_files, vec!["src/helper.lex"],
+        "`std.str` is imported by helper.lex alone; main.lex merely imports helper. \
+         Got: {ops:#?}",
+    );
+}
+
+/// A type error anywhere in the package publishes nothing at all. Before
+/// #828 each file was published as it was processed, so a failure in a
+/// later file left earlier files' ops already applied.
+#[test]
+fn a_type_error_anywhere_publishes_nothing() {
+    let (srv, _tmp) = start_server();
+    let head_before = branch_head(&srv.addr);
+
+    let files: Vec<(&str, &str)> = vec![
+        ("a_ok.lex", "fn fine() -> Int\n  examples {\n    fine() => 1,\n  }\n{ 1 }\n"),
+        // `z_bad.lex` sorts last, so it is reached only after `a_ok.lex`
+        // would have been published under the old per-file loop.
+        ("z_bad.lex", "fn broken() -> Int { \"not an int\" }\n"),
+    ];
+    let (status, body) = post_bytes(
+        &srv.addr,
+        "/v1/pkg/publish",
+        &pkg_archive("atomic", "0.1.0", &files),
+    );
+    assert_eq!(status, 422, "a type error must be rejected, got: {status} {body}");
+    assert_eq!(
+        branch_head(&srv.addr), head_before,
+        "a rejected publish must leave the branch head where it was",
+    );
+}
