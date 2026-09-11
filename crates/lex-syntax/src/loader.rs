@@ -10,12 +10,28 @@
 //!
 //! ## Mangling
 //!
-//! Each loaded file gets a prefix derived from its canonical filesystem
-//! path. The entry file's prefix is empty (so `lex run main.lex
-//! process` works unchanged). Imported files use `<stem>_<hash>`
-//! where `hash` is the first 8 hex chars of SHA-256 of the canonical
-//! path string. The hash disambiguates same-stem files in different
-//! directories without forcing a project manifest.
+//! Each loaded file gets a prefix derived from its filesystem path.
+//! The entry file's prefix is empty (so `lex run main.lex process`
+//! works unchanged). Imported files use `<stem>_<hash>` where `hash`
+//! is the first 8 hex chars of SHA-256 of the file's *mangling key*.
+//! The hash disambiguates same-stem files in different directories
+//! without forcing a project manifest.
+//!
+//! The mangling key is the canonical absolute path by default, and the
+//! path **relative to a caller-supplied root** when loading through
+//! [`load_program_with_root`]. Absolute paths are only stable as long
+//! as the tree stays put, which makes them unusable for anything that
+//! loads the same logical package from a fresh directory each time: a
+//! server unpacking an uploaded package into a per-request temp dir got
+//! a different prefix — and therefore a brand-new set of function names
+//! — for every file reached through a local import on every single
+//! request, so byte-identical republishes diffed as all-new functions
+//! and grew the branch's function set without bound (#826). Pass the
+//! package root and the key becomes `src/error.lex`, identical across
+//! requests. Files outside the root keep the absolute-path key (a
+//! dependency in the shared package cache lives at a stable absolute
+//! path of its own, and "relative to this package" says nothing useful
+//! about it).
 //!
 //! Within a file at prefix `P`:
 //!
@@ -44,10 +60,12 @@
 //!
 //! ## Limitations (tracked separately)
 //!
-//! The mangling key is the canonical filesystem path. Moving a file
+//! The mangling key is a filesystem path (see above). Moving a file
 //! changes its SigId; renaming changes the file-stem half of the
-//! prefix. The eventual fix — content-addressed identity decoupled
-//! from filesystem layout — lives with store-native imports
+//! prefix. A root-relative key narrows this to moves *within* the
+//! package, but does not remove it. The eventual fix —
+//! content-addressed identity decoupled from filesystem layout — lives
+//! with store-native imports
 //! (`import "stage:..."`); see the corresponding follow-up tracker.
 
 use std::collections::{HashMap, HashSet};
@@ -87,6 +105,28 @@ pub enum LoadError {
 /// Load a multi-file Lex program, expanding local imports relative to
 /// the entry path. Stdlib imports (`std.*`) pass through unchanged.
 pub fn load_program(entry: &Path) -> Result<Program, LoadError> {
+    load_rooted(entry, None)
+}
+
+/// Load a multi-file Lex program like [`load_program`], but derive
+/// mangling prefixes from each file's path **relative to `root`**
+/// instead of its absolute path.
+///
+/// Use this whenever the same logical package can be loaded from a
+/// different directory each time — an unpacked upload, a CI checkout, a
+/// scratch clone — and the mangled names it produces must match across
+/// those loads (#826). Files that do not live under `root` keep the
+/// absolute-path key, as do all files if `root` cannot be canonicalized.
+pub fn load_program_with_root(entry: &Path, root: &Path) -> Result<Program, LoadError> {
+    // Canonicalize the root too: the entry path is canonicalized below,
+    // and a root reached through a symlink (macOS's `/var/folders/...`
+    // temp dirs being the common case) would never prefix-match the
+    // canonicalized file paths otherwise.
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    load_rooted(entry, Some(root))
+}
+
+fn load_rooted(entry: &Path, prefix_root: Option<PathBuf>) -> Result<Program, LoadError> {
     let entry_canonical = entry.canonicalize().map_err(|source| LoadError::Io {
         path: entry.display().to_string(),
         source,
@@ -95,6 +135,7 @@ pub fn load_program(entry: &Path) -> Result<Program, LoadError> {
         in_progress: Vec::new(),
         loaded: HashSet::new(),
         prefixes: HashMap::new(),
+        prefix_root,
     };
     // Entry file's prefix is empty so `lex run main.lex process` works
     // without users typing the hashed prefix.
@@ -130,6 +171,11 @@ struct LoaderState {
     /// Stable mangling prefix per canonical path. Computed lazily;
     /// the entry file is seeded with an empty prefix.
     prefixes: HashMap<PathBuf, String>,
+    /// When set, mangling prefixes hash each file's path relative to
+    /// this (already canonicalized) directory rather than its absolute
+    /// path, so the same package layout mangles identically wherever it
+    /// is unpacked. See the module header's "Mangling" section.
+    prefix_root: Option<PathBuf>,
 }
 
 impl LoaderState {
@@ -142,13 +188,37 @@ impl LoaderState {
             .and_then(|s| s.to_str())
             .unwrap_or("module");
         let mut hasher = Sha256::new();
-        hasher.update(canonical.to_string_lossy().as_bytes());
+        hasher.update(self.mangling_key(canonical).as_bytes());
         let digest = hasher.finalize();
         let prefix = format!("{stem}_{:08x}", u32::from_be_bytes([
             digest[0], digest[1], digest[2], digest[3],
         ]));
         self.prefixes.insert(canonical.to_path_buf(), prefix.clone());
         prefix
+    }
+
+    /// The string a file's mangling hash is taken over: its path
+    /// relative to `prefix_root` when it lives under one, else its
+    /// canonical absolute path. Relative keys are joined with `/`
+    /// regardless of platform so the same layout hashes the same on
+    /// Windows and Unix.
+    fn mangling_key(&self, canonical: &Path) -> String {
+        if let Some(root) = &self.prefix_root {
+            if let Ok(rel) = canonical.strip_prefix(root) {
+                let key = rel
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                // An empty key means `canonical == root` (a root
+                // pointing at the file itself) — not a usable key, and
+                // it would collide with any other such file.
+                if !key.is_empty() {
+                    return key;
+                }
+            }
+        }
+        canonical.to_string_lossy().into_owned()
     }
 
     fn load(&mut self, canonical: &Path) -> Result<Program, LoadError> {

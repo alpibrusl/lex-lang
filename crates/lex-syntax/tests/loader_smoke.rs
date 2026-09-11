@@ -3,7 +3,7 @@
 //! qualified types, shadowing.
 
 use lex_syntax::syntax::*;
-use lex_syntax::{load_program, load_program_from_str, LoadError};
+use lex_syntax::{load_program, load_program_from_str, load_program_with_root, LoadError};
 use std::fs;
 
 fn write(dir: &std::path::Path, name: &str, src: &str) {
@@ -610,4 +610,129 @@ fn run() -> Int { w.identity(1) }
         },
         other => panic!("example expected not a Call: {other:?}"),
     }
+}
+
+
+// ── #826: mangling prefixes stable across extraction directories ─────────────
+
+/// Write the same two-file package (a `main.lex` importing `./error`)
+/// into `root`, under `src/`, and return the entry path.
+fn write_package(root: &std::path::Path) -> std::path::PathBuf {
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    write(
+        &src,
+        "error.lex",
+        r#"fn code_missing() -> Str { "missing" }
+fn code_type() -> Str { "type" }
+"#,
+    );
+    write(
+        &src,
+        "main.lex",
+        r#"import "./error" as e
+fn describe() -> Str { e.code_missing() }
+"#,
+    );
+    src.join("main.lex")
+}
+
+/// The bug behind #826: the mangling prefix hashes a path, so the same
+/// logical package unpacked into two different directories produced two
+/// completely different sets of names for everything reached through a
+/// local import. `load_program_with_root` keys on the path *relative to
+/// the package root*, so both loads agree.
+#[test]
+fn rooted_load_mangles_identically_from_two_different_directories() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let entry_a = write_package(a.path());
+    let entry_b = write_package(b.path());
+
+    let mut names_a = fn_names(&load_program_with_root(&entry_a, a.path()).expect("load a"));
+    let mut names_b = fn_names(&load_program_with_root(&entry_b, b.path()).expect("load b"));
+    names_a.sort();
+    names_b.sort();
+
+    assert_eq!(
+        names_a, names_b,
+        "byte-identical package layouts must mangle to identical names \
+         regardless of where they are unpacked (#826)",
+    );
+    // And the names are really mangled — this isn't passing because
+    // nothing got a prefix at all.
+    assert!(
+        names_a.iter().any(|n| n.starts_with("error_") && n.ends_with(".code_missing")),
+        "expected a mangled `error_<hash>.code_missing`, got: {names_a:?}",
+    );
+}
+
+/// The relative key includes the file's directory, so two same-stem
+/// files in different subdirectories still get different prefixes.
+#[test]
+fn rooted_load_distinguishes_same_stem_files_in_different_subdirs() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("src/one")).unwrap();
+    fs::create_dir_all(root.join("src/two")).unwrap();
+    write(&root.join("src/one"), "util.lex", "fn tag() -> Int { 1 }\n");
+    write(&root.join("src/two"), "util.lex", "fn tag() -> Int { 2 }\n");
+    write(
+        &root.join("src"),
+        "main.lex",
+        r#"import "./one/util" as a
+import "./two/util" as b
+fn total() -> Int { a.tag() + b.tag() }
+"#,
+    );
+
+    let prog = load_program_with_root(&root.join("src/main.lex"), root).expect("load");
+    let tags: Vec<String> = fn_names(&prog).into_iter().filter(|n| n.ends_with(".tag")).collect();
+    assert_eq!(tags.len(), 2, "both `util.lex` files' `tag` must survive: {tags:?}");
+    assert_ne!(tags[0], tags[1], "same-stem files in different dirs must not collide: {tags:?}");
+}
+
+/// A file outside the root keeps the absolute-path key — there is no
+/// meaningful "relative to this package" for a shared dependency — and
+/// loading still succeeds.
+#[test]
+fn rooted_load_still_resolves_imports_from_outside_the_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("pkg/src")).unwrap();
+    fs::create_dir_all(root.join("outside")).unwrap();
+    write(&root.join("outside"), "shared.lex", "fn shared_id() -> Int { 7 }\n");
+    write(
+        &root.join("pkg/src"),
+        "main.lex",
+        r#"import "../../outside/shared" as s
+fn use_shared() -> Int { s.shared_id() }
+"#,
+    );
+
+    let prog = load_program_with_root(&root.join("pkg/src/main.lex"), &root.join("pkg"))
+        .expect("load");
+    let names = fn_names(&prog);
+    assert!(names.contains(&"use_shared".to_string()), "got: {names:?}");
+    assert!(
+        names.iter().any(|n| n.ends_with(".shared_id")),
+        "out-of-root import must still be merged and mangled, got: {names:?}",
+    );
+}
+
+/// `load_program` is unchanged: its key is still the absolute path, so
+/// the two directories disagree. Pinned so the difference between the
+/// two entry points stays deliberate (changing `load_program`'s key
+/// would change every SigId of every locally-checked program — see
+/// `docs/INVARIANTS.md`).
+#[test]
+fn unrooted_load_still_keys_on_the_absolute_path() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let entry_a = write_package(a.path());
+    let entry_b = write_package(b.path());
+
+    let names_a = fn_names(&load_program(&entry_a).expect("load a"));
+    let names_b = fn_names(&load_program(&entry_b).expect("load b"));
+    assert_ne!(names_a, names_b);
 }

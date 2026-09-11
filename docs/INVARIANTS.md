@@ -49,6 +49,18 @@ depends on any of those hashes being stable, read it before this one.**
   names, adding/removing examples, changing the public signature.
 - Tests: `crates/lex-ast/tests/canonical.rs:40-146` are the
   golden-master record of these rules.
+- **StageId is name-independent, so one StageId can belong to several
+  SigIds.** The name lives in SigId only (`lex-ast/src/lib.rs`'s
+  `structural_sig_hash` + `implementation_hash`), by design — a rename
+  must not change implementation identity. Two functions differing only
+  in name therefore share a StageId, and each stores its own AST under
+  its own sig directory. `stage_index.jsonl` (StageId → SigId) keeps one
+  sig per StageId, so `Store::get_ast` / `get_asts_bulk` can return the
+  AST filed under the *other* sig: the right body under the wrong name.
+  Code that already holds the SigId — anything reading a branch head
+  map, which is keyed by SigId — must resolve through it
+  (`Store::get_asts_for_sigs_bulk`). Getting this wrong made every
+  republish of unchanged source emit fresh ops forever (#826).
 
 ### OpId
 
