@@ -1222,18 +1222,35 @@ impl Store {
         // `old_sig_id` directly (see `diff_report`'s doc comments), so
         // `diff_to_ops` no longer needs this lookup at all.
         let old_head = self.branch_head(branch)?;
-        let old_effects: BTreeMap<String, BTreeSet<String>> = old_head
+        // Read every live function's effects through the SigId the head
+        // names, in one batch. Two reasons, both load-bearing:
+        //
+        //   * Cost. This was a `get_ast` per live function, and
+        //     `get_ast`'s index-hit path re-reads and re-parses the whole
+        //     `stage_index.jsonl` on every call — O(index × live fns) per
+        //     publish, paid again for every `publish_program` call a
+        //     multi-file publish makes (#828; measured 34s for a no-op
+        //     republish of a real 21-file package against only 698 live
+        //     functions, nearly all of it here).
+        //   * Correctness. A StageId is name-independent, so two live
+        //     functions differing only in name share one and the index
+        //     maps it to a single sig — resolving by StageId therefore
+        //     attributed one function's effects to the *other* one's sig,
+        //     the same ambiguity #826 fixed in `pkg_publish_handler`.
+        let head_pairs: Vec<(String, String)> = old_head
             .iter()
-            .filter_map(|(sig, stg)| {
-                let ast = self.get_ast(stg).ok()?;
-                match ast {
-                    lex_ast::Stage::FnDecl(fd) => {
-                        let s: BTreeSet<String> =
-                            fd.effects.iter().map(|e| e.name.clone()).collect();
-                        Some((sig.clone(), s))
-                    }
-                    _ => None,
+            .map(|(sig, stage)| (sig.clone(), stage.clone()))
+            .collect();
+        let old_effects: BTreeMap<String, BTreeSet<String>> = head_pairs
+            .iter()
+            .zip(self.get_asts_for_sigs_bulk(&head_pairs))
+            .filter_map(|((sig, _), ast)| match ast.ok()? {
+                lex_ast::Stage::FnDecl(fd) => {
+                    let s: BTreeSet<String> =
+                        fd.effects.iter().map(|e| e.name.clone()).collect();
+                    Some((sig.clone(), s))
                 }
+                _ => None,
             })
             .collect();
         let old_imports = self.derive_imports_from_oplog(branch)?;

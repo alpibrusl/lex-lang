@@ -9,6 +9,43 @@ bumps may carry breaking changes when justified).
 
 ### Fixed
 
+- **A multi-file package publish reprocessed every locally-imported
+  function once per importing file (#828).** `pkg_publish_handler` loaded
+  each top-level `.lex` file independently, and each load flattened in the
+  whole local-import closure, so a shared file was canonicalized,
+  type-checked, diffed and published once for every file importing it —
+  2,239 declarations processed for 693 distinct names on the real 21-file
+  `lex-schema` package, whose `error.lex` 17 files import. Worse, each of
+  those 21 `publish_program` calls independently read every live function
+  on the branch and walked the op log. Measured against that package's
+  real source: a republish of unchanged source took 34.0s before and
+  0.72s after, and a cold publish 20.6s → 6.8s.
+  - `lex_syntax::load_package` loads the whole archive in one shared pass:
+    every file exactly once, every declaration prefix-mangled, one
+    type-check, one diff, one `publish_program` call. Per-file import
+    attribution is reported separately so `AddImport`/`RemoveImport` keep
+    naming the file that declares each module.
+  - **Naming change.** Nothing is published under its bare source-level
+    name any more: `fn validate` in `src/field.lex` is
+    `field_<hash>.validate`. That is what makes one program safe to check
+    as a unit (the checker's global scope is name-keyed, and two files may
+    each declare a `validate`), and it ends the double publication — a
+    file's functions used to be stored once bare and once prefixed. The
+    mangling key now also carries the package name, so two packages
+    sharing an internal layout no longer collapse onto one set of names.
+    The first publish after this lands re-adds a package's functions under
+    their new names; the previous names are left in place, unreferenced,
+    as nothing tracks package-scoped ownership to clean them up (#818).
+  - A type error anywhere in the archive now publishes nothing, where
+    before each file was published as it was processed.
+- **`publish_program` read every live function's effects one `get_ast` at
+  a time**, and `get_ast`'s index-hit path re-reads and re-parses the
+  whole `stage_index.jsonl` per call — O(index × live functions) on every
+  publish. It now reads them in one batch through the SigId the branch
+  head names, which also fixes the #826 ambiguity in that lookup: a
+  StageId shared by two same-bodied functions attributed one function's
+  effects to the other's SigId. Same fix in `pkg_delete_handler`, where
+  the ambiguity decided which functions got *removed*.
 - **Republishing unchanged multi-file packages was not idempotent
   (#826).** A publish of byte-identical source created real new ops and
   grew the branch's live function set on every attempt, forever. Three

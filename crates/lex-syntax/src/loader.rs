@@ -19,19 +19,38 @@
 //!
 //! The mangling key is the canonical absolute path by default, and the
 //! path **relative to a caller-supplied root** when loading through
-//! [`load_program_with_root`]. Absolute paths are only stable as long
-//! as the tree stays put, which makes them unusable for anything that
-//! loads the same logical package from a fresh directory each time: a
-//! server unpacking an uploaded package into a per-request temp dir got
-//! a different prefix — and therefore a brand-new set of function names
-//! — for every file reached through a local import on every single
-//! request, so byte-identical republishes diffed as all-new functions
-//! and grew the branch's function set without bound (#826). Pass the
-//! package root and the key becomes `src/error.lex`, identical across
-//! requests. Files outside the root keep the absolute-path key (a
-//! dependency in the shared package cache lives at a stable absolute
-//! path of its own, and "relative to this package" says nothing useful
-//! about it).
+//! [`load_program_with_root`] or [`load_package`]. Absolute paths are
+//! only stable as long as the tree stays put, which makes them unusable
+//! for anything that loads the same logical package from a fresh
+//! directory each time: a server unpacking an uploaded package into a
+//! per-request temp dir got a different prefix — and therefore a
+//! brand-new set of function names — for every file reached through a
+//! local import on every single request, so byte-identical republishes
+//! diffed as all-new functions and grew the branch's function set
+//! without bound (#826). Pass the package root and the key becomes
+//! `src/error.lex`, identical across requests. Files outside the root
+//! keep the absolute-path key (a dependency in the shared package cache
+//! lives at a stable absolute path of its own, and "relative to this
+//! package" says nothing useful about it).
+//!
+//! [`load_package`] adds a `namespace` ahead of the relative path
+//! (`lex-schema/src/error.lex`), because a relative key is only unique
+//! *within* one package: two packages published into one branch can both
+//! have a `src/error.lex`, and without the namespace both get the same
+//! `error_<hash>.format`.
+//!
+//! ## Whole-package loading
+//!
+//! [`load_program`] and [`load_program_with_root`] each flatten one
+//! entry's entire local-import closure into that entry's program, which
+//! is what `lex run`/`lex check` want for a single file. A caller holding
+//! *every* file of a package — a publish server, say — gets each shared
+//! dependency back once per importer instead: 2,239 declarations for 693
+//! distinct names on a real 21-file package whose `error.lex` 17 files
+//! import (#828). [`load_package`] is the whole-package entry point: one
+//! shared pass, every file exactly once, and every file mangled (no
+//! unmangled entry), since bare names from different files would collide
+//! in one program.
 //!
 //! Within a file at prefix `P`:
 //!
@@ -62,13 +81,15 @@
 //!
 //! The mangling key is a filesystem path (see above). Moving a file
 //! changes its SigId; renaming changes the file-stem half of the
-//! prefix. A root-relative key narrows this to moves *within* the
-//! package, but does not remove it. The eventual fix —
-//! content-addressed identity decoupled from filesystem layout — lives
-//! with store-native imports
+//! prefix, and under [`load_package`] that applies to every
+//! declaration, not only imported ones — a function moved between two
+//! files of a package is a new function there. A root-relative key
+//! narrows this to moves *within* the package, but does not remove it.
+//! The eventual fix — content-addressed identity decoupled from
+//! filesystem layout — lives with store-native imports
 //! (`import "stage:..."`); see the corresponding follow-up tracker.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -98,6 +119,15 @@ pub enum LoadError {
     NotFound { importer: String, reference: String },
     #[error("local imports (`./`, `../`, `/`) require a base path; cannot resolve from a string source")]
     LocalImportInStringSource,
+    #[error(
+        "alias `{alias}` is bound to both \"{first}\" and \"{second}\" within one package; \
+         loading the package as a single unit cannot keep both"
+    )]
+    ConflictingAlias {
+        alias: String,
+        first: String,
+        second: String,
+    },
     #[error("package import error: {0}")]
     Package(#[from] PackageError),
 }
@@ -126,6 +156,105 @@ pub fn load_program_with_root(entry: &Path, root: &Path) -> Result<Program, Load
     load_rooted(entry, Some(root))
 }
 
+/// A package loaded as one unit by [`load_package`].
+#[derive(Debug)]
+pub struct LoadedPackage {
+    /// Every file's declarations, each exactly once, all prefix-mangled.
+    pub program: Program,
+    /// The stdlib modules each file imports *itself*, keyed by the file's
+    /// path relative to the package root (`src/schema.lex`). Unlike
+    /// `program`, this is per-file: the flattening entry points cannot
+    /// report it, because by the time they return, a file's imports and
+    /// those of everything it imports are one undifferentiated list.
+    pub imports_by_file: BTreeMap<String, BTreeSet<String>>,
+}
+
+/// Load a whole package as **one** program: every file gets its
+/// path-derived mangling prefix (no file is the unmangled "entry"), and
+/// each file's declarations appear exactly once however many other files
+/// import it.
+///
+/// [`load_program`] and [`load_program_with_root`] flatten each entry's
+/// whole local-import closure into that entry's program, so a caller
+/// holding N top-level files gets every shared dependency back N times —
+/// once per importer. The real 21-file `lex-schema` package, whose
+/// `error.lex` is imported by 17 of its files, yielded 2,239 `FnDecl`s
+/// for 693 distinct names that way, and a server that canonicalizes,
+/// type-checks, diffs and publishes each copy paid for all 2,239 (#828).
+/// One shared pass yields 447 — one per declaration.
+///
+/// Because no file is the entry, **no declaration keeps its bare
+/// source-level name**: `fn validate` in `src/field.lex` is
+/// `field_<hash>.validate`, not `validate`. That is what makes one
+/// program safe to type-check as a unit — two files may each declare
+/// their own local `validate`, and the checker's global scope is a map
+/// keyed by name, so bare names from different files would silently
+/// overwrite each other and check bodies against the wrong signature.
+///
+/// `namespace` is mixed into every mangling key ahead of the relative
+/// path, so the same internal layout in two different packages does not
+/// collapse onto one set of names. Callers publishing into a shared
+/// branch should pass the package name: a tenant hosting both
+/// `lex-schema` and `lex-ocpi` has two `src/error.lex` files, and a
+/// purely path-derived key gives both the same `error_<hash>.format`.
+///
+/// Stdlib imports are deduped by `(reference, alias)`. An alias bound to
+/// two *different* references inside one package is rejected with
+/// [`LoadError::ConflictingAlias`] rather than merged: the checker's
+/// alias scope is also name-keyed, so merging would silently resolve one
+/// file's calls against the other file's module.
+pub fn load_package(
+    entries: &[PathBuf],
+    root: &Path,
+    namespace: &str,
+) -> Result<LoadedPackage, LoadError> {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut state = LoaderState {
+        in_progress: Vec::new(),
+        loaded: HashSet::new(),
+        prefixes: HashMap::new(),
+        prefix_root: Some(root),
+        prefix_namespace: Some(namespace.to_string()),
+        imports_by_file: BTreeMap::new(),
+    };
+    // Deliberately no empty-prefix seeding: see the doc comment above.
+    let mut items: Vec<Item> = Vec::new();
+    let mut aliases: HashMap<String, String> = HashMap::new();
+    for entry in entries {
+        let canonical = entry.canonicalize().map_err(|source| LoadError::Io {
+            path: entry.display().to_string(),
+            source,
+        })?;
+        for item in state.load(&canonical)?.items {
+            if let Item::Import(imp) = &item {
+                match aliases.get(&imp.alias) {
+                    // Same module under the same alias: one import is enough.
+                    Some(existing) if existing == &imp.reference => continue,
+                    Some(existing) => {
+                        return Err(LoadError::ConflictingAlias {
+                            alias: imp.alias.clone(),
+                            first: existing.clone(),
+                            second: imp.reference.clone(),
+                        })
+                    }
+                    None => {
+                        aliases.insert(imp.alias.clone(), imp.reference.clone());
+                    }
+                }
+            }
+            items.push(item);
+        }
+    }
+    Ok(LoadedPackage {
+        program: Program {
+            items,
+            leading_comments: Vec::new(),
+            trailing_comments: Vec::new(),
+        },
+        imports_by_file: state.imports_by_file,
+    })
+}
+
 fn load_rooted(entry: &Path, prefix_root: Option<PathBuf>) -> Result<Program, LoadError> {
     let entry_canonical = entry.canonicalize().map_err(|source| LoadError::Io {
         path: entry.display().to_string(),
@@ -136,6 +265,8 @@ fn load_rooted(entry: &Path, prefix_root: Option<PathBuf>) -> Result<Program, Lo
         loaded: HashSet::new(),
         prefixes: HashMap::new(),
         prefix_root,
+        prefix_namespace: None,
+        imports_by_file: BTreeMap::new(),
     };
     // Entry file's prefix is empty so `lex run main.lex process` works
     // without users typing the hashed prefix.
@@ -176,6 +307,14 @@ struct LoaderState {
     /// path, so the same package layout mangles identically wherever it
     /// is unpacked. See the module header's "Mangling" section.
     prefix_root: Option<PathBuf>,
+    /// Mixed into every relative mangling key ahead of the path, so two
+    /// packages sharing an internal layout (two `src/error.lex` files)
+    /// do not mangle to one set of names. Only [`load_package`] sets it.
+    prefix_namespace: Option<String>,
+    /// Stdlib modules imported by each file itself, keyed by the file's
+    /// root-relative path. Recorded for every file the loader reads;
+    /// only [`load_package`] hands it back.
+    imports_by_file: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl LoaderState {
@@ -197,28 +336,40 @@ impl LoaderState {
         prefix
     }
 
-    /// The string a file's mangling hash is taken over: its path
-    /// relative to `prefix_root` when it lives under one, else its
-    /// canonical absolute path. Relative keys are joined with `/`
-    /// regardless of platform so the same layout hashes the same on
+    /// The string a file's mangling hash is taken over: `prefix_namespace`
+    /// (when set) followed by the file's path relative to `prefix_root`,
+    /// else its canonical absolute path. Relative keys are joined with
+    /// `/` regardless of platform so the same layout hashes the same on
     /// Windows and Unix.
     fn mangling_key(&self, canonical: &Path) -> String {
-        if let Some(root) = &self.prefix_root {
-            if let Ok(rel) = canonical.strip_prefix(root) {
-                let key = rel
-                    .components()
-                    .map(|c| c.as_os_str().to_string_lossy())
-                    .collect::<Vec<_>>()
-                    .join("/");
-                // An empty key means `canonical == root` (a root
-                // pointing at the file itself) — not a usable key, and
-                // it would collide with any other such file.
-                if !key.is_empty() {
-                    return key;
-                }
-            }
+        match (self.relative_key(canonical), &self.prefix_namespace) {
+            (Some(rel), Some(ns)) => format!("{ns}/{rel}"),
+            (Some(rel), None) => rel,
+            (None, _) => canonical.to_string_lossy().into_owned(),
         }
-        canonical.to_string_lossy().into_owned()
+    }
+
+    /// A file's path relative to `prefix_root`, `/`-joined — `None` when
+    /// there is no root or the file lives outside it. Also the key
+    /// `imports_by_file` is reported under, which is why it carries no
+    /// namespace: those keys name files in the archive, and history
+    /// already records them under exactly this spelling.
+    fn relative_key(&self, canonical: &Path) -> Option<String> {
+        let root = self.prefix_root.as_ref()?;
+        let rel = canonical.strip_prefix(root).ok()?;
+        let key = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        // An empty key means `canonical == root` (a root pointing at the
+        // file itself) — not a usable key, and it would collide with any
+        // other such file.
+        if key.is_empty() {
+            None
+        } else {
+            Some(key)
+        }
     }
 
     fn load(&mut self, canonical: &Path) -> Result<Program, LoadError> {
@@ -302,6 +453,19 @@ impl LoaderState {
                 }
                 Item::Import(_) => std_imports.push(item),
                 _ => my_items.push(item),
+            }
+        }
+
+        // Attribute this file's own stdlib imports to this file, before
+        // the merge below makes them indistinguishable from its
+        // children's. Every file gets an entry, imports or not, so a
+        // file that has dropped its last import is still represented.
+        if let Some(key) = self.relative_key(canonical) {
+            let entry = self.imports_by_file.entry(key).or_default();
+            for item in &std_imports {
+                if let Item::Import(imp) = item {
+                    entry.insert(imp.reference.clone());
+                }
             }
         }
 

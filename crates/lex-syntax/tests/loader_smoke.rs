@@ -3,7 +3,9 @@
 //! qualified types, shadowing.
 
 use lex_syntax::syntax::*;
-use lex_syntax::{load_program, load_program_from_str, load_program_with_root, LoadError};
+use lex_syntax::{
+    load_package, load_program, load_program_from_str, load_program_with_root, LoadError,
+};
 use std::fs;
 
 fn write(dir: &std::path::Path, name: &str, src: &str) {
@@ -735,4 +737,157 @@ fn unrooted_load_still_keys_on_the_absolute_path() {
     let names_a = fn_names(&load_program(&entry_a).expect("load a"));
     let names_b = fn_names(&load_program(&entry_b).expect("load b"));
     assert_ne!(names_a, names_b);
+}
+
+
+// ── #828: one shared pass over a whole package ───────────────────────────────
+
+/// Write a package with one shared file imported by three others, plus a
+/// file that imports nothing, and return (root, entry paths sorted).
+fn write_dense_package(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    write(&src, "error.lex", "fn code() -> Str { \"e\" }\nfn fmt() -> Str { \"f\" }\n");
+    for name in ["a.lex", "b.lex", "c.lex"] {
+        write(
+            &src,
+            name,
+            "import \"./error\" as e\nfn use_it() -> Str { e.code() }\n",
+        );
+    }
+    write(&src, "alone.lex", "fn solo() -> Int { 1 }\n");
+    let mut entries: Vec<std::path::PathBuf> = fs::read_dir(&src)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("lex"))
+        .collect();
+    entries.sort();
+    entries
+}
+
+/// The redundancy #828 is about: flattening each entry separately hands a
+/// shared dependency back once per importer, so a caller processing every
+/// top-level file pays for it every time. One shared pass emits it once.
+#[test]
+fn load_package_emits_each_file_once_however_many_import_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let entries = write_dense_package(dir.path());
+
+    // What the per-entry entry points produce, totalled over the package.
+    let per_file_total: usize = entries
+        .iter()
+        .map(|e| fn_names(&load_program_with_root(e, dir.path()).expect("load")).len())
+        .sum();
+
+    let pkg = load_package(&entries, dir.path(), "pkg").expect("load package");
+    let names = fn_names(&pkg.program);
+
+    // 6 declarations: error.lex's 2, one per importer (3), alone.lex's 1.
+    assert_eq!(
+        names.len(), 6,
+        "one entry per declaration in the package, got: {names:?}",
+    );
+    let unique: std::collections::BTreeSet<&String> = names.iter().collect();
+    assert_eq!(unique.len(), names.len(), "no declaration appears twice: {names:?}");
+    assert!(
+        per_file_total > names.len(),
+        "per-entry loads must be the redundant case this replaces \
+         ({per_file_total} vs {})",
+        names.len(),
+    );
+    // `error.lex`'s two functions, exactly once each.
+    assert_eq!(
+        names.iter().filter(|n| n.starts_with("error_")).count(), 2,
+        "the shared file's declarations appear once each, got: {names:?}",
+    );
+}
+
+/// No file is the unmangled entry, because the checker's global scope is
+/// keyed by name: two files declaring the same bare name would overwrite
+/// each other and have their bodies checked against the wrong signature.
+#[test]
+fn load_package_mangles_every_file_including_the_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let entries = write_dense_package(dir.path());
+    let pkg = load_package(&entries, dir.path(), "pkg").expect("load package");
+    let names = fn_names(&pkg.program);
+    assert!(
+        names.iter().all(|n| n.contains('.')),
+        "every declaration carries its file's prefix, got: {names:?}",
+    );
+    assert!(
+        names.iter().any(|n| n.starts_with("alone_") && n.ends_with(".solo")),
+        "a file nobody imports is mangled too, got: {names:?}",
+    );
+}
+
+/// Two packages with the same internal layout must not collapse onto one
+/// set of names — a tenant hosting two packages has two `src/error.lex`
+/// files, and the branch they publish into is shared.
+#[test]
+fn load_package_namespaces_identical_layouts_apart() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let ea = write_dense_package(a.path());
+    let eb = write_dense_package(b.path());
+
+    let same = fn_names(&load_package(&ea, a.path(), "same").expect("a").program);
+    let other = fn_names(&load_package(&eb, b.path(), "same").expect("b").program);
+    assert_eq!(same, other, "one namespace, one layout: identical names");
+
+    let renamed = fn_names(&load_package(&eb, b.path(), "different").expect("b").program);
+    assert!(
+        renamed.iter().zip(&same).all(|(x, y)| x != y),
+        "a different namespace must rename every declaration:\n{renamed:?}\n{same:?}",
+    );
+}
+
+/// Imports are reported per declaring file, which a flattened load cannot
+/// do: by the time it returns, a file's imports and its children's are
+/// one list.
+#[test]
+fn load_package_attributes_imports_to_the_declaring_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    write(&src, "helper.lex", "import \"std.str\" as str\nfn shout(s :: Str) -> Str { str.to_upper(s) }\n");
+    write(&src, "main.lex", "import \"./helper\" as h\nfn go() -> Str { h.shout(\"a\") }\n");
+    let entries = vec![src.join("helper.lex"), src.join("main.lex")];
+
+    let pkg = load_package(&entries, dir.path(), "pkg").expect("load package");
+    let helper = pkg.imports_by_file.get("src/helper.lex").expect("helper keyed");
+    let main = pkg.imports_by_file.get("src/main.lex").expect("main keyed");
+    assert!(helper.contains("std.str"), "helper declares std.str, got: {helper:?}");
+    assert!(
+        main.is_empty(),
+        "main imports only ./helper, which is not a module import: {main:?}",
+    );
+}
+
+/// An alias bound to two different modules cannot survive the merge into
+/// one program — the checker's alias scope is name-keyed, so one file's
+/// calls would silently resolve against the other file's module. Rejected
+/// rather than merged.
+#[test]
+fn load_package_rejects_one_alias_bound_to_two_modules() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    write(&src, "a.lex", "import \"std.str\" as m\nfn one(s :: Str) -> Int { m.len(s) }\n");
+    write(&src, "b.lex", "import \"std.list\" as m\nfn two(l :: List[Int]) -> Int { m.len(l) }\n");
+    let entries = vec![src.join("a.lex"), src.join("b.lex")];
+
+    let err = load_package(&entries, dir.path(), "pkg").expect_err("must be rejected");
+    match err {
+        LoadError::ConflictingAlias { alias, .. } => assert_eq!(alias, "m"),
+        other => panic!("expected ConflictingAlias, got {other:?}"),
+    }
+
+    // The same alias for the same module in two files is fine, and the
+    // import is emitted once.
+    write(&src, "b.lex", "import \"std.str\" as m\nfn two(s :: Str) -> Int { m.len(s) }\n");
+    let pkg = load_package(&entries, dir.path(), "pkg").expect("same module is fine");
+    let imports = pkg.program.items.iter().filter(|i| matches!(i, Item::Import(_))).count();
+    assert_eq!(imports, 1, "one import item for one (module, alias) pair");
 }
