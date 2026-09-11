@@ -627,28 +627,6 @@ impl Store {
         Ok(serde_json::from_slice(&bytes)?)
     }
 
-    /// Bulk variant of [`Self::get_ast`] for callers resolving many
-    /// stage_ids at once (e.g. `pkg_publish_handler`'s `old_head`
-    /// scan over every live function in a tenant, once per publish
-    /// request). `get_ast` in a loop calls `lookup_lifecycle` once
-    /// per stage_id, and `lookup_lifecycle`'s index-hit path reads
-    /// and re-parses the *entire* `stage_index.jsonl` on every single
-    /// call — fine for one call, but O(index size × N) for N calls in
-    /// a row, which dominates once the index itself is large (#825's
-    /// follow-up: still correct and far better than the pre-index
-    /// full-tenant-scan-per-call behavior, but the per-call reparse
-    /// is itself a real, measured cost — 87.6s for 3,664 calls against
-    /// a ~14k-line index on the alpibrusl tenant).
-    ///
-    /// This loads the index once for the whole batch and keeps it in
-    /// memory across all `stage_ids`, only touching disk again to
-    /// append genuinely new entries (a positive backfill or a
-    /// negative "not found anywhere" cache, same as the single-call
-    /// path) — never to re-read what's already loaded.
-    ///
-    /// Returns results in the same order as `stage_ids`, `Err` for
-    /// anything that fails to resolve (mirroring `get_ast`'s error
-    /// semantics per call).
     /// Bulk AST fetch for callers that already know each stage's
     /// **signature** — a branch head map, for instance, which is keyed
     /// by SigId and whose values are the StageIds it points at.
@@ -681,6 +659,28 @@ impl Store {
             .collect()
     }
 
+    /// Bulk variant of [`Self::get_ast`] for callers resolving many
+    /// stage_ids at once (e.g. `pkg_publish_handler`'s `old_head`
+    /// scan over every live function in a tenant, once per publish
+    /// request). `get_ast` in a loop calls `lookup_lifecycle` once
+    /// per stage_id, and `lookup_lifecycle`'s index-hit path reads
+    /// and re-parses the *entire* `stage_index.jsonl` on every single
+    /// call — fine for one call, but O(index size × N) for N calls in
+    /// a row, which dominates once the index itself is large (#825's
+    /// follow-up: still correct and far better than the pre-index
+    /// full-tenant-scan-per-call behavior, but the per-call reparse
+    /// is itself a real, measured cost — 87.6s for 3,664 calls against
+    /// a ~14k-line index on the alpibrusl tenant).
+    ///
+    /// This loads the index once for the whole batch and keeps it in
+    /// memory across all `stage_ids`, only touching disk again to
+    /// append genuinely new entries (a positive backfill or a
+    /// negative "not found anywhere" cache, same as the single-call
+    /// path) — never to re-read what's already loaded.
+    ///
+    /// Returns results in the same order as `stage_ids`, `Err` for
+    /// anything that fails to resolve (mirroring `get_ast`'s error
+    /// semantics per call).
     pub fn get_asts_bulk(&self, stage_ids: &[String]) -> Vec<Result<Stage, StoreError>> {
         let mut index = self.load_stage_index();
         let mut sigs_cache: BTreeMap<String, Option<Lifecycle>> = BTreeMap::new();
