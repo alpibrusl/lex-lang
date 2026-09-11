@@ -93,6 +93,33 @@ fn post_bytes(addr: &SocketAddr, path: &str, body: &[u8]) -> (u16, String) {
     }
 }
 
+/// GET a path and return (status, body). Used to read the branch head
+/// so a test can assert a request did (or did not) append to the op log.
+fn get(addr: &SocketAddr, path: &str) -> (u16, String) {
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+    ).into_bytes();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match try_post(addr, &req) {
+            Ok(result) => return result,
+            Err(e) => {
+                if std::time::Instant::now() >= deadline {
+                    panic!("GET {path} failed after retries: {e}");
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+fn branch_head(addr: &SocketAddr) -> Option<String> {
+    let (status, body) = get(addr, "/v1/branches/main/head");
+    assert_eq!(status, 200, "branch head probe must succeed, got: {body}");
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    parsed["head_op"].as_str().map(|s| s.to_string())
+}
+
 fn try_post(addr: &SocketAddr, req: &[u8]) -> Result<(u16, String), String> {
     let mut s = TcpStream::connect_timeout(addr, Duration::from_secs(5)).map_err(|e| e.to_string())?;
     s.set_read_timeout(Some(Duration::from_secs(15))).map_err(|e| e.to_string())?;
@@ -418,3 +445,167 @@ fn publishing_one_package_never_touches_an_unrelated_package_in_the_same_tenant(
          (bravo's publish must not have removed it) -- got: {:#?}", ops[0],
     );
 }
+
+// ── #826: republishing unchanged source must be a no-op ──────────────────────
+
+/// Two files, one importing the other — the shape every real multi-file
+/// package has, and the shape #826 broke.
+const IDEMPOTENT_SRC: &[(&str, &str)] = &[
+    (
+        "error.lex",
+        concat!(
+            "fn code_missing() -> Str\n",
+            "  examples {\n",
+            "    code_missing() => \"missing\",\n",
+            "  }\n",
+            "{ \"missing\" }\n",
+        ),
+    ),
+    (
+        "schema.lex",
+        concat!(
+            "import \"./error\" as e\n",
+            "fn describe() -> Str\n",
+            "  examples {\n",
+            "    describe() => \"missing\",\n",
+            "  }\n",
+            "{ e.code_missing() }\n",
+        ),
+    ),
+];
+
+/// #826: `pkg_publish_handler` unpacks each archive into a fresh temp
+/// dir, and the loader's mangling prefix hashed the file's *absolute*
+/// path — so `error.lex`'s functions came back named
+/// `error_2ee49b9f.code_missing` on one request and
+/// `error_665fe47f.code_missing` on the next, from byte-identical
+/// source. Every name reached through a local import therefore diffed as
+/// brand new on every publish: real `add_function` ops, the previous
+/// request's versions orphaned, and the branch's live function map
+/// growing without bound forever (observed on the real tenant: 3,664 →
+/// 4,477 entries across one supposedly-no-op publish).
+///
+/// Republishing identical source must produce no ops at all and leave
+/// the branch head exactly where it was.
+#[test]
+fn republishing_identical_source_emits_no_ops() {
+    let (srv, _tmp) = start_server();
+
+    let (status, body) = post_bytes(
+        &srv.addr,
+        "/v1/pkg/publish",
+        &pkg_archive("idem", "0.1.0", IDEMPOTENT_SRC),
+    );
+    assert_eq!(status, 200, "first publish must succeed, got: {body}");
+    let head_after_first = branch_head(&srv.addr);
+    assert!(head_after_first.is_some(), "first publish must move the branch head");
+
+    // Same source, new version number (the same version is rejected
+    // outright — see the 409 test below).
+    let (status, body) = post_bytes(
+        &srv.addr,
+        "/v1/pkg/publish",
+        &pkg_archive("idem", "0.2.0", IDEMPOTENT_SRC),
+    );
+    assert_eq!(status, 200, "republish must succeed, got: {body}");
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON response");
+    let ops = parsed["ops"].as_array().expect("ops array in publish response");
+    assert!(
+        ops.is_empty(),
+        "republishing byte-identical source must emit zero ops, got {}: {:#?}",
+        ops.len(), ops,
+    );
+    assert_eq!(
+        branch_head(&srv.addr), head_after_first,
+        "a no-op republish must not move the branch head",
+    );
+}
+
+/// The names a publish records must also be stable across requests —
+/// not merely self-consistent within one. If the second publish emitted
+/// no ops but under a *different* set of names, the first publish's
+/// functions would be the orphans #826 describes.
+#[test]
+fn republished_function_names_are_identical_across_requests() {
+    let (srv, _tmp) = start_server();
+
+    let (status, body) = post_bytes(
+        &srv.addr,
+        "/v1/pkg/publish",
+        &pkg_archive("names", "0.1.0", IDEMPOTENT_SRC),
+    );
+    assert_eq!(status, 200, "first publish must succeed, got: {body}");
+    let (status, body) = post_bytes(
+        &srv.addr,
+        "/v1/pkg/publish",
+        &pkg_archive("names", "0.2.0", IDEMPOTENT_SRC),
+    );
+    assert_eq!(status, 200, "republish must succeed, got: {body}");
+
+    let names_of = |version: &str| -> Vec<String> {
+        let (status, body) = get(&srv.addr, &format!("/v1/pkg/names/{version}"));
+        assert_eq!(status, 200, "record for {version} must be readable, got: {body}");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        let mut names: Vec<String> = parsed["function_names"].as_array()
+            .expect("function_names array")
+            .iter()
+            .map(|v| v.as_str().unwrap_or_default().to_string())
+            .collect();
+        names.sort();
+        names
+    };
+    let v1 = names_of("0.1.0");
+    let v2 = names_of("0.2.0");
+    assert!(
+        v1.iter().any(|n| n.starts_with("error_") && n.ends_with(".code_missing")),
+        "expected a mangled name for the locally-imported file, got: {v1:?}",
+    );
+    assert_eq!(
+        v1, v2,
+        "the same source must publish under the same names on every request (#826)",
+    );
+}
+
+/// A duplicate `(name, version)` publish is rejected with 409 — but the
+/// check used to run *after* the publish loop had already written every
+/// file's ops to the store. The client saw a clean 409 while the
+/// tenant's op log and function set had already grown, which is how
+/// #826's repeated "duplicate version" verification publishes kept
+/// inflating the tenant. A rejected publish must leave the store
+/// untouched.
+#[test]
+fn duplicate_version_publish_leaves_the_op_log_untouched() {
+    let (srv, _tmp) = start_server();
+
+    let (status, body) = post_bytes(
+        &srv.addr,
+        "/v1/pkg/publish",
+        &pkg_archive("dup", "0.1.0", IDEMPOTENT_SRC),
+    );
+    assert_eq!(status, 200, "first publish must succeed, got: {body}");
+    let head_after_first = branch_head(&srv.addr);
+
+    // Same version, genuinely different content: without the re-ordered
+    // check this would publish the change and *then* 409.
+    let changed: &[(&str, &str)] = &[(
+        "error.lex",
+        concat!(
+            "fn code_missing() -> Str\n",
+            "  examples {\n",
+            "    code_missing() => \"gone\",\n",
+            "  }\n",
+            "{ \"gone\" }\n",
+        ),
+    )];
+    let (status, body) = post_bytes(
+        &srv.addr,
+        "/v1/pkg/publish",
+        &pkg_archive("dup", "0.1.0", changed),
+    );
+    assert_eq!(status, 409, "duplicate version must be rejected, got: {body}");
+    assert_eq!(
+        branch_head(&srv.addr), head_after_first,
+        "a 409'd publish must not have appended any ops",
+    );
+}
+

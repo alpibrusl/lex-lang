@@ -10,7 +10,7 @@ use lex_ast::canonicalize_program;
 use lex_bytecode::{compile_program, vm::Vm, Value};
 use lex_runtime::{check_program as check_policy, DefaultHandler, Policy};
 use lex_store::Store;
-use lex_syntax::{load_program, load_program_from_str, Manifest};
+use lex_syntax::{load_program_from_str, load_program_with_root, Manifest};
 use lex_vcs::{MergeSession, MergeSessionId};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1873,6 +1873,19 @@ fn pkg_publish_handler(state: &State, body: &[u8]) -> Response<std::io::Cursor<V
         None => return error_response(400, "lex.toml must have a [package] section"),
     };
 
+    // Reject a same-(name, version) re-publish BEFORE any store write:
+    // this ran after the publish loop, so a 409'd duplicate still
+    // appended its ops to the tenant's op log (#826).
+    if load_pkg_record(&state.root, &pkg_name, &pkg_version).is_some() {
+        return error_response(
+            409,
+            format!(
+                "package {pkg_name}@{pkg_version} already published; \
+                 bump the version in lex.toml to publish a new release"
+            ),
+        );
+    }
+
     let src_dir = tmp.path().join("src");
     if !src_dir.exists() {
         return error_response(400, "archive must contain a src/ directory");
@@ -1912,14 +1925,16 @@ fn pkg_publish_handler(state: &State, body: &[u8]) -> Response<std::io::Cursor<V
         Ok(h) => h,
         Err(e) => return error_response(500, format!("branch_head: {e}")),
     };
-    // `get_asts_bulk` loads the store's reverse index once for this
-    // whole batch instead of once per call (#825's follow-up) --
-    // `old_head` alone can be several thousand entries, and a
-    // per-call `get_ast` loop re-reads and re-parses the entire index
-    // file on every single one.
-    let old_stage_ids: Vec<String> = old_head.values().cloned().collect();
+    // Resolve each AST through the SigId the branch head names, never its
+    // StageId: StageIds are name-independent, so two live functions
+    // differing only in name share one, `stage_index` maps it to just one
+    // of their sigs, and the name that lookup missed got re-reported as an
+    // Add on every publish of unchanged source (#826). It also skips that
+    // index (#825) — see `get_asts_for_sigs_bulk`.
+    let old_pairs: Vec<(String, String)> =
+        old_head.iter().map(|(sig, stage)| (sig.clone(), stage.clone())).collect();
     let mut old_fns_by_name: BTreeMap<String, Vec<lex_ast::FnDecl>> = BTreeMap::new();
-    for fd in store.get_asts_bulk(&old_stage_ids)
+    for fd in store.get_asts_for_sigs_bulk(&old_pairs)
         .into_iter()
         .filter_map(|r| r.ok())
         .filter_map(|s| match s { lex_ast::Stage::FnDecl(fd) => Some(fd), _ => None })
@@ -2001,7 +2016,10 @@ fn pkg_publish_handler(state: &State, body: &[u8]) -> Response<std::io::Cursor<V
     }
     let mut units: Vec<FileUnit> = Vec::new();
     for lex_path in &lex_files {
-        let prog = match load_program(lex_path) {
+        // Mangle local imports against the unpacked archive root: each
+        // request unpacks into a fresh temp dir, so an absolute-path key
+        // renamed every locally-imported function per publish (#826).
+        let prog = match load_program_with_root(lex_path, tmp.path()) {
             Ok(p) => p,
             Err(e) => return error_response(400, format!("load {}: {e}", lex_path.display())),
         };
@@ -2117,17 +2135,6 @@ fn pkg_publish_handler(state: &State, body: &[u8]) -> Response<std::io::Cursor<V
     // function; leaving a deleted function's stage un-removed (it just
     // sits there, unreferenced) is the safe default until package-scoped
     // ownership is tracked, not silently deleting a stranger's data.
-
-    // Reject re-publish of the same (name, version) to keep the op log stable.
-    if load_pkg_record(&state.root, &pkg_name, &pkg_version).is_some() {
-        return error_response(
-            409,
-            format!(
-                "package {pkg_name}@{pkg_version} already published; \
-                 bump the version in lex.toml to publish a new release"
-            ),
-        );
-    }
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)

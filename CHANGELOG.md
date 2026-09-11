@@ -7,6 +7,33 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Republishing unchanged multi-file packages was not idempotent
+  (#826).** A publish of byte-identical source created real new ops and
+  grew the branch's live function set on every attempt, forever. Three
+  independent causes, all fixed:
+  - The loader's mangling prefix hashed each file's *absolute* path, and
+    `pkg_publish_handler` unpacks every archive into a fresh temp dir —
+    so every function reached through a local `./` import was renamed on
+    every request and diffed as brand new, orphaning the previous
+    request's versions. `lex_syntax::load_program_with_root` keys the
+    prefix on the path relative to a caller-supplied root (the archive
+    root, for a publish), which is identical across requests.
+    `load_program` is unchanged, so locally-checked programs keep their
+    existing SigIds.
+  - `pkg_publish_handler` reconstructed the branch's current function set
+    by StageId, which is name-independent by design: two live functions
+    differing only in name share one StageId, `stage_index` maps that
+    StageId to just one of their SigIds, and the handler ended up with
+    two entries under one name and none under the other. The unfound name
+    was re-reported as an Add on every publish. It now reads through the
+    SigId the branch head already gives it
+    (`Store::get_asts_for_sigs_bulk`).
+  - The duplicate-`(name, version)` 409 ran *after* the publish loop had
+    already written every file's ops, so a rejected publish still
+    appended to the tenant's op log. It now runs before any store work.
+
 ## [0.11.5] — 2026-09-10
 
 ### Fixed

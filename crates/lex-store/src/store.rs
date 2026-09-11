@@ -649,6 +649,38 @@ impl Store {
     /// Returns results in the same order as `stage_ids`, `Err` for
     /// anything that fails to resolve (mirroring `get_ast`'s error
     /// semantics per call).
+    /// Bulk AST fetch for callers that already know each stage's
+    /// **signature** — a branch head map, for instance, which is keyed
+    /// by SigId and whose values are the StageIds it points at.
+    ///
+    /// Prefer this over [`Self::get_asts_bulk`] whenever the SigId is in
+    /// hand, because resolving a StageId back to a SigId is not
+    /// reliable: a StageId hashes the structural signature plus the
+    /// implementation, deliberately *not* the name
+    /// (`docs/INVARIANTS.md`), so two functions that differ only in name
+    /// share one StageId while having two distinct SigIds — and two
+    /// separate ASTs, one under each sig directory. `stage_index` maps
+    /// each StageId to a single sig, so `get_ast`/`get_asts_bulk` return
+    /// whichever of those ASTs the index happens to name, i.e. the wrong
+    /// name half the time (#826). Reading straight from the sig the
+    /// caller already knows removes the ambiguity — and skips loading
+    /// the index at all.
+    ///
+    /// Returns results in the same order as `pairs`, `Err` for anything
+    /// that fails to resolve (mirroring `get_ast`'s error semantics).
+    pub fn get_asts_for_sigs_bulk(
+        &self,
+        pairs: &[(String, String)],
+    ) -> Vec<Result<Stage, StoreError>> {
+        pairs
+            .iter()
+            .map(|(sig_id, stage_id)| {
+                let bytes = self.read_stage_canonical_bytes(sig_id, stage_id)?;
+                Ok(serde_json::from_slice(&bytes)?)
+            })
+            .collect()
+    }
+
     pub fn get_asts_bulk(&self, stage_ids: &[String]) -> Vec<Result<Stage, StoreError>> {
         let mut index = self.load_stage_index();
         let mut sigs_cache: BTreeMap<String, Option<Lifecycle>> = BTreeMap::new();
