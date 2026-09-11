@@ -46,9 +46,6 @@ bumps may carry breaking changes when justified).
   StageId shared by two same-bodied functions attributed one function's
   effects to the other's SigId. Same fix in `pkg_delete_handler`, where
   the ambiguity decided which functions got *removed*.
-
-### Fixed
-
 - **Republishing unchanged multi-file packages was not idempotent
   (#826).** A publish of byte-identical source created real new ops and
   grew the branch's live function set on every attempt, forever. Three
