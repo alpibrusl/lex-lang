@@ -9,6 +9,28 @@ bumps may carry breaking changes when justified).
 
 ### Fixed
 
+- **`lex-store`'s write-time publish gate re-checked an already-rewritten
+  program and rejected it (#830).** `check_and_rewrite_program` rewrites
+  `<json|toml|yaml>.parse(...)` / `http.json_body(...)` call sites into
+  native `parse_strict_typed`/`json_body_typed` ops before every real
+  publish path (`pkg_publish_handler`, `publish_handler`, the CLI's local
+  publish) hands `stages` to `publish_program`/`publish_program_signed` —
+  whose own write-time gate then ran a second, plain `check_program` over
+  those same, already-rewritten stages. Since `parse_strict_typed`/
+  `json_body_typed` are native runtime ops, not literal fields of
+  `json`/`toml`/`yaml`/`http`'s Lex-level module type, that second check
+  always failed with `unknown_field: parse_strict_typed`, breaking every
+  publish of a package using this common decode pattern (confirmed via a
+  real package, `lex-web`, whose `lex-crypto/jwt` dependency decodes its
+  payload with `json.parse(...)`).
+  - The checker's `FieldAccess` handling now recognizes
+    `parse_strict_typed`/`json_body_typed` as valid whenever the base
+    record already has the corresponding `parse`/`json_body` field,
+    deriving the synthesized function's signature from the original
+    field's rather than hardcoding one, so re-checking an
+    already-rewritten program is safe without every caller having to
+    track "have I already rewritten this."
+
 - **A multi-file package publish reprocessed every locally-imported
   function once per importing file (#828).** `pkg_publish_handler` loaded
   each top-level `.lex` file independently, and each load flattened in the
