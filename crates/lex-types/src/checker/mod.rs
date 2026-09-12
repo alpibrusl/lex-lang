@@ -185,6 +185,43 @@ pub fn check_and_rewrite_program(
     Ok(pt)
 }
 
+/// `parse` → `parse_strict_typed` / `json_body` → `json_body_typed`
+/// (#168, `parse_strict.rs`) are synthesized onto an AST that has
+/// already been checked once — `rewrite_parse_calls` mutates a
+/// call's callee field name and appends two arguments, producing a
+/// call that the module's literal Lex-level record type has no
+/// field for (the `_typed` variants are native ops dispatched by
+/// name in `lex-runtime`'s `builtins.rs`, not declared Lex members).
+/// Re-checking those already-rewritten stages — as lex-store's
+/// write-time publish gate does on the same stages its caller just
+/// ran `check_and_rewrite_program` over — must accept the field
+/// rather than report it unknown. The synthesized signature is
+/// derived from the original field's rather than hardcoded, so it
+/// stays in sync with any future change to the base op's shape:
+/// same params (plus the two extra `List` arguments the rewrite
+/// always appends) and the same effects and return type.
+fn synthesize_decode_typed_field(field: &str, fields: &IndexMap<String, Ty>) -> Option<Ty> {
+    let base_field = match field {
+        "parse_strict_typed" => "parse",
+        "json_body_typed" => "json_body",
+        _ => return None,
+    };
+    let Ty::Function { params, effects, ret } = fields.get(base_field)? else {
+        return None;
+    };
+    let mut synthesized_params = params.clone();
+    synthesized_params.push(Ty::List(Box::new(Ty::Prim(Prim::Str))));
+    synthesized_params.push(Ty::List(Box::new(Ty::Tuple(vec![
+        Ty::Prim(Prim::Str),
+        Ty::Prim(Prim::Str),
+    ]))));
+    Some(Ty::Function {
+        params: synthesized_params,
+        effects: effects.clone(),
+        ret: ret.clone(),
+    })
+}
+
 fn collect_vars(t: &Ty) -> Vec<TyVarId> {
     let mut out = Vec::new();
     fn walk(t: &Ty, out: &mut Vec<TyVarId>) {
@@ -795,6 +832,7 @@ impl Checker {
                 };
                 match resolved {
                     Ty::Record(fields) => fields.get(field).cloned()
+                        .or_else(|| synthesize_decode_typed_field(field, &fields))
                         .ok_or_else(|| TypeError::UnknownField {
                             at_node: node_id.into(),
                             record_type: Ty::Record(fields.clone()).pretty(),

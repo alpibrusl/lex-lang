@@ -123,6 +123,32 @@ fn rewrite_against_different_stages_is_a_hard_error() {
 }
 
 #[test]
+fn rechecking_already_rewritten_stages_does_not_report_unknown_field() {
+    // #830: lex-store's write-time publish gate re-runs `check_program`
+    // on stages its caller already ran `check_and_rewrite_program`
+    // over. Before the fix, that second pass failed with
+    // `unknown_field: parse_strict_typed` — the rewrite's synthesized
+    // callee isn't a literal field of `toml`'s Lex-level record type,
+    // only a native op `lex-runtime` dispatches by name. Every real
+    // publish path (`pkg_publish_handler`, `publish_handler`, the
+    // CLI's local publish) pre-rewrites exactly like this, so any
+    // package that legitimately calls `<json|toml|yaml>.parse(...)` or
+    // `http.json_body(...)` failed to publish.
+    let prog = parse_source(SRC).expect("parse");
+    let mut stages = canonicalize_program(&prog);
+    check_and_rewrite_program(&mut stages).expect("first check + rewrite");
+
+    // Simulates the store's gate: a second, plain type-check of the
+    // same, now-rewritten stages.
+    check_program(&stages).expect("re-checking already-rewritten stages must not fail");
+
+    // A second `check_and_rewrite_program` pass (an alternative fix
+    // considered and rejected — see #830) must also be safe: nothing
+    // left to rewrite, and the field is now recognized either way.
+    check_and_rewrite_program(&mut stages).expect("second check_and_rewrite_program pass");
+}
+
+#[test]
 fn programs_without_decode_imports_record_nothing() {
     let src = r#"
 fn f(x :: Int) -> Int { x + 1 }
