@@ -509,7 +509,7 @@ impl Store {
 
 /// Apply a single `StageTransition` to a sig-stage map. Used by
 /// `branch_head` to replay an op log.
-fn apply_transition(map: &mut BTreeMap<String, String>, t: &StageTransition) {
+pub(crate) fn apply_transition(map: &mut BTreeMap<String, String>, t: &StageTransition) {
     match t {
         StageTransition::Create { sig_id, stage_id }
         | StageTransition::Replace { sig_id, to: stage_id, .. } => {
@@ -637,7 +637,9 @@ impl Store {
                     [s, d],
                 );
                 let t = lex_vcs::StageTransition::Merge { entries };
-                let _ = self.apply_operation(dst, op, t)?;
+                // Gated (#833): land the merge op, type-check the real
+                // post-merge head, and roll back if it doesn't compose.
+                let _ = self.apply_merge_op_gated(dst, op, t)?;
             }
             // src empty: nothing to merge in. Treat as no-op.
             (None, _) => { /* no-op */ }

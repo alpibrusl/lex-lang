@@ -569,7 +569,14 @@ fn merge_commit_with_custom_resolution_lands_agent_supplied_stage() {
     let conflict_id = conflict["conflict_id"].as_str().unwrap().to_string();
     let ours_stage = conflict["ours"].as_str().unwrap().to_string();
     let theirs_stage = conflict["theirs"].as_str().unwrap().to_string();
-    let custom_stage = "stage-agent-resolved-001".to_string();
+    // commit is gated (#833): the custom op must name a real stage.
+    let custom_stage = {
+        let s = lex_store::Store::open(_tmp.path()).unwrap();
+        let st = lex_ast::canonicalize_program(
+            &lex_syntax::parse_source("fn foo(n :: Int) -> Int { n + 3 }\n").unwrap())
+            .into_iter().next().unwrap();
+        s.publish(&st).unwrap()
+    };
 
     let resolve_body = json!({
         "resolutions": [
@@ -784,4 +791,111 @@ fn patch_with_unknown_node_returns_422() {
     let (s, b) = http(&srv.addr, "POST", "/v1/patch", &patch_body);
     assert_eq!(s, 422);
     assert!(b.contains("unknown_node"), "expected unknown_node in body: {b}");
+}
+
+
+// ── #833: the write-time gate on the merge and patch paths ──────────────────
+
+fn branch_head_op(srv: &Server, branch: &str) -> serde_json::Value {
+    let (s, b) = http(&srv.addr, "GET", &format!("/v1/branches/{branch}/head"), "");
+    assert_eq!(s, 200, "branch head: {b}");
+    serde_json::from_str::<serde_json::Value>(&b).unwrap()["head_op"].clone()
+}
+
+fn set_current_branch(tmp: &TempDir, name: &str, create_from: Option<&str>) {
+    let store = lex_store::Store::open(tmp.path()).unwrap();
+    if let Some(from) = create_from {
+        store.create_branch(name, from).unwrap();
+    }
+    store.set_current_branch(name).unwrap();
+}
+
+fn stage_id_of(src: &str, name: &str) -> String {
+    let st = lex_ast::canonicalize_program(&lex_syntax::parse_source(src).unwrap())
+        .into_iter()
+        .find(|s| matches!(s, lex_ast::Stage::FnDecl(fd) if fd.name == name))
+        .expect("fn not found");
+    lex_ast::stage_id(&st).unwrap()
+}
+
+// Note on "refuses a broken merge": with every write gated, each branch is
+// always individually valid, and the auto-merge engine keeps a
+// still-referenced sig rather than dropping it — so a broken *auto*-merge
+// isn't reachable through the public HTTP publish surface. The reachable
+// broken-merge is an agent-supplied Custom resolution that drops a
+// still-referenced sig; that path and the head rollback are tested directly
+// against the store in
+// lex-store/tests/merge_gate.rs::merge_op_that_drops_a_still_referenced_fn_is_refused_and_head_rolls_back.
+// Here we cover the HTTP happy path plus the /v1/patch composed-gate behavior.
+
+#[test]
+fn merge_commit_lands_a_merge_whose_result_typechecks() {
+    // Unambiguous conflict-free merge: main has helper, feature adds
+    // an independent `extra`. { helper, extra } composes → lands.
+    let (srv, tmp) = start_server();
+    let (s, _) = http(&srv.addr, "POST", "/v1/publish",
+        &json!({"source": "fn helper(x :: Int) -> Int { x }\n", "activate": true}).to_string());
+    assert_eq!(s, 200);
+    set_current_branch(&tmp, "feature", Some(lex_store::DEFAULT_BRANCH));
+    let (s, _) = http(&srv.addr, "POST", "/v1/publish", &json!({
+        "source": "fn helper(x :: Int) -> Int { x }\nfn extra(x :: Int) -> Int { x + 1 }\n",
+        "activate": true,
+    }).to_string());
+    assert_eq!(s, 200);
+    set_current_branch(&tmp, lex_store::DEFAULT_BRANCH, None);
+    let before = branch_head_op(&srv, lex_store::DEFAULT_BRANCH);
+
+    let (_, b) = http(&srv.addr, "POST", "/v1/merge/start",
+        &json!({"src_branch": "feature", "dst_branch": lex_store::DEFAULT_BRANCH}).to_string());
+    let merge_id = serde_json::from_str::<serde_json::Value>(&b).unwrap()["merge_id"]
+        .as_str().unwrap().to_string();
+    let (s, b) = http(&srv.addr, "POST", &format!("/v1/merge/{merge_id}/commit"), "");
+    assert_eq!(s, 200, "commit: {b}");
+    assert_ne!(branch_head_op(&srv, lex_store::DEFAULT_BRANCH), before);
+}
+
+#[test]
+fn patch_may_reference_a_sibling_function() {
+    // Before #833 the patched stage was checked in isolation, so a
+    // body calling any other function was rejected as an unknown
+    // identifier. The composed check sees the whole branch.
+    let (srv, _tmp) = start_server();
+    let src = "fn g(x :: Int) -> Int { x }\nfn f(x :: Int) -> Int { x + 1 }\n";
+    let (s, b) = http(&srv.addr, "POST", "/v1/publish",
+        &json!({"source": src, "activate": true}).to_string());
+    assert_eq!(s, 200, "publish: {b}");
+    let f_stage = stage_id_of(src, "f");
+    // Replace f's body (1 param → n_0.2) with g(x).
+    let patch_body = json!({
+        "stage_id": f_stage,
+        "patch": {"op": "replace", "target": "n_0.2",
+            "with": {"node": "Call", "callee": {"node": "Var", "name": "g"},
+                     "args": [{"node": "Var", "name": "x"}]}},
+    }).to_string();
+    let (s, b) = http(&srv.addr, "POST", "/v1/patch", &patch_body);
+    assert_eq!(s, 200, "a patch calling a sibling must be accepted: {b}");
+}
+
+#[test]
+fn patch_that_does_not_compose_is_refused_and_head_is_unchanged() {
+    let (srv, _tmp) = start_server();
+    let src = "fn g(x :: Int) -> Int { x }\nfn f(x :: Int) -> Int { x + 1 }\n";
+    let (s, _) = http(&srv.addr, "POST", "/v1/publish",
+        &json!({"source": src, "activate": true}).to_string());
+    assert_eq!(s, 200);
+    let f_stage = stage_id_of(src, "f");
+    let before = branch_head_op(&srv, lex_store::DEFAULT_BRANCH);
+    // g(x, x) — wrong arity against the real g, which only the composed
+    // program can know.
+    let patch_body = json!({
+        "stage_id": f_stage,
+        "patch": {"op": "replace", "target": "n_0.2",
+            "with": {"node": "Call", "callee": {"node": "Var", "name": "g"},
+                     "args": [{"node": "Var", "name": "x"}, {"node": "Var", "name": "x"}]}},
+    }).to_string();
+    let (s, b) = http(&srv.addr, "POST", "/v1/patch", &patch_body);
+    assert_eq!(s, 422, "expected 422: {b}");
+    assert!(b.contains("type errors after patch"), "body: {b}");
+    assert_eq!(branch_head_op(&srv, lex_store::DEFAULT_BRANCH), before,
+        "head must not move on a refused patch");
 }

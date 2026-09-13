@@ -173,6 +173,16 @@ fn merge_full_cycle_with_custom_resolution_lands_agent_stage() {
     let ours = conflict["ours"].as_str().unwrap().to_string();
     let theirs = conflict["theirs"].as_str().unwrap().to_string();
 
+    // commit is gated (#833): the custom op must name a stage that
+    // actually exists, so publish the resolved body first.
+    let custom_stage = {
+        let s = lex_store::Store::open(store.path()).unwrap();
+        let st = lex_ast::canonicalize_program(
+            &lex_syntax::parse_source("fn foo(n :: Int) -> Int { n + 3 }\n").unwrap())
+            .into_iter().next().unwrap();
+        s.publish(&st).unwrap()
+    };
+
     let resolutions_path = store.path().join("res.json");
     // Same shape as the HTTP /resolve body. Operation's `kind` is
     // serde-flattened so the OperationKind tag lives at the top.
@@ -184,7 +194,7 @@ fn merge_full_cycle_with_custom_resolution_lands_agent_stage() {
                 "op": "modify_body",
                 "sig_id": conflict_id,
                 "from_stage_id": ours,
-                "to_stage_id":   "stage-agent-resolved-cli-001",
+                "to_stage_id":   custom_stage,
                 "parents": [ours, theirs],
             }
         }

@@ -83,19 +83,49 @@ fn merge_conflict_when_both_sides_modify_same_sig() {
     assert_eq!(report.conflicts[0].kind, "modify-modify");
 }
 
+/// Parse `src` → the canonical stage `name` plus its sig/stage ids.
+/// Tests that *land* a merge need real stages: `commit_merge` is
+/// gated (#833) and assembles the merged program off disk, so a
+/// placeholder like `"stageB"` can't be loaded.
+fn real_stage(src: &str, name: &str) -> (lex_ast::Stage, String, String) {
+    let st = lex_ast::canonicalize_program(&lex_syntax::parse_source(src).unwrap())
+        .into_iter()
+        .find(|s| matches!(s, lex_ast::Stage::FnDecl(fd) if fd.name == name))
+        .expect("fn not found");
+    let sig = lex_ast::sig_id(&st).unwrap();
+    let stg = lex_ast::stage_id(&st).unwrap();
+    (st, sig, stg)
+}
+
 #[test]
 fn commit_merge_advances_dst_head_op() {
+    let (s, _tmp) = fresh();
+    let (st_a, sig, stg_a) = real_stage("fn foo(n :: Int) -> Int { n }\n", "foo");
+    s.publish(&st_a).unwrap();
+    let _ = add(&s, DEFAULT_BRANCH, &sig, &stg_a);
+    s.create_branch("feature", DEFAULT_BRANCH).unwrap();
+    let (st_b, _, stg_b) = real_stage("fn foo(n :: Int) -> Int { n + 1 }\n", "foo");
+    s.publish(&st_b).unwrap();
+    let _ = modify(&s, "feature", &sig, &stg_a, &stg_b);
+    let report = s.merge("feature", DEFAULT_BRANCH).unwrap();
+    s.commit_merge(DEFAULT_BRANCH, &report).unwrap();
+    assert_eq!(s.branch_head(DEFAULT_BRANCH).unwrap().get(&sig), Some(&stg_b));
+    assert_eq!(s.branch_log(DEFAULT_BRANCH).unwrap().len(), 1);
+}
+
+#[test]
+fn commit_merge_refuses_a_merge_naming_an_unpublished_stage() {
+    // The gate can't assemble a program from a stage that was never
+    // published — a head is never advanced onto content the store
+    // can't load. Head rolls back.
     let (s, _tmp) = fresh();
     let _ = add(&s, DEFAULT_BRANCH, "sig1", "stageA");
     s.create_branch("feature", DEFAULT_BRANCH).unwrap();
     let _ = modify(&s, "feature", "sig1", "stageA", "stageB");
+    let head_before = s.get_branch(DEFAULT_BRANCH).unwrap().unwrap().head_op;
     let report = s.merge("feature", DEFAULT_BRANCH).unwrap();
-    s.commit_merge(DEFAULT_BRANCH, &report).unwrap();
-    assert_eq!(
-        s.branch_head(DEFAULT_BRANCH).unwrap().get("sig1"),
-        Some(&"stageB".to_string()),
-    );
-    assert_eq!(s.branch_log(DEFAULT_BRANCH).unwrap().len(), 1);
+    assert!(s.commit_merge(DEFAULT_BRANCH, &report).is_err());
+    assert_eq!(s.get_branch(DEFAULT_BRANCH).unwrap().unwrap().head_op, head_before);
 }
 
 #[test]
