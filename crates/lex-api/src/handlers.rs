@@ -568,16 +568,16 @@ fn patch_handler(state: &State, body: &str) -> Response<std::io::Cursor<Vec<u8>>
             serde_json::to_value(&e).unwrap_or_default()),
     };
 
-    // 3. Type-check the new stage in isolation.
-    let stages = vec![patched.clone()];
-    if let Err(errs) = lex_types::check_program(&stages) {
-        return error_with_detail(422, "type errors after patch",
-            serde_json::to_value(&errs).unwrap_or_default());
-    }
+    // 3. No isolated check (#833): the gated apply below type-checks
+    // the *composed* program — the branch head with the patched stage
+    // swapped in. Stricter where it matters (a body that no longer
+    // composes with its callers is refused) and correct where the old
+    // isolated check was wrong (a body calling a sibling was rejected
+    // as an unknown identifier a one-stage program couldn't see).
 
-    // Routing through apply_operation so /v1/patch participates in
-    // the op DAG. We know this op is always a body change on the
-    // existing sig (a patch can't add a brand-new fn).
+    // Routing through the gated apply so /v1/patch participates in the
+    // op DAG. We know this op is always a body change on the existing
+    // sig (a patch can't add a brand-new fn).
     let branch = store.current_branch();
 
     // Find the sig — patched stage's sig must match the original's.
@@ -586,14 +586,11 @@ fn patch_handler(state: &State, body: &str) -> Response<std::io::Cursor<Vec<u8>>
         None => return error_response(500, "patched stage has no sig_id"),
     };
 
+    // Persist before the gate (its RepairHint on rejection is
+    // addressed to this stage); activate only once the head moved.
     let new_id = match store.publish(&patched) {
         Ok(id) => id, Err(e) => return error_response(500, format!("publish: {e}")),
     };
-    if req.activate {
-        if let Err(e) = store.activate(&new_id) {
-            return error_response(500, format!("activate: {e}"));
-        }
-    }
 
     // Determine op kind: ChangeEffectSig if effects differ, ModifyBody otherwise.
     let original_effects: std::collections::BTreeSet<String> = match &original {
@@ -645,10 +642,17 @@ fn patch_handler(state: &State, body: &str) -> Response<std::io::Cursor<Vec<u8>>
         kind,
         head_now.into_iter().collect::<Vec<_>>(),
     );
-    let op_id = match store.apply_operation(&branch, op, transition) {
+    let op_id = match store.apply_operation_gated(&branch, op, transition) {
         Ok(id) => id,
-        Err(e) => return write_error_response("apply_operation", e),
+        Err(lex_store::StoreError::TypeError(errs)) => return error_with_detail(
+            422, "type errors after patch", serde_json::to_value(&errs).unwrap_or_default()),
+        Err(e) => return write_error_response("apply_operation_gated", e),
     };
+    if req.activate {
+        if let Err(e) = store.activate(&new_id) {
+            return error_response(500, format!("activate: {e}"));
+        }
+    }
 
     let status = format!("{:?}",
         store.get_status(&new_id).unwrap_or(lex_store::StageStatus::Draft)).to_lowercase();
@@ -1076,11 +1080,15 @@ fn merge_commit_handler(
     );
     let transition = lex_vcs::StageTransition::Merge { entries };
     let store = state.store.lock().unwrap();
-    match store.apply_operation(&dst_branch, op, transition) {
+    // Gated (#833): lands the merge op, type-checks the real
+    // post-merge head, rolls the head back on a TypeError.
+    match store.apply_merge_op_gated(&dst_branch, op, transition) {
         Ok(new_head_op) => json_response(200, &serde_json::json!({
             "new_head_op": new_head_op,
             "dst_branch": dst_branch,
         })),
+        Err(lex_store::StoreError::TypeError(errs)) => error_with_detail(
+            422, "merged program has type errors", serde_json::to_value(&errs).unwrap_or_default()),
         Err(e) => write_error_response("apply merge op", e),
     }
 }

@@ -1372,19 +1372,15 @@ impl Store {
     ///
     /// # Why a separate method, not a flag on `apply_operation`
     ///
-    /// The merge engine in `lex-vcs::merge` calls
-    /// `Store::apply_operation` directly to land merge ops, and at
-    /// merge time the resolved program isn't a single `Vec<Stage>`
-    /// the way it is on the publish path — it's a per-sig
-    /// resolution map. Forcing a candidate through `apply_operation`
-    /// would either require the merge engine to assemble one (slow,
-    /// every active stage off disk) or accept `Option<&[Stage]>`
-    /// and silently skip the gate — the second is exactly the kind
-    /// of "secretly opt-out" path #130 is trying to remove. The
-    /// honest split is two methods: `apply_operation` for callers
-    /// that already typecheck their inputs (or don't need to —
-    /// rare, but the merge-resolve case), `apply_operation_checked`
-    /// for everyone else.
+    /// `apply_operation` accepting `Option<&[Stage]>` and silently
+    /// skipping the gate on `None` is exactly the kind of
+    /// "secretly opt-out" path #130 is trying to remove. The honest
+    /// split: `apply_operation` for the one caller that already
+    /// typechecked its input up front (`publish_program`),
+    /// `apply_operation_checked` for callers holding the candidate,
+    /// [`Self::apply_operation_gated`] for single-parent callers
+    /// that hold only the transition (`/v1/patch`), and
+    /// [`Self::apply_merge_op_gated`] for merge commits (#833).
     pub fn apply_operation_checked(
         &self,
         branch: &str,
@@ -1424,6 +1420,102 @@ impl Store {
             self.record_typecheck_passed(&attestable, &new_head.op_id)?;
             self.run_required_attestations_gate(branch, &new_head.op_id, &attestable, &op_effects)
         })
+    }
+
+    /// The program that would exist on `branch` after `transition`
+    /// is applied: the branch head (snapshot-cached) with the
+    /// transition replayed over it, every resulting `(sig, stage)`
+    /// bulk-loaded. Exact for a **single-parent** transition — the
+    /// candidate [`Self::apply_operation_gated`] wants. Not valid for
+    /// a merge: a `StageTransition::Merge` records only the delta
+    /// relative to dst, while the op-DAG replay that computes a
+    /// merge's real head walks both parents (#833).
+    pub fn candidate_program_for(
+        &self,
+        branch: &str,
+        transition: &lex_vcs::StageTransition,
+    ) -> Result<Vec<Stage>, StoreError> {
+        let mut head = self.branch_head(branch)?;
+        crate::branches::apply_transition(&mut head, transition);
+        let pairs: Vec<(String, String)> = head.into_iter().collect();
+        self.get_asts_for_sigs_bulk(&pairs).into_iter().collect()
+    }
+
+    /// [`Self::apply_operation_checked`] for a **single-parent** op
+    /// where the caller holds only the transition: assembles the
+    /// candidate via [`Self::candidate_program_for`] and runs the
+    /// gate. Same rejection semantics — `TypeError`, a `RepairHint`
+    /// attestation, head unchanged, nothing persisted. This is the
+    /// write path for `/v1/patch` (#833). Merge ops must not use it
+    /// (see `candidate_program_for`); they go through
+    /// [`Self::apply_merge_op_gated`].
+    pub fn apply_operation_gated(
+        &self,
+        branch: &str,
+        op: lex_vcs::Operation,
+        transition: lex_vcs::StageTransition,
+    ) -> Result<lex_vcs::OpId, StoreError> {
+        debug_assert!(
+            op.parents.len() <= 1,
+            "apply_operation_gated is single-parent only; merges use apply_merge_op_gated"
+        );
+        let candidate = self.candidate_program_for(branch, &transition)?;
+        self.apply_operation_checked(branch, op, transition, &candidate)
+    }
+
+    /// The gated write path for **merge** commits (`commit_merge`,
+    /// `POST /v1/merge/<id>/commit`, `lex merge commit`).
+    ///
+    /// A `StageTransition::Merge` records only the delta relative to
+    /// dst; the sig->stage map every consumer reads is recomputed by
+    /// replaying the op DAG, which for a merge walks *both* parents
+    /// and can surface sigs the delta never mentions. So the only way
+    /// to know the true post-merge program is to replay it — land the
+    /// op and read `branch_head`. This lands the merge op,
+    /// type-checks the resulting head, and on a failure rolls the
+    /// head back and returns `TypeError`.
+    ///
+    /// Before #833 the merge paths landed through the ungated
+    /// `apply_operation`, so a merge whose result didn't compose
+    /// (e.g. dst still calls `helper`, an agent-supplied resolution
+    /// dropped it) advanced the head with nothing to catch it.
+    ///
+    /// Rollback leaves the rejected merge op as an unreachable record
+    /// (reclaimed by `lex op gc`, the same orphan crash-recovery
+    /// already tolerates). A stage the merge names that was never
+    /// published surfaces as the underlying `StoreError` from the
+    /// bulk read — the "never advance onto content that can't be
+    /// loaded" invariant from the other side.
+    pub fn apply_merge_op_gated(
+        &self,
+        branch: &str,
+        op: lex_vcs::Operation,
+        transition: lex_vcs::StageTransition,
+    ) -> Result<lex_vcs::OpId, StoreError> {
+        let head_before = self.get_branch(branch)?.and_then(|b| b.head_op);
+        let op_id = self.apply_operation(branch, op, transition)?;
+
+        let verdict = (|| -> Result<(), StoreError> {
+            let head = self.branch_head(branch)?;
+            let pairs: Vec<(String, String)> = head.into_iter().collect();
+            let stages: Vec<Stage> =
+                self.get_asts_for_sigs_bulk(&pairs).into_iter().collect::<Result<_, _>>()?;
+            if let Err(errors) = lex_types::check_program(&stages) {
+                return Err(StoreError::TypeError(errors));
+            }
+            Ok(())
+        })();
+
+        if let Err(e) = verdict {
+            // Roll the head back. The empty-dst case never reaches
+            // here (it fast-forwards without a merge op), so
+            // `head_before` is always `Some` on this arm.
+            if let Some(prev) = head_before {
+                self.set_branch_head_op(branch, prev)?;
+            }
+            return Err(e);
+        }
+        Ok(op_id)
     }
 
     /// Open the attestation log rooted at this store. The log lives

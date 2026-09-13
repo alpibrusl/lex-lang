@@ -358,7 +358,10 @@ fn cmd_commit(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         parents,
     );
     let transition = lex_vcs::StageTransition::Merge { entries };
-    let new_head_op = store.apply_operation(&dst_branch, op, transition)?;
+    // Gated (#833): lands the merge op, type-checks the real
+    // post-merge head, rolls back on a TypeError. The session file is
+    // kept (we return before `delete_merge`) so the agent can retry.
+    let new_head_op = store.apply_merge_op_gated(&dst_branch, op, transition)?;
 
     delete_merge(&root, merge_id)?;
 

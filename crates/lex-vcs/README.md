@@ -115,8 +115,12 @@ sequence of tier-2 issues. Each module is independently usable:
   classify each group as auto-merge or [`ConflictKind`].
 - **[`MergeSession`]** — a stateful state machine for programmatic
   conflict resolution: `start` collects conflicts, `resolve` accepts
-  batched [`Resolution`]s (re-type-checking each candidate),
-  `commit` finalizes once no conflicts remain. The merge cost is
+  batched [`Resolution`]s (structural validation only — the engine
+  has no store access, so it can't type-check here; see
+  alpibrusl/lex-lang#834). `commit` finalizes once no conflicts
+  remain; the store-backed commit paths then land the merge through
+  `Store::apply_merge_op_gated`, which type-checks the real
+  post-merge head before it moves (#833). The merge cost is
   paid once per session, not once per resolution batch — which
   matches the agent loop "submit 50 resolutions, fix the ones that
   broke type-checking, retry." Backs the CLI `lex merge {start,
