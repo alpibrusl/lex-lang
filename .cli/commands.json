@@ -1881,6 +1881,55 @@
       ]
     },
     {
+      "name": "recall",
+      "description": "predicate query over the op log (#836)",
+      "arguments": [],
+      "options": [
+        {
+          "name": "intent",
+          "type": "string",
+          "description": "match ops under this intent id"
+        },
+        {
+          "name": "session",
+          "type": "string",
+          "description": "match ops under this session id"
+        },
+        {
+          "name": "predicate",
+          "type": "string",
+          "description": "raw predicate JSON"
+        },
+        {
+          "name": "all",
+          "type": "bool",
+          "description": "match every op in the log"
+        },
+        {
+          "name": "limit",
+          "type": "number",
+          "description": "cap the number of results"
+        },
+        {
+          "name": "store",
+          "type": "string",
+          "description": "store root directory"
+        }
+      ],
+      "subcommands": [],
+      "idempotent": true,
+      "examples": [
+        {
+          "description": "Everything under an intent",
+          "invocation": "lex recall --intent int-abc"
+        },
+        {
+          "description": "Everything in a session",
+          "invocation": "lex recall --session sess-1"
+        }
+      ]
+    },
+    {
       "name": "plan",
       "description": "list repair-candidate paths for a goal, cheapest-first, within budget",
       "arguments": [],

@@ -29,6 +29,7 @@ mod init;
 mod lint;
 mod merge;
 mod op;
+mod recall;
 mod pkg;
 mod plan;
 mod policy;
@@ -157,6 +158,7 @@ fn run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "policy" => cmd_policy(fmt, &args[1..]),
         "log" => branch::cmd_log(fmt, &args[1..]),
         "op" => op::cmd_op(fmt, &args[1..]),
+        "recall" => recall::cmd_recall(fmt, &args[1..]),
         "docs" => docs::cmd_docs(fmt, &args[1..]),
         "doc-sync" => doc_sync::cmd_doc_sync(&args[1..]),
         "plan" => cmd_plan(fmt, &args[1..]),
@@ -333,6 +335,8 @@ fn print_usage() {
     println!("  op {{show|log|push|pull|repack|gc}} [--store DIR]");
     println!("                                     inspect and sync the operation log");
     println!("  log [branch]                       show the operation log for a branch (alias of `branch log`)");
+    println!("  recall {{--intent ID|--session ID|--predicate JSON|--all}} [--limit N] [--store DIR]");
+    println!("                                     predicate query over the op log (#836)");
     println!(
         "  agent-guidelines [--version-only]  emit the AI-agent authoring contract (idiom rules)"
     );
