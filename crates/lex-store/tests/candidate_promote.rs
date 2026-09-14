@@ -241,3 +241,59 @@ fn candidates_for_different_sigs_are_isolated() {
     // Different op_ids.
     assert_ne!(pick_cands[0].op_id, dbl_cands[0].op_id);
 }
+
+#[test]
+fn promote_refuses_a_candidate_with_a_standing_reject_review() {
+    use lex_vcs::ReviewVerdict;
+    let (store, _tmp) = fresh();
+    let _ = seed_sig_on_branch(&store);
+    let intent = make_intent(&store, "variant with a bug", "ses_r");
+    let cand = stage_named("fn pick(n :: Int) -> Int { match n { 0 => 1, _ => 42 } }\n", "pick");
+    let cand_stage_id = stage_id(&cand).unwrap();
+    let op = store.propose_candidate(DEFAULT_BRANCH, &cand, &intent).unwrap();
+
+    // A reviewer rejects it.
+    store.record_review(&cand_stage_id, Some(op.clone()), "reviewer", ReviewVerdict::Reject,
+        Some("off-by-one".into())).unwrap();
+
+    // Promotion is refused; the branch head does not advance.
+    let head_before = store.branch_head(DEFAULT_BRANCH).unwrap();
+    let err = store.promote_candidate(DEFAULT_BRANCH, &op).expect_err("must refuse");
+    assert!(format!("{err:?}").contains("Reject"), "error should name the standing Reject: {err:?}");
+    assert_eq!(store.branch_head(DEFAULT_BRANCH).unwrap(), head_before, "head unchanged");
+}
+
+#[test]
+fn a_later_approve_lifts_a_reject_and_promotion_proceeds() {
+    use lex_vcs::ReviewVerdict;
+    let (store, _tmp) = fresh();
+    let (sig, _) = seed_sig_on_branch(&store);
+    let intent = make_intent(&store, "variant", "ses_r2");
+    let cand = stage_named("fn pick(n :: Int) -> Int { match n { 0 => 1, _ => 42 } }\n", "pick");
+    let cand_stage_id = stage_id(&cand).unwrap();
+    let op = store.propose_candidate(DEFAULT_BRANCH, &cand, &intent).unwrap();
+
+    store.record_review(&cand_stage_id, Some(op.clone()), "r1", ReviewVerdict::Reject, None).unwrap();
+    // Ensure a strictly-later timestamp for the approve (timestamps are
+    // whole seconds; sleep a hair over 1s so "latest" is unambiguous).
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    store.record_review(&cand_stage_id, Some(op.clone()), "r2", ReviewVerdict::Approve, None).unwrap();
+
+    store.promote_candidate(DEFAULT_BRANCH, &op).expect("approve lifts the reject → promote proceeds");
+    assert_eq!(store.branch_head(DEFAULT_BRANCH).unwrap().get(&sig), Some(&cand_stage_id));
+}
+
+#[test]
+fn request_changes_is_advisory_and_does_not_block_promote() {
+    use lex_vcs::ReviewVerdict;
+    let (store, _tmp) = fresh();
+    let (sig, _) = seed_sig_on_branch(&store);
+    let intent = make_intent(&store, "variant", "ses_r3");
+    let cand = stage_named("fn pick(n :: Int) -> Int { match n { 0 => 1, _ => 42 } }\n", "pick");
+    let cand_stage_id = stage_id(&cand).unwrap();
+    let op = store.propose_candidate(DEFAULT_BRANCH, &cand, &intent).unwrap();
+
+    store.record_review(&cand_stage_id, Some(op.clone()), "r", ReviewVerdict::RequestChanges, None).unwrap();
+    store.promote_candidate(DEFAULT_BRANCH, &op).expect("RequestChanges must not veto");
+    assert_eq!(store.branch_head(DEFAULT_BRANCH).unwrap().get(&sig), Some(&cand_stage_id));
+}
