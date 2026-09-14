@@ -1759,6 +1759,26 @@ impl Store {
         Ok(id)
     }
 
+    /// The latest `Review` verdict recorded on a stage, if any
+    /// (#836 G4). "Latest" is by attestation timestamp; ties keep the
+    /// last one seen. Used by `promote_candidate` to honor a standing
+    /// Reject.
+    pub fn latest_review_verdict(
+        &self,
+        stage_id: &str,
+    ) -> Result<Option<lex_vcs::ReviewVerdict>, StoreError> {
+        let log = self.attestation_log()?;
+        let mut latest: Option<(u64, lex_vcs::ReviewVerdict)> = None;
+        for a in log.list_for_stage(&stage_id.to_string())? {
+            if let lex_vcs::AttestationKind::Review { verdict, .. } = a.kind {
+                if latest.as_ref().map(|(t, _)| a.timestamp >= *t).unwrap_or(true) {
+                    latest = Some((a.timestamp, verdict));
+                }
+            }
+        }
+        Ok(latest.map(|(_, v)| v))
+    }
+
     /// Consult `policy.session_budgets` for the op's session
     /// (resolved via `op.intent_id → Intent.session_id`) and
     /// refuse if applying would push the session's monotonic spend
@@ -2432,6 +2452,18 @@ impl Store {
                 )))
             }
         };
+
+        // #836 G4: a candidate carrying a standing `Reject` review must
+        // not be promoted. "Standing" = the latest `Review` on the
+        // winner's stage is a Reject; a later `Approve` (or
+        // `RequestChanges`, which is advisory, not a veto) lifts it.
+        // Safe by default: a candidate with no review, or an approved
+        // one, promotes exactly as before.
+        if let Some(lex_vcs::ReviewVerdict::Reject) = self.latest_review_verdict(&winner_stage_id)? {
+            return Err(StoreError::InvalidTransition(format!(
+                "candidate `{candidate_op_id}` has a standing Reject review on stage                  `{winner_stage_id}`; record an Approve review (or promote a different                  candidate) before promoting"
+            )));
+        }
 
         // Gather every OTHER live candidate for this sig — the
         // ones this Promote will supersede.
