@@ -33,6 +33,7 @@
 //!   GET  /web/stage/<id>        → stage info + attestation trail (detail)
 
 pub mod handlers;
+mod branches_http;
 mod publish_examples;
 mod web;
 pub mod mcp;

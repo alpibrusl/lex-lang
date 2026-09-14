@@ -181,14 +181,14 @@ struct ErrorEnvelope {
     detail: Option<serde_json::Value>,
 }
 
-fn json_response(status: u16, body: &serde_json::Value) -> Response<std::io::Cursor<Vec<u8>>> {
+pub(crate) fn json_response(status: u16, body: &serde_json::Value) -> Response<std::io::Cursor<Vec<u8>>> {
     let bytes = serde_json::to_vec(body).unwrap_or_else(|_| b"{}".to_vec());
     Response::from_data(bytes)
         .with_status_code(status)
         .with_header(Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap())
 }
 
-fn error_response(status: u16, msg: impl Into<String>) -> Response<std::io::Cursor<Vec<u8>>> {
+pub(crate) fn error_response(status: u16, msg: impl Into<String>) -> Response<std::io::Cursor<Vec<u8>>> {
     json_response(status, &serde_json::to_value(ErrorEnvelope {
         error: msg.into(), detail: None,
     }).unwrap())
@@ -379,6 +379,15 @@ fn route(
         // ---- #242: append-only sync of op log + attestation log
         (Method::Post, "/v1/ops/batch") => ops_batch_handler(state, body),
         (Method::Post, "/v1/attestations/batch") => attestations_batch_handler(state, body),
+        // ---- #839 follow-up: branch management over HTTP so a remote
+        // client can create/switch branches (and thus drive the merge
+        // gates end to end), not just probe heads.
+        (Method::Get, "/v1/branches") => crate::branches_http::branches_list_handler(state),
+        (Method::Post, "/v1/branches") => crate::branches_http::branch_create_handler(state, body),
+        (Method::Post, p) if p.starts_with("/v1/branches/") && p.ends_with("/checkout") => {
+            let name = &p["/v1/branches/".len()..p.len() - "/checkout".len()];
+            crate::branches_http::branch_checkout_handler(state, name)
+        }
         // Probe endpoint for `lex op push` to discover the remote's
         // current head before computing a delta. Returns
         // `{ "head_op": Option<OpId> }`. `<branch>` is URL-encoded.
