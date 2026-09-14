@@ -1518,6 +1518,40 @@ impl Store {
         Ok(op_id)
     }
 
+    /// Type-check the program that would result from overlaying a merge
+    /// `delta` onto `branch`'s current head — **without moving the
+    /// head** (#834). `delta` maps `sig_id -> Some(stage)` to set that
+    /// sig to `stage`, or `sig_id -> None` to remove it, exactly the
+    /// `entries` a `StageTransition::Merge` records.
+    ///
+    /// This is the read-only, resolve-time counterpart of
+    /// `apply_merge_op_gated`'s commit-time gate: it lets a merge
+    /// session tell an agent *which resolution broke type-checking* the
+    /// moment it is submitted, instead of only after a failed commit.
+    /// `Ok(())` means the projected program composes; a type failure is
+    /// `Err(StoreError::TypeError(..))`; a read failure is the
+    /// corresponding `StoreError` I/O variant.
+    pub fn typecheck_merge_projection(
+        &self,
+        branch: &str,
+        delta: &std::collections::BTreeMap<String, Option<String>>,
+    ) -> Result<(), StoreError> {
+        let mut head = self.branch_head(branch)?;
+        for (sig, stage) in delta {
+            match stage {
+                Some(s) => { head.insert(sig.clone(), s.clone()); }
+                None => { head.remove(sig); }
+            }
+        }
+        let pairs: Vec<(String, String)> = head.into_iter().collect();
+        let stages: Vec<Stage> =
+            self.get_asts_for_sigs_bulk(&pairs).into_iter().collect::<Result<_, _>>()?;
+        if let Err(errors) = lex_types::check_program(&stages) {
+            return Err(StoreError::TypeError(errors));
+        }
+        Ok(())
+    }
+
     /// Open the attestation log rooted at this store. The log lives
     /// under `<root>/attestations/`; opening is idempotent and cheap
     /// (`fs::create_dir_all`). Exposed publicly so consumers — `lex

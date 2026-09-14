@@ -30,11 +30,13 @@ mod planner;
 mod store;
 mod model;
 mod branches;
+mod merge_checker;
 mod delta;
 mod gc;
 pub mod users;
 pub mod policy;
 
+pub use merge_checker::MergeResolutionChecker;
 pub use budget::SessionBudget;
 pub use planner::{Plan, PlanPath};
 pub use delta::{StageDelta, DELTA_CHAIN_CAP, DELTA_RATIO_THRESHOLD};
