@@ -101,7 +101,7 @@ pub fn cmd_recall(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             let tag = serde_json::to_value(&r.op.kind).ok()
                 .and_then(|v| v.get("op").and_then(|s| s.as_str()).map(String::from))
                 .unwrap_or_else(|| "?".into());
-            println!("  {}  {}", &r.op_id, tag);
+            println!("  {}  {}", r.op_id, tag);
         }
     });
     Ok(())
