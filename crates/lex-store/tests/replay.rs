@@ -111,3 +111,27 @@ fn replay_request_on_unknown_op_errors() {
     let (s, _tmp) = fresh();
     assert!(s.replay_request("deadbeef").is_err());
 }
+
+#[test]
+fn replay_record_miss_records_a_negative_verdict() {
+    // A regeneration that never yielded a comparable stage (didn't
+    // parse, or didn't define the target fn) is a legitimate negative
+    // result, not an error — recorded as reproduced=false with the
+    // reason in the attestation detail.
+    let (s, _tmp) = fresh();
+    let (op_id, _sig, stage) = land_add(&s, "fn f(x :: Int) -> Int { x + 1 }\n", "f");
+
+    let outcome = s.replay_record_miss(&op_id, "regenerated source did not parse").unwrap();
+    assert!(!outcome.reproduced);
+    assert!(outcome.produced_stage_id.is_none());
+    assert_eq!(outcome.expected_stage_id, stage);
+
+    let atts = s.attestation_log().unwrap().list_for_stage(&stage).unwrap();
+    let replay = atts.iter().find(|a| matches!(a.kind, lex_vcs::AttestationKind::Replay { .. }))
+        .expect("a Replay attestation");
+    match &replay.result {
+        lex_vcs::AttestationResult::Failed { detail } =>
+            assert!(detail.contains("did not parse"), "detail: {detail}"),
+        other => panic!("expected Failed, got {other:?}"),
+    }
+}

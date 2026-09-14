@@ -32,6 +32,7 @@ mod merge;
 mod op;
 mod recall;
 mod export_git;
+mod replay_runner;
 mod pkg;
 mod plan;
 mod policy;
