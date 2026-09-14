@@ -90,7 +90,9 @@ sequence of tier-2 issues. Each module is independently usable:
   `SandboxRun`, `Trace`, plus the governance kinds (`Override`,
   `Defer`, `Block` / `Unblock`, `ProducerBlock` /
   `ProducerUnblock`, `ProducerTrust` / `TrustWaived`) and the
-  repair-loop breadcrumbs (`RepairHint`, `RepairAttempt`).
+  repair-loop breadcrumbs (`RepairHint`, `RepairAttempt`), and the
+  structured `Review` verdict (`Approve` / `Reject` / `RequestChanges`)
+  that closes the Candidate->Promote gap (#836).
   [`AttestationId`] hashes `(stage_id, op_id, intent_id, kind,
   result, produced_by)` — `cost`, `timestamp`, and `signature` are
   excluded so the same logical verification dedups. Stored at

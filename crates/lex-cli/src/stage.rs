@@ -79,6 +79,9 @@ pub(super) fn cmd_stage(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                     lex_vcs::AttestationKind::Unblock { actor, .. } => {
                         format!("Unblock({actor})")
                     }
+                    lex_vcs::AttestationKind::Review { reviewer, verdict, .. } => {
+                        format!("Review({reviewer}:{verdict:?})")
+                    }
                     lex_vcs::AttestationKind::Trace {
                         run_id,
                         root_target,
