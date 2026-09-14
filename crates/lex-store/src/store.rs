@@ -1493,6 +1493,10 @@ impl Store {
         transition: lex_vcs::StageTransition,
     ) -> Result<lex_vcs::OpId, StoreError> {
         let head_before = self.get_branch(branch)?.and_then(|b| b.head_op);
+        // Capture the stages this merge introduces before `transition`
+        // is moved into `apply_operation`; used for the TypeCheck
+        // attestation below.
+        let attestable = attestable_stage_ids(&transition);
         let op_id = self.apply_operation(branch, op, transition)?;
 
         let verdict = (|| -> Result<(), StoreError> {
@@ -1515,6 +1519,16 @@ impl Store {
             }
             return Err(e);
         }
+        // #835: the merge's post-merge head type-checked, but until now
+        // that verdict left no trace in the attestation log — so a
+        // merged stage looked un-type-checked to `lex blame
+        // --with-evidence` and the attestation queries, unlike a
+        // published or patched stage. Emit `TypeCheck::Passed` for the
+        // stages the merge introduced, mirroring the publish / patch
+        // paths (`record_typecheck_passed`). Emitted only after the
+        // check passes and the head is committed, so a rolled-back
+        // merge records nothing.
+        self.record_typecheck_passed(&attestable, &op_id)?;
         Ok(op_id)
     }
 

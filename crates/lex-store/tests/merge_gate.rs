@@ -109,6 +109,67 @@ fn a_composing_merge_still_lands() {
 }
 
 #[test]
+fn a_composing_merge_emits_typecheck_attestations_for_introduced_stages() {
+    // #835: a merge type-checks its post-merge head but, before this,
+    // left no attestation — so the merged-in stage looked
+    // un-type-checked to `lex blame --with-evidence` / attestation
+    // queries, unlike a published or patched stage. The merge must now
+    // emit `TypeCheck::Passed` for the stage it introduced.
+    let (s, _tmp) = fresh();
+    land_add(&s, DEFAULT_BRANCH, HELPER, "helper");
+    s.create_branch("feature", DEFAULT_BRANCH).unwrap();
+    let (_extra_sig, extra_stg) =
+        land_add(&s, "feature", &format!("{HELPER}fn extra(x :: Int) -> Int {{ x + 1 }}\n"), "extra");
+
+    let report = s.merge("feature", DEFAULT_BRANCH).unwrap();
+    s.commit_merge(DEFAULT_BRANCH, &report).expect("a composing merge must land");
+
+    // The stage already carried a TypeCheck from its original publish
+    // on feature (same content-addressed stage_id); the new, distinct
+    // property is a TypeCheck::Passed attributed to the *merge* op —
+    // "this stage composes with dst's head," not just "valid in
+    // isolation."
+    let merge_op = s.get_branch(DEFAULT_BRANCH).unwrap().unwrap().head_op.unwrap();
+    let log = s.attestation_log().unwrap();
+    let listing = log.list_for_stage(&extra_stg).unwrap();
+    let merge_typechecks: Vec<_> = listing.iter()
+        .filter(|a| matches!(a.kind, lex_vcs::AttestationKind::TypeCheck)
+            && matches!(a.result, lex_vcs::AttestationResult::Passed)
+            && a.op_id.as_deref() == Some(merge_op.as_str()))
+        .collect();
+    assert_eq!(merge_typechecks.len(), 1,
+        "the merge op should emit exactly one TypeCheck::Passed for the introduced stage, got {listing:?}");
+}
+
+#[test]
+fn a_rejected_merge_emits_no_typecheck_attestation() {
+    // The mirror of the above: the refused-and-rolled-back merge from
+    // `merge_op_that_drops_a_still_referenced_fn_is_refused...` must
+    // leave no TypeCheck attestation behind (the emit is after the
+    // check passes and the head is committed).
+    use std::collections::BTreeMap;
+    let (s, _tmp) = fresh();
+    let (helper_sig, _) = land_add(&s, DEFAULT_BRANCH, HELPER, "helper");
+    let _ = land_add(&s, DEFAULT_BRANCH, &format!("{HELPER}fn caller(x :: Int) -> Int {{ helper(x) }}\n"), "caller");
+    s.create_branch("feature", DEFAULT_BRANCH).unwrap();
+    let d = s.get_branch(DEFAULT_BRANCH).unwrap().unwrap().head_op.unwrap();
+    let src = s.get_branch("feature").unwrap().unwrap().head_op.unwrap();
+
+    let mut entries: BTreeMap<String, Option<String>> = BTreeMap::new();
+    entries.insert(helper_sig.clone(), None); // drop helper: post-merge head won't compose
+    let op = Operation::new(OperationKind::Merge { resolved: 1 }, [src, d]);
+    let t = StageTransition::Merge { entries };
+
+    let before = s.attestation_log().unwrap().list_all().unwrap().len();
+    let _ = s.apply_merge_op_gated(DEFAULT_BRANCH, op, t).expect_err("must be refused");
+    let after: Vec<_> = s.attestation_log().unwrap().list_all().unwrap();
+    let new_typechecks = after.iter().skip(before)
+        .filter(|a| matches!(a.kind, lex_vcs::AttestationKind::TypeCheck))
+        .count();
+    assert_eq!(new_typechecks, 0, "a rolled-back merge must record no TypeCheck attestation");
+}
+
+#[test]
 fn candidate_program_for_replays_a_single_parent_transition_over_the_head() {
     // apply_operation_gated (patch) uses candidate_program_for, which
     // is exact for single-parent transitions.
