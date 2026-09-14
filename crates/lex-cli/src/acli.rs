@@ -134,6 +134,7 @@ fn commands() -> Vec<CommandInfo> {
         cmd_canonical(),
         cmd_docs(),
         cmd_op(),
+        cmd_recall(),
         cmd_plan(),
         cmd_repair(),
         cmd_policy(),
@@ -318,6 +319,21 @@ fn cmd_docs() -> CommandInfo {
             ("Per-file", "lex docs src/"),
         ])
         .with_see_also(vec!["skill", "introspect"])
+}
+
+fn cmd_recall() -> CommandInfo {
+    CommandInfo::new("recall", "predicate query over the op log (#836)")
+        .idempotent(true)
+        .add_option("intent", "string", "match ops under this intent id", None)
+        .add_option("session", "string", "match ops under this session id", None)
+        .add_option("predicate", "string", "raw predicate JSON", None)
+        .add_option("all", "bool", "match every op in the log", None)
+        .add_option("limit", "number", "cap the number of results", None)
+        .add_option("store", "string", "store root directory", None)
+        .with_examples(vec![
+            ("Everything under an intent", "lex recall --intent int-abc"),
+            ("Everything in a session", "lex recall --session sess-1"),
+        ])
 }
 
 fn cmd_op() -> CommandInfo {

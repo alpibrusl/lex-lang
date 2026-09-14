@@ -47,6 +47,7 @@ description: "Invoke the `lex` CLI. Commands: parse, check, run, hash…"
 - `lex canonical` — encode/decode the canonical wire form of an AST (idempotent)
 - `lex docs` — emit machine-readable API/workspace docs (idempotent)
 - `lex op` — inspect and sync the operation log (show|log|push|pull|repack|gc)
+- `lex recall` — predicate query over the op log (#836) (idempotent)
 - `lex plan` — list repair-candidate paths for a goal, cheapest-first, within budget (idempotent)
 - `lex repair` — apply a typed repair transform to a failed op; emits a RepairAttempt
 - `lex policy` — manage store policy.json (producer blocks + required attestations)
@@ -990,6 +991,31 @@ lex op gc --confirm
 ```
 
 **See also:** `lex log`, `lex store`
+
+## `lex recall`
+
+predicate query over the op log (#836)
+
+### Options
+
+- `--intent` (string) — match ops under this intent id
+- `--session` (string) — match ops under this session id
+- `--predicate` (string) — raw predicate JSON
+- `--all` (bool) — match every op in the log
+- `--limit` (number) — cap the number of results
+- `--store` (string) — store root directory
+
+### Examples
+
+```bash
+# Everything under an intent
+lex recall --intent int-abc
+```
+
+```bash
+# Everything in a session
+lex recall --session sess-1
+```
 
 ## `lex plan`
 

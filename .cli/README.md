@@ -215,6 +215,12 @@ inspect and sync the operation log (show|log|push|pull|repack|gc)
 
 Idempotent: false
 
+### recall
+
+predicate query over the op log (#836)
+
+Idempotent: true
+
 ### plan
 
 list repair-candidate paths for a goal, cheapest-first, within budget
