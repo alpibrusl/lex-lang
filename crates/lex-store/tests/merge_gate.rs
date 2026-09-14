@@ -131,3 +131,35 @@ fn candidate_program_for_replays_a_single_parent_transition_over_the_head() {
     let t = StageTransition::Remove { sig_id: helper_sig, last: helper_stg };
     assert!(s.candidate_program_for(DEFAULT_BRANCH, &t).unwrap().is_empty());
 }
+
+#[test]
+fn commit_merge_propagates_a_src_side_removal() {
+    // #841: a sig src removed (and that dst still had, unreferenced)
+    // must be gone from dst's head after the merge. Before the fix,
+    // commit_merge dropped removals from `report.merged` and left it.
+    let (s, _tmp) = fresh();
+    let (helper_sig, _) = land_add(&s, DEFAULT_BRANCH, HELPER, "helper");
+    // `standalone` doesn't reference helper, so removing helper stays valid.
+    let (standalone_sig, _) = land_add(&s, DEFAULT_BRANCH, "fn standalone(x :: Int) -> Int { x }\n", "standalone");
+    s.create_branch("feature", DEFAULT_BRANCH).unwrap();
+
+    // feature removes helper (valid: nothing on feature references it).
+    let op = Operation::new(
+        OperationKind::RemoveFunction { sig_id: helper_sig.clone(), last_stage_id: {
+            let hstg = s.branch_head("feature").unwrap().get(&helper_sig).cloned().unwrap();
+            hstg
+        }},
+        s.get_branch("feature").unwrap().and_then(|b| b.head_op).into_iter().collect::<Vec<_>>(),
+    );
+    let hstg = s.branch_head("feature").unwrap().get(&helper_sig).cloned().unwrap();
+    let t = StageTransition::Remove { sig_id: helper_sig.clone(), last: hstg };
+    s.apply_operation_gated("feature", op, t).expect("gated remove on feature must land");
+
+    let report = s.merge("feature", DEFAULT_BRANCH).unwrap();
+    assert!(report.removed.contains(&helper_sig), "merge report must record the removal: {report:?}");
+    s.commit_merge(DEFAULT_BRANCH, &report).expect("merge must land");
+
+    let head = s.branch_head(DEFAULT_BRANCH).unwrap();
+    assert!(!head.contains_key(&helper_sig), "helper must be removed from dst after the merge: {head:?}");
+    assert!(head.contains_key(&standalone_sig), "standalone must remain");
+}

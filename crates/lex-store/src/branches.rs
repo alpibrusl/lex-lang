@@ -103,6 +103,14 @@ pub struct MergeReport {
     pub summary: MergeSummary,
     pub merged: Vec<MergeEntry>,
     pub conflicts: Vec<MergeConflict>,
+    /// Sigs the merge decided to remove (a side deleted them and that
+    /// deletion won). Kept separate from `merged` (which only carries
+    /// present sig->stage) so `commit_merge` can propagate removals
+    /// into the `Merge` transition's `entries` as `None` (#841). Was
+    /// silently dropped before, so a src-side removal never reached
+    /// dst via `commit_merge`.
+    #[serde(default)]
+    pub removed: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -570,6 +578,7 @@ impl Store {
             },
             merged: Vec::new(),
             conflicts: Vec::new(),
+            removed: Vec::new(),
         };
         for o in out.outcomes {
             match o {
@@ -578,16 +587,14 @@ impl Store {
                         report.merged.push(MergeEntry { sig_id, stage_id, from: "both" });
                     }
                 }
-                lex_vcs::MergeOutcome::Src { sig_id, stage_id } => {
-                    if let Some(stage_id) = stage_id {
-                        report.merged.push(MergeEntry { sig_id, stage_id, from: "src" });
-                    }
-                }
-                lex_vcs::MergeOutcome::Dst { sig_id, stage_id } => {
-                    if let Some(stage_id) = stage_id {
-                        report.merged.push(MergeEntry { sig_id, stage_id, from: "dst" });
-                    }
-                }
+                lex_vcs::MergeOutcome::Src { sig_id, stage_id } => match stage_id {
+                    Some(stage_id) => report.merged.push(MergeEntry { sig_id, stage_id, from: "src" }),
+                    None => report.removed.push(sig_id),
+                },
+                lex_vcs::MergeOutcome::Dst { sig_id, stage_id } => match stage_id {
+                    Some(stage_id) => report.merged.push(MergeEntry { sig_id, stage_id, from: "dst" }),
+                    None => report.removed.push(sig_id),
+                },
                 lex_vcs::MergeOutcome::Conflict { sig_id, kind, base, src, dst } => {
                     let kind: &'static str = match kind {
                         lex_vcs::ConflictKind::ModifyModify => "modify-modify",
@@ -620,6 +627,14 @@ impl Store {
                 entries.insert(m.sig_id.clone(), Some(m.stage_id.clone()));
             }
         }
+        // #841: propagate removals the merge decided on. Only those dst
+        // still has need an entry (removing something dst lacks is a
+        // no-op).
+        for sig in &report.removed {
+            if dst_head_map.contains_key(sig) {
+                entries.insert(sig.clone(), None);
+            }
+        }
         let src_head = self.get_branch(&report.summary.src)?.and_then(|b| b.head_op);
         let dst_head_op = self.get_branch(dst)?.and_then(|b| b.head_op);
 
@@ -632,9 +647,14 @@ impl Store {
             // to merge. Skip apply but still journal below.
             (Some(s), Some(d)) if s == d => { /* no-op */ }
             (Some(s), Some(d)) => {
+                // Git convention: first parent is the branch being merged
+                // INTO (dst), second is the one merged in (src). The HTTP
+                // and CLI commit handlers already use this order; #841
+                // aligns commit_merge so the same merge yields the same
+                // head on every path.
                 let op = lex_vcs::Operation::new(
                     lex_vcs::OperationKind::Merge { resolved: entries.len() },
-                    [s, d],
+                    [d, s],
                 );
                 let t = lex_vcs::StageTransition::Merge { entries };
                 // Gated (#833): land the merge op, type-check the real
