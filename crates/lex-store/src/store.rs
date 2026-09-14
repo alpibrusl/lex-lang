@@ -106,6 +106,44 @@ pub struct PublishOutcome {
     pub head_op: Option<lex_vcs::OpId>,
 }
 
+/// Everything a regenerator needs to *replay* an op (#836 G3), produced
+/// by [`Store::replay_request`]. The model call is external: a harness
+/// feeds `prompt` + `parent_program` to `model`, then hands the
+/// regenerated stage to [`Store::replay_compare`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReplayRequest {
+    pub op_id: String,
+    /// The sig the op changed — the function to regenerate.
+    pub target_sig: String,
+    /// The stage id a faithful regeneration should reproduce.
+    pub expected_stage_id: String,
+    /// The recorded intent prompt (`None` if the op carried no intent).
+    pub prompt: Option<String>,
+    /// The recorded model (`provider/name[@version]`), if any.
+    pub model: Option<String>,
+    /// The recorded session id, if any.
+    pub session_id: Option<String>,
+    /// The program the change was made against — the parent state
+    /// rendered to source — the context a regenerator needs.
+    pub parent_program: String,
+}
+
+/// The result of comparing a regenerated candidate against an op's
+/// recorded output (#836 G3), returned by [`Store::replay_compare`]
+/// after it emits the `Replay` attestation.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReplayOutcome {
+    pub op_id: String,
+    pub expected_stage_id: String,
+    /// The candidate's stage id when it regenerated the same sig, else
+    /// `None`.
+    pub produced_stage_id: Option<String>,
+    /// `produced_stage_id == expected_stage_id`.
+    pub reproduced: bool,
+    /// The id of the `Replay` attestation this comparison emitted.
+    pub attestation_id: String,
+}
+
 /// One applied operation within a [`PublishOutcome`].
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PublishOp {
@@ -1637,6 +1675,148 @@ impl Store {
         }
     }
 
+    /// #836 G3: assemble everything a regenerator needs to *replay* an
+    /// op — re-derive the change from its recorded cause. Returns the
+    /// op's recorded intent (prompt / model / session), the target sig
+    /// and the stage id it produced, and the program the change was
+    /// made against (the parent state, rendered to source). An external
+    /// harness feeds the prompt + parent program to the recorded model,
+    /// then hands the regenerated stage back to [`Self::replay_compare`]
+    /// (lex owns the deterministic comparison; the model call is the
+    /// harness's, matching the rest of the architecture).
+    ///
+    /// Errors with `UnknownOp` if the op_id is unknown, or
+    /// `InvalidTransition` if the op didn't produce a stage (a removal /
+    /// import / merge has nothing to regenerate).
+    pub fn replay_request(&self, op_id: &str) -> Result<ReplayRequest, StoreError> {
+        let log = lex_vcs::OpLog::open(self.root())?;
+        let record = log
+            .get(&op_id.to_string())?
+            .ok_or_else(|| StoreError::UnknownOp(op_id.to_string()))?;
+        let (target_sig, expected_stage_id) = produced_sig_stage(&record.produces)
+            .ok_or_else(|| StoreError::InvalidTransition(format!("op {op_id} produced no stage to replay")))?;
+
+        let (prompt, model, session_id) = match &record.op.intent_id {
+            Some(id) => {
+                let intents = lex_vcs::IntentLog::open(self.root())?;
+                match intents.get(id)? {
+                    Some(i) => (Some(i.prompt), Some(model_label(&i.model)), Some(i.session_id)),
+                    None => (None, None, None),
+                }
+            }
+            None => (None, None, None),
+        };
+
+        // The program the op was applied against: the head state at its
+        // (first) parent, rendered with the canonical printer. A root
+        // op has no parent → empty program.
+        let parent_program = match record.op.parents.first() {
+            Some(parent) => self.program_source_at_op(parent)?,
+            None => String::new(),
+        };
+
+        Ok(ReplayRequest {
+            op_id: op_id.to_string(),
+            target_sig,
+            expected_stage_id,
+            prompt,
+            model,
+            session_id,
+            parent_program,
+        })
+    }
+
+    /// #836 G3: compare a regenerated `candidate` against what the op
+    /// recorded producing, and emit the `Replay` attestation. The
+    /// reproducibility claim made concrete — a faithful regeneration of
+    /// the same function from the same cause yields the same
+    /// content-addressed stage id.
+    ///
+    /// `reproduced` is true iff the candidate is the same sig *and* the
+    /// same stage id the op recorded. A candidate for a different sig
+    /// counts as "not reproduced" (`produced_stage_id: None`) rather
+    /// than an error — it's a legitimate, if negative, replay result.
+    /// The attestation is addressed to the op's recorded stage, so
+    /// `list_for_stage` surfaces it alongside the TypeCheck/Examples
+    /// evidence.
+    pub fn replay_compare(
+        &self,
+        op_id: &str,
+        candidate: &Stage,
+    ) -> Result<ReplayOutcome, StoreError> {
+        let log = lex_vcs::OpLog::open(self.root())?;
+        let record = log
+            .get(&op_id.to_string())?
+            .ok_or_else(|| StoreError::UnknownOp(op_id.to_string()))?;
+        let (target_sig, expected_stage_id) = produced_sig_stage(&record.produces)
+            .ok_or_else(|| StoreError::InvalidTransition(format!("op {op_id} produced no stage to replay")))?;
+
+        let cand_sig = lex_ast::sig_id(candidate);
+        let cand_stage = stage_id(candidate);
+        let produced_stage_id = match (cand_sig.as_deref(), &cand_stage) {
+            // Same function regenerated: the produced stage is
+            // whatever it content-addresses to.
+            (Some(s), Some(st)) if s == target_sig => Some(st.clone()),
+            // A different sig (or an unhashable stage) isn't a
+            // regeneration of this op's change.
+            _ => None,
+        };
+        let reproduced = produced_stage_id.as_deref() == Some(expected_stage_id.as_str());
+
+        let model = match &record.op.intent_id {
+            Some(id) => lex_vcs::IntentLog::open(self.root())?
+                .get(id)?
+                .map(|i| model_label(&i.model)),
+            None => None,
+        };
+
+        let attestation = lex_vcs::Attestation::new(
+            expected_stage_id.clone(),
+            Some(op_id.to_string()),
+            None,
+            lex_vcs::AttestationKind::Replay {
+                expected_stage_id: expected_stage_id.clone(),
+                produced_stage_id: produced_stage_id.clone(),
+                reproduced,
+                model,
+            },
+            if reproduced {
+                lex_vcs::AttestationResult::Passed
+            } else {
+                lex_vcs::AttestationResult::Failed {
+                    detail: "regeneration did not reproduce the recorded stage".into(),
+                }
+            },
+            replay_producer(),
+            None,
+        );
+        let attestation_id = attestation.attestation_id.clone();
+        self.attestation_log()?.put(&attestation)?;
+
+        Ok(ReplayOutcome {
+            op_id: op_id.to_string(),
+            expected_stage_id,
+            produced_stage_id,
+            reproduced,
+            attestation_id,
+        })
+    }
+
+    /// The program at an op (that op and all its ancestors applied),
+    /// rendered to source. Used to give a replay regenerator the
+    /// context the change was made against.
+    fn program_source_at_op(&self, op_id: &lex_vcs::OpId) -> Result<String, StoreError> {
+        let log = lex_vcs::OpLog::open(self.root())?;
+        let mut map: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+        for rec in log.walk_forward(op_id, None)? {
+            crate::branches::apply_transition(&mut map, &rec.produces);
+        }
+        let pairs: Vec<(String, String)> = map.into_iter().collect();
+        let stages: Vec<Stage> =
+            self.get_asts_for_sigs_bulk(&pairs).into_iter().collect::<Result<_, _>>()?;
+        Ok(lex_ast::print_stages(&stages))
+    }
+
     /// Open the attestation log rooted at this store. The log lives
     /// under `<root>/attestations/`; opening is idempotent and cheap
     /// (`fs::create_dir_all`). Exposed publicly so consumers — `lex
@@ -3097,6 +3277,39 @@ fn typecheck_producer() -> lex_vcs::ProducerDescriptor {
         tool: "lex-store".into(),
         version: env!("CARGO_PKG_VERSION").into(),
         model: None,
+    }
+}
+
+/// Producer for the replay-comparison attestation (#836 G3). Distinct
+/// tool name so the comparison lex performed is attributable
+/// separately from the (external) regeneration.
+fn replay_producer() -> lex_vcs::ProducerDescriptor {
+    lex_vcs::ProducerDescriptor {
+        tool: "lex-store-replay".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        model: None,
+    }
+}
+
+/// Human/audit label for a recorded model: `provider/name` (`@version`
+/// when pinned).
+fn model_label(m: &lex_vcs::ModelDescriptor) -> String {
+    match &m.version {
+        Some(v) => format!("{}/{}@{}", m.provider, m.name, v),
+        None => format!("{}/{}", m.provider, m.name),
+    }
+}
+
+/// The `(sig_id, stage_id)` an op recorded producing, or `None` for a
+/// transition that produces no stage (removal / import / merge) — those
+/// have nothing to regenerate for a replay.
+fn produced_sig_stage(t: &lex_vcs::StageTransition) -> Option<(String, String)> {
+    use lex_vcs::StageTransition::*;
+    match t {
+        Create { sig_id, stage_id } => Some((sig_id.clone(), stage_id.clone())),
+        Replace { sig_id, to, .. } => Some((sig_id.clone(), to.clone())),
+        Rename { to, body_stage_id, .. } => Some((to.clone(), body_stage_id.clone())),
+        Remove { .. } | ImportOnly | Merge { .. } => None,
     }
 }
 

@@ -402,6 +402,32 @@ pub enum AttestationKind {
         /// in force at decision time.
         manifest: String,
     },
+    /// Replay-as-verification (#836 G3): the recorded [`Intent`] behind
+    /// an op was re-run against the op's parent state, and the
+    /// regenerated stage compared to the recorded one. Makes the
+    /// reproducibility claim concrete — "can this change be regenerated
+    /// from its recorded cause". Addressed to the op's recorded stage;
+    /// `result` maps `reproduced` onto Passed/Failed so result-based
+    /// tooling reads it. The model call itself is external (the agent
+    /// harness regenerates and hands back a candidate); this attestation
+    /// records the deterministic comparison lex performed.
+    ///
+    /// [`Intent`]: crate::Intent
+    Replay {
+        /// The stage id the op recorded producing — what a faithful
+        /// regeneration should reproduce.
+        expected_stage_id: super::operation::StageId,
+        /// The stage id the regeneration actually produced, or `None`
+        /// when the regenerator returned nothing / a non-matching sig.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        produced_stage_id: Option<super::operation::StageId>,
+        /// Whether `produced_stage_id == expected_stage_id`.
+        reproduced: bool,
+        /// The model the recorded intent named, for audit (`None` when
+        /// the op carried no intent or the intent no model).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+    },
 }
 
 /// Walk a tool's `ProducerBlock` / `ProducerUnblock` attestations

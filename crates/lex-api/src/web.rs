@@ -887,6 +887,9 @@ fn kind_short(k: &AttestationKind) -> String {
         AttestationKind::TrustWaived { producer, kind_tag, .. } => {
             format!("TrustWaived({producer}/{kind_tag})")
         }
+        AttestationKind::Replay { reproduced, .. } => {
+            format!("Replay(reproduced={reproduced})")
+        }
     }
 }
 

@@ -353,17 +353,18 @@ fn cmd_recall() -> CommandInfo {
 fn cmd_op() -> CommandInfo {
     CommandInfo::new(
         "op",
-        "inspect and sync the operation log (show|log|push|pull|repack|gc)",
+        "inspect and sync the operation log (show|log|replay|push|pull|repack|gc)",
     )
     .idempotent(false)
     .add_argument(
         "subcommand",
-        "enum[show|log|push|pull|repack|gc]",
+        "enum[show|log|replay|push|pull|repack|gc]",
         "what to do",
         true,
     )
     .with_examples(vec![
         ("List ops", "lex op log"),
+        ("Replay-verify an op", "lex op replay <op_id> --candidate regen.lex"),
         ("Garbage-collect", "lex op gc --confirm"),
     ])
     .with_see_also(vec!["log", "store"])

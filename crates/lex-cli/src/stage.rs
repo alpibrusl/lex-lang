@@ -127,6 +127,9 @@ pub(super) fn cmd_stage(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                     } => {
                         format!("PlanApply({gate}:{subject} by {signer:.12}…)")
                     }
+                    lex_vcs::AttestationKind::Replay { reproduced, .. } => {
+                        format!("Replay(reproduced={reproduced})")
+                    }
                 };
                 let result = match &a.result {
                     lex_vcs::AttestationResult::Passed => "passed".to_string(),
