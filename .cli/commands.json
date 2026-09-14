@@ -1930,6 +1930,42 @@
       ]
     },
     {
+      "name": "export-git",
+      "description": "render a branch's op history as a git repo (#837)",
+      "arguments": [
+        {
+          "name": "out_dir",
+          "type": "string",
+          "description": "directory to write the git repo into",
+          "required": true
+        }
+      ],
+      "options": [
+        {
+          "name": "branch",
+          "type": "string",
+          "description": "branch to export (default: current)"
+        },
+        {
+          "name": "store",
+          "type": "string",
+          "description": "store root directory"
+        }
+      ],
+      "subcommands": [],
+      "idempotent": true,
+      "examples": [
+        {
+          "description": "Export main to ./export",
+          "invocation": "lex export-git ./export"
+        },
+        {
+          "description": "Export a feature branch",
+          "invocation": "lex export-git ./out --branch feature"
+        }
+      ]
+    },
+    {
       "name": "plan",
       "description": "list repair-candidate paths for a goal, cheapest-first, within budget",
       "arguments": [],

@@ -30,6 +30,7 @@ mod lint;
 mod merge;
 mod op;
 mod recall;
+mod export_git;
 mod pkg;
 mod plan;
 mod policy;
@@ -159,6 +160,7 @@ fn run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "log" => branch::cmd_log(fmt, &args[1..]),
         "op" => op::cmd_op(fmt, &args[1..]),
         "recall" => recall::cmd_recall(fmt, &args[1..]),
+        "export-git" => export_git::cmd_export_git(fmt, &args[1..]),
         "docs" => docs::cmd_docs(fmt, &args[1..]),
         "doc-sync" => doc_sync::cmd_doc_sync(&args[1..]),
         "plan" => cmd_plan(fmt, &args[1..]),
@@ -337,6 +339,8 @@ fn print_usage() {
     println!("  log [branch]                       show the operation log for a branch (alias of `branch log`)");
     println!("  recall {{--intent ID|--session ID|--predicate JSON|--all}} [--limit N] [--store DIR]");
     println!("                                     predicate query over the op log (#836)");
+    println!("  export-git <out_dir> [--branch NAME] [--store DIR]");
+    println!("                                     render a branch's op history as a git repo (#837)");
     println!(
         "  agent-guidelines [--version-only]  emit the AI-agent authoring contract (idiom rules)"
     );
