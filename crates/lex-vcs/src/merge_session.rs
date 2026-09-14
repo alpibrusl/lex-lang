@@ -117,6 +117,38 @@ pub enum ResolutionRejection {
         expected: Vec<OpId>,
         got: Vec<OpId>,
     },
+    /// The resolution is structurally valid but the program it
+    /// produces — dst's head with this resolution (and every
+    /// resolution accepted so far) overlaid — does not type-check.
+    /// Only returned by [`MergeSession::resolve_checked`]; the
+    /// structural [`MergeSession::resolve`] never composes a program
+    /// and so never emits this. `errors` are the composed program's
+    /// type errors, rendered by the injected [`ResolutionChecker`].
+    TypeError {
+        conflict_id: ConflictId,
+        errors: Vec<String>,
+    },
+}
+
+/// Injected composer + type-checker for merge resolutions.
+///
+/// `lex-vcs` deliberately does not depend on `lex-store`, so a merge
+/// session cannot compose a program from stage ids on its own — it
+/// only knows the *shape* of the merge (which sig resolves to which
+/// stage). The caller, which holds the store, supplies a checker so
+/// [`MergeSession::resolve_checked`] can type-check a resolution the
+/// moment it is submitted rather than only at commit. This mirrors
+/// [`crate::IntentResolver`], the same dependency-injection seam the
+/// predicate engine uses.
+///
+/// Implementors receive the full projected post-merge **delta against
+/// dst's head** — `sig_id -> Some(stage)` to set that sig to `stage`,
+/// `sig_id -> None` to remove it. The implementor overlays the delta
+/// onto dst's current head, composes the stages, and type-checks:
+/// return the (possibly empty) list of type errors as strings. An
+/// empty vec means the resolution composes.
+pub trait ResolutionChecker {
+    fn typecheck_projection(&self, delta: &BTreeMap<SigId, Option<StageId>>) -> Vec<String>;
 }
 
 /// Per-conflict outcome of a resolve call.
@@ -255,6 +287,103 @@ impl MergeSession {
             }
         }
         out
+    }
+
+    /// Submit resolutions in batch, **type-checking each** against the
+    /// composed program before accepting it (#834).
+    ///
+    /// This is the loop the session was built for — "submit N
+    /// resolutions, see which broke type-checking, fix them, retry" —
+    /// made real. Structural validation ([`Self::validate_resolution`])
+    /// runs first; a structurally-valid resolution is then overlaid on
+    /// dst's head together with every resolution accepted so far, and
+    /// the injected [`ResolutionChecker`] type-checks the result. A
+    /// resolution whose composed program doesn't type-check is rejected
+    /// with [`ResolutionRejection::TypeError`] and *not* recorded, so
+    /// the session's accepted set stays type-correct at every step.
+    ///
+    /// Resolutions are processed in order and accumulate: a later
+    /// resolution is checked against the program the earlier accepted
+    /// ones already produced. Interdependent picks (two conflicts that
+    /// only compose together) should therefore be submitted in
+    /// dependency order, or a rejected one resubmitted after its
+    /// partner lands — the same way `git` needs both halves of an
+    /// intertwined conflict resolved before the tree builds. Unresolved
+    /// conflicts contribute nothing to the projection: they leave dst's
+    /// (always-valid) side standing, so a partial batch still composes.
+    pub fn resolve_checked(
+        &mut self,
+        resolutions: Vec<(ConflictId, Resolution)>,
+        checker: &dyn ResolutionChecker,
+    ) -> Vec<ResolveVerdict> {
+        let mut out = Vec::with_capacity(resolutions.len());
+        for (conflict_id, resolution) in resolutions {
+            // 1. Structural: known conflict, custom op acknowledges
+            //    both sides. Cheap, and a malformed op can't be
+            //    type-checked meaningfully anyway.
+            if let Err(rej) = self.validate_resolution(&conflict_id, &resolution) {
+                out.push(ResolveVerdict { conflict_id, accepted: false, rejection: Some(rej) });
+                continue;
+            }
+            // 2. Type: overlay this resolution on the ones accepted so
+            //    far and type-check the composed program.
+            let mut trial = self.resolutions.clone();
+            trial.insert(conflict_id.clone(), resolution.clone());
+            let delta = self.projected_delta(&trial);
+            let errors = checker.typecheck_projection(&delta);
+            if !errors.is_empty() {
+                out.push(ResolveVerdict {
+                    conflict_id: conflict_id.clone(),
+                    accepted: false,
+                    rejection: Some(ResolutionRejection::TypeError { conflict_id, errors }),
+                });
+                continue;
+            }
+            self.resolutions.insert(conflict_id.clone(), resolution);
+            out.push(ResolveVerdict { conflict_id, accepted: true, rejection: None });
+        }
+        out
+    }
+
+    /// The projected post-merge head-delta **against dst's head**,
+    /// assuming `resolutions`. This is exactly the `entries` a
+    /// `StageTransition::Merge` would record, and the input the
+    /// [`ResolutionChecker`] overlays on dst's head:
+    ///
+    /// * `MergeOutcome::Src` (a change only src made) → set it.
+    /// * `MergeOutcome::Both` / `Dst` → dst's head already reflects it;
+    ///   no delta.
+    /// * conflict resolved `TakeTheirs` → set src's stage.
+    /// * conflict resolved `Custom` → set the custom op's target
+    ///   ([`OperationKind::merge_target`]).
+    /// * conflict resolved `TakeOurs` → dst already has it; no delta.
+    /// * conflict unresolved / `Defer` → no delta (dst's side stands).
+    fn projected_delta(
+        &self,
+        resolutions: &BTreeMap<ConflictId, Resolution>,
+    ) -> BTreeMap<SigId, Option<StageId>> {
+        let mut delta: BTreeMap<SigId, Option<StageId>> = BTreeMap::new();
+        for outcome in &self.auto_resolved {
+            if let MergeOutcome::Src { sig_id, stage_id } = outcome {
+                delta.insert(sig_id.clone(), stage_id.clone());
+            }
+        }
+        for (conflict_id, record) in &self.conflicts {
+            match resolutions.get(conflict_id) {
+                Some(Resolution::TakeTheirs) => {
+                    delta.insert(record.sig_id.clone(), record.theirs.clone());
+                }
+                Some(Resolution::Custom { op }) => {
+                    if let Some((sig, stage)) = op.kind.merge_target() {
+                        delta.insert(sig, stage);
+                    }
+                }
+                // TakeOurs (dst already has it), Defer, or unresolved:
+                // no change against dst's head.
+                _ => {}
+            }
+        }
+        delta
     }
 
     /// Validate a single resolution against the session's pending
@@ -655,5 +784,104 @@ mod tests {
         // src had a unique op vs the missing dst → it's an Src
         // outcome surfaced as auto-resolved.
         assert_eq!(session.auto_resolved.len(), 1);
+    }
+
+    // ---- #834: resolve_checked type-checks resolutions ----
+
+    /// A `ResolutionChecker` that rejects any projection setting the
+    /// conflicted sig to a named "poison" stage — a stand-in for the
+    /// real store-backed checker, which composes+type-checks. Records
+    /// the deltas it was asked about so tests can assert the
+    /// projection shape the session hands the checker.
+    struct MockChecker {
+        poison_stage: &'static str,
+        seen: std::cell::RefCell<Vec<BTreeMap<SigId, Option<StageId>>>>,
+    }
+    impl MockChecker {
+        fn new(poison_stage: &'static str) -> Self {
+            Self { poison_stage, seen: std::cell::RefCell::new(Vec::new()) }
+        }
+    }
+    impl ResolutionChecker for MockChecker {
+        fn typecheck_projection(&self, delta: &BTreeMap<SigId, Option<StageId>>) -> Vec<String> {
+            self.seen.borrow_mut().push(delta.clone());
+            if delta.values().any(|s| s.as_deref() == Some(self.poison_stage)) {
+                vec![format!("stage {} does not type-check", self.poison_stage)]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_checked_rejects_a_resolution_that_breaks_typechecking() {
+        // theirs == stage-2. A checker that poisons stage-2 must
+        // reject TakeTheirs and NOT record it — the session's
+        // accepted set stays type-correct.
+        let (_tmp, log, dst, src) = fixture();
+        let mut session = MergeSession::start("ms-c1", &log, Some(&src), Some(&dst)).unwrap();
+        let checker = MockChecker::new("stage-2");
+
+        let verdicts = session.resolve_checked(
+            vec![("fn::A".into(), Resolution::TakeTheirs)],
+            &checker,
+        );
+        assert_eq!(verdicts.len(), 1);
+        assert!(!verdicts[0].accepted);
+        assert!(matches!(
+            verdicts[0].rejection,
+            Some(ResolutionRejection::TypeError { .. })
+        ), "expected TypeError, got {:?}", verdicts[0].rejection);
+        // Not recorded → the conflict is still pending.
+        assert_eq!(session.remaining_conflicts().len(), 1);
+    }
+
+    #[test]
+    fn resolve_checked_accepts_a_resolution_that_composes() {
+        // TakeOurs keeps stage-1 (dst's side): the projection is
+        // empty (dst already has it), so the checker sees no poison
+        // and accepts.
+        let (_tmp, log, dst, src) = fixture();
+        let mut session = MergeSession::start("ms-c2", &log, Some(&src), Some(&dst)).unwrap();
+        let checker = MockChecker::new("stage-2");
+
+        let verdicts = session.resolve_checked(
+            vec![("fn::A".into(), Resolution::TakeOurs)],
+            &checker,
+        );
+        assert_eq!(verdicts.len(), 1);
+        assert!(verdicts[0].accepted, "got {:?}", verdicts[0].rejection);
+        assert!(session.remaining_conflicts().is_empty());
+        // TakeOurs contributes no delta against dst's head.
+        assert_eq!(checker.seen.borrow().last().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn resolve_checked_still_rejects_structurally_invalid_before_typechecking() {
+        // An unknown conflict is rejected structurally; the checker
+        // is never consulted for it.
+        let (_tmp, log, dst, src) = fixture();
+        let mut session = MergeSession::start("ms-c3", &log, Some(&src), Some(&dst)).unwrap();
+        let checker = MockChecker::new("stage-2");
+        let verdicts = session.resolve_checked(
+            vec![("fn::NOPE".into(), Resolution::TakeTheirs)],
+            &checker,
+        );
+        assert!(!verdicts[0].accepted);
+        assert!(matches!(
+            verdicts[0].rejection,
+            Some(ResolutionRejection::UnknownConflict { .. })
+        ));
+        assert!(checker.seen.borrow().is_empty(), "checker must not run on a structural reject");
+    }
+
+    #[test]
+    fn projected_delta_sets_theirs_for_take_theirs() {
+        let (_tmp, log, dst, src) = fixture();
+        let session = MergeSession::start("ms-c4", &log, Some(&src), Some(&dst)).unwrap();
+        let mut res = BTreeMap::new();
+        res.insert("fn::A".to_string(), Resolution::TakeTheirs);
+        let delta = session.projected_delta(&res);
+        assert_eq!(delta.get("fn::A"), Some(&Some("stage-2".to_string())));
     }
 }

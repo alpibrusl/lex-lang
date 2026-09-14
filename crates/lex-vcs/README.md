@@ -116,17 +116,25 @@ sequence of tier-2 issues. Each module is independently usable:
   diff the ops on each side, group by the `SigId` they touch, and
   classify each group as auto-merge or [`ConflictKind`].
 - **[`MergeSession`]** — a stateful state machine for programmatic
-  conflict resolution: `start` collects conflicts, `resolve` accepts
-  batched [`Resolution`]s (structural validation only — the engine
-  has no store access, so it can't type-check here; see
-  alpibrusl/lex-lang#834). `commit` finalizes once no conflicts
-  remain; the store-backed commit paths then land the merge through
-  `Store::apply_merge_op_gated`, which type-checks the real
-  post-merge head before it moves (#833). The merge cost is
-  paid once per session, not once per resolution batch — which
-  matches the agent loop "submit 50 resolutions, fix the ones that
-  broke type-checking, retry." Backs the CLI `lex merge {start,
-  status, resolve, commit}` and the `/v1/merge/*` HTTP routes.
+  conflict resolution: `start` collects conflicts, `resolve`/
+  `resolve_checked` accept batched [`Resolution`]s. `resolve` does
+  structural validation only (known conflict, custom op acknowledges
+  both sides). `resolve_checked` additionally **type-checks each
+  resolution against the composed program** the moment it's submitted
+  (#834): because the engine has no store access, it takes an injected
+  [`ResolutionChecker`] — `lex-store`'s `MergeResolutionChecker`
+  overlays the projected post-merge delta on dst's head and runs the
+  type checker (`Store::typecheck_merge_projection`), so a pick that
+  leaves the merged head broken is rejected with
+  `ResolutionRejection::TypeError` right away rather than at commit.
+  `commit` finalizes once no conflicts remain; the store-backed commit
+  paths then land the merge through `Store::apply_merge_op_gated`,
+  which re-checks the real post-merge head before it moves (#833). The
+  merge cost is paid once per session, not once per resolution batch —
+  which matches the agent loop "submit 50 resolutions, see which broke
+  type-checking, fix them, retry." Backs the CLI `lex merge {start,
+  status, resolve, commit}` and the `/v1/merge/*` HTTP routes (the
+  `/v1/merge/<id>/resolve` route uses `resolve_checked`).
 
 ### Diffing (`lex ast-diff` / `lex diff`)
 

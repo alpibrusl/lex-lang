@@ -386,6 +386,80 @@ fn merge_resolve_unknown_conflict_is_rejected_per_entry() {
 }
 
 #[test]
+fn merge_resolve_rejects_a_pick_that_does_not_typecheck() {
+    // #834: `/v1/merge/<id>/resolve` type-checks the projected program
+    // per resolution, so a pick that leaves the merged head broken is
+    // rejected at submission, not only at commit.
+    //
+    // Setup — every published program is individually valid:
+    //   base (main): { helper, foo } where foo calls helper.
+    //   feature:     { foo=n }         → removes helper, foo no longer
+    //                                    calls it (both valid).
+    //   main:        { helper, foo=helper(helper(n)) } → foo now leans
+    //                                    on helper harder.
+    // Merge feature→main: helper is a one-sided remove (auto-resolved);
+    // foo is a ModifyModify conflict. Picking *ours* (main's foo, which
+    // calls helper) composes with a head from which the merge removed
+    // helper → an unknown identifier → must be rejected. Picking
+    // *theirs* (foo=n) composes → accepted.
+    let (srv, tmp) = start_server();
+
+    let base = "fn helper(x :: Int) -> Int { x }\nfn foo(n :: Int) -> Int { helper(n) }\n";
+    let (s, b) = http(&srv.addr, "POST", "/v1/publish", &json!({"source": base, "activate": true}).to_string());
+    assert_eq!(s, 200, "publish base: {b}");
+
+    {
+        let store = lex_store::Store::open(tmp.path()).unwrap();
+        store.create_branch("feature", lex_store::DEFAULT_BRANCH).unwrap();
+        store.set_current_branch("feature").unwrap();
+    }
+    // feature: drop helper, foo becomes identity (whole-program publish
+    // diffs helper out).
+    let feat = "fn foo(n :: Int) -> Int { n }\n";
+    let (s, b) = http(&srv.addr, "POST", "/v1/publish", &json!({"source": feat, "activate": true}).to_string());
+    assert_eq!(s, 200, "publish feature: {b}");
+
+    {
+        let store = lex_store::Store::open(tmp.path()).unwrap();
+        store.set_current_branch(lex_store::DEFAULT_BRANCH).unwrap();
+    }
+    let main2 = "fn helper(x :: Int) -> Int { x }\nfn foo(n :: Int) -> Int { helper(helper(n)) }\n";
+    let (s, b) = http(&srv.addr, "POST", "/v1/publish", &json!({"source": main2, "activate": true}).to_string());
+    assert_eq!(s, 200, "publish main2: {b}");
+
+    let (s, b) = http(&srv.addr, "POST", "/v1/merge/start",
+        &json!({"src_branch": "feature", "dst_branch": lex_store::DEFAULT_BRANCH}).to_string());
+    assert_eq!(s, 200, "merge/start: {b}");
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    let merge_id = v["merge_id"].as_str().unwrap().to_string();
+    let conflicts = v["conflicts"].as_array().unwrap();
+    assert_eq!(conflicts.len(), 1, "exactly the foo conflict expected: {conflicts:?}");
+    let foo_conflict = conflicts[0]["conflict_id"].as_str().unwrap().to_string();
+
+    let path = format!("/v1/merge/{merge_id}/resolve");
+
+    // TakeOurs → main's foo calls helper, which the merge removes →
+    // type error → rejected.
+    let (s, b) = http(&srv.addr, "POST", &path, &json!({
+        "resolutions": [{"conflict_id": foo_conflict, "resolution": {"kind": "take_ours"}}]
+    }).to_string());
+    assert_eq!(s, 200, "resolve: {b}");
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(v["verdicts"][0]["accepted"], false, "take_ours must be rejected: {b}");
+    assert_eq!(v["verdicts"][0]["rejection"]["kind"], "type_error", "expected type_error: {b}");
+    assert_eq!(v["remaining_conflicts"].as_array().unwrap().len(), 1, "conflict still pending after a rejected pick");
+
+    // TakeTheirs → foo=n, doesn't reference helper → composes → accepted.
+    let (s, b) = http(&srv.addr, "POST", &path, &json!({
+        "resolutions": [{"conflict_id": foo_conflict, "resolution": {"kind": "take_theirs"}}]
+    }).to_string());
+    assert_eq!(s, 200, "resolve theirs: {b}");
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(v["verdicts"][0]["accepted"], true, "take_theirs composes; must be accepted: {b}");
+    assert_eq!(v["remaining_conflicts"].as_array().unwrap().len(), 0, "theirs clears the conflict");
+}
+
+#[test]
 fn web_activity_stream_lists_recent_attestations() {
     // The new home page (lex-tea v2) is an activity stream sourced
     // from the attestation log. After a publish, there's at least
@@ -621,7 +695,15 @@ fn merge_commit_with_custom_resolution_lands_agent_supplied_stage() {
 }
 
 #[test]
-fn merge_commit_rejects_custom_op_targeting_wrong_sig() {
+fn merge_resolve_rejects_custom_op_referencing_absent_stages() {
+    // A custom op targeting a made-up sig with stages that don't exist
+    // used to be accepted at resolve (structural check only) and caught
+    // at commit ("targets a different sig"). Since #834, resolve
+    // type-checks the projection: the projected delta sets a sig to a
+    // stage that can't be loaded, so the resolution is rejected on
+    // submission — fail-fast, the whole point of the batch loop. The
+    // commit-time wrong-sig guard remains in place as defense-in-depth
+    // for a wrong-sig op that happens to reference a composing stage.
     let (srv, _tmp, merge_id) = with_modify_modify_session();
     let path_resolve = format!("/v1/merge/{merge_id}/resolve");
     let path_commit  = format!("/v1/merge/{merge_id}/commit");
@@ -647,11 +729,16 @@ fn merge_commit_rejects_custom_op_targeting_wrong_sig() {
             }
         }]
     }).to_string();
-    let (s, _) = http(&srv.addr, "POST", &path_resolve, &resolve_body);
-    assert_eq!(s, 200, "resolve accepts; mismatch caught at commit");
+    let (s, b) = http(&srv.addr, "POST", &path_resolve, &resolve_body);
+    assert_eq!(s, 200, "resolve returns per-entry verdicts: {b}");
+    let rv: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(rv["verdicts"][0]["accepted"], false, "absent-stage custom op must be rejected at resolve: {b}");
+    assert_eq!(rv["verdicts"][0]["rejection"]["kind"], "type_error", "expected type_error: {b}");
+
+    // Nothing was recorded, so the conflict is still pending and commit
+    // reports conflicts-remaining (422), never advancing the head.
     let (s, b) = http(&srv.addr, "POST", &path_commit, "");
-    assert_eq!(s, 422, "commit should 422 on mismatched-sig custom op: {b}");
-    assert!(b.contains("targets a different sig"));
+    assert_eq!(s, 422, "commit must not advance with the conflict still unresolved: {b}");
 }
 
 #[test]

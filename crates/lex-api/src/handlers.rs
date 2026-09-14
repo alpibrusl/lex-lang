@@ -956,7 +956,14 @@ fn merge_resolve_handler(
     let pairs: Vec<(String, lex_vcs::Resolution)> = req.resolutions.into_iter()
         .map(|e| (e.conflict_id, e.resolution))
         .collect();
-    let verdicts = wrapped.inner.resolve(pairs);
+    // #834: type-check each resolution against dst's head at submission
+    // time (not only at commit) so the agent's "submit N, see which
+    // broke, retry" loop gets its feedback here. The store composes the
+    // projected program; the session owns the merge→delta semantics.
+    let store = state.store.lock().unwrap();
+    let checker = lex_store::MergeResolutionChecker::new(&store, wrapped.dst_branch.clone());
+    let verdicts = wrapped.inner.resolve_checked(pairs, &checker);
+    drop(store);
     let remaining: Vec<&lex_vcs::ConflictRecord> = wrapped.inner.remaining_conflicts();
     let body = serde_json::json!({
         "verdicts": verdicts,
