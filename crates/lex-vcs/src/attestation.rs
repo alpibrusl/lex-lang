@@ -85,6 +85,18 @@ pub type SpecId = String;
 /// to have no view into the hash function used by callers.
 pub type ContentHash = String;
 
+/// The decision a [`AttestationKind::Review`] carries (#836 G4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewVerdict {
+    /// This candidate should win / this stage is good to promote.
+    Approve,
+    /// This candidate should not win / this stage should not advance.
+    Reject,
+    /// Not a veto, but changes are wanted before it advances.
+    RequestChanges,
+}
+
 /// What was verified. The variants mirror the verdict surfaces
 /// `lex agent-tool` and the store-write gate already produce.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +121,20 @@ pub enum AttestationKind {
     DiffBody {
         other_body_hash: ContentHash,
         input_count: usize,
+    },
+    /// A structured review verdict on a stage — closes the
+    /// Candidate->Promote gap (#836 G4): the path from a `Candidate`
+    /// to a `Promote` otherwise carries no recorded reason. An agent
+    /// or human records why a candidate should (or shouldn't) win the
+    /// bake-off, addressable at the candidate's stage like any other
+    /// attestation. `Approve`/`Reject`/`RequestChanges` also map onto
+    /// the `result` field (Passed/Failed/Inconclusive) so existing
+    /// result-based tooling reads it sensibly.
+    Review {
+        reviewer: String,
+        verdict: ReviewVerdict,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notes: Option<String>,
     },
     /// Emitted by the store-write gate (#130) on every accepted op.
     /// The store can answer "the HEAD typechecks" as a queryable

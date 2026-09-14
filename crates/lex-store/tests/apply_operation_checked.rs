@@ -286,3 +286,36 @@ fn record_examples_passed_emits_an_examples_attestation() {
         assert_eq!(*count, 2);
     }
 }
+
+#[test]
+fn record_review_emits_a_verdict_attestation() {
+    use lex_vcs::{AttestationKind, AttestationResult, ReviewVerdict};
+    let (s, _tmp) = fresh();
+    let candidate = parse("fn add(x :: Int, y :: Int) -> Int { x + y }\n");
+    let (op, t) = add_fac_op();
+    let op_id = s.apply_operation_checked(DEFAULT_BRANCH, op, t, &candidate).unwrap();
+    let stage_id = "stg-1".to_string();
+
+    // Approve → Passed.
+    s.record_review(&stage_id, Some(op_id.clone()), "octocat", ReviewVerdict::Approve, Some("lgtm".into())).unwrap();
+    // Reject → Failed.
+    s.record_review(&stage_id, Some(op_id.clone()), "bob", ReviewVerdict::Reject, None).unwrap();
+
+    let log = s.attestation_log().unwrap();
+    let atts = log.list_for_stage(&stage_id).unwrap();
+    let reviews: Vec<_> = atts.iter()
+        .filter(|a| matches!(a.kind, AttestationKind::Review { .. }))
+        .collect();
+    assert_eq!(reviews.len(), 2, "both reviews recorded");
+
+    let approve = reviews.iter().find(|a| matches!(&a.kind,
+        AttestationKind::Review { verdict: ReviewVerdict::Approve, .. })).expect("approve review");
+    assert!(matches!(approve.result, AttestationResult::Passed));
+    if let AttestationKind::Review { reviewer, notes, .. } = &approve.kind {
+        assert_eq!(reviewer, "octocat");
+        assert_eq!(notes.as_deref(), Some("lgtm"));
+    }
+    let reject = reviews.iter().find(|a| matches!(&a.kind,
+        AttestationKind::Review { verdict: ReviewVerdict::Reject, .. })).expect("reject review");
+    assert!(matches!(reject.result, AttestationResult::Failed { .. }));
+}

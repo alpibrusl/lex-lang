@@ -859,6 +859,7 @@ fn kind_short(k: &AttestationKind) -> String {
         AttestationKind::Defer { actor, .. } => format!("Defer({actor})"),
         AttestationKind::Block { actor, .. } => format!("Block({actor})"),
         AttestationKind::Unblock { actor, .. } => format!("Unblock({actor})"),
+        AttestationKind::Review { reviewer, verdict, .. } => format!("Review({reviewer}:{verdict:?})"),
         AttestationKind::Trace { run_id, root_target } => {
             format!("Trace({root_target}@{run_id:.12}…)")
         }

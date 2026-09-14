@@ -124,3 +124,43 @@ fn empty_store_returns_empty_list() {
     let v = attest_filter_json(store.path(), &[]);
     assert_eq!(v.pointer("/data/count").unwrap().as_u64().unwrap(), 0);
 }
+
+#[test]
+fn attest_review_records_a_verdict_and_shows_up_in_filter() {
+    let store = tempdir().unwrap();
+    let src = store.path().join("a.lex");
+    std::fs::write(&src, "fn fac(n :: Int) -> Int { 1 }\n").unwrap();
+    publish(store.path(), &src);
+
+    // Find the published stage id via `attest filter` (the TypeCheck att).
+    let v = attest_filter_json(store.path(), &["--kind", "type_check"]);
+    let stage_id = v.pointer("/data/attestations/0/stage_id").unwrap().as_str().unwrap().to_string();
+
+    // Record an approving review.
+    let out = Command::new(lex_bin())
+        .args([
+            "--output", "json", "attest", "review",
+            "--store", store.path().to_str().unwrap(),
+            &stage_id, "--verdict", "approve", "--reviewer", "octocat", "--notes", "lgtm",
+        ])
+        .output().unwrap();
+    assert!(out.status.success(), "attest review failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    // It shows up under `--kind review`, tagged with the verdict/reviewer.
+    let v = attest_filter_json(store.path(), &["--kind", "review"]);
+    assert_eq!(v.pointer("/data/count").unwrap().as_u64().unwrap(), 1, "one review recorded");
+    let att = v.pointer("/data/attestations/0").unwrap();
+    assert_eq!(att.pointer("/kind/kind").unwrap().as_str(), Some("review"));
+    assert_eq!(att.pointer("/kind/verdict").unwrap().as_str(), Some("approve"));
+    assert_eq!(att.pointer("/kind/reviewer").unwrap().as_str(), Some("octocat"));
+    assert_eq!(att.pointer("/result/result").unwrap().as_str(), Some("passed"));
+
+    // An unknown verdict is rejected.
+    let out = Command::new(lex_bin())
+        .args([
+            "attest", "review", "--store", store.path().to_str().unwrap(),
+            &stage_id, "--verdict", "maybe",
+        ])
+        .output().unwrap();
+    assert!(!out.status.success(), "unknown verdict must be rejected");
+}

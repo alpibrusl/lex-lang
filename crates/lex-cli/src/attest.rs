@@ -11,7 +11,7 @@ pub(super) fn cmd_attest(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let sub = args.first().ok_or_else(|| {
         anyhow!(
             "usage: lex attest \
-             {{filter|import-install|import-apply|push|pull|retro-block|retro-unblock}} ..."
+             {{filter|review|import-install|import-apply|push|pull|retro-block|retro-unblock}} ..."
         )
     })?;
     let rest = &args[1..];
@@ -20,6 +20,9 @@ pub(super) fn cmd_attest(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     }
     if sub == "pull" {
         return cmd_attest_pull(fmt, rest);
+    }
+    if sub == "review" {
+        return cmd_attest_review(fmt, rest);
     }
     match sub.as_str() {
         "filter" => {
@@ -934,6 +937,53 @@ pub(super) fn cmd_attest_pull(fmt: &OutputFormat, args: &[String]) -> Result<()>
     Ok(())
 }
 
+/// `lex attest review <stage_id> --verdict approve|reject|request_changes
+/// [--op <op_id>] [--reviewer <id>] [--notes "..."] [--store DIR]` (#836 G4).
+/// Records a structured review verdict on a stage, addressable like any
+/// other attestation. Closes the gap where the Candidate->Promote path
+/// carried no recorded reason.
+pub(super) fn cmd_attest_review(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let mut stage_id: Option<String> = None;
+    let mut verdict: Option<String> = None;
+    let mut op_id: Option<String> = None;
+    let mut reviewer: Option<String> = None;
+    let mut notes: Option<String> = None;
+    let mut store_root: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--verdict" => { verdict = args.get(i + 1).cloned(); i += 2; }
+            "--op" => { op_id = args.get(i + 1).cloned(); i += 2; }
+            "--reviewer" => { reviewer = args.get(i + 1).cloned(); i += 2; }
+            "--notes" => { notes = args.get(i + 1).cloned(); i += 2; }
+            "--store" => { store_root = args.get(i + 1).map(PathBuf::from); i += 2; }
+            other if !other.starts_with("--") && stage_id.is_none() => { stage_id = Some(other.to_string()); i += 1; }
+            other => bail!("unexpected arg `{other}` (usage: lex attest review <stage_id> --verdict approve|reject|request_changes [--op OP] [--reviewer ID] [--notes STR] [--store DIR])"),
+        }
+    }
+    let stage_id = stage_id.ok_or_else(|| anyhow!("stage_id required"))?;
+    let verdict = match verdict.as_deref() {
+        Some("approve") => lex_vcs::ReviewVerdict::Approve,
+        Some("reject") => lex_vcs::ReviewVerdict::Reject,
+        Some("request_changes") | Some("request-changes") => lex_vcs::ReviewVerdict::RequestChanges,
+        Some(other) => bail!("unknown --verdict `{other}` (approve|reject|request_changes)"),
+        None => bail!("--verdict required (approve|reject|request_changes)"),
+    };
+    // Default reviewer identity: same env var the human-action kinds use.
+    let reviewer = reviewer
+        .or_else(|| std::env::var("LEX_TEA_USER").ok())
+        .unwrap_or_else(|| "anonymous".to_string());
+    let root = store_root.unwrap_or_else(default_store_root);
+    let store = Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
+    let id = store.record_review(&stage_id, op_id, &reviewer, verdict, notes)?;
+    let data = serde_json::json!({ "attestation_id": id, "stage_id": stage_id, "reviewer": reviewer });
+    let id_for_text = id.clone();
+    acli::emit_or_text("attest", data, fmt, move || {
+        println!("recorded review {id_for_text} on {stage_id}");
+    });
+    Ok(())
+}
+
 pub(super) fn attestation_kind_tag(k: &lex_vcs::AttestationKind) -> &'static str {
     use lex_vcs::AttestationKind::*;
     match k {
@@ -947,6 +997,7 @@ pub(super) fn attestation_kind_tag(k: &lex_vcs::AttestationKind) -> &'static str
         Defer { .. } => "defer",
         Block { .. } => "block",
         Unblock { .. } => "unblock",
+        Review { .. } => "review",
         Trace { .. } => "trace",
         ProducerBlock { .. } => "producer_block",
         ProducerUnblock { .. } => "producer_unblock",

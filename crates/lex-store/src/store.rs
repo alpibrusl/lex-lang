@@ -1724,6 +1724,41 @@ impl Store {
         Ok(())
     }
 
+    /// Record a structured `Review` verdict on a stage (#836 G4).
+    /// The verdict maps onto the attestation `result` so existing
+    /// result-based tooling reads it: Approve->Passed,
+    /// Reject->Failed, RequestChanges->Inconclusive.
+    pub fn record_review(
+        &self,
+        stage_id: &str,
+        op_id: Option<lex_vcs::OpId>,
+        reviewer: &str,
+        verdict: lex_vcs::ReviewVerdict,
+        notes: Option<String>,
+    ) -> Result<lex_vcs::AttestationId, StoreError> {
+        let result = match verdict {
+            lex_vcs::ReviewVerdict::Approve => lex_vcs::AttestationResult::Passed,
+            lex_vcs::ReviewVerdict::Reject => lex_vcs::AttestationResult::Failed {
+                detail: notes.clone().unwrap_or_else(|| "rejected".into()),
+            },
+            lex_vcs::ReviewVerdict::RequestChanges => lex_vcs::AttestationResult::Inconclusive {
+                detail: notes.clone().unwrap_or_else(|| "changes requested".into()),
+            },
+        };
+        let att = lex_vcs::Attestation::new(
+            stage_id.to_string(),
+            op_id,
+            None,
+            lex_vcs::AttestationKind::Review { reviewer: reviewer.to_string(), verdict, notes },
+            result,
+            review_producer(reviewer),
+            None,
+        );
+        let id = att.attestation_id.clone();
+        self.attestation_log()?.put(&att)?;
+        Ok(id)
+    }
+
     /// Consult `policy.session_budgets` for the op's session
     /// (resolved via `op.intent_id → Intent.session_id`) and
     /// refuse if applying would push the session's monotonic spend
@@ -2921,6 +2956,16 @@ fn typecheck_producer() -> lex_vcs::ProducerDescriptor {
 fn examples_producer() -> lex_vcs::ProducerDescriptor {
     lex_vcs::ProducerDescriptor {
         tool: "lex-store::examples".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        model: None,
+    }
+}
+
+/// Producer identity for `Review` attestations (#836). The reviewer's
+/// own id lives in the kind; this records which tool minted the record.
+fn review_producer(reviewer: &str) -> lex_vcs::ProducerDescriptor {
+    lex_vcs::ProducerDescriptor {
+        tool: format!("lex-store::review:{reviewer}"),
         version: env!("CARGO_PKG_VERSION").into(),
         model: None,
     }
