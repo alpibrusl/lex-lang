@@ -96,6 +96,7 @@ fn commands() -> Vec<CommandInfo> {
     vec![
         cmd_parse(),
         cmd_check(),
+        cmd_authority(),
         cmd_run(),
         cmd_hash(),
         cmd_blame(),
@@ -501,6 +502,44 @@ fn cmd_parse() -> CommandInfo {
             ("Parse stdin", "cat hello.lex | lex parse -"),
         ])
         .with_see_also(vec!["check", "hash"])
+}
+
+fn cmd_authority() -> CommandInfo {
+    CommandInfo::new(
+        "authority",
+        "derive the least grant a program provably needs from its effect rows, or diff that authority between two versions (exit 8 = the delta was refused by --fail-on)",
+    )
+    .idempotent(true)
+    .add_argument(
+        "subcommand",
+        "string",
+        "derive <file-or-dir> | diff --base <path> --head <path>",
+        true,
+    )
+    .add_option(
+        "base",
+        "string",
+        "the previously approved file or package (diff)",
+        None,
+    )
+    .add_option("head", "string", "the proposed file or package (diff)", None)
+    .add_option(
+        "fail-on",
+        "string",
+        "exit 8 on a delta at or above this severity: `widening` or `any` (diff)",
+        None,
+    )
+    .with_examples(vec![
+        (
+            "What authority does this package need?",
+            "lex authority derive src/",
+        ),
+        (
+            "Refuse a change that reaches somewhere new",
+            "lex authority diff --base old/ --head src/ --fail-on widening",
+        ),
+    ])
+    .with_see_also(vec!["check", "run"])
 }
 
 fn cmd_check() -> CommandInfo {

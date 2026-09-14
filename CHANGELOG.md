@@ -7,6 +7,39 @@ bumps may carry breaking changes when justified).
 
 ## [Unreleased]
 
+### Added
+
+- **`lex authority` — the grant is derived from the code, not written
+  beside it.** `lex check --allow-effects …` asks whether a program fits
+  a policy someone wrote. The inverse — *what policy does this code
+  require?* — is the question a reviewer actually has, and only an
+  effect system can answer it soundly: the declared rows are a static
+  over-approximation of every path, and `check_program` has already
+  rejected any row that lies about its body.
+  - `lex authority derive <file|dir>` folds those rows into the least
+    `Grant` the code needs, over a file or a whole package. Minimal by
+    construction — the level on a dimension is the join over the effects
+    touching it — and the output carries the evidence: for each
+    dimension, the effect that the next rank down would reject
+    (`Authority::minimality_witness`). It also names the *contributors*,
+    the function that is why each effect is in the answer, because
+    "this package needs `net`" is a worse review than "`push_telemetry`
+    needs `net`".
+  - `lex authority diff --base <p> --head <p>` classifies the delta as
+    `widening` / `narrowing` / `unchanged`, and `--fail-on
+    widening|any` makes it a CI gate (exit 8, `PRECONDITION_FAILED`).
+    A source diff says what the code now *does*; this says what it may
+    now *reach*.
+  - The fold itself is `lex_types::authority`, so downstream consumers
+    derive the same grant from the same rows — `lex-os` gates a manifest
+    on it and narrows a sandbox to it.
+  - Two limits are reported rather than papered over: effects outside
+    the trust lattice (`env`, `sql`, `approval`, …) are surfaced as
+    `off_lattice` since no grant refuses them, and a bare `[net]` —
+    `std.net.get` takes its URL at run time — sets `unscoped_net`, so
+    the static answer narrows to "may reach the network" and *which*
+    host stays a perimeter question.
+
 ### Fixed
 
 - **`lex-store`'s write-time publish gate re-checked an already-rewritten

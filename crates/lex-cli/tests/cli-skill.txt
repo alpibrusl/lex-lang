@@ -1,6 +1,6 @@
 ---
 name: lex
-description: "Invoke the `lex` CLI. Commands: parse, check, run, hash…"
+description: "Invoke the `lex` CLI. Commands: parse, check, authority, run…"
 ---
 
 # lex
@@ -12,6 +12,7 @@ description: "Invoke the `lex` CLI. Commands: parse, check, run, hash…"
 
 - `lex parse` — print canonical AST as JSON (idempotent)
 - `lex check` — type-check; given policy flags, also verify the declared effects fit inside them (exit 2 = type errors, 3 = policy violations) (idempotent)
+- `lex authority` — derive the least grant a program provably needs from its effect rows, or diff that authority between two versions (exit 8 = the delta was refused by --fail-on) (idempotent)
 - `lex run` — execute fn under capability policy (args parsed as JSON); the program's own exit status when it calls std.process.exit
 - `lex hash` — print canonical SigId/StageId hashes for each function (idempotent)
 - `lex blame` — show each fn's stage history from the store (idempotent)
@@ -111,6 +112,34 @@ lex check --allow-effects io,net app.lex
 ```
 
 **See also:** `lex parse`, `lex run`
+
+## `lex authority`
+
+derive the least grant a program provably needs from its effect rows, or diff that authority between two versions (exit 8 = the delta was refused by --fail-on)
+
+### Options
+
+- `--base` (string) — the previously approved file or package (diff)
+- `--head` (string) — the proposed file or package (diff)
+- `--fail-on` (string) — exit 8 on a delta at or above this severity: `widening` or `any` (diff)
+
+### Arguments
+
+- `subcommand` (string, required) — derive <file-or-dir> | diff --base <path> --head <path>
+
+### Examples
+
+```bash
+# What authority does this package need?
+lex authority derive src/
+```
+
+```bash
+# Refuse a change that reaches somewhere new
+lex authority diff --base old/ --head src/ --fail-on widening
+```
+
+**See also:** `lex check`, `lex run`
 
 ## `lex run`
 

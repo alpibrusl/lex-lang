@@ -13,6 +13,7 @@ pub mod stdlib_spec;
 pub mod checker;
 pub mod discharge;
 pub mod trust;
+pub mod authority;
 
 pub use checker::{
     check_and_rewrite_program, check_program, check_program_with_positions, rewrite_parse_calls,

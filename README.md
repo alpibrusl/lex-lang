@@ -44,6 +44,9 @@ Hot functions are promoted from the bytecode interpreter to native code via Cran
 **6. Package registry — publish and consume via LexHub.**
 `lex pkg publish` packs a `lex.toml` project and ships it to a registry. Consumers declare `{ registry = "…", version = "…" }` dependencies; the resolver downloads and caches the archive on first use. The canonical registry is [LexHub](https://hub.lexlang.org).
 
+**7. Authority — the grant is derived from the code, not written beside it.**
+`lex authority derive src/` folds the declared effect rows into the least grant the package provably needs, and says which function is why each effect is in the answer. `lex authority diff --base old/ --head src/ --fail-on widening` turns that into a review artifact: a source diff says what the code now *does*, this says what it may now *reach*, and exit 8 is the CI gate. The derivation is minimal — lower any dimension one rank and a declared effect stops type-checking, which `derive` prints as evidence rather than claiming. Downstream, [lex-os](https://github.com/alpibrusl/lex-os) gates a manifest on the same fold and narrows a sandbox to it.
+
 ## Quickstart
 
 ```sh
