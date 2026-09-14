@@ -24,7 +24,6 @@ mod ci;
 mod diff;
 mod doc_sync;
 mod docs;
-mod examples_eval;
 mod fmt;
 mod init;
 mod lint;
@@ -531,7 +530,7 @@ fn cmd_check(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             // same JSON envelope as type errors and exit 2 — they're hard
             // errors, not lints, because the `examples` block is meant to
             // be load-bearing contract, not a warning.
-            let example_errors = examples_eval::evaluate_examples(&stages);
+            let example_errors = lex_runtime::evaluate_examples(&stages);
             if !example_errors.is_empty() {
                 let positioned: Vec<lex_types::PositionedError> = example_errors
                     .into_iter()
