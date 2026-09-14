@@ -97,6 +97,51 @@
       ]
     },
     {
+      "name": "authority",
+      "description": "derive the least grant a program provably needs from its effect rows, or diff that authority between two versions (exit 8 = the delta was refused by --fail-on)",
+      "arguments": [
+        {
+          "name": "subcommand",
+          "type": "string",
+          "description": "derive <file-or-dir> | diff --base <path> --head <path>",
+          "required": true
+        }
+      ],
+      "options": [
+        {
+          "name": "base",
+          "type": "string",
+          "description": "the previously approved file or package (diff)"
+        },
+        {
+          "name": "head",
+          "type": "string",
+          "description": "the proposed file or package (diff)"
+        },
+        {
+          "name": "fail-on",
+          "type": "string",
+          "description": "exit 8 on a delta at or above this severity: `widening` or `any` (diff)"
+        }
+      ],
+      "subcommands": [],
+      "idempotent": true,
+      "examples": [
+        {
+          "description": "What authority does this package need?",
+          "invocation": "lex authority derive src/"
+        },
+        {
+          "description": "Refuse a change that reaches somewhere new",
+          "invocation": "lex authority diff --base old/ --head src/ --fail-on widening"
+        }
+      ],
+      "see_also": [
+        "check",
+        "run"
+      ]
+    },
+    {
       "name": "run",
       "description": "execute fn under capability policy (args parsed as JSON); the program's own exit status when it calls std.process.exit",
       "arguments": [

@@ -15,6 +15,7 @@ mod agent_guidelines;
 mod agent_tool;
 mod ast_merge;
 mod attest;
+mod authority;
 mod audit;
 mod blame;
 mod branch;
@@ -126,6 +127,7 @@ fn run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             Ok(())
         }
         "parse" => cmd_parse(fmt, &args[1..]),
+        "authority" => authority::cmd_authority(fmt, &args[1..]),
         "check" => cmd_check(fmt, &args[1..]),
         "run" => cmd_run(fmt, &args[1..]),
         "hash" => cmd_hash(fmt, &args[1..]),
@@ -220,6 +222,9 @@ fn print_usage() {
     );
     println!("  parse <file>                       print canonical AST as JSON");
     println!("  check [--strict] <file>            type-check; --strict adds lint warnings");
+    println!("  authority derive <file|dir>        the least grant this code provably needs");
+    println!("  authority diff --base <p> --head <p> [--fail-on widening|any]");
+    println!("                                     what a change did to that authority (exit 8 = refused)");
     println!("  repair <op_id> [--apply --transform '<json>'] [--store DIR]");
     println!("                                     apply a typed repair to a failed op; emits a RepairAttempt");
     println!("  plan <goal> [--budget N] [--store DIR]");

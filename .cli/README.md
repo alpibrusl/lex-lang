@@ -17,6 +17,12 @@ type-check; given policy flags, also verify the declared effects fit inside them
 
 Idempotent: true
 
+### authority
+
+derive the least grant a program provably needs from its effect rows, or diff that authority between two versions (exit 8 = the delta was refused by --fail-on)
+
+Idempotent: true
+
 ### run
 
 execute fn under capability policy (args parsed as JSON); the program's own exit status when it calls std.process.exit
