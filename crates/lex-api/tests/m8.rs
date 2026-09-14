@@ -899,3 +899,51 @@ fn patch_that_does_not_compose_is_refused_and_head_is_unchanged() {
     assert_eq!(branch_head_op(&srv, lex_store::DEFAULT_BRANCH), before,
         "head must not move on a refused patch");
 }
+
+// ── #835 Tier 1: behavioral example gate on publish ─────────────────────────
+
+#[test]
+fn publish_refuses_a_function_whose_example_is_behaviorally_wrong() {
+    // add(1, 2) => 4 type-checks (Int args, Int expected) but is wrong
+    // when run. Before #835 it published; now it's a 422 with the
+    // structured example-mismatch, and the branch head does not move.
+    let (srv, _tmp) = start_server();
+    let head_before = branch_head_op(&srv, lex_store::DEFAULT_BRANCH);
+    let src = "fn add(x :: Int, y :: Int) -> Int\n  examples { add(1, 2) => 4 }\n{ x + y }\n";
+    let (s, b) = http(&srv.addr, "POST", "/v1/publish",
+        &json!({"source": src, "activate": true}).to_string());
+    assert_eq!(s, 422, "a wrong example must refuse the publish: {b}");
+    assert!(b.contains("example") && b.contains("mismatch"), "structured example error: {b}");
+    assert_eq!(branch_head_op(&srv, lex_store::DEFAULT_BRANCH), head_before,
+        "head must not move when the publish is refused");
+}
+
+#[test]
+fn publish_accepts_correct_examples_and_records_an_examples_attestation() {
+    let (srv, _tmp) = start_server();
+    let src = "fn add(x :: Int, y :: Int) -> Int\n  examples { add(1, 2) => 3, add(0, 0) => 0 }\n{ x + y }\n";
+    let (s, b) = http(&srv.addr, "POST", "/v1/publish",
+        &json!({"source": src, "activate": true}).to_string());
+    assert_eq!(s, 200, "correct examples must publish: {b}");
+    let stage_id = serde_json::from_str::<serde_json::Value>(&b).unwrap()
+        ["ops"][0]["kind"]["stage_id"].as_str().unwrap().to_string();
+
+    // An Examples::Passed attestation must be recorded for the stage.
+    let (s, b) = http(&srv.addr, "GET", &format!("/v1/stage/{stage_id}/attestations"), "");
+    assert_eq!(s, 200, "attestations GET: {b}");
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    let atts = v["attestations"].as_array().expect("attestations array");
+    let has_examples = atts.iter().any(|a| {
+        a["kind"]["kind"].as_str() == Some("examples")
+            && a["result"]["result"].as_str() == Some("passed")
+    });
+    assert!(has_examples, "expected a passed Examples attestation on the stage: {atts:?}");
+}
+
+#[test]
+fn publish_of_a_function_without_examples_is_unaffected() {
+    let (srv, _tmp) = start_server();
+    let (s, b) = http(&srv.addr, "POST", "/v1/publish",
+        &json!({"source": "fn id(x :: Int) -> Int { x }\n", "activate": true}).to_string());
+    assert_eq!(s, 200, "example-less publish must be unaffected: {b}");
+}

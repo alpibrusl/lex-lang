@@ -77,6 +77,26 @@ pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         std::process::exit(2);
     }
 
+    // #835 Tier 1: behavioral example gate — run `examples {}` and refuse
+    // the publish on any mismatch, the same hard-error contract `lex check`
+    // uses. Type-level example checks already ran above.
+    let example_errors = lex_runtime::evaluate_examples(&stages);
+    if !example_errors.is_empty() {
+        let arr: Vec<serde_json::Value> = example_errors
+            .iter()
+            .map(|e| serde_json::to_value(e).unwrap())
+            .collect();
+        let data = serde_json::json!({ "phase": "examples", "errors": arr });
+        acli::emit_or_text("publish", data, fmt, || {
+            for e in &example_errors {
+                if let Ok(j) = serde_json::to_string(e) {
+                    eprintln!("{j}");
+                }
+            }
+        });
+        std::process::exit(2);
+    }
+
     let store =
         Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
     let branch = branch.unwrap_or_else(|| store.current_branch());
@@ -167,6 +187,23 @@ pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         activate,
         signer.as_ref(),
     )?;
+    // #835 Tier 1: record the behavioral-examples verdict for each
+    // published fn-stage that declares examples. Best-effort.
+    {
+        use std::collections::BTreeMap;
+        let op_for_stage: BTreeMap<String, String> = outcome.ops.iter()
+            .filter_map(|op| op.kind.get("stage_id").and_then(|v| v.as_str())
+                .map(|sid| (sid.to_string(), op.op_id.clone())))
+            .collect();
+        for stage in &stages {
+            let Stage::FnDecl(fd) = stage else { continue };
+            if fd.examples.is_empty() { continue; }
+            let Some(sid) = lex_ast::stage_id(stage) else { continue };
+            if let Some(op_id) = op_for_stage.get(&sid).cloned().or_else(|| outcome.head_op.clone()) {
+                let _ = store.record_examples_passed(&sid, &op_id, fd.examples.len());
+            }
+        }
+    }
     let signed = signer.as_ref().map(|kp| kp.public_hex());
     let data = serde_json::json!({
         "ops": outcome.ops,

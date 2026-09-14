@@ -20,6 +20,7 @@ mod stdlib;
 #[cfg(feature = "df")]
 pub mod df;
 pub mod cli;
+pub mod examples;
 pub mod policy;
 pub mod handler;
 #[cfg(feature = "quic")]
@@ -34,3 +35,4 @@ pub use handler::{
     StdoutSink,
 };
 pub use policy::{check_program, Policy, PolicyReport, PolicyViolation};
+pub use examples::evaluate_examples;

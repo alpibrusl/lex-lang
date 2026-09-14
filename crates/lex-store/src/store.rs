@@ -1696,6 +1696,34 @@ impl Store {
         Ok(())
     }
 
+    /// Emit an `Examples::Passed` attestation for a published stage
+    /// whose behavioral `examples {}` block was run and passed (#835,
+    /// Tier 1). Mirrors [`Self::record_typecheck_passed`]. The
+    /// behavioral run itself happens one layer up (lex-api / lex-cli)
+    /// because it needs the bytecode compiler + VM, which this crate
+    /// deliberately doesn't depend on; the store only records the
+    /// verdict. `file_hash` uses the stage id — the stage fully
+    /// determines its own examples.
+    pub fn record_examples_passed(
+        &self,
+        stage_id: &str,
+        op_id: &lex_vcs::OpId,
+        count: usize,
+    ) -> Result<(), StoreError> {
+        let log = self.attestation_log()?;
+        let attestation = lex_vcs::Attestation::new(
+            stage_id.to_string(),
+            Some(op_id.clone()),
+            None,
+            lex_vcs::AttestationKind::Examples { file_hash: stage_id.to_string(), count },
+            lex_vcs::AttestationResult::Passed,
+            examples_producer(),
+            None,
+        );
+        log.put(&attestation)?;
+        Ok(())
+    }
+
     /// Consult `policy.session_budgets` for the op's session
     /// (resolved via `op.intent_id → Intent.session_id`) and
     /// refuse if applying would push the session's monotonic spend
@@ -2881,6 +2909,18 @@ fn transition_for_kind(kind: &lex_vcs::OperationKind) -> lex_vcs::StageTransitio
 fn typecheck_producer() -> lex_vcs::ProducerDescriptor {
     lex_vcs::ProducerDescriptor {
         tool: "lex-store".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        model: None,
+    }
+}
+
+/// Producer identity for `Examples::Passed` attestations emitted by
+/// [`Store::record_examples_passed`] (#835). Distinct tool name so
+/// the activity feed can tell an auto-emitted publish-time examples
+/// verdict apart from an `lex agent-tool --examples` one.
+fn examples_producer() -> lex_vcs::ProducerDescriptor {
+    lex_vcs::ProducerDescriptor {
+        tool: "lex-store::examples".into(),
         version: env!("CARGO_PKG_VERSION").into(),
         model: None,
     }

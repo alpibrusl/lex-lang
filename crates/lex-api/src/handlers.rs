@@ -10,6 +10,7 @@ use lex_ast::canonicalize_program;
 use lex_bytecode::{compile_program, vm::Vm, Value};
 use lex_runtime::{check_program as check_policy, DefaultHandler, Policy};
 use lex_store::Store;
+use crate::publish_examples::record_examples_for_publish;
 use lex_syntax::{load_package, load_program_from_str, Manifest};
 use lex_vcs::{MergeSession, MergeSessionId};
 use serde::{Deserialize, Serialize};
@@ -487,6 +488,16 @@ pub(crate) fn publish_handler(state: &State, body: &str) -> Response<std::io::Cu
     if let Err(errs) = lex_types::check_and_rewrite_program(&mut stages) {
         return error_with_detail(422, "type errors", serde_json::to_value(&errs).unwrap());
     }
+    // #835 Tier 1: behavioral example gate. check_and_rewrite_program
+    // only type-checks `examples {}`; run them and refuse the publish
+    // if any declared example evaluates to the wrong value. Non-breaking:
+    // functions without examples (and effectful ones, which can't have
+    // them) produce no cases.
+    let example_errors = lex_runtime::evaluate_examples(&stages);
+    if !example_errors.is_empty() {
+        return error_with_detail(422, "example mismatch",
+            serde_json::to_value(&example_errors).unwrap_or_default());
+    }
 
     let store = state.store.lock().unwrap();
     let branch = store.current_branch();
@@ -523,10 +534,16 @@ pub(crate) fn publish_handler(state: &State, body: &str) -> Response<std::io::Cu
     }
 
     match store.publish_program(&branch, &stages, &report, &new_imports, req.activate) {
-        Ok(outcome) => json_response(200, &serde_json::json!({
-            "ops": outcome.ops,
-            "head_op": outcome.head_op,
-        })),
+        Ok(outcome) => {
+            // #835 Tier 1: record the behavioral-examples verdict for each
+            // published fn-stage that declares examples. Best-effort — a
+            // failure to record must not fail an otherwise-good publish.
+            record_examples_for_publish(&store, &stages, &outcome);
+            json_response(200, &serde_json::json!({
+                "ops": outcome.ops,
+                "head_op": outcome.head_op,
+            }))
+        }
         // The store-write gate (#130) also type-checks at the top
         // of `publish_program`. The handler above already pre-checks,
         // so this branch is reached only on a race or a state we

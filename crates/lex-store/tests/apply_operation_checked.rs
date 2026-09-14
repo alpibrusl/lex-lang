@@ -265,3 +265,24 @@ fn apply_operation_checked_propagates_apply_errors() {
         other => panic!("expected StoreError::Apply, got {other:?}"),
     }
 }
+
+#[test]
+fn record_examples_passed_emits_an_examples_attestation() {
+    use lex_vcs::{AttestationKind, AttestationResult};
+    let (s, _tmp) = fresh();
+    let candidate = parse("fn add(x :: Int, y :: Int) -> Int { x + y }\n");
+    let (op, t) = add_fac_op();
+    let op_id = s.apply_operation_checked(DEFAULT_BRANCH, op, t, &candidate).unwrap();
+    let stage_id = "stg-1".to_string(); // the AddFunction op's stage id in add_fac_op
+
+    s.record_examples_passed(&stage_id, &op_id, 2).unwrap();
+
+    let log = s.attestation_log().unwrap();
+    let atts = log.list_for_stage(&stage_id).unwrap();
+    let ex = atts.iter().find(|a| matches!(a.kind, AttestationKind::Examples { .. }))
+        .expect("an Examples attestation must be recorded");
+    assert!(matches!(ex.result, AttestationResult::Passed));
+    if let AttestationKind::Examples { count, .. } = &ex.kind {
+        assert_eq!(*count, 2);
+    }
+}

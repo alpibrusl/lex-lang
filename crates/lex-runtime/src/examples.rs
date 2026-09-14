@@ -38,7 +38,8 @@
 
 use lex_ast as a;
 use lex_bytecode::{compile_program, vm::Vm, Value};
-use lex_runtime::{DefaultHandler, Policy};
+use crate::handler::DefaultHandler;
+use crate::policy::Policy;
 use lex_types::TypeError;
 
 /// Run the behavioral-evaluation pass over `stages` and return any
