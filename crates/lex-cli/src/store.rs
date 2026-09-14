@@ -29,6 +29,11 @@ pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     // Pull --branch and --signing-key off as well.
     let mut branch: Option<String> = None;
     let mut signing_key_flag: Option<String> = None;
+    // #131 / #839: an optional Intent to stamp onto every op this
+    // publish emits (see `--intent-prompt`).
+    let mut intent_prompt: Option<String> = None;
+    let mut intent_model: Option<String> = None;
+    let mut intent_session: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
     let mut it = rest.iter();
     while let Some(a) = it.next() {
@@ -44,13 +49,35 @@ pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                     .ok_or_else(|| anyhow!("--signing-key needs a hex value"))?
                     .clone(),
             );
+        } else if a == "--intent-prompt" {
+            intent_prompt = Some(
+                it.next()
+                    .ok_or_else(|| anyhow!("--intent-prompt needs a value"))?
+                    .clone(),
+            );
+        } else if a == "--intent-model" {
+            intent_model = Some(
+                it.next()
+                    .ok_or_else(|| anyhow!("--intent-model needs a provider/name value"))?
+                    .clone(),
+            );
+        } else if a == "--intent-session" {
+            intent_session = Some(
+                it.next()
+                    .ok_or_else(|| anyhow!("--intent-session needs a value"))?
+                    .clone(),
+            );
         } else {
             positional.push(a.clone());
         }
     }
+    if intent_prompt.is_none() && (intent_model.is_some() || intent_session.is_some()) {
+        bail!("--intent-model / --intent-session require --intent-prompt");
+    }
     let path = positional.first().ok_or_else(|| {
         anyhow!(
-        "usage: lex publish [--store DIR] [--branch NAME] [--activate] [--signing-key HEX] <file>")
+        "usage: lex publish [--store DIR] [--branch NAME] [--activate] [--signing-key HEX] \
+         [--intent-prompt TEXT [--intent-model PROVIDER/NAME] [--intent-session ID]] <file>")
     })?;
     let signer = resolve_signing_key(signing_key_flag.as_deref())?;
 
@@ -179,13 +206,35 @@ pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    let outcome = store.publish_program_signed(
+    // #131 / #839: record the caller's Intent (prompt / model / session) so
+    // every op this publish emits carries *why* it happened. Optional;
+    // `lex recall --intent <id>` and `lex op replay` read it back.
+    let intent_id: Option<lex_vcs::IntentId> = match &intent_prompt {
+        Some(prompt) => {
+            let (provider, name) = split_model_ref(intent_model.as_deref());
+            let intent = lex_vcs::Intent::new(
+                prompt.clone(),
+                intent_session.clone().unwrap_or_else(|| "cli".to_string()),
+                lex_vcs::ModelDescriptor { provider, name, version: None },
+                None,
+            );
+            lex_vcs::IntentLog::open(&root)
+                .with_context(|| "opening intent log")?
+                .put(&intent)
+                .with_context(|| "recording intent")?;
+            Some(intent.intent_id.clone())
+        }
+        None => None,
+    };
+
+    let outcome = store.publish_program_with_intent(
         &branch,
         &stages,
         &report,
         &new_imports,
         activate,
         signer.as_ref(),
+        intent_id.clone(),
     )?;
     // #835 Tier 1: record the behavioral-examples verdict for each
     // published fn-stage that declares examples. Best-effort.
@@ -209,9 +258,26 @@ pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "ops": outcome.ops,
         "head_op": outcome.head_op,
         "signed_by": signed,
+        // The recorded Intent's id when --intent-prompt was given, so a
+        // harness (lex-code) can hand it to `lex recall` / `lex op replay`.
+        "intent_id": intent_id,
     });
     acli::emit_or_text("publish", data, fmt, || {});
     Ok(())
+}
+
+/// `provider/name` → `(provider, name)`. A bare name is attributed to
+/// provider `cli`; `None` → `("cli", "unknown")`. The model ref is
+/// recorded for audit and feeds the content-addressed IntentId, so the
+/// default must be stable, not empty.
+fn split_model_ref(m: Option<&str>) -> (String, String) {
+    match m {
+        None => ("cli".to_string(), "unknown".to_string()),
+        Some(s) => match s.split_once('/') {
+            Some((p, n)) if !p.is_empty() && !n.is_empty() => (p.to_string(), n.to_string()),
+            _ => ("cli".to_string(), s.to_string()),
+        },
+    }
 }
 
 pub(super) fn cmd_store(fmt: &OutputFormat, args: &[String]) -> Result<()> {

@@ -707,9 +707,31 @@ fn cmd_publish() -> CommandInfo {
         "transition published stages to Active",
         None,
     )
+    .add_option(
+        "intent-prompt",
+        "string",
+        "record an Intent for this publish: the prompt / instruction the change was made under (stamps every emitted op with its intent_id)",
+        None,
+    )
+    .add_option(
+        "intent-model",
+        "string",
+        "with --intent-prompt: the model as provider/name (e.g. ollama/qwen3.8:27b-mlx); default cli/unknown",
+        None,
+    )
+    .add_option(
+        "intent-session",
+        "string",
+        "with --intent-prompt: the agent session id; default cli",
+        None,
+    )
     .with_examples(vec![
         ("Publish drafts", "lex publish app.lex"),
         ("Publish + activate", "lex publish --activate app.lex"),
+        (
+            "Publish with a recorded intent",
+            "lex publish --intent-prompt 'add triple()' --intent-model ollama/qwen3.8:27b-mlx --intent-session run-1 app.lex",
+        ),
     ])
     .with_see_also(vec!["store", "branch"])
 }

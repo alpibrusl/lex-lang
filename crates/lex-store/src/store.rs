@@ -1245,6 +1245,33 @@ impl Store {
         activate: bool,
         signer: Option<&lex_vcs::Keypair>,
     ) -> Result<PublishOutcome, StoreError> {
+        self.publish_program_with_intent(branch, stages, diff, new_imports, activate, signer, None)
+    }
+
+    /// [`Self::publish_program_signed`] plus an optional `intent_id`
+    /// (#131 / #839): when given, every op this publish emits is stamped
+    /// with it, so the op log records *why* the change happened — the
+    /// prompt / model / session an agent was acting under — not only
+    /// what it was. `lex recall --intent <id>` and `lex op replay` read
+    /// it back. The caller records the [`lex_vcs::Intent`] in the
+    /// [`lex_vcs::IntentLog`] beforehand; this only links ops to it.
+    /// `None` is the existing (intent-less) behavior, so op ids for
+    /// intent-less publishes are unchanged.
+    // A batch publish legitimately takes the branch, program, diff,
+    // imports, activate flag, signer, and now the intent — bundling
+    // them into a struct for one optional field would obscure more
+    // than it clarifies.
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_program_with_intent(
+        &self,
+        branch: &str,
+        stages: &[lex_ast::Stage],
+        diff: &lex_vcs::DiffReport,
+        new_imports: &lex_vcs::ImportMap,
+        activate: bool,
+        signer: Option<&lex_vcs::Keypair>,
+        intent_id: Option<lex_vcs::IntentId>,
+    ) -> Result<PublishOutcome, StoreError> {
         use std::collections::{BTreeMap, BTreeSet};
 
         // #130's write-time gate: verify the candidate program
@@ -1332,6 +1359,13 @@ impl Store {
             let head_now = self.get_branch(branch)?.and_then(|b| b.head_op);
             let op =
                 lex_vcs::Operation::new(kind.clone(), head_now.into_iter().collect::<Vec<_>>());
+            // #131 / #839: stamp the caller's intent so the op log records
+            // why this change happened, not just what it was. The CAS
+            // retry path preserves `intent_id` when it rebuilds the op.
+            let op = match &intent_id {
+                Some(id) => op.with_intent(id.clone()),
+                None => op,
+            };
             let op_id = self.apply_operation(branch, op, transition)?;
             self.record_typecheck_passed(&attestable, &op_id)?;
             ops_out.push(PublishOp {
