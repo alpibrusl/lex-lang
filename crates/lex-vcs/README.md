@@ -114,7 +114,16 @@ sequence of tier-2 issues. Each module is independently usable:
 
 - **[`merge`]** — op-DAG three-way merge: find the LCA of two heads,
   diff the ops on each side, group by the `SigId` they touch, and
-  classify each group as auto-merge or [`ConflictKind`].
+  classify each group as auto-merge or [`ConflictKind`]. This layer is
+  whole-function: two divergent bodies for one sig are a
+  `ModifyModify` conflict.
+- **[`merge_bodies`]** — typed three-way merge *inside* a function
+  (#838): a structural merge of three canonical `CExpr` bodies that
+  composes disjoint subtree edits (different match arms, different let
+  bindings) and conflicts on overlap. `lex-store`'s merge path calls it
+  for a `ModifyModify`, accepting the result only if the merged body
+  also type-checks — so two agents editing different arms of one
+  function no longer collide, the piece git structurally cannot do.
 - **[`MergeSession`]** — a stateful state machine for programmatic
   conflict resolution: `start` collects conflicts, `resolve`/
   `resolve_checked` accept batched [`Resolution`]s. `resolve` does

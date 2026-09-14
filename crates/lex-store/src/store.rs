@@ -1566,6 +1566,77 @@ impl Store {
         Ok(())
     }
 
+    /// #838: attempt a typed three-way merge of a single sig's body for
+    /// a `ModifyModify` conflict — the intra-function, better-than-git
+    /// case where two agents edited *disjoint* subtrees of the same
+    /// function (different match arms, different let bindings).
+    ///
+    /// `base` / `ours` (the dst side) / `theirs` (the src side) are the
+    /// three stage ids the merge engine surfaced for `sig_id`. Loads
+    /// the three `FnDecl`s, structurally merges the bodies
+    /// ([`lex_vcs::merge_bodies`]), and accepts the result *only if* the
+    /// merged function also type-checks against `dst_branch`'s head — a
+    /// body that composes syntactically but not by type is still a
+    /// conflict (#838). On success the merged stage is published
+    /// (content-addressed, idempotent; orphaned and GC-reclaimable if
+    /// the merge is never committed) and its id returned; `None` means
+    /// "fall back to a whole-function conflict."
+    ///
+    /// Deliberately narrow for this slice: only pure body divergence is
+    /// merged. If the two sides disagree on anything but the body
+    /// (examples, type params — the signature is identical by
+    /// construction, since all three share `sig_id`), or either stage
+    /// isn't a function, it falls back to a conflict.
+    pub fn try_semantic_body_merge(
+        &self,
+        dst_branch: &str,
+        sig_id: &str,
+        base: &str,
+        ours: &str,
+        theirs: &str,
+    ) -> Result<Option<String>, StoreError> {
+        use lex_ast::Stage::FnDecl;
+        let (base_fd, ours_fd, theirs_fd) =
+            match (self.get_ast(base), self.get_ast(ours), self.get_ast(theirs)) {
+                (Ok(FnDecl(b)), Ok(FnDecl(o)), Ok(FnDecl(t))) => (b, o, t),
+                // A non-function stage (type decl / import) or a stage
+                // that can't be loaded isn't an intra-body merge.
+                _ => return Ok(None),
+            };
+
+        // Only the body may diverge between the two sides.
+        if !fndecl_same_except_body(&ours_fd, &theirs_fd) {
+            return Ok(None);
+        }
+
+        let merged_body =
+            match lex_vcs::merge_bodies(&base_fd.body, &ours_fd.body, &theirs_fd.body) {
+                lex_vcs::BodyMerge::Merged(b) => b,
+                lex_vcs::BodyMerge::Conflict => return Ok(None),
+            };
+
+        let mut merged_fd = ours_fd.clone();
+        merged_fd.body = merged_body;
+        let merged_stage = lex_ast::Stage::FnDecl(merged_fd);
+        let new_stage_id = match stage_id(&merged_stage) {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+
+        // Type-check the merged fn in context: dst's head with this sig
+        // swapped to the merged stage. Requires the merged stage to be
+        // loadable, so publish first (idempotent, content-addressed).
+        self.publish(&merged_stage)?;
+        let mut delta = std::collections::BTreeMap::new();
+        delta.insert(sig_id.to_string(), Some(new_stage_id.clone()));
+        match self.typecheck_merge_projection(dst_branch, &delta) {
+            Ok(()) => Ok(Some(new_stage_id)),
+            // Composes syntactically, not by type → still a conflict.
+            Err(StoreError::TypeError(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Open the attestation log rooted at this store. The log lives
     /// under `<root>/attestations/`; opening is idempotent and cheap
     /// (`fs::create_dir_all`). Exposed publicly so consumers — `lex
@@ -3132,6 +3203,21 @@ fn attestable_stage_ids(transition: &lex_vcs::StageTransition) -> Vec<String> {
         Merge { entries } => entries.values().filter_map(|opt| opt.clone()).collect(),
         Remove { .. } | ImportOnly => Vec::new(),
     }
+}
+
+/// True when two `FnDecl`s are identical except for their body — the
+/// precondition for a pure intra-body three-way merge (#838). The
+/// signature fields are equal by construction when both share a
+/// `sig_id`; this also guards the non-signature fields (`type_params`,
+/// `examples`) so a side that changed those isn't silently dropped.
+fn fndecl_same_except_body(a: &lex_ast::FnDecl, b: &lex_ast::FnDecl) -> bool {
+    a.name == b.name
+        && a.type_params == b.type_params
+        && a.params == b.params
+        && a.effects == b.effects
+        && a.effect_row_var == b.effect_row_var
+        && a.return_type == b.return_type
+        && a.examples == b.examples
 }
 
 fn write_canonical_json<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreError> {

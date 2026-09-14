@@ -30,6 +30,7 @@
 
 mod apply;
 mod attestation;
+mod body_merge;
 mod canonical;
 mod compute_diff;
 pub mod diff_report;
@@ -45,6 +46,7 @@ mod predicate;
 pub mod signing;
 
 pub use apply::{apply, ApplyError, NewHead};
+pub use body_merge::{merge_bodies, BodyMerge};
 pub use attestation::{
     active_producer_block, is_stage_blocked, Attestation, AttestationId, AttestationKind,
     AttestationLog, AttestationResult, ContentHash, Cost, ProducerDescriptor, Signature, SpecId,

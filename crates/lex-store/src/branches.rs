@@ -595,7 +595,28 @@ impl Store {
                     Some(stage_id) => report.merged.push(MergeEntry { sig_id, stage_id, from: "dst" }),
                     None => report.removed.push(sig_id),
                 },
-                lex_vcs::MergeOutcome::Conflict { sig_id, kind, base, src, dst } => {
+                lex_vcs::MergeOutcome::Conflict { sig_id, kind, base: base_stage, src: src_stage, dst: dst_stage } => {
+                    // #838: a ModifyModify where both sides edited the
+                    // same function is not necessarily a conflict — if
+                    // the edits touch disjoint subtrees (different match
+                    // arms, different let bindings) and the merged body
+                    // type-checks, compose them into a new typed stage
+                    // instead. `ours` = dst side, `theirs` = src side.
+                    // (`dst` here is the destination branch name.)
+                    if let (lex_vcs::ConflictKind::ModifyModify, Some(b), Some(s), Some(d)) =
+                        (&kind, &base_stage, &src_stage, &dst_stage)
+                    {
+                        if let Some(merged_id) =
+                            self.try_semantic_body_merge(dst, &sig_id, b, d, s)?
+                        {
+                            report.merged.push(MergeEntry {
+                                sig_id,
+                                stage_id: merged_id,
+                                from: "semantic",
+                            });
+                            continue;
+                        }
+                    }
                     let kind: &'static str = match kind {
                         lex_vcs::ConflictKind::ModifyModify => "modify-modify",
                         lex_vcs::ConflictKind::ModifyDelete => "modify-delete",
@@ -603,7 +624,7 @@ impl Store {
                         lex_vcs::ConflictKind::AddAdd       => "add-add",
                     };
                     report.conflicts.push(MergeConflict {
-                        sig_id, kind, base, src, dst,
+                        sig_id, kind, base: base_stage, src: src_stage, dst: dst_stage,
                     });
                 }
             }
