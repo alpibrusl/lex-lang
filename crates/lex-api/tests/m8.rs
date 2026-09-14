@@ -386,6 +386,83 @@ fn merge_resolve_unknown_conflict_is_rejected_per_entry() {
 }
 
 #[test]
+fn branch_create_checkout_and_list_over_http() {
+    let (srv, _tmp) = start_server();
+    // Publish once so main has a head.
+    let (s, _) = http(&srv.addr, "POST", "/v1/publish", &json!({"source": "fn f(n :: Int) -> Int { n }\n", "activate": true}).to_string());
+    assert_eq!(s, 200);
+
+    // Create feature off main and check out in one call.
+    let (s, b) = http(&srv.addr, "POST", "/v1/branches", &json!({"name": "feature", "checkout": true}).to_string());
+    assert_eq!(s, 201, "create: {b}");
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(v["name"], "feature");
+    assert_eq!(v["current"], "feature", "checkout should switch current");
+    assert!(v["head_op"].as_str().is_some(), "feature inherits main's head");
+
+    // List shows both, current is feature.
+    let (s, b) = http(&srv.addr, "GET", "/v1/branches", "");
+    assert_eq!(s, 200, "list: {b}");
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    let names: Vec<&str> = v["branches"].as_array().unwrap().iter().map(|x| x.as_str().unwrap()).collect();
+    assert!(names.contains(&"main") && names.contains(&"feature"), "got {names:?}");
+    assert_eq!(v["current"], "feature");
+
+    // Switch back to main.
+    let (s, b) = http(&srv.addr, "POST", "/v1/branches/main/checkout", "");
+    assert_eq!(s, 200, "checkout main: {b}");
+    let (_, b) = http(&srv.addr, "GET", "/v1/branches", "");
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&b).unwrap()["current"], "main");
+}
+
+#[test]
+fn branch_create_errors_are_reported() {
+    let (srv, _tmp) = start_server();
+    http(&srv.addr, "POST", "/v1/publish", &json!({"source": "fn f(n :: Int) -> Int { n }\n", "activate": true}).to_string());
+    // Duplicate: creating main again → 400.
+    let (s, _) = http(&srv.addr, "POST", "/v1/branches", &json!({"name": "dup"}).to_string());
+    assert_eq!(s, 201);
+    let (s, _) = http(&srv.addr, "POST", "/v1/branches", &json!({"name": "dup"}).to_string());
+    assert_eq!(s, 400, "duplicate branch must 400");
+    // Unknown source → 404.
+    let (s, _) = http(&srv.addr, "POST", "/v1/branches", &json!({"name": "x", "from": "nope"}).to_string());
+    assert_eq!(s, 404, "unknown from must 404");
+    // Path-like name → 400.
+    let (s, _) = http(&srv.addr, "POST", "/v1/branches", &json!({"name": "a/b"}).to_string());
+    assert_eq!(s, 400, "path-like name must 400");
+    // Checkout unknown → 404.
+    let (s, _) = http(&srv.addr, "POST", "/v1/branches/ghost/checkout", "");
+    assert_eq!(s, 404, "checkout unknown must 404");
+}
+
+#[test]
+fn a_conflict_can_be_driven_end_to_end_over_http() {
+    // #839 follow-up: with branch management over HTTP, a remote client
+    // can now build a divergent two-branch state and drive the merge
+    // gate to a real ModifyModify conflict — without touching the store
+    // directly. This is the path the merge/resolve tests previously had
+    // to set up via lex_store::Store.
+    let (srv, _tmp) = start_server();
+    http(&srv.addr, "POST", "/v1/publish", &json!({"source": "fn foo(n :: Int) -> Int { n }\n", "activate": true}).to_string());
+
+    // feature: diverge foo (create + checkout over HTTP, then publish).
+    let (s, _) = http(&srv.addr, "POST", "/v1/branches", &json!({"name": "feature", "checkout": true}).to_string());
+    assert_eq!(s, 201);
+    http(&srv.addr, "POST", "/v1/publish", &json!({"source": "fn foo(n :: Int) -> Int { n + 1 }\n", "activate": true}).to_string());
+
+    // back to main, diverge foo differently.
+    http(&srv.addr, "POST", "/v1/branches/main/checkout", "");
+    http(&srv.addr, "POST", "/v1/publish", &json!({"source": "fn foo(n :: Int) -> Int { n + 2 }\n", "activate": true}).to_string());
+
+    // merge/start now sees a real conflict — set up entirely over HTTP.
+    let (s, b) = http(&srv.addr, "POST", "/v1/merge/start",
+        &json!({"src_branch": "feature", "dst_branch": "main"}).to_string());
+    assert_eq!(s, 200, "merge/start: {b}");
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(v["conflicts"].as_array().unwrap().len(), 1, "expected the foo conflict: {b}");
+}
+
+#[test]
 fn merge_resolve_rejects_a_pick_that_does_not_typecheck() {
     // #834: `/v1/merge/<id>/resolve` type-checks the projected program
     // per resolution, so a pick that leaves the merged head broken is
