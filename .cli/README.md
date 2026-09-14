@@ -221,6 +221,12 @@ predicate query over the op log (#836)
 
 Idempotent: true
 
+### export-git
+
+render a branch's op history as a git repo (#837)
+
+Idempotent: true
+
 ### plan
 
 list repair-candidate paths for a goal, cheapest-first, within budget

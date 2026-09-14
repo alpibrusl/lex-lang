@@ -135,6 +135,7 @@ fn commands() -> Vec<CommandInfo> {
         cmd_docs(),
         cmd_op(),
         cmd_recall(),
+        cmd_export_git(),
         cmd_plan(),
         cmd_repair(),
         cmd_policy(),
@@ -319,6 +320,18 @@ fn cmd_docs() -> CommandInfo {
             ("Per-file", "lex docs src/"),
         ])
         .with_see_also(vec!["skill", "introspect"])
+}
+
+fn cmd_export_git() -> CommandInfo {
+    CommandInfo::new("export-git", "render a branch's op history as a git repo (#837)")
+        .idempotent(true)
+        .add_argument("out_dir", "string", "directory to write the git repo into", true)
+        .add_option("branch", "string", "branch to export (default: current)", None)
+        .add_option("store", "string", "store root directory", None)
+        .with_examples(vec![
+            ("Export main to ./export", "lex export-git ./export"),
+            ("Export a feature branch", "lex export-git ./out --branch feature"),
+        ])
 }
 
 fn cmd_recall() -> CommandInfo {
