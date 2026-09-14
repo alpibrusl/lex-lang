@@ -115,6 +115,15 @@ pub struct ReplayRequest {
     pub op_id: String,
     /// The sig the op changed — the function to regenerate.
     pub target_sig: String,
+    /// The target function's name (the recorded stage is a function
+    /// for every replayable op).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_name: Option<String>,
+    /// The target function's rendered signature (`fn name(...) -> T`),
+    /// so a regenerator knows the interface to implement without
+    /// re-deriving it from the sig hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_signature: Option<String>,
     /// The stage id a faithful regeneration should reproduce.
     pub expected_stage_id: String,
     /// The recorded intent prompt (`None` if the op carried no intent).
@@ -1715,9 +1724,20 @@ impl Store {
             None => String::new(),
         };
 
+        // The target function's name + signature, from the recorded
+        // stage — a regenerator needs the interface, not just the hash.
+        let (target_name, target_signature) = match self.get_ast(&expected_stage_id) {
+            Ok(lex_ast::Stage::FnDecl(fd)) => {
+                (Some(fd.name.clone()), Some(lex_vcs::render_signature(&fd)))
+            }
+            _ => (None, None),
+        };
+
         Ok(ReplayRequest {
             op_id: op_id.to_string(),
             target_sig,
+            target_name,
+            target_signature,
             expected_stage_id,
             prompt,
             model,
@@ -1744,13 +1764,7 @@ impl Store {
         op_id: &str,
         candidate: &Stage,
     ) -> Result<ReplayOutcome, StoreError> {
-        let log = lex_vcs::OpLog::open(self.root())?;
-        let record = log
-            .get(&op_id.to_string())?
-            .ok_or_else(|| StoreError::UnknownOp(op_id.to_string()))?;
-        let (target_sig, expected_stage_id) = produced_sig_stage(&record.produces)
-            .ok_or_else(|| StoreError::InvalidTransition(format!("op {op_id} produced no stage to replay")))?;
-
+        let (target_sig, expected_stage_id) = self.replay_target(op_id)?;
         let cand_sig = lex_ast::sig_id(candidate);
         let cand_stage = stage_id(candidate);
         let produced_stage_id = match (cand_sig.as_deref(), &cand_stage) {
@@ -1762,40 +1776,82 @@ impl Store {
             _ => None,
         };
         let reproduced = produced_stage_id.as_deref() == Some(expected_stage_id.as_str());
-
-        let model = match &record.op.intent_id {
-            Some(id) => lex_vcs::IntentLog::open(self.root())?
-                .get(id)?
-                .map(|i| model_label(&i.model)),
-            None => None,
+        let detail = if reproduced {
+            None
+        } else {
+            Some("regeneration did not reproduce the recorded stage".to_string())
         };
+        self.emit_replay(op_id, &expected_stage_id, produced_stage_id, reproduced, detail)
+    }
 
+    /// Record a *negative* replay result for a regeneration that never
+    /// yielded a comparable stage — the output didn't parse, or didn't
+    /// define the target sig (#836 G3). Emits a `Replay { reproduced:
+    /// false, produced_stage_id: None }` attestation with `reason` in
+    /// its `Failed` detail, so an automated `lex op replay` run always
+    /// records a verdict rather than aborting. `reason` is caller-supplied
+    /// (e.g. "regenerated source did not parse").
+    pub fn replay_record_miss(&self, op_id: &str, reason: &str) -> Result<ReplayOutcome, StoreError> {
+        let (_target_sig, expected_stage_id) = self.replay_target(op_id)?;
+        self.emit_replay(op_id, &expected_stage_id, None, false, Some(reason.to_string()))
+    }
+
+    /// `(target_sig, expected_stage_id)` for a replayable op, or an
+    /// error if the op is unknown or produced no stage.
+    fn replay_target(&self, op_id: &str) -> Result<(String, String), StoreError> {
+        let log = lex_vcs::OpLog::open(self.root())?;
+        let record = log
+            .get(&op_id.to_string())?
+            .ok_or_else(|| StoreError::UnknownOp(op_id.to_string()))?;
+        produced_sig_stage(&record.produces)
+            .ok_or_else(|| StoreError::InvalidTransition(format!("op {op_id} produced no stage to replay")))
+    }
+
+    /// Emit the `Replay` attestation and build the outcome. Shared by
+    /// [`Self::replay_compare`] and [`Self::replay_record_miss`].
+    fn emit_replay(
+        &self,
+        op_id: &str,
+        expected_stage_id: &str,
+        produced_stage_id: Option<String>,
+        reproduced: bool,
+        fail_detail: Option<String>,
+    ) -> Result<ReplayOutcome, StoreError> {
+        let model = {
+            let log = lex_vcs::OpLog::open(self.root())?;
+            match log.get(&op_id.to_string())?.and_then(|r| r.op.intent_id) {
+                Some(id) => lex_vcs::IntentLog::open(self.root())?
+                    .get(&id)?
+                    .map(|i| model_label(&i.model)),
+                None => None,
+            }
+        };
+        let result = if reproduced {
+            lex_vcs::AttestationResult::Passed
+        } else {
+            lex_vcs::AttestationResult::Failed {
+                detail: fail_detail.unwrap_or_else(|| "not reproduced".into()),
+            }
+        };
         let attestation = lex_vcs::Attestation::new(
-            expected_stage_id.clone(),
+            expected_stage_id.to_string(),
             Some(op_id.to_string()),
             None,
             lex_vcs::AttestationKind::Replay {
-                expected_stage_id: expected_stage_id.clone(),
+                expected_stage_id: expected_stage_id.to_string(),
                 produced_stage_id: produced_stage_id.clone(),
                 reproduced,
                 model,
             },
-            if reproduced {
-                lex_vcs::AttestationResult::Passed
-            } else {
-                lex_vcs::AttestationResult::Failed {
-                    detail: "regeneration did not reproduce the recorded stage".into(),
-                }
-            },
+            result,
             replay_producer(),
             None,
         );
         let attestation_id = attestation.attestation_id.clone();
         self.attestation_log()?.put(&attestation)?;
-
         Ok(ReplayOutcome {
             op_id: op_id.to_string(),
-            expected_stage_id,
+            expected_stage_id: expected_stage_id.to_string(),
             produced_stage_id,
             reproduced,
             attestation_id,

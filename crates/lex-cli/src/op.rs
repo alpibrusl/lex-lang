@@ -62,85 +62,125 @@ pub fn cmd_op(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     }
 }
 
-/// `lex op replay <op_id> [--candidate FILE] [--store DIR]` — #836 G3,
-/// replay-as-verification.
+/// `lex op replay <op_id> [--candidate FILE | --ollama [MODEL] |
+/// --regenerate-cmd CMD] [--store DIR]` — #836 G3, replay-as-verification.
 ///
-/// Without `--candidate`, prints the *replay request*: the recorded
-/// intent (prompt / model / session), the target sig + expected stage,
-/// and the parent program the change was made against — everything an
-/// external regenerator needs. (The model call is external, matching
-/// the architecture; lex owns the deterministic comparison.)
+/// With no regenerator flag, prints the *replay request*: the recorded
+/// intent (prompt / model / session), the target sig + signature, the
+/// expected stage, and the parent program the change was made against.
 ///
-/// With `--candidate FILE` (the regenerated source), parses it, extracts
-/// the target sig's stage, compares to the recorded stage, emits the
-/// `Replay` attestation, and reports whether the change reproduced.
+/// A regenerator produces candidate Lex source, which lex parses,
+/// extracts the target sig's stage from, compares to the recorded
+/// stage, and records as a `Replay` attestation:
+/// * `--candidate FILE` — source you already regenerated.
+/// * `--ollama [MODEL]` — a local Ollama daemon (`OLLAMA_HOST`, default
+///   `http://localhost:11434`); MODEL defaults to the recorded model's
+///   name, else `qwen3.8:27b-mlx`.
+/// * `--regenerate-cmd CMD` — any command; the request JSON is piped to
+///   its stdin and Lex source read from its stdout (wire opencode, an
+///   Anthropic call, anything).
 fn cmd_op_replay(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let mut op_id: Option<String> = None;
     let mut candidate: Option<PathBuf> = None;
+    let mut ollama: Option<Option<String>> = None; // Some(model?) when --ollama given
+    let mut regen_cmd: Option<String> = None;
     let mut store_root: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--candidate" => { candidate = args.get(i + 1).map(PathBuf::from); i += 2; }
+            "--regenerate-cmd" => { regen_cmd = args.get(i + 1).cloned(); i += 2; }
+            "--ollama" => {
+                // Optional model argument (anything not starting with `--`).
+                match args.get(i + 1) {
+                    Some(m) if !m.starts_with("--") => { ollama = Some(Some(m.clone())); i += 2; }
+                    _ => { ollama = Some(None); i += 1; }
+                }
+            }
             "--store" => { store_root = args.get(i + 1).map(PathBuf::from); i += 2; }
             other if !other.starts_with("--") && op_id.is_none() => {
                 op_id = Some(other.to_string()); i += 1;
             }
-            other => bail!("unexpected arg `{other}` (usage: lex op replay <op_id> [--candidate FILE] [--store DIR])"),
+            other => bail!("unexpected arg `{other}` (usage: lex op replay <op_id> \
+                [--candidate FILE | --ollama [MODEL] | --regenerate-cmd CMD] [--store DIR])"),
         }
     }
-    let op_id = op_id.ok_or_else(|| anyhow!("usage: lex op replay <op_id> [--candidate FILE] [--store DIR]"))?;
+    let op_id = op_id.ok_or_else(|| anyhow!("usage: lex op replay <op_id> \
+        [--candidate FILE | --ollama [MODEL] | --regenerate-cmd CMD] [--store DIR]"))?;
+    let regenerators = candidate.is_some() as u8 + ollama.is_some() as u8 + regen_cmd.is_some() as u8;
+    if regenerators > 1 {
+        bail!("choose at most one of --candidate, --ollama, --regenerate-cmd");
+    }
     let root = store_root.unwrap_or_else(crate::default_store_root_pub);
     let store = Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
 
-    match candidate {
-        None => {
-            // Emit the replay request for an external regenerator.
-            let req = store.replay_request(&op_id)?;
-            let data = serde_json::to_value(&req)?;
-            acli::emit_or_text("op-replay", data, fmt, move || {
-                println!("replay request for op {}", req.op_id);
-                println!("  target sig:      {}", req.target_sig);
-                println!("  expected stage:  {}", req.expected_stage_id);
-                println!("  model:           {}", req.model.as_deref().unwrap_or("(none recorded)"));
-                match &req.prompt {
-                    Some(p) => println!("  prompt:          {}", p.lines().next().unwrap_or("")),
-                    None => println!("  prompt:          (none recorded)"),
-                }
-                println!("  parent program:  {} byte(s)", req.parent_program.len());
-                println!("\nRegenerate the target fn from the prompt against the parent program, then\nrerun with --candidate <file> to record the Replay attestation.");
-            });
-            Ok(())
-        }
-        Some(path) => {
-            let src = std::fs::read_to_string(&path)
-                .with_context(|| format!("reading candidate {}", path.display()))?;
-            let req = store.replay_request(&op_id)?;
-            // Extract the target sig's stage from the candidate source.
-            let prog = lex_syntax::parse_source(&src)
-                .map_err(|e| anyhow!("parsing candidate {}: {e:?}", path.display()))?;
-            let stages = lex_ast::canonicalize_program(&prog);
-            let cand = stages.into_iter().find(|st| {
-                lex_ast::sig_id(st).as_deref() == Some(req.target_sig.as_str())
-            }).ok_or_else(|| anyhow!(
-                "candidate does not define the target sig {} (nothing to compare)", req.target_sig))?;
-
-            let outcome = store.replay_compare(&op_id, &cand)?;
-            let data = serde_json::to_value(&outcome)?;
-            acli::emit_or_text("op-replay", data, fmt, move || {
-                if outcome.reproduced {
-                    println!("reproduced: op {} regenerates to the recorded stage {}",
-                        outcome.op_id, outcome.expected_stage_id);
-                } else {
-                    println!("NOT reproduced: op {} expected {} but the candidate produced {}",
-                        outcome.op_id, outcome.expected_stage_id,
-                        outcome.produced_stage_id.as_deref().unwrap_or("(different sig / nothing)"));
-                }
-                println!("  Replay attestation: {}", outcome.attestation_id);
-            });
-            Ok(())
-        }
+    // No regenerator → print the request for an external one.
+    if regenerators == 0 {
+        let req = store.replay_request(&op_id)?;
+        let data = serde_json::to_value(&req)?;
+        acli::emit_or_text("op-replay", data, fmt, move || {
+            println!("replay request for op {}", req.op_id);
+            println!("  target:          {}", req.target_signature.as_deref().unwrap_or(&req.target_sig));
+            println!("  expected stage:  {}", req.expected_stage_id);
+            println!("  model:           {}", req.model.as_deref().unwrap_or("(none recorded)"));
+            match &req.prompt {
+                Some(p) => println!("  prompt:          {}", p.lines().next().unwrap_or("")),
+                None => println!("  prompt:          (none recorded)"),
+            }
+            println!("  parent program:  {} byte(s)", req.parent_program.len());
+            println!("\nRegenerate with --candidate FILE, --ollama [MODEL], or --regenerate-cmd CMD\nto record the Replay attestation.");
+        });
+        return Ok(());
     }
+
+    // Obtain candidate Lex source from the chosen regenerator.
+    let req = store.replay_request(&op_id)?;
+    let (src, how): (String, String) = if let Some(path) = &candidate {
+        (
+            std::fs::read_to_string(path).with_context(|| format!("reading candidate {}", path.display()))?,
+            format!("candidate {}", path.display()),
+        )
+    } else if let Some(model_opt) = &ollama {
+        let model = model_opt
+            .clone()
+            .or_else(|| req.model.as_ref().and_then(|m| m.rsplit('/').next().map(str::to_string)))
+            .unwrap_or_else(|| "qwen3.8:27b-mlx".to_string());
+        (crate::replay_runner::regenerate_ollama(&req, &model)?, format!("ollama:{model}"))
+    } else {
+        let cmd = regen_cmd.as_deref().unwrap();
+        (crate::replay_runner::regenerate_cmd(&req, cmd)?, format!("cmd `{cmd}`"))
+    };
+
+    // Parse the regenerated source and pull out the target sig's stage.
+    // A regeneration that doesn't parse, or doesn't define the target
+    // function, is a legitimate *negative* replay result (recorded as
+    // such) — not a hard error — so an automated replay always yields a
+    // verdict.
+    let outcome = match lex_syntax::parse_source(&src) {
+        Err(e) => store.replay_record_miss(&op_id, &format!("regenerated source did not parse: {e:?}"))?,
+        Ok(prog) => {
+            let stages = lex_ast::canonicalize_program(&prog);
+            match stages.into_iter().find(|st| lex_ast::sig_id(st).as_deref() == Some(req.target_sig.as_str())) {
+                Some(cand) => store.replay_compare(&op_id, &cand)?,
+                None => store.replay_record_miss(&op_id, &format!(
+                    "regenerated source did not define the target function {}",
+                    req.target_name.as_deref().unwrap_or(&req.target_sig)))?,
+            }
+        }
+    };
+    let data = serde_json::to_value(&outcome)?;
+    acli::emit_or_text("op-replay", data, fmt, move || {
+        if outcome.reproduced {
+            println!("reproduced ({how}): op {} regenerates to the recorded stage {}",
+                outcome.op_id, outcome.expected_stage_id);
+        } else {
+            println!("NOT reproduced ({how}): op {} expected {} but the candidate produced {}",
+                outcome.op_id, outcome.expected_stage_id,
+                outcome.produced_stage_id.as_deref().unwrap_or("(different sig / nothing)"));
+        }
+        println!("  Replay attestation: {}", outcome.attestation_id);
+    });
+    Ok(())
 }
 
 /// `lex op gc {--dry-run|--confirm} [--retain JSON ...] [--store DIR]`

@@ -37,7 +37,7 @@ pointer.
 | Action interface | `lex agent-tool`, `lex serve` (HTTP + MCP), ACLI (`lex skill`, `--output json`, stable exit codes) | ✅ shipped |
 | Environment modeling | Effect rows (`[net]`, `[fs_write("/tmp/…")]`, `[llm_cloud]`) as a machine-checked model of what a body may touch | ✅ shipped |
 | Pre-execution safety | Type-checker rejection before a byte runs; 7/7 adversarial cases in [`bench/REPORT.md`](../../bench/REPORT.md) | ✅ shipped |
-| Environment *simulation* | intent-replay (regenerate a change from its recorded cause, compare the stage) is scaffolded — `lex op replay`, `Replay` attestation — pending the model-call runner; trace-replay simulation is still open | 🚧 G3 partial |
+| Environment *simulation* | intent-replay (regenerate a change from its recorded cause, compare the stage) shipped — `lex op replay` with candidate / Ollama / external-command regenerators + the `Replay` attestation; the trace-replay simulation flavor is still open | ✅ G3 (intent-replay) |
 
 ### Layer 2 — Harness mechanisms
 
@@ -123,12 +123,16 @@ against; an external regenerator (the harness that owns the model, as
 everywhere else in this architecture) produces a candidate; and
 `Store::replay_compare(op_id, candidate)` compares its content-addressed
 stage id to the recorded one and emits a `Replay { reproduced }`
-attestation. Surfaced as `lex op replay <op_id> [--candidate FILE]`
-(no `--candidate` → prints the replay request; with it → records the
-verdict). The automatic model-driven loop lands when LLM infra is wired
-into a runner; the deterministic comparison and the attestation are
-done. The *trace-replay* flavor above (behavioral simulation against a
-recorded run, `TraceReplay`) remains a separate, later piece.
+attestation. Surfaced as `lex op replay <op_id>` with three regenerators:
+`--candidate FILE` (source you already have), `--ollama [MODEL]` (a local
+Ollama daemon — no API key), and `--regenerate-cmd CMD` (the request
+JSON piped to any command's stdin, Lex source read from its stdout — the
+provider-agnostic seam for opencode, an Anthropic call, anything). With
+no flag it prints the replay request. A regeneration that doesn't parse
+or doesn't define the target function is recorded as a negative verdict
+(not an error), so an automated run always yields a `Replay`
+attestation. The *trace-replay* flavor above (behavioral simulation
+against a recorded run, `TraceReplay`) remains a separate, later piece.
 
 ### Non-gap worth naming — verifiable rewards
 
