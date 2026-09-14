@@ -1898,11 +1898,11 @@
     },
     {
       "name": "op",
-      "description": "inspect and sync the operation log (show|log|push|pull|repack|gc)",
+      "description": "inspect and sync the operation log (show|log|replay|push|pull|repack|gc)",
       "arguments": [
         {
           "name": "subcommand",
-          "type": "enum[show|log|push|pull|repack|gc]",
+          "type": "enum[show|log|replay|push|pull|repack|gc]",
           "description": "what to do",
           "required": true
         }
@@ -1914,6 +1914,10 @@
         {
           "description": "List ops",
           "invocation": "lex op log"
+        },
+        {
+          "description": "Replay-verify an op",
+          "invocation": "lex op replay <op_id> --candidate regen.lex"
         },
         {
           "description": "Garbage-collect",

@@ -1007,5 +1007,6 @@ pub(super) fn attestation_kind_tag(k: &lex_vcs::AttestationKind) -> &'static str
         TrustWaived { .. } => "trust_waived",
         CapsuleInstall { .. } => "capsule_install",
         PlanApply { .. } => "plan_apply",
+        Replay { .. } => "replay",
     }
 }

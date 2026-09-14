@@ -48,16 +48,98 @@ fn parse_store(args: &[String]) -> (PathBuf, Vec<String>) {
 
 pub fn cmd_op(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let sub = args.first().ok_or_else(|| anyhow!(
-        "usage: lex op {{show|log|push|pull|repack|gc}} [--store DIR] ..."))?;
+        "usage: lex op {{show|log|replay|push|pull|repack|gc}} [--store DIR] ..."))?;
     let rest = &args[1..];
     match sub.as_str() {
         "show"   => cmd_op_show(fmt, rest),
         "log"    => cmd_op_log(fmt, rest),
+        "replay" => cmd_op_replay(fmt, rest),
         "push"   => cmd_op_push(fmt, rest),
         "pull"   => cmd_op_pull(fmt, rest),
         "repack" => cmd_op_repack(fmt, rest),
         "gc"     => cmd_op_gc(fmt, rest),
         other    => bail!("unknown `lex op` subcommand: {other}"),
+    }
+}
+
+/// `lex op replay <op_id> [--candidate FILE] [--store DIR]` — #836 G3,
+/// replay-as-verification.
+///
+/// Without `--candidate`, prints the *replay request*: the recorded
+/// intent (prompt / model / session), the target sig + expected stage,
+/// and the parent program the change was made against — everything an
+/// external regenerator needs. (The model call is external, matching
+/// the architecture; lex owns the deterministic comparison.)
+///
+/// With `--candidate FILE` (the regenerated source), parses it, extracts
+/// the target sig's stage, compares to the recorded stage, emits the
+/// `Replay` attestation, and reports whether the change reproduced.
+fn cmd_op_replay(fmt: &OutputFormat, args: &[String]) -> Result<()> {
+    let mut op_id: Option<String> = None;
+    let mut candidate: Option<PathBuf> = None;
+    let mut store_root: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--candidate" => { candidate = args.get(i + 1).map(PathBuf::from); i += 2; }
+            "--store" => { store_root = args.get(i + 1).map(PathBuf::from); i += 2; }
+            other if !other.starts_with("--") && op_id.is_none() => {
+                op_id = Some(other.to_string()); i += 1;
+            }
+            other => bail!("unexpected arg `{other}` (usage: lex op replay <op_id> [--candidate FILE] [--store DIR])"),
+        }
+    }
+    let op_id = op_id.ok_or_else(|| anyhow!("usage: lex op replay <op_id> [--candidate FILE] [--store DIR]"))?;
+    let root = store_root.unwrap_or_else(crate::default_store_root_pub);
+    let store = Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
+
+    match candidate {
+        None => {
+            // Emit the replay request for an external regenerator.
+            let req = store.replay_request(&op_id)?;
+            let data = serde_json::to_value(&req)?;
+            acli::emit_or_text("op-replay", data, fmt, move || {
+                println!("replay request for op {}", req.op_id);
+                println!("  target sig:      {}", req.target_sig);
+                println!("  expected stage:  {}", req.expected_stage_id);
+                println!("  model:           {}", req.model.as_deref().unwrap_or("(none recorded)"));
+                match &req.prompt {
+                    Some(p) => println!("  prompt:          {}", p.lines().next().unwrap_or("")),
+                    None => println!("  prompt:          (none recorded)"),
+                }
+                println!("  parent program:  {} byte(s)", req.parent_program.len());
+                println!("\nRegenerate the target fn from the prompt against the parent program, then\nrerun with --candidate <file> to record the Replay attestation.");
+            });
+            Ok(())
+        }
+        Some(path) => {
+            let src = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading candidate {}", path.display()))?;
+            let req = store.replay_request(&op_id)?;
+            // Extract the target sig's stage from the candidate source.
+            let prog = lex_syntax::parse_source(&src)
+                .map_err(|e| anyhow!("parsing candidate {}: {e:?}", path.display()))?;
+            let stages = lex_ast::canonicalize_program(&prog);
+            let cand = stages.into_iter().find(|st| {
+                lex_ast::sig_id(st).as_deref() == Some(req.target_sig.as_str())
+            }).ok_or_else(|| anyhow!(
+                "candidate does not define the target sig {} (nothing to compare)", req.target_sig))?;
+
+            let outcome = store.replay_compare(&op_id, &cand)?;
+            let data = serde_json::to_value(&outcome)?;
+            acli::emit_or_text("op-replay", data, fmt, move || {
+                if outcome.reproduced {
+                    println!("reproduced: op {} regenerates to the recorded stage {}",
+                        outcome.op_id, outcome.expected_stage_id);
+                } else {
+                    println!("NOT reproduced: op {} expected {} but the candidate produced {}",
+                        outcome.op_id, outcome.expected_stage_id,
+                        outcome.produced_stage_id.as_deref().unwrap_or("(different sig / nothing)"));
+                }
+                println!("  Replay attestation: {}", outcome.attestation_id);
+            });
+            Ok(())
+        }
     }
 }
 
