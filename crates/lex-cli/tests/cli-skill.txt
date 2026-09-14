@@ -241,6 +241,9 @@ publish each stage in a file to the store as Draft
 
 - `--store` (string) — store root directory (default: [store] path or .lex/store under the nearest lex.toml; ~/.lex/store outside any project)
 - `--activate` (bool) — transition published stages to Active
+- `--intent-prompt` (string) — record an Intent for this publish: the prompt / instruction the change was made under (stamps every emitted op with its intent_id)
+- `--intent-model` (string) — with --intent-prompt: the model as provider/name (e.g. ollama/qwen3.8:27b-mlx); default cli/unknown
+- `--intent-session` (string) — with --intent-prompt: the agent session id; default cli
 
 ### Arguments
 
@@ -256,6 +259,11 @@ lex publish app.lex
 ```bash
 # Publish + activate
 lex publish --activate app.lex
+```
+
+```bash
+# Publish with a recorded intent
+lex publish --intent-prompt 'add triple()' --intent-model ollama/qwen3.8:27b-mlx --intent-session run-1 app.lex
 ```
 
 **See also:** `lex store`, `lex branch`
