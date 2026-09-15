@@ -610,19 +610,54 @@ fn cmd_op_push(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let received = resp_body.get("received").and_then(|v| v.as_u64()).unwrap_or(0);
     let added = resp_body.get("added").and_then(|v| v.as_u64()).unwrap_or(0);
     let skipped = resp_body.get("skipped").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    // The ref half: the ops batch above transferred the object DAG; now
+    // advance the remote branch head to our local head. Fast-forward only
+    // (server-enforced) — a non-fast-forward is a real error the user must
+    // see (their branch diverged), not a silent no-op. Without this step a
+    // push lands the objects but nothing points at them, so the remote is
+    // unpullable — the bug this fixes.
+    let mut advance = String::from("unchanged");
+    if let Some(head) = local_head.as_ref() {
+        let head_url = format!(
+            "{}/v1/branches/{}/head",
+            remote.trim_end_matches('/'),
+            branch,
+        );
+        let head_body = serde_json::json!({ "head_op": head }).to_string();
+        let hr = with_auth(ureq::post(&head_url), token.as_deref())
+            .header("Content-Type", "application/json")
+            .send(head_body)
+            .map_err(|e| anyhow!("POST {head_url}: {e}"))?;
+        let hstatus = hr.status().as_u16();
+        let hbody: serde_json::Value = hr.into_body().read_json()
+            .map_err(|e| anyhow!("decoding branch-head response: {e}"))?;
+        if hstatus == 409 {
+            bail!("non-fast-forward: the remote branch `{branch}` has diverged from your local \
+                   head. The ops were uploaded, but the branch was not advanced. Pull and \
+                   reconcile first. ({hbody})");
+        }
+        if hstatus >= 400 {
+            bail!("server rejected branch-head advance (HTTP {hstatus}): {hbody}");
+        }
+        advance = hbody.get("advance").and_then(|a| a.as_str()).unwrap_or("advanced").to_string();
+    }
+
     let data = serde_json::json!({
         "remote": remote,
         "branch": branch,
         "received": received,
         "added": added,
         "skipped": skipped,
+        "head_advance": advance,
     });
     let remote_text = remote.clone();
     let branch_text = branch.clone();
+    let advance_text = advance.clone();
     acli::emit_or_text("op-push", data, fmt, move || {
         println!(
             "pushed {received} ops to {remote_text} on branch `{branch_text}`: \
-             {added} added, {skipped} skipped (already present)"
+             {added} added, {skipped} skipped (already present); head {advance_text}"
         );
     });
     Ok(())

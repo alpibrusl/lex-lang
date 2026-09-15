@@ -194,7 +194,7 @@ pub(crate) fn error_response(status: u16, msg: impl Into<String>) -> Response<st
     }).unwrap())
 }
 
-fn error_with_detail(status: u16, msg: impl Into<String>, detail: serde_json::Value)
+pub(crate) fn error_with_detail(status: u16, msg: impl Into<String>, detail: serde_json::Value)
     -> Response<std::io::Cursor<Vec<u8>>>
 {
     json_response(status, &serde_json::to_value(ErrorEnvelope {
@@ -388,12 +388,15 @@ fn route(
             let name = &p["/v1/branches/".len()..p.len() - "/checkout".len()];
             crate::branches_http::branch_checkout_handler(state, name)
         }
-        // Probe endpoint for `lex op push` to discover the remote's
-        // current head before computing a delta. Returns
-        // `{ "head_op": Option<OpId> }`. `<branch>` is URL-encoded.
+        // Branch head: GET probes it (for `op push`'s delta), POST advances
+        // it (the ref half of push, fast-forward-only). Both in branches_http.
         (Method::Get, p) if p.starts_with("/v1/branches/") && p.ends_with("/head") => {
             let name = &p["/v1/branches/".len()..p.len() - "/head".len()];
-            branch_head_handler(state, name)
+            crate::branches_http::branch_head_handler(state, name)
+        }
+        (Method::Post, p) if p.starts_with("/v1/branches/") && p.ends_with("/head") => {
+            let name = &p["/v1/branches/".len()..p.len() - "/head".len()];
+            crate::branches_http::branch_advance_head_handler(state, name, body)
         }
         // ---- #260: append-only fetch (inverse of #242 push)
         // Body is a JSON array of OperationRecords reachable from
@@ -1386,21 +1389,6 @@ pub(crate) fn attestations_batch_handler(state: &State, body: &str)
 /// Returns 200 even when the branch doesn't exist locally — the
 /// answer in that case is `head_op: null`, which is the right
 /// signal for "send everything you have."
-pub(crate) fn branch_head_handler(state: &State, name: &str)
-    -> Response<std::io::Cursor<Vec<u8>>>
-{
-    let store = state.store.lock().unwrap();
-    let head = match store.get_branch(name) {
-        Ok(Some(b)) => b.head_op,
-        Ok(None) => None,
-        Err(e) => return error_response(500, format!("get_branch: {e}")),
-    };
-    json_response(200, &serde_json::json!({
-        "branch": name,
-        "head_op": head,
-    }))
-}
-
 /// `GET /v1/ops/since?after=<op_id>&branch=<name>&limit=<n>` (#260).
 /// Server endpoint for `lex op pull`.
 ///

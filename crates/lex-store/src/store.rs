@@ -32,6 +32,14 @@ pub enum StoreError {
     InvalidTransition(String),
     #[error("unknown branch `{0}`")]
     UnknownBranch(String),
+    /// A branch-head advance (e.g. the ref half of `op push`) was
+    /// asked to move `branch` to `attempted`, but `attempted` is not a
+    /// descendant of the branch's `current` head — a non-fast-forward
+    /// that would orphan history. Refused, git-style, so a disjoint or
+    /// diverged push can't silently clobber a shared branch. The op
+    /// objects may already be present; only the ref is left unchanged.
+    #[error("non-fast-forward on `{branch}`: {attempted} is not a descendant of current head {current}")]
+    NonFastForward { branch: String, current: lex_vcs::OpId, attempted: lex_vcs::OpId },
     #[error("unknown blob `{0}`")]
     UnknownBlob(String),
     #[error("unknown blob ref `{namespace}/{key}`")]

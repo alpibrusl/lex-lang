@@ -49,6 +49,6 @@ pub use store::{
     Store, StoreError,
 };
 pub use branches::{
-    Branch, MergeConflict, MergeEntry, MergeRecord, MergeReport, MergeSummary,
+    Branch, BranchAdvance, MergeConflict, MergeEntry, MergeRecord, MergeReport, MergeSummary,
     DEFAULT_BRANCH,
 };
