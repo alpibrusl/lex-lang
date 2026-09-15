@@ -110,6 +110,22 @@ pub enum StageTransition {
     },
 }
 
+impl StageTransition {
+    /// Every stage id this transition references — the content-addressed
+    /// blobs a peer needs alongside the op record to render or replay it.
+    /// Used by `op push`/`pull` to sync stage objects, not just op records.
+    pub fn stage_ids(&self) -> Vec<StageId> {
+        match self {
+            StageTransition::Create { stage_id, .. } => vec![stage_id.clone()],
+            StageTransition::Replace { from, to, .. } => vec![from.clone(), to.clone()],
+            StageTransition::Remove { last, .. } => vec![last.clone()],
+            StageTransition::Rename { body_stage_id, .. } => vec![body_stage_id.clone()],
+            StageTransition::ImportOnly => Vec::new(),
+            StageTransition::Merge { entries } => entries.values().flatten().cloned().collect(),
+        }
+    }
+}
+
 /// The kinds of operations that produce stage transitions. Mirrors
 /// the initial set in #129; new kinds (`MoveBetweenFiles`,
 /// `SplitFunction`, `ExtractType`) can be added later as long as

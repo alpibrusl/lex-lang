@@ -379,6 +379,12 @@ fn route(
         // ---- #242: append-only sync of op log + attestation log
         (Method::Post, "/v1/ops/batch") => ops_batch_handler(state, body),
         (Method::Post, "/v1/attestations/batch") => attestations_batch_handler(state, body),
+        // Content half of push/pull: the stage (code) and intent blobs the
+        // op records reference. `batch` receives, `fetch` returns by id.
+        (Method::Post, "/v1/stages/batch") => crate::sync_http::stages_batch_handler(state, body),
+        (Method::Post, "/v1/stages/fetch") => crate::sync_http::stages_fetch_handler(state, body),
+        (Method::Post, "/v1/intents/batch") => crate::sync_http::intents_batch_handler(state, body),
+        (Method::Post, "/v1/intents/fetch") => crate::sync_http::intents_fetch_handler(state, body),
         // ---- #839 follow-up: branch management over HTTP so a remote
         // client can create/switch branches (and thus drive the merge
         // gates end to end), not just probe heads.

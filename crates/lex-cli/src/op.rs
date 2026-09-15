@@ -589,6 +589,11 @@ fn cmd_op_push(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         return Ok(());
     }
 
+    // Content first: push the stage + intent blobs these ops reference, so
+    // a peer that pulls the op records always has the objects they point at
+    // (without this, a pulled op-log renders as `unknown stage_id`).
+    push_objects(&remote, &to_send, &store, token.as_deref())?;
+
     // Post the batch.
     let url = format!("{}/v1/ops/batch", remote.trim_end_matches('/'));
     let body = serde_json::to_string(&to_send)
@@ -684,6 +689,124 @@ pub(crate) fn probe_remote_head(remote: &str, branch: &str, token: Option<&str>)
     Ok(body.get("head_op")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string()))
+}
+
+/// POST a JSON body to `<remote><path>`, returning the parsed response.
+/// Shared by the stage/intent object-sync calls.
+fn post_json(
+    remote: &str,
+    path: &str,
+    body: &serde_json::Value,
+    token: Option<&str>,
+) -> Result<serde_json::Value> {
+    let url = format!("{}{}", remote.trim_end_matches('/'), path);
+    let resp = with_auth(ureq::post(&url), token)
+        .header("Content-Type", "application/json")
+        .send(body.to_string())
+        .map_err(|e| anyhow!("POST {url}: {e}"))?;
+    let status = resp.status().as_u16();
+    if status == 401 {
+        bail!("remote requires auth (HTTP 401) — set LEXHUB_TOKEN or pass --token");
+    }
+    let v: serde_json::Value = resp.into_body().read_json()
+        .map_err(|e| anyhow!("decoding {path} response: {e}"))?;
+    if status >= 400 {
+        bail!("server rejected {path} (HTTP {status}): {v}");
+    }
+    Ok(v)
+}
+
+/// The content half of `op push`: send the stage (code) and intent blobs the
+/// given ops reference. Content-addressed and idempotent server-side, so a
+/// re-push converges; sending it before the op records means a peer that
+/// pulls always has the objects the records point at.
+fn push_objects(
+    remote: &str,
+    ops: &[OperationRecord],
+    store: &Store,
+    token: Option<&str>,
+) -> Result<()> {
+    use std::collections::BTreeSet;
+    let mut stage_ids: BTreeSet<String> = BTreeSet::new();
+    for rec in ops {
+        for sid in rec.produces.stage_ids() {
+            stage_ids.insert(sid);
+        }
+    }
+    let stages: Vec<lex_ast::Stage> =
+        stage_ids.iter().filter_map(|id| store.get_ast(id).ok()).collect();
+    if !stages.is_empty() {
+        post_json(remote, "/v1/stages/batch", &serde_json::to_value(&stages)?, token)?;
+    }
+
+    let intent_log = lex_vcs::IntentLog::open(store.root())?;
+    let mut intent_ids: BTreeSet<String> = BTreeSet::new();
+    for rec in ops {
+        if let Some(id) = &rec.op.intent_id {
+            intent_ids.insert(id.clone());
+        }
+    }
+    let intents: Vec<lex_vcs::Intent> =
+        intent_ids.iter().filter_map(|id| intent_log.get(id).ok().flatten()).collect();
+    if !intents.is_empty() {
+        post_json(remote, "/v1/intents/batch", &serde_json::to_value(&intents)?, token)?;
+    }
+    Ok(())
+}
+
+/// The content half of `op pull`: fetch + store the stage and intent blobs
+/// the pulled ops reference but the local store is missing, so `export-git`
+/// and replay work on a pulled op-log.
+fn pull_objects(
+    remote: &str,
+    ops: &[OperationRecord],
+    store: &Store,
+    token: Option<&str>,
+) -> Result<(usize, usize)> {
+    use std::collections::BTreeSet;
+    let mut want_stages: BTreeSet<String> = BTreeSet::new();
+    for rec in ops {
+        for sid in rec.produces.stage_ids() {
+            if store.get_ast(&sid).is_err() {
+                want_stages.insert(sid);
+            }
+        }
+    }
+    let mut stages_added = 0usize;
+    if !want_stages.is_empty() {
+        let ids: Vec<&String> = want_stages.iter().collect();
+        let v = post_json(remote, "/v1/stages/fetch", &serde_json::json!({ "ids": ids }), token)?;
+        if let Some(arr) = v.get("stages").and_then(|s| s.as_array()) {
+            for sv in arr {
+                let stage: lex_ast::Stage = serde_json::from_value(sv.clone())?;
+                store.publish(&stage)?;
+                stages_added += 1;
+            }
+        }
+    }
+
+    let intent_log = lex_vcs::IntentLog::open(store.root())?;
+    let mut want_intents: BTreeSet<String> = BTreeSet::new();
+    for rec in ops {
+        if let Some(id) = &rec.op.intent_id {
+            if intent_log.get(id)?.is_none() {
+                want_intents.insert(id.clone());
+            }
+        }
+    }
+    let mut intents_added = 0usize;
+    if !want_intents.is_empty() {
+        let ids: Vec<&String> = want_intents.iter().collect();
+        let v = post_json(remote, "/v1/intents/fetch", &serde_json::json!({ "ids": ids }), token)?;
+        if let Some(arr) = v.get("intents").and_then(|i| i.as_array()) {
+            for iv in arr {
+                let intent: lex_vcs::Intent = serde_json::from_value(iv.clone())?;
+                intent_log.put(&intent)?;
+                intents_added += 1;
+            }
+        }
+    }
+    Ok((stages_added, intents_added))
 }
 
 /// `lex op pull <remote_url> [--branch NAME] [--since OP_ID]
@@ -819,6 +942,11 @@ fn cmd_op_pull(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         }
         batch_ids.insert(rec.op_id.clone());
     }
+
+    // Content: fetch + store the stage (code) and intent blobs the pulled
+    // ops reference, so the pulled op-log actually renders and replays.
+    let (_stages_pulled, _intents_pulled) =
+        pull_objects(&remote, &received, &store, token.as_deref())?;
 
     // Divergent-history detection: a clean fast-forward requires
     // that the local head, if present, is reachable from the
