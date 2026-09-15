@@ -17,6 +17,7 @@ mod ast_merge;
 mod attest;
 mod authority;
 mod audit;
+mod behavioral;
 mod blame;
 mod branch;
 mod canonical;

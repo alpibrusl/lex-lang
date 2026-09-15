@@ -107,6 +107,56 @@ fn replay_compare_different_sig_is_not_a_reproduction() {
 }
 
 #[test]
+fn replay_stage_of_computes_exact_without_emitting() {
+    // The non-emitting compute the CLI uses before deciding whether to
+    // fall back to a behavioral check.
+    let (s, _tmp) = fresh();
+    let (op_id, _sig, stage) = land_add(&s, "fn f(x :: Int) -> Int { x + 1 }\n", "f");
+
+    let (expected, produced, exact) =
+        s.replay_stage_of(&op_id, &named("fn f(x :: Int) -> Int { x + 1 }\n", "f")).unwrap();
+    assert_eq!(expected, stage);
+    assert_eq!(produced.as_deref(), Some(stage.as_str()));
+    assert!(exact);
+
+    // Same sig, different body: produced is Some, exact is false — this is
+    // exactly the case that then goes to the behavioral tier.
+    let (_e, produced2, exact2) =
+        s.replay_stage_of(&op_id, &named("fn f(x :: Int) -> Int { x + 2 }\n", "f")).unwrap();
+    assert!(!exact2);
+    assert!(produced2.is_some());
+    assert_ne!(produced2.as_deref(), Some(stage.as_str()));
+
+    // No attestation was emitted by the compute.
+    let atts = s.attestation_log().unwrap().list_for_stage(&stage).unwrap();
+    assert!(!atts.iter().any(|a| matches!(a.kind, lex_vcs::AttestationKind::Replay { .. })));
+}
+
+#[test]
+fn replay_record_behavioral_marks_a_semantic_reproduction() {
+    // The verdict the CLI records when the candidate isn't byte-identical
+    // but is behaviorally equivalent: reproduced=true, behavioral_samples
+    // set, and distinctly labeled in the attestation.
+    let (s, _tmp) = fresh();
+    let (op_id, _sig, stage) = land_add(&s, "fn f(x :: Int) -> Int { x + 1 }\n", "f");
+
+    let produced = "somedifferentstageid".to_string();
+    let outcome = s
+        .replay_record(&op_id, Some(produced.clone()), true, Some(7), None)
+        .unwrap();
+    assert!(outcome.reproduced);
+    assert_eq!(outcome.behavioral_samples, Some(7));
+    assert_eq!(outcome.produced_stage_id.as_deref(), Some(produced.as_str()));
+
+    let atts = s.attestation_log().unwrap().list_for_stage(&stage).unwrap();
+    let replay = atts.iter().find(|a| matches!(a.kind, lex_vcs::AttestationKind::Replay { .. }))
+        .expect("a Replay attestation");
+    assert!(matches!(replay.result, lex_vcs::AttestationResult::Passed));
+    assert!(matches!(&replay.kind,
+        lex_vcs::AttestationKind::Replay { reproduced: true, behavioral_samples: Some(7), .. }));
+}
+
+#[test]
 fn replay_request_on_unknown_op_errors() {
     let (s, _tmp) = fresh();
     assert!(s.replay_request("deadbeef").is_err());
