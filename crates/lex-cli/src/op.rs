@@ -151,33 +151,50 @@ fn cmd_op_replay(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         (crate::replay_runner::regenerate_cmd(&req, cmd)?, format!("cmd `{cmd}`"))
     };
 
-    // Parse the regenerated source and pull out the target sig's stage.
-    // A regeneration that doesn't parse, or doesn't define the target
-    // function, is a legitimate *negative* replay result (recorded as
-    // such) — not a hard error — so an automated replay always yields a
-    // verdict.
+    // Parse the regenerated source and pull out the candidate for the
+    // target function. Recognition is by *callable identity* (name + param
+    // types + return + effects), NOT by sig_id: a fresh regeneration is
+    // given the intent and type signature, not the recorded `examples {}`
+    // block — and examples are folded into sig_id, so a sig_id match would
+    // reject every regeneration of a function lex-code wrote with examples
+    // (the common case). Exact reproduction still requires a byte-identical
+    // stage (examples included); a same-callable body that isn't identical
+    // falls through to the behavioral tier. A regeneration that doesn't
+    // parse, or defines no matching function, is a legitimate negative
+    // result — recorded, not a hard error.
+    let expected_stages = store.program_stages_at_op(&op_id).unwrap_or_default();
+    let recorded_fd = crate::behavioral::fndecl_at_stage(&expected_stages, &req.expected_stage_id);
     let outcome = match lex_syntax::parse_source(&src) {
         Err(e) => store.replay_record_miss(&op_id, &format!("regenerated source did not parse: {e:?}"))?,
         Ok(prog) => {
             let stages = lex_ast::canonicalize_program(&prog);
-            match stages.into_iter().find(|st| lex_ast::sig_id(st).as_deref() == Some(req.target_sig.as_str())) {
+            let cand = match recorded_fd {
+                Some(rec) => stages.into_iter().find(|st| {
+                    matches!(st, lex_ast::Stage::FnDecl(fd) if crate::behavioral::same_callable(rec, fd))
+                }),
+                // Couldn't load the recorded fn (e.g. reconstruction gap) —
+                // fall back to the exact sig_id match.
+                None => stages
+                    .into_iter()
+                    .find(|st| lex_ast::sig_id(st).as_deref() == Some(req.target_sig.as_str())),
+            };
+            match cand {
                 Some(cand) => {
-                    let (_expected, produced, exact) = store.replay_stage_of(&op_id, &cand)?;
+                    let produced = lex_ast::stage_id(&cand);
+                    let exact = produced.as_deref() == Some(req.expected_stage_id.as_str());
                     if exact {
                         store.replay_record(&op_id, produced, true, None, None)?
                     } else if let Some(pid) = produced {
-                        // Exact miss, but a valid same-sig candidate: try the
-                        // behavioral tier — the same function written differently
-                        // (if vs match, `>` vs `>=` on a tie) is a real
-                        // reproduction the syntactic oracle can't see. Recorded
-                        // distinctly (behavioral_samples), never conflated with
-                        // an exact match.
-                        let behavioral = store
-                            .program_stages_at_op(&op_id)
-                            .ok()
-                            .and_then(|expected_stages| {
-                                crate::behavioral::behavioral_equiv(&expected_stages, &cand, &req.target_sig)
-                            });
+                        // Same function, not byte-identical: the same body
+                        // written differently (if vs match, `>` vs `>=`), or
+                        // the same body with a different examples block. Try
+                        // the behavioral tier — recorded distinctly
+                        // (behavioral_samples), never conflated with exact.
+                        let behavioral = crate::behavioral::behavioral_equiv(
+                            &expected_stages,
+                            &cand,
+                            &req.expected_stage_id,
+                        );
                         match behavioral {
                             Some(n) => store.replay_record(&op_id, Some(pid), true, Some(n), None)?,
                             None => store.replay_record(&op_id, Some(pid), false, None,
@@ -185,7 +202,7 @@ fn cmd_op_replay(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                         }
                     } else {
                         store.replay_record(&op_id, None, false, None,
-                            Some("regeneration produced a different signature".into()))?
+                            Some("regenerated candidate had no hashable stage".into()))?
                     }
                 }
                 None => store.replay_record_miss(&op_id, &format!(
