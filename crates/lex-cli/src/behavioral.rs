@@ -24,9 +24,52 @@
 
 use std::sync::Arc;
 
-use lex_ast::{sig_id, FnDecl, Param, Stage, TypeExpr};
+use lex_ast::{stage_id, FnDecl, Param, Stage, TypeExpr};
 use lex_bytecode::{compile_program, vm::Vm, Program, Value};
 use lex_runtime::{DefaultHandler, Policy};
+
+/// Whether two functions have the same *callable identity* — name,
+/// parameter types (names ignored), return type, and effects. Deliberately
+/// excludes the body and any `examples {}` block, both of which are folded
+/// into `sig_id`/`stage_id`. This is what "a regeneration of the same
+/// function" means: a fresh regeneration is given the intent and the type
+/// signature, not the recorded examples, so it legitimately produces a
+/// different `sig_id` while still being the same function to regenerate.
+pub fn same_callable(a: &FnDecl, b: &FnDecl) -> bool {
+    a.name == b.name
+        && a.params.len() == b.params.len()
+        && a.params.iter().zip(&b.params).all(|(x, y)| x.ty == y.ty)
+        && a.return_type == b.return_type
+        && a.effects == b.effects
+}
+
+/// The `FnDecl` in `stages` whose exact `stage_id` matches — the recorded
+/// target, located unambiguously by content address.
+pub fn fndecl_at_stage<'a>(stages: &'a [Stage], want_stage: &str) -> Option<&'a FnDecl> {
+    stages.iter().find_map(|s| match s {
+        Stage::FnDecl(fd) if stage_id(s).as_deref() == Some(want_stage) => Some(fd),
+        _ => None,
+    })
+}
+
+/// `stages` with the stage whose id is `want_stage` replaced by `repl`.
+/// `None` if no stage matched (nothing to replace).
+fn swap_target(stages: &[Stage], want_stage: &str, repl: Stage) -> Option<Vec<Stage>> {
+    let mut out = stages.to_vec();
+    let mut replaced = false;
+    for s in out.iter_mut() {
+        if stage_id(s).as_deref() == Some(want_stage) {
+            *s = repl.clone();
+            replaced = true;
+            break;
+        }
+    }
+    if replaced {
+        Some(out)
+    } else {
+        None
+    }
+}
 
 /// Cap on how many input tuples to try. Bounds cost on multi-parameter
 /// functions (the grid is a cartesian product) without weakening the
@@ -77,13 +120,6 @@ fn value_eq(a: &Value, b: &Value) -> bool {
     }
 }
 
-fn find_fn<'a>(stages: &'a [Stage], sig: &str) -> Option<&'a FnDecl> {
-    stages.iter().find_map(|s| match s {
-        Stage::FnDecl(fd) if sig_id(s).as_deref() == Some(sig) => Some(fd),
-        _ => None,
-    })
-}
-
 /// Cartesian product of each parameter's sample set, capped at
 /// [`MAX_SAMPLES`]. `None` if any parameter type isn't sampleable.
 fn input_grid(params: &[Param]) -> Option<Vec<Vec<Value>>> {
@@ -132,14 +168,47 @@ fn call_fn(bc: &Arc<Program>, name: &str, args: Vec<Value>) -> Option<Value> {
 /// (not equivalent, or the function is outside the supported scope).
 ///
 /// `expected_stages` is the full program at the op (parent + recorded
-/// target); `target_sig` selects the function under test.
+/// target); `expected_stage_id` locates the recorded target by exact
+/// content address (so a differing `examples {}` block doesn't hide it).
 pub fn behavioral_equiv(
     expected_stages: &[Stage],
     candidate: &Stage,
-    target_sig: &str,
+    expected_stage_id: &str,
 ) -> Option<usize> {
-    let fd = find_fn(expected_stages, target_sig)?;
-    // Gate: pure, first-order scalar params, comparable return.
+    let fd = fndecl_at_stage(expected_stages, expected_stage_id)?;
+    let cand_fd = match candidate {
+        Stage::FnDecl(f) => f,
+        _ => return None,
+    };
+
+    // (1) Recorded-examples contract — the *intended-domain* behavioral spec.
+    // lex-code attaches `examples {}` to real functions; those are folded
+    // into the stage id (so they never match exactly) but they are also the
+    // recorded behavioral contract, on the domain the author meant (a `gcd`
+    // spec never mentions negatives). A candidate that satisfies the same
+    // examples the original had to pass is a real behavioral reproduction —
+    // and this handles any types, not just scalars, and sidesteps the
+    // synthetic grid's out-of-domain sampling. This is the primary path for
+    // real lex-code ops.
+    if !fd.examples.is_empty() {
+        let mut with_ex = cand_fd.clone();
+        with_ex.examples = fd.examples.clone();
+        if let Some(stages2) =
+            swap_target(expected_stages, expected_stage_id, Stage::FnDecl(with_ex))
+        {
+            // Must type-check, then every recorded example must hold on the
+            // candidate body (evaluate_examples returns one error per failing
+            // case; empty = all held — the other functions' examples are
+            // recorded and passing, so any failure is the candidate's).
+            if compiled(&stages2).is_some() && lex_runtime::evaluate_examples(&stages2).is_empty() {
+                return Some(fd.examples.len());
+            }
+        }
+    }
+
+    // (2) Synthetic grid — for functions with no recorded examples. Gate to
+    // pure, first-order scalar params with a comparable return so a positive
+    // is trustworthy.
     if !fd.effects.is_empty() {
         return None;
     }
@@ -152,20 +221,10 @@ pub fn behavioral_equiv(
         return None;
     }
 
-    // Candidate program = the expected program with the target's stage
-    // swapped for the candidate, so helper calls still resolve.
-    let mut cand_stages = expected_stages.to_vec();
-    let mut replaced = false;
-    for s in cand_stages.iter_mut() {
-        if sig_id(s).as_deref() == Some(target_sig) {
-            *s = candidate.clone();
-            replaced = true;
-            break;
-        }
-    }
-    if !replaced {
-        return None;
-    }
+    // Candidate program = the expected program with the recorded target's
+    // stage (located by exact stage id) swapped for the candidate, so
+    // helper calls still resolve.
+    let cand_stages = swap_target(expected_stages, expected_stage_id, candidate.clone())?;
 
     let exp_bc = Arc::new(compiled(expected_stages)?);
     let cand_bc = Arc::new(compiled(&cand_stages)?);
@@ -199,14 +258,16 @@ mod tests {
         lex_ast::canonicalize_program(&prog)
     }
 
-    fn target_sig(src: &str, name: &str) -> String {
-        stages(src)
+    /// The stage id of the named fn in `stages` — the exact content address
+    /// behavioral_equiv locates the recorded target by.
+    fn target_stage(stages: &[Stage], name: &str) -> String {
+        stages
             .iter()
             .find_map(|s| match s {
-                Stage::FnDecl(fd) if fd.name == name => sig_id(s),
+                Stage::FnDecl(fd) if fd.name == name => stage_id(s),
                 _ => None,
             })
-            .expect("sig")
+            .expect("stage")
     }
 
     const BASE: &str = "fn base(x :: Int) -> Int { x }\n";
@@ -217,17 +278,30 @@ mod tests {
         let expected = stages(&format!(
             "{BASE}fn max2(a :: Int, b :: Int) -> Int {{ if a > b {{ a }} else {{ b }} }}"
         ));
-        let sig = target_sig(
-            &format!(
-                "{BASE}fn max2(a :: Int, b :: Int) -> Int {{ if a > b {{ a }} else {{ b }} }}"
-            ),
-            "max2",
-        );
+        let stg = target_stage(&expected, "max2");
         let cand = stages("fn max2(a :: Int, b :: Int) -> Int { if a >= b { a } else { b } }")
             .into_iter()
             .next()
             .unwrap();
-        assert!(behavioral_equiv(&expected, &cand, &sig).is_some());
+        assert!(behavioral_equiv(&expected, &cand, &stg).is_some());
+    }
+
+    #[test]
+    fn rescues_across_differing_examples() {
+        // The library-build finding: the recorded fn carries `examples {}`
+        // (folded into stage_id/sig_id) but the regeneration doesn't. Same
+        // body, different examples → recognized by stage id + behaviorally
+        // equal, so it must reproduce, not vanish as "a different function".
+        let expected = stages(&format!(
+            "{BASE}fn gcd(a :: Int, b :: Int) -> Int\n  examples {{ gcd(4, 0) => 4, gcd(10, 6) => 2 }}\n{{ if b == 0 {{ a }} else {{ gcd(b, a % b) }} }}"
+        ));
+        let stg = target_stage(&expected, "gcd");
+        let cand =
+            stages("fn gcd(a :: Int, b :: Int) -> Int { if b == 0 { a } else { gcd(b, a % b) } }")
+                .into_iter()
+                .next()
+                .unwrap();
+        assert!(behavioral_equiv(&expected, &cand, &stg).is_some());
     }
 
     #[test]
@@ -235,18 +309,13 @@ mod tests {
         let expected = stages(&format!(
             "{BASE}fn max2(a :: Int, b :: Int) -> Int {{ if a > b {{ a }} else {{ b }} }}"
         ));
-        let sig = target_sig(
-            &format!(
-                "{BASE}fn max2(a :: Int, b :: Int) -> Int {{ if a > b {{ a }} else {{ b }} }}"
-            ),
-            "max2",
-        );
+        let stg = target_stage(&expected, "max2");
         // a + b is not max.
         let cand = stages("fn max2(a :: Int, b :: Int) -> Int { a + b }")
             .into_iter()
             .next()
             .unwrap();
-        assert!(behavioral_equiv(&expected, &cand, &sig).is_none());
+        assert!(behavioral_equiv(&expected, &cand, &stg).is_none());
     }
 
     #[test]
@@ -255,11 +324,35 @@ mod tests {
         // never a fabricated equivalence.
         let src = "fn tag(s :: Str) -> Str { s }";
         let expected = stages(src);
-        let sig = target_sig(src, "tag");
+        let stg = target_stage(&expected, "tag");
         let cand = stages("fn tag(s :: Str) -> Str { s }")
             .into_iter()
             .next()
             .unwrap();
-        assert!(behavioral_equiv(&expected, &cand, &sig).is_none());
+        assert!(behavioral_equiv(&expected, &cand, &stg).is_none());
+    }
+
+    #[test]
+    fn same_callable_ignores_examples_and_param_names() {
+        let a = match &stages("fn f(x :: Int) -> Int\n  examples { f(1) => 2 }\n{ x + 1 }")[0] {
+            Stage::FnDecl(fd) => fd.clone(),
+            _ => unreachable!(),
+        };
+        let b = match &stages("fn f(y :: Int) -> Int { y + 1 }")[0] {
+            Stage::FnDecl(fd) => fd.clone(),
+            _ => unreachable!(),
+        };
+        assert!(
+            same_callable(&a, &b),
+            "same name/types differ only in examples + param name"
+        );
+        let c = match &stages("fn f(x :: Int, z :: Int) -> Int { x }")[0] {
+            Stage::FnDecl(fd) => fd.clone(),
+            _ => unreachable!(),
+        };
+        assert!(
+            !same_callable(&a, &c),
+            "different arity is a different callable"
+        );
     }
 }
