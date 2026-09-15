@@ -421,8 +421,18 @@ pub enum AttestationKind {
         /// when the regenerator returned nothing / a non-matching sig.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         produced_stage_id: Option<super::operation::StageId>,
-        /// Whether `produced_stage_id == expected_stage_id`.
+        /// Whether the regeneration reproduced the recorded change — by
+        /// exact stage-id match, or (see `behavioral_samples`) behaviorally.
         reproduced: bool,
+        /// When reproduction was established *behaviorally* rather than by
+        /// exact stage-id match — the regenerated function returned the same
+        /// value as the recorded one over this many sampled inputs (#836
+        /// follow-up). `None` for an exact match (the stronger claim:
+        /// `produced_stage_id == expected_stage_id`) or a genuine miss.
+        /// Distinguishes "the same function, written differently" from
+        /// "byte-identical" without conflating them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        behavioral_samples: Option<usize>,
         /// The model the recorded intent named, for audit (`None` when
         /// the op carried no intent or the intent no model).
         #[serde(default, skip_serializing_if = "Option::is_none")]

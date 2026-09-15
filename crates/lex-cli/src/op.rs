@@ -161,7 +161,33 @@ fn cmd_op_replay(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         Ok(prog) => {
             let stages = lex_ast::canonicalize_program(&prog);
             match stages.into_iter().find(|st| lex_ast::sig_id(st).as_deref() == Some(req.target_sig.as_str())) {
-                Some(cand) => store.replay_compare(&op_id, &cand)?,
+                Some(cand) => {
+                    let (_expected, produced, exact) = store.replay_stage_of(&op_id, &cand)?;
+                    if exact {
+                        store.replay_record(&op_id, produced, true, None, None)?
+                    } else if let Some(pid) = produced {
+                        // Exact miss, but a valid same-sig candidate: try the
+                        // behavioral tier — the same function written differently
+                        // (if vs match, `>` vs `>=` on a tie) is a real
+                        // reproduction the syntactic oracle can't see. Recorded
+                        // distinctly (behavioral_samples), never conflated with
+                        // an exact match.
+                        let behavioral = store
+                            .program_stages_at_op(&op_id)
+                            .ok()
+                            .and_then(|expected_stages| {
+                                crate::behavioral::behavioral_equiv(&expected_stages, &cand, &req.target_sig)
+                            });
+                        match behavioral {
+                            Some(n) => store.replay_record(&op_id, Some(pid), true, Some(n), None)?,
+                            None => store.replay_record(&op_id, Some(pid), false, None,
+                                Some("regeneration did not reproduce the recorded stage".into()))?,
+                        }
+                    } else {
+                        store.replay_record(&op_id, None, false, None,
+                            Some("regeneration produced a different signature".into()))?
+                    }
+                }
                 None => store.replay_record_miss(&op_id, &format!(
                     "regenerated source did not define the target function {}",
                     req.target_name.as_deref().unwrap_or(&req.target_sig)))?,
@@ -171,8 +197,14 @@ fn cmd_op_replay(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let data = serde_json::to_value(&outcome)?;
     acli::emit_or_text("op-replay", data, fmt, move || {
         if outcome.reproduced {
-            println!("reproduced ({how}): op {} regenerates to the recorded stage {}",
-                outcome.op_id, outcome.expected_stage_id);
+            match outcome.behavioral_samples {
+                Some(n) => println!(
+                    "reproduced behaviorally ({how}): op {} — the candidate differs from the \
+                     recorded stage {} but returns the same value over {n} sampled input(s)",
+                    outcome.op_id, outcome.expected_stage_id),
+                None => println!("reproduced ({how}): op {} regenerates to the recorded stage {}",
+                    outcome.op_id, outcome.expected_stage_id),
+            }
         } else {
             println!("NOT reproduced ({how}): op {} expected {} but the candidate produced {}",
                 outcome.op_id, outcome.expected_stage_id,

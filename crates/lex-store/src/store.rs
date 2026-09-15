@@ -147,8 +147,14 @@ pub struct ReplayOutcome {
     /// The candidate's stage id when it regenerated the same sig, else
     /// `None`.
     pub produced_stage_id: Option<String>,
-    /// `produced_stage_id == expected_stage_id`.
+    /// Whether the regeneration reproduced the recorded change (exact or
+    /// behavioral).
     pub reproduced: bool,
+    /// Set when reproduction was behavioral (same values over N sampled
+    /// inputs) rather than an exact stage-id match. `None` for an exact
+    /// match or a genuine miss.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behavioral_samples: Option<usize>,
     /// The id of the `Replay` attestation this comparison emitted.
     pub attestation_id: String,
 }
@@ -1815,7 +1821,7 @@ impl Store {
         } else {
             Some("regeneration did not reproduce the recorded stage".to_string())
         };
-        self.emit_replay(op_id, &expected_stage_id, produced_stage_id, reproduced, detail)
+        self.emit_replay(op_id, &expected_stage_id, produced_stage_id, reproduced, None, detail)
     }
 
     /// Record a *negative* replay result for a regeneration that never
@@ -1827,7 +1833,7 @@ impl Store {
     /// (e.g. "regenerated source did not parse").
     pub fn replay_record_miss(&self, op_id: &str, reason: &str) -> Result<ReplayOutcome, StoreError> {
         let (_target_sig, expected_stage_id) = self.replay_target(op_id)?;
-        self.emit_replay(op_id, &expected_stage_id, None, false, Some(reason.to_string()))
+        self.emit_replay(op_id, &expected_stage_id, None, false, None, Some(reason.to_string()))
     }
 
     /// `(target_sig, expected_stage_id)` for a replayable op, or an
@@ -1841,14 +1847,56 @@ impl Store {
             .ok_or_else(|| StoreError::InvalidTransition(format!("op {op_id} produced no stage to replay")))
     }
 
+    /// Record a replay verdict the caller has already decided — used by
+    /// the CLI's behavioral tier, which does the (VM-backed) equivalence
+    /// check the store deliberately can't. `expected_stage_id` is looked
+    /// up from the op. Set `behavioral_samples` to `Some(n)` when the
+    /// candidate reproduced *behaviorally* over `n` sampled inputs rather
+    /// than by exact stage-id match; the attestation then records that
+    /// weaker-but-real claim distinctly.
+    pub fn replay_record(
+        &self,
+        op_id: &str,
+        produced_stage_id: Option<String>,
+        reproduced: bool,
+        behavioral_samples: Option<usize>,
+        fail_detail: Option<String>,
+    ) -> Result<ReplayOutcome, StoreError> {
+        let (_target_sig, expected_stage_id) = self.replay_target(op_id)?;
+        self.emit_replay(op_id, &expected_stage_id, produced_stage_id, reproduced, behavioral_samples, fail_detail)
+    }
+
+    /// Compute the exact-match verdict for a candidate *without* emitting
+    /// an attestation — `(expected_stage_id, produced_stage_id, exact)`.
+    /// Lets a caller (the CLI) fall back to a behavioral check on a valid
+    /// but non-identical candidate and emit a single verdict, instead of
+    /// [`Self::replay_compare`]'s emit-immediately shape.
+    pub fn replay_stage_of(
+        &self,
+        op_id: &str,
+        candidate: &Stage,
+    ) -> Result<(String, Option<String>, bool), StoreError> {
+        let (target_sig, expected_stage_id) = self.replay_target(op_id)?;
+        let cand_sig = lex_ast::sig_id(candidate);
+        let cand_stage = stage_id(candidate);
+        let produced_stage_id = match (cand_sig.as_deref(), &cand_stage) {
+            (Some(s), Some(st)) if s == target_sig => Some(st.clone()),
+            _ => None,
+        };
+        let exact = produced_stage_id.as_deref() == Some(expected_stage_id.as_str());
+        Ok((expected_stage_id, produced_stage_id, exact))
+    }
+
     /// Emit the `Replay` attestation and build the outcome. Shared by
-    /// [`Self::replay_compare`] and [`Self::replay_record_miss`].
+    /// [`Self::replay_compare`], [`Self::replay_record_miss`], and
+    /// [`Self::replay_record`].
     fn emit_replay(
         &self,
         op_id: &str,
         expected_stage_id: &str,
         produced_stage_id: Option<String>,
         reproduced: bool,
+        behavioral_samples: Option<usize>,
         fail_detail: Option<String>,
     ) -> Result<ReplayOutcome, StoreError> {
         let model = {
@@ -1875,6 +1923,7 @@ impl Store {
                 expected_stage_id: expected_stage_id.to_string(),
                 produced_stage_id: produced_stage_id.clone(),
                 reproduced,
+                behavioral_samples,
                 model,
             },
             result,
@@ -1888,23 +1937,33 @@ impl Store {
             expected_stage_id: expected_stage_id.to_string(),
             produced_stage_id,
             reproduced,
+            behavioral_samples,
             attestation_id,
         })
     }
 
-    /// The program at an op (that op and all its ancestors applied),
-    /// rendered to source. Used to give a replay regenerator the
-    /// context the change was made against.
-    fn program_source_at_op(&self, op_id: &lex_vcs::OpId) -> Result<String, StoreError> {
+    /// The program at an op (that op and all its ancestors applied), as
+    /// canonical stages. The behavioral replay tier needs the whole
+    /// program — a regenerated function may call helpers from its parent
+    /// state, so it can only be run in context. Exposed for the CLI's
+    /// equivalence check; `op_id` may be any op in the log.
+    pub fn program_stages_at_op(&self, op_id: &str) -> Result<Vec<Stage>, StoreError> {
+        let oid: lex_vcs::OpId = op_id.to_string();
         let log = lex_vcs::OpLog::open(self.root())?;
         let mut map: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-        for rec in log.walk_forward(op_id, None)? {
+        for rec in log.walk_forward(&oid, None)? {
             crate::branches::apply_transition(&mut map, &rec.produces);
         }
         let pairs: Vec<(String, String)> = map.into_iter().collect();
         let stages: Vec<Stage> =
             self.get_asts_for_sigs_bulk(&pairs).into_iter().collect::<Result<_, _>>()?;
-        Ok(lex_ast::print_stages(&stages))
+        Ok(stages)
+    }
+
+    /// The program at an op, rendered to source. Used to give a replay
+    /// regenerator the context the change was made against.
+    fn program_source_at_op(&self, op_id: &lex_vcs::OpId) -> Result<String, StoreError> {
+        Ok(lex_ast::print_stages(&self.program_stages_at_op(op_id)?))
     }
 
     /// Open the attestation log rooted at this store. The log lives
