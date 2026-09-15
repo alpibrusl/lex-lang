@@ -11,7 +11,53 @@ use serde::Deserialize;
 use std::io::Cursor;
 use tiny_http::Response;
 
-use crate::handlers::{error_response, json_response, State};
+use crate::handlers::{error_response, error_with_detail, json_response, State};
+
+/// `GET /v1/branches/<name>/head` — probe the branch head. Returns
+/// `{ "head_op": Option<OpId> }`; the delta-probe half of `op push`.
+pub(crate) fn branch_head_handler(state: &State, name: &str) -> Response<Cursor<Vec<u8>>> {
+    let store = state.store.lock().unwrap();
+    let head = match store.get_branch(name) {
+        Ok(Some(b)) => b.head_op,
+        Ok(None) => None,
+        Err(e) => return error_response(500, format!("get_branch: {e}")),
+    };
+    json_response(200, &serde_json::json!({ "branch": name, "head_op": head }))
+}
+
+/// `POST /v1/branches/<name>/head` — advance a branch head, the ref half
+/// of `op push`. Body `{ "head_op": "<op_id>" }`. Fast-forward only: a
+/// non-fast-forward is refused with 409 (git-style), so a disjoint or
+/// diverged push can't clobber a shared branch. The op objects must
+/// already be present (the ops batch runs first); an unknown `head_op`
+/// reads as a non-fast-forward against a head it can't reach.
+pub(crate) fn branch_advance_head_handler(state: &State, name: &str, body: &str)
+    -> Response<Cursor<Vec<u8>>>
+{
+    let v: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return error_response(400, format!("body must be JSON: {e}")),
+    };
+    let head_op = match v.get("head_op").and_then(|h| h.as_str()) {
+        Some(s) => s.to_string(),
+        None => return error_response(400, "missing string field `head_op`"),
+    };
+    let store = state.store.lock().unwrap();
+    match store.advance_branch_head_ff(name, &head_op) {
+        Ok(advance) => json_response(200, &serde_json::json!({
+            "branch": name,
+            "head_op": head_op,
+            "advance": advance,
+        })),
+        Err(lex_store::StoreError::NonFastForward { branch, current, attempted }) =>
+            error_with_detail(409, "NonFastForward", serde_json::json!({
+                "branch": branch,
+                "current": current,
+                "attempted": attempted,
+            })),
+        Err(e) => error_response(500, format!("advance_branch_head_ff: {e}")),
+    }
+}
 
 /// `GET /v1/branches` — list branches and the current one.
 pub(crate) fn branches_list_handler(state: &State) -> Response<Cursor<Vec<u8>>> {
