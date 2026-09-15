@@ -38,6 +38,18 @@ pub enum CasFailed {
     Io(String),
 }
 
+/// Outcome of [`Store::advance_branch_head_ff`] — how the ref moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchAdvance {
+    /// The branch didn't exist (or had no head) and was set to the new head.
+    Created,
+    /// The branch already pointed at the new head; nothing to do.
+    UpToDate,
+    /// The current head was an ancestor of the new head; advanced.
+    FastForward,
+}
+
 pub const DEFAULT_BRANCH: &str = "main";
 
 /// Persisted, best-effort cache of `branch_head`'s computed view,
@@ -375,6 +387,64 @@ impl Store {
     /// merge / `lex publish` callers run sequentially; multi-writer
     /// safety (file locking) is on the table once `lex serve` becomes
     /// a real concurrent producer (#130 territory).
+    /// Advance `branch` to `new_head`, fast-forward only — the ref half
+    /// of `op push` (the op objects are transferred separately via the
+    /// ops batch). Semantics mirror `git push` to a branch:
+    ///
+    /// * branch absent / no head yet → create it at `new_head`;
+    /// * `new_head` already the head → no-op (`UpToDate`);
+    /// * current head is an ancestor of `new_head` → fast-forward;
+    /// * otherwise → [`StoreError::NonFastForward`], so a disjoint or
+    ///   diverged history can't silently clobber a shared branch.
+    ///
+    /// `new_head` must already exist in the op log (the batch landed it);
+    /// an unknown op is a `NonFastForward` against a head it can't reach.
+    pub fn advance_branch_head_ff(
+        &self,
+        name: &str,
+        new_head: &OpId,
+    ) -> Result<BranchAdvance, StoreError> {
+        let current = self.get_branch(name)?.and_then(|b| b.head_op);
+        match current {
+            None => {
+                // First push to this branch (any name, not just main) —
+                // create it pointing at new_head.
+                let b = Branch {
+                    name: name.to_string(),
+                    parent: None,
+                    head_op: Some(new_head.clone()),
+                    predicate: None,
+                    merges: Vec::new(),
+                    created_at: now(),
+                    last_gate_checkpoint: Some(new_head.clone()),
+                };
+                fs::create_dir_all(self.branches_dir())?;
+                write_branch_atomic(&self.branch_path(name), &b)?;
+                Ok(BranchAdvance::Created)
+            }
+            Some(cur) if &cur == new_head => Ok(BranchAdvance::UpToDate),
+            Some(cur) => {
+                // Fast-forward iff the current head is reachable from the
+                // new head (i.e. an ancestor of it).
+                let log = lex_vcs::OpLog::open(self.root())?;
+                let is_ff = log
+                    .walk_forward(new_head, None)?
+                    .iter()
+                    .any(|rec| rec.op_id == cur);
+                if is_ff {
+                    self.set_branch_head_op(name, new_head.clone())?;
+                    Ok(BranchAdvance::FastForward)
+                } else {
+                    Err(StoreError::NonFastForward {
+                        branch: name.to_string(),
+                        current: cur,
+                        attempted: new_head.clone(),
+                    })
+                }
+            }
+        }
+    }
+
     pub(crate) fn set_branch_head_op(
         &self,
         name: &str,
@@ -789,5 +859,51 @@ mod branch_head_snapshot_tests {
         // and still agree.
         let again = store.branch_head(DEFAULT_BRANCH).unwrap();
         assert_eq!(after_reset, again);
+    }
+
+    #[test]
+    fn advance_branch_head_ff_creates_advances_and_refuses_nonff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        // Chain a <- b <- c on main (the object DAG a push would transfer).
+        let _a = add(&store, "fn::a", "sa");
+        let b = add(&store, "fn::b", "sb");
+        let c = add(&store, "fn::c", "sc");
+
+        // First push to a fresh branch creates it at the pushed head.
+        assert_eq!(store.advance_branch_head_ff("feat", &c).unwrap(), BranchAdvance::Created);
+        assert_eq!(store.get_branch("feat").unwrap().unwrap().head_op, Some(c.clone()));
+
+        // Re-pushing the same head is a no-op.
+        assert_eq!(store.advance_branch_head_ff("feat", &c).unwrap(), BranchAdvance::UpToDate);
+
+        // Reset feat to b; advancing to c fast-forwards (b is c's ancestor).
+        store.set_branch_head_op("feat", b.clone()).unwrap();
+        assert_eq!(store.advance_branch_head_ff("feat", &c).unwrap(), BranchAdvance::FastForward);
+
+        // A disjoint root is a non-fast-forward and must be refused, leaving
+        // the branch untouched (the clobber-prevention the alpibrusl push hit).
+        let d_op = Operation::new(
+            OperationKind::AddFunction {
+                sig_id: "fn::d".into(),
+                stage_id: "sd".into(),
+                effects: BTreeSet::new(),
+                budget_cost: None,
+            },
+            Vec::new(),
+        );
+        let d = d_op.op_id();
+        OpLog::open(store.root())
+            .unwrap()
+            .put(&lex_vcs::OperationRecord::new(
+                d_op,
+                StageTransition::Create { sig_id: "fn::d".into(), stage_id: "sd".into() },
+            ))
+            .unwrap();
+        match store.advance_branch_head_ff("feat", &d) {
+            Err(StoreError::NonFastForward { .. }) => {}
+            other => panic!("expected NonFastForward, got {other:?}"),
+        }
+        assert_eq!(store.get_branch("feat").unwrap().unwrap().head_op, Some(c));
     }
 }
