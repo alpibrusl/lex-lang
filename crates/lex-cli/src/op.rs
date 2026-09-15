@@ -708,13 +708,18 @@ fn post_json(
     if status == 401 {
         bail!("remote requires auth (HTTP 401) — set LEXHUB_TOKEN or pass --token");
     }
-    let v: serde_json::Value = resp.into_body().read_json()
+    let v: serde_json::Value = resp.into_body().with_config().limit(SYNC_BODY_LIMIT).read_json()
         .map_err(|e| anyhow!("decoding {path} response: {e}"))?;
     if status >= 400 {
         bail!("server rejected {path} (HTTP {status}): {v}");
     }
     Ok(v)
 }
+
+/// Stage/intent ids requested per `fetch` call. Stage blobs are ASTs and can
+/// be large, so bound how many come back in one response; `pull_objects`
+/// chunks its id lists by this.
+const FETCH_CHUNK: usize = 256;
 
 /// The content half of `op push`: send the stage (code) and intent blobs the
 /// given ops reference. Content-addressed and idempotent server-side, so a
@@ -773,9 +778,9 @@ fn pull_objects(
         }
     }
     let mut stages_added = 0usize;
-    if !want_stages.is_empty() {
-        let ids: Vec<&String> = want_stages.iter().collect();
-        let v = post_json(remote, "/v1/stages/fetch", &serde_json::json!({ "ids": ids }), token)?;
+    let want_stages: Vec<String> = want_stages.into_iter().collect();
+    for chunk in want_stages.chunks(FETCH_CHUNK) {
+        let v = post_json(remote, "/v1/stages/fetch", &serde_json::json!({ "ids": chunk }), token)?;
         if let Some(arr) = v.get("stages").and_then(|s| s.as_array()) {
             for sv in arr {
                 let stage: lex_ast::Stage = serde_json::from_value(sv.clone())?;
@@ -795,9 +800,9 @@ fn pull_objects(
         }
     }
     let mut intents_added = 0usize;
-    if !want_intents.is_empty() {
-        let ids: Vec<&String> = want_intents.iter().collect();
-        let v = post_json(remote, "/v1/intents/fetch", &serde_json::json!({ "ids": ids }), token)?;
+    let want_intents: Vec<String> = want_intents.into_iter().collect();
+    for chunk in want_intents.chunks(FETCH_CHUNK) {
+        let v = post_json(remote, "/v1/intents/fetch", &serde_json::json!({ "ids": chunk }), token)?;
         if let Some(arr) = v.get("intents").and_then(|i| i.as_array()) {
             for iv in arr {
                 let intent: lex_vcs::Intent = serde_json::from_value(iv.clone())?;
@@ -869,7 +874,7 @@ fn cmd_op_pull(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     // Fetch the delta from the remote. Returns oldest-first so we
     // can apply in topological order with the existing idempotent
     // OpLog::put.
-    let received = fetch_ops_since(&remote, &branch, cutoff.as_deref(), limit, token.as_deref())?;
+    let received = fetch_ops_paginated(&remote, &branch, cutoff.as_deref(), limit, token.as_deref())?;
 
     if dry_run {
         let ids: Vec<&String> = received.iter().map(|r| &r.op_id).collect();
@@ -1006,6 +1011,17 @@ fn cmd_op_pull(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 
 /// Fetch a delta from `<remote>/v1/ops/since`. Returns the records
 /// in the order the server sent them (oldest-first by contract).
+/// Ops requested per page when pulling. Op records are small (they carry
+/// stage/intent *ids*, not content), so a page of this many stays far under
+/// any response cap; content is fetched separately by `pull_objects`.
+const OPS_PAGE: usize = 1000;
+/// Belt-and-suspenders read cap for sync responses — ureq defaults to 10MB,
+/// which `/v1/ops/since` blew past on a large tenant. Pagination keeps pages
+/// small; this guards against a single oversized page/blob.
+const SYNC_BODY_LIMIT: u64 = 512 * 1024 * 1024;
+
+/// One page of `/v1/ops/since`: ops reachable from `branch.head_op` but not
+/// from `after`, oldest-first, capped at `limit`.
 fn fetch_ops_since(
     remote: &str,
     branch: &str,
@@ -1031,8 +1047,42 @@ fn fetch_ops_since(
             .unwrap_or_else(|_| "(unreadable body)".into());
         bail!("server returned HTTP {status}: {body}");
     }
-    resp.into_body().read_json::<Vec<OperationRecord>>()
+    resp.into_body().with_config().limit(SYNC_BODY_LIMIT).read_json::<Vec<OperationRecord>>()
         .map_err(|e| anyhow!("decoding response from {url}: {e}"))
+}
+
+/// Pull the full op delta by paging through `/v1/ops/since` with a cursor,
+/// so an arbitrarily long history transfers without a single response
+/// exceeding the read cap. `total_limit` (from `--limit`) caps the overall
+/// number pulled; `None` means all. Pages are oldest-first and stitched in
+/// order.
+fn fetch_ops_paginated(
+    remote: &str,
+    branch: &str,
+    start_after: Option<&str>,
+    total_limit: Option<usize>,
+    token: Option<&str>,
+) -> Result<Vec<OperationRecord>> {
+    let mut all: Vec<OperationRecord> = Vec::new();
+    let mut cursor: Option<String> = start_after.map(String::from);
+    loop {
+        let want = match total_limit {
+            Some(t) if t <= all.len() => break,
+            Some(t) => (t - all.len()).min(OPS_PAGE),
+            None => OPS_PAGE,
+        };
+        let page = fetch_ops_since(remote, branch, cursor.as_deref(), Some(want), token)?;
+        if page.is_empty() {
+            break;
+        }
+        cursor = Some(page.last().unwrap().op_id.clone());
+        let short = page.len() < want;
+        all.extend(page);
+        if short {
+            break; // last page
+        }
+    }
+    Ok(all)
 }
 
 /// Advance `<root>/branches/<name>.json`'s `head_op` to `new`. The
