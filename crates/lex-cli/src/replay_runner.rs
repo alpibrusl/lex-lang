@@ -117,7 +117,24 @@ pub fn regenerate_cmd(req: &ReplayRequest, cmd: &str) -> Result<String> {
             String::from_utf8_lossy(&out.stderr)
         );
     }
-    Ok(strip_code_fences(&String::from_utf8_lossy(&out.stdout)))
+    Ok(strip_code_fences(&strip_lex_run_echo(&String::from_utf8_lossy(&out.stdout))))
+}
+
+/// Drop a trailing standalone `null` line. A regenerator that is itself
+/// a `lex run <file> main` program (the natural kind — e.g. lex-code
+/// `--regenerate`) has its `main`'s `Nil` return echoed to stdout as a
+/// final `null`, after the source it printed. That echo is not part of
+/// the candidate, and left in place it makes the source unparseable. A
+/// real regenerated function never ends with a bare `null` statement, so
+/// this only ever strips the runner's own artifact.
+fn strip_lex_run_echo(s: &str) -> String {
+    let trimmed = s.trim_end();
+    match trimmed.strip_suffix("null") {
+        // Only when `null` stands alone on the last line (preceded by a
+        // newline or the whole output is just `null`).
+        Some(before) if before.is_empty() || before.ends_with('\n') => before.trim_end().to_string(),
+        _ => trimmed.to_string(),
+    }
 }
 
 /// Strip a leading/trailing markdown code fence if the model wrapped
@@ -146,5 +163,17 @@ mod tests {
         assert_eq!(strip_code_fences("```lex\nfn f() -> Int { 1 }\n```"), "fn f() -> Int { 1 }");
         assert_eq!(strip_code_fences("```\nfn f() -> Int { 1 }\n```"), "fn f() -> Int { 1 }");
         assert_eq!(strip_code_fences("  fn f() -> Int { 1 }  "), "fn f() -> Int { 1 }");
+    }
+
+    #[test]
+    fn strips_lex_run_null_echo() {
+        // The `lex run` Nil echo after the source.
+        assert_eq!(strip_lex_run_echo("fn f() -> Int { 1 }\n\nnull\n"), "fn f() -> Int { 1 }");
+        assert_eq!(strip_lex_run_echo("fn f() -> Int { 1 }\nnull"), "fn f() -> Int { 1 }");
+        assert_eq!(strip_lex_run_echo("null\n"), "");
+        // A function whose source legitimately ends in something else is untouched.
+        assert_eq!(strip_lex_run_echo("fn f() -> Int { 1 }\n"), "fn f() -> Int { 1 }");
+        // `null` as part of a token on the last line is not a standalone echo.
+        assert_eq!(strip_lex_run_echo("fn f() -> Str { \"isnull\" }"), "fn f() -> Str { \"isnull\" }");
     }
 }
