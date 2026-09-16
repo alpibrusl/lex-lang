@@ -126,7 +126,8 @@ impl EffectHandler for DefaultHandler {
             let effect_kind = match op {
                 "exists" | "is_file" | "is_dir" | "stat"
                 | "list_dir" | "walk" | "glob" => "fs_walk",
-                "mkdir_p" | "remove" => "fs_write",
+                "read_to_string" => "fs_read",
+                "mkdir_p" | "remove" | "write" => "fs_write",
                 "copy" => {
                     self.ensure_kind_allowed("fs_walk")?;
                     self.ensure_kind_allowed("fs_write")?;
@@ -434,19 +435,11 @@ impl EffectHandler for DefaultHandler {
                 Ok(Value::Unit)
             }
             ("io", "read") => {
+                // Legacy content read. Declares [io] rather than [fs_read],
+                // which is why `fs.read_to_string` exists (#882); the path
+                // scope is identical, and shared so the two cannot drift.
                 let path = expect_str(args.first())?.to_string();
-                let resolved = self.resolve_read_path(&path);
-                // Honor read-allowlist if any. Symmetric with io.write.
-                // The path argument is checked as-given (resolved-against-
-                // read_root for tests); a tool granted [io] cannot escape
-                // the configured prefix even though the effect itself is
-                // permitted. This is the per-path scope the bench's case
-                // #6 ("[io] granted, body reads /etc/passwd") needed.
-                if !self.policy.allow_fs_read.is_empty()
-                    && !self.policy.allow_fs_read.iter().any(|a| resolved.starts_with(a))
-                {
-                    return Err(format!("read of `{path}` outside --allow-fs-read"));
-                }
+                let resolved = self.ensure_fs_read_content_path(&path)?;
                 match std::fs::read_to_string(&resolved) {
                     Ok(s) => Ok(ok(Value::Str(s.into()))),
                     Err(e) => Ok(err(Value::Str(format!("{e}").into()))),
@@ -473,32 +466,10 @@ impl EffectHandler for DefaultHandler {
                 Ok(Value::List(list.into()))
             }
             ("io", "write") => {
+                // Legacy content write; see the note on ("io", "read").
                 let path = expect_str(args.first())?.to_string();
                 let contents = expect_str(args.get(1))?.to_string();
-                // Honor write-allowlist if any.
-                // Canonicalize both sides so macOS /tmp → /private/tmp symlinks
-                // and other platform-specific path aliases compare correctly.
-                if !self.policy.allow_fs_write.is_empty() {
-                    let raw = std::env::current_dir()
-                        .map(|cwd| cwd.join(&path))
-                        .unwrap_or_else(|_| std::path::PathBuf::from(&path));
-                    // canonicalize fails if the file doesn't exist yet (new writes).
-                    // Fall back to canonicalizing the parent so macOS /tmp → /private/tmp
-                    // symlinks still compare correctly against the allowlist.
-                    let p = std::fs::canonicalize(&raw).unwrap_or_else(|_| {
-                        raw.parent()
-                            .and_then(|par| std::fs::canonicalize(par).ok())
-                            .map(|par| par.join(raw.file_name().unwrap_or_default()))
-                            .unwrap_or(raw)
-                    });
-                    let allowed = self.policy.allow_fs_write.iter().any(|a| {
-                        let ca = std::fs::canonicalize(a).unwrap_or_else(|_| a.clone());
-                        p.starts_with(&ca)
-                    });
-                    if !allowed {
-                        return Err(format!("write to `{path}` outside --allow-fs-write"));
-                    }
-                }
+                self.ensure_fs_write_content_path(&path)?;
                 match std::fs::write(&path, contents) {
                     Ok(_) => Ok(ok(Value::Unit)),
                     Err(e) => Ok(err(Value::Str(format!("{e}").into()))),

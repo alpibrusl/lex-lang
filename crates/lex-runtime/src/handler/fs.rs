@@ -111,6 +111,28 @@ impl DefaultHandler {
                 }
                 Ok(ok(Value::List(paths.into())))
             }
+            // Content read/write. These are the reason `[fs_read]` /
+            // `[fs_write]` exist as effect names at all: the same
+            // operations under `io.read` / `io.write` declare `[io]`,
+            // which reads as "console" and tells a reviewer nothing
+            // about filesystem reach (alpibrusl/lex-lang#882).
+            "read_to_string" => {
+                let path = expect_str(args.first())?.to_string();
+                let resolved = self.ensure_fs_read_content_path(&path)?;
+                match std::fs::read_to_string(&resolved) {
+                    Ok(s) => Ok(ok(Value::Str(s.into()))),
+                    Err(e) => Ok(err(Value::Str(format!("{e}").into()))),
+                }
+            }
+            "write" => {
+                let path = expect_str(args.first())?.to_string();
+                let contents = expect_str(args.get(1))?.to_string();
+                self.ensure_fs_write_content_path(&path)?;
+                match std::fs::write(&path, contents) {
+                    Ok(_) => Ok(ok(Value::Unit)),
+                    Err(e) => Ok(err(Value::Str(format!("{e}").into()))),
+                }
+            }
             "mkdir_p" => {
                 let path = expect_str(args.first())?.to_string();
                 if let Err(e) = self.ensure_fs_write_path(&path) {
@@ -186,6 +208,57 @@ impl DefaultHandler {
             Ok(())
         } else {
             Err(format!("fs path `{path}` outside --allow-fs-write"))
+        }
+    }
+}
+
+impl DefaultHandler {
+    /// Path scope for CONTENT reads (`fs.read_to_string`, and the legacy
+    /// `io.read`). Distinct from `ensure_fs_walk_path` in one way that
+    /// matters: it returns the *resolved* path, because `read_root` may
+    /// rebase it for tests, and the caller must read the same path the
+    /// check approved.
+    pub(super) fn ensure_fs_read_content_path(&self, path: &str) -> Result<PathBuf, String> {
+        let resolved = self.resolve_read_path(path);
+        if !self.policy.allow_fs_read.is_empty()
+            && !self.policy.allow_fs_read.iter().any(|a| resolved.starts_with(a))
+        {
+            return Err(format!("read of `{path}` outside --allow-fs-read"));
+        }
+        Ok(resolved)
+    }
+
+    /// Path scope for CONTENT writes (`fs.write`, and the legacy
+    /// `io.write`). Canonicalises both sides so platform path aliases
+    /// (macOS `/tmp` -> `/private/tmp`) compare correctly; `canonicalize`
+    /// fails on a file that does not exist yet, so a new write falls back
+    /// to canonicalising the parent.
+    ///
+    /// NOTE: `ensure_fs_write_path` (used by mkdir_p / remove / copy) does
+    /// a plain prefix comparison with no canonicalisation, so the two
+    /// disagree on aliased paths. That divergence predates this function
+    /// and is deliberately not changed here.
+    pub(super) fn ensure_fs_write_content_path(&self, path: &str) -> Result<(), String> {
+        if self.policy.allow_fs_write.is_empty() {
+            return Ok(());
+        }
+        let raw = std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| PathBuf::from(path));
+        let p = std::fs::canonicalize(&raw).unwrap_or_else(|_| {
+            raw.parent()
+                .and_then(|par| std::fs::canonicalize(par).ok())
+                .map(|par| par.join(raw.file_name().unwrap_or_default()))
+                .unwrap_or(raw)
+        });
+        let allowed = self.policy.allow_fs_write.iter().any(|a| {
+            let ca = std::fs::canonicalize(a).unwrap_or_else(|_| a.clone());
+            p.starts_with(&ca)
+        });
+        if allowed {
+            Ok(())
+        } else {
+            Err(format!("write to `{path}` outside --allow-fs-write"))
         }
     }
 }

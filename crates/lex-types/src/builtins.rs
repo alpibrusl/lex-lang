@@ -20,12 +20,22 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 Ty::Unit,
             ));
             // io.read(path :: Str) -> [io] Result[Str, Str]
+            //
+            // DEPRECATED in favour of `fs.read_to_string`, which declares
+            // [fs_read]. This op takes a PATH and is gated by
+            // --allow-fs-read, but declares [io] — documented as
+            // "console / stdio" — so an effect row carrying [io] tells a
+            // reviewer nothing about filesystem reach (#882). Kept working
+            // because ~160 call sites across the fleet use it; re-typing it
+            // in place would change every declared row at once, which is
+            // the failure mode #808 already produced.
             fields.insert("read".into(), Ty::function(
                 vec![Ty::str()],
                 EffectSet::singleton("io"),
                 Ty::Con("Result".into(), vec![Ty::str(), Ty::str()]),
             ));
             // io.write(path :: Str, contents :: Str) -> [io] Result[Unit, Str]
+            // DEPRECATED in favour of `fs.write` ([fs_write]); see io.read.
             fields.insert("write".into(), Ty::function(
                 vec![Ty::str(), Ty::str()],
                 EffectSet::singleton("io"),
@@ -2315,6 +2325,28 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             };
             let result_str = |t: Ty| Ty::Con("Result".into(), vec![t, Ty::str()]);
             let mut fields = IndexMap::new();
+            // Content read/write [fs_read] / [fs_write]
+            //
+            // These are what make [fs_read] an effect a program can
+            // actually produce. Before them the only content I/O in the
+            // language was io.read / io.write under [io], so "does this
+            // touch the filesystem" was not answerable from an effect row
+            // and `lex audit --effect fs_read` matched almost nothing
+            // (#882). Path scoping is unchanged — the same
+            // --allow-fs-read / --allow-fs-write allowlists, via the same
+            // handler helpers the io.* ops now call.
+            //
+            // fs.read_to_string :: Str -> [fs_read] Result[Str, Str]
+            fields.insert("read_to_string".into(), Ty::function(
+                vec![Ty::str()],
+                EffectSet::singleton("fs_read"),
+                result_str(Ty::str())));
+            // fs.write :: (Str, Str) -> [fs_write] Result[Unit, Str]
+            fields.insert("write".into(), Ty::function(
+                vec![Ty::str(), Ty::str()],
+                EffectSet::singleton("fs_write"),
+                result_str(Ty::Unit)));
+
             // Walk-style queries [fs_walk]
             fields.insert("exists".into(), Ty::function(
                 vec![Ty::str()], EffectSet::singleton("fs_walk"), Ty::bool()));

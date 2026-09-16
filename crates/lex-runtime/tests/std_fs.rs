@@ -197,3 +197,164 @@ fn stat_returns_size_of_file() {
     );
     assert_eq!(v, Value::Int(6));
 }
+
+// ── content read/write (#882) ────────────────────────────────────────────────
+//
+// `fs.read_to_string` / `fs.write` exist so that "this touches the filesystem"
+// is answerable from an effect row. The behaviour they must have is exactly the
+// behaviour `io.read` / `io.write` already had — same allowlists, same refusals
+// — with `[fs_read]` / `[fs_write]` in the row instead of `[io]`. These tests
+// pin both halves: that the ops work, and that the scope still bites.
+
+fn policy_read_only(read_root: &std::path::Path) -> Policy {
+    let mut p = Policy::pure();
+    p.allow_effects = ["fs_read".to_string()].into_iter().collect::<BTreeSet<_>>();
+    p.allow_fs_read = vec![read_root.to_path_buf()];
+    p
+}
+
+fn policy_write_only(write_root: &std::path::Path) -> Policy {
+    let mut p = Policy::pure();
+    p.allow_effects = ["fs_write".to_string()].into_iter().collect::<BTreeSet<_>>();
+    p.allow_fs_write = vec![write_root.to_path_buf()];
+    p
+}
+
+const READ_SRC: &str = r#"
+import "std.fs" as fs
+
+fn read_it(p :: Str) -> [fs_read] Str {
+  match fs.read_to_string(p) {
+    Err(m) => m,
+    Ok(t) => t,
+  }
+}
+"#;
+
+const WRITE_SRC: &str = r#"
+import "std.fs" as fs
+
+fn write_it(p :: Str, body :: Str) -> [fs_write] Str {
+  match fs.write(p, body) {
+    Err(m) => m,
+    Ok(_) => "WROTE",
+  }
+}
+"#;
+
+#[test]
+fn fs_read_to_string_reads_inside_the_allowlist() {
+    let dir = unique_dir("read-ok");
+    let file = dir.join("in.txt");
+    std::fs::write(&file, "hello-from-fs").unwrap();
+
+    let got = run(
+        READ_SRC,
+        "read_it",
+        vec![Value::Str(file.to_string_lossy().into_owned().into())],
+        policy_read_only(&dir),
+    );
+    assert_eq!(got, Value::Str("hello-from-fs".into()));
+}
+
+#[test]
+fn fs_read_to_string_refuses_outside_the_allowlist() {
+    let dir = unique_dir("read-deny");
+    let outside = unique_dir("read-deny-other").join("secret.txt");
+    std::fs::write(&outside, "should-not-be-readable").unwrap();
+
+    // The handler refuses before touching the file, so this surfaces as a
+    // call error rather than an Err value — the same shape io.read produced.
+    let prog = parse_source(READ_SRC).expect("parse");
+    let stages = canonicalize_program(&prog);
+    lex_types::check_program(&stages).expect("type errors");
+    let bc = Arc::new(compile_program(&stages));
+    let handler = DefaultHandler::new(policy_read_only(&dir)).with_program(Arc::clone(&bc));
+    let mut vm = Vm::with_handler(&bc, Box::new(handler));
+    let err = vm
+        .call(
+            "read_it",
+            vec![Value::Str(outside.to_string_lossy().into_owned().into())],
+        )
+        .expect_err("read outside --allow-fs-read must be refused");
+    assert!(
+        format!("{err}").contains("outside --allow-fs-read"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn fs_write_writes_inside_the_allowlist() {
+    let dir = unique_dir("write-ok");
+    let file = dir.join("out.txt");
+
+    let got = run(
+        WRITE_SRC,
+        "write_it",
+        vec![
+            Value::Str(file.to_string_lossy().into_owned().into()),
+            Value::Str("written-by-fs".into()),
+        ],
+        policy_write_only(&dir),
+    );
+    assert_eq!(got, Value::Str("WROTE".into()));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "written-by-fs");
+}
+
+#[test]
+fn fs_write_refuses_outside_the_allowlist() {
+    let dir = unique_dir("write-deny");
+    let outside = unique_dir("write-deny-other").join("nope.txt");
+
+    let prog = parse_source(WRITE_SRC).expect("parse");
+    let stages = canonicalize_program(&prog);
+    lex_types::check_program(&stages).expect("type errors");
+    let bc = Arc::new(compile_program(&stages));
+    let handler = DefaultHandler::new(policy_write_only(&dir)).with_program(Arc::clone(&bc));
+    let mut vm = Vm::with_handler(&bc, Box::new(handler));
+    let err = vm
+        .call(
+            "write_it",
+            vec![
+                Value::Str(outside.to_string_lossy().into_owned().into()),
+                Value::Str("nope".into()),
+            ],
+        )
+        .expect_err("write outside --allow-fs-write must be refused");
+    assert!(
+        format!("{err}").contains("outside --allow-fs-write"),
+        "unexpected error: {err}"
+    );
+    assert!(!outside.exists(), "refused write must not create the file");
+}
+
+#[test]
+fn granting_io_does_not_reach_fs_content_ops() {
+    // The point of the whole change: [io] must no longer be a way to read
+    // files through the `fs` module. A program declaring [fs_read] is not
+    // satisfied by a policy granting only `io`.
+    let dir = unique_dir("io-not-fs");
+    let file = dir.join("in.txt");
+    std::fs::write(&file, "x").unwrap();
+
+    let mut p = Policy::pure();
+    p.allow_effects = ["io".to_string()].into_iter().collect::<BTreeSet<_>>();
+    p.allow_fs_read = vec![dir.clone()];
+
+    let prog = parse_source(READ_SRC).expect("parse");
+    let stages = canonicalize_program(&prog);
+    lex_types::check_program(&stages).expect("type errors");
+    let bc = Arc::new(compile_program(&stages));
+    let handler = DefaultHandler::new(p).with_program(Arc::clone(&bc));
+    let mut vm = Vm::with_handler(&bc, Box::new(handler));
+    let err = vm
+        .call(
+            "read_it",
+            vec![Value::Str(file.to_string_lossy().into_owned().into())],
+        )
+        .expect_err("[io] must not satisfy an [fs_read] program");
+    assert!(
+        format!("{err}").contains("fs_read"),
+        "unexpected error: {err}"
+    );
+}
