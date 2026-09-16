@@ -9,6 +9,46 @@ bumps may carry breaking changes when justified).
 
 ### Added
 
+- **`fs.read_to_string` / `fs.write` — content I/O that declares
+  `[fs_read]` / `[fs_write]` (#882).** Until now the only way to read or
+  write file *contents* in Lex was `io.read` / `io.write`, which declare
+  `[io]` — an effect the runtime's own table documents as
+  "console / stdio". So an effect row never answered "does this touch the
+  filesystem", `lex audit --effect fs_read` matched almost nothing, and a
+  program whose row read `[io]` could read any file on the machine:
+
+  ```console
+  $ lex run --allow-effects io leak.lex read_anything '"/etc/passwd"'
+  "##\n# User Database\n# ..."
+  ```
+
+  The path scope was never missing — `--allow-fs-read` / `--allow-fs-write`
+  gate these ops and always did, and adding either flag refuses the read
+  above. What was missing is that none of it was visible in the row, and
+  the flags follow an empty-means-allow-any convention (#552), so the
+  wide-open case is also the one that looks tidiest.
+
+  `fs.read_to_string :: Str -> [fs_read] Result[Str, Str]` and
+  `fs.write :: (Str, Str) -> [fs_write] Result[Unit, Str]` do the same
+  work under the effect names that already describe it, next to the
+  `[fs_walk]` traversal ops and the `[fs_write]` mutators. `arrow.read_csv`
+  has declared `[fs_read]` all along; this makes `io` the outlier rather
+  than the rule.
+
+  `io.read` / `io.write` keep working and are **deprecated, not changed** —
+  roughly 160 call sites across the lex-* fleet use them, and re-typing in
+  place would alter every declared row at once, which is the failure #808
+  already produced on an unpinned fleet. Both now route through the same
+  handler helpers as the `fs.*` ops, so the two cannot drift on path
+  scoping.
+
+  Migration is a rename: `io.read(p)` to `fs.read_to_string(p)`,
+  `io.write(p, s)` to `fs.write(p, s)`, then narrow the declared row from
+  `[io]` to `[fs_read]` / `[fs_write]`. Worth doing first in the low-level
+  packages — `lex-web`, `lex-schema`, `lex-cli`, `lex-llm` — since
+  everything importing them currently inherits an `[io]` that means
+  "filesystem" without saying so.
+
 - **`lex authority` — the grant is derived from the code, not written
   beside it.** `lex check --allow-effects …` asks whether a program fits
   a policy someone wrote. The inverse — *what policy does this code

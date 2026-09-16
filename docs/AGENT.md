@@ -196,7 +196,7 @@ an exhaustive function list.
 | `std.duration` | `millis`, `seconds`, `minutes`, `hours`, `days` |
 | `std.approval` | `request` |
 | `std.process` | `spawn`, `read_stdout_line`, `read_stderr_line`, `wait`, `kill`, `exit`, `run` |
-| `std.fs` | `exists`, `is_file`, `is_dir`, `stat`, `list_dir`, `walk`, `glob`, `mkdir_p`, `remove`, `copy` |
+| `std.fs` | `read_to_string`, `write`, `exists`, `is_file`, `is_dir`, `stat`, `list_dir`, `walk`, `glob`, `mkdir_p`, `remove`, `copy` |
 | `std.kv` | `open`, `close`, `get`, `put`, `delete`, `contains`, `list_prefix` |
 | `std.vcs` | `put_blob`, `get_blob`, `has_blob`, `ref_set`, `ref_get` |
 | `std.sql` | `open`, `close`, `exec`, `query`, `query_iter`, `begin`, `commit`, `rollback`, `exec_tx`, `query_tx`, `get_str`, `get_int`, `get_float`, `get_bool` |
