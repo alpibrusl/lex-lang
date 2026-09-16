@@ -181,6 +181,35 @@ impl TypeEnv {
             e.ctor_to_type.insert((*ctor).into(), "HttpError".into());
         }
 
+        // Json = JNull | JBool(Bool) | JInt(Int) | JFloat(Float)
+        //      | JStr(Str) | JList(List[Json]) | JObj(List[(Str, Json)])
+        // The generic JSON value ADT produced by `std.json.decode` and
+        // consumed by `std.json.encode`. Structurally identical to
+        // lex-schema's `json_value.Json`, so the native builtins are a
+        // drop-in for that interpreted parser. Registered globally (like
+        // Tz/HttpError) so a program can pattern-match `Json` without an
+        // extra type import. Recursive payloads reference the type by
+        // name via `Ty::Con("Json", [])`.
+        let json_ty = || Ty::Con("Json".into(), vec![]);
+        let mut json_variants = IndexMap::new();
+        json_variants.insert("JNull".into(), None);
+        json_variants.insert("JBool".into(), Some(Ty::bool()));
+        json_variants.insert("JInt".into(), Some(Ty::int()));
+        json_variants.insert("JFloat".into(), Some(Ty::float()));
+        json_variants.insert("JStr".into(), Some(Ty::str()));
+        json_variants.insert("JList".into(), Some(Ty::List(Box::new(json_ty()))));
+        json_variants.insert(
+            "JObj".into(),
+            Some(Ty::List(Box::new(Ty::Tuple(vec![Ty::str(), json_ty()])))),
+        );
+        e.types.insert("Json".into(), TypeDef {
+            params: vec![],
+            kind: TypeDefKind::Union(json_variants),
+        });
+        for ctor in &["JNull", "JBool", "JInt", "JFloat", "JStr", "JList", "JObj"] {
+            e.ctor_to_type.insert((*ctor).into(), "Json".into());
+        }
+
         // HttpRequest = { method, url, headers, body, timeout_ms }.
         // The std.http request shape. Anonymous record literals coerce
         // to this nominal alias at every position (per the §3.13
