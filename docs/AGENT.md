@@ -181,7 +181,7 @@ an exhaustive function list.
 | `std.conc` | `spawn`, `ask`, `tell`, `register`, `lookup`, `unregister`, `registered` |
 | `std.arrow` | `from_int_columns`, `from_float_columns`, `from_str_columns`, `nrows`, `ncols`, `col_names`, `col_type`, `col_sum_int`, `col_sum_float`, `col_mean`, `col_min_int`, `col_max_int`, `col_count`, `head`, `tail`, `slice`, `select_cols`, `drop_col`, `rename_col`, `read_csv`, `read_parquet`, `read_parquet_cols`, `write_parquet`, `write_csv` |
 | `std.df` | `filter_eq_int`, `filter_gt_int`, `filter_lt_int`, `filter_eq_str`, `filter_in_str`, `filter_eq_float`, `filter_lt_float`, `filter_gt_float`, `filter_isnull`, `filter_notnull`, `drop_nulls`, `sort_by`, `group_by_agg`, `inner_join`, `left_join`, `cross_join` |
-| `std.json` | `stringify`, `parse`, `parse_strict` |
+| `std.json` | `stringify`, `parse`, `parse_strict`, `decode`, `encode`, `encode_pretty` |
 | `std.result` | `map`, `and_then`, `map_err`, `or_else`, `unwrap_or`, `unwrap_or_else`, `is_ok`, `is_err` |
 | `std.option` | `map`, `and_then`, `unwrap_or`, `unwrap_or_else`, `or_else`, `is_some`, `is_none`, `ok_or` |
 | `std.tuple` | `fst`, `snd`, `third`, `len` |

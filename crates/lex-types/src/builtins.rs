@@ -1268,6 +1268,28 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 EffectSet::empty(),
                 Ty::Con("Result".into(), vec![Ty::Var(0), Ty::str()]),
             ));
+            // decode :: Str -> Result[Json, Str]
+            // Parse into the generic `Json` value ADT (JNull/JBool/…),
+            // total: the result is always a well-typed `Json`, so callers
+            // walk it with pattern matches instead of trusting a shape.
+            // Native (serde_json), O(n) — the drop-in for lex-schema's
+            // interpreted `json_value.parse`. Distinct from `parse`
+            // (which decodes into an inferred concrete type `T` and is
+            // the subject of the parse_strict rewrite); `decode`'s
+            // concrete `Json` return is never rewritten.
+            let json_v = Ty::Con("Json".into(), vec![]);
+            fields.insert("decode".into(), Ty::function(
+                vec![Ty::str()], EffectSet::empty(),
+                Ty::Con("Result".into(), vec![json_v.clone(), Ty::str()]),
+            ));
+            // encode :: Json -> Str  (compact)
+            fields.insert("encode".into(), Ty::function(
+                vec![json_v.clone()], EffectSet::empty(), Ty::str(),
+            ));
+            // encode_pretty :: (Json, Int) -> Str  (indent spaces per level)
+            fields.insert("encode_pretty".into(), Ty::function(
+                vec![json_v, Ty::int()], EffectSet::empty(), Ty::str(),
+            ));
             Some(Ty::Record(fields))
         }
         "result" => {

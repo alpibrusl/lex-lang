@@ -219,6 +219,33 @@ fn dispatch(kind: &str, op: &str, args: &[Value]) -> Result<Value, String> {
                 Err(e) => Ok(err_v(Value::Str(format!("{e}").into()))),
             }
         }
+        // #885: generic `Json` value ADT path — native serde_json, O(n).
+        // `decode` builds JNull/JBool/JInt/JFloat/JStr/JList/JObj variants
+        // (not the natural Record/List shapes `json_to_value` produces);
+        // `encode`/`encode_pretty` are the inverse. This is the drop-in
+        // for lex-schema's interpreted `json_value`.
+        ("json", "decode") => {
+            let s = expect_str(args.first())?;
+            match serde_json::from_str::<serde_json::Value>(s) {
+                Ok(v) => Ok(ok_v(json_to_adt(&v))),
+                Err(e) => Ok(err_v(Value::Str(format!("{e}").into()))),
+            }
+        }
+        ("json", "encode") => {
+            let j = adt_to_json(first_arg(args)?)?;
+            Ok(Value::Str(serde_json::to_string(&j).unwrap_or_default().into()))
+        }
+        ("json", "encode_pretty") => {
+            let j = adt_to_json(args.first().ok_or("json.encode_pretty: missing arg")?)?;
+            let indent = expect_int(args.get(1))?.max(0) as usize;
+            let mut buf = Vec::new();
+            let space = vec![b' '; indent];
+            let fmt = serde_json::ser::PrettyFormatter::with_indent(&space);
+            let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
+            use serde::Serialize;
+            j.serialize(&mut ser).map_err(|e| format!("json.encode_pretty: {e}"))?;
+            Ok(Value::Str(String::from_utf8_lossy(&buf).into_owned().into()))
+        }
 
         // -- toml (config parser; routes through serde_json::Value
         // so the parsed shape composes with the existing json
@@ -2512,6 +2539,111 @@ fn unwrap_toml_datetime_markers(v: &mut serde_json::Value) {
 }
 
 fn json_to_value(v: &serde_json::Value) -> Value { Value::from_json(v) }
+
+/// Recursively build the generic `Json` value ADT (`std.json.decode`).
+/// Distinct from `json_to_value`, which produces the *natural* Record/List
+/// shapes — here every node is an explicit `J*` variant so the result is a
+/// total, pattern-matchable `Json`. serde_json preserves the int/float
+/// distinction (`is_i64`), mirrored onto `JInt`/`JFloat`.
+fn json_to_adt(v: &serde_json::Value) -> Value {
+    use serde_json::Value as J;
+    let variant = |name: &str, args: Vec<Value>| Value::Variant { name: name.into(), args };
+    match v {
+        J::Null => variant("JNull", vec![]),
+        J::Bool(b) => variant("JBool", vec![Value::Bool(*b)]),
+        J::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                variant("JInt", vec![Value::Int(i)])
+            } else {
+                // u64 beyond i64, or any fractional/large value → JFloat.
+                variant("JFloat", vec![Value::Float(n.as_f64().unwrap_or(f64::NAN))])
+            }
+        }
+        J::String(s) => variant("JStr", vec![Value::Str(s.as_str().into())]),
+        J::Array(xs) => variant(
+            "JList",
+            vec![Value::List(xs.iter().map(json_to_adt).collect())],
+        ),
+        J::Object(m) => variant(
+            "JObj",
+            vec![Value::List(
+                m.iter()
+                    .map(|(k, val)| {
+                        Value::Tuple(vec![Value::Str(k.as_str().into()), json_to_adt(val)])
+                    })
+                    .collect(),
+            )],
+        ),
+    }
+}
+
+/// Inverse of `json_to_adt`: turn a `Json` ADT value back into a
+/// `serde_json::Value` for `encode`/`encode_pretty`. Errors (rather than
+/// panics) if handed a value that isn't a well-formed `Json` — the type
+/// checker guarantees well-formedness for typed callers, but a builtin
+/// must stay total against hand-built `Value::Variant`s too.
+fn adt_to_json(v: &Value) -> Result<serde_json::Value, String> {
+    let (name, args) = match v {
+        Value::Variant { name, args } => (name.as_str(), args),
+        other => return Err(format!("json.encode: expected Json, got {other:?}")),
+    };
+    fn arg0<'a>(name: &str, args: &'a [Value]) -> Result<&'a Value, String> {
+        args.first().ok_or_else(|| format!("json.encode: {name} missing payload"))
+    }
+    match name {
+        "JNull" => Ok(serde_json::Value::Null),
+        "JBool" => match arg0(name, args)? {
+            Value::Bool(b) => Ok(serde_json::Value::Bool(*b)),
+            o => Err(format!("json.encode: JBool payload not a Bool: {o:?}")),
+        },
+        "JInt" => match arg0(name, args)? {
+            Value::Int(i) => Ok(serde_json::Value::Number((*i).into())),
+            o => Err(format!("json.encode: JInt payload not an Int: {o:?}")),
+        },
+        "JFloat" => match arg0(name, args)? {
+            Value::Float(f) => Ok(serde_json::Number::from_f64(*f)
+                .map(serde_json::Value::Number)
+                // JSON has no NaN/Infinity; emit null, matching serde's own
+                // behaviour for non-finite f64.
+                .unwrap_or(serde_json::Value::Null)),
+            o => Err(format!("json.encode: JFloat payload not a Float: {o:?}")),
+        },
+        "JStr" => match arg0(name, args)? {
+            Value::Str(s) => Ok(serde_json::Value::String(s.to_string())),
+            o => Err(format!("json.encode: JStr payload not a Str: {o:?}")),
+        },
+        "JList" => match arg0(name, args)? {
+            Value::List(xs) => {
+                let mut out = Vec::with_capacity(xs.len());
+                for x in xs.iter() {
+                    out.push(adt_to_json(x)?);
+                }
+                Ok(serde_json::Value::Array(out))
+            }
+            o => Err(format!("json.encode: JList payload not a List: {o:?}")),
+        },
+        "JObj" => match arg0(name, args)? {
+            Value::List(pairs) => {
+                let mut map = serde_json::Map::new();
+                for pair in pairs.iter() {
+                    match pair {
+                        Value::Tuple(kv) if kv.len() == 2 => {
+                            let k = match &kv[0] {
+                                Value::Str(s) => s.to_string(),
+                                o => return Err(format!("json.encode: JObj key not a Str: {o:?}")),
+                            };
+                            map.insert(k, adt_to_json(&kv[1])?);
+                        }
+                        o => return Err(format!("json.encode: JObj entry not a (Str, Json) pair: {o:?}")),
+                    }
+                }
+                Ok(serde_json::Value::Object(map))
+            }
+            o => Err(format!("json.encode: JObj payload not a List: {o:?}")),
+        },
+        other => Err(format!("json.encode: not a Json constructor: {other}")),
+    }
+}
 
 /// Extract the `List[Str]` of required field names from the second
 /// argument of `*.parse_strict`. The list is allowed to be empty
