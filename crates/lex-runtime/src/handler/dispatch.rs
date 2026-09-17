@@ -127,7 +127,7 @@ impl EffectHandler for DefaultHandler {
                 "exists" | "is_file" | "is_dir" | "stat"
                 | "list_dir" | "walk" | "glob" => "fs_walk",
                 "read_to_string" => "fs_read",
-                "mkdir_p" | "remove" | "write" => "fs_write",
+                "mkdir_p" | "remove" | "write" | "append" => "fs_write",
                 "copy" => {
                     self.ensure_kind_allowed("fs_walk")?;
                     self.ensure_kind_allowed("fs_write")?;

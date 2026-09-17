@@ -242,6 +242,17 @@ fn write_it(p :: Str, body :: Str) -> [fs_write] Str {
 }
 "#;
 
+const APPEND_SRC: &str = r#"
+import "std.fs" as fs
+
+fn append_it(p :: Str, body :: Str) -> [fs_write] Str {
+  match fs.append(p, body) {
+    Err(m) => m,
+    Ok(_) => "APPENDED",
+  }
+}
+"#;
+
 #[test]
 fn fs_read_to_string_reads_inside_the_allowlist() {
     let dir = unique_dir("read-ok");
@@ -356,5 +367,140 @@ fn granting_io_does_not_reach_fs_content_ops() {
     assert!(
         format!("{err}").contains("fs_read"),
         "unexpected error: {err}"
+    );
+}
+
+// ── fs.append (#899) ─────────────────────────────────────────────────────────
+//
+// Without it, adding a line to a file means read-all, concatenate, write-all,
+// so an append-only log costs O(n) bytes per entry and O(n^2) over its life.
+// Measured on a running hash-chained ledger: 1.8 TB written in a week to store
+// 87 MB.
+
+#[test]
+fn fs_append_adds_without_truncating() {
+    let dir = unique_dir("append-ok");
+    let file = dir.join("log.txt");
+    std::fs::write(&file, "first\n").unwrap();
+
+    let out = run(
+        APPEND_SRC,
+        "append_it",
+        vec![
+            Value::Str(file.to_string_lossy().into_owned().into()),
+            Value::Str("second\n".into()),
+        ],
+        policy_write_only(&dir),
+    );
+    assert_eq!(out, Value::Str("APPENDED".into()));
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "first\nsecond\n",
+        "append must preserve what was already there — truncating is `write`"
+    );
+}
+
+// A log's first line should not be a special case: appending to a path that
+// does not exist yet creates it, the way `write` would.
+#[test]
+fn fs_append_creates_a_missing_file() {
+    let dir = unique_dir("append-create");
+    let file = dir.join("fresh.txt");
+
+    let out = run(
+        APPEND_SRC,
+        "append_it",
+        vec![
+            Value::Str(file.to_string_lossy().into_owned().into()),
+            Value::Str("line one\n".into()),
+        ],
+        policy_write_only(&dir),
+    );
+    assert_eq!(out, Value::Str("APPENDED".into()));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "line one\n");
+}
+
+// Repeated appends accumulate in order. This is the property the whole feature
+// exists for: growing a log without rewriting it.
+#[test]
+fn fs_append_accumulates_in_order() {
+    let dir = unique_dir("append-order");
+    let file = dir.join("chain.txt");
+
+    for n in ["a\n", "b\n", "c\n"] {
+        run(
+            APPEND_SRC,
+            "append_it",
+            vec![
+                Value::Str(file.to_string_lossy().into_owned().into()),
+                Value::Str(n.into()),
+            ],
+            policy_write_only(&dir),
+        );
+    }
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "a\nb\nc\n");
+}
+
+// The scope must bite exactly as it does for `write`. Appending is a write:
+// nothing about only adding to the end makes it need less authority.
+#[test]
+fn fs_append_refuses_outside_the_write_allowlist() {
+    let allowed = unique_dir("append-scope-ok");
+    let other = unique_dir("append-scope-outside");
+    let file = other.join("elsewhere.txt");
+
+    let err = std::panic::catch_unwind(|| {
+        run(
+            APPEND_SRC,
+            "append_it",
+            vec![
+                Value::Str(file.to_string_lossy().into_owned().into()),
+                Value::Str("nope\n".into()),
+            ],
+            policy_write_only(&allowed),
+        )
+    })
+    .expect_err("append outside --allow-fs-write must refuse");
+    let msg = err
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_else(|| "non-string panic".into());
+    assert!(
+        msg.contains("allow-fs-write") || msg.contains("fs_write"),
+        "unexpected error: {msg}"
+    );
+    assert!(
+        !file.exists(),
+        "a refused append must not have created the file"
+    );
+}
+
+// It must NOT imply read. An appender that cannot read what it writes to is a
+// genuinely smaller authority for a log-only component, and that reduction is
+// only real if `fs_write` alone suffices to append.
+#[test]
+fn fs_append_needs_no_read_permission() {
+    let dir = unique_dir("append-no-read");
+    let file = dir.join("writeonly.txt");
+    std::fs::write(&file, "existing\n").unwrap();
+
+    let mut p = Policy::pure();
+    p.allow_effects = ["fs_write".to_string()].into_iter().collect::<BTreeSet<_>>();
+    p.allow_fs_write = vec![dir.clone()];
+    // deliberately no allow_fs_read at all
+
+    let out = run(
+        APPEND_SRC,
+        "append_it",
+        vec![
+            Value::Str(file.to_string_lossy().into_owned().into()),
+            Value::Str("added\n".into()),
+        ],
+        p,
+    );
+    assert_eq!(out, Value::Str("APPENDED".into()));
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "existing\nadded\n"
     );
 }

@@ -2368,6 +2368,26 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 vec![Ty::str(), Ty::str()],
                 EffectSet::singleton("fs_write"),
                 result_str(Ty::Unit)));
+            // fs.append :: (Str, Str) -> [fs_write] Result[Unit, Str]
+            //
+            // Without this, adding a line to a file means read-all,
+            // concatenate, write-all — so an append-only log costs O(n) bytes
+            // per entry and O(n^2) over its life. Measured on a running
+            // hash-chained ledger: 1.8 TB written in a week to store 87 MB
+            // (#899). Sharding into many files trades a write problem for a
+            // correctness one, and reaching for a database to add a line to a
+            // log is a service dependency inside programs whose argument is a
+            // small auditable surface.
+            //
+            // Same effect as `write` and the same `--allow-fs-write` gate: it
+            // modifies a file, and nothing about appending makes it need less
+            // authority. It deliberately does NOT imply read — an appender
+            // that cannot read what it writes to is a genuinely smaller
+            // authority for a log-only component.
+            fields.insert("append".into(), Ty::function(
+                vec![Ty::str(), Ty::str()],
+                EffectSet::singleton("fs_write"),
+                result_str(Ty::Unit)));
 
             // Walk-style queries [fs_walk]
             fields.insert("exists".into(), Ty::function(
