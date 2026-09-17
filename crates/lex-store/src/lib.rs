@@ -28,6 +28,7 @@
 mod budget;
 mod planner;
 mod store;
+pub mod render;
 mod model;
 mod branches;
 mod merge_checker;

@@ -2000,42 +2000,6 @@ impl Store {
         Ok(lex_ast::print_stages(&self.program_stages_at_op(op_id)?))
     }
 
-    /// The program at `op_id`, rendered to **de-mangled, compilable** source
-    /// for a single-module package (#920). Declarations published through the
-    /// package loader carry a per-file mangling prefix (`lib_ab12cd.double`);
-    /// this strips it so `import "<pkg>/lib"` resolves the real names. Used by
-    /// the registry archive endpoint to serve source for an op-log-native
-    /// release that has no separately-uploaded archive.
-    ///
-    /// Single-module only (the hosting limit, #894): all declarations share
-    /// one prefix, and that prefix is a globally-unique `<stem>_<hash>` token,
-    /// so a textual strip is unambiguous — it can't collide with a stdlib
-    /// alias (`int.to_str`) or any bare name. A package with more than one
-    /// declaration prefix (multi-module) is not something the hub hosts yet;
-    /// each detected prefix is stripped best-effort.
-    pub fn render_source_at_op(&self, op_id: &str) -> Result<String, StoreError> {
-        let stages = self.program_stages_at_op(op_id)?;
-        let source = lex_ast::print_stages(&stages);
-        // Collect the mangling prefixes actually used by *declarations*
-        // (never stdlib import aliases, which don't appear as decl names).
-        let mut prefixes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for stage in &stages {
-            let name = match stage {
-                Stage::FnDecl(fd) => Some(&fd.name),
-                Stage::TypeDecl(td) => Some(&td.name),
-                Stage::Import(_) => None,
-            };
-            if let Some((prefix, _)) = name.and_then(|n| n.split_once('.')) {
-                prefixes.insert(prefix.to_string());
-            }
-        }
-        let mut out = source;
-        for prefix in prefixes {
-            out = out.replace(&format!("{prefix}."), "");
-        }
-        Ok(out)
-    }
-
     /// Open the attestation log rooted at this store. The log lives
     /// under `<root>/attestations/`; opening is idempotent and cheap
     /// (`fs::create_dir_all`). Exposed publicly so consumers — `lex
