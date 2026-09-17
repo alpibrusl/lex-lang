@@ -9,10 +9,13 @@ use lex_runtime::{DefaultHandler, Policy};
 use lex_syntax::parse_source;
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{TcpStream};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+
+mod common;
+use common::wait_for_bind;
 
 /// Spawn the Lex source's `entry` function on a background thread.
 /// The thread is detached; it dies when the test process exits.
@@ -36,29 +39,6 @@ fn spawn_lex_server(src: &str, entry: &str) {
         let mut vm = Vm::with_handler(&bc, Box::new(handler));
         let _ = vm.call(&entry, vec![]);
     });
-}
-
-/// Poll-connect to `port` until the listener accepts a TCP
-/// connection or the deadline expires. Replaces a fixed sleep so
-/// the test passes whether bind takes 5ms (plain HTTP) or 500ms
-/// (TLS with cold cert load) without slowing the fast path.
-fn wait_for_bind(port: u16, timeout: Duration) {
-    let deadline = std::time::Instant::now() + timeout;
-    let mut backoff = Duration::from_millis(20);
-    loop {
-        if let Ok(s) = TcpStream::connect_timeout(
-            &("127.0.0.1", port).to_socket_addrs().unwrap().next().unwrap(),
-            Duration::from_millis(200),
-        ) {
-            drop(s);
-            return;
-        }
-        if std::time::Instant::now() >= deadline {
-            panic!("server on :{port} did not bind within {timeout:?}");
-        }
-        thread::sleep(backoff);
-        backoff = (backoff * 2).min(Duration::from_millis(200));
-    }
 }
 
 fn http(port: u16, method: &str, path: &str, body: &str) -> (u16, String) {

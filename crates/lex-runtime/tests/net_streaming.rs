@@ -14,10 +14,13 @@ use lex_runtime::{DefaultHandler, Policy};
 use lex_syntax::parse_source;
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{TcpStream};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+
+mod common;
+use common::wait_for_bind;
 
 fn spawn_lex_server(src: &str, entry: &str) {
     let prog = parse_source(src).expect("parse");
@@ -34,24 +37,6 @@ fn spawn_lex_server(src: &str, entry: &str) {
         let mut vm = Vm::with_handler(&bc, Box::new(handler));
         let _ = vm.call(&entry, vec![]);
     });
-}
-
-fn wait_for_bind(port: u16, timeout: Duration) {
-    let deadline = std::time::Instant::now() + timeout;
-    let mut backoff = Duration::from_millis(20);
-    loop {
-        if TcpStream::connect_timeout(
-            &("127.0.0.1", port).to_socket_addrs().unwrap().next().unwrap(),
-            Duration::from_millis(200),
-        ).is_ok() {
-            return;
-        }
-        if std::time::Instant::now() >= deadline {
-            panic!("server on :{port} did not bind within {timeout:?}");
-        }
-        thread::sleep(backoff);
-        backoff = (backoff * 2).min(Duration::from_millis(200));
-    }
 }
 
 /// Raw GET that returns (status_line, headers_text, raw_body_bytes).

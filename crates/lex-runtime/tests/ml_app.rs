@@ -13,6 +13,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+mod common;
+use common::wait_for_bind;
+
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent().unwrap()
@@ -40,19 +43,7 @@ fn spawn_ml_server(port: u16) {
         let mut vm = Vm::with_handler(&bc, Box::new(handler));
         let _ = vm.call("main", vec![]);
     });
-    // Poll until the server is accepting connections rather than sleeping a
-    // fixed interval: under CI load the listener may not be up within 200ms,
-    // which made the connect() in http() panic spuriously.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            panic!("ml server on port {port} did not start listening within 10s");
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
+    wait_for_bind(port, Duration::from_secs(10));
 }
 
 fn http(port: u16, path: &str) -> (u16, String) {
