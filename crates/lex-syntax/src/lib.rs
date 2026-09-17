@@ -7,6 +7,7 @@ pub mod syntax;
 pub mod parser;
 pub mod printer;
 pub mod loader;
+pub mod semver;
 pub mod workspace;
 
 pub use loader::{
