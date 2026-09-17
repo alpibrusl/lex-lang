@@ -456,6 +456,11 @@ fn cmd_check(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     // canonical-AST bytes instead of `.lex` text.
     let mut from_canonical = false;
     let mut strict = false;
+    // Opt-in enforcement of deprecation notices. Off by default and it must
+    // stay that way: `lex ci` runs `check --strict`, and 122 files across the
+    // fleet still call `io.read`. A notice nobody asked for should not turn
+    // into a red build nobody chose.
+    let mut deny_deprecated = false;
     let mut path: Option<&str> = None;
     // The effect policy to check the program against, and whether the
     // caller asked for that check at all.
@@ -470,7 +475,7 @@ fn cmd_check(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let mut policy = Policy::pure();
     let mut policy_given = false;
     let usage = || {
-        format!("usage: lex check [--from-canonical] [--strict] {POLICY_USAGE} <file>")
+        format!("usage: lex check [--from-canonical] [--strict] [--deny-deprecated] {POLICY_USAGE} <file>")
     };
     let mut i = 0;
     while i < args.len() {
@@ -485,6 +490,9 @@ fn cmd_check(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             }
             "--strict" => {
                 strict = true;
+            }
+            "--deny-deprecated" => {
+                deny_deprecated = true;
             }
             other if !other.starts_with("--") => {
                 if path.is_some() {
@@ -633,6 +641,21 @@ widen the policy or narrow the program"
                 vec![]
             };
 
+            // Deprecation notices, on EVERY check rather than only under
+            // `--strict`. They are the cheap half of a migration nobody has
+            // been asked to start, and the plain `lex check` is what people
+            // actually run — a notice only visible behind a flag is the same
+            // as the Rust source comment it replaces.
+            let deprecation_notices = if !from_canonical && path != "-" {
+                std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|src| lex_syntax::parse_source(&src).ok())
+                    .map(|prog| lint::deprecations(&prog))
+                    .unwrap_or_default()
+            } else {
+                vec![]
+            };
+
             // Third --strict check (#347 A2): bytecode stack-depth verifier.
             // Compiles the type-checked program and verifies that every branch
             // merge point has a consistent stack depth — catching PConstructor
@@ -662,6 +685,9 @@ widen the policy or narrow the program"
                 "required_net_host": summary.net_host,
                 "policy_checked": policy_given,
                 "warnings": lint_warnings,
+                // Separate from `warnings`, and deliberately not folded into
+                // `ok`: a deprecation is not a defect in this program.
+                "deprecations": deprecation_notices,
             });
             acli::emit_or_text("check", data, fmt, || {
                 if lint_warnings.is_empty() {
@@ -670,6 +696,9 @@ widen the policy or narrow the program"
                     for w in &lint_warnings {
                         println!("[{}] {} ({})", w.code, w.message, w.location);
                     }
+                }
+                for d in &deprecation_notices {
+                    println!("[{}] {} ({})", d.code, d.message, d.location);
                 }
                 if !summary.kinds.is_empty() {
                     println!("required effects: {}", summary.kinds.join(", "));
@@ -689,6 +718,12 @@ widen the policy or narrow the program"
                 }
             });
             if !lint_warnings.is_empty() {
+                std::process::exit(1);
+            }
+            // Only when the caller asked. A repository that has finished
+            // migrating can wire this in to stay migrated; one that has not
+            // keeps a green build and a visible notice.
+            if deny_deprecated && !deprecation_notices.is_empty() {
                 std::process::exit(1);
             }
             Ok(())

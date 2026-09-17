@@ -216,6 +216,26 @@ an exhaustive function list.
 | `std.moe` | `pin`, `unpin`, `prefetch_hint`, `usage_snapshot`, `stats` |
 <!-- docsync:end stdlib-index -->
 
+#### Deprecated: `io.read` / `io.write`
+
+`std.io`'s content ops take a **path** but declare `[io]` — documented as
+"console / stdio" — so an effect row never reveals filesystem reach (#882).
+Use `fs.read_to_string` and `fs.write` instead; they declare `[fs_read]` and
+`[fs_write]`, and are gated by the same `--allow-fs-read` / `--allow-fs-write`
+allowlists.
+
+`lex check` reports a `DEPRECATED_IO` notice where the old ops are called. It
+is advisory: it does **not** fail the check, and `--strict` still exits 0 on a
+program whose only finding is a deprecation. Pass `--deny-deprecated` to
+enforce it in a package that has finished migrating.
+
+**Migrating changes your effect row.** `fs.read_to_string` declares
+`[fs_read]` where `io.read` declared `[io]`, so the enclosing function's
+signature changes — and that propagates to every caller and to every
+*unpinned* dependent (#756). Swapping the call in a library without the
+packages that depend on it is how a silent break happens. Migrate a package
+and its dependents together, and pin while you do it.
+
 #### Declared builtins
 
 The modules below are defined declaratively in
