@@ -76,6 +76,28 @@ bumps may carry breaking changes when justified).
   registry archive endpoint, so the git view and an installed package are
   byte-identical source. (Local-import alias fidelity is still #909.)
 
+## [0.11.38] - 2026-09-18
+
+### Added
+
+- **Dependency change-propagation (#893).** A low-level package's API change
+  can now be pushed down its dependents provably, instead of surfacing as
+  downstream build breakage later.
+  - **Version-bump gate** — `POST /v1/pkg/{name}/release` refuses a version
+    bump smaller than the public-API change requires (breaking → major,
+    addition → minor, body-only → patch), diffing against the semver
+    predecessor. This makes `^`/`~` resolution trustworthy.
+  - **`lex propagate --package <up> --rename old=new [--workspace <d>]
+    [--apply]`** — token-precise rename fan-out across dependents: finds each
+    one's import alias for the upstream and rewrites `alias.old` →
+    `alias.new`, preserving formatting/comments and leaving strings and
+    look-alikes untouched.
+  - **`lex propagate --package <up> --symbol <name> --note <text>
+    (--regenerate-cmd <cmd> | --ollama [MODEL])`** — agent-driven semantic
+    migration for changes that aren't pure renames, accepting a regenerated
+    module only if it parses and type-checks (the always-valid-HEAD gate
+    applied to a propagated change).
+
 ## [Unreleased]
 
 ### Added
