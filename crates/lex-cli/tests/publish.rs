@@ -151,3 +151,57 @@ fn blame_after_rename_shows_one_causal_event() {
         .filter(|e| e["kind"] == "rename_symbol").collect();
     assert_eq!(renames.len(), 1, "expected exactly one rename in causal history");
 }
+
+fn publish_dir(root: &std::path::Path, store: &std::path::Path) -> std::process::Output {
+    Command::new(lex_bin())
+        .args([
+            "--output", "json", "publish", "--activate",
+            "--store", store.to_str().unwrap(),
+            root.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap()
+}
+
+fn ops_len(out: &std::process::Output) -> usize {
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    v.pointer("/data/ops")
+        .or_else(|| v.get("ops"))
+        .and_then(|o| o.as_array())
+        .map(|a| a.len())
+        .unwrap_or_else(|| panic!("no ops field; stderr: {}", String::from_utf8_lossy(&out.stderr)))
+}
+
+/// `lex publish <dir>` publishes a whole multi-module package as one
+/// prefix-mangled program (#894), and a byte-identical republish is a
+/// no-op. The two modules share a *structurally identical* `dup` helper:
+/// same signature and body, different files, so they get one
+/// name-independent `StageId` but distinct `SigId`s. Reading the old side
+/// by `StageId` dropped one of the pair and re-added it on every
+/// republish (unbounded op growth, #818/#826/#894) — this pins that shut.
+#[test]
+fn publish_package_is_idempotent_across_shared_stage_ids() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("lex.toml"), "[package]\nname = \"pkg\"\nversion = \"0.1.0\"\n").unwrap();
+    let src = root.join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("a.lex"), "fn dup(x :: Int) -> Int { x }\n").unwrap();
+    std::fs::write(src.join("b.lex"), "fn dup(x :: Int) -> Int { x }\n").unwrap();
+    std::fs::write(
+        src.join("main.lex"),
+        "import \"./a\" as a\nimport \"./b\" as b\nfn run(n :: Int) -> Int { a.dup(n) + b.dup(n) }\n",
+    )
+    .unwrap();
+    let store = root.join(".lex/store");
+
+    let p1 = publish_dir(root, &store);
+    assert!(p1.status.success(), "publish #1: {}", String::from_utf8_lossy(&p1.stderr));
+    // Both `dup`s + `run` — the sibling-name collision that made
+    // module-by-module publishing fail can't happen (mangled names).
+    assert!(ops_len(&p1) >= 3, "expected >=3 ops (both dups + run), got {}", ops_len(&p1));
+
+    let p2 = publish_dir(root, &store);
+    assert!(p2.status.success(), "publish #2: {}", String::from_utf8_lossy(&p2.stderr));
+    assert_eq!(ops_len(&p2), 0, "a package republish must be a no-op (idempotent)");
+}
