@@ -716,6 +716,25 @@ fn post_json(
     Ok(v)
 }
 
+/// GET `<remote><path>`, returning the parsed JSON response. The read half's
+/// twin of [`post_json`], for the attestation-sync fetches.
+fn get_json(remote: &str, path: &str, token: Option<&str>) -> Result<serde_json::Value> {
+    let url = format!("{}{}", remote.trim_end_matches('/'), path);
+    let resp = with_auth(ureq::get(&url), token)
+        .call()
+        .map_err(|e| anyhow!("GET {url}: {e}"))?;
+    let status = resp.status().as_u16();
+    if status == 401 {
+        bail!("remote requires auth (HTTP 401) — set LEXHUB_TOKEN or pass --token");
+    }
+    let v: serde_json::Value = resp.into_body().with_config().limit(SYNC_BODY_LIMIT).read_json()
+        .map_err(|e| anyhow!("decoding {path} response: {e}"))?;
+    if status >= 400 {
+        bail!("server rejected {path} (HTTP {status}): {v}");
+    }
+    Ok(v)
+}
+
 /// Stage/intent ids requested per `fetch` call. Stage blobs are ASTs and can
 /// be large, so bound how many come back in one response; `pull_objects`
 /// chunks its id lists by this.
@@ -767,14 +786,20 @@ fn pull_objects(
     ops: &[OperationRecord],
     store: &Store,
     token: Option<&str>,
-) -> Result<(usize, usize)> {
+) -> Result<(usize, usize, usize)> {
     use std::collections::BTreeSet;
-    let mut want_stages: BTreeSet<String> = BTreeSet::new();
+    // Every stage the pulled ops produce — used both to fetch missing stage
+    // ASTs and to pull the attestations keyed to those stages.
+    let mut produced_stages: BTreeSet<String> = BTreeSet::new();
     for rec in ops {
         for sid in rec.produces.stage_ids() {
-            if store.get_ast(&sid).is_err() {
-                want_stages.insert(sid);
-            }
+            produced_stages.insert(sid);
+        }
+    }
+    let mut want_stages: BTreeSet<String> = BTreeSet::new();
+    for sid in &produced_stages {
+        if store.get_ast(sid).is_err() {
+            want_stages.insert(sid.clone());
         }
     }
     let mut stages_added = 0usize;
@@ -811,7 +836,28 @@ fn pull_objects(
             }
         }
     }
-    Ok((stages_added, intents_added))
+
+    // Attestations are stage-keyed, so pull them per produced stage (#916).
+    // Without this a puller never sees the remote's verdicts — e.g. the
+    // hosted CI runner's trusted `lex-hub-ci` TypeCheck attestation — so a
+    // require-attestation gate can't be checked locally. Idempotent: an
+    // attestation already present (content-addressed id) is skipped.
+    let attestation_log = lex_vcs::AttestationLog::open(store.root())?;
+    let mut attestations_added = 0usize;
+    for sid in &produced_stages {
+        let v = get_json(remote, &format!("/v1/stage/{sid}/attestations"), token)?;
+        if let Some(arr) = v.get("attestations").and_then(|a| a.as_array()) {
+            for av in arr {
+                let att: lex_vcs::Attestation = serde_json::from_value(av.clone())?;
+                if attestation_log.get(&att.attestation_id)?.is_none() {
+                    attestation_log.put(&att)?;
+                    attestations_added += 1;
+                }
+            }
+        }
+    }
+
+    Ok((stages_added, intents_added, attestations_added))
 }
 
 /// `lex op pull <remote_url> [--branch NAME] [--since OP_ID]
@@ -948,9 +994,10 @@ fn cmd_op_pull(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         batch_ids.insert(rec.op_id.clone());
     }
 
-    // Content: fetch + store the stage (code) and intent blobs the pulled
-    // ops reference, so the pulled op-log actually renders and replays.
-    let (_stages_pulled, _intents_pulled) =
+    // Content: fetch + store the stage (code), intent, and attestation blobs
+    // the pulled ops reference, so the pulled op-log actually renders, replays,
+    // and carries the remote's verdicts (#916).
+    let (_stages_pulled, _intents_pulled, attestations_pulled) =
         pull_objects(&remote, &received, &store, token.as_deref())?;
 
     // Divergent-history detection: a clean fast-forward requires
@@ -994,6 +1041,7 @@ fn cmd_op_pull(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "branch": branch,
         "received": received.len(),
         "added": added,
+        "attestations_added": attestations_pulled,
         "fast_forwarded_to": new_tip,
     });
     let total = received.len();
@@ -1001,9 +1049,14 @@ fn cmd_op_pull(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let branch_text = branch.clone();
     let new_tip_text = new_tip.clone();
     acli::emit_or_text("op-pull", data, fmt, move || {
+        let att = if attestations_pulled > 0 {
+            format!(", {attestations_pulled} attestation(s)")
+        } else {
+            String::new()
+        };
         println!(
             "pulled {total} ops from {remote_text} on branch `{branch_text}`: \
-             {added} new, branch advanced to {new_tip_text}"
+             {added} new{att}, branch advanced to {new_tip_text}"
         );
     });
     Ok(())
