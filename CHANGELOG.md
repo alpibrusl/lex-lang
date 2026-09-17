@@ -40,6 +40,30 @@ bumps may carry breaking changes when justified).
   `TypeCheck::Failed` — the write-time gate still refuses a type-broken
   publish.
 
+## [0.11.36] - 2026-09-17
+
+### Fixed
+
+- **Registry dependency resolution reads the public surface (#917).**
+  `lex pkg lock`/`update`/`install` fetched versions/archive/contract from
+  the authenticated `/v1/pkg/{name}/…` route, which returns `401` to an
+  anonymous resolver, and built malformed URLs from a tenant-qualified
+  `registry`. They now target the hub's public surface
+  `https://<host>/v1/public/<tenant>/<name>/…`, with a named store selected
+  via `?store=<store>` (new `lex_syntax::registry::public`). Bare-host
+  registries keep the legacy form.
+- **`lex op pull` syncs attestations (#916).** Pull fetched only
+  ops + stages + intents, so a puller never saw the hub's server-side
+  verdicts (the trusted `lex-hub-ci` TypeCheck attestation, `Review`,
+  `Replay`, …). It now fetches attestations per produced stage into the
+  local log and reports the count.
+- **Op-log-native packages install (#920).** A package hosted via `op push`
+  + `POST …/release` resolved (`lex pkg lock`) but did not install: the
+  archive endpoint 404'd because a released version has an op-log head, not
+  a stored archive. The registry archive endpoint now renders a de-mangled
+  source archive from the release's op-log head on demand, so such a package
+  installs like any other (single-module; #894).
+
 ## [Unreleased]
 
 ### Added
