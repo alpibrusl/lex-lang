@@ -780,3 +780,34 @@ fn a_type_error_anywhere_publishes_nothing() {
         "a rejected publish must leave the branch head where it was",
     );
 }
+
+/// #893: `POST /v1/pkg/{name}/release` snapshots the current op-log head
+/// as an immutable `name@version` release (op-log ref only, no archive),
+/// readable via the registry, and a re-release of the same version is a
+/// 409 — so a resolved+locked dependency can never change underneath a
+/// consumer.
+#[test]
+fn release_snapshots_the_head_immutably() {
+    let (srv, _tmp) = start_server();
+
+    // Seed a head by publishing a package.
+    let archive = pkg_archive("relpkg", "0.1.0", &[("a.lex", "fn f() -> Int { 1 }\n")]);
+    let (s, b) = post_bytes(&srv.addr, "/v1/pkg/publish", &archive);
+    assert_eq!(s, 200, "publish: {b}");
+
+    // Cut a new versioned release of the current head.
+    let (s, b) = post_bytes(&srv.addr, "/v1/pkg/relpkg/release", br#"{"version":"1.0.0"}"#);
+    assert_eq!(s, 201, "release: {b}");
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert!(v["head_op"].as_str().is_some(), "release response carries head_op: {b}");
+
+    // The release record is readable and carries the op-log ref.
+    let (s, b) = get(&srv.addr, "/v1/pkg/relpkg/1.0.0");
+    assert_eq!(s, 200, "read release: {b}");
+    let rec: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert!(rec["head_op"].as_str().is_some(), "record has head_op: {b}");
+
+    // Immutable: re-releasing 1.0.0 is a 409.
+    let (s, _b) = post_bytes(&srv.addr, "/v1/pkg/relpkg/release", br#"{"version":"1.0.0"}"#);
+    assert_eq!(s, 409, "re-release of an existing version must be rejected");
+}

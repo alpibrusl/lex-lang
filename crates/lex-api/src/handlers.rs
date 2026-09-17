@@ -437,6 +437,12 @@ fn route(
             let name = &p["/v1/pkg/".len()..p.len() - "/visibility".len()];
             pkg_set_visibility_handler(state, name, body)
         }
+        // Cut an immutable versioned release of an op-log-hosted package
+        // (#893). POST, before the generic /v1/pkg/{name} arms.
+        (Method::Post, p) if p.starts_with("/v1/pkg/") && p.ends_with("/release") => {
+            let name = &p["/v1/pkg/".len()..p.len() - "/release".len()];
+            pkg_release_handler(state, name, body)
+        }
         (Method::Get, p) if p.starts_with("/v1/pkg/") && p.ends_with("/head") => {
             let name = &p["/v1/pkg/".len()..p.len() - "/head".len()];
             pkg_head_handler(state, name)
@@ -1715,6 +1721,93 @@ fn pkg_set_visibility_handler(
     }
 }
 
+#[derive(serde::Deserialize)]
+struct ReleaseReq {
+    version: String,
+    #[serde(default)]
+    branch: Option<String>,
+}
+
+/// `POST /v1/pkg/{name}/release` — cut an immutable versioned release of
+/// an **op-log-hosted** package: snapshot the current branch head as
+/// `name@version` in the registry (#893). Unlike `POST /v1/pkg/publish`
+/// (archive upload), this records only the op-log ref (`head_op`) — a
+/// consumer resolves the version, `op pull`s that head, and renders
+/// source. A published version is immutable: re-releasing an existing
+/// version is a 409, so a resolved+locked dependency can never change
+/// under a consumer.
+fn pkg_release_handler(state: &State, name: &str, body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    if !valid_pkg_segment(name) {
+        return error_response(400, format!("invalid package name {name:?}"));
+    }
+    let req: ReleaseReq = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(e) => return error_response(400, format!("bad request: {e}")),
+    };
+    let version = req.version.trim().to_string();
+    if version.is_empty() || !valid_pkg_segment(&version) {
+        return error_response(400, "version must be a non-empty, path-safe string (e.g. 1.2.0)");
+    }
+    // Immutable: a published version can never be overwritten.
+    if load_pkg_record(&state.root, name, &version).is_some() {
+        return error_response(
+            409,
+            format!("{name}@{version} already released; releases are immutable — bump the version"),
+        );
+    }
+
+    let store = state.store.lock().unwrap();
+    let branch = req.branch.unwrap_or_else(|| store.current_branch());
+    let head_op = match store.get_branch(&branch) {
+        Ok(Some(b)) => b.head_op,
+        Ok(None) => return error_response(404, format!("unknown branch {branch:?}")),
+        Err(e) => return error_response(500, format!("get_branch: {e}")),
+    };
+    let Some(head_op) = head_op else {
+        return error_response(400, format!("branch {branch:?} has no commits to release"));
+    };
+
+    // The package's exported function names at this head (for retract /
+    // the catalog), read through the SigId the head names each by.
+    let head = store.branch_head(&branch).unwrap_or_default();
+    let pairs: Vec<(String, String)> = head.iter().map(|(s, st)| (s.clone(), st.clone())).collect();
+    let function_names: Vec<String> = store
+        .get_asts_for_sigs_bulk(&pairs)
+        .into_iter()
+        .filter_map(|r| r.ok())
+        .filter_map(|s| match s {
+            lex_ast::Stage::FnDecl(fd) => Some(fd.name),
+            _ => None,
+        })
+        .collect();
+    drop(store);
+
+    let published_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let record = PkgRecord {
+        name: name.to_string(),
+        version: version.clone(),
+        head_op: Some(head_op.clone()),
+        published_at,
+        function_names,
+        ops: Vec::new(),
+    };
+    if let Err(e) = save_pkg_record(&state.root, &record, None) {
+        return error_response(500, format!("write release: {e}"));
+    }
+    json_response(
+        201,
+        &serde_json::json!({
+            "name": name,
+            "version": version,
+            "head_op": head_op,
+            "branch": branch,
+        }),
+    )
+}
+
 /// Names of the tenant's PUBLIC packages, sorted. Pure (filesystem in,
 /// names out) so the visibility filter is unit-testable.
 fn public_pkg_names(root: &std::path::Path) -> Vec<String> {
@@ -1841,7 +1934,9 @@ pub fn route_public(
 fn save_pkg_record(
     root: &std::path::Path,
     record: &PkgRecord,
-    archive: &[u8],
+    // `None` for an op-log release, whose source of truth is the op-log at
+    // `head_op` (pull + render); `Some` for an archive-upload publish.
+    archive: Option<&[u8]>,
 ) -> std::io::Result<()> {
     let dir = pkg_name_dir(root, &record.name);
     std::fs::create_dir_all(&dir)?;
@@ -1850,8 +1945,10 @@ fn save_pkg_record(
     let rec_bytes = serde_json::to_vec_pretty(record).unwrap_or_default();
     std::fs::write(pkg_version_path(root, &record.name, &record.version), rec_bytes)?;
 
-    // Archive (tar.gz) for the download endpoint.
-    std::fs::write(pkg_archive_path(root, &record.name, &record.version), archive)?;
+    // Archive (tar.gz) for the download endpoint, when one was uploaded.
+    if let Some(archive) = archive {
+        std::fs::write(pkg_archive_path(root, &record.name, &record.version), archive)?;
+    }
 
     // Update the index.
     let mut index = load_pkg_index(root, &record.name).unwrap_or_default();
@@ -2181,7 +2278,7 @@ fn pkg_publish_handler(state: &State, body: &[u8]) -> Response<std::io::Cursor<V
         function_names: all_function_names,
         ops: all_ops.clone(),
     };
-    if let Err(e) = save_pkg_record(&state.root, &record, body) {
+    if let Err(e) = save_pkg_record(&state.root, &record, Some(body)) {
         return error_response(500, format!("save package index: {e}"));
     }
 
@@ -2447,7 +2544,7 @@ mod public_read_tests {
             function_names: vec![format!("{name}.f")],
             ops: vec![],
         };
-        save_pkg_record(root, &record, format!("ARCHIVE:{name}@{version}").as_bytes())
+        save_pkg_record(root, &record, Some(format!("ARCHIVE:{name}@{version}").as_bytes()))
             .expect("seed package");
     }
 
