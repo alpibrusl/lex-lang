@@ -1,6 +1,73 @@
 //! `lex publish` and `lex store *`: publishing stages into the content store, store maintenance and search.
 
 use super::*;
+use lex_syntax::{load_package, Manifest};
+
+/// Read the source `lex publish` was given. A **directory** is a whole
+/// package: every `src/**/*.lex` is loaded as one prefix-mangled program
+/// (`<stem>_<hash>.<name>`), so two modules can each declare a `validate`
+/// without colliding in the branch's name-keyed type-check scope
+/// (#828/#894) — publishing a multi-module package module-by-module can't
+/// (they collide). Returns the per-file import map for a package; a
+/// single **file** is loaded as before and returns `None` (the caller
+/// derives imports from the parsed `Import` stages).
+fn read_publish_source(path: &str) -> Result<(SynProgram, Option<lex_vcs::ImportMap>)> {
+    let p = std::path::Path::new(path);
+    if !p.is_dir() {
+        return Ok((read_program(path)?, None));
+    }
+    let manifest = Manifest::load(&p.join("lex.toml"))
+        .map_err(|e| anyhow!("reading {path}/lex.toml (a package publish needs it): {e}"))?;
+    // The package name is mixed into every mangling key so two packages
+    // with the same internal layout don't collapse onto one set of names.
+    let namespace = manifest
+        .package
+        .as_ref()
+        .map(|m| m.name.clone())
+        .ok_or_else(|| anyhow!("{path}/lex.toml needs a [package] name to publish a package"))?;
+    let src_dir = p.join("src");
+    if !src_dir.is_dir() {
+        bail!("package {path} has no src/ directory to publish");
+    }
+    let mut entries: Vec<PathBuf> = Vec::new();
+    collect_lex_files(&src_dir, &mut entries);
+    if entries.is_empty() {
+        bail!("no .lex files under {path}/src");
+    }
+    let loaded =
+        load_package(&entries, p, &namespace).map_err(|e| anyhow!("loading package {path}: {e}"))?;
+    // `imports_by_file` carries only the module reference, not the `as`
+    // alias, so record each under its default alias; a non-default alias
+    // in a multi-file package round-trips once the loader threads aliases
+    // through (with the rest of #894).
+    let mut imports = lex_vcs::ImportMap::new();
+    for (file, modules) in &loaded.imports_by_file {
+        let entry = imports.entry(file.clone()).or_default();
+        for m in modules {
+            entry.insert(lex_vcs::ImportRef {
+                reference: m.clone(),
+                alias: lex_vcs::default_import_alias(m),
+            });
+        }
+    }
+    Ok((loaded.program, Some(imports)))
+}
+
+/// Recursively collect `*.lex` files under `dir`, sorted for a
+/// deterministic load order.
+fn collect_lex_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut es: Vec<_> = rd.filter_map(|e| e.ok()).collect();
+    es.sort_by_key(|e| e.path());
+    for e in es {
+        let path = e.path();
+        if path.is_dir() {
+            collect_lex_files(&path, out);
+        } else if path.extension().and_then(|x| x.to_str()) == Some("lex") {
+            out.push(path);
+        }
+    }
+}
 
 /// Build the embedder used by `lex store search` / `lex audit
 /// --query`. When `LEX_EMBED_URL` is set we wire up an HTTP backend
@@ -81,7 +148,10 @@ pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     })?;
     let signer = resolve_signing_key(signing_key_flag.as_deref())?;
 
-    let prog = read_program(path)?;
+    // A directory argument publishes the whole package (mangled, one op
+    // log, no sibling-name collisions); a file argument is a single
+    // module. `pkg_imports` is `Some` only for a package.
+    let (prog, pkg_imports) = read_publish_source(path)?;
     // #168: type-check *and* rewrite stdlib parse calls so a
     // typed `toml.parse[T]` validates required fields before
     // returning Ok. The mutation lands in the canonical AST so
@@ -130,27 +200,42 @@ pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 
     // Compute the diff. We need the old fns and new fns.
     let old_head = store.branch_head(&branch)?;
-    let old_fns: BTreeMap<String, lex_ast::FnDecl> = old_head
-        .values()
-        .filter_map(|stg| store.get_ast(stg).ok())
-        .filter_map(|s| match s {
-            Stage::FnDecl(fd) => Some((fd.name.clone(), fd)),
-            _ => None,
-        })
+    // Read every live declaration through the `SigId` the head names it
+    // by — NOT by `StageId`. A `StageId` is name-independent, so two
+    // structurally identical helpers copy-pasted across a package's
+    // modules (`list_contains_str` in both `constraints.lex` and
+    // `migrate.lex`) share one `StageId`; reading the old side by
+    // `StageId` (`get_ast`) returns a single name for the pair and drops
+    // the other, so the diff re-adds it on every republish — unbounded op
+    // growth (#818/#826/#894). `get_asts_for_sigs_bulk` reads each
+    // `SigId`'s own stored AST, recovering the correct name for each. The
+    // HTTP publish path already reads the old side this way.
+    let head_pairs: Vec<(String, String)> = old_head
+        .iter()
+        .map(|(sig, stage)| (sig.clone(), stage.clone()))
         .collect();
+    let mut old_fns: BTreeMap<String, lex_ast::FnDecl> = BTreeMap::new();
+    let mut old_types: BTreeMap<String, lex_ast::TypeDecl> = BTreeMap::new();
+    for ast in store
+        .get_asts_for_sigs_bulk(&head_pairs)
+        .into_iter()
+        .filter_map(|r| r.ok())
+    {
+        match ast {
+            Stage::FnDecl(fd) => {
+                old_fns.insert(fd.name.clone(), fd);
+            }
+            // Types too, so the op log captures `type`s (#895).
+            Stage::TypeDecl(td) => {
+                old_types.insert(td.name.clone(), td);
+            }
+            _ => {}
+        }
+    }
     let new_fns: BTreeMap<String, lex_ast::FnDecl> = stages
         .iter()
         .filter_map(|s| match s {
             Stage::FnDecl(fd) => Some((fd.name.clone(), fd.clone())),
-            _ => None,
-        })
-        .collect();
-    // Type declarations, so the op log captures `type`s too (#895).
-    let old_types: BTreeMap<String, lex_ast::TypeDecl> = old_head
-        .values()
-        .filter_map(|stg| store.get_ast(stg).ok())
-        .filter_map(|s| match s {
-            Stage::TypeDecl(td) => Some((td.name.clone(), td)),
             _ => None,
         })
         .collect();
@@ -165,22 +250,27 @@ pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         &old_fns, &new_fns, &old_types, &new_types, /* body_patches: */ true,
     );
 
-    // Build new imports map (one entry per source file we just read).
-    let mut new_imports: ImportMap = ImportMap::new();
-    // Stable, transport-independent key. Per-file imports are not
-    // currently tracked separately — all imports of one publish are
-    // grouped under "<source>" so that publishing the same source
-    // via CLI vs HTTP produces identical op_ids.
-    let file_key = "<source>".to_string();
-    let entry = new_imports.entry(file_key).or_default();
-    for s in &stages {
-        if let Stage::Import(im) = s {
-            entry.insert(lex_vcs::ImportRef {
-                reference: im.reference.clone(),
-                alias: im.alias.clone(),
-            });
+    // Build the new imports map. A package publish already attributed
+    // imports per source file (`src/schema.lex` → its modules); a single
+    // file groups all its imports under one stable, transport-independent
+    // `<source>` key so a CLI vs HTTP publish of the same file produces
+    // identical op_ids.
+    let new_imports: ImportMap = match pkg_imports {
+        Some(im) => im,
+        None => {
+            let mut new_imports = ImportMap::new();
+            let entry = new_imports.entry("<source>".to_string()).or_default();
+            for s in &stages {
+                if let Stage::Import(im) = s {
+                    entry.insert(lex_vcs::ImportRef {
+                        reference: im.reference.clone(),
+                        alias: im.alias.clone(),
+                    });
+                }
+            }
+            new_imports
         }
-    }
+    };
 
     if dry_run {
         // Compute the op kinds for the dry-run preview using diff_to_ops
