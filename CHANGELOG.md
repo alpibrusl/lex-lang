@@ -64,6 +64,18 @@ bumps may carry breaking changes when justified).
   source archive from the release's op-log head on demand, so such a package
   installs like any other (single-module; #894).
 
+## [0.11.37] - 2026-09-17
+
+### Added
+
+- **Multi-module packages install (#894).** A multi-module op-log-native
+  package's rendered archive is now the full de-flattened `src/*.lex` tree,
+  not a single flattened file — so both modules install and each import path
+  resolves. The `export-git` de-flatten renderer moved into a shared
+  `lex_store::render`, used by both the CLI git mirror and the hosted
+  registry archive endpoint, so the git view and an installed package are
+  byte-identical source. (Local-import alias fidelity is still #909.)
+
 ## [Unreleased]
 
 ### Added
