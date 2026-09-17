@@ -101,15 +101,21 @@ pub fn fetch_versions(registry: &str, name: &str) -> Result<Vec<AvailableRelease
         head_op: Option<String>,
     }
 
-    let base = registry.trim_end_matches('/');
-    let base = if base.contains("://") {
-        base.to_string()
-    } else {
-        // Bare `vcs.lexlang.org/lex-official` → assume TLS, matching every
-        // real registry deployment.
-        format!("https://{base}")
+    // A tenant-qualified registry (`host/tenant[/store]`) reads the hub's
+    // public, unauthenticated surface (#917); a bare host falls back to the
+    // legacy `{registry}/v1/pkg/…` form.
+    let url = match lex_syntax::registry::public(registry) {
+        Some(pr) => pr.versions_url(name),
+        None => {
+            let base = registry.trim_end_matches('/');
+            let base = if base.contains("://") {
+                base.to_string()
+            } else {
+                format!("https://{base}")
+            };
+            format!("{base}/v1/pkg/{name}/versions")
+        }
     };
-    let url = format!("{base}/v1/pkg/{name}/versions");
     let body = match ureq::get(&url).call() {
         Ok(resp) => resp
             .into_body()

@@ -238,6 +238,94 @@ fn install_without_a_lock_errors_for_a_constraint() {
     assert!(combined.contains("lex pkg lock"), "output={combined}");
 }
 
+/// Spawn a registry that answers a versions listing ONLY on the public
+/// route `/v1/public/<expect_seg>/…/versions`, 404 otherwise — so a test
+/// fails unless the client actually targets the public surface (#917).
+fn spawn_public_only_registry(expect_seg: &'static str, body: &'static str) -> String {
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let addr = match server.server_addr() {
+        tiny_http::ListenAddr::IP(a) => a,
+        _ => unreachable!("expected IP listener"),
+    };
+    thread::spawn(move || {
+        for req in server.incoming_requests() {
+            let url = req.url().to_string();
+            let ok = url.contains(&format!("/v1/public/{expect_seg}/")) && url.contains("/versions");
+            if ok {
+                let resp = tiny_http::Response::from_string(body).with_header(
+                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                        .unwrap(),
+                );
+                let _ = req.respond(resp);
+            } else {
+                let _ = req.respond(tiny_http::Response::empty(404));
+            }
+        }
+    });
+    format!("http://{addr}")
+}
+
+#[test]
+fn lock_targets_the_public_route_for_a_tenant_qualified_registry() {
+    // registry = "<host>/acme" must resolve versions from
+    // /v1/public/acme/dep/versions, NOT the auth'd /v1/pkg/dep/versions.
+    let tmp = tempfile::tempdir().unwrap();
+    let host = spawn_public_only_registry("acme", VERSIONS);
+    let app = tmp.path().join("app");
+    write_consumer(&app, &format!("{host}/acme"), "^1.2");
+
+    let out = run_pkg(&app, "lock");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "lock must resolve via the public route: stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lock = std::fs::read_to_string(app.join("lex.lock")).unwrap();
+    assert!(lock.contains("version = \"1.4.9\""), "lock:\n{lock}");
+}
+
+#[test]
+fn lock_passes_store_query_for_a_named_store_registry() {
+    // registry = "<host>/acme/widgets" → /v1/public/acme/dep/versions?store=widgets
+    let tmp = tempfile::tempdir().unwrap();
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let addr = match server.server_addr() {
+        tiny_http::ListenAddr::IP(a) => a,
+        _ => unreachable!(),
+    };
+    thread::spawn(move || {
+        for req in server.incoming_requests() {
+            let url = req.url().to_string();
+            // Only answer when the store query is present on the public route.
+            let ok = url.contains("/v1/public/acme/")
+                && url.contains("/versions")
+                && url.contains("store=widgets");
+            if ok {
+                let resp = tiny_http::Response::from_string(VERSIONS).with_header(
+                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                        .unwrap(),
+                );
+                let _ = req.respond(resp);
+            } else {
+                let _ = req.respond(tiny_http::Response::empty(404));
+            }
+        }
+    });
+    let host = format!("http://{addr}");
+    let app = tmp.path().join("app");
+    write_consumer(&app, &format!("{host}/acme/widgets"), "^1.2");
+
+    let out = run_pkg(&app, "lock");
+    assert!(
+        out.status.success(),
+        "lock must send ?store=widgets: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lock = std::fs::read_to_string(app.join("lex.lock")).unwrap();
+    assert!(lock.contains("version = \"1.4.9\""), "lock:\n{lock}");
+}
+
 #[test]
 fn lock_reports_when_nothing_satisfies_the_constraint() {
     let tmp = tempfile::tempdir().unwrap();
