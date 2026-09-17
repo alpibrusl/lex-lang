@@ -40,6 +40,7 @@ description: "Invoke the `lex` CLI. Commands: parse, check, authority, run…"
 - `lex agent-guidelines` — emit the AI-agent authoring contract (idiom rules) for this Lex toolchain (idempotent)
 - `lex init` — scaffold a new project (lex.toml, src/, tests/, CI)
 - `lex pkg` — package manager: init, add, install, list deps; publish/verify signed capability contracts
+- `lex propagate` — push an upstream package's API change down its dependents: token-precise rename fan-out, or an agent-gated semantic migration
 - `lex fmt` — format .lex files; --check exits 1 if any need it
 - `lex ci` — run the full pipeline: pkg install, check --strict, fmt --check, test
 - `lex doc-sync` — regenerate (or --check) generated doc regions declared in docsync.toml; drift fails --check naming each stale target (idempotent)
@@ -857,6 +858,28 @@ lex pkg verify --archive pkg.tar --contract c.json --trusted-keys keyring.json
 ```
 
 **See also:** `lex init`, `lex ci`, `lex keygen`
+
+## `lex propagate`
+
+push an upstream package's API change down its dependents: token-precise rename fan-out, or an agent-gated semantic migration
+
+### Arguments
+
+- `package` (string, required) — the upstream package that changed (--package)
+
+### Examples
+
+```bash
+# Rename a symbol across every dependent in a workspace
+lex propagate --package lex-nt --rename gcd=euclidean_gcd --workspace . --apply
+```
+
+```bash
+# Agent-migrate dependents after a behavioral change (gated on type-check)
+lex propagate --package lex-nt --symbol euler_phi --note 'handles 0 now' --ollama
+```
+
+**See also:** `lex pkg`, `lex op`, `lex replay`
 
 ## `lex fmt`
 

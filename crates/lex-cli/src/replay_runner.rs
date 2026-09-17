@@ -58,6 +58,13 @@ pub fn regen_prompt(req: &ReplayRequest) -> String {
 /// Regenerate via a local Ollama daemon. `model` defaults to the
 /// recorded model's name when present, else a caller default.
 pub fn regenerate_ollama(req: &ReplayRequest, model: &str) -> Result<String> {
+    regenerate_with_prompt_ollama(&regen_prompt(req), model)
+}
+
+/// Ollama regeneration from an arbitrary prompt — the reusable core (used by
+/// `lex op replay` via [`regenerate_ollama`] and by `lex propagate`'s semantic
+/// migration). Deterministic decoding (temperature 0).
+pub fn regenerate_with_prompt_ollama(prompt: &str, model: &str) -> Result<String> {
     let host = std::env::var("OLLAMA_HOST")
         .ok()
         .filter(|s| !s.is_empty())
@@ -65,10 +72,10 @@ pub fn regenerate_ollama(req: &ReplayRequest, model: &str) -> Result<String> {
     let url = format!("{host}/api/generate");
     let payload = serde_json::json!({
         "model": model,
-        "prompt": regen_prompt(req),
+        "prompt": prompt,
         "stream": false,
-        // Deterministic decoding: replay measures reproducibility, so
-        // sampling noise would only muddy the signal.
+        // Deterministic decoding: replay/propagation measures reproducibility,
+        // so sampling noise would only muddy the signal.
         "think": false,
         "options": { "temperature": 0 },
     });
@@ -86,6 +93,37 @@ pub fn regenerate_ollama(req: &ReplayRequest, model: &str) -> Result<String> {
         .and_then(|r| r.as_str())
         .ok_or_else(|| anyhow!("ollama response had no `response` field: {v}"))?;
     Ok(strip_code_fences(text))
+}
+
+/// External-command regeneration from an arbitrary prompt: the prompt is piped
+/// to the command's stdin, Lex source read from its stdout. The
+/// provider-agnostic seam for `lex propagate`'s semantic migration.
+pub fn regenerate_with_prompt_cmd(prompt: &str, cmd: &str) -> Result<String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawning regenerate-cmd `{cmd}`"))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("no stdin on regenerate-cmd child"))?
+        .write_all(prompt.as_bytes())
+        .context("writing prompt to regenerate-cmd stdin")?;
+    let out = child.wait_with_output().context("waiting on regenerate-cmd")?;
+    if !out.status.success() {
+        bail!(
+            "regenerate-cmd `{cmd}` failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(strip_code_fences(&strip_lex_run_echo(&String::from_utf8_lossy(&out.stdout))))
 }
 
 /// Regenerate via an external command: pipe the request JSON to its
@@ -127,7 +165,7 @@ pub fn regenerate_cmd(req: &ReplayRequest, cmd: &str) -> Result<String> {
 /// the candidate, and left in place it makes the source unparseable. A
 /// real regenerated function never ends with a bare `null` statement, so
 /// this only ever strips the runner's own artifact.
-fn strip_lex_run_echo(s: &str) -> String {
+pub fn strip_lex_run_echo(s: &str) -> String {
     let trimmed = s.trim_end();
     match trimmed.strip_suffix("null") {
         // Only when `null` stands alone on the last line (preceded by a

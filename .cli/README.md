@@ -1,6 +1,6 @@
 # lex
 
-Version: 0.11.34
+Version: 0.11.37
 ACLI version: 0.1.0
 
 ## Commands
@@ -170,6 +170,12 @@ Idempotent: false
 ### pkg
 
 package manager: init, add, install, list deps; publish/verify signed capability contracts
+
+Idempotent: false
+
+### propagate
+
+push an upstream package's API change down its dependents: token-precise rename fan-out, or an agent-gated semantic migration
 
 Idempotent: false
 
