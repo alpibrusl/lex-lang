@@ -133,6 +133,40 @@ impl DefaultHandler {
                     Err(e) => Ok(err(Value::Str(format!("{e}").into()))),
                 }
             }
+            // Append, so a log does not have to be rewritten to grow.
+            //
+            // Opened with `append(true).create(true)`, so appending to a path
+            // that does not exist yet behaves like `write` rather than
+            // failing — a log's first line should not be a special case.
+            //
+            // ATOMICITY. One call issues one `write(2)` to an O_APPEND
+            // descriptor. On a local filesystem the kernel makes the seek and
+            // the write atomic, so concurrent appenders cannot interleave
+            // within a single call for payloads up to the platform's
+            // guarantee (PIPE_BUF, 4 KiB on Linux). A larger payload may be
+            // split, and NFS does not guarantee it at all. Callers that need
+            // a record to arrive whole should keep records small — which a
+            // line-oriented log does anyway — and callers that need more
+            // should be using a database.
+            "append" => {
+                let path = expect_str(args.first())?.to_string();
+                let contents = expect_str(args.get(1))?.to_string();
+                self.ensure_fs_write_content_path(&path)?;
+                match std::fs::OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(&path)
+                {
+                    Ok(mut f) => {
+                        use std::io::Write as _;
+                        match f.write_all(contents.as_bytes()) {
+                            Ok(_) => Ok(ok(Value::Unit)),
+                            Err(e) => Ok(err(Value::Str(format!("{e}").into()))),
+                        }
+                    }
+                    Err(e) => Ok(err(Value::Str(format!("{e}").into()))),
+                }
+            }
             "mkdir_p" => {
                 let path = expect_str(args.first())?.to_string();
                 if let Err(e) = self.ensure_fs_write_path(&path) {
