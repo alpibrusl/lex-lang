@@ -135,6 +135,39 @@ fn try_post(addr: &SocketAddr, req: &[u8]) -> Result<(u16, String), String> {
     Ok((status, body.to_string()))
 }
 
+/// GET a path and return `(status, raw body bytes)` — for binary responses
+/// (the rendered `.tar.gz` archive) that a lossy String would corrupt.
+fn get_raw(addr: &SocketAddr, path: &str) -> (u16, Vec<u8>) {
+    let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").into_bytes();
+    let mut s = TcpStream::connect_timeout(addr, Duration::from_secs(5)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+    s.write_all(&req).unwrap();
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).unwrap();
+    // Split head/body on the first CRLFCRLF at the byte level.
+    let sep = buf.windows(4).position(|w| w == b"\r\n\r\n").expect("no header terminator");
+    let head = String::from_utf8_lossy(&buf[..sep]);
+    let status = head.split_whitespace().nth(1).unwrap_or("0").parse().unwrap_or(0);
+    (status, buf[sep + 4..].to_vec())
+}
+
+/// Extract one file's contents from a gzip-tar archive.
+fn extract(archive: &[u8], want: &str) -> Option<String> {
+    use std::io::Read;
+    let gz = flate2::read::GzDecoder::new(archive);
+    let mut ar = tar::Archive::new(gz);
+    for entry in ar.entries().ok()? {
+        let mut entry = entry.ok()?;
+        let path = entry.path().ok()?.to_string_lossy().to_string();
+        if path == want {
+            let mut s = String::new();
+            entry.read_to_string(&mut s).ok()?;
+            return Some(s);
+        }
+    }
+    None
+}
+
 /// Build a `.tar.gz` containing `lex.toml` + one or more `src/*.lex`
 /// files, the shape `POST /v1/pkg/publish` expects.
 fn pkg_archive(name: &str, version: &str, src_files: &[(&str, &str)]) -> Vec<u8> {
@@ -810,4 +843,39 @@ fn release_snapshots_the_head_immutably() {
     // Immutable: re-releasing 1.0.0 is a 409.
     let (s, _b) = post_bytes(&srv.addr, "/v1/pkg/relpkg/release", br#"{"version":"1.0.0"}"#);
     assert_eq!(s, 409, "re-release of an existing version must be rejected");
+}
+
+/// #920: a released version has an op-log head but no *stored* archive
+/// (only the archive-upload publish path stores one, keyed by the published
+/// version). The archive endpoint must render source from the head so an
+/// op-log-native package installs like any other.
+#[test]
+fn released_version_archive_is_rendered_from_the_op_log_head() {
+    let (srv, _tmp) = start_server();
+
+    // Publish (0.1.0) — this builds the op-log; then release 1.0.0, which
+    // records a head_op but stores no 1.0.0.tar.gz.
+    let src = "fn double(x :: Int) -> Int { x * 2 }\n";
+    let archive = pkg_archive("oplogpkg", "0.1.0", &[("lib.lex", src)]);
+    assert_eq!(post_bytes(&srv.addr, "/v1/pkg/publish", &archive).0, 200, "publish");
+    assert_eq!(
+        post_bytes(&srv.addr, "/v1/pkg/oplogpkg/release", br#"{"version":"1.0.0"}"#).0,
+        201, "release"
+    );
+
+    // The released version's archive is rendered on demand from the head.
+    let (status, body) = get_raw(&srv.addr, "/v1/pkg/oplogpkg/1.0.0/archive");
+    assert_eq!(status, 200, "released-version archive should be rendered, not 404");
+    assert!(!body.is_empty(), "archive body must be non-empty");
+
+    // It is a real gz-tar carrying a compilable lib.lex with the function
+    // under its real (unmangled) name, so a consumer's `import "<pkg>/lib"`
+    // resolves it.
+    let manifest = extract(&body, "lex.toml").expect("archive has lex.toml");
+    assert!(manifest.contains("oplogpkg"), "manifest names the package: {manifest}");
+    let lib = extract(&body, "src/lib.lex").expect("archive has src/lib.lex");
+    assert!(
+        lib.contains("fn double(") && lib.contains("x * 2"),
+        "rendered source must carry the unmangled function: {lib}"
+    );
 }
