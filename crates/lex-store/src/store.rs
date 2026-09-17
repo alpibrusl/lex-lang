@@ -2178,6 +2178,77 @@ impl Store {
         Ok(())
     }
 
+    /// The hosted CI runner (#93): independently re-run the write-time
+    /// type-check gate on a branch head and record the verdict as a
+    /// `lex-hub-ci`-produced `TypeCheck` attestation for the stages the
+    /// advance introduced. Called after an `op push` fast-forwards the
+    /// head, so `require-attestation type_check` gates are backed by a
+    /// producer that actually verified the code server-side, not by
+    /// whatever attestation a client chose to attach. Does NOT move or
+    /// roll back the head — the client's own always-valid-HEAD gate is
+    /// what refuses a bad publish; this produces the trusted verdict on
+    /// top of an already-committed advance (so a client that bypassed
+    /// its gate is caught by a `TypeCheck::Failed` from `lex-hub-ci`).
+    ///
+    /// `from_head` is the branch head *before* the advance; the ops
+    /// between it and `to_head` are the ones whose stages get attested.
+    /// Idempotent: attestations are content-addressed, so re-verifying
+    /// the same head is a no-op.
+    pub fn verify_head_and_attest(
+        &self,
+        branch: &str,
+        from_head: Option<&str>,
+        to_head: &str,
+    ) -> Result<HubCiVerdict, StoreError> {
+        // Reconstruct the program at the new head and re-check it.
+        let head = self.branch_head(branch)?;
+        let pairs: Vec<(String, String)> = head.into_iter().collect();
+        let stages: Vec<Stage> =
+            self.get_asts_for_sigs_bulk(&pairs).into_iter().collect::<Result<_, _>>()?;
+        let checked_stages = stages.len();
+        let result = match lex_types::check_program(&stages) {
+            Ok(_) => lex_vcs::AttestationResult::Passed,
+            Err(errors) => lex_vcs::AttestationResult::Failed {
+                detail: serde_json::to_string(&errors).unwrap_or_else(|_| "type errors".into()),
+            },
+        };
+        let passed = matches!(result, lex_vcs::AttestationResult::Passed);
+
+        // Stages introduced by THIS advance (from_head exclusive → to_head).
+        let log = lex_vcs::OpLog::open(self.root())?;
+        let to = to_head.to_string();
+        let records = match from_head {
+            Some(f) => log
+                .walk_forward_since(&to, &f.to_string())?
+                .unwrap_or_else(|| log.walk_forward(&to, None).unwrap_or_default()),
+            None => log.walk_forward(&to, None)?,
+        };
+        let mut introduced: Vec<String> = Vec::new();
+        for rec in &records {
+            introduced.extend(attestable_stage_ids(&rec.produces));
+        }
+
+        let alog = self.attestation_log()?;
+        for sid in &introduced {
+            let att = lex_vcs::Attestation::new(
+                sid.clone(),
+                Some(to_head.to_string()),
+                None,
+                lex_vcs::AttestationKind::TypeCheck,
+                result.clone(),
+                hub_ci_producer(),
+                None,
+            );
+            alog.put(&att)?;
+        }
+
+        let detail = match &result {
+            lex_vcs::AttestationResult::Failed { detail } => Some(detail.clone()),
+            _ => None,
+        };
+        Ok(HubCiVerdict { passed, checked_stages, attested_stages: introduced.len(), detail })
+    }
+
     /// Emit an `Examples::Passed` attestation for a published stage
     /// whose behavioral `examples {}` block was run and passed (#835,
     /// Tier 1). Mirrors [`Self::record_typecheck_passed`]. The
@@ -3463,6 +3534,28 @@ fn typecheck_producer() -> lex_vcs::ProducerDescriptor {
         version: env!("CARGO_PKG_VERSION").into(),
         model: None,
     }
+}
+
+/// Producer for attestations the hosted CI runner writes (#93). A
+/// distinct tool name so a `require-attestation` gate — via the
+/// producer-trust model — can weight "the hub verified this
+/// server-side" above a client-attached `TypeCheck`.
+fn hub_ci_producer() -> lex_vcs::ProducerDescriptor {
+    lex_vcs::ProducerDescriptor {
+        tool: "lex-hub-ci".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        model: None,
+    }
+}
+
+/// Verdict of a hosted-CI run over a branch head (#93).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HubCiVerdict {
+    pub passed: bool,
+    pub checked_stages: usize,
+    pub attested_stages: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// Producer for the replay-comparison attestation (#836 G3). Distinct
