@@ -13,6 +13,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+mod common;
+use common::wait_for_bind;
+
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent().unwrap()
@@ -43,7 +46,7 @@ fn spawn_analytics_server(port: u16) {
         let mut vm = Vm::with_handler(&bc, Box::new(handler));
         let _ = vm.call("main", vec![]);
     });
-    thread::sleep(Duration::from_millis(200));
+    wait_for_bind(port, Duration::from_secs(10));
 }
 
 fn http(port: u16, path: &str) -> (u16, String) {

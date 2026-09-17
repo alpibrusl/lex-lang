@@ -22,6 +22,9 @@ use std::time::Duration;
 use tungstenite::client::IntoClientRequest;
 use tungstenite::stream::MaybeTlsStream;
 
+mod common;
+use common::wait_for_bind;
+
 fn free_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     let port = listener.local_addr().expect("local_addr").port();
@@ -182,6 +185,9 @@ fn main() -> [net, concurrent] Nil {{
 "#
     );
     spawn_server(&src);
+    // `spawn_server` returns as soon as the thread is spawned, so the connect
+    // below raced the bind with no tolerance at all.
+    wait_for_bind(port, Duration::from_secs(10));
 
     let url = format!("ws://127.0.0.1:{port}/anywhere");
     let req = url.as_str().into_client_request().expect("request");

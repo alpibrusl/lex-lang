@@ -14,6 +14,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+mod common;
+use common::wait_for_bind;
+
 fn spawn_inbox_server(port: u16) {
     // Per-port tmp paths so parallel tests don't collide on shared
     // log files. Each test owns its own port → owns its own logs.
@@ -38,7 +41,7 @@ fn spawn_inbox_server(port: u16) {
         let mut vm = Vm::with_handler(&bc, Box::new(handler));
         let _ = vm.call("main", vec![]);
     });
-    thread::sleep(Duration::from_millis(200));
+    wait_for_bind(port, Duration::from_secs(10));
 }
 
 fn post(port: u16, path: &str, body: &str) -> (u16, String) {

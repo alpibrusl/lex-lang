@@ -15,6 +15,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+mod common;
+use common::wait_for_bind;
+
 fn spawn_gateway(port: u16) {
     let src = include_str!("../../../examples/gateway_app.lex")
         .replace("net.serve(8210,", &format!("net.serve({port},"));
@@ -32,7 +35,7 @@ fn spawn_gateway(port: u16) {
         let mut vm = Vm::with_handler(&bc, Box::new(handler));
         let _ = vm.call("main", vec![]);
     });
-    thread::sleep(Duration::from_millis(200));
+    wait_for_bind(port, Duration::from_secs(10));
 }
 
 fn http(port: u16, method: &str, path: &str, body: &str) -> (u16, String) {
