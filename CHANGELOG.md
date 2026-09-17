@@ -5,6 +5,41 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [0.11.35] - 2026-09-17
+
+### Added
+
+- **Package registry version model — releases, semver constraints, and a
+  lockfile (#893).** A registry dependency
+  (`{ registry = "…", version = "^1.2" }`) now resolves to an immutable,
+  pinned release instead of drifting to whatever is newest:
+
+  - `POST /v1/pkg/{name}/release {version, branch?}` cuts an immutable
+    `name@MAJOR.MINOR.PATCH → op-log head` release from a branch head
+    (409 on re-release; a release is a permanent snapshot).
+  - `lex_syntax::semver` matches `^`, `~`, exact, `=`, comparator, and
+    `*`/`latest` constraints (Cargo caret/tilde semantics, including the
+    `0.x` rules); `best_match` deterministically picks the highest
+    satisfying release.
+  - `lex pkg lock` resolves every registry dependency against the published
+    release set (`GET /v1/pkg/{name}/versions`) and writes `lex.lock`
+    pinning the exact version and op-log head; it keeps any current pin that
+    still satisfies its constraint (reproducible). `lex pkg update`
+    re-resolves to the highest match and relocks.
+  - `lex pkg install` reads `lex.lock` and fetches the pinned exact release.
+    A constraint dependency with no lock entry now fails with a clear
+    "run `lex pkg lock`" instead of building an unresolvable request from
+    the constraint string.
+
+- **Hosted CI runner — trusted server-side type-check attestation (#93,
+  slice 1).** When a push advances a branch head, the hub independently
+  re-runs the type-check server-side and writes a `lex-hub-ci` `TypeCheck`
+  attestation for each stage the push introduced. Require-attestation gates
+  can now trust a verdict the hub produced, not one a client attached. The
+  check is idempotent (content-addressed) and a failure surfaces as
+  `TypeCheck::Failed` — the write-time gate still refuses a type-broken
+  publish.
+
 ## [Unreleased]
 
 ### Added
