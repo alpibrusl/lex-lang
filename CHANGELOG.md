@@ -166,6 +166,49 @@ bumps may carry breaking changes when justified).
     already written every file's ops, so a rejected publish still
     appended to the tenant's op log. It now runs before any store work.
 
+## [0.11.34] — 2026-09-17
+
+(The `[Unreleased]` entries above accumulated across 0.11.6–0.11.33 and
+were released in those tags; the per-version roll-up lapsed and is
+tracked separately. This section records only what is new in 0.11.34.)
+
+### Fixed
+
+- **Op-log fidelity: `type` declarations are captured and import aliases
+  are preserved, so a package round-trips to compilable source (#895).**
+  Publishing a package to the op-log dropped every top-level `type`
+  declaration and, on `export-git`, every `import` line — so the
+  reconstructed source was function bodies with no imports and no ADTs,
+  and it did not type-check. Even a one-file package could not migrate:
+
+  ```console
+  $ lex publish --store .lex/store src/jobs.lex   # 5 imports, 4 types, 16 fns
+  $ lex export-git out --store .lex/store && lex check out/src.lex
+  error: unknown identifier `sql`   (import dropped)
+  error: field access `.handler` — expected record, got JobRow   (type dropped)
+  ```
+
+  Two causes, both fixed. The AST diff only ever surfaced `FnDecl`s, so a
+  `type` never reached `diff.added`/`removed`/`modified` even though the
+  `AddType`/`RemoveType`/`ModifyType` ops already existed — a new
+  `compute_diff_with_types`, wired into the CLI and HTTP publish paths,
+  diffs types too. And `AddImport` recorded only the module reference,
+  not its `as` alias, while `export-git` skipped imports entirely — an
+  additive optional `alias` on `AddImport` (omitted when it equals the
+  module's default last-segment alias, so existing ops keep their `OpId`)
+  now carries a non-default alias like `import "./error" as e`, and
+  `export-git` renders the import lines. After the fix the same package
+  round-trips with exact parity (5 imports, 4 types, 16 fns) and
+  `lex check` on the exported source passes. Orthogonal to the
+  multi-module namespacing/layout work (#894).
+
+- Publish handlers were deduplicated into `stage_fns` / `stage_types`
+  helpers as part of the above; `crates/lex-api/src/handlers.rs` split is
+  tracked in #897.
+
+- Flaky `ml_app` test: poll for server readiness instead of a fixed
+  sleep (#888).
+
 ## [0.11.5] — 2026-09-10
 
 ### Fixed
