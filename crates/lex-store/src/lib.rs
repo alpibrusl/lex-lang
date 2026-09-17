@@ -29,6 +29,7 @@ mod budget;
 mod planner;
 mod store;
 pub mod render;
+pub mod api;
 mod model;
 mod branches;
 mod merge_checker;

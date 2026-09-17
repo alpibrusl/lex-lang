@@ -910,3 +910,23 @@ fn released_multimodule_archive_renders_the_full_src_tree() {
     assert!(!lib_out.contains("fn lib_") && !util_out.contains("fn util_"),
         "declarations must be de-mangled");
 }
+
+#[test]
+fn release_allows_a_patch_for_a_body_only_change_and_requires_minor_for_additions() {
+    let (srv, _tmp) = start_server();
+
+    let v1 = "fn f() -> Int { 1 }\n";
+    assert_eq!(post_bytes(&srv.addr, "/v1/pkg/publish", &pkg_archive("gate2", "0.1.0", &[("lib.lex", v1)])).0, 200);
+    assert_eq!(post_bytes(&srv.addr, "/v1/pkg/gate2/release", br#"{"version":"1.0.0"}"#).0, 201);
+
+    // Body-only change (same signature) → patch is fine.
+    let v2 = "fn f() -> Int { 42 }\n";
+    assert_eq!(post_bytes(&srv.addr, "/v1/pkg/publish", &pkg_archive("gate2", "0.2.0", &[("lib.lex", v2)])).0, 200);
+    assert_eq!(post_bytes(&srv.addr, "/v1/pkg/gate2/release", br#"{"version":"1.0.1"}"#).0, 201, "body-only change is a valid patch");
+
+    // Add a public function → patch refused, minor accepted.
+    let v3 = "fn f() -> Int { 42 }\nfn g() -> Int { 7 }\n";
+    assert_eq!(post_bytes(&srv.addr, "/v1/pkg/publish", &pkg_archive("gate2", "0.3.0", &[("lib.lex", v3)])).0, 200);
+    assert_eq!(post_bytes(&srv.addr, "/v1/pkg/gate2/release", br#"{"version":"1.0.2"}"#).0, 422, "addition as patch refused");
+    assert_eq!(post_bytes(&srv.addr, "/v1/pkg/gate2/release", br#"{"version":"1.1.0"}"#).0, 201, "addition as minor accepted");
+}

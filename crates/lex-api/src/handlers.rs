@@ -1767,6 +1767,59 @@ fn pkg_release_handler(state: &State, name: &str, body: &str) -> Response<std::i
         return error_response(400, format!("branch {branch:?} has no commits to release"));
     };
 
+    // Version-bump gate (#893): the version increment must be at least what
+    // the public-API change requires — a breaking change (a removed or
+    // re-signatured public declaration) needs a *major* bump, an addition at
+    // least a *minor*. This is what makes `^`/`~` resolution safe: a caret
+    // update can't silently pull a breaking change mislabeled as a patch.
+    //
+    // Compare against the **semver predecessor** — the highest already-published
+    // version strictly less than the new one (not merely `latest`, so releasing
+    // 2.0.0 after 1.5.0 diffs against 1.5.0). No predecessor (first version, or
+    // a back-port below everything) means nothing to gate.
+    let predecessor = load_pkg_index(&state.root, name)
+        .map(|i| i.versions)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| lex_syntax::semver::parse_exact(&v.version).map(|p| (p, v)))
+        .filter(|(p, _)| lex_syntax::semver::parse_exact(&version).map(|n| *p < n).unwrap_or(false))
+        .max_by_key(|(p, _)| *p)
+        .map(|(_, v)| v);
+    if let Some(prev) = predecessor {
+        if let (Some(prev_head), Some(declared)) = (
+            prev.head_op.clone(),
+            lex_syntax::semver::bump_between(&prev.version, &version),
+        ) {
+            if let (Ok(prev_api), Ok(new_api)) = (
+                lex_store::api::public_api_at_op(&store, &prev_head),
+                lex_store::api::public_api_at_op(&store, &head_op),
+            ) {
+                use lex_store::api::ApiChange;
+                use lex_syntax::semver::Bump;
+                let (required, why) = match lex_store::api::classify_api_change(&prev_api, &new_api) {
+                    ApiChange::Breaking(d) => (Bump::Major, d),
+                    ApiChange::Additive(d) => (Bump::Minor, d),
+                    ApiChange::None => (Bump::Patch, String::new()),
+                };
+                if declared < required {
+                    let need = match required {
+                        Bump::Major => "major",
+                        Bump::Minor => "minor",
+                        Bump::Patch => "patch",
+                    };
+                    return error_response(
+                        422,
+                        format!(
+                            "version bump too small: {} → {version} is a {declared:?} bump, \
+                             but the API change ({why}) requires a {need} bump",
+                            prev.version
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
     // The package's exported function names at this head (for retract /
     // the catalog), read through the SigId the head names each by.
     let head = store.branch_head(&branch).unwrap_or_default();
