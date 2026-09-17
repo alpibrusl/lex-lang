@@ -43,12 +43,27 @@ pub(crate) fn branch_advance_head_handler(state: &State, name: &str, body: &str)
         None => return error_response(400, "missing string field `head_op`"),
     };
     let store = state.store.lock().unwrap();
+    // The head before the advance — the ops between it and the new head are
+    // the ones the hosted CI runner (#93) attests.
+    let prev_head = store.get_branch(name).ok().flatten().and_then(|b| b.head_op);
     match store.advance_branch_head_ff(name, &head_op) {
-        Ok(advance) => json_response(200, &serde_json::json!({
-            "branch": name,
-            "head_op": head_op,
-            "advance": advance,
-        })),
+        Ok(advance) => {
+            // #93 hosted CI: independently re-run the type-check gate on the
+            // new head and record a `lex-hub-ci`-produced TypeCheck
+            // attestation, so `require-attestation` gates are backed by a
+            // trusted server-side producer, not the pushing client. A failure
+            // here doesn't undo the (already-committed, fast-forward) advance;
+            // it's recorded as `TypeCheck::Failed` and surfaced in `ci`.
+            let ci = store
+                .verify_head_and_attest(name, prev_head.as_deref(), &head_op)
+                .ok();
+            json_response(200, &serde_json::json!({
+                "branch": name,
+                "head_op": head_op,
+                "advance": advance,
+                "ci": ci,
+            }))
+        }
         Err(lex_store::StoreError::NonFastForward { branch, current, attempted }) =>
             error_with_detail(409, "NonFastForward", serde_json::json!({
                 "branch": branch,
