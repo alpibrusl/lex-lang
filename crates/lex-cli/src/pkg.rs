@@ -1087,8 +1087,14 @@ fn verify_registry_dep(
     version: &str,
     trusted: Option<&Keyring>,
 ) -> Result<DepVerification> {
+    // Read the hub's public surface for a tenant-qualified registry (#917),
+    // else the legacy `{registry}/v1/pkg/…` form.
+    let public = lex_syntax::registry::public(registry);
     let base = registry.trim_end_matches('/');
-    let contract_url = format!("{base}/v1/pkg/{name}/{version}/contract");
+    let contract_url = match &public {
+        Some(pr) => pr.contract_url(name, version),
+        None => format!("{base}/v1/pkg/{name}/{version}/contract"),
+    };
     let signed: SignedContract = match ureq::get(&contract_url).call() {
         Ok(resp) => {
             let body = resp
@@ -1098,12 +1104,19 @@ fn verify_registry_dep(
             serde_json::from_str(&body)
                 .with_context(|| format!("parsing contract from {contract_url}"))?
         }
-        // A registry that doesn't publish a contract for this version.
-        Err(ureq::Error::StatusCode(404)) => return Ok(DepVerification::NoContract),
+        // The public surface serves no signed contract (404) — or refuses an
+        // anonymous read of an authenticated route (401). Either way the
+        // package is served unsigned; provenance is skipped, not fatal.
+        Err(ureq::Error::StatusCode(404)) | Err(ureq::Error::StatusCode(401)) => {
+            return Ok(DepVerification::NoContract)
+        }
         Err(e) => bail!("GET {contract_url}: {e}"),
     };
 
-    let archive_url = format!("{base}/v1/pkg/{name}/{version}/archive");
+    let archive_url = match &public {
+        Some(pr) => pr.archive_url(name, version),
+        None => format!("{base}/v1/pkg/{name}/{version}/archive"),
+    };
     let archive = ureq::get(&archive_url)
         .call()
         .map_err(|e| anyhow::anyhow!("GET {archive_url}: {e}"))?

@@ -9,6 +9,7 @@ pub mod printer;
 pub mod loader;
 pub mod semver;
 pub mod lock;
+pub mod registry;
 pub mod workspace;
 
 pub use loader::{

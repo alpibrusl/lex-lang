@@ -365,7 +365,10 @@ fn run_git(args: &[&str], url: &str) -> Result<bool, PackageError> {
 /// Cache path: `$LEX_PACKAGES_DIR/{name}-{version}/` (versioned to avoid
 /// collisions with git-cached packages at `{name}/`).
 ///
-/// Download URL: `{registry}/v1/pkg/{name}/{version}/archive`
+/// Download URL: the hub's public surface
+/// `{host}/v1/public/{tenant}/{name}/{version}/archive[?store=…]` for a
+/// tenant-qualified registry (#917), else the legacy
+/// `{registry}/v1/pkg/{name}/{version}/archive`.
 fn registry_ensure_cached(
     pkg_name: &str,
     registry: &str,
@@ -383,12 +386,15 @@ fn registry_ensure_cached(
         detail: e.to_string(),
     })?;
 
-    let url = format!(
-        "{}/v1/pkg/{}/{}/archive",
-        registry.trim_end_matches('/'),
-        pkg_name,
-        version,
-    );
+    let url = match crate::registry::public(registry) {
+        Some(pr) => pr.archive_url(pkg_name, version),
+        None => format!(
+            "{}/v1/pkg/{}/{}/archive",
+            registry.trim_end_matches('/'),
+            pkg_name,
+            version,
+        ),
+    };
     let response = ureq::get(&url).call().map_err(|e| PackageError::RegistryFailed {
         name: pkg_name.to_string(),
         registry: registry.to_string(),
