@@ -39,6 +39,7 @@ fn n_concurrent_writers_all_land() {
                         stage_id: stage.clone(),
                         effects: BTreeSet::new(),
                         budget_cost: None,
+                        in_file: None,
                     },
                     [],
                 );
@@ -84,6 +85,7 @@ fn n_concurrent_writers_chain_into_a_single_history() {
                         stage_id: stage.clone(),
                         effects: BTreeSet::new(),
                         budget_cost: None,
+                        in_file: None,
                     },
                     [],
                 );
@@ -139,6 +141,7 @@ fn concurrent_writers_do_not_lose_op_records() {
                         stage_id: stage.clone(),
                         effects: BTreeSet::new(),
                         budget_cost: None,
+                        in_file: None,
                     },
                     [],
                 );
@@ -190,6 +193,7 @@ fn empty_parents_op_chains_off_existing_head() {
                 stage_id: stage.into(),
                 effects: BTreeSet::new(),
                 budget_cost: None,
+                in_file: None,
             },
             [],
         );

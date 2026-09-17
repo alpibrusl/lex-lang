@@ -169,6 +169,15 @@ pub enum OperationKind {
         effects: EffectSet,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         budget_cost: Option<u64>,
+        /// The package source file this declaration came from
+        /// (`src/schema.lex`), when published as part of a multi-module
+        /// package. `None` for a single-file publish — so those ops
+        /// serialize byte-identically and keep their `OpId` (same
+        /// additive trick as `budget_cost`). Lets `export-git` de-flatten
+        /// a mangled package back into its `src/*.lex` tree (#894) and
+        /// gives `lex blame` per-file provenance.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        in_file: Option<String>,
     },
     /// Function removed; `last_stage_id` is the head before the
     /// remove (so blame can walk the predecessor without scanning).
@@ -247,6 +256,11 @@ pub enum OperationKind {
     AddType {
         sig_id: SigId,
         stage_id: StageId,
+        /// Source file this type came from, for multi-module packages;
+        /// `None` (and omitted) for a single-file publish. See
+        /// `AddFunction::in_file`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        in_file: Option<String>,
     },
     RemoveType {
         sig_id: SigId,
@@ -393,7 +407,7 @@ impl OperationKind {
         use OperationKind::*;
         match self {
             AddFunction { sig_id, stage_id, .. }
-            | AddType { sig_id, stage_id }
+            | AddType { sig_id, stage_id, .. }
                 => Some((sig_id.clone(), Some(stage_id.clone()))),
             ModifyBody { sig_id, to_stage_id, .. }
             | ChangeEffectSig { sig_id, to_stage_id, .. }
@@ -644,6 +658,7 @@ mod tests {
             stage_id: "abc123".into(),
             effects: BTreeSet::new(),
             budget_cost: None,
+            in_file: None,
         }
     }
 
@@ -663,6 +678,7 @@ mod tests {
                 stage_id: "abc123".into(),
                 effects: BTreeSet::new(),
                 budget_cost: None,
+                in_file: None,
             },
             [],
         );
@@ -741,6 +757,7 @@ mod tests {
                 stage_id: "abc123".into(),
                 effects: BTreeSet::new(),
                 budget_cost: None,
+                in_file: None,
             },
             ["op-parent".into()],
         );
@@ -759,6 +776,7 @@ mod tests {
             OperationKind::AddFunction {
                 sig_id: "x".into(), stage_id: "s".into(), effects: a_effects,
                 budget_cost: None,
+                in_file: None,
             },
             [],
         );
@@ -766,6 +784,7 @@ mod tests {
             OperationKind::AddFunction {
                 sig_id: "x".into(), stage_id: "s".into(), effects: b_effects,
                 budget_cost: None,
+                in_file: None,
             },
             [],
         );
@@ -866,6 +885,7 @@ mod tests {
                 stage_id: "abc123".into(),
                 effects: BTreeSet::new(),
                 budget_cost: None,
+                in_file: None,
             },
             [],
         );

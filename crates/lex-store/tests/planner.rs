@@ -29,6 +29,7 @@ fn publish_fn(store: &Store, src: &str, name: &str) {
             stage_id: stg.clone(),
             effects: Default::default(),
             budget_cost: None,
+            in_file: None,
         },
         [],
     );

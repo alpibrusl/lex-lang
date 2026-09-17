@@ -167,6 +167,13 @@ pub struct LoadedPackage {
     /// report it, because by the time they return, a file's imports and
     /// those of everything it imports are one undifferentiated list.
     pub imports_by_file: BTreeMap<String, BTreeSet<String>>,
+    /// Mangling prefix → the file it belongs to (`schema_a1b2` →
+    /// `src/schema.lex`), for every file in the package. A declaration's
+    /// mangled name is `<prefix>.<local>`, so this is what lets a
+    /// consumer attribute each declaration in `program` back to its
+    /// source file — the record `export-git` needs to de-flatten the
+    /// package into its `src/*.lex` tree (#894).
+    pub module_prefixes: BTreeMap<String, String>,
 }
 
 /// Load a whole package as **one** program: every file gets its
@@ -245,6 +252,14 @@ pub fn load_package(
             items.push(item);
         }
     }
+    // prefix → relative file path, for every mangled file (the entry
+    // has no empty prefix under `load_package`, so all are included).
+    let module_prefixes: BTreeMap<String, String> = state
+        .prefixes
+        .iter()
+        .filter(|(_, prefix)| !prefix.is_empty())
+        .filter_map(|(path, prefix)| state.relative_key(path).map(|rel| (prefix.clone(), rel)))
+        .collect();
     Ok(LoadedPackage {
         program: Program {
             items,
@@ -252,6 +267,7 @@ pub fn load_package(
             trailing_comments: Vec::new(),
         },
         imports_by_file: state.imports_by_file,
+        module_prefixes,
     })
 }
 

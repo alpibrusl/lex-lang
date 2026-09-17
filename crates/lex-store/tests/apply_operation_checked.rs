@@ -28,6 +28,7 @@ fn add_fac_op() -> (Operation, StageTransition) {
             stage_id: "stg-1".into(),
             effects: BTreeSet::new(),
             budget_cost: None,
+            in_file: None,
         },
         [],
     );

@@ -39,6 +39,7 @@ fn resolve_50_conflicts_in_one_batch_is_fast() {
                 stage_id: stage.clone(),
                 effects: BTreeSet::new(),
                 budget_cost: None,
+                in_file: None,
             },
             head.iter().cloned().collect::<Vec<_>>(),
         );

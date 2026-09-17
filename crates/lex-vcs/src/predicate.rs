@@ -404,6 +404,7 @@ mod tests {
                 stage_id: stage.into(),
                 effects: BTreeSet::new(),
                 budget_cost: None,
+                in_file: None,
             },
             [],
         );

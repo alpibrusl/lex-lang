@@ -19,6 +19,7 @@ fn apply_operation_advances_head_on_main() {
             stage_id: "stg-1".into(),
             effects: BTreeSet::new(),
             budget_cost: None,
+            in_file: None,
         },
         [],
     );
@@ -44,6 +45,7 @@ fn apply_operation_chains_against_existing_head() {
             stage_id: "stg-1".into(),
             effects: BTreeSet::new(),
             budget_cost: None,
+            in_file: None,
         },
         [],
     );
@@ -77,6 +79,7 @@ fn apply_operation_with_stale_parent_errors() {
             stage_id: "stg-1".into(),
             effects: BTreeSet::new(),
             budget_cost: None,
+            in_file: None,
         },
         [],
     );
@@ -112,6 +115,7 @@ fn apply_operation_against_unknown_branch_does_not_persist() {
             stage_id: "stg-1".into(),
             effects: BTreeSet::new(),
             budget_cost: None,
+            in_file: None,
         },
         [],
     );

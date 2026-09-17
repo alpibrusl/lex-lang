@@ -11,10 +11,12 @@ use lex_syntax::{load_package, Manifest};
 /// (they collide). Returns the per-file import map for a package; a
 /// single **file** is loaded as before and returns `None` (the caller
 /// derives imports from the parsed `Import` stages).
-fn read_publish_source(path: &str) -> Result<(SynProgram, Option<lex_vcs::ImportMap>)> {
+fn read_publish_source(
+    path: &str,
+) -> Result<(SynProgram, Option<lex_vcs::ImportMap>, BTreeMap<String, String>)> {
     let p = std::path::Path::new(path);
     if !p.is_dir() {
-        return Ok((read_program(path)?, None));
+        return Ok((read_program(path)?, None, BTreeMap::new()));
     }
     let manifest = Manifest::load(&p.join("lex.toml"))
         .map_err(|e| anyhow!("reading {path}/lex.toml (a package publish needs it): {e}"))?;
@@ -50,7 +52,7 @@ fn read_publish_source(path: &str) -> Result<(SynProgram, Option<lex_vcs::Import
             });
         }
     }
-    Ok((loaded.program, Some(imports)))
+    Ok((loaded.program, Some(imports), loaded.module_prefixes))
 }
 
 /// Recursively collect `*.lex` files under `dir`, sorted for a
@@ -151,7 +153,7 @@ pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     // A directory argument publishes the whole package (mangled, one op
     // log, no sibling-name collisions); a file argument is a single
     // module. `pkg_imports` is `Some` only for a package.
-    let (prog, pkg_imports) = read_publish_source(path)?;
+    let (prog, pkg_imports, module_prefixes) = read_publish_source(path)?;
     // #168: type-check *and* rewrite stdlib parse calls so a
     // typed `toml.parse[T]` validates required fields before
     // returning Ok. The mutation lands in the canonical AST so
@@ -302,6 +304,7 @@ pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             new_stages: &stages,
             new_imports: &new_imports,
             diff: &report,
+            module_prefixes: &module_prefixes,
         })
         .map_err(|e| anyhow!("diff_to_ops: {e}"))?;
         let actions: Vec<serde_json::Value> = op_kinds
@@ -346,6 +349,7 @@ pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         activate,
         signer.as_ref(),
         intent_id.clone(),
+        &module_prefixes,
     )?;
     // #835 Tier 1: record the behavioral-examples verdict for each
     // published fn-stage that declares examples. Best-effort.

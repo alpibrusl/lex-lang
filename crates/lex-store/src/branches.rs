@@ -797,6 +797,7 @@ mod branch_head_snapshot_tests {
                 stage_id: stg.into(),
                 effects: BTreeSet::new(),
                 budget_cost: None,
+                in_file: None,
             },
             parent.into_iter().collect::<Vec<_>>(),
         );
@@ -831,6 +832,7 @@ mod branch_head_snapshot_tests {
                 stage_id: "stage_reset".into(),
                 effects: BTreeSet::new(),
                 budget_cost: None,
+                in_file: None,
             },
             Vec::new(), // no parents: a fresh root, unrelated to fn::a/fn::b
         );
@@ -889,6 +891,7 @@ mod branch_head_snapshot_tests {
                 stage_id: "sd".into(),
                 effects: BTreeSet::new(),
                 budget_cost: None,
+                in_file: None,
             },
             Vec::new(),
         );

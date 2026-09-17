@@ -1259,7 +1259,18 @@ impl Store {
         activate: bool,
         signer: Option<&lex_vcs::Keypair>,
     ) -> Result<PublishOutcome, StoreError> {
-        self.publish_program_with_intent(branch, stages, diff, new_imports, activate, signer, None)
+        // Single-file / test callers don't publish a mangled package, so
+        // there are no module prefixes to record (`in_file` stays `None`).
+        self.publish_program_with_intent(
+            branch,
+            stages,
+            diff,
+            new_imports,
+            activate,
+            signer,
+            None,
+            &std::collections::BTreeMap::new(),
+        )
     }
 
     /// [`Self::publish_program_signed`] plus an optional `intent_id`
@@ -1285,6 +1296,11 @@ impl Store {
         activate: bool,
         signer: Option<&lex_vcs::Keypair>,
         intent_id: Option<lex_vcs::IntentId>,
+        // Mangling prefix → package source file, for a multi-module
+        // package publish; empty for a single file. Recorded as each
+        // `AddFunction`/`AddType`'s `in_file` so `export-git` can
+        // de-flatten the package (#894).
+        module_prefixes: &std::collections::BTreeMap<String, String>,
     ) -> Result<PublishOutcome, StoreError> {
         use std::collections::{BTreeMap, BTreeSet};
 
@@ -1350,6 +1366,7 @@ impl Store {
             new_stages: stages,
             new_imports,
             diff,
+            module_prefixes,
         })
         .map_err(|e| StoreError::InvalidTransition(format!("diff_to_ops: {e}")))?;
 
@@ -2742,6 +2759,8 @@ impl Store {
                 stage_id: new_fn_stage_id.clone(),
                 effects: new_fn_effects,
                 budget_cost: new_fn_budget,
+                // Single-op apply path — no package context here.
+                in_file: None,
             },
             head_now.into_iter().collect::<Vec<_>>(),
         )
@@ -3340,7 +3359,7 @@ fn transition_for_kind(kind: &lex_vcs::OperationKind) -> lex_vcs::StageTransitio
         AddFunction {
             sig_id, stage_id, ..
         }
-        | AddType { sig_id, stage_id } => StageTransition::Create {
+        | AddType { sig_id, stage_id, .. } => StageTransition::Create {
             sig_id: sig_id.clone(),
             stage_id: stage_id.clone(),
         },

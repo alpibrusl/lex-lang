@@ -33,6 +33,7 @@ fn land_add(s: &Store, src: &str, name: &str) -> (String, String, String) {
             stage_id: stg.clone(),
             effects: BTreeSet::new(),
             budget_cost: None,
+            in_file: None,
         },
         s.get_branch(DEFAULT_BRANCH).unwrap().and_then(|b| b.head_op).into_iter().collect::<Vec<_>>(),
     );

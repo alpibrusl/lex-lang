@@ -43,6 +43,7 @@ fn add_function() -> Operation {
             stage_id: "abc123".into(),
             effects: empty_effects(),
             budget_cost: None,
+            in_file: None,
         },
         [],
     )
@@ -117,6 +118,7 @@ fn add_type() -> Operation {
         OperationKind::AddType {
             sig_id: "Color".into(),
             stage_id: "type-stage-1".into(),
+            in_file: None,
         },
         [],
     )
@@ -136,6 +138,7 @@ fn add_function_with_intent() -> Operation {
             stage_id: "abc123".into(),
             effects: empty_effects(),
             budget_cost: None,
+            in_file: None,
         },
         [],
     )
@@ -156,6 +159,7 @@ fn add_function_parameterized_effect() -> Operation {
             stage_id: "stage-w-1".into(),
             effects,
             budget_cost: None,
+            in_file: None,
         },
         ["op-parent".into()],
     )

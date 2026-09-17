@@ -256,6 +256,7 @@ mod tests {
                 stage_id: stg.into(),
                 effects: BTreeSet::new(),
                 budget_cost: None,
+                in_file: None,
             },
             parent.cloned().into_iter().collect::<Vec<_>>(),
         );

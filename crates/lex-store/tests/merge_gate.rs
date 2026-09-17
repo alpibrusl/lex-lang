@@ -47,6 +47,7 @@ fn land_add(s: &Store, branch: &str, src: &str, name: &str) -> (String, String) 
             stage_id: stg.clone(),
             effects: BTreeSet::new(),
             budget_cost: None,
+            in_file: None,
         },
         head_op_vec(s, branch),
     );

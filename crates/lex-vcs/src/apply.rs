@@ -89,6 +89,7 @@ mod tests {
                 stage_id: "s1".into(),
                 effects: BTreeSet::new(),
                 budget_cost: None,
+                in_file: None,
             },
             [],
         );
@@ -193,6 +194,7 @@ mod tests {
                 stage_id: "d1".into(),
                 effects: BTreeSet::new(),
                 budget_cost: None,
+                in_file: None,
             },
             [],
         );
