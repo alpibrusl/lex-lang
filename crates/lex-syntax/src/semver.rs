@@ -161,9 +161,51 @@ pub fn best_match<'a>(constraint: &str, versions: &'a [String]) -> Option<&'a st
         .map(|s| s.as_str())
 }
 
+/// The kind of version increment between two releases, ordered
+/// `Patch < Minor < Major`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Bump {
+    Patch,
+    Minor,
+    Major,
+}
+
+/// The bump from `prev` to `new` (both `MAJOR.MINOR.PATCH`). `None` if either
+/// is unparseable or `new` is not strictly greater than `prev` — the caller
+/// decides what a non-forward release means (the version-bump gate skips it).
+pub fn bump_between(prev: &str, new: &str) -> Option<Bump> {
+    let p = parse_exact(prev)?;
+    let n = parse_exact(new)?;
+    if n <= p {
+        return None;
+    }
+    if n.0 > p.0 {
+        Some(Bump::Major)
+    } else if n.1 > p.1 {
+        Some(Bump::Minor)
+    } else {
+        Some(Bump::Patch)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bumps() {
+        assert_eq!(bump_between("1.0.0", "2.0.0"), Some(Bump::Major));
+        assert_eq!(bump_between("1.2.0", "1.3.0"), Some(Bump::Minor));
+        assert_eq!(bump_between("1.2.3", "1.2.4"), Some(Bump::Patch));
+        // major bump beats a simultaneous minor/patch change
+        assert_eq!(bump_between("1.2.3", "2.0.0"), Some(Bump::Major));
+        // not strictly greater → None
+        assert_eq!(bump_between("1.2.3", "1.2.3"), None);
+        assert_eq!(bump_between("1.2.3", "1.2.0"), None);
+        assert_eq!(bump_between("1.2.3", "nope"), None);
+        // ordering
+        assert!(Bump::Major > Bump::Minor && Bump::Minor > Bump::Patch);
+    }
 
     #[test]
     fn exact() {
