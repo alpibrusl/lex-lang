@@ -32,6 +32,7 @@ fn make_add_op(sig: &str, stage: &str) -> (Operation, StageTransition) {
             stage_id: stage.into(),
             effects: BTreeSet::new(),
             budget_cost: None,
+            in_file: None,
         },
         [],
     );
@@ -115,6 +116,7 @@ fn record_run_committed_ops_since_walks_diff() {
         OperationKind::AddFunction {
             sig_id: "fb".into(), stage_id: "stg-fb".into(),
             effects: BTreeSet::new(), budget_cost: None,
+            in_file: None,
         },
         [id_a.clone()],
     );

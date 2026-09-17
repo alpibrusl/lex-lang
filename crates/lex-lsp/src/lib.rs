@@ -956,6 +956,7 @@ fn second() -> Int {
                 stage_id: stg.clone(),
                 effects: Default::default(),
                 budget_cost: None,
+                in_file: None,
             },
             [],
         );

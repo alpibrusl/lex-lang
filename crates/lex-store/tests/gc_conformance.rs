@@ -19,6 +19,7 @@ fn make_add_op(sig: &str, stage: &str) -> (Operation, StageTransition) {
             stage_id: stage.into(),
             effects: BTreeSet::new(),
             budget_cost: None,
+            in_file: None,
         },
         [],
     );
@@ -126,6 +127,7 @@ fn predicate_match_retains_orphaned_ops() {
         OperationKind::AddFunction {
             sig_id: "fb".into(), stage_id: "stg-fb".into(),
             effects: BTreeSet::new(), budget_cost: None,
+            in_file: None,
         },
         [],
     );
@@ -163,6 +165,7 @@ fn apply_gc_deletes_orphans_and_is_idempotent() {
             OperationKind::AddFunction {
                 sig_id: "fb".into(), stage_id: "stg-fb".into(),
                 effects: BTreeSet::new(), budget_cost: None,
+                in_file: None,
             },
             [],
         ),
@@ -201,6 +204,7 @@ fn policy_json_retain_predicates_are_honored() {
             OperationKind::AddFunction {
                 sig_id: "fb".into(), stage_id: "stg-fb".into(),
                 effects: BTreeSet::new(), budget_cost: None,
+                in_file: None,
             },
             [],
         ),
@@ -238,6 +242,7 @@ fn evict_rewrites_packed_ops_into_a_smaller_pack() {
                     stage_id: format!("s{i}"),
                     effects: BTreeSet::new(),
                     budget_cost: None,
+                    in_file: None,
                 },
                 [],
             ),

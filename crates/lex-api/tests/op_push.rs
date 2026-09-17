@@ -75,6 +75,7 @@ fn add_op(parent: Option<&str>, sig: &str, stg: &str) -> OperationRecord {
                 stage_id: stg.into(),
                 effects: BTreeSet::new(),
                 budget_cost: None,
+                in_file: None,
             },
             parents,
         ),

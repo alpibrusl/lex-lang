@@ -40,6 +40,7 @@ fn build_op_store() -> tempfile::TempDir {
                 stage_id: stage.clone(),
                 effects: BTreeSet::new(),
                 budget_cost: None,
+                in_file: None,
             },
             head_now.into_iter().collect::<Vec<_>>(),
         );

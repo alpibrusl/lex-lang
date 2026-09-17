@@ -43,6 +43,7 @@ fn well_typed_add_op(sig: &str, stage: &str, cost: u64, intent: &str) -> (Operat
             stage_id: stage.into(),
             effects,
             budget_cost: Some(cost),
+            in_file: None,
         },
         [],
     ).with_intent(intent);
@@ -201,6 +202,7 @@ fn apply_operation_checked_no_intent_is_unaffected() {
             stage_id: "stg-1".into(),
             effects,
             budget_cost: Some(50),
+            in_file: None,
         },
         [],
     );

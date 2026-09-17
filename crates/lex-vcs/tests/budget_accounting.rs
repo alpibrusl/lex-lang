@@ -86,6 +86,7 @@ fn add_function_without_budget_keeps_pre_247_op_id() {
             stage_id: "abc123".into(),
             effects: BTreeSet::new(),
             budget_cost: None,
+            in_file: None,
         },
         [],
     );
@@ -105,6 +106,7 @@ fn add_function_with_budget_produces_distinct_op_id() {
             stage_id: "s".into(),
             effects: BTreeSet::new(),
             budget_cost: None,
+            in_file: None,
         },
         [],
     );
@@ -114,6 +116,7 @@ fn add_function_with_budget_produces_distinct_op_id() {
             stage_id: "s".into(),
             effects: BTreeSet::new(),
             budget_cost: Some(50),
+            in_file: None,
         },
         [],
     );
@@ -127,6 +130,7 @@ fn budget_delta_returns_the_right_pair_per_variant() {
         stage_id: "s".into(),
         effects: BTreeSet::new(),
         budget_cost: Some(10),
+        in_file: None,
     };
     assert_eq!(add.budget_delta(), (None, Some(10)));
 
@@ -183,6 +187,7 @@ fn budget_chain_grow_shrink_reports_the_right_deltas() {
             stage_id: "s1".into(),
             effects: s("budget(10)"),
             budget_cost: Some(10),
+            in_file: None,
         },
         OperationKind::ModifyBody {
             sig_id: "fac".into(),

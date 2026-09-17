@@ -35,6 +35,7 @@ fn add(s: &Store, branch: &str, sig: &str, stg: &str) -> String {
             stage_id: stg.into(),
             effects: BTreeSet::new(),
             budget_cost: None,
+            in_file: None,
         },
         s.get_branch(branch).unwrap().and_then(|b| b.head_op).into_iter().collect::<Vec<_>>(),
     );

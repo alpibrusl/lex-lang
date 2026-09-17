@@ -2121,7 +2121,18 @@ fn pkg_publish_handler(state: &State, body: &[u8]) -> Response<std::io::Cursor<V
         }
     }
 
-    let outcome = match store.publish_program(&branch, &stages, &report, &new_imports, false) {
+    // Record each declaration's source file (#894) so an HTTP-published
+    // package de-flattens in `export-git` too, not just a CLI-published one.
+    let outcome = match store.publish_program_with_intent(
+        &branch,
+        &stages,
+        &report,
+        &new_imports,
+        false,
+        None,
+        None,
+        &loaded.module_prefixes,
+    ) {
         Ok(outcome) => outcome,
         Err(lex_store::StoreError::TypeError(errs)) => {
             return error_with_detail(422, "type errors", serde_json::to_value(&errs).unwrap());

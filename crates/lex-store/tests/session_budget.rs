@@ -48,6 +48,7 @@ fn add_fn_with_budget(
             stage_id: stage.into(),
             effects,
             budget_cost: Some(cost),
+            in_file: None,
         },
         parents,
     );

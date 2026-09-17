@@ -45,6 +45,7 @@ fn pure_op(sig: &str, stg: &str) -> (Operation, StageTransition) {
                 stage_id: stg.into(),
                 effects: BTreeSet::new(),
                 budget_cost: None,
+                in_file: None,
             },
             [],
         ),

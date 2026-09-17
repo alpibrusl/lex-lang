@@ -183,6 +183,7 @@ mod tests {
             stage_id: "s".into(),
             effects: Default::default(),
             budget_cost: Some(10),
+            in_file: None,
         };
         assert_eq!(monotonic_spend(&k), 10);
 

@@ -52,6 +52,7 @@ fn seed_sig_on_branch(store: &Store) -> (String, String) {
             stage_id: stg.clone(),
             effects: Default::default(),
             budget_cost: None,
+            in_file: None,
         },
         [],
     );
@@ -217,6 +218,7 @@ fn candidates_for_different_sigs_are_isolated() {
             stage_id: other_stg.clone(),
             effects: Default::default(),
             budget_cost: None,
+            in_file: None,
         },
         [head_now],
     );

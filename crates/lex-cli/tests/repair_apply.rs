@@ -40,6 +40,7 @@ fn publish_initial_pick(store: &Store) -> (String, String) {
             stage_id: stg.clone(),
             effects: Default::default(),
             budget_cost: None,
+            in_file: None,
         },
         [],
     );

@@ -64,6 +64,14 @@ pub struct DiffInputs<'a> {
     /// different signatures), so a `name -> SigId` map here would
     /// silently collapse distinct functions onto one SigId.
     pub diff: &'a DiffReport,
+    /// Mangling prefix → package source file (`schema_a1b2` →
+    /// `src/schema.lex`), for a multi-module package publish. A
+    /// declaration's mangled name is `<prefix>.<local>`, so this maps
+    /// each `AddFunction`/`AddType` to its origin file, recorded as the
+    /// op's `in_file` so `export-git` can de-flatten the package (#894).
+    /// Empty for a single-file publish (then `in_file` stays `None` and
+    /// OpIds are unchanged).
+    pub module_prefixes: &'a BTreeMap<String, String>,
 }
 
 pub fn diff_to_ops(inputs: DiffInputs<'_>) -> Result<Vec<OperationKind>, DiffMappingError> {
@@ -142,6 +150,7 @@ pub fn diff_to_ops(inputs: DiffInputs<'_>) -> Result<Vec<OperationKind>, DiffMap
         let Some(stg) = stage_id(stage) else {
             return Err(DiffMappingError::NoStageIdForStage(a.name.clone()));
         };
+        let in_file = origin_file(&a.name, inputs.module_prefixes);
         match stage {
             Stage::FnDecl(fd) => {
                 let effects = effect_set(&fd.effects);
@@ -151,11 +160,11 @@ pub fn diff_to_ops(inputs: DiffInputs<'_>) -> Result<Vec<OperationKind>, DiffMap
                 // query time.
                 let budget_cost = crate::operation::budget_from_effects(&effects);
                 out.push(OperationKind::AddFunction {
-                    sig_id: sig, stage_id: stg, effects, budget_cost,
+                    sig_id: sig, stage_id: stg, effects, budget_cost, in_file,
                 });
             }
             Stage::TypeDecl(_) => {
-                out.push(OperationKind::AddType { sig_id: sig, stage_id: stg });
+                out.push(OperationKind::AddType { sig_id: sig, stage_id: stg, in_file });
             }
             Stage::Import(_) => unreachable!(),
         }
@@ -260,6 +269,16 @@ fn effect_set(effs: &[Effect]) -> EffectSet {
     effs.iter().map(crate::compute_diff::effect_label).collect()
 }
 
+/// The package source file a declaration came from, or `None`. A
+/// package-mangled name is `<prefix>.<local>` (e.g.
+/// `schema_a1b2.validate`); `module_prefixes` maps the prefix to its
+/// file. A single-file publish leaves names unmangled and passes an
+/// empty map, so this is `None` and the op's `in_file` is omitted.
+fn origin_file(name: &str, module_prefixes: &BTreeMap<String, String>) -> Option<String> {
+    let prefix = name.split_once('.')?.0;
+    module_prefixes.get(prefix).cloned()
+}
+
 /// The alias to record on an `AddImport`, or `None` when it is just the
 /// module's default alias. Omitting the default keeps the common-case
 /// `AddImport` byte-identical to its pre-alias form, so its `OpId` does
@@ -295,6 +314,7 @@ mod tests {
             new_stages: &stages,
             new_imports: &ni,
             diff: &d,
+            module_prefixes: &BTreeMap::new(),
         }).expect("ok");
         assert!(ops.is_empty());
     }
@@ -332,6 +352,7 @@ mod tests {
             new_stages: &[parse_int],
             new_imports: &ni,
             diff: &diff,
+            module_prefixes: &BTreeMap::new(),
         }).expect("ok");
         assert_eq!(ops.len(), 1);
         match &ops[0] {
@@ -374,6 +395,7 @@ mod tests {
         let ops = diff_to_ops(DiffInputs {
             old_head: &head, old_effects: &eff,
             old_imports: &oi, new_stages: &[fac], new_imports: &ni, diff: &diff,
+            module_prefixes: &BTreeMap::new(),
         }).expect("ok");
         assert_eq!(ops.len(), 1);
         match &ops[0] {
@@ -399,6 +421,7 @@ mod tests {
         let ops = diff_to_ops(DiffInputs {
             old_head: &head, old_effects: &eff,
             old_imports: &oi, new_stages: &stages, new_imports: &new_imports, diff: &diff,
+            module_prefixes: &BTreeMap::new(),
         }).expect("ok");
         assert_eq!(ops.len(), 1);
         match &ops[0] {
@@ -425,6 +448,7 @@ mod tests {
         let ops = diff_to_ops(DiffInputs {
             old_head: &head, old_effects: &eff,
             old_imports: &oi, new_stages: &stages, new_imports: &new_imports, diff: &diff,
+            module_prefixes: &BTreeMap::new(),
         }).expect("ok");
         match &ops[0] {
             OperationKind::AddImport { module, alias, .. } => {
@@ -455,6 +479,7 @@ mod tests {
         let err = diff_to_ops(DiffInputs {
             old_head: &head, old_effects: &eff,
             old_imports: &oi, new_stages: &stages, new_imports: &ni, diff: &diff,
+            module_prefixes: &BTreeMap::new(),
         }).unwrap_err();
         match err {
             DiffMappingError::MissingOldSigForName(n) => assert_eq!(n, "ghost"),
@@ -561,6 +586,7 @@ mod tests {
             new_stages: &[new_stage],
             new_imports: &ni,
             diff: &diff,
+            module_prefixes: &BTreeMap::new(),
         }).expect("diff_to_ops should succeed");
 
         let change = ops.iter().find(|op| matches!(op, OperationKind::ChangeEffectSig { .. }));

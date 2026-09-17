@@ -205,3 +205,50 @@ fn publish_package_is_idempotent_across_shared_stage_ids() {
     assert!(p2.status.success(), "publish #2: {}", String::from_utf8_lossy(&p2.stderr));
     assert_eq!(ops_len(&p2), 0, "a package republish must be a no-op (idempotent)");
 }
+
+/// #894 slice 2: a package publish records each declaration's source
+/// file on its `AddFunction`/`AddType` op (so `export-git` can later
+/// de-flatten the package). A single-file publish records none, keeping
+/// those ops byte-identical (OpId-stable).
+#[test]
+fn package_publish_records_in_file_per_declaration() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("lex.toml"), "[package]\nname = \"pkg\"\nversion = \"0.1.0\"\n").unwrap();
+    let src = root.join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("a.lex"), "type Wid = { n :: Int }\nfn helper(x :: Int) -> Int { x + 1 }\n").unwrap();
+    std::fs::write(src.join("main.lex"), "import \"./a\" as a\nfn run(n :: Int) -> Int { a.helper(n) }\n").unwrap();
+    let store = root.join(".lex/store");
+
+    let out = Command::new(lex_bin())
+        .args([
+            "--output", "json", "publish", "--activate",
+            "--store", store.to_str().unwrap(),
+            root.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "publish: {}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let ops = v.pointer("/data/ops").or_else(|| v.get("ops")).unwrap().as_array().unwrap();
+
+    // Every add_function / add_type op carries an in_file naming a src file.
+    let adds: Vec<&serde_json::Value> = ops
+        .iter()
+        .filter(|o| matches!(o.pointer("/kind/op").and_then(|s| s.as_str()), Some("add_function") | Some("add_type")))
+        .collect();
+    assert!(adds.len() >= 3, "expected >=3 add ops (Wid, helper, run), got {}", adds.len());
+    for a in &adds {
+        let in_file = a.pointer("/kind/in_file").and_then(|s| s.as_str());
+        assert!(
+            matches!(in_file, Some(f) if f.starts_with("src/") && f.ends_with(".lex")),
+            "add op missing a src/ in_file: {a}"
+        );
+    }
+    // `helper` and `Wid` are in a.lex; `run` is in main.lex.
+    let files: std::collections::BTreeSet<&str> =
+        adds.iter().filter_map(|a| a.pointer("/kind/in_file").and_then(|s| s.as_str())).collect();
+    assert!(files.contains("src/a.lex") && files.contains("src/main.lex"),
+        "expected both src/a.lex and src/main.lex, got {files:?}");
+}
