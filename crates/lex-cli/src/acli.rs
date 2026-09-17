@@ -127,6 +127,7 @@ fn commands() -> Vec<CommandInfo> {
         // `every_dispatched_command_is_documented` now enforces.
         cmd_init(),
         cmd_pkg(),
+        cmd_propagate(),
         cmd_fmt(),
         cmd_ci(),
         cmd_doc_sync(),
@@ -196,6 +197,27 @@ fn cmd_pkg() -> CommandInfo {
         ),
     ])
     .with_see_also(vec!["init", "ci", "keygen"])
+}
+
+fn cmd_propagate() -> CommandInfo {
+    CommandInfo::new(
+        "propagate",
+        "push an upstream package's API change down its dependents: token-precise \
+         rename fan-out, or an agent-gated semantic migration",
+    )
+    .idempotent(false)
+    .add_argument("package", "string", "the upstream package that changed (--package)", true)
+    .with_examples(vec![
+        (
+            "Rename a symbol across every dependent in a workspace",
+            "lex propagate --package lex-nt --rename gcd=euclidean_gcd --workspace . --apply",
+        ),
+        (
+            "Agent-migrate dependents after a behavioral change (gated on type-check)",
+            "lex propagate --package lex-nt --symbol euler_phi --note 'handles 0 now' --ollama",
+        ),
+    ])
+    .with_see_also(vec!["pkg", "op", "replay"])
 }
 
 fn cmd_fmt() -> CommandInfo {

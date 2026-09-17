@@ -1,6 +1,6 @@
 {
   "name": "lex",
-  "version": "0.11.34",
+  "version": "0.11.37",
   "acli_version": "0.1.0",
   "commands": [
     {
@@ -1696,6 +1696,36 @@
         "init",
         "ci",
         "keygen"
+      ]
+    },
+    {
+      "name": "propagate",
+      "description": "push an upstream package's API change down its dependents: token-precise rename fan-out, or an agent-gated semantic migration",
+      "arguments": [
+        {
+          "name": "package",
+          "type": "string",
+          "description": "the upstream package that changed (--package)",
+          "required": true
+        }
+      ],
+      "options": [],
+      "subcommands": [],
+      "idempotent": false,
+      "examples": [
+        {
+          "description": "Rename a symbol across every dependent in a workspace",
+          "invocation": "lex propagate --package lex-nt --rename gcd=euclidean_gcd --workspace . --apply"
+        },
+        {
+          "description": "Agent-migrate dependents after a behavioral change (gated on type-check)",
+          "invocation": "lex propagate --package lex-nt --symbol euler_phi --note 'handles 0 now' --ollama"
+        }
+      ],
+      "see_also": [
+        "pkg",
+        "op",
+        "replay"
       ]
     },
     {

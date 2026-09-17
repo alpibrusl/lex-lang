@@ -36,6 +36,7 @@ mod export_git;
 mod replay_runner;
 mod pkg;
 mod pkg_lock;
+mod propagate;
 mod plan;
 mod policy;
 mod repair;
@@ -174,6 +175,7 @@ fn run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "canonical" => cmd_canonical(fmt, &args[1..]),
         "keygen" => cmd_keygen(fmt, &args[1..]),
         "pkg" => pkg::cmd_pkg(&args[1..]),
+        "propagate" => propagate::cmd_propagate(fmt, &args[1..]),
         "repl" => repl::cmd_repl(&args[1..]),
         "test" => test_runner::cmd_test(fmt, &args[1..]),
         "watch" => watch::cmd_watch(&args[1..]),
@@ -246,6 +248,8 @@ fn print_usage() {
     println!("  pkg add <name> --git <url>         add a git dependency");
     println!("  pkg install                        install/verify all declared dependencies");
     println!("  pkg list                           list declared dependencies");
+    println!("  propagate --package <p> --rename <old>=<new> [--workspace <d>] [--apply]");
+    println!("                                     push an upstream API change down its dependents");
     println!("  run [policy] <file> <fn> [args]    execute fn (args parsed as JSON)");
     println!("  run --from-store STAGE_ID [--require-signed] [--trusted-key HEX] <fn> [args]");
     println!("                                     run a stage straight out of the store;");
