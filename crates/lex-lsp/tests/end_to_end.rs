@@ -551,6 +551,7 @@ fn repair_hint_surfaces_as_code_action_when_store_has_one() {
             stage_id: stg.clone(),
             effects: Default::default(),
             budget_cost: None,
+            in_file: None,
         },
         [],
     );
