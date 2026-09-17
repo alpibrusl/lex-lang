@@ -36,6 +36,23 @@ pub type EffectSet = BTreeSet<String>;
 /// this crate doesn't pull in `lex-syntax`'s parser.
 pub type ModuleRef = String;
 
+/// The alias a module binds to when the import writes no explicit
+/// `as` — the module reference's last path segment, splitting on
+/// either `.` (stdlib, `std.sql` → `sql`) or `/` (local/package,
+/// `./error` → `error`, `lex-web/lib` → `lib`). Lex actually requires
+/// an explicit alias on every import, so this is not a language
+/// default; it is the convention `AddImport` uses to decide when an
+/// alias can be omitted from the op (keeping the `OpId` stable) and
+/// `export-git` uses to reconstruct it. The two MUST agree, so both
+/// call this one function.
+pub fn default_import_alias(module: &str) -> String {
+    module
+        .rsplit(['.', '/'])
+        .find(|seg| !seg.is_empty())
+        .unwrap_or(module)
+        .to_string()
+}
+
 /// Version tag for the operation canonical form (#244).
 ///
 /// The pre-image bytes hashed to derive an `OpId` are not stable
@@ -210,6 +227,18 @@ pub enum OperationKind {
     AddImport {
         in_file: String,
         module: ModuleRef,
+        /// The binding the module is imported under (`import "std.sql"
+        /// as sql` → `"sql"`). Lex requires an alias on every import,
+        /// but this is `None` whenever it equals the module's default
+        /// alias (the last path segment) — the common case — so those
+        /// `AddImport`s serialize exactly as before and keep their
+        /// original `OpId` (additive serialization, same trick as
+        /// `budget_cost`). Only a non-default alias (`import "./error"
+        /// as e`) is carried explicitly. Without it, `export-git`
+        /// cannot reconstruct a compilable module — the reference alone
+        /// doesn't say what name the body binds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        alias: Option<String>,
     },
     RemoveImport {
         in_file: String,

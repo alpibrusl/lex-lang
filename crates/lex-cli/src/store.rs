@@ -145,7 +145,25 @@ pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             _ => None,
         })
         .collect();
-    let report = diff::compute_diff(&old_fns, &new_fns, /* body_patches: */ true);
+    // Type declarations, so the op log captures `type`s too (#895).
+    let old_types: BTreeMap<String, lex_ast::TypeDecl> = old_head
+        .values()
+        .filter_map(|stg| store.get_ast(stg).ok())
+        .filter_map(|s| match s {
+            Stage::TypeDecl(td) => Some((td.name.clone(), td)),
+            _ => None,
+        })
+        .collect();
+    let new_types: BTreeMap<String, lex_ast::TypeDecl> = stages
+        .iter()
+        .filter_map(|s| match s {
+            Stage::TypeDecl(td) => Some((td.name.clone(), td.clone())),
+            _ => None,
+        })
+        .collect();
+    let report = lex_vcs::compute_diff_with_types(
+        &old_fns, &new_fns, &old_types, &new_types, /* body_patches: */ true,
+    );
 
     // Build new imports map (one entry per source file we just read).
     let mut new_imports: ImportMap = ImportMap::new();
@@ -157,7 +175,10 @@ pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let entry = new_imports.entry(file_key).or_default();
     for s in &stages {
         if let Stage::Import(im) = s {
-            entry.insert(im.reference.clone());
+            entry.insert(lex_vcs::ImportRef {
+                reference: im.reference.clone(),
+                alias: im.alias.clone(),
+            });
         }
     }
 

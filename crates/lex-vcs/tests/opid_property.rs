@@ -115,6 +115,7 @@ fn corpus() -> Vec<OperationKind> {
             out.push(OperationKind::AddImport {
                 in_file: file.into(),
                 module: module.into(),
+                alias: None,
             });
             out.push(OperationKind::RemoveImport {
                 in_file: file.into(),

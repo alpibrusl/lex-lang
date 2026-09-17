@@ -18,7 +18,7 @@
 //!   lex export-git <out_dir> [--branch NAME] [--store DIR]
 
 use super::*;
-use lex_vcs::{IntentLog, OpLog, StageTransition};
+use lex_vcs::{default_import_alias, IntentLog, OpLog, OperationKind, StageTransition};
 use std::collections::BTreeMap;
 use std::process::Command;
 
@@ -63,13 +63,38 @@ pub fn cmd_export_git(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 
     let src_path = out_dir.join("src.lex");
     let mut map: BTreeMap<String, String> = BTreeMap::new();
+    // Imports live outside the SigId→StageId head map (they replay as
+    // `ImportOnly`, a no-op there), so track them from the op kinds
+    // directly — `reference` → `alias`. Without this the rendered module
+    // has no `import` lines and doesn't compile (#895).
+    let mut imports: BTreeMap<String, String> = BTreeMap::new();
     let mut commits = 0usize;
 
     for rec in &records {
         apply_transition(&mut map, &rec.produces);
+        match &rec.op.kind {
+            OperationKind::AddImport { module, alias, .. } => {
+                // The op omits the alias when it's the module's default;
+                // reconstruct it the same way the store does.
+                let alias = alias.clone().unwrap_or_else(|| default_import_alias(module));
+                imports.insert(module.clone(), alias);
+            }
+            OperationKind::RemoveImport { module, .. } => {
+                imports.remove(module);
+            }
+            _ => {}
+        }
 
-        // Render the current head to source.
-        let mut stages: Vec<lex_ast::Stage> = Vec::with_capacity(map.len());
+        // Render the current head to source: imports first (a module
+        // won't type-check with its `import` lines below the code that
+        // uses them), then the fn/type stages the head map names.
+        let mut stages: Vec<lex_ast::Stage> = Vec::with_capacity(imports.len() + map.len());
+        for (reference, alias) in &imports {
+            stages.push(lex_ast::Stage::Import(lex_ast::Import {
+                reference: reference.clone(),
+                alias: alias.clone(),
+            }));
+        }
         for stage_id in map.values() {
             stages.push(store.get_ast(stage_id)?);
         }
