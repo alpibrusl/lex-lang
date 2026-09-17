@@ -2352,19 +2352,67 @@ fn pkg_get_version_handler(state: &State, name: &str, version: &str) -> Response
 
 /// `GET /v1/pkg/{name}/{version}/archive` — download the source tar.gz.
 fn pkg_archive_handler(state: &State, name: &str, version: &str) -> Response<std::io::Cursor<Vec<u8>>> {
-    let path = pkg_archive_path(&state.root, name, version);
-    match std::fs::read(&path) {
-        Ok(bytes) => Response::from_data(bytes)
-            .with_status_code(200)
-            .with_header(
-                tiny_http::Header::from_bytes(
-                    &b"Content-Type"[..],
-                    &b"application/gzip"[..],
-                )
-                .unwrap(),
-            ),
-        Err(_) => error_response(404, format!("archive for {name:?}@{version:?} not found")),
+    let gzip = |bytes: Vec<u8>| {
+        Response::from_data(bytes).with_status_code(200).with_header(
+            tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/gzip"[..]).unwrap(),
+        )
+    };
+
+    // 1. A stored archive (the `lex pkg publish --registry` upload path).
+    if let Ok(bytes) = std::fs::read(pkg_archive_path(&state.root, name, version)) {
+        return gzip(bytes);
     }
+
+    // 2. An op-log-native release (op push + `POST …/release`, #911) has no
+    //    stored archive — render one from the pinned op-log head so the
+    //    package installs like any other (#920).
+    if let Some(head_op) = load_pkg_record(&state.root, name, version).and_then(|r| r.head_op) {
+        match render_op_log_archive(state, name, version, &head_op) {
+            Ok(bytes) => return gzip(bytes),
+            Err(e) => {
+                return error_response(500, format!("rendering archive for {name:?}@{version:?}: {e}"));
+            }
+        }
+    }
+
+    error_response(404, format!("archive for {name:?}@{version:?} not found"))
+}
+
+/// Build a gzip-tar package archive (`lex.toml` + `src/lib.lex`) by rendering
+/// the op-log head `head_op` to source — the composition of a registry release
+/// (#911) with the op-log, so an `op push`-hosted package is installable
+/// without a separately-uploaded archive (#920). Single-module only, matching
+/// the hosting limit (#894).
+fn render_op_log_archive(
+    state: &State,
+    name: &str,
+    version: &str,
+    head_op: &str,
+) -> Result<Vec<u8>, String> {
+    let src = {
+        let store = state.store.lock().unwrap();
+        store
+            .render_source_at_op(head_op)
+            .map_err(|e| format!("rendering source at {head_op}: {e}"))?
+    };
+
+    let manifest = format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\n");
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    {
+        let mut ar = tar::Builder::new(&mut enc);
+        let mut append = |p: &str, data: &[u8]| -> std::io::Result<()> {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(data.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            ar.append_data(&mut h, p, data)
+        };
+        // The conventional `import "<pkg>/lib"` module.
+        append("lex.toml", manifest.as_bytes()).map_err(|e| e.to_string())?;
+        append("src/lib.lex", src.as_bytes()).map_err(|e| e.to_string())?;
+        ar.finish().map_err(|e| e.to_string())?;
+    }
+    enc.finish().map_err(|e| e.to_string())
 }
 
 /// `GET /v1/pkg/{name}/head` — head op for a package's latest version.
