@@ -40,6 +40,64 @@ fn spawn_registry(body: &'static str) -> String {
     format!("http://{addr}")
 }
 
+/// A minimal gzipped-tar package archive (`lex.toml` + `src/lib.lex`), the
+/// exact format `registry_ensure_cached` unpacks.
+fn gz_tar_archive(name: &str) -> Vec<u8> {
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    {
+        let mut ar = tar::Builder::new(&mut enc);
+        let toml = format!("[package]\nname = \"{name}\"\nversion = \"1.4.9\"\n");
+        let add = |path: &str, data: &[u8], ar: &mut tar::Builder<&mut flate2::write::GzEncoder<Vec<u8>>>| {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(data.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            ar.append_data(&mut h, path, data).unwrap();
+        };
+        add("lex.toml", toml.as_bytes(), &mut ar);
+        add("src/lib.lex", b"fn helper(x :: Int) -> Int { x + 1 }\n", &mut ar);
+        ar.finish().unwrap();
+    }
+    enc.finish().unwrap()
+}
+
+/// Spawn a registry serving both `/versions` (`body`) and a gz-tar archive at
+/// `/v1/pkg/{name}/{version}/archive` for any version.
+fn spawn_registry_with_archive(body: &'static str, archive: Vec<u8>) -> String {
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let addr = match server.server_addr() {
+        tiny_http::ListenAddr::IP(a) => a,
+        _ => unreachable!("expected IP listener"),
+    };
+    thread::spawn(move || {
+        for req in server.incoming_requests() {
+            let url = req.url().to_string();
+            if url.ends_with("/versions") {
+                let resp = tiny_http::Response::from_string(body).with_header(
+                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                        .unwrap(),
+                );
+                let _ = req.respond(resp);
+            } else if url.ends_with("/archive") {
+                let _ = req.respond(tiny_http::Response::from_data(archive.clone()));
+            } else {
+                // No /contract → verify treats it as unsigned (NoContract).
+                let _ = req.respond(tiny_http::Response::empty(404));
+            }
+        }
+    });
+    format!("http://{addr}")
+}
+
+fn run_pkg_isolated_cache(dir: &Path, cache: &Path, sub: &str) -> std::process::Output {
+    Command::new(lex_bin())
+        .current_dir(dir)
+        .env("LEX_PACKAGES_DIR", cache)
+        .args(["pkg", sub])
+        .output()
+        .unwrap()
+}
+
 /// Write a consumer project depending on `dep` at `constraint` from `registry`.
 fn write_consumer(dir: &Path, registry: &str, constraint: &str) {
     std::fs::create_dir_all(dir).unwrap();
@@ -131,6 +189,53 @@ fn lock_keeps_a_valid_pin_but_update_advances_it() {
     let updated = std::fs::read_to_string(app.join("lex.lock")).unwrap();
     assert!(updated.contains("version = \"1.9.0\""), "updated lock:\n{updated}");
     assert!(updated.contains("op_c"), "updated lock:\n{updated}");
+}
+
+#[test]
+fn install_fetches_the_locked_version_for_a_constraint() {
+    // The whole loop: a `^1.2` constraint has no single version to fetch, so
+    // install must consult lex.lock. `lex pkg lock` pins 1.4.9; `lex pkg
+    // install` then fetches exactly that release's archive.
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tmp.path().join("cache");
+    let registry = spawn_registry_with_archive(VERSIONS, gz_tar_archive("dep"));
+    let app = tmp.path().join("app");
+    write_consumer(&app, &registry, "^1.2");
+
+    assert!(run_pkg_isolated_cache(&app, &cache, "lock").status.success());
+
+    let out = run_pkg_isolated_cache(&app, &cache, "install");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "install should succeed via the lock: stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Display shows the constraint resolving to the locked version.
+    assert!(stdout.contains("1.4.9 (locked)"), "stdout={stdout}");
+    // The exact locked release was extracted into the cache.
+    assert!(cache.join("dep-1.4.9").join("src/lib.lex").exists(), "cache missing dep-1.4.9");
+}
+
+#[test]
+fn install_without_a_lock_errors_for_a_constraint() {
+    // A constraint dep with no lex.lock cannot be fetched — install must
+    // refuse with a clear "run lex pkg lock", not fabricate a version.
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tmp.path().join("cache");
+    let registry = spawn_registry_with_archive(VERSIONS, gz_tar_archive("dep"));
+    let app = tmp.path().join("app");
+    write_consumer(&app, &registry, "^1.2");
+    // Deliberately do NOT run `lex pkg lock`.
+
+    let out = run_pkg_isolated_cache(&app, &cache, "install");
+    assert!(!out.status.success(), "install must fail without a lock");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(combined.contains("lex pkg lock"), "output={combined}");
 }
 
 #[test]

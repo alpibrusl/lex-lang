@@ -217,7 +217,24 @@ pub fn resolve_package_import(
             git_ensure_cached(pkg_name, git, &git_ref)?
         }
         Dependency::Registry { registry, version } => {
-            registry_ensure_cached(pkg_name, registry, version)?
+            // A registry dependency declares a *constraint*; the exact release
+            // to fetch comes from `lex.lock` (#893). Prefer the locked pin; a
+            // declaration that is already an exact version resolves directly.
+            let locked = crate::lock::LockFile::load_dir(&toml_dir)
+                .and_then(|lf| lf.entry(pkg_name).map(|e| e.version.clone()));
+            let effective = match locked {
+                Some(v) => v,
+                None if crate::semver::parse_exact(version).is_some() => version.clone(),
+                None => {
+                    // A constraint with no lock entry can't be fetched — there
+                    // is no single version to ask the registry for.
+                    return Err(PackageError::UnlockedRegistryDep {
+                        name: pkg_name.to_string(),
+                        constraint: version.clone(),
+                    });
+                }
+            };
+            registry_ensure_cached(pkg_name, registry, &effective)?
         }
     };
 
@@ -455,6 +472,9 @@ pub enum PackageError {
 
     #[error("registry fetch of {name}@{version} from {registry} failed: {detail}")]
     RegistryFailed { name: String, registry: String, version: String, detail: String },
+
+    #[error("registry dependency \"{name}\" declares constraint \"{constraint}\" but is not in lex.lock — run `lex pkg lock` to pin a version")]
+    UnlockedRegistryDep { name: String, constraint: String },
 
     #[error("I/O error at {path}: {detail}")]
     Io { path: String, detail: String },

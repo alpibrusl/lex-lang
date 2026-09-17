@@ -227,6 +227,12 @@ fn cmd_install(args: &[String]) -> Result<()> {
 
     println!("installing dependencies from {}:", toml_path.display());
 
+    // The root lex.lock pins each registry dependency to an exact release
+    // (#893). Registry deps declare a *constraint*; the pinned version is what
+    // actually gets fetched. Loaded once and looked up by name (the flat
+    // layout holds one version per name).
+    let lock = crate::pkg_lock::LockFile::load_dir(&toml_dir).unwrap_or_default();
+
     // BFS queue: (dep_name, dir_of_declaring_lex_toml, is_direct_dep)
     let mut queue: VecDeque<(String, PathBuf, bool)> = VecDeque::new();
     // seen: dep_name → flat-layout identity — detects cycles and version conflicts.
@@ -264,8 +270,13 @@ fn cmd_install(args: &[String]) -> Result<()> {
                 format!("{}{}", git, ref_desc)
             }
             Some(lex_syntax::workspace::Dependency::Path { path }) => path.clone(),
-            Some(lex_syntax::workspace::Dependency::Registry { registry, version }) =>
-                format!("{registry}@{version}"),
+            Some(lex_syntax::workspace::Dependency::Registry { registry, version }) => {
+                match lock.entry(&name) {
+                    Some(e) if e.version != *version =>
+                        format!("{registry}@{version} → {} (locked)", e.version),
+                    _ => format!("{registry}@{version}"),
+                }
+            }
             None => "?".into(),
         };
         let transitive_tag = if direct { "" } else { "  [transitive]" };
@@ -274,7 +285,10 @@ fn cmd_install(args: &[String]) -> Result<()> {
 
         // For registry deps: verify the published contract before installing.
         if let Some(lex_syntax::workspace::Dependency::Registry { registry, version }) = &dep_owned {
-            match verify_registry_dep(registry, &name, version, keyring.as_ref()) {
+            // Verify the exact release that will be fetched — the lock's pin,
+            // not the constraint (a constraint has no `/contract` endpoint).
+            let effective = lock.entry(&name).map(|e| e.version.as_str()).unwrap_or(version.as_str());
+            match verify_registry_dep(registry, &name, effective, keyring.as_ref()) {
                 Ok(DepVerification::Verified { signer, signer_trusted, .. }) => {
                     let trust = if signer_trusted {
                         " (signer trusted)".to_string()
@@ -488,7 +502,7 @@ fn cmd_lock(args: &[String], keep_existing: bool) -> Result<()> {
             version: crate::pkg_lock::LOCK_FORMAT_VERSION,
             packages: Vec::new(),
         };
-        std::fs::write(&lock_path, empty.to_toml()?)
+        std::fs::write(&lock_path, empty.to_toml().map_err(anyhow::Error::msg)?)
             .with_context(|| format!("writing {}", lock_path.display()))?;
         return Ok(());
     }
@@ -556,7 +570,7 @@ fn cmd_lock(args: &[String], keep_existing: bool) -> Result<()> {
         version: crate::pkg_lock::LOCK_FORMAT_VERSION,
         packages,
     };
-    std::fs::write(&lock_path, lock.to_toml()?)
+    std::fs::write(&lock_path, lock.to_toml().map_err(anyhow::Error::msg)?)
         .with_context(|| format!("writing {}", lock_path.display()))?;
     println!("wrote {} ({} package(s))", lock_path.display(), lock.packages.len());
     Ok(())
