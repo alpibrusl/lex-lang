@@ -1414,12 +1414,21 @@ impl Store {
         let mut out: lex_vcs::ImportMap = Default::default();
         for r in log.walk_forward(&head, None)? {
             match r.op.kind {
-                AddImport { in_file, module } => {
-                    out.entry(in_file).or_default().insert(module);
+                AddImport { in_file, module, alias } => {
+                    // The op omits the alias when it's the module's
+                    // default (last path segment) to keep its OpId
+                    // stable; rebuild it the same way on the way out.
+                    let alias =
+                        alias.unwrap_or_else(|| lex_vcs::default_import_alias(&module));
+                    out.entry(in_file)
+                        .or_default()
+                        .insert(lex_vcs::ImportRef { reference: module, alias });
                 }
                 RemoveImport { in_file, module } => {
+                    // Removal is keyed by reference (the op carries no
+                    // alias), so drop any binding of that module.
                     if let Some(set) = out.get_mut(&in_file) {
-                        set.remove(&module);
+                        set.retain(|ir| ir.reference != module);
                     }
                 }
                 _ => {}

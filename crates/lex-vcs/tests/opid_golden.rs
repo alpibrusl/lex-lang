@@ -104,6 +104,9 @@ fn add_import() -> Operation {
         OperationKind::AddImport {
             in_file: "src/main.lex".into(),
             module: "std.io".into(),
+            // Default alias ("io") — omitted, so this op's canonical
+            // bytes and OpId are byte-identical to the pre-alias form.
+            alias: None,
         },
         ["op-parent".into()],
     )

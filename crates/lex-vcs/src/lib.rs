@@ -52,9 +52,11 @@ pub use attestation::{
     AttestationLog, AttestationResult, ContentHash, Cost, ProducerDescriptor, Signature, SpecId,
     ReviewVerdict, SpecMethod, TraceRunId,
 };
-pub use compute_diff::{compute_diff, effect_label, render_signature};
+pub use compute_diff::{
+    compute_diff, compute_diff_with_types, effect_label, render_signature, render_type_signature,
+};
 pub use diff_report::DiffReport;
-pub use diff_to_ops::{diff_to_ops, DiffInputs, DiffMappingError, ImportMap};
+pub use diff_to_ops::{diff_to_ops, DiffInputs, DiffMappingError, ImportMap, ImportRef};
 pub use gate::{check_and_apply, GateError};
 pub use intent::{Intent, IntentId, IntentLog, ModelDescriptor, SessionId};
 pub use merge::{merge, ConflictKind, MergeOutcome, MergeOutput};
@@ -66,6 +68,7 @@ pub use predicate::{evaluate, evaluate_with_resolver, IntentResolver, Predicate}
 pub use signing::{verify_message, verify_stage_id, Keypair, SigningError};
 pub use op_log::OpLog;
 pub use operation::{
-    budget_from_effects as operation_budget_from_effects, EffectSet, ModuleRef, OpId, Operation,
-    OperationFormat, OperationKind, OperationRecord, SigId, StageId, StageTransition,
+    budget_from_effects as operation_budget_from_effects, default_import_alias, EffectSet,
+    ModuleRef, OpId, Operation, OperationFormat, OperationKind, OperationRecord, SigId, StageId,
+    StageTransition,
 };

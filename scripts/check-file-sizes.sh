@@ -21,6 +21,7 @@ allow=(
   "crates/lex-runtime/src/builtins.rs"    # #778
   "crates/lex-store/src/store.rs"         # #779
   "crates/lex-types/src/builtins.rs"      # #778
+  "crates/lex-api/src/handlers.rs"        # #897
 )
 
 is_allowed() {

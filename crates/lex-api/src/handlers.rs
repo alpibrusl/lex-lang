@@ -20,6 +20,23 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tiny_http::{Header, Method, Request, Response};
 
+/// The function declarations in a canonicalized program, by name.
+fn stage_fns(stages: &[lex_ast::Stage]) -> BTreeMap<String, lex_ast::FnDecl> {
+    stages.iter().filter_map(|s| match s {
+        lex_ast::Stage::FnDecl(fd) => Some((fd.name.clone(), fd.clone())),
+        _ => None,
+    }).collect()
+}
+
+/// The type declarations in a canonicalized program, by name — so the
+/// publish diff captures `type`s alongside functions (#895).
+fn stage_types(stages: &[lex_ast::Stage]) -> BTreeMap<String, lex_ast::TypeDecl> {
+    stages.iter().filter_map(|s| match s {
+        lex_ast::Stage::TypeDecl(td) => Some((td.name.clone(), td.clone())),
+        _ => None,
+    }).collect()
+}
+
 pub struct State {
     pub store: Mutex<Store>,
     /// Filesystem root of the store. Held alongside the `Store`
@@ -525,20 +542,15 @@ pub(crate) fn publish_handler(state: &State, body: &str) -> Response<std::io::Cu
         Ok(h) => h,
         Err(e) => return error_response(500, format!("branch_head: {e}")),
     };
-    let old_fns: std::collections::BTreeMap<String, lex_ast::FnDecl> = old_head.values()
-        .filter_map(|stg| store.get_ast(stg).ok())
-        .filter_map(|s| match s {
-            lex_ast::Stage::FnDecl(fd) => Some((fd.name.clone(), fd)),
-            _ => None,
-        })
-        .collect();
-    let new_fns: std::collections::BTreeMap<String, lex_ast::FnDecl> = stages.iter()
-        .filter_map(|s| match s {
-            lex_ast::Stage::FnDecl(fd) => Some((fd.name.clone(), fd.clone())),
-            _ => None,
-        })
-        .collect();
-    let report = lex_vcs::compute_diff(&old_fns, &new_fns, false);
+    // Fns + types (#895) on both sides. Old side is the branch head.
+    let old_head_stages: Vec<lex_ast::Stage> =
+        old_head.values().filter_map(|stg| store.get_ast(stg).ok()).collect();
+    let old_fns = stage_fns(&old_head_stages);
+    let new_fns = stage_fns(&stages);
+    let old_types = stage_types(&old_head_stages);
+    let new_types = stage_types(&stages);
+    let report =
+        lex_vcs::compute_diff_with_types(&old_fns, &new_fns, &old_types, &new_types, false);
 
     // Build new imports map from any Import stages in the source.
     let mut new_imports: lex_vcs::ImportMap = lex_vcs::ImportMap::new();
@@ -546,7 +558,10 @@ pub(crate) fn publish_handler(state: &State, body: &str) -> Response<std::io::Cu
         let entry = new_imports.entry("<source>".into()).or_default();
         for s in &stages {
             if let lex_ast::Stage::Import(im) = s {
-                entry.insert(im.reference.clone());
+                entry.insert(lex_vcs::ImportRef {
+                    reference: im.reference.clone(),
+                    alias: im.alias.clone(),
+                });
             }
         }
     }
@@ -1973,6 +1988,16 @@ fn pkg_publish_handler(state: &State, body: &[u8]) -> Response<std::io::Cursor<V
     {
         old_fns_by_name.entry(fd.name.clone()).or_default().push(fd);
     }
+    // Old `type`s on the branch, by (mangled) name — captured too (#895).
+    // Types aren't overloaded, so a plain name map needs no take_matching.
+    let mut old_types_by_name: BTreeMap<String, lex_ast::TypeDecl> = BTreeMap::new();
+    for td in store.get_asts_for_sigs_bulk(&old_pairs)
+        .into_iter()
+        .filter_map(|r| r.ok())
+        .filter_map(|s| match s { lex_ast::Stage::TypeDecl(td) => Some(td), _ => None })
+    {
+        old_types_by_name.insert(td.name.clone(), td);
+    }
     // A name-independent fingerprint of a function's *contract*
     // (effects, param types, return type, examples — everything SigId
     // hashes except the name). Used only to disambiguate when multiple
@@ -2052,13 +2077,7 @@ fn pkg_publish_handler(state: &State, body: &[u8]) -> Response<std::io::Cursor<V
             serde_json::to_value(&errs).unwrap(),
         );
     }
-    let new_fns: BTreeMap<String, lex_ast::FnDecl> = stages
-        .iter()
-        .filter_map(|s| match s {
-            lex_ast::Stage::FnDecl(fd) => Some((fd.name.clone(), fd.clone())),
-            _ => None,
-        })
-        .collect();
+    let new_fns = stage_fns(&stages);
     let all_function_names: Vec<String> = new_fns.keys().cloned().collect();
 
     // Resolve each declaration against the branch's current state. No
@@ -2071,17 +2090,34 @@ fn pkg_publish_handler(state: &State, body: &[u8]) -> Response<std::io::Cursor<V
             old_fns.insert(name.clone(), fd);
         }
     }
-    let report = lex_vcs::compute_diff(&old_fns, &new_fns, false);
+    let new_types = stage_types(&stages);
+    // Only diff old types this publish also declares — one on the branch
+    // but absent from this file-set is left alone (as unclaimed old fns
+    // are), not read as removed.
+    let old_types: BTreeMap<String, lex_ast::TypeDecl> = new_types
+        .keys()
+        .filter_map(|n| old_types_by_name.get(n).map(|td| (n.clone(), td.clone())))
+        .collect();
+    let report =
+        lex_vcs::compute_diff_with_types(&old_fns, &new_fns, &old_types, &new_types, false);
 
     // Imports stay attributed per file — `AddImport`/`RemoveImport` carry
     // an `in_file`, and history records these same root-relative keys.
     // Each file now gets only the modules it imports itself; a flattened
     // per-file load could not tell those from its children's.
+    //
+    // `imports_by_file` carries only the reference, not the `as` alias, so
+    // record each under its default alias; a non-default alias in a
+    // multi-file package round-trips once the loader threads aliases
+    // through (with the multi-module work, #894).
     let mut new_imports = lex_vcs::ImportMap::new();
     for (file, modules) in &loaded.imports_by_file {
         let entry = new_imports.entry(file.clone()).or_default();
         for m in modules {
-            entry.insert(m.clone());
+            entry.insert(lex_vcs::ImportRef {
+                reference: m.clone(),
+                alias: lex_vcs::default_import_alias(m),
+            });
         }
     }
 

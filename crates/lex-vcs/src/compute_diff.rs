@@ -8,7 +8,7 @@
 use crate::diff_report::{
     AddRemove, BodyPatch, DiffReport, EffectChanges, Modified, Renamed,
 };
-use lex_ast::{stage_canonical_hash_hex, CExpr, Effect, EffectArg, FnDecl, Stage, TypeExpr};
+use lex_ast::{stage_canonical_hash_hex, CExpr, Effect, EffectArg, FnDecl, Stage, TypeDecl, TypeExpr};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Compute a structural diff between two named fn-decl maps.
@@ -16,9 +16,32 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 /// `body_patches` controls whether body-level expression diffs are
 /// emitted inside each `Modified` entry. Pass `true` for rich output
 /// (CLI / review); `false` for a signature-only diff (faster).
+///
+/// Function-only: type declarations are not considered. Use
+/// [`compute_diff_with_types`] on the publish path, where the op log
+/// must capture `type` declarations too (else `export-git` cannot
+/// reproduce a compilable module — see alpibrusl/lex-lang#895).
 pub fn compute_diff(
     a: &BTreeMap<String, FnDecl>,
     b: &BTreeMap<String, FnDecl>,
+    body_patches: bool,
+) -> DiffReport {
+    compute_diff_with_types(a, b, &BTreeMap::new(), &BTreeMap::new(), body_patches)
+}
+
+/// Like [`compute_diff`], but also diffs top-level `type` declarations,
+/// emitting added / removed / modified entries for them so `diff_to_ops`
+/// produces `AddType` / `RemoveType` / `ModifyType` ops. A type's
+/// `signature` is rendered `type Name = …` (the `"type "` prefix is how
+/// `diff_to_ops` tells a type removal from a function removal), and its
+/// `old_sig_id` is the `SigId` of the old `TypeDecl` stage. Rename
+/// detection is intentionally function-only; a renamed type reads as a
+/// remove + add, which reproduces it correctly.
+pub fn compute_diff_with_types(
+    a: &BTreeMap<String, FnDecl>,
+    b: &BTreeMap<String, FnDecl>,
+    a_types: &BTreeMap<String, TypeDecl>,
+    b_types: &BTreeMap<String, TypeDecl>,
     body_patches: bool,
 ) -> DiffReport {
     let mut report = DiffReport::default();
@@ -114,6 +137,64 @@ pub fn compute_diff(
             body_patches: patches,
             old_sig_id: lex_ast::sig_id(&Stage::FnDecl(fa.clone())).unwrap_or_default(),
         });
+    }
+
+    // Types. Added / removed by name; a same-name pair whose canonical
+    // hash differs is a modification (its `SigId` — name + type params,
+    // not the definition — stays put across a body change). A pair whose
+    // `SigId` differs too (e.g. gained a type parameter) reads as a
+    // remove + add, since the old sig can't be `ModifyType`d into the new
+    // one. No rename detection for types (rare; remove + add reproduces).
+    let tnames_a: BTreeSet<&String> = a_types.keys().collect();
+    let tnames_b: BTreeSet<&String> = b_types.keys().collect();
+    for n in tnames_a.difference(&tnames_b) {
+        let td = &a_types[*n];
+        report.removed.push(AddRemove {
+            name: (*n).clone(),
+            signature: render_type_signature(td),
+            old_sig_id: lex_ast::sig_id(&Stage::TypeDecl(td.clone())),
+        });
+    }
+    for n in tnames_b.difference(&tnames_a) {
+        let td = &b_types[*n];
+        report.added.push(AddRemove {
+            name: (*n).clone(),
+            signature: render_type_signature(td),
+            old_sig_id: None,
+        });
+    }
+    for n in tnames_a.intersection(&tnames_b) {
+        let ta = &a_types[*n];
+        let tb = &b_types[*n];
+        let hash_a = stage_canonical_hash_hex(&Stage::TypeDecl(ta.clone()));
+        let hash_b = stage_canonical_hash_hex(&Stage::TypeDecl(tb.clone()));
+        if hash_a == hash_b { continue; }
+        let sig_a = lex_ast::sig_id(&Stage::TypeDecl(ta.clone()));
+        let sig_b = lex_ast::sig_id(&Stage::TypeDecl(tb.clone()));
+        if sig_a != sig_b {
+            // Structural identity changed (type params): can't modify in
+            // place — drop the old, introduce the new.
+            report.removed.push(AddRemove {
+                name: (*n).clone(),
+                signature: render_type_signature(ta),
+                old_sig_id: sig_a,
+            });
+            report.added.push(AddRemove {
+                name: (*n).clone(),
+                signature: render_type_signature(tb),
+                old_sig_id: None,
+            });
+        } else {
+            report.modified.push(Modified {
+                name: (*n).clone(),
+                signature_before: render_type_signature(ta),
+                signature_after: render_type_signature(tb),
+                signature_changed: true,
+                effect_changes: EffectChanges::default(),
+                body_patches: Vec::new(),
+                old_sig_id: sig_a.unwrap_or_default(),
+            });
+        }
     }
     report
 }
@@ -278,6 +359,18 @@ pub fn render_signature(fd: &FnDecl) -> String {
     };
     format!("fn {}({}) -> {}{}", fd.name, params.join(", "),
         eff, render_type(&fd.return_type))
+}
+
+/// Render a type declaration's signature. The leading `type ` is
+/// load-bearing: `diff_to_ops` classifies a removal as `RemoveType`
+/// vs `RemoveFunction` by testing `signature.starts_with("type ")`.
+pub fn render_type_signature(td: &TypeDecl) -> String {
+    let params = if td.params.is_empty() {
+        String::new()
+    } else {
+        format!("[{}]", td.params.join(", "))
+    };
+    format!("type {}{} = {}", td.name, params, render_type(&td.definition))
 }
 
 /// Render an effect with its arg if present: `fs_read("/tmp")`,

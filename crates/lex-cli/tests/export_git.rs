@@ -62,3 +62,41 @@ fn export_is_deterministic_and_re_runnable() {
     // Re-running into the same dir must not error (idempotent tool).
     assert!(run().status.success(), "re-export must succeed");
 }
+
+/// #895: a module's `import`s (with their real aliases) and `type`
+/// declarations must survive the op-log round-trip, so the exported
+/// source is a compilable module — not just its function bodies.
+#[test]
+fn export_round_trips_imports_and_types_to_compilable_source() {
+    let store = tempdir().unwrap();
+    // Non-default alias (`as integer`, not the default `int`) exercises
+    // alias capture; the `type` exercises type capture; `show` uses both.
+    let source = concat!(
+        "import \"std.int\" as integer\n",
+        "type Wrapped = { n :: Int }\n",
+        "fn show(w :: Wrapped) -> Str { integer.to_str(w.n) }\n",
+    );
+    publish(store.path(), source);
+
+    let out = tempdir().unwrap();
+    let res = Command::new(lex_bin())
+        .args(["export-git", out.path().to_str().unwrap(),
+               "--store", store.path().to_str().unwrap()])
+        .output().unwrap();
+    assert!(res.status.success(), "export: {}", String::from_utf8_lossy(&res.stderr));
+
+    let rendered = std::fs::read_to_string(out.path().join("src.lex")).unwrap();
+    assert!(rendered.contains("import \"std.int\" as integer"),
+        "the non-default alias must round-trip verbatim, got:\n{rendered}");
+    assert!(rendered.contains("type Wrapped"),
+        "the type declaration must round-trip, got:\n{rendered}");
+
+    // The decisive check: the rendered module type-checks. Before #895
+    // it did not — imports and types were dropped, so `integer` and
+    // `Wrapped` were unresolved.
+    let check = Command::new(lex_bin())
+        .args(["check", out.path().join("src.lex").to_str().unwrap()])
+        .output().unwrap();
+    assert!(check.status.success(),
+        "rendered module must type-check: {}", String::from_utf8_lossy(&check.stderr));
+}

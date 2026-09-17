@@ -13,11 +13,21 @@
 //! to make this typed rather than string-prefix-based.
 
 use crate::diff_report::DiffReport;
-use crate::operation::{EffectSet, ModuleRef, OperationKind, SigId, StageId};
+use crate::operation::{default_import_alias, EffectSet, OperationKind, SigId, StageId};
 use lex_ast::{sig_id, stage_id, Effect, Stage};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub type ImportMap = BTreeMap<String, BTreeSet<ModuleRef>>;
+/// One import as the diff sees it: the module reference plus the alias
+/// it is bound under. The alias is part of the set key, so re-aliasing
+/// an already-imported module (`as sql` → `as db`) reads as a
+/// remove + add, which is exactly the pair of ops that reproduces it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub struct ImportRef {
+    pub reference: String,
+    pub alias: String,
+}
+
+pub type ImportMap = BTreeMap<String, BTreeSet<ImportRef>>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DiffMappingError {
@@ -76,13 +86,14 @@ pub fn diff_to_ops(inputs: DiffInputs<'_>) -> Result<Vec<OperationKind>, DiffMap
         for m in modules.difference(&old) {
             out.push(OperationKind::AddImport {
                 in_file: file.clone(),
-                module: m.clone(),
+                module: m.reference.clone(),
+                alias: explicit_alias(m),
             });
         }
         for m in old.difference(modules) {
             out.push(OperationKind::RemoveImport {
                 in_file: file.clone(),
-                module: m.clone(),
+                module: m.reference.clone(),
             });
         }
     }
@@ -91,7 +102,7 @@ pub fn diff_to_ops(inputs: DiffInputs<'_>) -> Result<Vec<OperationKind>, DiffMap
             for m in old {
                 out.push(OperationKind::RemoveImport {
                     in_file: file.clone(),
-                    module: m.clone(),
+                    module: m.reference.clone(),
                 });
             }
         }
@@ -249,6 +260,19 @@ fn effect_set(effs: &[Effect]) -> EffectSet {
     effs.iter().map(crate::compute_diff::effect_label).collect()
 }
 
+/// The alias to record on an `AddImport`, or `None` when it is just the
+/// module's default alias. Omitting the default keeps the common-case
+/// `AddImport` byte-identical to its pre-alias form, so its `OpId` does
+/// not rotate; only a deliberately-renamed import (`as e`) carries the
+/// alias explicitly.
+fn explicit_alias(m: &ImportRef) -> Option<String> {
+    if m.alias == default_import_alias(&m.reference) {
+        None
+    } else {
+        Some(m.alias.clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,7 +390,7 @@ mod tests {
     fn import_added_emits_add_import() {
         let mut new_imports = ImportMap::new();
         new_imports.insert("main.lex".into(),
-            std::iter::once("std.io".to_string()).collect());
+            std::iter::once(ImportRef { reference: "std.io".into(), alias: "io".into() }).collect());
         let head = BTreeMap::new();
         let eff = BTreeMap::new();
         let oi = ImportMap::new();
@@ -378,9 +402,35 @@ mod tests {
         }).expect("ok");
         assert_eq!(ops.len(), 1);
         match &ops[0] {
-            OperationKind::AddImport { in_file, module } => {
+            OperationKind::AddImport { in_file, module, alias } => {
                 assert_eq!(in_file, "main.lex");
                 assert_eq!(module, "std.io");
+                // "io" is the default alias of "std.io", so it's omitted.
+                assert_eq!(alias, &None);
+            }
+            other => panic!("expected AddImport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn import_with_nondefault_alias_carries_it() {
+        let mut new_imports = ImportMap::new();
+        new_imports.insert("main.lex".into(),
+            std::iter::once(ImportRef { reference: "./error".into(), alias: "e".into() }).collect());
+        let head = BTreeMap::new();
+        let eff = BTreeMap::new();
+        let oi = ImportMap::new();
+        let stages: Vec<Stage> = Vec::new();
+        let diff = dr();
+        let ops = diff_to_ops(DiffInputs {
+            old_head: &head, old_effects: &eff,
+            old_imports: &oi, new_stages: &stages, new_imports: &new_imports, diff: &diff,
+        }).expect("ok");
+        match &ops[0] {
+            OperationKind::AddImport { module, alias, .. } => {
+                assert_eq!(module, "./error");
+                // "e" != default alias "error", so it's carried explicitly.
+                assert_eq!(alias, &Some("e".to_string()));
             }
             other => panic!("expected AddImport, got {other:?}"),
         }
