@@ -35,6 +35,7 @@ mod recall;
 mod export_git;
 mod replay_runner;
 mod pkg;
+mod pkg_lock;
 mod plan;
 mod policy;
 mod repair;

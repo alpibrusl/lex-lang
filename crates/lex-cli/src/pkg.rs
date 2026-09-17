@@ -6,6 +6,12 @@
 //!   lex pkg add <name> --git <url> [--tag|--branch|--rev <ref>]
 //!                                                      — add a pinned git dependency
 //!   lex pkg add <name> --registry <url> --version <v>  — add a registry dependency
+//!   lex pkg lock                                       — resolve registry deps' semver
+//!                                                        constraints against published
+//!                                                        releases and write lex.lock
+//!                                                        (keeps still-valid pins)
+//!   lex pkg update                                     — re-resolve every registry dep to
+//!                                                        the highest match and relock
 //!   lex pkg list                                       — list dependencies in lex.toml
 //!   lex pkg publish [--registry <url>] [--token <jwt>] — publish package to a registry
 //!       [--sign <key>] [--requires <grant.json>] [--egress h,h] [--contract-out <file>]
@@ -31,10 +37,12 @@ pub fn cmd_pkg(args: &[String]) -> Result<()> {
         Some("add")     => cmd_add(&args[1..]),
         Some("list")    => cmd_list(),
         Some("install") => cmd_install(&args[1..]),
+        Some("lock")    => cmd_lock(&args[1..], /*keep_existing=*/ true),
+        Some("update")  => cmd_lock(&args[1..], /*keep_existing=*/ false),
         Some("publish") => cmd_publish(&args[1..]),
         Some("verify")  => cmd_verify(&args[1..]),
-        Some(other)     => bail!("unknown pkg subcommand `{other}`; try: init, add, install, list, publish, verify"),
-        None            => bail!("usage: lex pkg <init|add|install|list|publish|verify>"),
+        Some(other)     => bail!("unknown pkg subcommand `{other}`; try: init, add, install, lock, update, list, publish, verify"),
+        None            => bail!("usage: lex pkg <init|add|install|lock|update|list|publish|verify>"),
     }
 }
 
@@ -425,6 +433,133 @@ fn cmd_install(args: &[String]) -> Result<()> {
     } else {
         bail!("{} error(s) during install", errors.len())
     }
+}
+
+/// `lex pkg lock` / `lex pkg update` — resolve every registry dependency's
+/// semver constraint against the registry's published releases (#911) and
+/// write `lex.lock` next to `lex.toml`.
+///
+/// * `keep_existing = true` (`lock`) keeps any current pin that still
+///   satisfies its constraint and is still offered — the lock only moves when
+///   it must, so an already-valid lock is reproducible.
+/// * `keep_existing = false` (`update`) re-resolves every dependency to the
+///   highest satisfying release, deliberately pulling newer versions.
+///
+/// Path and git dependencies carry their own pin (a path, a git ref) and are
+/// not part of the semver lock; only `{ registry, version }` deps appear in
+/// `lex.lock`.
+fn cmd_lock(args: &[String], keep_existing: bool) -> Result<()> {
+    use lex_syntax::workspace::Dependency;
+
+    if let Some(flag) = args.first() {
+        bail!("`lex pkg {}` takes no arguments (got `{flag}`)",
+            if keep_existing { "lock" } else { "update" });
+    }
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    let (toml_path, toml_dir) = lex_syntax::find_manifest(&cwd)
+        .ok_or_else(|| anyhow::anyhow!("no lex.toml found (run `lex pkg init` to create one)"))?;
+    let manifest = lex_syntax::Manifest::load(&toml_path)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let lock_path = toml_dir.join("lex.lock");
+    let existing = std::fs::read_to_string(&lock_path)
+        .ok()
+        .and_then(|s| crate::pkg_lock::LockFile::from_toml(&s).ok())
+        .unwrap_or_default();
+
+    // Only registry deps are semver-resolved. Sorted for deterministic output
+    // and stable progress reporting.
+    let mut registry_deps: Vec<(String, String, String)> = manifest
+        .dependencies
+        .iter()
+        .filter_map(|(name, dep)| match dep {
+            Dependency::Registry { registry, version } =>
+                Some((name.clone(), registry.clone(), version.clone())),
+            _ => None,
+        })
+        .collect();
+    registry_deps.sort();
+
+    if registry_deps.is_empty() {
+        println!("no registry dependencies in {} — nothing to lock", toml_path.display());
+        // Still write an (empty) lock so its absence never means "stale".
+        let empty = crate::pkg_lock::LockFile {
+            version: crate::pkg_lock::LOCK_FORMAT_VERSION,
+            packages: Vec::new(),
+        };
+        std::fs::write(&lock_path, empty.to_toml()?)
+            .with_context(|| format!("writing {}", lock_path.display()))?;
+        return Ok(());
+    }
+
+    let verb = if keep_existing { "locking" } else { "updating" };
+    println!("{verb} registry dependencies from {}:", toml_path.display());
+
+    let mut packages = Vec::new();
+    let mut errors = Vec::new();
+    for (name, registry, constraint) in &registry_deps {
+        print!("  {name}  {registry}@{constraint} ... ");
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+
+        let available = match crate::pkg_lock::fetch_versions(registry, name) {
+            Ok(v) if v.is_empty() => {
+                println!("FAILED");
+                errors.push(format!("{name}: registry lists no releases"));
+                continue;
+            }
+            Ok(v) => v,
+            Err(e) => {
+                println!("FAILED");
+                eprintln!("    {e}");
+                errors.push(format!("{name}: {e}"));
+                continue;
+            }
+        };
+
+        match crate::pkg_lock::resolve_one(
+            name,
+            registry,
+            constraint,
+            &available,
+            existing.entry(name),
+            keep_existing,
+        ) {
+            Some(entry) => {
+                match &entry.head_op {
+                    Some(head) => println!("{} → {} @ {:.12}…", constraint, entry.version, head),
+                    None => println!("{} → {} (no head)", constraint, entry.version),
+                }
+                packages.push(entry);
+            }
+            None => {
+                println!("no match");
+                let offered = available
+                    .iter()
+                    .map(|r| r.version.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let msg = format!(
+                    "{name}: no released version satisfies `{constraint}` (offered: {offered})"
+                );
+                eprintln!("    {msg}");
+                errors.push(msg);
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        bail!("{} dependency/dependencies could not be resolved", errors.len());
+    }
+
+    let lock = crate::pkg_lock::LockFile {
+        version: crate::pkg_lock::LOCK_FORMAT_VERSION,
+        packages,
+    };
+    std::fs::write(&lock_path, lock.to_toml()?)
+        .with_context(|| format!("writing {}", lock_path.display()))?;
+    println!("wrote {} ({} package(s))", lock_path.display(), lock.packages.len());
+    Ok(())
 }
 
 /// A dependency's identity for flat-layout conflict detection.
