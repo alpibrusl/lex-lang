@@ -1,0 +1,468 @@
+//! Rendering a package's op-log head back to **source** — single `src.lex`
+//! for a single-module package, or the de-flattened `src/*.lex` tree for a
+//! multi-module one (#894).
+//!
+//! Declarations published through the package loader carry a per-file
+//! mangling prefix (`schema_a1b2.validate`); each `AddFunction`/`AddType` op
+//! records the source file it came from (`in_file`, #903). To render source
+//! we group the head's stages by file, strip each file's own prefix, and
+//! rewrite a reference to *another* file's prefix into `alias.name` plus a
+//! local `import`.
+//!
+//! This lives in `lex-store` (not the CLI) so both `lex export-git` and the
+//! hosted registry's archive endpoint render identically — the same source a
+//! human reads in the git mirror is the source a consumer installs.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use lex_vcs::{default_import_alias, OpLog, OperationKind};
+
+use crate::store::{Store, StoreError};
+
+/// A package head decomposed into what the renderer needs: the SigId→StageId
+/// head map, each SigId's source file, and the imports (flat, and per-file).
+#[derive(Debug, Default, Clone)]
+pub struct PackageHead {
+    /// SigId → StageId at the head.
+    pub map: BTreeMap<String, String>,
+    /// SigId → the source file its declaration came from (`in_file`).
+    pub sig_files: BTreeMap<String, String>,
+    /// module → alias, flattened across files (single-module render).
+    pub flat_imports: BTreeMap<String, String>,
+    /// file → (module → alias) (multi-module render).
+    pub file_imports: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+/// Rendered package source: one module, or a `relpath → source` tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenderedSource {
+    Single(String),
+    Multi(BTreeMap<String, String>),
+}
+
+/// Walk the op-log from `head_op` and assemble the [`PackageHead`] — the same
+/// bookkeeping `lex export-git` does incrementally, done once for a single
+/// head (used by the registry archive endpoint).
+pub fn package_head_at_op(store: &Store, head_op: &str) -> Result<PackageHead, StoreError> {
+    let log = OpLog::open(store.root())?;
+    let mut head = PackageHead::default();
+    for rec in log.walk_forward(&head_op.to_string(), None)? {
+        crate::branches::apply_transition(&mut head.map, &rec.produces);
+        match &rec.op.kind {
+            OperationKind::AddFunction { sig_id, in_file: Some(f), .. }
+            | OperationKind::AddType { sig_id, in_file: Some(f), .. } => {
+                head.sig_files.insert(sig_id.clone(), f.clone());
+            }
+            OperationKind::AddImport { in_file, module, alias } => {
+                let alias = alias.clone().unwrap_or_else(|| default_import_alias(module));
+                head.flat_imports.insert(module.clone(), alias.clone());
+                head.file_imports.entry(in_file.clone()).or_default().insert(module.clone(), alias);
+            }
+            OperationKind::RemoveImport { in_file, module } => {
+                head.flat_imports.remove(module);
+                if let Some(m) = head.file_imports.get_mut(in_file) {
+                    m.remove(module);
+                }
+            }
+            OperationKind::RenameSymbol { from, to, .. } => {
+                if let Some(f) = head.sig_files.remove(from) {
+                    head.sig_files.insert(to.clone(), f);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(head)
+}
+
+/// Render a package head to source. Multi-module iff every head fn/type stage
+/// records its source file; otherwise a single module.
+pub fn render_source(store: &Store, head: &PackageHead) -> Result<RenderedSource, StoreError> {
+    let multi = !head.map.is_empty() && head.map.keys().all(|s| head.sig_files.contains_key(s));
+    if multi {
+        Ok(RenderedSource::Multi(render_multifile(store, head)?))
+    } else {
+        Ok(RenderedSource::Single(render_singlefile(store, head)?))
+    }
+}
+
+/// The whole head as one source string (single module / #895 path). Imports
+/// first, then the head stages read per-SigId (so structurally identical
+/// stages that share a StageId keep their distinct names).
+fn render_singlefile(store: &Store, head: &PackageHead) -> Result<String, StoreError> {
+    let mut stages: Vec<lex_ast::Stage> = Vec::new();
+    for (reference, alias) in &head.flat_imports {
+        stages.push(lex_ast::Stage::Import(lex_ast::Import {
+            reference: reference.clone(),
+            alias: alias.clone(),
+        }));
+    }
+    let pairs: Vec<(String, String)> = head.map.iter().map(|(s, st)| (s.clone(), st.clone())).collect();
+    for ast in store.get_asts_for_sigs_bulk(&pairs) {
+        stages.push(ast?);
+    }
+    Ok(lex_ast::print_stages(&stages))
+}
+
+/// De-flatten a mangled multi-module head into a `relpath → source` tree.
+fn render_multifile(store: &Store, head: &PackageHead) -> Result<BTreeMap<String, String>, StoreError> {
+    let mut prefix_to_file: BTreeMap<String, String> = BTreeMap::new();
+    let mut by_file: BTreeMap<String, Vec<lex_ast::Stage>> = BTreeMap::new();
+    // Read each stage through the SigId the head names it by (not by StageId,
+    // which is name-independent) so cross-module structural twins keep their
+    // own names and file (#818/#894).
+    let pairs: Vec<(String, String)> = head.map.iter().map(|(s, st)| (s.clone(), st.clone())).collect();
+    let asts = store.get_asts_for_sigs_bulk(&pairs);
+    for ((sig, _), ast) in pairs.iter().zip(asts) {
+        let stage = ast?;
+        let file = head.sig_files.get(sig).cloned().unwrap_or_default();
+        if let Some(prefix) = stage_prefix(&stage) {
+            prefix_to_file.insert(prefix, file.clone());
+        }
+        by_file.entry(file).or_default().push(stage);
+    }
+
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for (file, stages) in &by_file {
+        let own_prefix = stages.iter().find_map(stage_prefix).unwrap_or_default();
+        let mut bound_locals = BTreeSet::new();
+        for s in stages {
+            collect_bound_locals(s, &mut bound_locals);
+        }
+        let mut rw = FileRewrite {
+            own_prefix: &own_prefix,
+            own_file: file,
+            prefix_to_file: &prefix_to_file,
+            bound_locals: &bound_locals,
+            local_imports: BTreeMap::new(),
+        };
+        let rewritten: Vec<lex_ast::Stage> = stages
+            .iter()
+            .cloned()
+            .map(|mut s| {
+                rw.rewrite_stage(&mut s);
+                s
+            })
+            .collect();
+
+        let mut imports: BTreeMap<String, String> = head.file_imports.get(file).cloned().unwrap_or_default();
+        imports.extend(rw.local_imports);
+
+        let mut out_stages: Vec<lex_ast::Stage> = Vec::new();
+        for (reference, alias) in &imports {
+            out_stages.push(lex_ast::Stage::Import(lex_ast::Import {
+                reference: reference.clone(),
+                alias: alias.clone(),
+            }));
+        }
+        out_stages.extend(rewritten);
+        out.insert(file.clone(), lex_ast::print_stages(&out_stages));
+    }
+    Ok(out)
+}
+
+/// The mangling prefix of a declaration (`schema_a1b2.validate` →
+/// `schema_a1b2`), or `None` for an import or an unmangled name.
+fn stage_prefix(s: &lex_ast::Stage) -> Option<String> {
+    let name = match s {
+        lex_ast::Stage::FnDecl(fd) => &fd.name,
+        lex_ast::Stage::TypeDecl(td) => &td.name,
+        lex_ast::Stage::Import(_) => return None,
+    };
+    name.split_once('.').map(|(p, _)| p.to_string())
+}
+
+/// `("src/schema.lex", "src/error.lex")` → `("./error", "error")`.
+fn relative_import(from: &str, to: &str) -> (String, String) {
+    let from_dir: Vec<&str> = from
+        .rsplit_once('/')
+        .map(|(d, _)| d)
+        .unwrap_or("")
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    let to_noext = to.strip_suffix(".lex").unwrap_or(to);
+    let to_parts: Vec<&str> = to_noext.split('/').filter(|s| !s.is_empty()).collect();
+    let alias = to_parts.last().copied().unwrap_or("mod").to_string();
+    let mut i = 0;
+    while i < from_dir.len() && i + 1 < to_parts.len() && from_dir[i] == to_parts[i] {
+        i += 1;
+    }
+    let ups = from_dir.len() - i;
+    let mut rel = String::new();
+    if ups == 0 {
+        rel.push_str("./");
+    } else {
+        for _ in 0..ups {
+            rel.push_str("../");
+        }
+    }
+    rel.push_str(&to_parts[i..].join("/"));
+    (rel, alias)
+}
+
+fn collect_bound_locals(s: &lex_ast::Stage, out: &mut BTreeSet<String>) {
+    if let lex_ast::Stage::FnDecl(fd) = s {
+        for p in &fd.params {
+            out.insert(p.name.clone());
+        }
+        collect_expr_locals(&fd.body, out);
+        for ex in &fd.examples {
+            for a in &ex.args {
+                collect_expr_locals(a, out);
+            }
+            collect_expr_locals(&ex.expected, out);
+        }
+    }
+}
+
+fn collect_expr_locals(e: &lex_ast::CExpr, out: &mut BTreeSet<String>) {
+    use lex_ast::CExpr::*;
+    match e {
+        Let { name, value, body, .. } => {
+            out.insert(name.clone());
+            collect_expr_locals(value, out);
+            collect_expr_locals(body, out);
+        }
+        Lambda { params, body, .. } => {
+            for p in params {
+                out.insert(p.name.clone());
+            }
+            collect_expr_locals(body, out);
+        }
+        Match { scrutinee, arms } => {
+            collect_expr_locals(scrutinee, out);
+            for arm in arms {
+                collect_pattern_locals(&arm.pattern, out);
+                collect_expr_locals(&arm.body, out);
+            }
+        }
+        Call { callee, args } => {
+            collect_expr_locals(callee, out);
+            for a in args {
+                collect_expr_locals(a, out);
+            }
+        }
+        Block { statements, result } => {
+            for s in statements {
+                collect_expr_locals(s, out);
+            }
+            collect_expr_locals(result, out);
+        }
+        Constructor { args, .. } => {
+            for a in args {
+                collect_expr_locals(a, out);
+            }
+        }
+        RecordLit { fields } => {
+            for f in fields {
+                collect_expr_locals(&f.value, out);
+            }
+        }
+        TupleLit { items } | ListLit { items } => {
+            for i in items {
+                collect_expr_locals(i, out);
+            }
+        }
+        FieldAccess { value, .. } => collect_expr_locals(value, out),
+        BinOp { lhs, rhs, .. } => {
+            collect_expr_locals(lhs, out);
+            collect_expr_locals(rhs, out);
+        }
+        UnaryOp { expr, .. } => collect_expr_locals(expr, out),
+        Return { value } => collect_expr_locals(value, out),
+        Var { .. } | Literal { .. } => {}
+    }
+}
+
+fn collect_pattern_locals(p: &lex_ast::Pattern, out: &mut BTreeSet<String>) {
+    use lex_ast::Pattern::*;
+    match p {
+        PVar { name } => {
+            out.insert(name.clone());
+        }
+        PConstructor { args, .. } => {
+            for a in args {
+                collect_pattern_locals(a, out);
+            }
+        }
+        PRecord { fields } => {
+            for f in fields {
+                collect_pattern_locals(&f.pattern, out);
+            }
+        }
+        PTuple { items } => {
+            for i in items {
+                collect_pattern_locals(i, out);
+            }
+        }
+        PLiteral { .. } | PWild => {}
+    }
+}
+
+struct FileRewrite<'a> {
+    own_prefix: &'a str,
+    own_file: &'a str,
+    prefix_to_file: &'a BTreeMap<String, String>,
+    bound_locals: &'a BTreeSet<String>,
+    local_imports: BTreeMap<String, String>,
+}
+
+impl FileRewrite<'_> {
+    /// Un-mangle a dotted name for THIS file: own prefix → bare; another
+    /// package file's prefix → `alias.rest` (recording the import); anything
+    /// else (a stdlib alias like `int.to_str`, or a bare name) untouched.
+    fn rename(&mut self, name: &str) -> String {
+        if let Some(rest) = name.strip_prefix(&format!("{}.", self.own_prefix)) {
+            return rest.to_string();
+        }
+        if let Some((q, rest)) = name.split_once('.') {
+            if q != self.own_prefix {
+                if let Some(other_file) = self.prefix_to_file.get(q) {
+                    let (import_ref, stem) = relative_import(self.own_file, other_file);
+                    let alias = if self.bound_locals.contains(&stem) {
+                        q.to_string()
+                    } else {
+                        stem
+                    };
+                    self.local_imports.insert(import_ref, alias.clone());
+                    return format!("{alias}.{rest}");
+                }
+            }
+        }
+        name.to_string()
+    }
+
+    fn rewrite_stage(&mut self, s: &mut lex_ast::Stage) {
+        match s {
+            lex_ast::Stage::FnDecl(fd) => {
+                fd.name = self.rename(&fd.name);
+                for p in &mut fd.params {
+                    self.rewrite_type(&mut p.ty);
+                }
+                self.rewrite_type(&mut fd.return_type);
+                self.rewrite_expr(&mut fd.body);
+                for ex in &mut fd.examples {
+                    for a in &mut ex.args {
+                        self.rewrite_expr(a);
+                    }
+                    self.rewrite_expr(&mut ex.expected);
+                }
+            }
+            lex_ast::Stage::TypeDecl(td) => {
+                td.name = self.rename(&td.name);
+                self.rewrite_type(&mut td.definition);
+            }
+            lex_ast::Stage::Import(_) => {}
+        }
+    }
+
+    fn rewrite_expr(&mut self, e: &mut lex_ast::CExpr) {
+        use lex_ast::CExpr::*;
+        match e {
+            Var { name } => *name = self.rename(name),
+            Literal { .. } => {}
+            Call { callee, args } => {
+                self.rewrite_expr(callee);
+                for a in args {
+                    self.rewrite_expr(a);
+                }
+            }
+            Let { value, body, ty, .. } => {
+                if let Some(t) = ty {
+                    self.rewrite_type(t);
+                }
+                self.rewrite_expr(value);
+                self.rewrite_expr(body);
+            }
+            Match { scrutinee, arms } => {
+                self.rewrite_expr(scrutinee);
+                for arm in arms {
+                    self.rewrite_expr(&mut arm.body);
+                }
+            }
+            Block { statements, result } => {
+                for s in statements {
+                    self.rewrite_expr(s);
+                }
+                self.rewrite_expr(result);
+            }
+            Constructor { args, .. } => {
+                for a in args {
+                    self.rewrite_expr(a);
+                }
+            }
+            RecordLit { fields } => {
+                for f in fields {
+                    self.rewrite_expr(&mut f.value);
+                }
+            }
+            TupleLit { items } | ListLit { items } => {
+                for i in items {
+                    self.rewrite_expr(i);
+                }
+            }
+            FieldAccess { value, .. } => self.rewrite_expr(value),
+            Lambda { params, return_type, body, .. } => {
+                for p in params {
+                    self.rewrite_type(&mut p.ty);
+                }
+                self.rewrite_type(return_type);
+                self.rewrite_expr(body);
+            }
+            BinOp { lhs, rhs, .. } => {
+                self.rewrite_expr(lhs);
+                self.rewrite_expr(rhs);
+            }
+            UnaryOp { expr, .. } => self.rewrite_expr(expr),
+            Return { value } => self.rewrite_expr(value),
+        }
+    }
+
+    fn rewrite_type(&mut self, t: &mut lex_ast::TypeExpr) {
+        use lex_ast::TypeExpr::*;
+        match t {
+            Named { name, args } => {
+                *name = self.rename(name);
+                for a in args {
+                    self.rewrite_type(a);
+                }
+            }
+            Record { fields } => {
+                for f in fields {
+                    self.rewrite_type(&mut f.ty);
+                }
+            }
+            Tuple { items } => {
+                for i in items {
+                    self.rewrite_type(i);
+                }
+            }
+            Function { params, ret, .. } => {
+                for p in params {
+                    self.rewrite_type(p);
+                }
+                self.rewrite_type(ret);
+            }
+            Union { variants } => {
+                for v in variants {
+                    if let Some(pl) = &mut v.payload {
+                        self.rewrite_type(pl);
+                    }
+                }
+            }
+            RecordWithSpreads { spreads, fields } => {
+                for s in spreads {
+                    *s = self.rename(s);
+                }
+                for f in fields {
+                    self.rewrite_type(&mut f.ty);
+                }
+            }
+            Refined { base, predicate, .. } => {
+                self.rewrite_type(base);
+                self.rewrite_expr(predicate);
+            }
+        }
+    }
+}

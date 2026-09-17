@@ -879,3 +879,34 @@ fn released_version_archive_is_rendered_from_the_op_log_head() {
         "rendered source must carry the unmangled function: {lib}"
     );
 }
+
+/// #894: a multi-module op-log package's rendered archive is the full
+/// `src/*.lex` tree (de-flattened), not a single flattened file — so both
+/// modules install and each import path resolves.
+#[test]
+fn released_multimodule_archive_renders_the_full_src_tree() {
+    let (srv, _tmp) = start_server();
+
+    let util = "fn twice(x :: Int) -> Int { x + x }\n";
+    let lib = "import \"./util\" as u\n\nfn quad(x :: Int) -> Int { u.twice(u.twice(x)) }\n";
+    let archive = pkg_archive("mm", "0.1.0", &[("util.lex", util), ("lib.lex", lib)]);
+    assert_eq!(post_bytes(&srv.addr, "/v1/pkg/publish", &archive).0, 200, "publish");
+    assert_eq!(
+        post_bytes(&srv.addr, "/v1/pkg/mm/release", br#"{"version":"1.0.0"}"#).0,
+        201, "release"
+    );
+
+    let (status, body) = get_raw(&srv.addr, "/v1/pkg/mm/1.0.0/archive");
+    assert_eq!(status, 200, "multi-module archive should render");
+
+    // Both modules present as separate files.
+    let util_out = extract(&body, "src/util.lex").expect("archive has src/util.lex");
+    let lib_out = extract(&body, "src/lib.lex").expect("archive has src/lib.lex");
+    // De-mangled: util defines `twice`, lib defines `quad` and imports util.
+    assert!(util_out.contains("fn twice("), "util.lex: {util_out}");
+    assert!(lib_out.contains("fn quad(") && lib_out.contains("import \"./util\""),
+        "lib.lex must keep quad + the local import: {lib_out}");
+    // Neither file leaks a mangle prefix into a declaration.
+    assert!(!lib_out.contains("fn lib_") && !util_out.contains("fn util_"),
+        "declarations must be de-mangled");
+}

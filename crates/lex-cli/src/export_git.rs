@@ -9,10 +9,12 @@
 //! the op id as a trailer. The result is a repo humans, GitHub, and
 //! IDEs can read, reconstructed deterministically from the typed log.
 //!
-//! Slice 1 renders the whole head to a single `src.lex` per commit.
-//! Multi-file layout, a git-import path (text diff → typed ops via
-//! `diff_to_ops`), and per-op author/date from the intent's model are
-//! follow-ups on #837.
+//! Rendering (single `src.lex` for a single module, or the de-flattened
+//! `src/*.lex` tree for a multi-module package, #894) is done by the shared
+//! `lex_store::render`, so the git view is byte-identical to the source a
+//! consumer installs from the hosted registry. A git-import path (text diff →
+//! typed ops via `diff_to_ops`) and per-op author/date from the intent's
+//! model are follow-ups on #837.
 //!
 //! Usage:
 //!   lex export-git <out_dir> [--branch NAME] [--store DIR]
@@ -111,11 +113,30 @@ pub fn cmd_export_git(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         let _ = std::fs::remove_file(&src_path);
         let _ = std::fs::remove_dir_all(out_dir.join("src"));
 
-        // Multi-file iff every head fn/type stage records its source file.
-        if !map.is_empty() && map.keys().all(|sig| sig_files.contains_key(sig)) {
-            render_multifile(&out_dir, &store, &map, &sig_files, &file_imports)?;
-        } else {
-            render_singlefile(&src_path, &store, &map, &flat_imports)?;
+        // Render the head via the shared `lex-store` renderer — the same code
+        // the hosted registry's archive endpoint uses, so the git view and an
+        // installed package are byte-identical source (#894).
+        let head = lex_store::render::PackageHead {
+            map: map.clone(),
+            sig_files: sig_files.clone(),
+            flat_imports: flat_imports.clone(),
+            file_imports: file_imports.clone(),
+        };
+        match lex_store::render::render_source(&store, &head)? {
+            lex_store::render::RenderedSource::Single(src) => {
+                std::fs::write(&src_path, src)
+                    .with_context(|| format!("writing {}", src_path.display()))?;
+            }
+            lex_store::render::RenderedSource::Multi(tree) => {
+                for (relpath, src) in tree {
+                    let path = out_dir.join(&relpath);
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(&path, src)
+                        .with_context(|| format!("writing {}", path.display()))?;
+                }
+            }
         }
 
         // Commit message: the intent prompt, else a kind summary.
@@ -140,440 +161,6 @@ pub fn cmd_export_git(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Render the whole head as one `src.lex` (single file / single module).
-fn render_singlefile(
-    src_path: &std::path::Path,
-    store: &Store,
-    map: &BTreeMap<String, String>,
-    imports: &BTreeMap<String, String>,
-) -> Result<()> {
-    let mut stages: Vec<lex_ast::Stage> = Vec::with_capacity(imports.len() + map.len());
-    for (reference, alias) in imports {
-        stages.push(lex_ast::Stage::Import(lex_ast::Import {
-            reference: reference.clone(),
-            alias: alias.clone(),
-        }));
-    }
-    // Read per-SigId (not by StageId) so structurally identical stages
-    // that share a StageId keep their distinct names (see render_multifile).
-    let head_pairs: Vec<(String, String)> =
-        map.iter().map(|(s, st)| (s.clone(), st.clone())).collect();
-    for ast in store.get_asts_for_sigs_bulk(&head_pairs) {
-        stages.push(ast?);
-    }
-    let source = lex_ast::print_stages(&stages);
-    std::fs::write(src_path, source).with_context(|| format!("writing {}", src_path.display()))?;
-    Ok(())
-}
-
-/// De-flatten a mangled multi-module package back into its `src/*.lex`
-/// tree (#894 slice 2b). Each declaration's mangled name is
-/// `<prefix>.<local>`; `sig_files` says which file each belongs to. Group
-/// by file, strip each file's own prefix, and rewrite a reference to
-/// another file's prefix into `alias.name` plus a local
-/// `import "./<relpath>" as alias`.
-///
-/// Faithful except for one thing the op log cannot recover: a *local*
-/// import's non-default alias. `import "./error" as e` was flattened away
-/// at publish (the reference became `error_<hash>.…`), so it comes back as
-/// `import "./error" as error` — functionally identical and compiling.
-/// Stdlib aliases are preserved (they ride on `AddImport`).
-fn render_multifile(
-    out_dir: &std::path::Path,
-    store: &Store,
-    map: &BTreeMap<String, String>,
-    sig_files: &BTreeMap<String, String>,
-    file_imports: &BTreeMap<String, BTreeMap<String, String>>,
-) -> Result<()> {
-    let mut prefix_to_file: BTreeMap<String, String> = BTreeMap::new();
-    let mut by_file: BTreeMap<String, Vec<lex_ast::Stage>> = BTreeMap::new();
-    // Read each stage through the SigId the head names it by — NOT by
-    // StageId. A StageId is name-independent, so two structurally identical
-    // helpers across modules (`contains_str` in both `schema_import.lex`
-    // and `constraints.lex`) share one; reading by StageId returns a single
-    // name for the pair and would file one under the other's prefix
-    // (#818/#894). `get_asts_for_sigs_bulk` recovers the right name per sig.
-    let head_pairs: Vec<(String, String)> =
-        map.iter().map(|(s, st)| (s.clone(), st.clone())).collect();
-    let asts = store.get_asts_for_sigs_bulk(&head_pairs);
-    for ((sig, _), ast) in head_pairs.iter().zip(asts) {
-        let stage = ast?;
-        let file = sig_files.get(sig).cloned().unwrap_or_default();
-        if let Some(prefix) = stage_prefix(&stage) {
-            prefix_to_file.insert(prefix, file.clone());
-        }
-        by_file.entry(file).or_default().push(stage);
-    }
-
-    for (file, stages) in &by_file {
-        // Every stage in a file shares its prefix.
-        let own_prefix = stages.iter().find_map(stage_prefix).unwrap_or_default();
-        // Names bound as params / lets / lambda-params / patterns in this
-        // file. A local import's alias must not be one of them, or it would
-        // be shadowed (`import "./field" as field` under `field :: Str` —
-        // lex-schema used `as f` to dodge this, but that alias was
-        // flattened away). When the stem collides we fall back to the
-        // guaranteed-unique mangle prefix, which no bare local can be.
-        let mut bound_locals = std::collections::BTreeSet::new();
-        for s in stages {
-            collect_bound_locals(s, &mut bound_locals);
-        }
-        let mut rw = FileRewrite {
-            own_prefix: &own_prefix,
-            own_file: file,
-            prefix_to_file: &prefix_to_file,
-            bound_locals: &bound_locals,
-            local_imports: BTreeMap::new(),
-        };
-        let rewritten: Vec<lex_ast::Stage> = stages
-            .iter()
-            .cloned()
-            .map(|mut s| {
-                rw.rewrite_stage(&mut s);
-                s
-            })
-            .collect();
-
-        // Stdlib imports for this file + the local imports the rewrite found.
-        let mut imports: BTreeMap<String, String> = file_imports.get(file).cloned().unwrap_or_default();
-        imports.extend(rw.local_imports);
-
-        let mut out_stages: Vec<lex_ast::Stage> = Vec::new();
-        for (reference, alias) in &imports {
-            out_stages.push(lex_ast::Stage::Import(lex_ast::Import {
-                reference: reference.clone(),
-                alias: alias.clone(),
-            }));
-        }
-        out_stages.extend(rewritten);
-
-        let source = lex_ast::print_stages(&out_stages);
-        let path = out_dir.join(file);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&path, source).with_context(|| format!("writing {}", path.display()))?;
-    }
-    Ok(())
-}
-
-/// The mangling prefix of a declaration (`schema_a1b2.validate` →
-/// `schema_a1b2`), or `None` for an import or an unmangled name.
-fn stage_prefix(s: &lex_ast::Stage) -> Option<String> {
-    let name = match s {
-        lex_ast::Stage::FnDecl(fd) => &fd.name,
-        lex_ast::Stage::TypeDecl(td) => &td.name,
-        lex_ast::Stage::Import(_) => return None,
-    };
-    name.split_once('.').map(|(p, _)| p.to_string())
-}
-
-/// `("src/schema.lex", "src/error.lex")` → `("./error", "error")`.
-fn relative_import(from: &str, to: &str) -> (String, String) {
-    let from_dir: Vec<&str> = from
-        .rsplit_once('/')
-        .map(|(d, _)| d)
-        .unwrap_or("")
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .collect();
-    let to_noext = to.strip_suffix(".lex").unwrap_or(to);
-    let to_parts: Vec<&str> = to_noext.split('/').filter(|s| !s.is_empty()).collect();
-    let alias = to_parts.last().copied().unwrap_or("mod").to_string();
-    let mut i = 0;
-    while i < from_dir.len()
-        && i + 1 < to_parts.len()
-        && from_dir[i] == to_parts[i]
-    {
-        i += 1;
-    }
-    let ups = from_dir.len() - i;
-    let mut rel = String::new();
-    if ups == 0 {
-        rel.push_str("./");
-    } else {
-        for _ in 0..ups {
-            rel.push_str("../");
-        }
-    }
-    rel.push_str(&to_parts[i..].join("/"));
-    (rel, alias)
-}
-
-/// Rewrites the mangled names in one file's stages back to source form.
-/// Bare names bound in a stage (params, lets, lambda params, match
-/// bindings) — the names an import alias must avoid to not be shadowed.
-fn collect_bound_locals(s: &lex_ast::Stage, out: &mut std::collections::BTreeSet<String>) {
-    if let lex_ast::Stage::FnDecl(fd) = s {
-        for p in &fd.params {
-            out.insert(p.name.clone());
-        }
-        collect_expr_locals(&fd.body, out);
-        for ex in &fd.examples {
-            for a in &ex.args {
-                collect_expr_locals(a, out);
-            }
-            collect_expr_locals(&ex.expected, out);
-        }
-    }
-}
-
-fn collect_expr_locals(e: &lex_ast::CExpr, out: &mut std::collections::BTreeSet<String>) {
-    use lex_ast::CExpr::*;
-    match e {
-        Let { name, value, body, .. } => {
-            out.insert(name.clone());
-            collect_expr_locals(value, out);
-            collect_expr_locals(body, out);
-        }
-        Lambda { params, body, .. } => {
-            for p in params {
-                out.insert(p.name.clone());
-            }
-            collect_expr_locals(body, out);
-        }
-        Match { scrutinee, arms } => {
-            collect_expr_locals(scrutinee, out);
-            for arm in arms {
-                collect_pattern_locals(&arm.pattern, out);
-                collect_expr_locals(&arm.body, out);
-            }
-        }
-        Call { callee, args } => {
-            collect_expr_locals(callee, out);
-            for a in args {
-                collect_expr_locals(a, out);
-            }
-        }
-        Block { statements, result } => {
-            for s in statements {
-                collect_expr_locals(s, out);
-            }
-            collect_expr_locals(result, out);
-        }
-        Constructor { args, .. } => {
-            for a in args {
-                collect_expr_locals(a, out);
-            }
-        }
-        RecordLit { fields } => {
-            for f in fields {
-                collect_expr_locals(&f.value, out);
-            }
-        }
-        TupleLit { items } | ListLit { items } => {
-            for i in items {
-                collect_expr_locals(i, out);
-            }
-        }
-        FieldAccess { value, .. } => collect_expr_locals(value, out),
-        BinOp { lhs, rhs, .. } => {
-            collect_expr_locals(lhs, out);
-            collect_expr_locals(rhs, out);
-        }
-        UnaryOp { expr, .. } => collect_expr_locals(expr, out),
-        Return { value } => collect_expr_locals(value, out),
-        Var { .. } | Literal { .. } => {}
-    }
-}
-
-fn collect_pattern_locals(p: &lex_ast::Pattern, out: &mut std::collections::BTreeSet<String>) {
-    use lex_ast::Pattern::*;
-    match p {
-        PVar { name } => {
-            out.insert(name.clone());
-        }
-        PConstructor { args, .. } => {
-            for a in args {
-                collect_pattern_locals(a, out);
-            }
-        }
-        PRecord { fields } => {
-            for f in fields {
-                collect_pattern_locals(&f.pattern, out);
-            }
-        }
-        PTuple { items } => {
-            for i in items {
-                collect_pattern_locals(i, out);
-            }
-        }
-        PLiteral { .. } | PWild => {}
-    }
-}
-
-struct FileRewrite<'a> {
-    own_prefix: &'a str,
-    own_file: &'a str,
-    prefix_to_file: &'a BTreeMap<String, String>,
-    bound_locals: &'a std::collections::BTreeSet<String>,
-    /// Local imports discovered while rewriting: import ref → alias.
-    local_imports: BTreeMap<String, String>,
-}
-
-impl FileRewrite<'_> {
-    /// Un-mangle a dotted name for THIS file: own prefix → bare; another
-    /// package file's prefix → `alias.rest` (recording the import);
-    /// anything else (a stdlib alias like `int.to_str`, or a bare name) is
-    /// left untouched.
-    fn rename(&mut self, name: &str) -> String {
-        if let Some(rest) = name.strip_prefix(&format!("{}.", self.own_prefix)) {
-            return rest.to_string();
-        }
-        if let Some((q, rest)) = name.split_once('.') {
-            if q != self.own_prefix {
-                if let Some(other_file) = self.prefix_to_file.get(q) {
-                    let (import_ref, stem) = relative_import(self.own_file, other_file);
-                    // A stem that shadows a local binding is unusable as an
-                    // alias — fall back to the mangle prefix, which no bare
-                    // local can equal.
-                    let alias = if self.bound_locals.contains(&stem) {
-                        q.to_string()
-                    } else {
-                        stem
-                    };
-                    self.local_imports.insert(import_ref, alias.clone());
-                    return format!("{alias}.{rest}");
-                }
-            }
-        }
-        name.to_string()
-    }
-
-    fn rewrite_stage(&mut self, s: &mut lex_ast::Stage) {
-        match s {
-            lex_ast::Stage::FnDecl(fd) => {
-                fd.name = self.rename(&fd.name);
-                for p in &mut fd.params {
-                    self.rewrite_type(&mut p.ty);
-                }
-                self.rewrite_type(&mut fd.return_type);
-                self.rewrite_expr(&mut fd.body);
-                for ex in &mut fd.examples {
-                    for a in &mut ex.args {
-                        self.rewrite_expr(a);
-                    }
-                    self.rewrite_expr(&mut ex.expected);
-                }
-            }
-            lex_ast::Stage::TypeDecl(td) => {
-                td.name = self.rename(&td.name);
-                self.rewrite_type(&mut td.definition);
-            }
-            lex_ast::Stage::Import(_) => {}
-        }
-    }
-
-    fn rewrite_expr(&mut self, e: &mut lex_ast::CExpr) {
-        use lex_ast::CExpr::*;
-        match e {
-            Var { name } => *name = self.rename(name),
-            Literal { .. } => {}
-            Call { callee, args } => {
-                self.rewrite_expr(callee);
-                for a in args {
-                    self.rewrite_expr(a);
-                }
-            }
-            Let { value, body, ty, .. } => {
-                if let Some(t) = ty {
-                    self.rewrite_type(t);
-                }
-                self.rewrite_expr(value);
-                self.rewrite_expr(body);
-            }
-            Match { scrutinee, arms } => {
-                self.rewrite_expr(scrutinee);
-                for arm in arms {
-                    self.rewrite_expr(&mut arm.body);
-                }
-            }
-            Block { statements, result } => {
-                for s in statements {
-                    self.rewrite_expr(s);
-                }
-                self.rewrite_expr(result);
-            }
-            // Constructor names are global (never mangled); rewrite args only.
-            Constructor { args, .. } => {
-                for a in args {
-                    self.rewrite_expr(a);
-                }
-            }
-            RecordLit { fields } => {
-                for f in fields {
-                    self.rewrite_expr(&mut f.value);
-                }
-            }
-            TupleLit { items } | ListLit { items } => {
-                for i in items {
-                    self.rewrite_expr(i);
-                }
-            }
-            FieldAccess { value, .. } => self.rewrite_expr(value),
-            Lambda { params, return_type, body, .. } => {
-                for p in params {
-                    self.rewrite_type(&mut p.ty);
-                }
-                self.rewrite_type(return_type);
-                self.rewrite_expr(body);
-            }
-            BinOp { lhs, rhs, .. } => {
-                self.rewrite_expr(lhs);
-                self.rewrite_expr(rhs);
-            }
-            UnaryOp { expr, .. } => self.rewrite_expr(expr),
-            Return { value } => self.rewrite_expr(value),
-        }
-    }
-
-    fn rewrite_type(&mut self, t: &mut lex_ast::TypeExpr) {
-        use lex_ast::TypeExpr::*;
-        match t {
-            Named { name, args } => {
-                *name = self.rename(name);
-                for a in args {
-                    self.rewrite_type(a);
-                }
-            }
-            Record { fields } => {
-                for f in fields {
-                    self.rewrite_type(&mut f.ty);
-                }
-            }
-            Tuple { items } => {
-                for i in items {
-                    self.rewrite_type(i);
-                }
-            }
-            Function { params, ret, .. } => {
-                for p in params {
-                    self.rewrite_type(p);
-                }
-                self.rewrite_type(ret);
-            }
-            Union { variants } => {
-                for v in variants {
-                    if let Some(pl) = &mut v.payload {
-                        self.rewrite_type(pl);
-                    }
-                }
-            }
-            RecordWithSpreads { spreads, fields } => {
-                for s in spreads {
-                    *s = self.rename(s);
-                }
-                for f in fields {
-                    self.rewrite_type(&mut f.ty);
-                }
-            }
-            Refined { base, predicate, .. } => {
-                self.rewrite_type(base);
-                self.rewrite_expr(predicate);
-            }
-        }
-    }
-}
 
 /// One op → one commit message. The intent's prompt is the actual
 /// causal event (a commit message can be made up; the prompt is what

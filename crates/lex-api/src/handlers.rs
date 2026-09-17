@@ -2389,11 +2389,20 @@ fn render_op_log_archive(
     version: &str,
     head_op: &str,
 ) -> Result<Vec<u8>, String> {
-    let src = {
+    // De-flatten the head into its source tree — one `src/lib.lex` for a
+    // single-module package, or the full `src/*.lex` layout for a
+    // multi-module one (#894). The same renderer `lex export-git` uses, so
+    // the installed source matches the git mirror.
+    let files: Vec<(String, String)> = {
         let store = state.store.lock().unwrap();
-        store
-            .render_source_at_op(head_op)
+        let head = lex_store::render::package_head_at_op(&store, head_op)
+            .map_err(|e| format!("reading head {head_op}: {e}"))?;
+        match lex_store::render::render_source(&store, &head)
             .map_err(|e| format!("rendering source at {head_op}: {e}"))?
+        {
+            lex_store::render::RenderedSource::Single(src) => vec![("src/lib.lex".to_string(), src)],
+            lex_store::render::RenderedSource::Multi(tree) => tree.into_iter().collect(),
+        }
     };
 
     let manifest = format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\n");
@@ -2407,9 +2416,10 @@ fn render_op_log_archive(
             h.set_cksum();
             ar.append_data(&mut h, p, data)
         };
-        // The conventional `import "<pkg>/lib"` module.
         append("lex.toml", manifest.as_bytes()).map_err(|e| e.to_string())?;
-        append("src/lib.lex", src.as_bytes()).map_err(|e| e.to_string())?;
+        for (path, src) in &files {
+            append(path, src.as_bytes()).map_err(|e| e.to_string())?;
+        }
         ar.finish().map_err(|e| e.to_string())?;
     }
     enc.finish().map_err(|e| e.to_string())
