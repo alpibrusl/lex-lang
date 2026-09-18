@@ -140,6 +140,20 @@ bumps may carry breaking changes when justified).
   hub's cross-store dependents index (`/v1/dependents`) inverts for hosted
   change-propagation.
 
+## [0.11.42] - 2026-09-18
+
+### Added
+
+- **`lex propagate --hosted` (#893).** Fan a change out to a package's
+  *hosted* dependents, discovered from the hub's `/v1/dependents` index:
+  fetches each dependent's public source archive into `--out/<name>/` and
+  applies the rename fan-out there. Completes the discovery + rewrite half of
+  cross-store propagation (op-push write-back is a follow-up).
+- **`lex pkg release` (#893).** Cut an immutable versioned release of the
+  hosted head, reading the name, version, and dependency edges from
+  `lex.toml` — so the cross-store dependency graph populates itself on every
+  release. Surfaces the version-bump gate (409 immutable / 422 too-small).
+
 ## [Unreleased]
 
 ### Added
