@@ -127,6 +127,19 @@ bumps may carry breaking changes when justified).
   by a tenant-keyed caller directly; `review_http` is public so lex-hub can
   compose an owner-authorized console route over it.
 
+## [0.11.41] - 2026-09-18
+
+### Added
+
+- **Dependency-graph edges (#893).** A release now records its external
+  package dependencies — declared by the releaser (from `lex.toml`, in the
+  release request) and unioned with any non-inlined external imports found in
+  the head (`lex_store::api::external_dependencies_at_op`). Op-log packages
+  inline resolved deps at publish, so the declared list is the authoritative
+  source. Exposed on `GET /v1/pkg/{name}/{version}`. This is the edge set the
+  hub's cross-store dependents index (`/v1/dependents`) inverts for hosted
+  change-propagation.
+
 ## [Unreleased]
 
 ### Added
