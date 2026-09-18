@@ -27,12 +27,14 @@
 //! can't be *run* without runtime linking (#946); the caller reports that
 //! honestly as `Failed` with the VM's detail.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use lex_vcs::{
     render_signature, render_type_signature, Acceptance, ApiChangeKind, ApiEntry, Attestation,
-    AttestationId, AttestationKind, AttestationResult, Issue, ProducerDescriptor,
+    AttestationId, AttestationKind, AttestationResult, IntentLog, Issue, IssueId, IssueLog, OpLog,
+    ProducerDescriptor,
 };
+use serde::Serialize;
 
 use crate::render::demangled_head_stages;
 use crate::store::{Store, StoreError};
@@ -257,6 +259,103 @@ pub fn is_verified(store: &Store, issue_id: &str) -> Result<bool, StoreError> {
         .into_iter()
         .max_by_key(|a| a.timestamp);
     Ok(matches!(latest.map(|a| a.result), Some(AttestationResult::Passed)))
+}
+
+// ---- Derived state (#949 phase 3) ------------------------------------
+//
+// A board is a *view* over the op-log and the issue graph; nobody drags
+// cards. State is computed here, never stored, so it cannot drift from the
+// code.
+
+/// Where an issue stands, computed from the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueState {
+    /// No op carries this issue's intent yet.
+    Open,
+    /// Some op on some branch carries its intent (work has started).
+    InProgress,
+    /// Its latest verdict is a pass — done, as a proof.
+    Verified,
+    /// A dependency is not verified (an unknown dependency id counts as
+    /// blocking, conservatively).
+    Blocked,
+}
+
+/// An issue with its derived state.
+#[derive(Debug, Clone, Serialize)]
+pub struct IssueStatus {
+    pub issue: Issue,
+    pub state: IssueState,
+    /// Dependencies not yet verified.
+    pub blocked_on: Vec<IssueId>,
+    /// Whether any op in the store carries this issue's intent.
+    pub has_work: bool,
+}
+
+/// Every issue id that some op's intent references, across every branch's
+/// history — the "work has started" signal, derived from provenance.
+pub fn issues_in_progress(store: &Store) -> Result<BTreeSet<IssueId>, StoreError> {
+    let log = OpLog::open(store.root())?;
+    let intents = IntentLog::open(store.root())?;
+    let mut out = BTreeSet::new();
+    let mut seen_intents: BTreeSet<String> = BTreeSet::new();
+    for branch in store.list_branches()? {
+        let Some(head) = store.get_branch(&branch)?.and_then(|b| b.head_op) else { continue };
+        for rec in log.walk_forward(&head, None)? {
+            let Some(iid) = rec.op.intent_id.clone() else { continue };
+            if !seen_intents.insert(iid.clone()) {
+                continue;
+            }
+            if let Some(intent) = intents.get(&iid)? {
+                if let Some(issue_id) = intent.issue_id {
+                    out.insert(issue_id);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// One issue's derived state. Precedence: **verified** (done is done) →
+/// **blocked** (a dependency isn't verified — work can't complete) →
+/// **in progress** (an op carries its intent) → **open**.
+pub fn issue_status(
+    store: &Store,
+    issue: &Issue,
+    in_progress: &BTreeSet<IssueId>,
+) -> Result<IssueStatus, StoreError> {
+    let verified = is_verified(store, &issue.issue_id)?;
+    let mut blocked_on = Vec::new();
+    for dep in &issue.deps {
+        if !is_verified(store, dep)? {
+            blocked_on.push(dep.clone());
+        }
+    }
+    let has_work = in_progress.contains(&issue.issue_id);
+    let state = if verified {
+        IssueState::Verified
+    } else if !blocked_on.is_empty() {
+        IssueState::Blocked
+    } else if has_work {
+        IssueState::InProgress
+    } else {
+        IssueState::Open
+    };
+    Ok(IssueStatus { issue: issue.clone(), state, blocked_on, has_work })
+}
+
+/// Derived state for every issue in the store, sorted by id.
+pub fn all_issue_status(store: &Store) -> Result<Vec<IssueStatus>, StoreError> {
+    let log = IssueLog::open(store.root())?;
+    let in_progress = issues_in_progress(store)?;
+    let mut out = Vec::new();
+    for id in log.list_ids()? {
+        if let Some(issue) = log.get(&id)? {
+            out.push(issue_status(store, &issue, &in_progress)?);
+        }
+    }
+    Ok(out)
 }
 
 fn issue_gate_producer() -> ProducerDescriptor {
