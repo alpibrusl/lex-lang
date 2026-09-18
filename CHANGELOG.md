@@ -5,6 +5,29 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [0.11.48] - 2026-09-18
+
+### Added
+
+- **Typed issues — units of work with a declared, verifiable acceptance
+  (#949, phases 1–3).** A GitHub issue is free text and "done" is a human
+  judgment; here an issue declares an *oracle* and done is a proof the gate
+  verifies at HEAD.
+  - `Issue` (content-addressed like an intent) with five acceptance shapes:
+    `typed_delta` (API entries + examples), `failing_example`,
+    `metric_invariant`, `evidence`, `free_form` (human-closed). `IssueLog`,
+    `/v1/issues/batch|fetch|list`, and `op push`/`pull` carry issues with the
+    package; `Intent.issue_id` links issue ↔ intent ↔ ops ↔ attestation (#950).
+  - The acceptance evaluator + `AttestationKind::IssueVerified`
+    (`lex_store::issues`): a typed delta is checked like-with-like against the
+    head's rendered signatures; examples run at the head with every other
+    example stripped; verdicts are recorded keyed by the issue id.
+    `lex issue verify <id>` exits 1 when the oracle fails (#951).
+  - Derived state — open / in progress / verified / blocked — computed from
+    provenance and verdicts, never stored: `GET /v1/issues`, `/v1/issues/<id>`,
+    `/v1/projects` (#952). `issues_http` is `pub` so the hub can wrap it with
+    owner-session auth for the console.
+
 ## [0.11.47] - 2026-09-18
 
 ### Fixed
