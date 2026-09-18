@@ -91,14 +91,89 @@ pub fn check_program_with_modules(
 
 /// Build a dependency module's value type — a record of its exported
 /// functions — from `(name, type)` pairs, for [`check_program_with_modules`]
-/// (#930). Callers never touch the record representation directly; this is
-/// also the single seam where a later phase will renumber each export's
-/// type variables into a disjoint block before merging, so that two
-/// polymorphic exports of one dependency don't share a variable when the
-/// record is generalized as a whole. Monomorphic exports (the common case,
-/// e.g. `gcd(Int, Int) -> Int`) carry no variables and need no renumbering.
+/// (#930). Callers never touch the record representation directly.
+///
+/// The record is bound under an import alias and generalized *as a whole*
+/// (Pass 1: `collect_vars`/`collect_eff_vars` over the record, then
+/// `instantiate` per reference). Each export, however, was generalized
+/// independently and so numbers its own variables from zero — two exports
+/// of one dependency both spelling `Var(0)` would be tied together by that
+/// whole-record generalization. So every export is renumbered into a
+/// disjoint block: type variables from `0` up, effect-row variables from
+/// [`EFF_VAR_BASE`] up (the same type/effect split stdlib's
+/// [`crate::stdlib_spec::module_record`] keeps). Monomorphic exports (the
+/// common case, e.g. `gcd(Int, Int) -> Int`) carry no variables and pass
+/// through unchanged.
 pub fn module_record_from_fields(fields: impl IntoIterator<Item = (String, Ty)>) -> Ty {
-    Ty::Record(fields.into_iter().collect())
+    let mut next_ty: u32 = 0;
+    let mut next_eff: u32 = crate::stdlib_spec::EFF_VAR_BASE;
+    let renumbered: IndexMap<String, Ty> = fields
+        .into_iter()
+        .map(|(name, ty)| (name, renumber_field_vars(&ty, &mut next_ty, &mut next_eff)))
+        .collect();
+    Ty::Record(renumbered)
+}
+
+/// Rewrite every type variable and effect-row variable in `ty` to a fresh
+/// id drawn from the running counters, consistently within `ty`: a variable
+/// used more than once stays one variable, but distinct variables get
+/// distinct fresh ids, and no id is reused across separate calls (the
+/// counters advance). See [`module_record_from_fields`].
+fn renumber_field_vars(ty: &Ty, next_ty: &mut u32, next_eff: &mut u32) -> Ty {
+    fn walk(
+        t: &mut Ty,
+        ty_map: &mut HashMap<u32, u32>,
+        eff_map: &mut HashMap<u32, u32>,
+        next_ty: &mut u32,
+        next_eff: &mut u32,
+    ) {
+        match t {
+            Ty::Var(v) => {
+                let nv = *ty_map.entry(*v).or_insert_with(|| {
+                    let x = *next_ty;
+                    *next_ty += 1;
+                    x
+                });
+                *v = nv;
+            }
+            Ty::Prim(_) | Ty::Unit | Ty::Never => {}
+            Ty::List(inner) => walk(inner, ty_map, eff_map, next_ty, next_eff),
+            Ty::Tuple(items) => {
+                for it in items {
+                    walk(it, ty_map, eff_map, next_ty, next_eff);
+                }
+            }
+            Ty::Record(fs) => {
+                for v in fs.values_mut() {
+                    walk(v, ty_map, eff_map, next_ty, next_eff);
+                }
+            }
+            Ty::Con(_, args) => {
+                for a in args {
+                    walk(a, ty_map, eff_map, next_ty, next_eff);
+                }
+            }
+            Ty::Function { params, effects, ret } => {
+                for p in params {
+                    walk(p, ty_map, eff_map, next_ty, next_eff);
+                }
+                if let Some(v) = effects.var {
+                    let nv = *eff_map.entry(v).or_insert_with(|| {
+                        let x = *next_eff;
+                        *next_eff += 1;
+                        x
+                    });
+                    effects.var = Some(nv);
+                }
+                walk(ret, ty_map, eff_map, next_ty, next_eff);
+            }
+        }
+    }
+    let mut out = ty.clone();
+    let mut ty_map: HashMap<u32, u32> = HashMap::new();
+    let mut eff_map: HashMap<u32, u32> = HashMap::new();
+    walk(&mut out, &mut ty_map, &mut eff_map, next_ty, next_eff);
+    out
 }
 
 fn check_program_inner(

@@ -209,7 +209,9 @@ pub fn lookup(module: &str, name: &str) -> Option<&'static BuiltinDef> {
 /// the type-variable ids (`0..`) so a module scheme never has a type
 /// variable and a row variable sharing an id, and unique per builtin
 /// so two higher-order functions in one module never share a row.
-const EFF_VAR_BASE: u32 = 1000;
+/// `pub(crate)` so [`crate::checker::module_record_from_fields`] can base
+/// a resolved dependency module's effect rows at the same offset (#930).
+pub(crate) const EFF_VAR_BASE: u32 = 1000;
 
 /// Parse one signature into a [`Ty`]. `eff_var` is the row-variable
 /// id to use for the definition's open row, if it has one.
