@@ -930,3 +930,30 @@ fn release_allows_a_patch_for_a_body_only_change_and_requires_minor_for_addition
     assert_eq!(post_bytes(&srv.addr, "/v1/pkg/gate2/release", br#"{"version":"1.0.2"}"#).0, 422, "addition as patch refused");
     assert_eq!(post_bytes(&srv.addr, "/v1/pkg/gate2/release", br#"{"version":"1.1.0"}"#).0, 201, "addition as minor accepted");
 }
+
+/// #893 api-diff endpoint: reports the classification + detected renames
+/// between two releases, so `lex propagate` can auto-derive its edits.
+#[test]
+fn api_diff_reports_change_between_two_releases() {
+    let (srv, _tmp) = start_server();
+
+    // 1.0.0 with one fn.
+    assert_eq!(post_bytes(&srv.addr, "/v1/pkg/publish",
+        &pkg_archive("adiff", "0.1.0", &[("lib.lex", "fn f() -> Int { 1 }\n")])).0, 200);
+    assert_eq!(post_bytes(&srv.addr, "/v1/pkg/adiff/release", br#"{"version":"1.0.0"}"#).0, 201);
+
+    // Add g, release 1.1.0 (a minor — additive).
+    assert_eq!(post_bytes(&srv.addr, "/v1/pkg/publish",
+        &pkg_archive("adiff", "0.2.0", &[("lib.lex", "fn f() -> Int { 1 }\nfn g() -> Int { 2 }\n")])).0, 200);
+    assert_eq!(post_bytes(&srv.addr, "/v1/pkg/adiff/release", br#"{"version":"1.1.0"}"#).0, 201);
+
+    let (status, body) = get(&srv.addr, "/v1/pkg/adiff/api-diff?from=1.0.0&to=1.1.0");
+    assert_eq!(status, 200, "api-diff: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["change"], "additive", "adding g is additive: {body}");
+    assert!(v["detail"].as_str().unwrap().contains("g"), "detail names g: {body}");
+    assert_eq!(v["renames"].as_array().unwrap().len(), 0, "an addition is not a rename");
+
+    // Missing params → 400.
+    assert_eq!(get(&srv.addr, "/v1/pkg/adiff/api-diff").0, 400);
+}

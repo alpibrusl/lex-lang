@@ -451,6 +451,10 @@ fn route(
             let name = &p["/v1/pkg/".len()..p.len() - "/versions".len()];
             pkg_versions_handler(state, name)
         }
+        (Method::Get, p) if p.starts_with("/v1/pkg/") && p.ends_with("/api-diff") => {
+            let name = &p["/v1/pkg/".len()..p.len() - "/api-diff".len()];
+            pkg_api_diff_handler(state, name, query)
+        }
         // /v1/pkg/{name}/{version}/archive — must match before the generic /{name}/{version}
         (Method::Get, p) if p.starts_with("/v1/pkg/") && p.ends_with("/archive") => {
             let inner = &p["/v1/pkg/".len()..p.len() - "/archive".len()];
@@ -1898,6 +1902,7 @@ enum PublicTarget {
     List,
     Latest(String),
     Versions(String),
+    ApiDiff(String),
     Head(String),
     Version(String, String),
     Archive(String, String),
@@ -1910,6 +1915,7 @@ impl PublicTarget {
             PublicTarget::List => None,
             PublicTarget::Latest(n)
             | PublicTarget::Versions(n)
+            | PublicTarget::ApiDiff(n)
             | PublicTarget::Head(n)
             | PublicTarget::Version(n, _)
             | PublicTarget::Archive(n, _) => Some(n),
@@ -1936,6 +1942,7 @@ fn resolve_public(method: &Method, path: &str) -> Result<PublicTarget, u16> {
     match segs.as_slice() {
         [n] => Ok(PublicTarget::Latest(n.to_string())),
         [n, "versions"] => Ok(PublicTarget::Versions(n.to_string())),
+        [n, "api-diff"] => Ok(PublicTarget::ApiDiff(n.to_string())),
         [n, "head"] => Ok(PublicTarget::Head(n.to_string())),
         [n, v, "archive"] => Ok(PublicTarget::Archive(n.to_string(), v.to_string())),
         [n, v] => Ok(PublicTarget::Version(n.to_string(), v.to_string())),
@@ -1957,7 +1964,7 @@ pub fn route_public(
     state: &State,
     method: &Method,
     path: &str,
-    _query: &str,
+    query: &str,
 ) -> Response<std::io::Cursor<Vec<u8>>> {
     let target = match resolve_public(method, path) {
         Ok(t) => t,
@@ -1978,6 +1985,7 @@ pub fn route_public(
         PublicTarget::List => unreachable!("handled above"),
         PublicTarget::Latest(n) => pkg_get_handler(state, &n),
         PublicTarget::Versions(n) => pkg_versions_handler(state, &n),
+        PublicTarget::ApiDiff(n) => pkg_api_diff_handler(state, &n, query),
         PublicTarget::Head(n) => pkg_head_handler(state, &n),
         PublicTarget::Version(n, v) => pkg_get_version_handler(state, &n, &v),
         PublicTarget::Archive(n, v) => pkg_archive_handler(state, &n, &v),
@@ -2386,6 +2394,48 @@ fn pkg_versions_handler(state: &State, name: &str) -> Response<std::io::Cursor<V
         })),
         None => error_response(404, format!("package {name:?} not found")),
     }
+}
+
+/// `GET /v1/pkg/{name}/api-diff?from=<v>&to=<v>` — how the public API changed
+/// between two releases (#893 propagation): the classification and the
+/// mechanically-propagatable renames, so `lex propagate` can auto-derive its
+/// `--rename` edits from a hosted release pair rather than have them restated.
+fn pkg_api_diff_handler(state: &State, name: &str, query: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    let mut from: Option<String> = None;
+    let mut to: Option<String> = None;
+    for kv in query.split('&') {
+        match kv.split_once('=') {
+            Some(("from", v)) => from = Some(v.to_string()),
+            Some(("to", v)) => to = Some(v.to_string()),
+            _ => {}
+        }
+    }
+    let (Some(from), Some(to)) = (from, to) else {
+        return error_response(400, "api-diff requires ?from=<version>&to=<version>");
+    };
+    let head_of = |v: &str| load_pkg_record(&state.root, name, v).and_then(|r| r.head_op);
+    let (Some(from_head), Some(to_head)) = (head_of(&from), head_of(&to)) else {
+        return error_response(404, format!("{name}: unknown release in {from}..{to}"));
+    };
+
+    let store = state.store.lock().unwrap();
+    let (prev_api, new_api) = match (
+        lex_store::api::public_api_at_op(&store, &from_head),
+        lex_store::api::public_api_at_op(&store, &to_head),
+    ) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => return error_response(500, "could not read package APIs for the given releases"),
+    };
+    let (change, detail) = match lex_store::api::classify_api_change(&prev_api, &new_api) {
+        lex_store::api::ApiChange::Breaking(d) => ("breaking", d),
+        lex_store::api::ApiChange::Additive(d) => ("additive", d),
+        lex_store::api::ApiChange::None => ("none", String::new()),
+    };
+    let renames = lex_store::api::detect_renames(&prev_api, &new_api);
+    json_response(200, &serde_json::json!({
+        "name": name, "from": from, "to": to,
+        "change": change, "detail": detail, "renames": renames,
+    }))
 }
 
 /// `GET /v1/pkg/{name}/{version}` — specific version details.

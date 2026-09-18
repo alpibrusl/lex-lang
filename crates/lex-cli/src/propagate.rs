@@ -33,11 +33,18 @@ pub fn cmd_propagate(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let mut note: Option<String> = None;
     let mut regen_cmd: Option<String> = None;
     let mut ollama: Option<Option<String>> = None;
+    // Auto-detect renames from a hosted release pair.
+    let mut from: Option<String> = None;
+    let mut to: Option<String> = None;
+    let mut registry: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--package" => { package = args.get(i + 1).cloned(); i += 2; }
+            "--from" => { from = args.get(i + 1).cloned(); i += 2; }
+            "--to" => { to = args.get(i + 1).cloned(); i += 2; }
+            "--registry" => { registry = args.get(i + 1).cloned(); i += 2; }
             "--rename" => {
                 let spec = args.get(i + 1).ok_or_else(|| anyhow!("--rename needs <old>=<new>"))?;
                 let (old, new) = spec.split_once('=')
@@ -64,6 +71,34 @@ pub fn cmd_propagate(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let semantic = symbol.is_some() || regen_cmd.is_some() || ollama.is_some();
     if semantic && !renames.is_empty() {
         bail!("choose either mechanical --rename or semantic --symbol, not both");
+    }
+
+    // Auto-detect renames from a hosted release pair (#893): fetch the two
+    // releases' API diff and fold the detected renames into `renames`, so the
+    // operator needn't restate them. A breaking change that ISN'T a rename is
+    // surfaced as needing a semantic migration.
+    if from.is_some() || to.is_some() {
+        if semantic {
+            bail!("--from/--to derive mechanical renames; not compatible with --symbol");
+        }
+        let (from, to) = (from.unwrap(), to.unwrap_or_default());
+        let registry = registry
+            .ok_or_else(|| anyhow!("--from/--to need --registry <host/tenant[/store]> to fetch the API diff"))?;
+        let diff = fetch_api_diff(&registry, &package, &from, &to)?;
+        for r in &diff.renames {
+            renames.push((r.old.clone(), r.new.clone()));
+        }
+        eprintln!(
+            "api-diff {package} {from}→{to}: {} ({}); {} rename(s) auto-detected",
+            diff.change, if diff.detail.is_empty() { "—" } else { &diff.detail }, diff.renames.len()
+        );
+        if diff.change == "breaking" && diff.renames.is_empty() {
+            eprintln!(
+                "  note: this is a breaking change that is not a pure rename — \
+                 run a semantic migration: lex propagate --package {package} --symbol <name> \
+                 --note '{}' --ollama", diff.detail
+            );
+        }
     }
 
     // The dependent packages to migrate: each package dir under --workspace
@@ -168,6 +203,52 @@ fn package_lex_files(dir: &Path) -> Vec<PathBuf> {
     }
     out.sort();
     out
+}
+
+/// The API diff between two releases, as served by
+/// `GET {public}/{name}/api-diff?from=&to=`.
+struct ApiDiff {
+    change: String,
+    detail: String,
+    renames: Vec<Rename>,
+}
+struct Rename {
+    old: String,
+    new: String,
+}
+
+/// Fetch the API diff for `package` between two releases from its registry's
+/// public surface (#893). `registry` is the tenant-qualified string
+/// (`host/tenant[/store]`), the same as a `lex.toml` registry dependency.
+fn fetch_api_diff(registry: &str, package: &str, from: &str, to: &str) -> Result<ApiDiff> {
+    let pr = lex_syntax::registry::public(registry)
+        .ok_or_else(|| anyhow!("--registry must be tenant-qualified (host/tenant[/store]), got `{registry}`"))?;
+    // public base is `https://host/v1/public/tenant`; append the package path.
+    let mut url = format!("{}/{package}/api-diff?from={from}&to={to}", pr.base);
+    if let Some(store) = &pr.store {
+        url.push_str(&format!("&store={store}"));
+    }
+    let body = ureq::get(&url)
+        .call()
+        .map_err(|e| anyhow!("GET {url}: {e}"))?
+        .into_body()
+        .read_to_string()
+        .map_err(|e| anyhow!("reading api-diff: {e}"))?;
+    let v: serde_json::Value = serde_json::from_str(&body)
+        .with_context(|| format!("parsing api-diff from {url}"))?;
+    let renames = v.get("renames").and_then(|r| r.as_array()).map(|arr| {
+        arr.iter().filter_map(|r| {
+            Some(Rename {
+                old: r.get("old")?.as_str()?.to_string(),
+                new: r.get("new")?.as_str()?.to_string(),
+            })
+        }).collect()
+    }).unwrap_or_default();
+    Ok(ApiDiff {
+        change: v.get("change").and_then(|c| c.as_str()).unwrap_or("unknown").to_string(),
+        detail: v.get("detail").and_then(|d| d.as_str()).unwrap_or("").to_string(),
+        renames,
+    })
 }
 
 // ── Part b: mechanical rename propagation ───────────────────────────────────
