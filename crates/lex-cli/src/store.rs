@@ -351,6 +351,18 @@ pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         intent_id.clone(),
         &module_prefixes,
     )?;
+    // #930 P2b-1: capture the committed `lex.lock` at this head, so a peer
+    // (the hub's write-time gate) can resolve this head's dependencies
+    // against the exact pinned versions/heads it was built with, rather than
+    // inlining them. Best-effort on the read (a dependency-free package has no
+    // lock to commit); a store write error is real and propagates.
+    if let Some(head) = outcome.head_op.as_deref() {
+        if let Some((_toml, dir)) = lex_syntax::find_manifest(std::path::Path::new(path)) {
+            if let Ok(lock_toml) = std::fs::read_to_string(dir.join("lex.lock")) {
+                store.set_committed_lock(head, &lock_toml)?;
+            }
+        }
+    }
     // #835 Tier 1: record the behavioral-examples verdict for each
     // published fn-stage that declares examples. Best-effort.
     {

@@ -594,6 +594,20 @@ fn cmd_op_push(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     // (without this, a pulled op-log renders as `unknown stage_id`).
     push_objects(&remote, &to_send, &store, token.as_deref())?;
 
+    // #930 P2b-1: send the committed lex.lock for the head we're advancing to,
+    // so the remote's write-time gate can resolve this head's pinned
+    // dependencies. A dependency-free head has no committed lock — skip it.
+    if let Some(head) = local_head.as_ref() {
+        if let Some(lock) = store.committed_lock(head)? {
+            post_json(
+                &remote,
+                "/v1/locks/batch",
+                &serde_json::json!([{ "head_op": head, "lock": lock }]),
+                token.as_deref(),
+            )?;
+        }
+    }
+
     // Post the batch.
     let url = format!("{}/v1/ops/batch", remote.trim_end_matches('/'));
     let body = serde_json::to_string(&to_send)
@@ -1035,6 +1049,25 @@ fn cmd_op_pull(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     // path; for now we rely on the single-writer invariant.)
     fast_forward_branch_head(&root, &branch, &new_tip)
         .with_context(|| format!("advancing branch head to {new_tip}"))?;
+
+    // #930 P2b-1: fetch + store the committed lex.lock for the new tip, so the
+    // write-time gate here can resolve this head's pinned dependencies the
+    // same way the remote did. A dependency-free head has no lock to fetch.
+    {
+        let resp = post_json(
+            &remote,
+            "/v1/locks/fetch",
+            &serde_json::json!({ "head_ops": [new_tip] }),
+            token.as_deref(),
+        )?;
+        if let Some(locks) = resp.get("locks").and_then(|l| l.as_object()) {
+            for (head, toml) in locks {
+                if let Some(t) = toml.as_str() {
+                    store.set_committed_lock(head, t)?;
+                }
+            }
+        }
+    }
 
     let data = serde_json::json!({
         "remote": remote,
