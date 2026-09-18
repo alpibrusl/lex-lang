@@ -305,7 +305,17 @@ fn check_program_inner(
 pub fn check_and_rewrite_program(
     stages: &mut [a::Stage],
 ) -> Result<ProgramTypes, Vec<TypeError>> {
-    let pt = check_program(&*stages)?;
+    check_and_rewrite_program_with_modules(stages, &BTreeMap::new())
+}
+
+/// Like [`check_and_rewrite_program`], but resolving external dependency
+/// references through `modules` (#930) — the publish path checks the same
+/// non-inlined head its store gate will, so the two agree.
+pub fn check_and_rewrite_program_with_modules(
+    stages: &mut [a::Stage],
+    modules: &BTreeMap<String, Ty>,
+) -> Result<ProgramTypes, Vec<TypeError>> {
+    let pt = check_program_with_modules(&*stages, modules)?;
     rewrite_parse_calls(stages, &pt);
     Ok(pt)
 }
