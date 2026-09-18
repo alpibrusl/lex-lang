@@ -19,7 +19,7 @@ use lex_store::issues::{
 use lex_vcs::IssueLog;
 
 /// `GET /v1/issues` — every issue with its derived state.
-pub(crate) fn issues_state_handler(state: &State) -> Response<Cursor<Vec<u8>>> {
+pub fn issues_state_handler(state: &State) -> Response<Cursor<Vec<u8>>> {
     let store = state.store.lock().unwrap();
     match all_issue_status(&store) {
         Ok(issues) => json_response(200, &serde_json::json!({ "issues": issues })),
@@ -29,7 +29,7 @@ pub(crate) fn issues_state_handler(state: &State) -> Response<Cursor<Vec<u8>>> {
 
 /// `GET /v1/issues/<id>` — one issue, its derived state, and every recorded
 /// `IssueVerified` verdict. 404 for an unknown id.
-pub(crate) fn issue_detail_handler(state: &State, id: &str) -> Response<Cursor<Vec<u8>>> {
+pub fn issue_detail_handler(state: &State, id: &str) -> Response<Cursor<Vec<u8>>> {
     let store = state.store.lock().unwrap();
     let log = match IssueLog::open(store.root()) {
         Ok(l) => l,
@@ -64,7 +64,7 @@ pub(crate) fn issue_detail_handler(state: &State, id: &str) -> Response<Cursor<V
 /// `GET /v1/projects` — issues grouped by project (a project is a subgraph
 /// with a goal), each with per-state counts. Issues with no project appear
 /// in `/v1/issues` only.
-pub(crate) fn projects_handler(state: &State) -> Response<Cursor<Vec<u8>>> {
+pub fn projects_handler(state: &State) -> Response<Cursor<Vec<u8>>> {
     let store = state.store.lock().unwrap();
     let all = match all_issue_status(&store) {
         Ok(v) => v,

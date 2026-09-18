@@ -36,7 +36,10 @@ pub mod handlers;
 mod branches_http;
 pub mod review_http;
 mod sync_http;
-mod issues_http;
+/// Derived issue/project state (#949 phase 3). `pub` so lex-hub can wrap the
+/// handlers with owner-session auth for the console, as it does for
+/// [`review_http`].
+pub mod issues_http;
 mod publish_examples;
 mod web;
 pub mod mcp;
