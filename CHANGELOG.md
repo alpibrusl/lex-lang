@@ -154,6 +154,18 @@ bumps may carry breaking changes when justified).
   `lex.toml` — so the cross-store dependency graph populates itself on every
   release. Surfaces the version-bump gate (409 immutable / 422 too-small).
 
+## [0.11.43] - 2026-09-18
+
+### Fixed
+
+- **Inlined-dependency packages render with valid names (#930).** An inlined
+  registry dependency's mangle prefix (`lib_56ce0533`) mapped to no source
+  file, so the renderer left it as `lib_56ce0533.gcd` — a dotted, invalid
+  declaration/reference that made an inlined-dep package's install archive
+  fail to compile. Such prefixes are now flattened to bare names (what
+  inlining means: the dep is folded into the package's namespace). The deeper
+  fix — not inlining registry deps at all — is tracked in #930.
+
 ## [Unreleased]
 
 ### Added
