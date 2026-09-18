@@ -98,6 +98,20 @@ bumps may carry breaking changes when justified).
     module only if it parses and type-checks (the always-valid-HEAD gate
     applied to a propagated change).
 
+## [0.11.39] - 2026-09-18
+
+### Added
+
+- **Auto-detected rename propagation (#893).** `GET
+  /v1/pkg/{name}/api-diff?from=<v>&to=<v>` reports how a package's public API
+  changed between two releases — the classification and the mechanically
+  propagatable renames (a removed declaration paired with an added one of
+  identical signature). `lex propagate --package <up> --from <v> --to <v>
+  --registry <r>` fetches that diff over the public registry surface and fans
+  the detected renames out to dependents, so the edits needn't be restated by
+  hand; a breaking change that isn't a pure rename points the operator at a
+  semantic migration.
+
 ## [Unreleased]
 
 ### Added
