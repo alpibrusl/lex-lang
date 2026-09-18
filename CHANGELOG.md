@@ -5,6 +5,33 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [0.11.45] - 2026-09-18
+
+### Changed
+
+- **Registry/git dependencies are kept as `import` edges, not inlined (#930).**
+  A package published through the op-log-native path (`lex publish` +
+  `lex op push`) now records its registry/git dependencies as `import` edges
+  with their real `as` alias, instead of resolving and inlining their bodies.
+  History records the dependency, rendered source is faithful to what the
+  author wrote (`import "lex-nt/lib" as nt` + `nt.gcd`, not a wall of inlined
+  `lib_<hash>.gcd`), and hosted propagation of an upstream change is sound.
+
+  - The type-checker resolves a dependency from a supplied module map:
+    `check_program_with_modules` / `check_and_rewrite_program_with_modules`,
+    with `module_record_from_fields` building a dependency's record (type- and
+    effect-variable hygiene so polymorphic exports never alias).
+  - The write-time gate resolves through an injectable `DepResolver` on the
+    `Store`: the client resolves from the working-copy `lex.lock` + local
+    cache; the hub resolves cross-store from the committed lock. No resolver
+    installed → empty map → pre-#930 behavior (inlined heads are unaffected,
+    and `lex run` / `lex check` still inline to stay self-contained).
+  - `lex.lock` is now committed, pushed package state (blob-CAS, keyed by head
+    op) so the resolving gate pins the exact dependency versions a head was
+    built against; `op push`/`pull` transfer it (`/v1/locks/*`).
+  - `lex_store::render::module_record_at_op` extracts a hosted dependency's
+    public signatures from its op-log head for the hub gate.
+
 ## [0.11.35] - 2026-09-17
 
 ### Added
