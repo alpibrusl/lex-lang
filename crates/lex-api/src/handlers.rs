@@ -405,6 +405,8 @@ fn route(
         // ---- #839 follow-up: branch management over HTTP so a remote
         // client can create/switch branches (and thus drive the merge
         // gates end to end), not just probe heads.
+        (Method::Get, "/v1/review/inbox") => crate::review_http::review_inbox_handler(state, query),
+        (Method::Post, "/v1/review/verdict") => crate::review_http::review_verdict_handler(state, body),
         (Method::Get, "/v1/branches") => crate::branches_http::branches_list_handler(state),
         (Method::Post, "/v1/branches") => crate::branches_http::branch_create_handler(state, body),
         (Method::Post, p) if p.starts_with("/v1/branches/") && p.ends_with("/checkout") => {

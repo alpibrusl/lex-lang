@@ -957,3 +957,41 @@ fn api_diff_reports_change_between_two_releases() {
     // Missing params → 400.
     assert_eq!(get(&srv.addr, "/v1/pkg/adiff/api-diff").0, 400);
 }
+
+/// lex-hub#92 (first slice): the human review surface — an inbox of head
+/// stages needing review, and a verdict that lands as a Review attestation
+/// the inbox then reflects.
+#[test]
+fn review_inbox_lists_stages_and_a_verdict_updates_it() {
+    let (srv, _tmp) = start_server();
+    assert_eq!(post_bytes(&srv.addr, "/v1/pkg/publish",
+        &pkg_archive("rev", "0.1.0", &[("lib.lex", "fn f() -> Int { 1 }\nfn g() -> Int { 2 }\n")])).0, 200);
+
+    // Inbox: both stages present, each needs review (none approved yet).
+    let (status, body) = get(&srv.addr, "/v1/review/inbox");
+    assert_eq!(status, 200, "inbox: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let items = v["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "two stages in the inbox: {body}");
+    assert!(items.iter().all(|it| it["needs_review"] == true), "all need review: {body}");
+    let stage_id = items[0]["stage_id"].as_str().unwrap().to_string();
+
+    // Approve one stage → 201.
+    let verdict = format!(r#"{{"stage_id":"{stage_id}","verdict":"approve","reviewer":"alfonso"}}"#);
+    let (s, b) = post_bytes(&srv.addr, "/v1/review/verdict", verdict.as_bytes());
+    assert_eq!(s, 201, "verdict: {b}");
+
+    // Inbox now shows that stage approved and no longer needing review.
+    let (_s, body) = get(&srv.addr, "/v1/review/inbox");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let approved = v["items"].as_array().unwrap().iter()
+        .find(|it| it["stage_id"] == stage_id).unwrap();
+    assert_eq!(approved["review"], "approved", "verdict reflected: {body}");
+    assert_eq!(approved["needs_review"], false);
+
+    // A verdict on an unknown stage → 404; a bad verdict word → 400.
+    assert_eq!(post_bytes(&srv.addr, "/v1/review/verdict",
+        br#"{"stage_id":"nope","verdict":"approve","reviewer":"x"}"#).0, 404);
+    assert_eq!(post_bytes(&srv.addr, "/v1/review/verdict",
+        format!(r#"{{"stage_id":"{stage_id}","verdict":"maybe","reviewer":"x"}}"#).as_bytes()).0, 400);
+}
