@@ -161,6 +161,20 @@ fn render_multifile(store: &Store, head: &PackageHead) -> Result<BTreeMap<String
     Ok(out)
 }
 
+/// Whether `q` looks like a per-file mangle prefix (`<stem>_<hex6+>`), as
+/// opposed to a stdlib import alias (`int`, `str`, `map`). Used to detect an
+/// inlined dependency's prefix so it can be flattened to a bare name.
+fn is_mangle_prefix(q: &str) -> bool {
+    match q.rsplit_once('_') {
+        Some((stem, hex)) => {
+            !stem.is_empty()
+                && hex.len() >= 6
+                && hex.chars().all(|c| c.is_ascii_hexdigit())
+        }
+        None => false,
+    }
+}
+
 /// The mangling prefix of a declaration (`schema_a1b2.validate` →
 /// `schema_a1b2`), or `None` for an import or an unmangled name.
 fn stage_prefix(s: &lex_ast::Stage) -> Option<String> {
@@ -328,6 +342,16 @@ impl FileRewrite<'_> {
                     self.local_imports.insert(import_ref, alias.clone());
                     return format!("{alias}.{rest}");
                 }
+                // A mangle prefix (`<stem>_<hex>`) that maps to no file is an
+                // *inlined dependency* — the loader flattened a registry dep
+                // into this program (lex-lang#930). It has no file of its own,
+                // so render it as a bare top-level name (inlining folds it into
+                // this package's namespace); leaving `prefix.name` would emit
+                // an invalid dotted declaration/reference. Stdlib aliases
+                // (`int.to_str`) don't match the mangle pattern and pass through.
+                if is_mangle_prefix(q) {
+                    return rest.to_string();
+                }
             }
         }
         name.to_string()
@@ -464,5 +488,23 @@ impl FileRewrite<'_> {
                 self.rewrite_expr(predicate);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod prefix_tests {
+    use super::is_mangle_prefix;
+
+    #[test]
+    fn recognizes_mangle_prefixes_not_stdlib_aliases() {
+        // Inlined-dep / file mangle prefixes: <stem>_<hex6+>.
+        assert!(is_mangle_prefix("lib_56ce0533"));
+        assert!(is_mangle_prefix("schema_a1b2c3"));
+        // Stdlib import aliases and ordinary names are not prefixes.
+        assert!(!is_mangle_prefix("int"));
+        assert!(!is_mangle_prefix("str"));
+        assert!(!is_mangle_prefix("map_reduce")); // "reduce" isn't hex
+        assert!(!is_mangle_prefix("nt"));
+        assert!(!is_mangle_prefix("lib_xyz")); // too short / non-hex
     }
 }
