@@ -63,6 +63,14 @@ pub enum StoreError {
     /// type-broken publish leaves no footprint.
     #[error("type errors in published program: {} error(s)", .0.len())]
     TypeError(Vec<lex_types::TypeError>),
+    /// A dependency being resolved for the write-time gate (#930) is a
+    /// multi-module package. Per-module signature extraction (picking the
+    /// imported module's file out of the de-flattened tree) is not yet
+    /// implemented; single-module (leaf) dependencies resolve today. A
+    /// caller can treat this as "cannot resolve here" rather than a hard
+    /// failure.
+    #[error("multi-module dependency resolution is not yet supported")]
+    UnsupportedMultiModuleDependency,
     /// The op was persisted but a `required_attestations` rule in
     /// `policy.json` (#245) refused to advance the branch head past
     /// it. The op record is durable — re-running with the missing
