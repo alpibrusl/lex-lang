@@ -59,6 +59,35 @@ pub fn public_api_at_op(store: &Store, op_id: &str) -> Result<PublicApi, StoreEr
     Ok(api)
 }
 
+/// The external **package** dependencies visible in a head's imports: the
+/// first path segment of every import reference that is neither a stdlib
+/// import (`std.*`) nor a local/relative one (`./`, `../`, `/`). Note that a
+/// package published with its deps *installed* has them inlined into a
+/// self-contained op-log, so this is often empty — the release request's
+/// declared dependencies (from `lex.toml`) are the authoritative source, and
+/// this catches only deps left as unresolved imports. Deduped, sorted.
+pub fn external_dependencies_at_op(store: &Store, op_id: &str) -> Result<Vec<String>, StoreError> {
+    let head = crate::render::package_head_at_op(store, op_id)?;
+    let mut deps = std::collections::BTreeSet::new();
+    for imports in head.file_imports.values() {
+        for module in imports.keys() {
+            if module.starts_with("std.")
+                || module.starts_with("./")
+                || module.starts_with("../")
+                || module.starts_with('/')
+            {
+                continue;
+            }
+            // `lex-nt/lib` → `lex-nt`; a bare `lex-nt` → `lex-nt`.
+            let pkg = module.split('/').next().unwrap_or(module);
+            if !pkg.is_empty() {
+                deps.insert(pkg.to_string());
+            }
+        }
+    }
+    Ok(deps.into_iter().collect())
+}
+
 /// Bare name for a message (strip the path-derived mangle prefix).
 fn bare(name: &str) -> &str {
     name.split_once('.').map(|(_, n)| n).unwrap_or(name)

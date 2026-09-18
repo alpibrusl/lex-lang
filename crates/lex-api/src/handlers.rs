@@ -1596,6 +1596,12 @@ struct PkgRecord {
     published_at: u64,
     /// Function names introduced or updated by this version (for retract).
     function_names: Vec<String>,
+    /// External package dependencies of this release — declared by the
+    /// releaser (from `lex.toml`) and/or extracted from the head's
+    /// non-inlined imports. The edge set of the dependency graph (#893
+    /// propagation). `#[serde(default)]` keeps pre-existing records readable.
+    #[serde(default)]
+    dependencies: Vec<String>,
     /// Raw op JSON from each file in this publish.
     ops: Vec<serde_json::Value>,
 }
@@ -1732,6 +1738,10 @@ struct ReleaseReq {
     version: String,
     #[serde(default)]
     branch: Option<String>,
+    /// External package dependencies (from the releaser's `lex.toml`).
+    /// Unioned with any non-inlined external imports found in the head.
+    #[serde(default)]
+    dependencies: Vec<String>,
 }
 
 /// `POST /v1/pkg/{name}/release` — cut an immutable versioned release of
@@ -1839,6 +1849,14 @@ fn pkg_release_handler(state: &State, name: &str, body: &str) -> Response<std::i
             _ => None,
         })
         .collect();
+    // Dependency-graph edges (#893 propagation): the releaser's declared deps
+    // (from lex.toml) unioned with any external imports still visible in the
+    // head (most are inlined at publish, so the declared list is primary).
+    let mut deps: std::collections::BTreeSet<String> = req.dependencies.into_iter().collect();
+    if let Ok(extracted) = lex_store::api::external_dependencies_at_op(&store, &head_op) {
+        deps.extend(extracted);
+    }
+    let dependencies: Vec<String> = deps.into_iter().collect();
     drop(store);
 
     let published_at = std::time::SystemTime::now()
@@ -1851,6 +1869,7 @@ fn pkg_release_handler(state: &State, name: &str, body: &str) -> Response<std::i
         head_op: Some(head_op.clone()),
         published_at,
         function_names,
+        dependencies,
         ops: Vec::new(),
     };
     if let Err(e) = save_pkg_record(&state.root, &record, None) {
@@ -2333,12 +2352,19 @@ fn pkg_publish_handler(state: &State, body: &[u8]) -> Response<std::io::Cursor<V
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    // External deps from the head's non-inlined imports (archive publish; the
+    // op-log release route also accepts declared deps from lex.toml).
+    let dependencies: Vec<String> = final_head_op
+        .as_ref()
+        .and_then(|h| lex_store::api::external_dependencies_at_op(&store, h).ok())
+        .unwrap_or_default();
     let record = PkgRecord {
         name: pkg_name.clone(),
         version: pkg_version,
         head_op: final_head_op.clone(),
         published_at: now,
         function_names: all_function_names,
+        dependencies,
         ops: all_ops.clone(),
     };
     if let Err(e) = save_pkg_record(&state.root, &record, Some(body)) {
@@ -2449,6 +2475,7 @@ fn pkg_get_version_handler(state: &State, name: &str, version: &str) -> Response
             "head_op": r.head_op,
             "published_at": r.published_at,
             "function_names": r.function_names,
+            "dependencies": r.dependencies,
             "ops": r.ops,
         })),
         None => error_response(404, format!("package {name:?}@{version:?} not found")),
@@ -2705,6 +2732,7 @@ mod public_read_tests {
             head_op: Some(format!("op-{name}")),
             published_at: 1,
             function_names: vec![format!("{name}.f")],
+            dependencies: vec![],
             ops: vec![],
         };
         save_pkg_record(root, &record, Some(format!("ARCHIVE:{name}@{version}").as_bytes()))
