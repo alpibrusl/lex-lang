@@ -823,7 +823,7 @@ package manager: init, add, install, list deps; publish/verify signed capability
 
 ### Arguments
 
-- `subcommand` (enum[init|add|install|list|publish|verify], required) — what to do
+- `subcommand` (enum[init|add|install|lock|update|list|publish|release|verify], required) — what to do
 
 ### Examples
 
@@ -845,6 +845,11 @@ lex pkg install --ignore-lex-floor
 ```bash
 # Add a path dep
 lex pkg add mylib --path ../mylib
+```
+
+```bash
+# Cut a versioned release (name/version/deps from lex.toml)
+LEXHUB_TOKEN=evk_… lex pkg release https://vcs.lexlang.org
 ```
 
 ```bash
