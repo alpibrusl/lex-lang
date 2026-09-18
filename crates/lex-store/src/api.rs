@@ -82,6 +82,48 @@ pub fn classify_api_change(prev: &PublicApi, new: &PublicApi) -> ApiChange {
     ApiChange::None
 }
 
+/// A detected rename: a public name that disappeared and reappeared under a
+/// new name with the **same signature** — a drop-in rename that can propagate
+/// mechanically (`nt.gcd` → `nt.euclidean_gcd`). Names are bare (mangle prefix
+/// stripped) so they feed `lex propagate --rename old=new` directly.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Rename {
+    pub old: String,
+    pub new: String,
+}
+
+/// Detect renames between two public APIs: pair each removed declaration with
+/// an added one that has an identical signature. A signature shared by several
+/// removed/added names is ambiguous and left unpaired (a rename can't be
+/// inferred safely), so only unambiguous 1:1 matches are returned.
+pub fn detect_renames(prev: &PublicApi, new: &PublicApi) -> Vec<Rename> {
+    // Candidates: names present on exactly one side.
+    let removed: Vec<(&String, &String)> =
+        prev.iter().filter(|(k, _)| !new.contains_key(*k)).collect();
+    let added: Vec<(&String, &String)> =
+        new.iter().filter(|(k, _)| !prev.contains_key(*k)).collect();
+
+    let mut renames = Vec::new();
+    let mut used_added = std::collections::BTreeSet::new();
+    for (old_name, old_sig) in &removed {
+        // Unambiguous only: exactly one removed and one added with this sig.
+        let removed_same = removed.iter().filter(|(_, s)| s == old_sig).count();
+        let matches: Vec<&(&String, &String)> = added
+            .iter()
+            .filter(|(n, s)| s == old_sig && !used_added.contains(*n))
+            .collect();
+        if removed_same == 1 && matches.len() == 1 {
+            let (new_name, _) = matches[0];
+            used_added.insert((*new_name).clone());
+            renames.push(Rename {
+                old: bare(old_name).to_string(),
+                new: bare(new_name).to_string(),
+            });
+        }
+    }
+    renames
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,5 +166,30 @@ mod tests {
         let prev = api(&[("foo", "fn:A")]);
         let new = api(&[("bar", "fn:B")]);
         assert!(matches!(classify_api_change(&prev, &new), ApiChange::Breaking(_)));
+    }
+
+    #[test]
+    fn detects_a_same_signature_rename() {
+        // gcd removed, euclidean_gcd added with the identical signature.
+        let prev = api(&[("m_a1.gcd", "fn:SIG"), ("m_a1.other", "fn:X")]);
+        let new = api(&[("m_a1.euclidean_gcd", "fn:SIG"), ("m_a1.other", "fn:X")]);
+        let renames = detect_renames(&prev, &new);
+        assert_eq!(renames, vec![Rename { old: "gcd".into(), new: "euclidean_gcd".into() }]);
+    }
+
+    #[test]
+    fn does_not_infer_rename_when_signature_differs() {
+        // Removed + added but different signatures → not a rename (breaking).
+        let prev = api(&[("m.foo", "fn:A")]);
+        let new = api(&[("m.bar", "fn:B")]);
+        assert!(detect_renames(&prev, &new).is_empty());
+    }
+
+    #[test]
+    fn does_not_infer_rename_when_ambiguous() {
+        // Two removed and two added share one signature → ambiguous, skip both.
+        let prev = api(&[("m.a", "fn:S"), ("m.b", "fn:S")]);
+        let new = api(&[("m.c", "fn:S"), ("m.d", "fn:S")]);
+        assert!(detect_renames(&prev, &new).is_empty());
     }
 }
