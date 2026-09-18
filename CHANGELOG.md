@@ -5,6 +5,21 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [0.11.49] - 2026-09-18
+
+### Fixed
+
+- **Issue boards no longer 500 on stores with a persisted head snapshot
+  (#949 phase 4 prod finding).** `list_branches` reported the stem of each
+  branch's `<branch>.head_snapshot.json` as a phantom branch, and
+  `issues_in_progress` then failed reading it as a branch record
+  (`missing field name`), taking down every `/v1/issues*` surface.
+  Snapshot files are skipped, and an unreadable branch record now
+  contributes no provenance instead of failing the derivation.
+- **`lex attest push` / `lex attest pull` authenticate.** Both commands now
+  take `--token` (or `LEXHUB_TOKEN`) with the same precedence as `lex op
+  push`, and surface a clear hint on 401 instead of an opaque rejection.
+
 ## [0.11.48] - 2026-09-18
 
 ### Added
