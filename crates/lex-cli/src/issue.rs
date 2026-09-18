@@ -19,6 +19,10 @@
 use std::collections::BTreeSet;
 
 use anyhow::{anyhow, bail, Result};
+use lex_store::issues::{
+    evaluate_static, prepare_example_stages, record_issue_verdict, IssueEvaluation,
+};
+use lex_store::{Store, StoreError};
 use lex_vcs::{Acceptance, ApiChangeKind, ApiEntry, Issue, IssueLog};
 
 use crate::store_root::parse_store_flag;
@@ -31,8 +35,10 @@ pub fn cmd_issue(args: &[String]) -> Result<()> {
         "create" => create(&root, tail),
         "list" => list(&root),
         "show" => show(&root, tail),
+        "verify" => verify(&root, tail),
         _ => bail!(
-            "usage: lex issue <create|list|show> [--store DIR]\n\
+            "usage: lex issue <create|list|show|verify> [--store DIR]\n\
+             verify: <id> [--at OP]  evaluate the issue's acceptance at a head (default: branch head)\n\
              create: --title T [--body B] --shape typed_delta|failing_example|metric_invariant|evidence|free_form\n\
              \x20       [--api name:sig[:kind]]... [--example E]... [--predicate P --window W]\n\
              \x20       [--subject S] [--invariant I]... [--base OP] [--dep ID]... [--project P]"
@@ -135,6 +141,117 @@ fn parse_api_entry(s: &str) -> Result<ApiEntry> {
         bail!("--api expects name:signature[:kind], got `{s}`");
     }
     Ok(ApiEntry { name: name.to_string(), signature: signature.to_string(), kind })
+}
+
+/// `lex issue verify <id> [--at OP]` — evaluate the issue's declared
+/// acceptance at a head and record the verdict as an `IssueVerified`
+/// attestation. Done is a proof, not a status: the static half
+/// (`evaluate_static`: the API delta) runs in lex-store; the examples half
+/// runs here, because running code needs lex-runtime, which lex-store can't
+/// depend on. Exit 1 when the oracle fails, so a script can gate on it.
+fn verify(root: &std::path::Path, args: &[String]) -> Result<()> {
+    let mut id: Option<String> = None;
+    let mut at: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--at" => at = Some(it.next().cloned().ok_or_else(|| anyhow!("--at needs an op id"))?),
+            other if !other.starts_with("--") && id.is_none() => id = Some(other.to_string()),
+            other => bail!("unexpected arg `{other}` (usage: lex issue verify <id> [--at OP] [--store DIR])"),
+        }
+    }
+    let id = id.ok_or_else(|| anyhow!("usage: lex issue verify <id> [--at OP] [--store DIR]"))?;
+    let log = IssueLog::open(root)?;
+    let issue = log.get(&id)?.ok_or_else(|| anyhow!("unknown issue `{id}`"))?;
+    let store = Store::open(root)?;
+    let head = match at {
+        Some(h) => h,
+        None => {
+            let branch = store.current_branch();
+            store
+                .get_branch(&branch)?
+                .and_then(|b| b.head_op)
+                .ok_or_else(|| anyhow!("branch `{branch}` has no head yet; pass --at OP"))?
+        }
+    };
+
+    // 1. Everything that needs no execution (the typed delta's API check).
+    let mut eval = evaluate_static(&store, &issue, &head)?;
+
+    // 2. The examples, only if the static half held and the shape carries any.
+    if eval.is_passed() {
+        let cases_src: Vec<&str> = match &issue.acceptance {
+            Acceptance::TypedDelta { examples, .. } => examples.iter().map(String::as_str).collect(),
+            Acceptance::FailingExample { example } => vec![example.as_str()],
+            _ => Vec::new(),
+        };
+        if !cases_src.is_empty() {
+            let mut cases = Vec::with_capacity(cases_src.len());
+            for c in &cases_src {
+                cases.push(parse_example_case(c)?);
+            }
+            match prepare_example_stages(&store, &head, &cases) {
+                Ok(stages) => {
+                    let errs = lex_runtime::evaluate_examples(&stages);
+                    if !errs.is_empty() {
+                        let detail = errs
+                            .iter()
+                            .map(|e| serde_json::to_string(e).unwrap_or_else(|_| "example mismatch".into()))
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        eval = IssueEvaluation::failed(detail);
+                    }
+                }
+                Err(StoreError::IssueTarget(name)) => {
+                    eval = IssueEvaluation::failed(format!(
+                        "example targets `{name}`, which is not declared at this head"
+                    ));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    let attestation = record_issue_verdict(&store, &issue, &head, &eval)?;
+    match &eval {
+        IssueEvaluation::Passed => {
+            println!("verified: {id} at {head} (attestation {attestation})");
+            Ok(())
+        }
+        IssueEvaluation::NotEvaluable { reason } => {
+            println!("inconclusive: {reason} (attestation {attestation})");
+            Ok(())
+        }
+        IssueEvaluation::Failed { detail } => {
+            println!("failed: {detail} (attestation {attestation})");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `name(args) => expected` → `(name, Example)`. Parsed under a stub fn
+/// named after the callee: the parser keeps a case's args and expected
+/// value (not its callee), and never type-checks the stub, so `-> Int { 0 }`
+/// is fine for any signature.
+fn parse_example_case(case: &str) -> Result<(String, lex_ast::Example)> {
+    let name = case
+        .split('(')
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("example `{case}` must be `name(args) => expected`"))?
+        .to_string();
+    let src = format!("fn {name}() -> Int examples {{ {case} }} {{ 0 }}\n");
+    let prog = lex_syntax::parse_source(&src)
+        .map_err(|e| anyhow!("parsing example `{case}`: {e:?}"))?;
+    let example = lex_ast::canonicalize_program(&prog)
+        .into_iter()
+        .find_map(|st| match st {
+            lex_ast::Stage::FnDecl(fd) => fd.examples.into_iter().next(),
+            _ => None,
+        })
+        .ok_or_else(|| anyhow!("example `{case}` parsed to no case"))?;
+    Ok((name, example))
 }
 
 fn list(root: &std::path::Path) -> Result<()> {

@@ -15,3 +15,6 @@ lex issue list
 
 # Show one as JSON
 lex issue show <id>
+
+# Verify an issue at the branch head — done is a proof the gate records, not a status
+lex issue verify <id>

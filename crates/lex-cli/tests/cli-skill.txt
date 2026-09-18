@@ -871,7 +871,7 @@ typed issues (#949): a unit of work with a declared, verifiable acceptance — d
 
 ### Arguments
 
-- `subcommand` (enum[create|list|show], required) — what to do
+- `subcommand` (enum[create|list|show|verify], required) — what to do
 
 ### Examples
 
@@ -898,6 +898,11 @@ lex issue list
 ```bash
 # Show one as JSON
 lex issue show <id>
+```
+
+```bash
+# Verify an issue at the branch head — done is a proof the gate records, not a status
+lex issue verify <id>
 ```
 
 ## `lex propagate`

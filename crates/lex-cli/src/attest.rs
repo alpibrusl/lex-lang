@@ -998,6 +998,7 @@ pub(super) fn attestation_kind_tag(k: &lex_vcs::AttestationKind) -> &'static str
         Block { .. } => "block",
         Unblock { .. } => "unblock",
         Review { .. } => "review",
+        IssueVerified { .. } => "issue_verified",
         Trace { .. } => "trace",
         ProducerBlock { .. } => "producer_block",
         ProducerUnblock { .. } => "producer_unblock",

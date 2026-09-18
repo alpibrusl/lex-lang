@@ -136,6 +136,18 @@ pub enum AttestationKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         notes: Option<String>,
     },
+    /// A typed issue's declared acceptance was evaluated at a head (#949
+    /// phase 2) — the definition of done as code. Keyed by the *issue id*
+    /// (as the attestation's stage subject) so "is issue X done?" is a
+    /// lookup, not a judgment. `result` carries the verdict: `Passed` when
+    /// the oracle holds, `Failed` with what didn't, `Inconclusive` when the
+    /// shape isn't machine-evaluable here (free-form is human-closed; the
+    /// metric/evidence oracles land later). Never recorded as passed for a
+    /// shape the gate could not actually check.
+    IssueVerified {
+        issue_id: String,
+        shape: String,
+    },
     /// Emitted by the store-write gate (#130) on every accepted op.
     /// The store can answer "the HEAD typechecks" as a queryable
     /// fact rather than an implicit invariant.
