@@ -85,6 +85,12 @@ pub struct Intent {
     /// handle Y'"). `None` for top-level intents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_intent: Option<IntentId>,
+    /// The typed issue this intent realizes (#949), so provenance links
+    /// issue ↔ intent ↔ ops ↔ attestation. `None` for intents not tied to
+    /// an issue; omitted from the serialized form (and the id hash) when
+    /// `None`, so pre-existing intents keep their ids byte-for-byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_id: Option<crate::issue::IssueId>,
     /// Wall-clock seconds since epoch when this intent was first
     /// created. Excluded from `intent_id` so the dedup property
     /// holds across runs.
@@ -121,15 +127,33 @@ impl Intent {
     ) -> Self {
         let prompt = prompt.into();
         let session_id = session_id.into();
-        let intent_id = compute_intent_id(&prompt, &session_id, &model, parent_intent.as_deref());
+        let intent_id =
+            compute_intent_id(&prompt, &session_id, &model, parent_intent.as_deref(), None);
         Self {
             intent_id,
             prompt,
             session_id,
             model,
             parent_intent,
+            issue_id: None,
             created_at,
         }
+    }
+
+    /// Attach the typed issue this intent realizes (#949), recomputing the
+    /// id: "implement issue X" and the same prompt with no issue are
+    /// distinct intents. An intent without an issue serializes exactly as
+    /// before, so pre-existing ids are unchanged.
+    pub fn with_issue(mut self, issue_id: crate::issue::IssueId) -> Self {
+        self.intent_id = compute_intent_id(
+            &self.prompt,
+            &self.session_id,
+            &self.model,
+            self.parent_intent.as_deref(),
+            Some(issue_id.as_str()),
+        );
+        self.issue_id = Some(issue_id);
+        self
     }
 }
 
@@ -138,12 +162,14 @@ fn compute_intent_id(
     session_id: &str,
     model: &ModelDescriptor,
     parent_intent: Option<&str>,
+    issue_id: Option<&str>,
 ) -> IntentId {
     let view = CanonicalIntentView {
         prompt,
         session_id,
         model,
         parent_intent,
+        issue_id,
     };
     canonical::hash(&view)
 }
@@ -158,6 +184,10 @@ struct CanonicalIntentView<'a> {
     model: &'a ModelDescriptor,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_intent: Option<&'a str>,
+    /// Omitted when `None` so an intent with no issue hashes exactly as it
+    /// did before #949 — id stability for every pre-existing intent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    issue_id: Option<&'a str>,
 }
 
 // ---- Persistence -------------------------------------------------

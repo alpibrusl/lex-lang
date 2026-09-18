@@ -406,6 +406,11 @@ fn route(
         // write-time gate can resolve a head's pinned dependencies.
         (Method::Post, "/v1/locks/batch") => crate::sync_http::locks_batch_handler(state, body),
         (Method::Post, "/v1/locks/fetch") => crate::sync_http::locks_fetch_handler(state, body),
+        // #949 phase 1: typed issues travel with the package (content-
+        // addressed, like intents) so a pulled op-log carries its work items.
+        (Method::Post, "/v1/issues/batch") => crate::sync_http::issues_batch_handler(state, body),
+        (Method::Post, "/v1/issues/fetch") => crate::sync_http::issues_fetch_handler(state, body),
+        (Method::Get, "/v1/issues/list") => crate::sync_http::issues_list_handler(state),
         // ---- #839 follow-up: branch management over HTTP so a remote
         // client can create/switch branches (and thus drive the merge
         // gates end to end), not just probe heads.

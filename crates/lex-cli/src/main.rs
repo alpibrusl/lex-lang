@@ -31,6 +31,7 @@ mod init;
 mod lint;
 mod merge;
 mod dep_resolver;
+mod issue;
 mod op;
 mod recall;
 mod export_git;
@@ -166,6 +167,7 @@ fn run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "policy" => cmd_policy(fmt, &args[1..]),
         "log" => branch::cmd_log(fmt, &args[1..]),
         "op" => op::cmd_op(fmt, &args[1..]),
+        "issue" => issue::cmd_issue(&args[1..]),
         "recall" => recall::cmd_recall(fmt, &args[1..]),
         "export-git" => export_git::cmd_export_git(fmt, &args[1..]),
         "docs" => docs::cmd_docs(fmt, &args[1..]),
