@@ -301,7 +301,12 @@ pub fn issues_in_progress(store: &Store) -> Result<BTreeSet<IssueId>, StoreError
     let mut out = BTreeSet::new();
     let mut seen_intents: BTreeSet<String> = BTreeSet::new();
     for branch in store.list_branches()? {
-        let Some(head) = store.get_branch(&branch)?.and_then(|b| b.head_op) else { continue };
+        // A branch whose record can't be read contributes no provenance;
+        // skip it rather than failing the whole derivation (the review and
+        // branch-head surfaces tolerate the same way).
+        let Some(head) = store.get_branch(&branch).ok().flatten().and_then(|b| b.head_op) else {
+            continue;
+        };
         for rec in log.walk_forward(&head, None)? {
             let Some(iid) = rec.op.intent_id.clone() else { continue };
             if !seen_intents.insert(iid.clone()) {
