@@ -104,11 +104,15 @@ pub fn render_source(store: &Store, head: &PackageHead) -> Result<RenderedSource
 /// recursive extension that follows.
 pub fn module_record_at_op(store: &Store, head_op: &str) -> Result<lex_types::Ty, StoreError> {
     let head = package_head_at_op(store, head_op)?;
-    // A multi-module head records an `in_file` for every stage (same test the
-    // renderer uses to choose its path). Per-module extraction isn't wired up
-    // yet, so surface a typed "cannot resolve here" instead of guessing.
-    let multi = !head.map.is_empty() && head.map.keys().all(|s| head.sig_files.contains_key(s));
-    if multi {
+    // "Multi-module" here means the head spans MORE THAN ONE source file — then
+    // extracting one module's surface needs picking the imported module's file,
+    // which isn't wired up yet. A single-file package still records an `in_file`
+    // for every stage when published via `lex publish <dir>` (so it renders to
+    // `src/<file>.lex`), but its whole surface is that one module and resolves
+    // fine through the single-file path below. Count distinct files rather than
+    // "every stage has a file", which misclassified the single-file case.
+    let distinct_files: BTreeSet<&String> = head.sig_files.values().collect();
+    if distinct_files.len() > 1 {
         return Err(StoreError::UnsupportedMultiModuleDependency);
     }
     let pairs: Vec<(String, String)> =

@@ -72,6 +72,60 @@ fn extracts_public_signatures_as_a_module_record() {
     }
 }
 
+/// Regression (#930): a *single-file* package published via `lex publish <dir>`
+/// records an `in_file` for every stage (so it renders to `src/<file>.lex`),
+/// but its whole surface is one module and must still resolve. The earlier
+/// "every stage has a file → multi-module" test misclassified this and made
+/// the hub resolver bail (`unknown_identifier`) on real single-file deps like
+/// lex-nt. `module_record_at_op` now keys off the count of distinct files.
+#[test]
+fn single_file_package_with_in_file_still_resolves() {
+    let (store, _tmp) = fresh();
+    // Simulate a single-file package head: one mangled prefix, one source file.
+    let mut stages = parse("fn gcd(a :: Int, b :: Int) -> Int { a }\n");
+    for st in &mut stages {
+        if let lex_ast::Stage::FnDecl(fd) = st {
+            fd.name = format!("lib_ab12ef.{}", fd.name);
+        }
+    }
+    let new: BTreeMap<String, lex_ast::FnDecl> = stages
+        .iter()
+        .filter_map(|st| match st {
+            lex_ast::Stage::FnDecl(fd) => Some((fd.name.clone(), fd.clone())),
+            _ => None,
+        })
+        .collect();
+    let et: BTreeMap<String, lex_ast::TypeDecl> = BTreeMap::new();
+    let diff = lex_vcs::compute_diff_with_types(&BTreeMap::new(), &new, &et, &et, true);
+    // Every stage's prefix maps to the one source file — the `in_file` a real
+    // single-file `lex publish <dir>` records.
+    let mut module_prefixes = BTreeMap::new();
+    module_prefixes.insert("lib_ab12ef".to_string(), "src/lib.lex".to_string());
+    let head = store
+        .publish_program_with_intent(
+            DEFAULT_BRANCH,
+            &stages,
+            &diff,
+            &lex_vcs::ImportMap::new(),
+            true,
+            None,
+            None,
+            &module_prefixes,
+        )
+        .expect("publish")
+        .head_op
+        .expect("head op");
+
+    let rec = module_record_at_op(&store, &head).expect("single-file dep must resolve, not bail");
+    match rec {
+        Ty::Record(fs) => {
+            // De-mangled to the bare public name the dependent writes.
+            assert!(fs.contains_key("gcd"), "expected bare `gcd`, got {:?}", fs.keys().collect::<Vec<_>>());
+        }
+        other => panic!("expected a record, got {other:?}"),
+    }
+}
+
 /// The extracted record is usable end to end: a dependent that imports this
 /// package and calls `nt.gcd` type-checks against the resolved signatures,
 /// without the dependency's bodies present.
