@@ -36,6 +36,7 @@ pub mod handlers;
 mod branches_http;
 pub mod review_http;
 mod sync_http;
+mod issues_http;
 mod publish_examples;
 mod web;
 pub mod mcp;

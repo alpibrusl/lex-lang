@@ -411,6 +411,14 @@ fn route(
         (Method::Post, "/v1/issues/batch") => crate::sync_http::issues_batch_handler(state, body),
         (Method::Post, "/v1/issues/fetch") => crate::sync_http::issues_fetch_handler(state, body),
         (Method::Get, "/v1/issues/list") => crate::sync_http::issues_list_handler(state),
+        // #949 phase 3: derived issue/project state, computed from the log —
+        // a board is a view, nobody drags cards. The `/list` literal above
+        // wins over the `/v1/issues/<id>` prefix arm below.
+        (Method::Get, "/v1/issues") => crate::issues_http::issues_state_handler(state),
+        (Method::Get, "/v1/projects") => crate::issues_http::projects_handler(state),
+        (Method::Get, p) if p.starts_with("/v1/issues/") => {
+            crate::issues_http::issue_detail_handler(state, &p["/v1/issues/".len()..])
+        }
         // ---- #839 follow-up: branch management over HTTP so a remote
         // client can create/switch branches (and thus drive the merge
         // gates end to end), not just probe heads.
