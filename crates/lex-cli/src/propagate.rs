@@ -37,6 +37,10 @@ pub fn cmd_propagate(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let mut from: Option<String> = None;
     let mut to: Option<String> = None;
     let mut registry: Option<String> = None;
+    // Hosted fan-out: discover dependents from the hub's /v1/dependents index
+    // and materialize each into --out for the rewrite.
+    let mut hosted = false;
+    let mut out: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -53,6 +57,8 @@ pub fn cmd_propagate(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                 i += 2;
             }
             "--workspace" => { workspace = args.get(i + 1).map(PathBuf::from); i += 2; }
+            "--hosted" => { hosted = true; i += 1; }
+            "--out" => { out = args.get(i + 1).map(PathBuf::from); i += 2; }
             "--apply" => { apply = true; i += 1; }
             "--symbol" => { symbol = args.get(i + 1).cloned(); i += 2; }
             "--note" => { note = args.get(i + 1).cloned(); i += 2; }
@@ -82,9 +88,9 @@ pub fn cmd_propagate(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             bail!("--from/--to derive mechanical renames; not compatible with --symbol");
         }
         let (from, to) = (from.unwrap(), to.unwrap_or_default());
-        let registry = registry
+        let reg = registry.as_deref()
             .ok_or_else(|| anyhow!("--from/--to need --registry <host/tenant[/store]> to fetch the API diff"))?;
-        let diff = fetch_api_diff(&registry, &package, &from, &to)?;
+        let diff = fetch_api_diff(reg, &package, &from, &to)?;
         for r in &diff.renames {
             renames.push((r.old.clone(), r.new.clone()));
         }
@@ -101,9 +107,19 @@ pub fn cmd_propagate(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         }
     }
 
-    // The dependent packages to migrate: each package dir under --workspace
-    // that depends on `package`, or just the current package.
-    let targets = discover_targets(workspace.as_deref(), &package)?;
+    // The dependent packages to migrate. `--hosted` discovers them from the
+    // hub's cross-store /v1/dependents index and fetches each one's public
+    // source into --out; otherwise they're local dirs under --workspace (or
+    // the current package).
+    let targets = if hosted {
+        let registry = registry.as_deref()
+            .ok_or_else(|| anyhow!("--hosted needs --registry <host/tenant[/store]> to reach the hub"))?;
+        let out = out.clone()
+            .ok_or_else(|| anyhow!("--hosted needs --out <dir> to materialize the dependents' source"))?;
+        fetch_hosted_targets(registry, &package, &out)?
+    } else {
+        discover_targets(workspace.as_deref(), &package)?
+    };
     if targets.is_empty() {
         bail!("no dependent packages found for `{package}`\
                {}", workspace.as_ref().map(|w| format!(" under {}", w.display())).unwrap_or_default());
@@ -249,6 +265,59 @@ fn fetch_api_diff(registry: &str, package: &str, from: &str, to: &str) -> Result
         detail: v.get("detail").and_then(|d| d.as_str()).unwrap_or("").to_string(),
         renames,
     })
+}
+
+/// The hub origin (`https://host`) from a tenant-qualified registry
+/// (`host/tenant[/store]`, scheme optional).
+fn hub_origin(registry: &str) -> Result<String> {
+    let trimmed = registry.trim().trim_end_matches('/');
+    let (scheme, rest) = trimmed.split_once("://").unwrap_or(("https", trimmed));
+    let host = rest.split('/').next().filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("registry `{registry}` has no host"))?;
+    Ok(format!("{scheme}://{host}"))
+}
+
+/// Discover the hosted dependents of `package` from the hub's cross-store
+/// `/v1/dependents` index (#893), fetch each one's public source archive into
+/// `out/<name>/`, and return them as rewrite targets. This is what makes
+/// propagation fan out across *hosted* packages, not just a local workspace.
+fn fetch_hosted_targets(registry: &str, package: &str, out: &Path) -> Result<Vec<Target>> {
+    let hub = hub_origin(registry)?;
+    let url = format!("{hub}/v1/dependents?of={package}");
+    let body = ureq::get(&url).call()
+        .map_err(|e| anyhow!("GET {url}: {e}"))?
+        .into_body().read_to_string()
+        .map_err(|e| anyhow!("reading dependents: {e}"))?;
+    let v: serde_json::Value = serde_json::from_str(&body)
+        .with_context(|| format!("parsing dependents from {url}"))?;
+    let deps = v.get("dependents").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+
+    let mut targets = Vec::new();
+    for d in &deps {
+        let (Some(tenant), Some(name), Some(version)) = (
+            d.get("tenant").and_then(|x| x.as_str()),
+            d.get("name").and_then(|x| x.as_str()),
+            d.get("version").and_then(|x| x.as_str()),
+        ) else { continue };
+        let store = d.get("store").and_then(|x| x.as_str());
+
+        // Fetch the dependent's public source archive and unpack it.
+        let mut archive_url = format!("{hub}/v1/public/{tenant}/{name}/{version}/archive");
+        if let Some(s) = store { archive_url.push_str(&format!("?store={s}")); }
+        let bytes = ureq::get(&archive_url).call()
+            .map_err(|e| anyhow!("GET {archive_url}: {e}"))?
+            .into_body().read_to_vec()
+            .map_err(|e| anyhow!("reading archive for {name}: {e}"))?;
+        let dir = out.join(name);
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let gz = flate2::read::GzDecoder::new(std::io::Cursor::new(&bytes));
+        tar::Archive::new(gz).unpack(&dir)
+            .with_context(|| format!("unpacking archive for {name}"))?;
+
+        let aliases = aliases_for_package(&dir, package)?;
+        targets.push(Target { dir, aliases });
+    }
+    Ok(targets)
 }
 
 // ── Part b: mechanical rename propagation ───────────────────────────────────
