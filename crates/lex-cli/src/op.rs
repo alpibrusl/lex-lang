@@ -18,7 +18,10 @@ use std::path::PathBuf;
 /// auth hint never fired; batch-rejection bodies were never surfaced).
 /// Turning `http_status_as_error` off returns `Ok(resp)` for error statuses
 /// so those handlers run.
-fn with_auth<B>(req: ureq::RequestBuilder<B>, token: Option<&str>) -> ureq::RequestBuilder<B> {
+pub(crate) fn with_auth<B>(
+    req: ureq::RequestBuilder<B>,
+    token: Option<&str>,
+) -> ureq::RequestBuilder<B> {
     let req = req.config().http_status_as_error(false).build();
     match token {
         Some(t) => req.header("Authorization", &format!("Bearer {t}")),
@@ -27,7 +30,7 @@ fn with_auth<B>(req: ureq::RequestBuilder<B>, token: Option<&str>) -> ureq::Requ
 }
 
 /// Resolve the Bearer token: `--token` flag > `LEXHUB_TOKEN` env var > None.
-fn resolve_token(flag: Option<String>) -> Option<String> {
+pub(crate) fn resolve_token(flag: Option<String>) -> Option<String> {
     flag.or_else(|| std::env::var("LEXHUB_TOKEN").ok().filter(|s| !s.is_empty()))
 }
 

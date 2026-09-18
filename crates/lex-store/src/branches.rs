@@ -186,6 +186,12 @@ impl Store {
             let path = entry.path();
             if path.extension().is_some_and(|e| e == "json") {
                 if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
+                    // `branches/` also holds each branch's persisted head
+                    // snapshot (`<branch>.head_snapshot.json`, see
+                    // `save_head_snapshot`); its stem is not a branch name and
+                    // its JSON is a SigId→StageId map, not a `Branch` — listing
+                    // it would make `get_branch` fail on a phantom branch.
+                    if name.ends_with(".head_snapshot") { continue; }
                     if name != DEFAULT_BRANCH { out.push(name.to_string()); }
                 }
             }

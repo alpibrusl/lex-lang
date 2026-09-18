@@ -666,6 +666,7 @@ pub(super) fn cmd_attest_push(fmt: &OutputFormat, args: &[String]) -> Result<()>
     let (root, rest, _, _) = parse_store_flag(args);
     let mut remote: Option<String> = None;
     let mut since_op: Option<String> = None;
+    let mut token: Option<String> = None;
     let mut dry_run = false;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
@@ -677,6 +678,13 @@ pub(super) fn cmd_attest_push(fmt: &OutputFormat, args: &[String]) -> Result<()>
                         .clone(),
                 );
             }
+            "--token" => {
+                token = Some(
+                    it.next()
+                        .ok_or_else(|| anyhow!("--token needs a value"))?
+                        .clone(),
+                );
+            }
             "--dry-run" => dry_run = true,
             other if !other.starts_with("--") && remote.is_none() => {
                 remote = Some(other.to_string());
@@ -685,8 +693,13 @@ pub(super) fn cmd_attest_push(fmt: &OutputFormat, args: &[String]) -> Result<()>
         }
     }
     let remote = remote.ok_or_else(|| {
-        anyhow!("usage: lex attest push <remote_url> [--since-op OP_ID] [--dry-run] [--store DIR]")
+        anyhow!(
+            "usage: lex attest push <remote_url> [--since-op OP_ID] [--token TOKEN] \
+             [--dry-run] [--store DIR]"
+        )
     })?;
+    // Same precedence as `lex op push`: `--token` > `LEXHUB_TOKEN` > anon.
+    let token = crate::op::resolve_token(token);
 
     let store = lex_store::Store::open(&root)
         .with_context(|| format!("opening store at {}", root.display()))?;
@@ -748,11 +761,17 @@ pub(super) fn cmd_attest_push(fmt: &OutputFormat, args: &[String]) -> Result<()>
 
     let url = format!("{}/v1/attestations/batch", remote.trim_end_matches('/'));
     let body = serde_json::to_string(&to_send).map_err(|e| anyhow!("serializing batch: {e}"))?;
-    let resp = ureq::post(&url)
+    let resp = crate::op::with_auth(ureq::post(&url), token.as_deref())
         .header("Content-Type", "application/json")
         .send(body)
         .map_err(|e| anyhow!("POST {url}: {e}"))?;
     let status = resp.status().as_u16();
+    if status == 401 {
+        bail!(
+            "POST {url}: HTTP 401 unauthorized — pass --token or set LEXHUB_TOKEN \
+             (a tenant JWT or a store-scoped evk_ key)"
+        );
+    }
     let resp_body: serde_json::Value = resp
         .into_body()
         .read_json()
@@ -803,6 +822,7 @@ pub(super) fn cmd_attest_pull(fmt: &OutputFormat, args: &[String]) -> Result<()>
     let mut remote: Option<String> = None;
     let mut since_op: Option<String> = None;
     let mut limit: Option<usize> = None;
+    let mut token: Option<String> = None;
     let mut dry_run = false;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
@@ -811,6 +831,13 @@ pub(super) fn cmd_attest_pull(fmt: &OutputFormat, args: &[String]) -> Result<()>
                 since_op = Some(
                     it.next()
                         .ok_or_else(|| anyhow!("--since-op needs an op_id"))?
+                        .clone(),
+                );
+            }
+            "--token" => {
+                token = Some(
+                    it.next()
+                        .ok_or_else(|| anyhow!("--token needs a value"))?
                         .clone(),
                 );
             }
@@ -830,8 +857,10 @@ pub(super) fn cmd_attest_pull(fmt: &OutputFormat, args: &[String]) -> Result<()>
         }
     }
     let remote = remote.ok_or_else(|| anyhow!(
-        "usage: lex attest pull <remote_url> [--since-op OP_ID] [--limit N] [--dry-run] [--store DIR]"
+        "usage: lex attest pull <remote_url> [--since-op OP_ID] [--limit N] [--token TOKEN] \
+         [--dry-run] [--store DIR]"
     ))?;
+    let token = crate::op::resolve_token(token);
 
     let mut url = format!("{}/v1/attestations/since", remote.trim_end_matches('/'),);
     let mut sep = '?';
@@ -842,10 +871,16 @@ pub(super) fn cmd_attest_pull(fmt: &OutputFormat, args: &[String]) -> Result<()>
     if let Some(n) = limit {
         url.push_str(&format!("{sep}limit={n}"));
     }
-    let resp = ureq::get(&url)
+    let resp = crate::op::with_auth(ureq::get(&url), token.as_deref())
         .call()
         .map_err(|e| anyhow!("GET {url}: {e}"))?;
     let status = resp.status().as_u16();
+    if status == 401 {
+        bail!(
+            "GET {url}: HTTP 401 unauthorized — pass --token or set LEXHUB_TOKEN \
+             (a tenant JWT or a store-scoped evk_ key)"
+        );
+    }
     if status >= 400 {
         let body = resp
             .into_body()
