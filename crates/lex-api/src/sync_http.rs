@@ -97,6 +97,66 @@ pub(crate) fn intents_fetch_handler(state: &State, body: &str) -> Response<Curso
     json_response(200, &serde_json::json!({ "intents": intents }))
 }
 
+/// `POST /v1/locks/batch` — receive committed lockfiles. Body: a JSON array
+/// of `{ "head_op": "<op>", "lock": "<toml>" }`. Each binds the lock to its
+/// package head (content-addressed + idempotent, via `set_committed_lock`).
+/// The committed lock pins the exact dependency versions and op-log heads a
+/// head was built against (#930), so the write-time gate can resolve this
+/// head's dependencies instead of requiring them inlined.
+pub(crate) fn locks_batch_handler(state: &State, body: &str) -> Response<Cursor<Vec<u8>>> {
+    let v: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return error_response(400, format!("body must be JSON: {e}")),
+    };
+    let entries = match v.as_array() {
+        Some(a) => a,
+        None => return error_response(400, "body must be a JSON array of {head_op, lock}"),
+    };
+    let store = state.store.lock().unwrap();
+    let mut added = 0usize;
+    for e in entries {
+        let head_op = match e.get("head_op").and_then(|x| x.as_str()) {
+            Some(h) => h,
+            None => return error_response(400, "each entry needs a string `head_op`"),
+        };
+        let lock = match e.get("lock").and_then(|x| x.as_str()) {
+            Some(l) => l,
+            None => return error_response(400, "each entry needs a string `lock`"),
+        };
+        if let Err(err) = store.set_committed_lock(head_op, lock) {
+            return error_response(500, format!("store lock for {head_op}: {err}"));
+        }
+        added += 1;
+    }
+    json_response(200, &serde_json::json!({ "received": entries.len(), "added": added }))
+}
+
+/// `POST /v1/locks/fetch` — return committed lockfiles for a set of head ops.
+/// Body: `{ "head_ops": [...] }`. Returns `{ "locks": { head_op: toml } }`
+/// for those present; a head with no committed lock is silently omitted.
+pub(crate) fn locks_fetch_handler(state: &State, body: &str) -> Response<Cursor<Vec<u8>>> {
+    let v: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return error_response(400, format!("body must be JSON: {e}")),
+    };
+    let ids = match v.get("head_ops").and_then(|i| i.as_array()) {
+        Some(a) => a,
+        None => return error_response(400, "missing array field `head_ops`"),
+    };
+    let store = state.store.lock().unwrap();
+    let mut locks = serde_json::Map::new();
+    for id in ids.iter().filter_map(|x| x.as_str()) {
+        match store.committed_lock(id) {
+            Ok(Some(toml)) => {
+                locks.insert(id.to_string(), serde_json::Value::String(toml));
+            }
+            Ok(None) => {}
+            Err(e) => return error_response(500, format!("read lock {id}: {e}")),
+        }
+    }
+    json_response(200, &serde_json::json!({ "locks": locks }))
+}
+
 /// Parse a `{ "ids": [...] }` body into a `Vec<String>`.
 fn parse_ids(body: &str) -> Result<Vec<String>, Response<Cursor<Vec<u8>>>> {
     let v: serde_json::Value = serde_json::from_str(body)

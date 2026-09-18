@@ -402,6 +402,10 @@ fn route(
         (Method::Post, "/v1/stages/fetch") => crate::sync_http::stages_fetch_handler(state, body),
         (Method::Post, "/v1/intents/batch") => crate::sync_http::intents_batch_handler(state, body),
         (Method::Post, "/v1/intents/fetch") => crate::sync_http::intents_fetch_handler(state, body),
+        // #930 P2b-1: committed lockfiles travel with the package so the
+        // write-time gate can resolve a head's pinned dependencies.
+        (Method::Post, "/v1/locks/batch") => crate::sync_http::locks_batch_handler(state, body),
+        (Method::Post, "/v1/locks/fetch") => crate::sync_http::locks_fetch_handler(state, body),
         // ---- #839 follow-up: branch management over HTTP so a remote
         // client can create/switch branches (and thus drive the merge
         // gates end to end), not just probe heads.

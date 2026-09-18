@@ -411,6 +411,36 @@ impl Store {
         }
     }
 
+    /// Blob-ref namespace for committed lockfiles (#930 phase 2b-1).
+    const LOCK_NS: &'static str = "lock";
+
+    /// Record the `lex.lock` committed with the package head `head_op` — the
+    /// exact dependency versions and op-log heads that head was built and
+    /// type-checks against (#930 phase 2b-1: "HEAD + its committed lex.lock
+    /// always type-checks"). Content-addressed via [`Self::put_blob`] and
+    /// bound under the `lock` namespace keyed by the head op, so it is
+    /// idempotent (a re-push converges) and travels with the package through
+    /// the same object-sync path as stages and intents. Keyed by head op
+    /// rather than by branch so re-verifying a *historical* head resolves it
+    /// against the lock that head actually committed, not whatever the branch
+    /// points at now.
+    pub fn set_committed_lock(&self, head_op: &str, lock_toml: &str) -> Result<(), StoreError> {
+        let sha = self.put_blob(lock_toml)?;
+        self.set_blob_ref(Self::LOCK_NS, head_op, &sha)
+    }
+
+    /// The `lex.lock` committed with `head_op`, or `None` when the head
+    /// carries no committed lock — a dependency-free package, or one
+    /// published before locks were committed (the write-time gate then has no
+    /// registry/git dependencies to resolve, exactly as today).
+    pub fn committed_lock(&self, head_op: &str) -> Result<Option<String>, StoreError> {
+        match self.get_blob_ref(Self::LOCK_NS, head_op) {
+            Ok(sha) => Ok(Some(self.get_blob(&sha)?)),
+            Err(StoreError::UnknownBlobRef { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// All `key → sha` bindings in a namespace (e.g. every artifact in a
     /// sprint). Empty map if the namespace has no bindings yet.
     pub fn list_blob_refs(
