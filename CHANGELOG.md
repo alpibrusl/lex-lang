@@ -5,6 +5,19 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [0.11.46] - 2026-09-18
+
+### Fixed
+
+- **`module_record_at_op` resolves single-file packages that record an
+  `in_file` (#930).** The write-time gate's dependency signature extraction
+  treated any head whose every stage carries an `in_file` as multi-module and
+  bailed — but a single-file package published via `lex publish <dir>` records
+  one too, so the hub's cross-store resolver failed on real single-file
+  dependencies (e.g. lex-nt's `src/lib.lex`), leaving the dependent's head
+  with an `unknown_identifier` type-check failure. It now keys off the count
+  of distinct source files.
+
 ## [0.11.45] - 2026-09-18
 
 ### Changed
