@@ -90,6 +90,35 @@ pub fn render_source(store: &Store, head: &PackageHead) -> Result<RenderedSource
 /// first, then the head stages read per-SigId (so structurally identical
 /// stages that share a StageId keep their distinct names).
 fn render_singlefile(store: &Store, head: &PackageHead) -> Result<String, StoreError> {
+    let pairs: Vec<(String, String)> = head.map.iter().map(|(s, st)| (s.clone(), st.clone())).collect();
+    let mut decls: Vec<lex_ast::Stage> = Vec::new();
+    for ast in store.get_asts_for_sigs_bulk(&pairs) {
+        decls.push(ast?);
+    }
+    // De-mangle: a single-module head still carries mangle prefixes (the
+    // package loader mangles every declaration, and an inlined dependency
+    // adds its own). With one module, everything belongs to this package's
+    // namespace, so strip every mangle prefix to a bare name — otherwise the
+    // rendered source has invalid dotted declarations (#930). FileRewrite with
+    // an empty `prefix_to_file` and the shared own-prefix does exactly this
+    // (own prefix stripped directly; any other mangle prefix via the inlined
+    // fallback in `rename`).
+    let own_prefix = decls.iter().find_map(stage_prefix).unwrap_or_default();
+    let mut bound_locals = BTreeSet::new();
+    for s in &decls {
+        collect_bound_locals(s, &mut bound_locals);
+    }
+    let mut rw = FileRewrite {
+        own_prefix: &own_prefix,
+        own_file: "",
+        prefix_to_file: &BTreeMap::new(),
+        bound_locals: &bound_locals,
+        local_imports: BTreeMap::new(),
+    };
+    for s in &mut decls {
+        rw.rewrite_stage(s);
+    }
+
     let mut stages: Vec<lex_ast::Stage> = Vec::new();
     for (reference, alias) in &head.flat_imports {
         stages.push(lex_ast::Stage::Import(lex_ast::Import {
@@ -97,10 +126,7 @@ fn render_singlefile(store: &Store, head: &PackageHead) -> Result<String, StoreE
             alias: alias.clone(),
         }));
     }
-    let pairs: Vec<(String, String)> = head.map.iter().map(|(s, st)| (s.clone(), st.clone())).collect();
-    for ast in store.get_asts_for_sigs_bulk(&pairs) {
-        stages.push(ast?);
-    }
+    stages.extend(decls);
     Ok(lex_ast::print_stages(&stages))
 }
 
