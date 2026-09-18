@@ -103,14 +103,36 @@ pub fn render_source(store: &Store, head: &PackageHead) -> Result<RenderedSource
 /// resolving a dependency that itself has registry/git dependencies is the
 /// recursive extension that follows.
 pub fn module_record_at_op(store: &Store, head_op: &str) -> Result<lex_types::Ty, StoreError> {
+    let stages = demangled_head_stages(store, head_op)?;
+    let types = lex_types::check_program(&stages).map_err(StoreError::TypeError)?;
+    // Every top-level function is part of the module's callable surface.
+    let fields = types
+        .fn_signatures
+        .iter()
+        .map(|(name, scheme)| (name.clone(), scheme.ty.clone()));
+    Ok(lex_types::module_record_from_fields(fields))
+}
+
+/// A single-file package head as a *de-mangled* canonical program: the
+/// head's (stdlib) imports followed by its declarations under bare names —
+/// `gcd`, not `lib_<hash>.gcd`. This is the program a dependent's author
+/// sees, so it's the common substrate for everything that reasons about a
+/// head at the source level: extracting a dependency's public surface
+/// ([`module_record_at_op`]) and evaluating a typed issue's acceptance
+/// against it (`crate::issues`, #949).
+///
+/// "Multi-module" means the head spans MORE THAN ONE source file — then
+/// per-module de-mangling at the stage level isn't wired up yet (#942) and
+/// this returns [`StoreError::UnsupportedMultiModuleDependency`]. A
+/// single-file package still records an `in_file` for every stage when
+/// published via `lex publish <dir>` (so it renders to `src/<file>.lex`), but
+/// its whole surface is that one module; count distinct files rather than
+/// "every stage has a file", which misclassified that case.
+pub(crate) fn demangled_head_stages(
+    store: &Store,
+    head_op: &str,
+) -> Result<Vec<lex_ast::Stage>, StoreError> {
     let head = package_head_at_op(store, head_op)?;
-    // "Multi-module" here means the head spans MORE THAN ONE source file — then
-    // extracting one module's surface needs picking the imported module's file,
-    // which isn't wired up yet. A single-file package still records an `in_file`
-    // for every stage when published via `lex publish <dir>` (so it renders to
-    // `src/<file>.lex`), but its whole surface is that one module and resolves
-    // fine through the single-file path below. Count distinct files rather than
-    // "every stage has a file", which misclassified the single-file case.
     let distinct_files: BTreeSet<&String> = head.sig_files.values().collect();
     if distinct_files.len() > 1 {
         return Err(StoreError::UnsupportedMultiModuleDependency);
@@ -121,9 +143,7 @@ pub fn module_record_at_op(store: &Store, head_op: &str) -> Result<lex_types::Ty
     for ast in store.get_asts_for_sigs_bulk(&pairs) {
         decls.push(ast?);
     }
-    // De-mangle to bare names exactly as `render_singlefile` does, so the
-    // record's field names are the public names a dependent writes
-    // (`nt.gcd`), not the mangled `lib_<hash>.gcd`.
+    // De-mangle exactly as `render_singlefile` does.
     let own_prefix = decls.iter().find_map(stage_prefix).unwrap_or_default();
     let mut bound_locals = BTreeSet::new();
     for s in &decls {
@@ -139,8 +159,6 @@ pub fn module_record_at_op(store: &Store, head_op: &str) -> Result<lex_types::Ty
     for s in &mut decls {
         rw.rewrite_stage(s);
     }
-    // A checkable program: the head's (stdlib) imports, then the de-mangled
-    // declarations. A leaf dependency type-checks here on its own.
     let mut stages: Vec<lex_ast::Stage> = Vec::new();
     for (reference, alias) in &head.flat_imports {
         stages.push(lex_ast::Stage::Import(lex_ast::Import {
@@ -149,13 +167,7 @@ pub fn module_record_at_op(store: &Store, head_op: &str) -> Result<lex_types::Ty
         }));
     }
     stages.extend(decls);
-    let types = lex_types::check_program(&stages).map_err(StoreError::TypeError)?;
-    // Every top-level function is part of the module's callable surface.
-    let fields = types
-        .fn_signatures
-        .iter()
-        .map(|(name, scheme)| (name.clone(), scheme.ty.clone()));
-    Ok(lex_types::module_record_from_fields(fields))
+    Ok(stages)
 }
 
 /// The whole head as one source string (single module / #895 path). Imports

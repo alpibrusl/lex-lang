@@ -172,7 +172,7 @@ fn cmd_issue() -> CommandInfo {
          done is a proof the gate verifies at HEAD, not a status someone sets",
     )
     .idempotent(true)
-    .add_argument("subcommand", "enum[create|list|show]", "what to do", true)
+    .add_argument("subcommand", "enum[create|list|show|verify]", "what to do", true)
     .with_examples(vec![
         (
             "Declare a feature as a typed delta (API entry + example)",
@@ -191,6 +191,10 @@ fn cmd_issue() -> CommandInfo {
         ),
         ("List issues", "lex issue list"),
         ("Show one as JSON", "lex issue show <id>"),
+        (
+            "Verify an issue at the branch head — done is a proof the gate records, not a status",
+            "lex issue verify <id>",
+        ),
     ])
 }
 

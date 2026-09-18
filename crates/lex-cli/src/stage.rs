@@ -82,6 +82,9 @@ pub(super) fn cmd_stage(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                     lex_vcs::AttestationKind::Review { reviewer, verdict, .. } => {
                         format!("Review({reviewer}:{verdict:?})")
                     }
+                    lex_vcs::AttestationKind::IssueVerified { issue_id, shape } => {
+                        format!("IssueVerified({shape}, {issue_id:.12}…)")
+                    }
                     lex_vcs::AttestationKind::Trace {
                         run_id,
                         root_target,

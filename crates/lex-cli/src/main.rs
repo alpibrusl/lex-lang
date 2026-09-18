@@ -257,6 +257,9 @@ fn print_usage() {
     println!("                                     a typed issue: work with a declared, verifiable acceptance");
     println!("  issue list [--store DIR]           list issues (id, shape, title)");
     println!("  issue show <id> [--store DIR]      print an issue as JSON");
+    println!("  issue verify <id> [--at OP] [--store DIR]");
+    println!("                                     evaluate its acceptance at a head (default: branch head)");
+    println!("                                     and record the verdict; exit 1 if the oracle fails");
     println!("  propagate --package <p> --rename <old>=<new> [--workspace <d>] [--apply]");
     println!("                                     push an upstream API change down its dependents");
     println!("  run [policy] <file> <fn> [args]    execute fn (args parsed as JSON)");

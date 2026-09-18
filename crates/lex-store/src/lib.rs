@@ -29,6 +29,7 @@ mod budget;
 mod planner;
 mod store;
 pub mod render;
+pub mod issues;
 pub mod api;
 mod model;
 mod branches;

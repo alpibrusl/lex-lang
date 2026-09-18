@@ -71,6 +71,11 @@ pub enum StoreError {
     /// failure.
     #[error("multi-module dependency resolution is not yet supported")]
     UnsupportedMultiModuleDependency,
+    /// A typed issue's example targets a function that isn't declared at
+    /// the head being evaluated (#949) — the example cannot be attached, so
+    /// the issue cannot be judged there.
+    #[error("issue example targets `{0}`, which is not declared at this head")]
+    IssueTarget(String),
     /// The op was persisted but a `required_attestations` rule in
     /// `policy.json` (#245) refused to advance the branch head past
     /// it. The op record is durable — re-running with the missing

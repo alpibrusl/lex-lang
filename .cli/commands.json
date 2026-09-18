@@ -1708,7 +1708,7 @@
       "arguments": [
         {
           "name": "subcommand",
-          "type": "enum[create|list|show]",
+          "type": "enum[create|list|show|verify]",
           "description": "what to do",
           "required": true
         }
@@ -1736,6 +1736,10 @@
         {
           "description": "Show one as JSON",
           "invocation": "lex issue show <id>"
+        },
+        {
+          "description": "Verify an issue at the branch head — done is a proof the gate records, not a status",
+          "invocation": "lex issue verify <id>"
         }
       ]
     },
