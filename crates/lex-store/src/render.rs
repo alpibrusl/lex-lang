@@ -86,6 +86,74 @@ pub fn render_source(store: &Store, head: &PackageHead) -> Result<RenderedSource
     }
 }
 
+/// Extract a single-module package head's public function signatures as a
+/// module record type — what the write-time gate hands to
+/// [`lex_types::check_program_with_modules`] when it resolves a dependency
+/// (#930 phase 2b). The dependency's op-log head is reconstructed,
+/// de-mangled to bare names (reusing the same [`FileRewrite`] the single-file
+/// renderer applies), and type-checked; each top-level function signature
+/// becomes a field of the returned [`lex_types::Ty::Record`].
+///
+/// Only single-module dependencies are supported for now — a multi-module
+/// head (every stage carries an `in_file`) returns
+/// [`StoreError::UnsupportedMultiModuleDependency`] rather than silently
+/// resolving the wrong surface; picking the imported module's file out of the
+/// de-flattened tree is a later extension. The dependency must also
+/// type-check on its own (a *leaf* — no unresolved dependencies of its own);
+/// resolving a dependency that itself has registry/git dependencies is the
+/// recursive extension that follows.
+pub fn module_record_at_op(store: &Store, head_op: &str) -> Result<lex_types::Ty, StoreError> {
+    let head = package_head_at_op(store, head_op)?;
+    // A multi-module head records an `in_file` for every stage (same test the
+    // renderer uses to choose its path). Per-module extraction isn't wired up
+    // yet, so surface a typed "cannot resolve here" instead of guessing.
+    let multi = !head.map.is_empty() && head.map.keys().all(|s| head.sig_files.contains_key(s));
+    if multi {
+        return Err(StoreError::UnsupportedMultiModuleDependency);
+    }
+    let pairs: Vec<(String, String)> =
+        head.map.iter().map(|(s, st)| (s.clone(), st.clone())).collect();
+    let mut decls: Vec<lex_ast::Stage> = Vec::new();
+    for ast in store.get_asts_for_sigs_bulk(&pairs) {
+        decls.push(ast?);
+    }
+    // De-mangle to bare names exactly as `render_singlefile` does, so the
+    // record's field names are the public names a dependent writes
+    // (`nt.gcd`), not the mangled `lib_<hash>.gcd`.
+    let own_prefix = decls.iter().find_map(stage_prefix).unwrap_or_default();
+    let mut bound_locals = BTreeSet::new();
+    for s in &decls {
+        collect_bound_locals(s, &mut bound_locals);
+    }
+    let mut rw = FileRewrite {
+        own_prefix: &own_prefix,
+        own_file: "",
+        prefix_to_file: &BTreeMap::new(),
+        bound_locals: &bound_locals,
+        local_imports: BTreeMap::new(),
+    };
+    for s in &mut decls {
+        rw.rewrite_stage(s);
+    }
+    // A checkable program: the head's (stdlib) imports, then the de-mangled
+    // declarations. A leaf dependency type-checks here on its own.
+    let mut stages: Vec<lex_ast::Stage> = Vec::new();
+    for (reference, alias) in &head.flat_imports {
+        stages.push(lex_ast::Stage::Import(lex_ast::Import {
+            reference: reference.clone(),
+            alias: alias.clone(),
+        }));
+    }
+    stages.extend(decls);
+    let types = lex_types::check_program(&stages).map_err(StoreError::TypeError)?;
+    // Every top-level function is part of the module's callable surface.
+    let fields = types
+        .fn_signatures
+        .iter()
+        .map(|(name, scheme)| (name.clone(), scheme.ty.clone()));
+    Ok(lex_types::module_record_from_fields(fields))
+}
+
 /// The whole head as one source string (single module / #895 path). Imports
 /// first, then the head stages read per-SigId (so structurally identical
 /// stages that share a StageId keep their distinct names).
