@@ -5,6 +5,28 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [0.11.50] - 2026-09-18
+
+### Added
+
+- **`lex publish --intent-issue <id>` (#949 phase 5).** Stamps the typed
+  issue a publish realizes into the recorded Intent (`Intent.issue_id`), so
+  every emitted op links back to the work item and the derived issue state
+  sees the work as in progress from provenance. Requires `--intent-prompt`
+  like the other intent flags; the link is part of the intent's identity.
+- **`lex issue create` / `lex issue verify` honor `--output json`**
+  (`{issue_id, shape, title, project}` / `{issue_id, verdict, detail,
+  head_op, attestation_id}`), so harnesses (lex-loom #521, lex-code #173)
+  parse them. Text output unchanged; verify still exits 1 on a failed
+  verdict.
+
+### Fixed
+
+- **`POST /v1/issues/batch` validates ids.** An issue whose `issue_id` is
+  not the hash of its content is refused (400) and the whole batch is left
+  unfiled; the log is keyed by id and idempotent on re-puts, so a bad
+  record could have squatted on a real issue's id.
+
 ## [0.11.49] - 2026-09-18
 
 ### Fixed
