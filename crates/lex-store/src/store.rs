@@ -2307,9 +2307,28 @@ impl Store {
         // Reconstruct the program at the new head and re-check it.
         let head = self.branch_head(branch)?;
         let pairs: Vec<(String, String)> = head.into_iter().collect();
-        let stages: Vec<Stage> =
+        let decls: Vec<Stage> =
             self.get_asts_for_sigs_bulk(&pairs).into_iter().collect::<Result<_, _>>()?;
-        let checked_stages = stages.len();
+        let checked_stages = decls.len();
+        // #930: the SigId→stage map holds only fn/type declarations — the
+        // head's `import` edges are AddImport ops, absent here. Reconstruct
+        // them so a non-inlined head's `<alias>.name` references bind: the
+        // resolver scans these imports to resolve each dependency, and the
+        // checker's Pass 1 binds the alias to the resolved module. (Without
+        // this the alias is unbound and the head fails as `unknown_identifier`,
+        // even with the dependency correctly resolved.)
+        let head_imports = crate::render::package_head_at_op(self, to_head)
+            .map(|ph| {
+                ph.flat_imports
+                    .into_iter()
+                    .map(|(reference, alias)| {
+                        Stage::Import(lex_ast::Import { reference, alias })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut stages = head_imports;
+        stages.extend(decls);
         // #930: the hub gate resolves this head's external dependencies from
         // the lock committed with `to_head` (via the installed cross-store
         // resolver); empty when none is installed or the head is inlined.
