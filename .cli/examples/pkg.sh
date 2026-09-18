@@ -13,6 +13,9 @@ lex pkg install --ignore-lex-floor
 # Add a path dep
 lex pkg add mylib --path ../mylib
 
+# Cut a versioned release (name/version/deps from lex.toml)
+LEXHUB_TOKEN=evk_… lex pkg release https://vcs.lexlang.org
+
 # Publish with a contract whose grant is derived from the code's effects
 lex pkg publish --sign <key> --derive-grant --contract-out c.json --archive-out pkg.tar
 

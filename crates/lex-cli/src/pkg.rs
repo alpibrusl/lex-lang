@@ -13,6 +13,10 @@
 //!   lex pkg update                                     — re-resolve every registry dep to
 //!                                                        the highest match and relock
 //!   lex pkg list                                       — list dependencies in lex.toml
+//!   lex pkg release <hub-url> [--version V] [--branch B] [--token TOK]
+//!                                                      — cut an immutable versioned release of
+//!                                                        the hosted head; version + dependency
+//!                                                        edges read from lex.toml (#893)
 //!   lex pkg publish [--registry <url>] [--token <jwt>] — publish package to a registry
 //!       [--sign <key>] [--requires <grant.json>] [--egress h,h] [--contract-out <file>]
 //!                                                      — also emit a signed capability
@@ -40,9 +44,10 @@ pub fn cmd_pkg(args: &[String]) -> Result<()> {
         Some("lock")    => cmd_lock(&args[1..], /*keep_existing=*/ true),
         Some("update")  => cmd_lock(&args[1..], /*keep_existing=*/ false),
         Some("publish") => cmd_publish(&args[1..]),
+        Some("release") => cmd_release(&args[1..]),
         Some("verify")  => cmd_verify(&args[1..]),
-        Some(other)     => bail!("unknown pkg subcommand `{other}`; try: init, add, install, lock, update, list, publish, verify"),
-        None            => bail!("usage: lex pkg <init|add|install|lock|update|list|publish|verify>"),
+        Some(other)     => bail!("unknown pkg subcommand `{other}`; try: init, add, install, lock, update, list, publish, release, verify"),
+        None            => bail!("usage: lex pkg <init|add|install|lock|update|list|publish|release|verify>"),
     }
 }
 
@@ -574,6 +579,85 @@ fn cmd_lock(args: &[String], keep_existing: bool) -> Result<()> {
         .with_context(|| format!("writing {}", lock_path.display()))?;
     println!("wrote {} ({} package(s))", lock_path.display(), lock.packages.len());
     Ok(())
+}
+
+/// `lex pkg release <hub-url> [--version V] [--branch B] [--token TOK]` —
+/// cut an immutable versioned release of the package's current hosted head
+/// (#893), reading the name, version, and dependency edges from `lex.toml`.
+///
+/// This wraps the raw `POST /v1/pkg/{name}/release` (previously hand-curled)
+/// and, crucially, auto-fills `dependencies` from the manifest's
+/// `[dependencies]` table — so the cross-store dependency graph populates
+/// itself on every release instead of relying on the releaser to restate
+/// deps. The version defaults to `[package].version`; `--version` overrides.
+/// The token (a store-scoped `evk_` key) comes from `--token` or
+/// `LEXHUB_TOKEN`. The hub applies the version-bump gate, so a too-small bump
+/// for the API change is refused here just as over HTTP.
+fn cmd_release(args: &[String]) -> Result<()> {
+    let mut hub: Option<String> = None;
+    let mut version: Option<String> = None;
+    let mut branch: Option<String> = None;
+    let mut token: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--version" => { version = args.get(i + 1).cloned(); i += 2; }
+            "--branch" => { branch = args.get(i + 1).cloned(); i += 2; }
+            "--token" => { token = args.get(i + 1).cloned(); i += 2; }
+            other if !other.starts_with("--") && hub.is_none() => { hub = Some(other.to_string()); i += 1; }
+            other => bail!("unexpected arg `{other}` (usage: lex pkg release <hub-url> [--version V] [--branch B] [--token TOK])"),
+        }
+    }
+    let hub = hub.ok_or_else(|| anyhow::anyhow!(
+        "usage: lex pkg release <hub-url> [--version V] [--branch B] [--token TOK]"))?;
+    let token = token
+        .or_else(|| std::env::var("LEXHUB_TOKEN").ok().filter(|s| !s.is_empty()))
+        .ok_or_else(|| anyhow::anyhow!("no token — pass --token or set LEXHUB_TOKEN"))?;
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    let (toml_path, _dir) = lex_syntax::find_manifest(&cwd)
+        .ok_or_else(|| anyhow::anyhow!("no lex.toml found (run inside a package)"))?;
+    let manifest = lex_syntax::Manifest::load(&toml_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let pkg = manifest.package.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("lex.toml has no [package] section"))?;
+    let name = pkg.name.clone();
+    let version = version.unwrap_or_else(|| pkg.version.clone());
+    // Dependency-graph edges: the names of declared dependencies.
+    let dependencies: Vec<String> = manifest.dependencies.keys().cloned().collect();
+
+    let url = format!("{}/v1/pkg/{}/release", hub.trim_end_matches('/'), name);
+    let body = serde_json::json!({
+        "version": version,
+        "branch": branch,
+        "dependencies": dependencies,
+    });
+    print!("releasing {name}@{version}");
+    if !dependencies.is_empty() {
+        print!(" (deps: {})", dependencies.join(", "));
+    }
+    println!(" → {url}");
+
+    // Disable ureq's "non-2xx is an error" so the status arms below run
+    // (a 409/422 carries a body we want to surface, not a transport error).
+    let resp = ureq::post(&url)
+        .config().http_status_as_error(false).build()
+        .header("Authorization", &format!("Bearer {token}"))
+        .header("Content-Type", "application/json")
+        .send(body.to_string());
+    match resp {
+        Ok(r) => {
+            let status = r.status().as_u16();
+            let text = r.into_body().read_to_string().unwrap_or_default();
+            match status {
+                200 | 201 => { println!("released: {text}"); Ok(()) }
+                409 => bail!("already released (immutable) — bump the version: {text}"),
+                422 => bail!("version-bump gate refused the release: {text}"),
+                _ => bail!("release failed (HTTP {status}): {text}"),
+            }
+        }
+        Err(ureq::Error::StatusCode(code)) => bail!("release failed (HTTP {code})"),
+        Err(e) => bail!("POST {url}: {e}"),
+    }
 }
 
 /// A dependency's identity for flat-layout conflict detection.

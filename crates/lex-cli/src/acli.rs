@@ -172,7 +172,7 @@ fn cmd_pkg() -> CommandInfo {
     .idempotent(false)
     .add_argument(
         "subcommand",
-        "enum[init|add|install|list|publish|verify]",
+        "enum[init|add|install|lock|update|list|publish|release|verify]",
         "what to do",
         true,
     )
@@ -187,6 +187,10 @@ fn cmd_pkg() -> CommandInfo {
             "lex pkg install --ignore-lex-floor",
         ),
         ("Add a path dep", "lex pkg add mylib --path ../mylib"),
+        (
+            "Cut a versioned release (name/version/deps from lex.toml)",
+            "LEXHUB_TOKEN=evk_… lex pkg release https://vcs.lexlang.org",
+        ),
         (
             "Publish with a contract whose grant is derived from the code's effects",
             "lex pkg publish --sign <key> --derive-grant --contract-out c.json --archive-out pkg.tar",
