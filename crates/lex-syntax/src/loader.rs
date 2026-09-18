@@ -89,7 +89,7 @@
 //! filesystem layout — lives with store-native imports
 //! (`import "stage:..."`); see the corresponding follow-up tracker.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -161,12 +161,16 @@ pub fn load_program_with_root(entry: &Path, root: &Path) -> Result<Program, Load
 pub struct LoadedPackage {
     /// Every file's declarations, each exactly once, all prefix-mangled.
     pub program: Program,
-    /// The stdlib modules each file imports *itself*, keyed by the file's
-    /// path relative to the package root (`src/schema.lex`). Unlike
-    /// `program`, this is per-file: the flattening entry points cannot
-    /// report it, because by the time they return, a file's imports and
-    /// those of everything it imports are one undifferentiated list.
-    pub imports_by_file: BTreeMap<String, BTreeSet<String>>,
+    /// The non-inlined imports each file makes *itself* — stdlib always, plus
+    /// registry/git package imports when the package was loaded without
+    /// inlining (#930) — keyed by the file's path relative to the package root
+    /// (`src/schema.lex`), each mapping the import *reference* to its `as`
+    /// alias. Unlike `program`, this is per-file: the flattening entry points
+    /// cannot report it, because by the time they return, a file's imports and
+    /// those of everything it imports are one undifferentiated list. The alias
+    /// is preserved so a non-default `import "lex-nt/lib" as nt` round-trips as
+    /// `nt` rather than the default last-segment `lib` (#909).
+    pub imports_by_file: BTreeMap<String, BTreeMap<String, String>>,
     /// Mangling prefix → the file it belongs to (`schema_a1b2` →
     /// `src/schema.lex`), for every file in the package. A declaration's
     /// mangled name is `<prefix>.<local>`, so this is what lets a
@@ -214,6 +218,7 @@ pub fn load_package(
     entries: &[PathBuf],
     root: &Path,
     namespace: &str,
+    inline_packages: bool,
 ) -> Result<LoadedPackage, LoadError> {
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let mut state = LoaderState {
@@ -223,6 +228,7 @@ pub fn load_package(
         prefix_root: Some(root),
         prefix_namespace: Some(namespace.to_string()),
         imports_by_file: BTreeMap::new(),
+        inline_packages,
     };
     // Deliberately no empty-prefix seeding: see the doc comment above.
     let mut items: Vec<Item> = Vec::new();
@@ -283,6 +289,9 @@ fn load_rooted(entry: &Path, prefix_root: Option<PathBuf>) -> Result<Program, Lo
         prefix_root,
         prefix_namespace: None,
         imports_by_file: BTreeMap::new(),
+        // Single-entry loads (`lex run`/`lex check`) inline every dependency
+        // so the program is self-contained without a resolver, as before #930.
+        inline_packages: true,
     };
     // Entry file's prefix is empty so `lex run main.lex process` works
     // without users typing the hashed prefix.
@@ -327,10 +336,20 @@ struct LoaderState {
     /// packages sharing an internal layout (two `src/error.lex` files)
     /// do not mangle to one set of names. Only [`load_package`] sets it.
     prefix_namespace: Option<String>,
-    /// Stdlib modules imported by each file itself, keyed by the file's
-    /// root-relative path. Recorded for every file the loader reads;
-    /// only [`load_package`] hands it back.
-    imports_by_file: BTreeMap<String, BTreeSet<String>>,
+    /// Non-inlined imports each file makes itself — stdlib always, and (when
+    /// `inline_packages` is false) registry/git package imports too — keyed by
+    /// the file's root-relative path, each mapping the import *reference* to
+    /// its `as` alias. Recorded for every file the loader reads; only
+    /// [`load_package`] hands it back. The alias is kept (not defaulted) so a
+    /// non-inlined `import "lex-nt/lib" as nt` round-trips as `nt`, not the
+    /// default last-segment `lib` (#909/#930).
+    imports_by_file: BTreeMap<String, BTreeMap<String, String>>,
+    /// When false, registry/git package imports are recorded as import edges
+    /// (like stdlib) instead of being resolved and inlined — the op-log then
+    /// keeps the dependency edge and the consumer resolves it (#930). Local
+    /// (`./`, `../`, `/`) imports are always inlined. [`load_package`] sets
+    /// this per call; the single-entry loaders always inline.
+    inline_packages: bool,
 }
 
 impl LoaderState {
@@ -449,8 +468,13 @@ impl LoaderState {
                     let child_prog = self.load(&resolved)?;
                     merged_children.extend(child_prog.items);
                 }
+                // A registry/git package import. With `inline_packages`, resolve
+                // and inline it (self-contained program, pre-#930 behavior);
+                // otherwise leave it as an import edge (recorded below like
+                // stdlib) so the op-log keeps the dependency edge and the
+                // consumer resolves it — refs stay `<alias>.name`, unmangled.
                 Item::Import(ref imp)
-                    if split_package_import(&imp.reference).is_some() =>
+                    if self.inline_packages && split_package_import(&imp.reference).is_some() =>
                 {
                     let (pkg, module) =
                         split_package_import(&imp.reference).unwrap();
@@ -480,7 +504,7 @@ impl LoaderState {
             let entry = self.imports_by_file.entry(key).or_default();
             for item in &std_imports {
                 if let Item::Import(imp) = item {
-                    entry.insert(imp.reference.clone());
+                    entry.insert(imp.reference.clone(), imp.alias.clone());
                 }
             }
         }

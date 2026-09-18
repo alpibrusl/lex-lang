@@ -2243,7 +2243,11 @@ fn pkg_publish_handler(state: &State, body: &[u8]) -> Response<std::io::Cursor<V
     // check as a unit — the checker's global scope is keyed by name, and
     // two files may each declare their own `validate` (#818) — and it is
     // the naming change #828 asks for in exchange for the single pass.
-    let loaded = match load_package(&lex_files, tmp.path(), &pkg_name) {
+    // The archive-publish path type-checks the loaded program with no
+    // dependency resolver, so it still inlines registry/git deps to stay
+    // self-contained (#930). The op-log-native `op push` path publishes
+    // without inlining and resolves at the gate instead.
+    let loaded = match load_package(&lex_files, tmp.path(), &pkg_name, /*inline_packages=*/ true) {
         Ok(p) => p,
         Err(e) => return error_response(400, format!("load package: {e}")),
     };
@@ -2289,17 +2293,15 @@ fn pkg_publish_handler(state: &State, body: &[u8]) -> Response<std::io::Cursor<V
     // Each file now gets only the modules it imports itself; a flattened
     // per-file load could not tell those from its children's.
     //
-    // `imports_by_file` carries only the reference, not the `as` alias, so
-    // record each under its default alias; a non-default alias in a
-    // multi-file package round-trips once the loader threads aliases
-    // through (with the multi-module work, #894).
+    // `imports_by_file` carries each import's real `as` alias (#909/#930), so
+    // a non-default `import "..." as x` round-trips as `x`.
     let mut new_imports = lex_vcs::ImportMap::new();
     for (file, modules) in &loaded.imports_by_file {
         let entry = new_imports.entry(file.clone()).or_default();
-        for m in modules {
+        for (reference, alias) in modules {
             entry.insert(lex_vcs::ImportRef {
-                reference: m.clone(),
-                alias: lex_vcs::default_import_alias(m),
+                reference: reference.clone(),
+                alias: alias.clone(),
             });
         }
     }

@@ -1,6 +1,7 @@
 //! `lex publish` and `lex store *`: publishing stages into the content store, store maintenance and search.
 
 use super::*;
+use lex_store::DepResolver; // #930: `resolve_modules` on the client resolver
 use lex_syntax::{load_package, Manifest};
 
 /// Read the source `lex publish` was given. A **directory** is a whole
@@ -13,6 +14,7 @@ use lex_syntax::{load_package, Manifest};
 /// derives imports from the parsed `Import` stages).
 fn read_publish_source(
     path: &str,
+    inline_packages: bool,
 ) -> Result<(SynProgram, Option<lex_vcs::ImportMap>, BTreeMap<String, String>)> {
     let p = std::path::Path::new(path);
     if !p.is_dir() {
@@ -36,19 +38,22 @@ fn read_publish_source(
     if entries.is_empty() {
         bail!("no .lex files under {path}/src");
     }
-    let loaded =
-        load_package(&entries, p, &namespace).map_err(|e| anyhow!("loading package {path}: {e}"))?;
-    // `imports_by_file` carries only the module reference, not the `as`
-    // alias, so record each under its default alias; a non-default alias
-    // in a multi-file package round-trips once the loader threads aliases
-    // through (with the rest of #894).
+    // #930: the op-log publish loads without inlining registry/git
+    // dependencies, so history keeps the `import` edges (the consumer's gate
+    // resolves them) and refs stay `<alias>.name`; local (`./`) modules always
+    // inline. The example gate re-loads WITH inlining, because running examples
+    // needs the dependencies' implementations, not just their signatures.
+    let loaded = load_package(&entries, p, &namespace, inline_packages)
+        .map_err(|e| anyhow!("loading package {path}: {e}"))?;
+    // `imports_by_file` now carries each import's real `as` alias, so a
+    // non-default `import "lex-nt/lib" as nt` round-trips as `nt` (#909/#930).
     let mut imports = lex_vcs::ImportMap::new();
     for (file, modules) in &loaded.imports_by_file {
         let entry = imports.entry(file.clone()).or_default();
-        for m in modules {
+        for (reference, alias) in modules {
             entry.insert(lex_vcs::ImportRef {
-                reference: m.clone(),
-                alias: lex_vcs::default_import_alias(m),
+                reference: reference.clone(),
+                alias: alias.clone(),
             });
         }
     }
@@ -153,14 +158,23 @@ pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     // A directory argument publishes the whole package (mangled, one op
     // log, no sibling-name collisions); a file argument is a single
     // module. `pkg_imports` is `Some` only for a package.
-    let (prog, pkg_imports, module_prefixes) = read_publish_source(path)?;
+    // #930: load without inlining registry/git deps, so the op-log keeps the
+    // `import` edges; the resolver below supplies their signatures to the gate.
+    let (prog, pkg_imports, module_prefixes) = read_publish_source(path, /*inline_packages=*/ false)?;
     // #168: type-check *and* rewrite stdlib parse calls so a
     // typed `toml.parse[T]` validates required fields before
     // returning Ok. The mutation lands in the canonical AST so
     // every downstream consumer (bytecode compile, store
     // publish) sees the strict shape.
     let mut stages = canonicalize_program(&prog);
-    if let Err(errs) = lex_types::check_and_rewrite_program(&mut stages) {
+    // #930: resolve this head's external dependency signatures from the
+    // working copy, so the non-inlined head type-checks here exactly as the
+    // store gate will; the same resolver is installed on the store below.
+    let resolver = std::sync::Arc::new(crate::dep_resolver::ClientDepResolver::new(
+        std::path::PathBuf::from(path),
+    ));
+    let modules = resolver.resolve_modules(&stages, None);
+    if let Err(errs) = lex_types::check_and_rewrite_program_with_modules(&mut stages, &modules) {
         let arr: Vec<serde_json::Value> = errs
             .iter()
             .map(|e| serde_json::to_value(e).unwrap())
@@ -179,7 +193,24 @@ pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     // #835 Tier 1: behavioral example gate — run `examples {}` and refuse
     // the publish on any mismatch, the same hard-error contract `lex check`
     // uses. Type-level example checks already ran above.
-    let example_errors = lex_runtime::evaluate_examples(&stages);
+    //
+    // #930: examples RUN the code, so with external dependencies present they
+    // need those dependencies' *implementations* — the non-inlined `stages`
+    // above only carry the edges. Re-load with inlining for the example run;
+    // the op-log still gets the non-inlined `stages`. A dependency-free publish
+    // (the common case) skips the extra load — `stages` already inline
+    // everything local.
+    let example_stages = if modules.is_empty() {
+        stages.clone()
+    } else {
+        let (inlined_prog, _, _) = read_publish_source(path, /*inline_packages=*/ true)?;
+        let mut s = canonicalize_program(&inlined_prog);
+        // Rewrite parse calls in the inlined view too (deps inlined → no
+        // resolver needed); a type error here would have surfaced above.
+        let _ = lex_types::check_and_rewrite_program(&mut s);
+        s
+    };
+    let example_errors = lex_runtime::evaluate_examples(&example_stages);
     if !example_errors.is_empty() {
         let arr: Vec<serde_json::Value> = example_errors
             .iter()
@@ -198,14 +229,10 @@ pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 
     let mut store =
         Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
-    // #930 P2b-3: install the client dependency resolver so a head that keeps
-    // external `import` edges (non-inlined deps) type-checks at the publish
-    // gate against the deps resolved from the working copy. Harmless for a
-    // single-file publish or a package with no external deps — it resolves
-    // nothing and the gate sees an empty module map, exactly as before.
-    store.set_dep_resolver(std::sync::Arc::new(crate::dep_resolver::ClientDepResolver::new(
-        std::path::PathBuf::from(path),
-    )));
+    // #930 P2b-3: install the same client resolver on the store, so the
+    // write-time gate resolves this head's external deps exactly as the
+    // pre-check above did.
+    store.set_dep_resolver(resolver);
     let branch = branch.unwrap_or_else(|| store.current_branch());
 
     // Compute the diff. We need the old fns and new fns.

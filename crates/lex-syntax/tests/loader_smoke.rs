@@ -780,7 +780,7 @@ fn load_package_emits_each_file_once_however_many_import_it() {
         .map(|e| fn_names(&load_program_with_root(e, dir.path()).expect("load")).len())
         .sum();
 
-    let pkg = load_package(&entries, dir.path(), "pkg").expect("load package");
+    let pkg = load_package(&entries, dir.path(), "pkg", true).expect("load package");
     let names = fn_names(&pkg.program);
 
     // 6 declarations: error.lex's 2, one per importer (3), alone.lex's 1.
@@ -810,7 +810,7 @@ fn load_package_emits_each_file_once_however_many_import_it() {
 fn load_package_mangles_every_file_including_the_entries() {
     let dir = tempfile::tempdir().unwrap();
     let entries = write_dense_package(dir.path());
-    let pkg = load_package(&entries, dir.path(), "pkg").expect("load package");
+    let pkg = load_package(&entries, dir.path(), "pkg", true).expect("load package");
     let names = fn_names(&pkg.program);
     assert!(
         names.iter().all(|n| n.contains('.')),
@@ -832,11 +832,11 @@ fn load_package_namespaces_identical_layouts_apart() {
     let ea = write_dense_package(a.path());
     let eb = write_dense_package(b.path());
 
-    let same = fn_names(&load_package(&ea, a.path(), "same").expect("a").program);
-    let other = fn_names(&load_package(&eb, b.path(), "same").expect("b").program);
+    let same = fn_names(&load_package(&ea, a.path(), "same", true).expect("a").program);
+    let other = fn_names(&load_package(&eb, b.path(), "same", true).expect("b").program);
     assert_eq!(same, other, "one namespace, one layout: identical names");
 
-    let renamed = fn_names(&load_package(&eb, b.path(), "different").expect("b").program);
+    let renamed = fn_names(&load_package(&eb, b.path(), "different", true).expect("b").program);
     assert!(
         renamed.iter().zip(&same).all(|(x, y)| x != y),
         "a different namespace must rename every declaration:\n{renamed:?}\n{same:?}",
@@ -855,14 +855,51 @@ fn load_package_attributes_imports_to_the_declaring_file() {
     write(&src, "main.lex", "import \"./helper\" as h\nfn go() -> Str { h.shout(\"a\") }\n");
     let entries = vec![src.join("helper.lex"), src.join("main.lex")];
 
-    let pkg = load_package(&entries, dir.path(), "pkg").expect("load package");
+    let pkg = load_package(&entries, dir.path(), "pkg", true).expect("load package");
     let helper = pkg.imports_by_file.get("src/helper.lex").expect("helper keyed");
     let main = pkg.imports_by_file.get("src/main.lex").expect("main keyed");
-    assert!(helper.contains("std.str"), "helper declares std.str, got: {helper:?}");
+    assert!(helper.contains_key("std.str"), "helper declares std.str, got: {helper:?}");
     assert!(
         main.is_empty(),
         "main imports only ./helper, which is not a module import: {main:?}",
     );
+}
+
+/// #930: without inlining, a registry/git package import is recorded as an
+/// import edge (with its real `as` alias) rather than resolved and inlined —
+/// so the op-log keeps the dependency edge, `<alias>.name` references survive
+/// unmangled, and the dependency need not even be installed to load.
+#[test]
+fn load_package_records_package_imports_as_edges_when_not_inlining() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    write(
+        &src,
+        "lib.lex",
+        "import \"lex-nt/lib\" as nt\nfn reduce(a :: Int, b :: Int) -> Int { nt.gcd(a, b) }\n",
+    );
+    let entries = vec![src.join("lib.lex")];
+
+    // No lex-nt installed anywhere: this only succeeds because the package
+    // import is NOT resolved when `inline_packages` is false.
+    let pkg = load_package(&entries, dir.path(), "pkg", false).expect("load without inlining");
+
+    // The edge is recorded under its real alias, not the default `lib`.
+    let lib = pkg.imports_by_file.get("src/lib.lex").expect("lib.lex keyed");
+    assert_eq!(lib.get("lex-nt/lib").map(String::as_str), Some("nt"));
+
+    // The dependency is not inlined: no `gcd` declaration appears, and the
+    // `nt.gcd` reference is preserved (mangling only touches local aliases).
+    let names = fn_names(&pkg.program);
+    assert!(
+        !names.iter().any(|n| n.contains("gcd")),
+        "dependency must not be inlined, got: {names:?}",
+    );
+    // The one declaration is this package's own `reduce`, kept (mangled) — its
+    // `nt.gcd` call was never rewritten because `nt` is an import edge, not a
+    // local alias.
+    assert!(names.iter().any(|n| n.ends_with(".reduce") || n == "reduce"), "got: {names:?}");
 }
 
 /// An alias bound to two different modules cannot survive the merge into
@@ -878,7 +915,7 @@ fn load_package_rejects_one_alias_bound_to_two_modules() {
     write(&src, "b.lex", "import \"std.list\" as m\nfn two(l :: List[Int]) -> Int { m.len(l) }\n");
     let entries = vec![src.join("a.lex"), src.join("b.lex")];
 
-    let err = load_package(&entries, dir.path(), "pkg").expect_err("must be rejected");
+    let err = load_package(&entries, dir.path(), "pkg", true).expect_err("must be rejected");
     match err {
         LoadError::ConflictingAlias { alias, .. } => assert_eq!(alias, "m"),
         other => panic!("expected ConflictingAlias, got {other:?}"),
@@ -887,7 +924,7 @@ fn load_package_rejects_one_alias_bound_to_two_modules() {
     // The same alias for the same module in two files is fine, and the
     // import is emitted once.
     write(&src, "b.lex", "import \"std.str\" as m\nfn two(s :: Str) -> Int { m.len(s) }\n");
-    let pkg = load_package(&entries, dir.path(), "pkg").expect("same module is fine");
+    let pkg = load_package(&entries, dir.path(), "pkg", true).expect("same module is fine");
     let imports = pkg.program.items.iter().filter(|i| matches!(i, Item::Import(_))).count();
     assert_eq!(imports, 1, "one import item for one (module, alias) pair");
 }
