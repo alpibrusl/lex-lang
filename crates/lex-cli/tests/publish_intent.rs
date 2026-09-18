@@ -80,6 +80,62 @@ fn publish_without_intent_is_unchanged() {
     assert_eq!(d["ops"].as_array().map(|a| a.len()), Some(1));
 }
 
+/// #949 phase 5: `--intent-issue` links the publish to the typed issue it
+/// realizes. The recorded Intent carries `issue_id`, and its content-addressed
+/// id differs from the same intent without the link.
+#[test]
+fn publish_with_intent_issue_links_the_intent_to_the_issue() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("store");
+    let store_s = store.to_string_lossy().into_owned();
+    let file = write(tmp.path(), "m.lex", "fn triple(x :: Int) -> Int { x * 3 }\n");
+
+    // A real issue in the same store, so the link points at something.
+    let created = run_json(&[
+        "issue", "create", "--store", &store_s,
+        "--title", "add triple", "--shape", "typed_delta",
+        "--api", "triple:(x :: Int) -> Int:added",
+    ]);
+    let issue_id = data(&created)["issue_id"].as_str().expect("issue id").to_string();
+
+    let v = run_json(&[
+        "publish", &file, "--store", &store_s,
+        "--intent-prompt", "add a triple function",
+        "--intent-session", "run-42",
+        "--intent-issue", &issue_id,
+    ]);
+    let intent_id = data(&v)["intent_id"].as_str().expect("intent id").to_string();
+
+    // The persisted Intent record carries the issue id.
+    let raw = std::fs::read_to_string(store.join("intents").join(format!("{intent_id}.json")))
+        .expect("intent record on disk");
+    let intent: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(intent["issue_id"].as_str(), Some(issue_id.as_str()), "intent: {raw}");
+
+    // Same prompt/session without the link is a different intent (the link
+    // is part of the identity, so provenance can't be retro-fitted).
+    let tmp2 = tempfile::tempdir().unwrap();
+    let store2 = tmp2.path().join("store").to_string_lossy().into_owned();
+    let file2 = write(tmp2.path(), "m.lex", "fn triple(x :: Int) -> Int { x * 3 }\n");
+    let v2 = run_json(&[
+        "publish", &file2, "--store", &store2,
+        "--intent-prompt", "add a triple function",
+        "--intent-session", "run-42",
+    ]);
+    assert_ne!(data(&v2)["intent_id"].as_str(), Some(intent_id.as_str()));
+}
+
+#[test]
+fn intent_issue_without_prompt_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store_s = tmp.path().join("store").to_string_lossy().into_owned();
+    let file = write(tmp.path(), "q.lex", "fn quad(x :: Int) -> Int { x * 4 }\n");
+    let out = lex().args(["publish", &file, "--store", &store_s, "--intent-issue", "abc"]).output().unwrap();
+    assert!(!out.status.success(), "must refuse --intent-issue without --intent-prompt");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("require --intent-prompt"), "stderr: {err}");
+}
+
 #[test]
 fn intent_model_or_session_without_prompt_is_refused() {
     let tmp = tempfile::tempdir().unwrap();

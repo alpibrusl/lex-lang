@@ -793,12 +793,22 @@ fn cmd_publish() -> CommandInfo {
         "with --intent-prompt: the agent session id; default cli",
         None,
     )
+    .add_option(
+        "intent-issue",
+        "string",
+        "with --intent-prompt: the typed issue (lex issue create) this publish realizes; the Intent carries issue_id so the ops link back to the work item and the derived issue state sees the work as started",
+        None,
+    )
     .with_examples(vec![
         ("Publish drafts", "lex publish app.lex"),
         ("Publish + activate", "lex publish --activate app.lex"),
         (
             "Publish with a recorded intent",
             "lex publish --intent-prompt 'add triple()' --intent-model ollama/qwen3.8:27b-mlx --intent-session run-1 app.lex",
+        ),
+        (
+            "Publish as the realization of a typed issue",
+            "lex publish --intent-prompt 'add triple()' --intent-issue <issue_id> app.lex",
         ),
     ])
     .with_see_also(vec!["store", "branch"])

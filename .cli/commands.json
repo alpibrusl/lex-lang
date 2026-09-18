@@ -1,6 +1,6 @@
 {
   "name": "lex",
-  "version": "0.11.48",
+  "version": "0.11.49",
   "acli_version": "0.1.0",
   "commands": [
     {
@@ -330,6 +330,11 @@
           "name": "intent-session",
           "type": "string",
           "description": "with --intent-prompt: the agent session id; default cli"
+        },
+        {
+          "name": "intent-issue",
+          "type": "string",
+          "description": "with --intent-prompt: the typed issue (lex issue create) this publish realizes; the Intent carries issue_id so the ops link back to the work item and the derived issue state sees the work as started"
         }
       ],
       "subcommands": [],
@@ -346,6 +351,10 @@
         {
           "description": "Publish with a recorded intent",
           "invocation": "lex publish --intent-prompt 'add triple()' --intent-model ollama/qwen3.8:27b-mlx --intent-session run-1 app.lex"
+        },
+        {
+          "description": "Publish as the realization of a typed issue",
+          "invocation": "lex publish --intent-prompt 'add triple()' --intent-issue <issue_id> app.lex"
         }
       ],
       "see_also": [

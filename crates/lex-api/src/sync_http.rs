@@ -171,6 +171,20 @@ pub(crate) fn issues_batch_handler(state: &State, body: &str) -> Response<Cursor
         Ok(l) => l,
         Err(e) => return error_response(500, format!("opening issue log: {e}")),
     };
+    // Content-addressed: the id must be the hash of the content. Refuse the
+    // whole batch before writing anything — the log is keyed by id and
+    // idempotent on re-puts, so a record filed under an id its content
+    // doesn't own would silently shadow (or squat on) the real one.
+    if let Some(bad) = issues.iter().find(|i| !i.id_is_consistent()) {
+        return error_response(
+            400,
+            format!(
+                "issue {}: issue_id does not match its content (expected {})",
+                bad.issue_id,
+                bad.computed_id()
+            ),
+        );
+    }
     let mut added = 0usize;
     for issue in &issues {
         let existed = matches!(log.get(&issue.issue_id), Ok(Some(_)));

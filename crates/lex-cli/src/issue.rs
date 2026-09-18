@@ -25,17 +25,20 @@ use lex_store::issues::{
 use lex_store::{Store, StoreError};
 use lex_vcs::{Acceptance, ApiChangeKind, ApiEntry, Issue, IssueLog};
 
+use ::acli::OutputFormat;
+
+use crate::acli;
 use crate::store_root::parse_store_flag;
 
-pub fn cmd_issue(args: &[String]) -> Result<()> {
+pub fn cmd_issue(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let (root, rest, _activate, _dry_run) = parse_store_flag(args);
     let sub = rest.first().map(String::as_str).unwrap_or("");
     let tail = if rest.is_empty() { &rest[..] } else { &rest[1..] };
     match sub {
-        "create" => create(&root, tail),
+        "create" => create(fmt, &root, tail),
         "list" => list(&root),
         "show" => show(&root, tail),
-        "verify" => verify(&root, tail),
+        "verify" => verify(fmt, &root, tail),
         _ => bail!(
             "usage: lex issue <create|list|show|verify> [--store DIR]\n\
              verify: <id> [--at OP]  evaluate the issue's acceptance at a head (default: branch head)\n\
@@ -46,7 +49,7 @@ pub fn cmd_issue(args: &[String]) -> Result<()> {
     }
 }
 
-fn create(root: &std::path::Path, args: &[String]) -> Result<()> {
+fn create(fmt: &OutputFormat, root: &std::path::Path, args: &[String]) -> Result<()> {
     let mut title: Option<String> = None;
     let mut body = String::new();
     let mut shape: Option<String> = None;
@@ -115,7 +118,15 @@ fn create(root: &std::path::Path, args: &[String]) -> Result<()> {
     let issue = Issue::new(title, body, acceptance, base, deps, project);
     let log = IssueLog::open(root)?;
     log.put(&issue)?;
-    println!("{}", issue.issue_id);
+    let id = issue.issue_id.clone();
+    let data = serde_json::json!({
+        "issue_id": issue.issue_id,
+        "shape": issue.acceptance.shape(),
+        "title": issue.title,
+        "project": issue.project,
+    });
+    // Text mode prints the bare id: harnesses (loom, lex-code) read one line.
+    acli::emit_or_text("issue-create", data, fmt, move || println!("{id}"));
     Ok(())
 }
 
@@ -149,7 +160,7 @@ fn parse_api_entry(s: &str) -> Result<ApiEntry> {
 /// (`evaluate_static`: the API delta) runs in lex-store; the examples half
 /// runs here, because running code needs lex-runtime, which lex-store can't
 /// depend on. Exit 1 when the oracle fails, so a script can gate on it.
-fn verify(root: &std::path::Path, args: &[String]) -> Result<()> {
+fn verify(fmt: &OutputFormat, root: &std::path::Path, args: &[String]) -> Result<()> {
     let mut id: Option<String> = None;
     let mut at: Option<String> = None;
     let mut it = args.iter();
@@ -213,20 +224,34 @@ fn verify(root: &std::path::Path, args: &[String]) -> Result<()> {
     }
 
     let attestation = record_issue_verdict(&store, &issue, &head, &eval)?;
-    match &eval {
-        IssueEvaluation::Passed => {
-            println!("verified: {id} at {head} (attestation {attestation})");
-            Ok(())
-        }
+    let (verdict, detail) = match &eval {
+        IssueEvaluation::Passed => ("verified", String::new()),
+        IssueEvaluation::NotEvaluable { reason } => ("inconclusive", reason.clone()),
+        IssueEvaluation::Failed { detail } => ("failed", detail.clone()),
+    };
+    let data = serde_json::json!({
+        "issue_id": id,
+        "verdict": verdict,
+        "detail": detail,
+        "head_op": head,
+        "attestation_id": attestation,
+    });
+    let line = match &eval {
+        IssueEvaluation::Passed => format!("verified: {id} at {head} (attestation {attestation})"),
         IssueEvaluation::NotEvaluable { reason } => {
-            println!("inconclusive: {reason} (attestation {attestation})");
-            Ok(())
+            format!("inconclusive: {reason} (attestation {attestation})")
         }
         IssueEvaluation::Failed { detail } => {
-            println!("failed: {detail} (attestation {attestation})");
-            std::process::exit(1);
+            format!("failed: {detail} (attestation {attestation})")
         }
+    };
+    acli::emit_or_text("issue-verify", data, fmt, move || println!("{line}"));
+    if matches!(eval, IssueEvaluation::Failed { .. }) {
+        // Exit 1 so scripts can gate on the verdict; the JSON/text above
+        // already carries the detail.
+        std::process::exit(1);
     }
+    Ok(())
 }
 
 /// `name(args) => expected` → `(name, Example)`. Parsed under a stub fn
