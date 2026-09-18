@@ -995,3 +995,26 @@ fn review_inbox_lists_stages_and_a_verdict_updates_it() {
     assert_eq!(post_bytes(&srv.addr, "/v1/review/verdict",
         format!(r#"{{"stage_id":"{stage_id}","verdict":"maybe","reviewer":"x"}}"#).as_bytes()).0, 400);
 }
+
+/// #893 dependency graph (slice 1): a release records its declared external
+/// dependencies (from the releaser's lex.toml), the edge set the cross-store
+/// dependents index is built from.
+#[test]
+fn release_records_declared_dependencies() {
+    let (srv, _tmp) = start_server();
+    assert_eq!(post_bytes(&srv.addr, "/v1/pkg/publish",
+        &pkg_archive("dg", "0.1.0", &[("lib.lex", "fn f() -> Int { 1 }\n")])).0, 200);
+    // Release declaring two upstream deps.
+    let (s, b) = post_bytes(&srv.addr, "/v1/pkg/dg/release",
+        br#"{"version":"1.0.0","dependencies":["lex-nt","lex-crypto"]}"#);
+    assert_eq!(s, 201, "release: {b}");
+
+    // The version record carries the dependencies.
+    let (s, body) = get(&srv.addr, "/v1/pkg/dg/1.0.0");
+    assert_eq!(s, 200, "record: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let deps: Vec<String> = v["dependencies"].as_array().unwrap()
+        .iter().map(|d| d.as_str().unwrap().to_string()).collect();
+    assert!(deps.contains(&"lex-nt".to_string()) && deps.contains(&"lex-crypto".to_string()),
+        "declared deps recorded: {body}");
+}
