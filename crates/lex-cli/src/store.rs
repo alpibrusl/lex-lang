@@ -108,6 +108,10 @@ pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let mut intent_prompt: Option<String> = None;
     let mut intent_model: Option<String> = None;
     let mut intent_session: Option<String> = None;
+    // #949 phase 5: the typed issue this publish realizes. Stamped into the
+    // Intent (`Intent.issue_id`), so the ops link back to the work item and
+    // the derived issue state can see "work has started" from provenance.
+    let mut intent_issue: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
     let mut it = rest.iter();
     while let Some(a) = it.next() {
@@ -141,17 +145,26 @@ pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                     .ok_or_else(|| anyhow!("--intent-session needs a value"))?
                     .clone(),
             );
+        } else if a == "--intent-issue" {
+            intent_issue = Some(
+                it.next()
+                    .ok_or_else(|| anyhow!("--intent-issue needs an issue id"))?
+                    .clone(),
+            );
         } else {
             positional.push(a.clone());
         }
     }
-    if intent_prompt.is_none() && (intent_model.is_some() || intent_session.is_some()) {
-        bail!("--intent-model / --intent-session require --intent-prompt");
+    if intent_prompt.is_none()
+        && (intent_model.is_some() || intent_session.is_some() || intent_issue.is_some())
+    {
+        bail!("--intent-model / --intent-session / --intent-issue require --intent-prompt");
     }
     let path = positional.first().ok_or_else(|| {
         anyhow!(
         "usage: lex publish [--store DIR] [--branch NAME] [--activate] [--signing-key HEX] \
-         [--intent-prompt TEXT [--intent-model PROVIDER/NAME] [--intent-session ID]] <file>")
+         [--intent-prompt TEXT [--intent-model PROVIDER/NAME] [--intent-session ID] \
+         [--intent-issue ISSUE_ID]] <file>")
     })?;
     let signer = resolve_signing_key(signing_key_flag.as_deref())?;
 
@@ -367,6 +380,10 @@ pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                 lex_vcs::ModelDescriptor { provider, name, version: None },
                 None,
             );
+            let intent = match &intent_issue {
+                Some(id) => intent.with_issue(id.clone()),
+                None => intent,
+            };
             lex_vcs::IntentLog::open(&root)
                 .with_context(|| "opening intent log")?
                 .put(&intent)

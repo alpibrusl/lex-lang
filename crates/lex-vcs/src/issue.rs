@@ -167,6 +167,26 @@ impl Issue {
         );
         Self { issue_id, title, body, acceptance, base, deps, project, created_at }
     }
+
+    /// The id this issue's content hashes to. Equal to `issue_id` for a
+    /// well-formed record; a peer receiving issues over the wire compares the
+    /// two so a mismatched id (tampered or miscomputed) is refused instead of
+    /// being filed under a name its content doesn't own.
+    pub fn computed_id(&self) -> IssueId {
+        compute_issue_id(
+            &self.title,
+            &self.body,
+            &self.acceptance,
+            self.base.as_deref(),
+            &self.deps,
+            self.project.as_deref(),
+        )
+    }
+
+    /// `issue_id` matches the content hash.
+    pub fn id_is_consistent(&self) -> bool {
+        self.issue_id == self.computed_id()
+    }
 }
 
 fn compute_issue_id(

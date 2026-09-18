@@ -108,6 +108,29 @@ fn malformed_issue_batch_is_rejected() {
     assert_eq!(status, 400);
 }
 
+/// #949 phase 5: the id is the content hash. A record whose `issue_id` does
+/// not match its content is refused (400) and nothing in the batch is filed —
+/// otherwise a bad record could squat on a real issue's id.
+#[test]
+fn issue_with_inconsistent_id_is_refused_and_nothing_is_filed() {
+    let (srv, _tmp) = start_server();
+    let good = gcd_issue();
+    let mut tampered = gcd_issue();
+    tampered.title = "not the gcd issue".into(); // content changed, id kept
+    assert!(!tampered.id_is_consistent());
+
+    let batch = serde_json::to_string(&vec![good.clone(), tampered]).unwrap();
+    let (status, body) = http(&srv.addr, "POST", "/v1/issues/batch", &batch);
+    assert_eq!(status, 400, "tampered id must be refused: {body}");
+    assert!(body.contains("does not match its content"), "{body}");
+
+    // All-or-nothing: the good record in the same batch was not filed either.
+    let (status, body) = http(&srv.addr, "GET", "/v1/issues/list", "");
+    assert_eq!(status, 200);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(v["ids"].as_array().unwrap().is_empty(), "nothing filed: {body}");
+}
+
 #[test]
 fn empty_log_lists_nothing() {
     let (srv, _tmp) = start_server();
