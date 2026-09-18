@@ -56,7 +56,7 @@ pub fn check_program_with_positions(
     stages: &[a::Stage],
     positions: &BTreeMap<String, Position>,
 ) -> Result<ProgramTypes, Vec<PositionedError>> {
-    check_program_inner(stages, Some(positions))
+    check_program_inner(stages, Some(positions), &BTreeMap::new())
         .map_err(|errs| errs.into_iter().map(|(e, fn_name)| {
             let pos = fn_name.as_deref().and_then(|n| positions.get(n)).cloned();
             PositionedError::new(e, pos)
@@ -64,13 +64,47 @@ pub fn check_program_with_positions(
 }
 
 pub fn check_program(stages: &[a::Stage]) -> Result<ProgramTypes, Vec<TypeError>> {
-    check_program_inner(stages, None)
+    check_program_inner(stages, None, &BTreeMap::new())
         .map_err(|errs| errs.into_iter().map(|(e, _)| e).collect())
+}
+
+/// Like [`check_program`], but with a set of already-resolved dependency
+/// modules the head may import by *reference* (e.g. `"lex-nt/lib"`). Each
+/// value is that module's type — a [`Ty::Record`] of its exported
+/// functions, the same shape [`crate::builtins::module_scope`] produces for
+/// stdlib (build one with [`module_record_from_fields`]). Registry/git
+/// dependencies resolve through this map instead of being inlined into
+/// `stages` (#930): the op-log keeps the `import` edge and the write-time
+/// gate supplies the dependency's signatures here, so the head still
+/// type-checks against them without carrying their bodies.
+///
+/// An empty map reproduces [`check_program`] exactly — only stdlib imports
+/// resolve, and any `<alias>.name` reaching an unsupplied dependency is an
+/// unbound-reference error, as today.
+pub fn check_program_with_modules(
+    stages: &[a::Stage],
+    modules: &BTreeMap<String, Ty>,
+) -> Result<ProgramTypes, Vec<TypeError>> {
+    check_program_inner(stages, None, modules)
+        .map_err(|errs| errs.into_iter().map(|(e, _)| e).collect())
+}
+
+/// Build a dependency module's value type — a record of its exported
+/// functions — from `(name, type)` pairs, for [`check_program_with_modules`]
+/// (#930). Callers never touch the record representation directly; this is
+/// also the single seam where a later phase will renumber each export's
+/// type variables into a disjoint block before merging, so that two
+/// polymorphic exports of one dependency don't share a variable when the
+/// record is generalized as a whole. Monomorphic exports (the common case,
+/// e.g. `gcd(Int, Int) -> Int`) carry no variables and need no renumbering.
+pub fn module_record_from_fields(fields: impl IntoIterator<Item = (String, Ty)>) -> Ty {
+    Ty::Record(fields.into_iter().collect())
 }
 
 fn check_program_inner(
     stages: &[a::Stage],
     _positions: Option<&BTreeMap<String, Position>>,
+    modules: &BTreeMap<String, Ty>,
 ) -> Result<ProgramTypes, Vec<(TypeError, Option<String>)>> {
     let mut tcx = Checker::new();
     // Each entry is (error, optional fn name the error came from)
@@ -80,6 +114,7 @@ fn check_program_inner(
     // Pass 1: gather imports → bring module values into scope.
     for stage in stages {
         if let a::Stage::Import(i) = stage {
+            // Stdlib modules resolve to a built-in scope.
             if let Some(mod_name) = module_for_import(&i.reference) {
                 if let Some(ty) = module_scope(mod_name, &tcx.type_env) {
                     tcx.globals.insert(i.alias.clone(), Scheme {
@@ -91,7 +126,22 @@ fn check_program_inner(
                         ty,
                     });
                     tcx.module_aliases.insert(i.alias.clone(), mod_name.to_string());
+                    continue;
                 }
+            }
+            // #930: a resolved registry/git dependency, supplied by the
+            // caller (the write-time gate) keyed by import reference,
+            // rather than inlined into `stages`. Bind its record under this
+            // file's alias so `<alias>.name` references type-check with the
+            // dependency's signatures but without its bodies present. The
+            // record is already generalized per export, so generalize it as
+            // a whole the same way a stdlib module scope is bound above.
+            if let Some(ty) = modules.get(&i.reference) {
+                tcx.globals.insert(i.alias.clone(), Scheme {
+                    vars: collect_vars(ty),
+                    eff_vars: collect_eff_vars(ty),
+                    ty: ty.clone(),
+                });
             }
         }
     }
