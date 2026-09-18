@@ -24,7 +24,7 @@ use crate::handlers::{error_response, json_response, State};
 /// `GET /v1/review/inbox[?branch=<name>]` — the review inbox for a branch head:
 /// each head stage with its declaration name, the intent it was made under (the
 /// *why*), its latest review verdict, and whether it still needs a human look.
-pub(crate) fn review_inbox_handler(state: &State, query: &str) -> Response<Cursor<Vec<u8>>> {
+pub fn review_inbox_handler(state: &State, query: &str) -> Response<Cursor<Vec<u8>>> {
     let branch = query
         .split('&')
         .find_map(|kv| kv.strip_prefix("branch="))
@@ -101,7 +101,7 @@ struct VerdictReq {
 /// `POST /v1/review/verdict` — record a human review verdict as a `Review`
 /// attestation on a stage. The verdict enters the same attestation graph the
 /// gates consume (a Reject blocks promotion via `latest_review_verdict`).
-pub(crate) fn review_verdict_handler(state: &State, body: &str) -> Response<Cursor<Vec<u8>>> {
+pub fn review_verdict_handler(state: &State, body: &str) -> Response<Cursor<Vec<u8>>> {
     let req: VerdictReq = match serde_json::from_str(body) {
         Ok(r) => r,
         Err(e) => return error_response(400, format!("bad request: {e}")),
