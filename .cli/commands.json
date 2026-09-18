@@ -1,6 +1,6 @@
 {
   "name": "lex",
-  "version": "0.11.38",
+  "version": "0.11.41",
   "acli_version": "0.1.0",
   "commands": [
     {
@@ -1720,6 +1720,10 @@
         {
           "description": "Auto-detect renames from two hosted releases and fan them out",
           "invocation": "lex propagate --package lex-nt --from 1.4.0 --to 2.0.0 --registry vcs.lexlang.org/lex-official/lex-nt --workspace . --apply"
+        },
+        {
+          "description": "Fan out to every HOSTED dependent (discovered via /v1/dependents)",
+          "invocation": "lex propagate --package lex-nt --rename gcd=euclidean_gcd --hosted --registry vcs.lexlang.org/lex-official/lex-nt --out ./migrated --apply"
         },
         {
           "description": "Agent-migrate dependents after a behavioral change (gated on type-check)",

@@ -217,6 +217,10 @@ fn cmd_propagate() -> CommandInfo {
             "lex propagate --package lex-nt --from 1.4.0 --to 2.0.0 --registry vcs.lexlang.org/lex-official/lex-nt --workspace . --apply",
         ),
         (
+            "Fan out to every HOSTED dependent (discovered via /v1/dependents)",
+            "lex propagate --package lex-nt --rename gcd=euclidean_gcd --hosted --registry vcs.lexlang.org/lex-official/lex-nt --out ./migrated --apply",
+        ),
+        (
             "Agent-migrate dependents after a behavioral change (gated on type-check)",
             "lex propagate --package lex-nt --symbol euler_phi --note 'handles 0 now' --ollama",
         ),

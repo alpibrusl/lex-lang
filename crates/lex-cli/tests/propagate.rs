@@ -3,6 +3,7 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::thread;
 
 fn lex_bin() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_lex"))
@@ -91,4 +92,64 @@ fn semantic_migration_accepts_a_valid_regeneration_and_rejects_a_broken_one() {
     assert!(!out.status.success(), "broken regen must fail the gate");
     assert!(std::fs::read_to_string(&dn_lib).unwrap().contains("up.old(x)"),
         "rejected migration must not modify the file");
+}
+
+/// A gz-tar of a dependent package that imports `up` and calls `up.old`.
+fn dependent_archive() -> Vec<u8> {
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    {
+        let mut ar = tar::Builder::new(&mut enc);
+        let add = |p: &str, data: &[u8], ar: &mut tar::Builder<&mut flate2::write::GzEncoder<Vec<u8>>>| {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(data.len() as u64); h.set_mode(0o644); h.set_cksum();
+            ar.append_data(&mut h, p, data).unwrap();
+        };
+        add("lex.toml", b"[package]\nname = \"dn\"\nversion = \"1.0.0\"\n\n[dependencies]\nup = { registry = \"h/acme\", version = \"^1\" }\n", &mut ar);
+        add("src/lib.lex", b"import \"up/lib\" as up\n\nfn use_it(x :: Int) -> Int { up.old(x) }\n", &mut ar);
+        ar.finish().unwrap();
+    }
+    enc.finish().unwrap()
+}
+
+/// Spawn a hub that serves the dependents index + a dependent's public archive.
+fn spawn_hub_with_dependent() -> String {
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let addr = match server.server_addr() { tiny_http::ListenAddr::IP(a) => a, _ => unreachable!() };
+    let archive = dependent_archive();
+    thread::spawn(move || {
+        for req in server.incoming_requests() {
+            let url = req.url().to_string();
+            if url.starts_with("/v1/dependents") {
+                let body = r#"{"of":"up","dependents":[{"tenant":"acme","store":null,"name":"dn","version":"1.0.0"}]}"#;
+                let _ = req.respond(tiny_http::Response::from_string(body).with_header(
+                    tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap()));
+            } else if url.contains("/archive") {
+                let _ = req.respond(tiny_http::Response::from_data(archive.clone()));
+            } else {
+                let _ = req.respond(tiny_http::Response::empty(404));
+            }
+        }
+    });
+    format!("http://{addr}")
+}
+
+#[test]
+fn hosted_fanout_discovers_and_rewrites_dependents_from_the_hub() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hub = spawn_hub_with_dependent(); // http://127.0.0.1:PORT
+    let out = tmp.path().join("out");
+
+    // registry is `<host>/acme`; --hosted discovers dependents via the hub.
+    let output = Command::new(lex_bin())
+        .args(["propagate", "--package", "up", "--rename", "old=new",
+               "--hosted", "--registry", &format!("{hub}/acme"), "--out"])
+        .arg(&out).arg("--apply")
+        .output().unwrap();
+    let so = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "hosted propagate: {so}{}", String::from_utf8_lossy(&output.stderr));
+    assert!(so.contains("up.old → up.new"), "reports the edit: {so}");
+
+    // The dependent's fetched source was rewritten in place under --out.
+    let migrated = std::fs::read_to_string(out.join("dn/src/lib.lex")).expect("dn materialized");
+    assert!(migrated.contains("up.new(x)") && !migrated.contains("up.old"), "rewritten: {migrated}");
 }
