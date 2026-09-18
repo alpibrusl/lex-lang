@@ -5,6 +5,20 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [0.11.47] - 2026-09-18
+
+### Fixed
+
+- **`verify_head_and_attest` reconstructs a head's `import` edges before
+  type-checking (#930).** The hub-CI gate rebuilt a head's program from the
+  SigId→stage map (fn/type declarations only); a head's `import` edges are
+  AddImport ops and were omitted. A non-inlined head therefore reached the
+  checker with no `import "<pkg>/mod" as <alias>` stage, the alias never bound,
+  and verify failed with `unknown_identifier "<alias>"` even when the
+  dependency resolved. The gate now reconstructs the head's imports (via
+  `package_head_at_op`) so the resolver sees them and the checker binds each
+  alias.
+
 ## [0.11.46] - 2026-09-18
 
 ### Fixed
