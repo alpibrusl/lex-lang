@@ -166,6 +166,16 @@ bumps may carry breaking changes when justified).
   inlining means: the dep is folded into the package's namespace). The deeper
   fix — not inlining registry deps at all — is tracked in #930.
 
+## [0.11.44] - 2026-09-18
+
+### Fixed
+
+- **Single-module packages de-mangle on render (#930).** The #931 fix only
+  covered multi-module render; a single-module package published through the
+  loader (or with an inlined dependency) still rendered invalid dotted names.
+  `render_singlefile` now applies the same de-flatten, so its install archive
+  compiles.
+
 ## [Unreleased]
 
 ### Added
