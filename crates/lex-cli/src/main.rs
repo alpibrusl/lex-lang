@@ -30,6 +30,7 @@ mod fmt;
 mod init;
 mod lint;
 mod merge;
+mod dep_resolver;
 mod op;
 mod recall;
 mod export_git;

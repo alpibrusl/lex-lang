@@ -196,8 +196,16 @@ pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         std::process::exit(2);
     }
 
-    let store =
+    let mut store =
         Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
+    // #930 P2b-3: install the client dependency resolver so a head that keeps
+    // external `import` edges (non-inlined deps) type-checks at the publish
+    // gate against the deps resolved from the working copy. Harmless for a
+    // single-file publish or a package with no external deps — it resolves
+    // nothing and the gate sees an empty module map, exactly as before.
+    store.set_dep_resolver(std::sync::Arc::new(crate::dep_resolver::ClientDepResolver::new(
+        std::path::PathBuf::from(path),
+    )));
     let branch = branch.unwrap_or_else(|| store.current_branch());
 
     // Compute the diff. We need the old fns and new fns.
