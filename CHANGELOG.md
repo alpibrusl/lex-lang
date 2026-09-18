@@ -112,6 +112,21 @@ bumps may carry breaking changes when justified).
   hand; a breaking change that isn't a pure rename points the operator at a
   semantic migration.
 
+## [0.11.40] - 2026-09-18
+
+### Added
+
+- **Human review surface (lex-hub#92, first slice).** `GET
+  /v1/review/inbox[?branch=<b>]` lists a branch head's stages, each with the
+  Intent it was made under, its latest review verdict, and a `needs_review`
+  flag (everything not yet approved — an exception inbox, not a
+  diff-of-everything). `POST /v1/review/verdict {stage_id, verdict, reviewer,
+  note}` records Approve / Reject / RequestChanges as a `Review` attestation,
+  so a human decision lives in the same typed attestation graph the machine
+  gates consume (a Reject already blocks promotion). Tenant-scoped, reachable
+  by a tenant-keyed caller directly; `review_http` is public so lex-hub can
+  compose an owner-authorized console route over it.
+
 ## [Unreleased]
 
 ### Added
