@@ -608,6 +608,21 @@ fn cmd_op_push(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         }
     }
 
+    // #949 phase 1: typed issues travel with the package. An open issue isn't
+    // reachable from any op, so send the whole local log — content-addressed
+    // and idempotent server-side, a re-push converges.
+    {
+        let ilog = lex_vcs::IssueLog::open(store.root())?;
+        let issues: Vec<lex_vcs::Issue> = ilog
+            .list_ids()?
+            .iter()
+            .filter_map(|id| ilog.get(id).ok().flatten())
+            .collect();
+        if !issues.is_empty() {
+            post_json(&remote, "/v1/issues/batch", &serde_json::to_value(&issues)?, token.as_deref())?;
+        }
+    }
+
     // Post the batch.
     let url = format!("{}/v1/ops/batch", remote.trim_end_matches('/'));
     let body = serde_json::to_string(&to_send)
@@ -1064,6 +1079,39 @@ fn cmd_op_pull(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             for (head, toml) in locks {
                 if let Some(t) = toml.as_str() {
                     store.set_committed_lock(head, t)?;
+                }
+            }
+        }
+    }
+
+    // #949 phase 1: fetch every issue the remote holds (open issues aren't
+    // reachable from pulled ops) and store the ones missing locally.
+    {
+        let listed = get_json(&remote, "/v1/issues/list", token.as_deref())?;
+        let ids: Vec<String> = listed
+            .get("ids")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        if !ids.is_empty() {
+            let ilog = lex_vcs::IssueLog::open(store.root())?;
+            let want: Vec<String> = ids
+                .into_iter()
+                .filter(|id| !matches!(ilog.get(id), Ok(Some(_))))
+                .collect();
+            if !want.is_empty() {
+                let resp = post_json(
+                    &remote,
+                    "/v1/issues/fetch",
+                    &serde_json::json!({ "ids": want }),
+                    token.as_deref(),
+                )?;
+                if let Some(arr) = resp.get("issues").and_then(|v| v.as_array()) {
+                    for v in arr {
+                        if let Ok(issue) = serde_json::from_value::<lex_vcs::Issue>(v.clone()) {
+                            ilog.put(&issue)?;
+                        }
+                    }
                 }
             }
         }

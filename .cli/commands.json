@@ -1,6 +1,6 @@
 {
   "name": "lex",
-  "version": "0.11.44",
+  "version": "0.11.47",
   "acli_version": "0.1.0",
   "commands": [
     {
@@ -1700,6 +1700,43 @@
         "init",
         "ci",
         "keygen"
+      ]
+    },
+    {
+      "name": "issue",
+      "description": "typed issues (#949): a unit of work with a declared, verifiable acceptance — done is a proof the gate verifies at HEAD, not a status someone sets",
+      "arguments": [
+        {
+          "name": "subcommand",
+          "type": "enum[create|list|show]",
+          "description": "what to do",
+          "required": true
+        }
+      ],
+      "options": [],
+      "subcommands": [],
+      "idempotent": true,
+      "examples": [
+        {
+          "description": "Declare a feature as a typed delta (API entry + example)",
+          "invocation": "lex issue create --title \"add gcd\" --shape typed_delta --api \"gcd:(a :: Int, b :: Int) -> Int\" --example \"gcd(12, 8) => 4\""
+        },
+        {
+          "description": "File a bug as a failing example (fixed = it passes)",
+          "invocation": "lex issue create --title \"gcd(0,0) crashes\" --shape failing_example --example \"gcd(0, 0) => 0\""
+        },
+        {
+          "description": "A metric target (ops/growth): a predicate over the event backbone",
+          "invocation": "lex issue create --title \"p99 under 200ms\" --shape metric_invariant --predicate \"p99 < 200\" --window 7d"
+        },
+        {
+          "description": "List issues",
+          "invocation": "lex issue list"
+        },
+        {
+          "description": "Show one as JSON",
+          "invocation": "lex issue show <id>"
+        }
       ]
     },
     {

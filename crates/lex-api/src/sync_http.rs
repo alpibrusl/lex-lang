@@ -17,7 +17,7 @@ use tiny_http::Response;
 
 use crate::handlers::{error_response, json_response, State};
 use lex_ast::{stage_id, Stage};
-use lex_vcs::{Intent, IntentLog};
+use lex_vcs::{Intent, IntentLog, Issue, IssueLog};
 
 /// `POST /v1/stages/batch` — receive stage blobs. Body: a JSON array of
 /// `Stage`. Each is stored content-addressed (idempotent); a stage that
@@ -155,6 +155,64 @@ pub(crate) fn locks_fetch_handler(state: &State, body: &str) -> Response<Cursor<
         }
     }
     json_response(200, &serde_json::json!({ "locks": locks }))
+}
+
+/// `POST /v1/issues/batch` — receive typed issues (#949, content-addressed:
+/// idempotent, self-verifying). Issues travel with the package like stages,
+/// intents and locks, so a peer that pulls the op-log also gets the work
+/// items its intents reference — and the open ones nothing references yet.
+pub(crate) fn issues_batch_handler(state: &State, body: &str) -> Response<Cursor<Vec<u8>>> {
+    let issues: Vec<Issue> = match serde_json::from_str(body) {
+        Ok(i) => i,
+        Err(e) => return error_response(400, format!("body must be a JSON array of Issue: {e}")),
+    };
+    let store = state.store.lock().unwrap();
+    let log = match IssueLog::open(store.root()) {
+        Ok(l) => l,
+        Err(e) => return error_response(500, format!("opening issue log: {e}")),
+    };
+    let mut added = 0usize;
+    for issue in &issues {
+        let existed = matches!(log.get(&issue.issue_id), Ok(Some(_)));
+        if let Err(e) = log.put(issue) {
+            return error_response(500, format!("put issue {}: {e}", issue.issue_id));
+        }
+        if !existed { added += 1 }
+    }
+    json_response(200, &serde_json::json!({
+        "received": issues.len(), "added": added,
+    }))
+}
+
+/// `POST /v1/issues/fetch` — return issues for a set of ids. Body:
+/// `{ "ids": [...] }`; missing ids are silently omitted.
+pub(crate) fn issues_fetch_handler(state: &State, body: &str) -> Response<Cursor<Vec<u8>>> {
+    let ids = match parse_ids(body) {
+        Ok(ids) => ids,
+        Err(resp) => return resp,
+    };
+    let store = state.store.lock().unwrap();
+    let log = match IssueLog::open(store.root()) {
+        Ok(l) => l,
+        Err(e) => return error_response(500, format!("opening issue log: {e}")),
+    };
+    let issues: Vec<Issue> = ids.iter().filter_map(|id| log.get(id).ok().flatten()).collect();
+    json_response(200, &serde_json::json!({ "issues": issues }))
+}
+
+/// `GET /v1/issues/list` — every issue id in the log. An issue can exist
+/// before any op references it (open work), so a puller lists the whole log
+/// rather than only the ids reachable from pulled ops.
+pub(crate) fn issues_list_handler(state: &State) -> Response<Cursor<Vec<u8>>> {
+    let store = state.store.lock().unwrap();
+    let log = match IssueLog::open(store.root()) {
+        Ok(l) => l,
+        Err(e) => return error_response(500, format!("opening issue log: {e}")),
+    };
+    match log.list_ids() {
+        Ok(ids) => json_response(200, &serde_json::json!({ "ids": ids })),
+        Err(e) => error_response(500, format!("listing issues: {e}")),
+    }
 }
 
 /// Parse a `{ "ids": [...] }` body into a `Vec<String>`.

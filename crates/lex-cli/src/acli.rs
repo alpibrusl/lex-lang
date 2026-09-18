@@ -127,6 +127,7 @@ fn commands() -> Vec<CommandInfo> {
         // `every_dispatched_command_is_documented` now enforces.
         cmd_init(),
         cmd_pkg(),
+        cmd_issue(),
         cmd_propagate(),
         cmd_fmt(),
         cmd_ci(),
@@ -162,6 +163,35 @@ fn cmd_init() -> CommandInfo {
         ("Into a dir", "lex init my-proj"),
     ])
     .with_see_also(vec!["pkg", "agent-guidelines"])
+}
+
+fn cmd_issue() -> CommandInfo {
+    CommandInfo::new(
+        "issue",
+        "typed issues (#949): a unit of work with a declared, verifiable acceptance — \
+         done is a proof the gate verifies at HEAD, not a status someone sets",
+    )
+    .idempotent(true)
+    .add_argument("subcommand", "enum[create|list|show]", "what to do", true)
+    .with_examples(vec![
+        (
+            "Declare a feature as a typed delta (API entry + example)",
+            "lex issue create --title \"add gcd\" --shape typed_delta \
+             --api \"gcd:(a :: Int, b :: Int) -> Int\" --example \"gcd(12, 8) => 4\"",
+        ),
+        (
+            "File a bug as a failing example (fixed = it passes)",
+            "lex issue create --title \"gcd(0,0) crashes\" --shape failing_example \
+             --example \"gcd(0, 0) => 0\"",
+        ),
+        (
+            "A metric target (ops/growth): a predicate over the event backbone",
+            "lex issue create --title \"p99 under 200ms\" --shape metric_invariant \
+             --predicate \"p99 < 200\" --window 7d",
+        ),
+        ("List issues", "lex issue list"),
+        ("Show one as JSON", "lex issue show <id>"),
+    ])
 }
 
 fn cmd_pkg() -> CommandInfo {

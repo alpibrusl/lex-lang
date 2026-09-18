@@ -1,6 +1,6 @@
 # lex
 
-Version: 0.11.44
+Version: 0.11.47
 ACLI version: 0.1.0
 
 ## Commands
@@ -172,6 +172,12 @@ Idempotent: false
 package manager: init, add, install, list deps; publish/verify signed capability contracts
 
 Idempotent: false
+
+### issue
+
+typed issues (#949): a unit of work with a declared, verifiable acceptance — done is a proof the gate verifies at HEAD, not a status someone sets
+
+Idempotent: true
 
 ### propagate
 

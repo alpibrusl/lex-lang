@@ -40,6 +40,7 @@ description: "Invoke the `lex` CLI. Commands: parse, check, authority, run…"
 - `lex agent-guidelines` — emit the AI-agent authoring contract (idiom rules) for this Lex toolchain (idempotent)
 - `lex init` — scaffold a new project (lex.toml, src/, tests/, CI)
 - `lex pkg` — package manager: init, add, install, list deps; publish/verify signed capability contracts
+- `lex issue` — typed issues (#949): a unit of work with a declared, verifiable acceptance — done is a proof the gate verifies at HEAD, not a status someone sets (idempotent)
 - `lex propagate` — push an upstream package's API change down its dependents: token-precise rename fan-out, or an agent-gated semantic migration
 - `lex fmt` — format .lex files; --check exits 1 if any need it
 - `lex ci` — run the full pipeline: pkg install, check --strict, fmt --check, test
@@ -863,6 +864,41 @@ lex pkg verify --archive pkg.tar --contract c.json --trusted-keys keyring.json
 ```
 
 **See also:** `lex init`, `lex ci`, `lex keygen`
+
+## `lex issue`
+
+typed issues (#949): a unit of work with a declared, verifiable acceptance — done is a proof the gate verifies at HEAD, not a status someone sets
+
+### Arguments
+
+- `subcommand` (enum[create|list|show], required) — what to do
+
+### Examples
+
+```bash
+# Declare a feature as a typed delta (API entry + example)
+lex issue create --title "add gcd" --shape typed_delta --api "gcd:(a :: Int, b :: Int) -> Int" --example "gcd(12, 8) => 4"
+```
+
+```bash
+# File a bug as a failing example (fixed = it passes)
+lex issue create --title "gcd(0,0) crashes" --shape failing_example --example "gcd(0, 0) => 0"
+```
+
+```bash
+# A metric target (ops/growth): a predicate over the event backbone
+lex issue create --title "p99 under 200ms" --shape metric_invariant --predicate "p99 < 200" --window 7d
+```
+
+```bash
+# List issues
+lex issue list
+```
+
+```bash
+# Show one as JSON
+lex issue show <id>
+```
 
 ## `lex propagate`
 

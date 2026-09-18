@@ -31,6 +31,7 @@ mod init;
 mod lint;
 mod merge;
 mod dep_resolver;
+mod issue;
 mod op;
 mod recall;
 mod export_git;
@@ -166,6 +167,7 @@ fn run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "policy" => cmd_policy(fmt, &args[1..]),
         "log" => branch::cmd_log(fmt, &args[1..]),
         "op" => op::cmd_op(fmt, &args[1..]),
+        "issue" => issue::cmd_issue(&args[1..]),
         "recall" => recall::cmd_recall(fmt, &args[1..]),
         "export-git" => export_git::cmd_export_git(fmt, &args[1..]),
         "docs" => docs::cmd_docs(fmt, &args[1..]),
@@ -249,6 +251,12 @@ fn print_usage() {
     println!("  pkg add <name> --git <url>         add a git dependency");
     println!("  pkg install                        install/verify all declared dependencies");
     println!("  pkg list                           list declared dependencies");
+    println!("  issue create --title T --shape S [--api name:sig[:kind]]... [--example E]...");
+    println!("                                     [--predicate P --window W] [--subject S] [--base OP]");
+    println!("                                     [--dep ID]... [--project P] [--store DIR]");
+    println!("                                     a typed issue: work with a declared, verifiable acceptance");
+    println!("  issue list [--store DIR]           list issues (id, shape, title)");
+    println!("  issue show <id> [--store DIR]      print an issue as JSON");
     println!("  propagate --package <p> --rename <old>=<new> [--workspace <d>] [--apply]");
     println!("                                     push an upstream API change down its dependents");
     println!("  run [policy] <file> <fn> [args]    execute fn (args parsed as JSON)");
