@@ -5,6 +5,26 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [0.11.60] - 2026-09-20
+
+### Fixed
+
+- **Replay works on package publishes (#980).** A package publish mangles every
+  declaration with a path-derived prefix, and a dotted name cannot be written as
+  Lex source — so `replay_request` asked regenerators for something unwritable,
+  and a bare-named regeneration was rejected for lacking the prefix. Every
+  package-published op replayed as a false negative, and the exact tier was
+  unreachable for them. Replay now compares in de-mangled space: the request
+  reports bare names, `parent_program` renders de-mangled, and "exact
+  reproduction" means byte-identical modulo the storage prefix. The attestation
+  still records the real stage id, so provenance is unchanged.
+- **A non-inlined head can be replayed (#946).** Reconstruction now includes the
+  head's `import` edges, and the behavioral tier links dependencies before
+  executing — re-materializing the head as source and loading it through the
+  same inlining loader `lex run` uses. Previously a head with any dependency
+  could not be executed at all, so correct regenerations were recorded as "did
+  not reproduce".
+
 ## [0.11.59] - 2026-09-19
 
 ### Changed
