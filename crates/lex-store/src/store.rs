@@ -364,6 +364,55 @@ impl Store {
         }
     }
 
+    /// The `import` edges of the head at `head_op`, as `Stage::Import`s (#930).
+    ///
+    /// A SigId→stage map holds only fn/type declarations; a head's imports are
+    /// `AddImport` ops and are absent from it. Every gate that type-checks a
+    /// reconstructed head must prepend these or a non-inlined head's
+    /// `<alias>.name` references fail as `unknown_identifier` even when the
+    /// dependency resolved correctly — the resolver scans these imports to find
+    /// each dependency, and the checker's Pass 1 binds the alias to the
+    /// resolved module. Returns empty when the head can't be read (an inlined
+    /// or import-free head needs nothing).
+    ///
+    /// Shared by all the write-path gates so they agree (#945).
+    fn head_import_stages(&self, head_op: &str) -> Vec<Stage> {
+        crate::render::package_head_at_op(self, head_op)
+            .map(|ph| {
+                ph.flat_imports
+                    .into_iter()
+                    .map(|(reference, alias)| Stage::Import(lex_ast::Import { reference, alias }))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Prepend the head's import edges to `decls`, skipping any import the
+    /// program already carries (so a caller that already has its own imports —
+    /// a publish of full file contents, say — doesn't get duplicates).
+    ///
+    /// The gate helper: `stages = store.with_head_imports(head_op, decls)`.
+    fn with_head_imports(&self, head_op: Option<&str>, decls: Vec<Stage>) -> Vec<Stage> {
+        let Some(head) = head_op else { return decls };
+        let present: std::collections::BTreeSet<(String, String)> = decls
+            .iter()
+            .filter_map(|s| match s {
+                Stage::Import(i) => Some((i.reference.clone(), i.alias.clone())),
+                _ => None,
+            })
+            .collect();
+        let mut stages: Vec<Stage> = self
+            .head_import_stages(head)
+            .into_iter()
+            .filter(|s| match s {
+                Stage::Import(i) => !present.contains(&(i.reference.clone(), i.alias.clone())),
+                _ => true,
+            })
+            .collect();
+        stages.extend(decls);
+        stages
+    }
+
     /// One-time migration for a store that predates the reverse
     /// index (#822), or whose previous rebuild pass never finished
     /// (e.g. the process was killed or its client disconnected
@@ -1477,6 +1526,16 @@ impl Store {
         // `apply_operation` are not gated yet (#130 follow-up).
         // #930: resolve any external dependency edges the head keeps
         // (empty when no resolver is installed or the head is inlined).
+        //
+        // `head_op` is deliberately `None` here and must stay that way (#945):
+        // this call CREATES the head, so there is no committed lock keyed to it
+        // yet — the pins live in the caller's working-copy `lex.lock`, which is
+        // exactly what a `None` head tells the resolver to use. Passing the
+        // *parent* head would be wrong: a publish may introduce a brand-new
+        // dependency whose pin exists only in the working copy. `stages` here is
+        // the full program as loaded, so it already carries its own `import`
+        // edges — unlike the map-reconstructed heads in the gates below, which
+        // must add them via `with_head_imports`.
         let modules = self.resolved_modules(stages, None);
         let module_types = self.resolved_module_types(stages, None);
         let dep_prefixes = self.resolved_module_prefixes(stages, None);
@@ -1677,10 +1736,17 @@ impl Store {
         transition: lex_vcs::StageTransition,
         candidate: &[lex_ast::Stage],
     ) -> Result<lex_vcs::OpId, StoreError> {
-        let modules = self.resolved_modules(candidate, None); // #930
-        let module_types = self.resolved_module_types(candidate, None);
-        let dep_prefixes = self.resolved_module_prefixes(candidate, None);
-        if let Err(errors) = lex_types::check_program_with_deps(candidate, &modules, &module_types, &dep_prefixes) {
+        // #945: the candidate comes from the head's SigId→stage map, which holds
+        // only fn/type declarations — the head's `import` edges are absent. Add
+        // them and resolve against the head the op applies to (whose committed
+        // lock pins the dependencies), so a non-inlined head type-checks on this
+        // write path exactly as it does on publish and on the hub's own gate.
+        let base_head = self.get_branch(branch).ok().flatten().and_then(|b| b.head_op);
+        let stages = self.with_head_imports(base_head.as_deref(), candidate.to_vec());
+        let modules = self.resolved_modules(&stages, base_head.as_deref()); // #930
+        let module_types = self.resolved_module_types(&stages, base_head.as_deref());
+        let dep_prefixes = self.resolved_module_prefixes(&stages, base_head.as_deref());
+        if let Err(errors) = lex_types::check_program_with_deps(&stages, &modules, &module_types, &dep_prefixes) {
             // #281: emit a `RepairHint` attestation against each
             // candidate stage the transition was about to produce.
             // The op record itself isn't persisted (the gate is
@@ -1794,13 +1860,19 @@ impl Store {
         let verdict = (|| -> Result<(), StoreError> {
             let head = self.branch_head(branch)?;
             let pairs: Vec<(String, String)> = head.into_iter().collect();
-            let stages: Vec<Stage> =
+            let decls: Vec<Stage> =
                 self.get_asts_for_sigs_bulk(&pairs).into_iter().collect::<Result<_, _>>()?;
-            // #930: per-head dep resolution for the merge path is a follow-up;
-            // None lets a client resolver use its working-copy lock.
-            let modules = self.resolved_modules(&stages, None);
-            let module_types = self.resolved_module_types(&stages, None);
-            let dep_prefixes = self.resolved_module_prefixes(&stages, None);
+            // #945: the merge op is already applied, so the post-merge head IS
+            // `op_id` — resolve this head's dependencies against it (its
+            // committed lock) and prepend its `import` edges, which the
+            // SigId→stage map omits. Without this a non-inlined head failed the
+            // merge gate as `unknown_identifier <alias>` even with the
+            // dependency correctly resolvable.
+            let merged_head = op_id.as_str();
+            let stages = self.with_head_imports(Some(merged_head), decls);
+            let modules = self.resolved_modules(&stages, Some(merged_head));
+            let module_types = self.resolved_module_types(&stages, Some(merged_head));
+            let dep_prefixes = self.resolved_module_prefixes(&stages, Some(merged_head));
             if let Err(errors) = lex_types::check_program_with_deps(&stages, &modules, &module_types, &dep_prefixes) {
                 return Err(StoreError::TypeError(errors));
             }
@@ -1855,11 +1927,19 @@ impl Store {
             }
         }
         let pairs: Vec<(String, String)> = head.into_iter().collect();
-        let stages: Vec<Stage> =
+        let decls: Vec<Stage> =
             self.get_asts_for_sigs_bulk(&pairs).into_iter().collect::<Result<_, _>>()?;
-        let modules = self.resolved_modules(&stages, None); // #930 (patch path)
-        let module_types = self.resolved_module_types(&stages, None);
-        let dep_prefixes = self.resolved_module_prefixes(&stages, None);
+        // #945: a projection has no committed op of its own, so resolve against
+        // the head it is projected ONTO — that head's committed lock pins the
+        // dependencies, and its `import` edges are the projection's imports too
+        // (a merge delta maps sig→stage, so it never adds or removes an import).
+        // Without this, resolve-time checking of a non-inlined head reported a
+        // bogus `unknown_identifier <alias>` and rejected valid resolutions.
+        let base_head = self.get_branch(branch).ok().flatten().and_then(|b| b.head_op);
+        let stages = self.with_head_imports(base_head.as_deref(), decls);
+        let modules = self.resolved_modules(&stages, base_head.as_deref()); // #930 (patch path)
+        let module_types = self.resolved_module_types(&stages, base_head.as_deref());
+        let dep_prefixes = self.resolved_module_prefixes(&stages, base_head.as_deref());
         if let Err(errors) = lex_types::check_program_with_deps(&stages, &modules, &module_types, &dep_prefixes) {
             return Err(StoreError::TypeError(errors));
         }
