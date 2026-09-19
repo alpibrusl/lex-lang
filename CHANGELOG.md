@@ -5,6 +5,23 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [0.11.59] - 2026-09-19
+
+### Changed
+
+- **Every publish now records an Intent (#970).** Intent was opt-in, and the
+  hosted store reached 136,507 ops with zero intents — the "why was this
+  changed" provenance that distinguishes lex-vcs from git had no data on real
+  history. A publish without `--intent-prompt` now records an explicitly
+  *unattributed* intent instead of none: it invents no prompt, but records the
+  session (so one run's ops group together), the producer (`cli/unknown`), and a
+  fixed, exactly-matchable marker that no prompt was declared. The session
+  defaults per-process, with `LEX_INTENT_SESSION` for a harness spanning
+  invocations.
+- `--intent-model` / `--intent-session` / `--intent-issue` no longer require
+  `--intent-prompt`; they are meaningful on their own now that an intent always
+  exists. Forward-only: existing intentless ops stay intentless.
+
 ## [0.11.58] - 2026-09-19
 
 ### Fixed
