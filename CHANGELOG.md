@@ -5,6 +5,21 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [0.11.51] - 2026-09-19
+
+### Fixed
+
+- **Non-inlined dependency resolution now carries a dependency's exported
+  type declarations, not just its function signatures (#930 completeness).**
+  A package that referenced a dependency's exported *type* — in an
+  annotation, by constructing/reading its record, or via its ADT
+  constructors — failed to type-check on the non-inlined path (it worked
+  pre-#930 only because dependencies were inlined). The dependency's `type`
+  decls are registered under each import's alias, matching the visibility an
+  inlined dependency's types had. `check_program_with_module_ifaces` /
+  `check_and_rewrite_program_with_module_ifaces` and
+  `DepResolver::resolve_module_types` (defaulted) thread them through.
+
 ## [0.11.50] - 2026-09-18
 
 ### Added
