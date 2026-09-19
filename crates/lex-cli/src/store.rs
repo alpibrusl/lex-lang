@@ -155,16 +155,21 @@ pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             positional.push(a.clone());
         }
     }
-    if intent_prompt.is_none()
-        && (intent_model.is_some() || intent_session.is_some() || intent_issue.is_some())
-    {
-        bail!("--intent-model / --intent-session / --intent-issue require --intent-prompt");
-    }
+    // #970: `--intent-model` / `--intent-session` / `--intent-issue` no longer
+    // require `--intent-prompt`. Every publish now records an intent (a
+    // synthesized, explicitly-unattributed one when no prompt is given), so
+    // these flags are meaningful on their own — binding an op to an issue or a
+    // session without prose is useful, and refusing it only pushed callers
+    // toward recording nothing at all.
     let path = positional.first().ok_or_else(|| {
         anyhow!(
         "usage: lex publish [--store DIR] [--branch NAME] [--activate] [--signing-key HEX] \
-         [--intent-prompt TEXT [--intent-model PROVIDER/NAME] [--intent-session ID] \
-         [--intent-issue ISSUE_ID]] <file>")
+         [--intent-prompt TEXT] [--intent-model PROVIDER/NAME] [--intent-session ID] \
+         [--intent-issue ISSUE_ID] <file>\n\
+         \n\
+         Every publish records an Intent. Without --intent-prompt it is recorded \
+         as explicitly unattributed (#970) — pass --intent-prompt to say why the \
+         change was made, which is what makes `lex recall` and `lex op replay` useful.")
     })?;
     let signer = resolve_signing_key(signing_key_flag.as_deref())?;
 
@@ -376,28 +381,43 @@ pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     }
 
     // #131 / #839: record the caller's Intent (prompt / model / session) so
-    // every op this publish emits carries *why* it happened. Optional;
-    // `lex recall --intent <id>` and `lex op replay` read it back.
-    let intent_id: Option<lex_vcs::IntentId> = match &intent_prompt {
-        Some(prompt) => {
-            let (provider, name) = split_model_ref(intent_model.as_deref());
-            let intent = lex_vcs::Intent::new(
-                prompt.clone(),
-                intent_session.clone().unwrap_or_else(|| "cli".to_string()),
-                lex_vcs::ModelDescriptor { provider, name, version: None },
-                None,
-            );
-            let intent = match &intent_issue {
-                Some(id) => intent.with_issue(id.clone()),
-                None => intent,
-            };
-            lex_vcs::IntentLog::open(&root)
-                .with_context(|| "opening intent log")?
-                .put(&intent)
-                .with_context(|| "recording intent")?;
-            Some(intent.intent_id.clone())
-        }
-        None => None,
+    // every op this publish emits carries *why* it happened.
+    //
+    // #970: this is no longer optional. Intent was opt-in, and the result was
+    // that the hosted corpus reached 136k ops with ZERO intents — the "why was
+    // this changed" provenance that distinguishes lex-vcs from git had no data
+    // at all on real history. Optional provenance reliably converges on no
+    // provenance, so a publish without `--intent-prompt` now records an
+    // explicitly *unattributed* intent instead of none.
+    //
+    // It does not invent a prompt. What it does record is worth having: the
+    // session (so one run's ops group together), the producer, and a marker
+    // that no prompt was declared — which is queryable, so "show me the ops
+    // nobody explained" becomes answerable rather than indistinguishable from
+    // the rest of history.
+    let intent_id: Option<lex_vcs::IntentId> = {
+        let prompt = intent_prompt
+            .clone()
+            .unwrap_or_else(|| UNATTRIBUTED_PROMPT.to_string());
+        // `split_model_ref(None)` already yields this toolchain's spelling for
+        // "the CLI made this, no model declared" (`cli/unknown`), which is the
+        // honest descriptor for an unattributed publish too.
+        let (provider, name) = split_model_ref(intent_model.as_deref());
+        let intent = lex_vcs::Intent::new(
+            prompt,
+            intent_session.clone().unwrap_or_else(default_intent_session),
+            lex_vcs::ModelDescriptor { provider, name, version: None },
+            None,
+        );
+        let intent = match &intent_issue {
+            Some(id) => intent.with_issue(id.clone()),
+            None => intent,
+        };
+        lex_vcs::IntentLog::open(&root)
+            .with_context(|| "opening intent log")?
+            .put(&intent)
+            .with_context(|| "recording intent")?;
+        Some(intent.intent_id.clone())
     };
 
     let outcome = store.publish_program_with_intent(
@@ -456,6 +476,36 @@ pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 /// provider `cli`; `None` → `("cli", "unknown")`. The model ref is
 /// recorded for audit and feeds the content-addressed IntentId, so the
 /// default must be stable, not empty.
+/// The prompt recorded when a publish declares no `--intent-prompt` (#970).
+///
+/// Deliberately *not* a plausible-looking prompt: it must be impossible to
+/// mistake a synthesized intent for one a caller actually supplied. It is a
+/// fixed string so it is exactly matchable — `lex recall --predicate` can list
+/// every unattributed op, which is what makes "who never explained their
+/// changes" answerable instead of invisible.
+pub(crate) const UNATTRIBUTED_PROMPT: &str = "(unattributed: published without --intent-prompt)";
+
+/// The session id for a publish that gave no `--intent-session` (#970).
+///
+/// `LEX_INTENT_SESSION` lets a harness supply continuity across several `lex`
+/// invocations that belong to one logical run. Without it, the id is
+/// per-process: one invocation's ops group together, while separate runs stay
+/// separate. A *constant* default would be worse than none — it would collapse
+/// every publish ever made on the machine into a single bogus "session", making
+/// `lex recall --session` useless precisely where it should help.
+fn default_intent_session() -> String {
+    if let Ok(s) = std::env::var("LEX_INTENT_SESSION") {
+        if !s.trim().is_empty() {
+            return s;
+        }
+    }
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("cli-{}-{started}", std::process::id())
+}
+
 fn split_model_ref(m: Option<&str>) -> (String, String) {
     match m {
         None => ("cli".to_string(), "unknown".to_string()),
