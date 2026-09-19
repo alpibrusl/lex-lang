@@ -5,6 +5,24 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [0.11.52] - 2026-09-19
+
+### Fixed
+
+- **Within-package transitive type identity for non-inlined dependencies
+  (#963, building on #962).** A dependency's sibling module re-exposing an
+  inlined module's type (lex-orm's `connection` re-exposing its `error`
+  module's `DbErr`) broke non-inlined resolution: a directly-imported module
+  got a differently-named type than the copies inlined into its siblings. A
+  dependency is now resolved as one package (`load_package`) so its modules
+  share the loader's deterministic path-derived prefixes; the gate registers
+  the dependency's prefix-named types and normalizes an alias-qualified
+  annotation (`e.DbErr`) to the canonical name. New entry points
+  `check_program_with_deps` / `check_and_rewrite_program_with_deps` and
+  `DepResolver::resolve_module_prefixes` (defaulted). A remaining
+  cross-package case (a type reached through two different dependency
+  packages) is tracked on #963.
+
 ## [0.11.51] - 2026-09-19
 
 ### Fixed
