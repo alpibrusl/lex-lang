@@ -486,9 +486,33 @@ impl LoaderState {
                                 path: imp.reference.clone(),
                                 source,
                             })?;
+                    // #963 cross-package identity: prefix the dependency's files
+                    // by the dependency's OWN package identity — its package root
+                    // and name — not the importer's. The same dependency module
+                    // reached through two different importers (a direct
+                    // `import "lex-schema/json_value"` and a copy inlined via
+                    // `lex-spec`) then mangles to one prefix, so its type has one
+                    // identity. A dependency's files are only ever reached
+                    // through a package import, so switching here (and restoring
+                    // after) prefixes every dependency consistently regardless of
+                    // which importer reaches it first. Only affects the
+                    // `inline_packages` path (dependency resolution + example
+                    // runs); the non-inlined publish keeps package edges, so
+                    // op-log SigIds are unchanged.
+                    let dep_root = crate::workspace::find_manifest(&resolved)
+                        .map(|(_toml, root)| root)
+                        .and_then(|r| r.canonicalize().ok());
+                    let saved_root = self.prefix_root.clone();
+                    let saved_ns = self.prefix_namespace.clone();
+                    if let Some(root) = dep_root {
+                        self.prefix_root = Some(root);
+                        self.prefix_namespace = Some(pkg.to_string());
+                    }
                     let child_prefix = self.prefix_for(&resolved);
                     path_imports.insert(imp.alias.clone(), child_prefix);
                     let child_prog = self.load(&resolved)?;
+                    self.prefix_root = saved_root;
+                    self.prefix_namespace = saved_ns;
                     merged_children.extend(child_prog.items);
                 }
                 Item::Import(_) => std_imports.push(item),
