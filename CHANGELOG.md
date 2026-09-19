@@ -5,6 +5,21 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [0.11.57] - 2026-09-19
+
+### Fixed
+
+- **The merge and patch gates now resolve dependencies (#945).** Since #930 made
+  dependencies non-inlined, a head keeps its `import` edges — but
+  `apply_operation_checked` (`/v1/patch`), `apply_merge_op_gated` and
+  `typecheck_merge_projection` type-checked a head rebuilt from the
+  SigId→stage map, which omits those edges, and so rejected valid non-inlined
+  heads as `unknown_identifier "<alias>"`. Each gate now resolves against the
+  head that applies — the op's base head, the post-merge head, and the head
+  being projected onto respectively — sharing one import-reconstruction helper
+  with the hub gate. `publish_program_with_intent` deliberately still resolves
+  from the working-copy lock, since it creates the head.
+
 ## [0.11.56] - 2026-09-19
 
 ### Fixed
