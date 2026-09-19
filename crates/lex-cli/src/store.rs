@@ -188,9 +188,13 @@ pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     ));
     let modules = resolver.resolve_modules(&stages, None);
     let module_types = resolver.resolve_module_types(&stages, None);
-    if let Err(errs) =
-        lex_types::check_and_rewrite_program_with_module_ifaces(&mut stages, &modules, &module_types)
-    {
+    let dep_prefixes = resolver.resolve_module_prefixes(&stages, None);
+    if let Err(errs) = lex_types::check_and_rewrite_program_with_deps(
+        &mut stages,
+        &modules,
+        &module_types,
+        &dep_prefixes,
+    ) {
         let arr: Vec<serde_json::Value> = errs
             .iter()
             .map(|e| serde_json::to_value(e).unwrap())

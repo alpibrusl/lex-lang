@@ -271,6 +271,24 @@ pub trait DepResolver: Send + Sync {
     ) -> BTreeMap<String, Vec<lex_ast::TypeDecl>> {
         BTreeMap::new()
     }
+
+    /// Each resolved dependency import's **module mangle prefix**, keyed by the
+    /// same import reference (#963). When a dependency is resolved as a whole
+    /// package, its exported types are named by their path-derived prefix
+    /// (`error_<hash>.DbErr`); this lets the write-time gate map the import
+    /// alias to that prefix so an alias-qualified type reference (`e.DbErr`)
+    /// resolves to the same type the dependency's own signatures name.
+    ///
+    /// Defaulted to empty: a resolver that returns bare (alias-qualified) type
+    /// names supplies none, and the gate keeps the #930 alias-qualification
+    /// path.
+    fn resolve_module_prefixes(
+        &self,
+        _stages: &[Stage],
+        _head_op: Option<&str>,
+    ) -> BTreeMap<String, String> {
+        BTreeMap::new()
+    }
 }
 
 pub struct Store {
@@ -328,6 +346,20 @@ impl Store {
     ) -> BTreeMap<String, Vec<lex_ast::TypeDecl>> {
         match &self.resolver {
             Some(r) => r.resolve_module_types(stages, head_op),
+            None => BTreeMap::new(),
+        }
+    }
+
+    /// The resolved dependency import → module-prefix map for a head being
+    /// gated (#963) — the installed resolver's answer, or empty when none is
+    /// installed (then the gate keeps the #930 alias-qualified path).
+    fn resolved_module_prefixes(
+        &self,
+        stages: &[Stage],
+        head_op: Option<&str>,
+    ) -> BTreeMap<String, String> {
+        match &self.resolver {
+            Some(r) => r.resolve_module_prefixes(stages, head_op),
             None => BTreeMap::new(),
         }
     }
@@ -1447,7 +1479,8 @@ impl Store {
         // (empty when no resolver is installed or the head is inlined).
         let modules = self.resolved_modules(stages, None);
         let module_types = self.resolved_module_types(stages, None);
-        if let Err(errors) = lex_types::check_program_with_module_ifaces(stages, &modules, &module_types) {
+        let dep_prefixes = self.resolved_module_prefixes(stages, None);
+        if let Err(errors) = lex_types::check_program_with_deps(stages, &modules, &module_types, &dep_prefixes) {
             return Err(StoreError::TypeError(errors));
         }
 
@@ -1646,7 +1679,8 @@ impl Store {
     ) -> Result<lex_vcs::OpId, StoreError> {
         let modules = self.resolved_modules(candidate, None); // #930
         let module_types = self.resolved_module_types(candidate, None);
-        if let Err(errors) = lex_types::check_program_with_module_ifaces(candidate, &modules, &module_types) {
+        let dep_prefixes = self.resolved_module_prefixes(candidate, None);
+        if let Err(errors) = lex_types::check_program_with_deps(candidate, &modules, &module_types, &dep_prefixes) {
             // #281: emit a `RepairHint` attestation against each
             // candidate stage the transition was about to produce.
             // The op record itself isn't persisted (the gate is
@@ -1766,7 +1800,8 @@ impl Store {
             // None lets a client resolver use its working-copy lock.
             let modules = self.resolved_modules(&stages, None);
             let module_types = self.resolved_module_types(&stages, None);
-            if let Err(errors) = lex_types::check_program_with_module_ifaces(&stages, &modules, &module_types) {
+            let dep_prefixes = self.resolved_module_prefixes(&stages, None);
+            if let Err(errors) = lex_types::check_program_with_deps(&stages, &modules, &module_types, &dep_prefixes) {
                 return Err(StoreError::TypeError(errors));
             }
             Ok(())
@@ -1824,7 +1859,8 @@ impl Store {
             self.get_asts_for_sigs_bulk(&pairs).into_iter().collect::<Result<_, _>>()?;
         let modules = self.resolved_modules(&stages, None); // #930 (patch path)
         let module_types = self.resolved_module_types(&stages, None);
-        if let Err(errors) = lex_types::check_program_with_module_ifaces(&stages, &modules, &module_types) {
+        let dep_prefixes = self.resolved_module_prefixes(&stages, None);
+        if let Err(errors) = lex_types::check_program_with_deps(&stages, &modules, &module_types, &dep_prefixes) {
             return Err(StoreError::TypeError(errors));
         }
         Ok(())
@@ -2373,7 +2409,8 @@ impl Store {
         // resolver); empty when none is installed or the head is inlined.
         let modules = self.resolved_modules(&stages, Some(to_head));
         let module_types = self.resolved_module_types(&stages, Some(to_head));
-        let result = match lex_types::check_program_with_module_ifaces(&stages, &modules, &module_types) {
+        let dep_prefixes = self.resolved_module_prefixes(&stages, Some(to_head));
+        let result = match lex_types::check_program_with_deps(&stages, &modules, &module_types, &dep_prefixes) {
             Ok(_) => lex_vcs::AttestationResult::Passed,
             Err(errors) => lex_vcs::AttestationResult::Failed {
                 detail: serde_json::to_string(&errors).unwrap_or_else(|_| "type errors".into()),

@@ -36,36 +36,71 @@ impl ClientDepResolver {
     /// [`lex_store::DepResolver::resolve_modules`], the type decls feed
     /// [`lex_store::DepResolver::resolve_module_types`], so a dependent that
     /// references a dependency's *type* (not just its functions) type-checks.
-    fn module_iface(&self, pkg: &str, module: &str) -> Option<(Ty, Vec<lex_ast::TypeDecl>)> {
+    /// A dependency module's public surface, resolved with the whole
+    /// dependency loaded as **one package** (#963). `load_package` gives every
+    /// file in the dependency a deterministic, path-derived mangle prefix
+    /// (`connection_<hash>`, `error_<hash>`), so a module imported directly and
+    /// the copies of it inlined into its sibling modules share ONE identity —
+    /// the diamond `load_program`-per-module produced (a bare direct import vs
+    /// an `error_<hash>` inlined copy) disappears. Returns:
+    /// - the value record, this module's own functions keyed by bare name
+    ///   (prefix stripped), signatures kept as loaded (cross-module references
+    ///   stay prefix-qualified);
+    /// - every type declaration in the loaded package (prefix-named, globally
+    ///   unique), so any type the module's surface exposes resolves;
+    /// - this module's own mangle prefix, so the checker can map the import
+    ///   alias to it (`<alias>.Type` → `<prefix>.Type`).
+    fn module_iface(
+        &self,
+        pkg: &str,
+        module: &str,
+    ) -> Option<(Ty, Vec<lex_ast::TypeDecl>, String)> {
         let module_file =
             lex_syntax::workspace::resolve_package_import(&self.importer, pkg, module).ok()?;
-        // `load_program` inlines the dependency module's *local* closure and
-        // keeps its own declarations under their bare names — exactly the
-        // public surface a dependent reaches via `<alias>.name`.
-        let prog = lex_syntax::load_program(&module_file).ok()?;
-        let stages = lex_ast::canonicalize_program(&prog);
+        let (_toml, pkg_root) = lex_syntax::workspace::find_manifest(&module_file)?;
+        let loaded = lex_syntax::load_package(
+            std::slice::from_ref(&module_file),
+            &pkg_root,
+            pkg,
+            /*inline_packages=*/ true,
+        )
+        .ok()?;
+        let stages = lex_ast::canonicalize_program(&loaded.program);
         let types = lex_types::check_program(&stages).ok()?;
-        let fields = types
-            .fn_signatures
+
+        // This module's own prefix: the `module_prefixes` entry whose file is
+        // this module, relative to the (canonicalized) package root.
+        let root_c = pkg_root.canonicalize().ok()?;
+        let module_rel = module_file
+            .canonicalize()
+            .ok()?
+            .strip_prefix(&root_c)
+            .ok()?
+            .to_string_lossy()
+            .to_string();
+        let prefix = loaded
+            .module_prefixes
             .iter()
-            .map(|(name, scheme)| (name.clone(), scheme.ty.clone()));
+            .find(|(_p, f)| f.as_str() == module_rel)
+            .map(|(p, _)| p.clone())?;
+
+        // Value record: this module's own functions, bare-keyed.
+        let dot = format!("{prefix}.");
+        let fields = types.fn_signatures.iter().filter_map(|(name, scheme)| {
+            name.strip_prefix(&dot).map(|bare| (bare.to_string(), scheme.ty.clone()))
+        });
         let record = lex_types::module_record_from_fields(fields);
-        // Only the module's OWN types are part of its public surface. Types it
-        // inlined from its *own* transitive dependencies carry a mangle prefix
-        // (`constraints_<hash>.StrCheck`); a dependent that also imports that
-        // transitive dependency directly reaches those types through its own
-        // alias, so re-exposing the inlined copies here would register a second,
-        // distinct qualified name (and duplicate constructors) for the same
-        // type — a diamond mismatch. A module's own type names are bare (no
-        // dot), so exclude the dotted, inlined ones.
+
+        // Every type in the loaded package — prefix-named and globally unique,
+        // so the checker registers them as-is and any exposed type resolves.
         let type_decls: Vec<lex_ast::TypeDecl> = stages
             .into_iter()
             .filter_map(|s| match s {
-                lex_ast::Stage::TypeDecl(td) if !td.name.contains('.') => Some(td),
+                lex_ast::Stage::TypeDecl(td) => Some(td),
                 _ => None,
             })
             .collect();
-        Some((record, type_decls))
+        Some((record, type_decls, prefix))
     }
 }
 
@@ -81,7 +116,7 @@ impl DepResolver for ClientDepResolver {
             let Some((pkg, module)) = split_package_import(&imp.reference) else {
                 continue;
             };
-            if let Some((ty, _)) = self.module_iface(pkg, module) {
+            if let Some((ty, _, _)) = self.module_iface(pkg, module) {
                 out.insert(imp.reference.clone(), ty);
             }
         }
@@ -99,10 +134,28 @@ impl DepResolver for ClientDepResolver {
             let Some((pkg, module)) = split_package_import(&imp.reference) else {
                 continue;
             };
-            if let Some((_, decls)) = self.module_iface(pkg, module) {
+            if let Some((_, decls, _)) = self.module_iface(pkg, module) {
                 if !decls.is_empty() {
                     out.insert(imp.reference.clone(), decls);
                 }
+            }
+        }
+        out
+    }
+
+    fn resolve_module_prefixes(
+        &self,
+        stages: &[lex_ast::Stage],
+        _head_op: Option<&str>,
+    ) -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        for st in stages {
+            let lex_ast::Stage::Import(imp) = st else { continue };
+            let Some((pkg, module)) = split_package_import(&imp.reference) else {
+                continue;
+            };
+            if let Some((_, _, prefix)) = self.module_iface(pkg, module) {
+                out.insert(imp.reference.clone(), prefix);
             }
         }
         out

@@ -25,6 +25,14 @@ pub struct TypeEnv {
     pub types: IndexMap<String, TypeDef>,
     /// Constructor name → owning type-name.
     pub ctor_to_type: IndexMap<String, String>,
+    /// Import alias → dependency module mangle prefix (#963). When a dependency
+    /// is resolved as a whole package, its types are registered under canonical
+    /// prefix names (`error_<hash>.DbErr`); this maps an import alias `e` to
+    /// that prefix so an alias-qualified annotation `e.DbErr` is normalized to
+    /// the same canonical `Con` in [`ty_from_canon_env`] — making a
+    /// directly-imported module and the copies inlined into its sibling modules
+    /// one type. Empty in the ordinary (inlined / no-dependency) case.
+    pub dep_alias_prefixes: IndexMap<String, String>,
 }
 
 impl TypeEnv {
@@ -373,10 +381,16 @@ impl TypeEnv {
     pub fn add_user_type(&mut self, name: &str, decl: lex_ast::TypeDecl) -> Result<(), String> {
         match &decl.definition {
             lex_ast::TypeExpr::Union { variants } => {
+                // Resolve payloads env-aware (#963: normalizes alias-qualified
+                // dependency types in a variant payload, e.g. `AddColumn(s.Field)`)
+                // — compute the whole map under an immutable borrow first, then
+                // record constructors and insert the type.
                 let mut vmap = IndexMap::new();
                 for v in variants {
-                    let payload = v.payload.as_ref().map(|p| ty_from_canon(p, &decl.params));
+                    let payload = v.payload.as_ref().map(|p| ty_from_canon_env(p, &decl.params, self));
                     vmap.insert(v.name.clone(), payload);
+                }
+                for v in variants {
                     self.ctor_to_type.insert(v.name.clone(), name.to_string());
                 }
                 self.types.insert(name.to_string(), TypeDef {
@@ -493,6 +507,16 @@ pub fn ty_from_canon(t: &lex_ast::TypeExpr, params: &[String]) -> Ty {
 /// type names in `env`. Called from `add_user_type` and `function_scheme` so
 /// that `{ ...Post, extra :: Int }` expands to a flat `Ty::Record`.
 pub fn ty_from_canon_env(t: &lex_ast::TypeExpr, params: &[String], env: &TypeEnv) -> Ty {
+    // #963: normalize alias-qualified dependency type references to the
+    // dependency module's canonical prefix (`e.DbErr` → `error_<hash>.DbErr`)
+    // so they name the same type the dependency's own signatures (and the
+    // copies inlined into its sibling modules) do. Only kicks in when a
+    // dependency was resolved as a whole package.
+    if !env.dep_alias_prefixes.is_empty() {
+        if let Some(normalized) = normalize_dep_alias(t, env) {
+            return ty_from_canon_env(&normalized, params, env);
+        }
+    }
     match t {
         lex_ast::TypeExpr::RecordWithSpreads { spreads, fields } => {
             let mut m = IndexMap::new();
@@ -512,4 +536,128 @@ pub fn ty_from_canon_env(t: &lex_ast::TypeExpr, params: &[String], env: &TypeEnv
         }
         other => ty_from_canon(other, params),
     }
+}
+
+/// Deep-rewrite alias-qualified dependency type names (`e.DbErr`) to their
+/// module's canonical prefix (`error_<hash>.DbErr`) using
+/// [`TypeEnv::dep_alias_prefixes`]. Returns `Some(rewritten)` only when a name
+/// actually changed, so the caller can proceed on the rewritten form without
+/// re-entering (the rewritten form has no alias names left). See #963.
+fn normalize_dep_alias(t: &lex_ast::TypeExpr, env: &TypeEnv) -> Option<lex_ast::TypeExpr> {
+    use lex_ast::TypeExpr as T;
+    match t {
+        T::Named { name, args } => {
+            let renamed = name
+                .split_once('.')
+                .and_then(|(alias, rest)| {
+                    env.dep_alias_prefixes.get(alias).map(|p| format!("{p}.{rest}"))
+                });
+            let new_args: Vec<Option<T>> = args.iter().map(|a| normalize_dep_alias(a, env)).collect();
+            if renamed.is_none() && new_args.iter().all(|a| a.is_none()) {
+                return None;
+            }
+            let args = args
+                .iter()
+                .zip(new_args)
+                .map(|(orig, changed)| changed.unwrap_or_else(|| orig.clone()))
+                .collect();
+            Some(T::Named { name: renamed.unwrap_or_else(|| name.clone()), args })
+        }
+        T::Record { fields } => rewrite_fields(fields, env).map(|fields| T::Record { fields }),
+        T::Tuple { items } => rewrite_items(items, env).map(|items| T::Tuple { items }),
+        T::Function { params, effects, effect_row_var, ret } => {
+            let new_params: Vec<Option<T>> = params.iter().map(|p| normalize_dep_alias(p, env)).collect();
+            let new_ret = normalize_dep_alias(ret, env);
+            if new_ret.is_none() && new_params.iter().all(|p| p.is_none()) {
+                return None;
+            }
+            let params = params
+                .iter()
+                .zip(new_params)
+                .map(|(orig, changed)| changed.unwrap_or_else(|| orig.clone()))
+                .collect();
+            Some(T::Function {
+                params,
+                effects: effects.clone(),
+                effect_row_var: effect_row_var.clone(),
+                ret: Box::new(new_ret.unwrap_or_else(|| (**ret).clone())),
+            })
+        }
+        T::Union { variants } => {
+            let rewritten: Vec<Option<T>> = variants
+                .iter()
+                .map(|v| v.payload.as_ref().and_then(|p| normalize_dep_alias(p, env)))
+                .collect();
+            if rewritten.iter().all(|r| r.is_none()) {
+                return None;
+            }
+            let variants = variants
+                .iter()
+                .zip(rewritten)
+                .map(|(v, changed)| lex_ast::UnionVariant {
+                    name: v.name.clone(),
+                    payload: changed.or_else(|| v.payload.clone()),
+                })
+                .collect();
+            Some(T::Union { variants })
+        }
+        T::RecordWithSpreads { spreads, fields } => {
+            // Spread base names could be alias-qualified too.
+            let new_spreads: Vec<String> = spreads
+                .iter()
+                .map(|s| {
+                    s.split_once('.')
+                        .and_then(|(a, rest)| env.dep_alias_prefixes.get(a).map(|p| format!("{p}.{rest}")))
+                        .unwrap_or_else(|| s.clone())
+                })
+                .collect();
+            let spreads_changed = new_spreads != *spreads;
+            let new_fields = rewrite_fields(fields, env);
+            if !spreads_changed && new_fields.is_none() {
+                return None;
+            }
+            Some(T::RecordWithSpreads {
+                spreads: new_spreads,
+                fields: new_fields.unwrap_or_else(|| fields.clone()),
+            })
+        }
+        T::Refined { base, binding, predicate } => normalize_dep_alias(base, env).map(|b| T::Refined {
+            base: Box::new(b),
+            binding: binding.clone(),
+            predicate: predicate.clone(),
+        }),
+    }
+}
+
+fn rewrite_fields(fields: &[lex_ast::TypeField], env: &TypeEnv) -> Option<Vec<lex_ast::TypeField>> {
+    let rewritten: Vec<Option<lex_ast::TypeExpr>> =
+        fields.iter().map(|f| normalize_dep_alias(&f.ty, env)).collect();
+    if rewritten.iter().all(|r| r.is_none()) {
+        return None;
+    }
+    Some(
+        fields
+            .iter()
+            .zip(rewritten)
+            .map(|(f, changed)| lex_ast::TypeField {
+                name: f.name.clone(),
+                ty: changed.unwrap_or_else(|| f.ty.clone()),
+            })
+            .collect(),
+    )
+}
+
+fn rewrite_items(items: &[lex_ast::TypeExpr], env: &TypeEnv) -> Option<Vec<lex_ast::TypeExpr>> {
+    let rewritten: Vec<Option<lex_ast::TypeExpr>> =
+        items.iter().map(|it| normalize_dep_alias(it, env)).collect();
+    if rewritten.iter().all(|r| r.is_none()) {
+        return None;
+    }
+    Some(
+        items
+            .iter()
+            .zip(rewritten)
+            .map(|(it, changed)| changed.unwrap_or_else(|| it.clone()))
+            .collect(),
+    )
 }
