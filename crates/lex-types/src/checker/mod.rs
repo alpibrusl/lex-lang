@@ -1191,6 +1191,17 @@ impl Checker {
                 Ok(Ty::List(Box::new(elem)))
             }
             a::CExpr::FieldAccess { value, field } => {
+                // #963: `<alias>.Ctor` used as a value — a nullary constructor
+                // of a resolved dependency module (a payload constructor used
+                // this way is handled in `check_call`). Same rationale as the
+                // qualified-constructor call path.
+                if let a::CExpr::Var { name: alias } = &**value {
+                    if self.type_env.dep_alias_prefixes.contains_key(alias)
+                        && self.type_env.ctor_to_type.contains_key(field)
+                    {
+                        return self.check_constructor(field, &[], node_id, locals, effs);
+                    }
+                }
                 let vt = self.check_expr(value, node_id, locals, effs)?;
                 let resolved = self.u.resolve(&vt);
                 // Unfold a Record-aliased Con (e.g. `type Request = { ... }`
@@ -1426,6 +1437,21 @@ impl Checker {
         locals: &mut IndexMap<String, Ty>,
         effs: &mut EffectSet,
     ) -> Result<Ty, TypeError> {
+        // #963: a qualified constructor call, `<alias>.Ctor(args)`, where the
+        // alias is a resolved dependency module and `Ctor` is one of its
+        // exported constructors. Non-inlined resolution keeps the reference
+        // qualified (an inlined dependency would have rewritten it to the bare,
+        // flat-namespace constructor), so route it to constructor checking
+        // rather than letting it read as a field access on the module record.
+        if let a::CExpr::FieldAccess { value, field } = callee {
+            if let a::CExpr::Var { name: alias } = &**value {
+                if self.type_env.dep_alias_prefixes.contains_key(alias)
+                    && self.type_env.ctor_to_type.contains_key(field)
+                {
+                    return self.check_constructor(field, args, node_id, locals, effs);
+                }
+            }
+        }
         // #168: identify the call before the recursive descent so we
         // can later rewrite this exact node. The identity is a stable
         // (stage, NodeId) pair rather than the expression's address

@@ -185,3 +185,39 @@ fn oops() -> Int { width(5) }
         "passing an Int where sa.Shared is expected must fail"
     );
 }
+
+// #963: a qualified constructor of a resolved dependency — `d.KStr("x")` (call)
+// and `d.None` (nullary value) — resolves to the dependency's ADT constructor,
+// not a field access on the module record.
+#[test]
+fn qualified_dependency_constructor_resolves() {
+    let dep_kind: Vec<lex_ast::TypeDecl> = stages("type Kind = KStr(Str) | KNil")
+        .into_iter()
+        .filter_map(|s| match s {
+            lex_ast::Stage::TypeDecl(mut td) => {
+                td.name = "k_h.Kind".to_string();
+                Some(td)
+            }
+            _ => None,
+        })
+        .collect();
+    let modules = BTreeMap::from([("dep/k".to_string(), module_record_from_fields(Vec::new()))]);
+    let module_types = BTreeMap::from([("dep/k".to_string(), dep_kind)]);
+    let prefixes = BTreeMap::from([("dep/k".to_string(), "k_h".to_string())]);
+
+    let src = "\
+import \"dep/k\" as d
+fn from_str() -> d.Kind { d.KStr(\"x\") }
+fn nil() -> d.Kind { d.KNil }
+";
+    let s = stages(src);
+    check_program_with_deps(&s, &modules, &module_types, &prefixes)
+        .unwrap_or_else(|errs| panic!("qualified constructors must resolve: {errs:#?}"));
+
+    // A wrong payload type is still rejected.
+    let bad = stages("import \"dep/k\" as d\nfn oops() -> d.Kind { d.KStr(5) }\n");
+    assert!(
+        check_program_with_deps(&bad, &modules, &module_types, &prefixes).is_err(),
+        "d.KStr(Int) must fail — payload is Str"
+    );
+}

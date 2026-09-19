@@ -1,6 +1,6 @@
 {
   "name": "lex",
-  "version": "0.11.52",
+  "version": "0.11.53",
   "acli_version": "0.1.0",
   "commands": [
     {
