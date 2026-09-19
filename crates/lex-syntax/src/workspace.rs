@@ -116,6 +116,24 @@ pub fn satisfies_floor(running: &str, floor: &str) -> Option<bool> {
 #[serde(untagged)]
 pub enum Dependency {
     Path     { path: String },
+    /// A dual reference: the vcs registry is the PRIMARY, default resolution
+    /// source (pinned via `lex.lock`), and `git` is a recorded mirror/fallback
+    /// — used only when the registry is unreachable, or when the CLI is asked
+    /// to resolve from git instead (`--source git`). Listed before `Git`/
+    /// `Registry` so the untagged deserializer picks it whenever all of
+    /// `registry` + `version` + `git` are present. This is what lets a manifest
+    /// carry BOTH a git and a vcs reference for the same dependency.
+    Both     {
+        registry: String,
+        version:  String,
+        git:      String,
+        #[serde(default)]
+        branch:   Option<String>,
+        #[serde(default)]
+        tag:      Option<String>,
+        #[serde(default)]
+        rev:      Option<String>,
+    },
     Git      {
         git:    String,
         #[serde(default)]
@@ -128,16 +146,46 @@ pub enum Dependency {
     Registry { registry: String, version: String },
 }
 
+/// A git dependency coordinate: `(url, branch, tag, rev)`. `branch`/`tag`/`rev`
+/// are mutually exclusive (at most one set); all `None` means the default branch.
+pub type GitCoord<'a> = (&'a str, Option<&'a str>, Option<&'a str>, Option<&'a str>);
+
 impl Dependency {
     /// Return an error if more than one of branch/tag/rev is set.
     pub fn validate(&self) -> Result<(), String> {
-        if let Dependency::Git { branch, tag, rev, .. } = self {
-            let count = [branch, tag, rev].iter().filter(|o| o.is_some()).count();
-            if count > 1 {
-                return Err("at most one of `branch`, `tag`, `rev` may be set on a git dependency".into());
-            }
+        let refs = match self {
+            Dependency::Git { branch, tag, rev, .. } => [branch, tag, rev],
+            Dependency::Both { branch, tag, rev, .. } => [branch, tag, rev],
+            _ => return Ok(()),
+        };
+        if refs.iter().filter(|o| o.is_some()).count() > 1 {
+            return Err("at most one of `branch`, `tag`, `rev` may be set on a git dependency".into());
         }
         Ok(())
+    }
+
+    /// The vcs/registry coordinate `(registry, version)` if this dep resolves
+    /// (by default) from a registry — both a bare `Registry` and the dual
+    /// `Both`. `None` for pure git or path deps.
+    pub fn registry_coord(&self) -> Option<(&str, &str)> {
+        match self {
+            Dependency::Registry { registry, version }
+            | Dependency::Both { registry, version, .. } => Some((registry, version)),
+            _ => None,
+        }
+    }
+
+    /// The git coordinate `(git, branch, tag, rev)` this dep carries — the
+    /// sole source for a pure `Git`, or the recorded fallback mirror on a
+    /// dual `Both`. `None` for registry-only or path deps.
+    pub fn git_coord(&self) -> Option<GitCoord<'_>> {
+        match self {
+            Dependency::Git { git, branch, tag, rev }
+            | Dependency::Both { git, branch, tag, rev, .. } => {
+                Some((git, branch.as_deref(), tag.as_deref(), rev.as_deref()))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -217,24 +265,31 @@ pub fn resolve_package_import(
             git_ensure_cached(pkg_name, git, &git_ref)?
         }
         Dependency::Registry { registry, version } => {
-            // A registry dependency declares a *constraint*; the exact release
-            // to fetch comes from `lex.lock` (#893). Prefer the locked pin; a
-            // declaration that is already an exact version resolves directly.
-            let locked = crate::lock::LockFile::load_dir(&toml_dir)
-                .and_then(|lf| lf.entry(pkg_name).map(|e| e.version.clone()));
-            let effective = match locked {
-                Some(v) => v,
-                None if crate::semver::parse_exact(version).is_some() => version.clone(),
-                None => {
-                    // A constraint with no lock entry can't be fetched — there
-                    // is no single version to ask the registry for.
-                    return Err(PackageError::UnlockedRegistryDep {
-                        name: pkg_name.to_string(),
-                        constraint: version.clone(),
-                    });
-                }
+            resolve_registry_dep(pkg_name, registry, version, &toml_dir)?
+        }
+        Dependency::Both { registry, version, git, branch, tag, rev } => {
+            dep.validate().map_err(|e| PackageError::ManifestParse {
+                path: toml_path.display().to_string(),
+                detail: e,
+            })?;
+            // vcs is the PRIMARY, default source; git is the recorded
+            // fallback mirror. `LEX_DEP_SOURCE=git` (set by the CLI's
+            // `--source git`) forces the git ref; otherwise resolve from the
+            // registry and fall back to git only when there is no way to ask
+            // the registry (no lock pin and a non-exact constraint).
+            let resolve_git = || -> Result<PathBuf, PackageError> {
+                let git_ref = GitRef::from(branch.as_deref(), tag.as_deref(), rev.as_deref());
+                git_ensure_cached(pkg_name, git, &git_ref)
             };
-            registry_ensure_cached(pkg_name, registry, &effective)?
+            if dep_source_prefers_git() {
+                resolve_git()?
+            } else {
+                match resolve_registry_dep(pkg_name, registry, version, &toml_dir) {
+                    Ok(root) => root,
+                    Err(PackageError::UnlockedRegistryDep { .. }) => resolve_git()?,
+                    Err(e) => return Err(e),
+                }
+            }
         }
     };
 
@@ -243,6 +298,42 @@ pub fn resolve_package_import(
         module: module_path.to_string(),
         pkg_root: pkg_root.display().to_string(),
     })
+}
+
+/// Whether dependency resolution should prefer a dual dep's git fallback over
+/// its vcs/registry primary. Set by the CLI's `--source git` flag via the
+/// `LEX_DEP_SOURCE` env var so the pure source resolver stays flag-free.
+/// Default (unset, or any value other than `git`) is vcs-primary.
+pub fn dep_source_prefers_git() -> bool {
+    std::env::var("LEX_DEP_SOURCE")
+        .map(|v| v.eq_ignore_ascii_case("git"))
+        .unwrap_or(false)
+}
+
+/// Resolve a registry (vcs) dependency to a cached package root. A registry
+/// dependency declares a *constraint*; the exact release to fetch comes from
+/// `lex.lock` (#893). Prefer the locked pin; a declaration that is already an
+/// exact version resolves directly; a constraint with no lock entry can't be
+/// fetched (there is no single version to ask the registry for).
+fn resolve_registry_dep(
+    pkg_name: &str,
+    registry: &str,
+    version: &str,
+    toml_dir: &Path,
+) -> Result<PathBuf, PackageError> {
+    let locked = crate::lock::LockFile::load_dir(toml_dir)
+        .and_then(|lf| lf.entry(pkg_name).map(|e| e.version.clone()));
+    let effective = match locked {
+        Some(v) => v,
+        None if crate::semver::parse_exact(version).is_some() => version.to_string(),
+        None => {
+            return Err(PackageError::UnlockedRegistryDep {
+                name: pkg_name.to_string(),
+                constraint: version.to_string(),
+            });
+        }
+    };
+    registry_ensure_cached(pkg_name, registry, &effective)
 }
 
 /// Look for `{module_path}.lex` inside a package root, checking `src/`
@@ -541,5 +632,69 @@ mod floor_tests {
         let m: super::Manifest =
             toml::from_str("[package]\nname = \"p\"\nversion = \"0.1.0\"\n").expect("parse");
         assert_eq!(m.package.unwrap().lex, None);
+    }
+}
+
+#[cfg(test)]
+mod dual_ref_tests {
+    use super::{Dependency, Manifest};
+
+    fn dep<'a>(m: &'a Manifest, name: &str) -> &'a Dependency {
+        m.dependencies.get(name).expect("dep present")
+    }
+
+    #[test]
+    fn a_dep_with_both_git_and_registry_parses_as_both_not_git() {
+        // The untagged deserializer must pick `Both` (not `Git`, which is
+        // listed after it) when registry+version+git are all present —
+        // otherwise the vcs primary would be silently dropped.
+        let m: Manifest = toml::from_str(
+            "[package]\nname = \"c\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\n\
+             lex-schema = { registry = \"vcs.lexlang.org/lex-official/lex-schema\", version = \"^0.9\", git = \"https://github.com/alpibrusl/lex-schema\" }\n",
+        )
+        .expect("parse");
+        let d = dep(&m, "lex-schema");
+        assert!(matches!(d, Dependency::Both { .. }), "got {d:?}");
+        assert_eq!(
+            d.registry_coord(),
+            Some(("vcs.lexlang.org/lex-official/lex-schema", "^0.9")),
+            "vcs primary must be readable"
+        );
+        assert_eq!(
+            d.git_coord(),
+            Some(("https://github.com/alpibrusl/lex-schema", None, None, None)),
+            "git mirror must be readable"
+        );
+        d.validate().expect("valid");
+    }
+
+    #[test]
+    fn bare_git_and_bare_registry_still_parse_to_their_own_variants() {
+        let m: Manifest = toml::from_str(
+            "[package]\nname = \"c\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\n\
+             g = { git = \"https://example.com/g\", tag = \"v1\" }\n\
+             r = { registry = \"vcs.example/tenant/r\", version = \"^1.0\" }\n",
+        )
+        .expect("parse");
+        assert!(matches!(dep(&m, "g"), Dependency::Git { .. }));
+        assert!(matches!(dep(&m, "r"), Dependency::Registry { .. }));
+        // Accessors: bare git has no registry coord; bare registry has no git.
+        assert_eq!(dep(&m, "g").registry_coord(), None);
+        assert_eq!(dep(&m, "g").git_coord(), Some(("https://example.com/g", None, Some("v1"), None)));
+        assert_eq!(dep(&m, "r").registry_coord(), Some(("vcs.example/tenant/r", "^1.0")));
+        assert_eq!(dep(&m, "r").git_coord(), None);
+    }
+
+    #[test]
+    fn a_dual_dep_rejects_two_git_refs() {
+        let m: Manifest = toml::from_str(
+            "[package]\nname = \"c\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\n\
+             d = { registry = \"vcs/r\", version = \"1.0.0\", git = \"https://x/g\", branch = \"main\", tag = \"v1\" }\n",
+        )
+        .expect("parse");
+        assert!(dep(&m, "d").validate().is_err(), "two git refs must be rejected");
     }
 }
