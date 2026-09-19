@@ -1604,6 +1604,62 @@ pub(crate) fn attestations_since_handler(state: &State, query: &str)
 
 // ── Package concept (#4) ────────────────────────────────────────────────────
 
+/// Full coordinates of one declared dependency, captured from the releaser's
+/// `lex.toml` so the rendered archive can reproduce a faithful `[dependencies]`
+/// table — carrying BOTH a vcs (`registry` + `version`) reference and a `git`
+/// mirror when the source declared both. Every field is optional so a bare
+/// registry dep, a bare git dep, or a dual dep all round-trip. `#[serde(default,
+/// skip_serializing_if)]` keeps the record compact and back-compatible.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct DepSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    registry: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    git: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rev: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+}
+
+impl DepSpec {
+    /// Render this spec as the body of a `lex.toml` inline dependency table,
+    /// e.g. `{ registry = "…", version = "^0.9", git = "…" }`. Keys are emitted
+    /// in a stable order (vcs primary first, then the git mirror) so the
+    /// rendered manifest is deterministic.
+    fn to_toml_inline(&self) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        let mut push = |k: &str, v: &Option<String>| {
+            if let Some(val) = v {
+                parts.push(format!("{k} = {}", toml_str(val)));
+            }
+        };
+        push("registry", &self.registry);
+        push("version", &self.version);
+        push("git", &self.git);
+        push("branch", &self.branch);
+        push("tag", &self.tag);
+        push("rev", &self.rev);
+        push("path", &self.path);
+        if parts.is_empty() {
+            None
+        } else {
+            Some(format!("{{ {} }}", parts.join(", ")))
+        }
+    }
+}
+
+/// Quote a string as a TOML basic string (escaping `\` and `"`).
+fn toml_str(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 /// Per-version record stored at `{store_root}/packages/{name}/{version}.json`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PkgRecord {
@@ -1619,6 +1675,13 @@ struct PkgRecord {
     /// propagation). `#[serde(default)]` keeps pre-existing records readable.
     #[serde(default)]
     dependencies: Vec<String>,
+    /// Full dependency coordinates (name → git+vcs refs) captured from the
+    /// releaser's `lex.toml`, so the rendered install archive reproduces a
+    /// faithful `[dependencies]` table (with both git and vcs references).
+    /// `#[serde(default)]` keeps pre-existing records (which lack it) readable;
+    /// when empty, the archive falls back to a bare `[package]` manifest.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    dependency_specs: std::collections::BTreeMap<String, DepSpec>,
     /// Raw op JSON from each file in this publish.
     ops: Vec<serde_json::Value>,
 }
@@ -1759,6 +1822,12 @@ struct ReleaseReq {
     /// Unioned with any non-inlined external imports found in the head.
     #[serde(default)]
     dependencies: Vec<String>,
+    /// Full dependency coordinates (name → git+vcs refs) from the releaser's
+    /// `lex.toml`, so the rendered install archive reproduces a faithful
+    /// `[dependencies]` table. Optional (back-compatible); when omitted, the
+    /// archive manifest carries only `[package]`.
+    #[serde(default)]
+    dependency_specs: std::collections::BTreeMap<String, DepSpec>,
 }
 
 /// `POST /v1/pkg/{name}/release` — cut an immutable versioned release of
@@ -1873,6 +1942,9 @@ fn pkg_release_handler(state: &State, name: &str, body: &str) -> Response<std::i
     if let Ok(extracted) = lex_store::api::external_dependencies_at_op(&store, &head_op) {
         deps.extend(extracted);
     }
+    // Names captured as full coordinates count as dependency-graph edges too,
+    // so a release that sends only `dependency_specs` still records the edges.
+    deps.extend(req.dependency_specs.keys().cloned());
     let dependencies: Vec<String> = deps.into_iter().collect();
     drop(store);
 
@@ -1887,6 +1959,7 @@ fn pkg_release_handler(state: &State, name: &str, body: &str) -> Response<std::i
         published_at,
         function_names,
         dependencies,
+        dependency_specs: req.dependency_specs,
         ops: Vec::new(),
     };
     if let Err(e) = save_pkg_record(&state.root, &record, None) {
@@ -2384,6 +2457,10 @@ fn pkg_publish_handler(state: &State, body: &[u8]) -> Response<std::io::Cursor<V
         published_at: now,
         function_names: all_function_names,
         dependencies,
+        // The archive-upload path stores the uploaded archive verbatim (its
+        // lex.toml already carries the full dependency table), so it is served
+        // directly rather than re-rendered — no captured specs needed here.
+        dependency_specs: Default::default(),
         ops: all_ops.clone(),
     };
     if let Err(e) = save_pkg_record(&state.root, &record, Some(body)) {
@@ -2517,11 +2594,13 @@ fn pkg_archive_handler(state: &State, name: &str, version: &str) -> Response<std
     // 2. An op-log-native release (op push + `POST …/release`, #911) has no
     //    stored archive — render one from the pinned op-log head so the
     //    package installs like any other (#920).
-    if let Some(head_op) = load_pkg_record(&state.root, name, version).and_then(|r| r.head_op) {
-        match render_op_log_archive(state, name, version, &head_op) {
-            Ok(bytes) => return gzip(bytes),
-            Err(e) => {
-                return error_response(500, format!("rendering archive for {name:?}@{version:?}: {e}"));
+    if let Some(record) = load_pkg_record(&state.root, name, version) {
+        if let Some(head_op) = record.head_op.clone() {
+            match render_op_log_archive(state, name, version, &head_op, &record.dependency_specs) {
+                Ok(bytes) => return gzip(bytes),
+                Err(e) => {
+                    return error_response(500, format!("rendering archive for {name:?}@{version:?}: {e}"));
+                }
             }
         }
     }
@@ -2539,6 +2618,7 @@ fn render_op_log_archive(
     name: &str,
     version: &str,
     head_op: &str,
+    dependency_specs: &std::collections::BTreeMap<String, DepSpec>,
 ) -> Result<Vec<u8>, String> {
     // De-flatten the head into its source tree — one `src/lib.lex` for a
     // single-module package, or the full `src/*.lex` layout for a
@@ -2556,7 +2636,22 @@ fn render_op_log_archive(
         }
     };
 
-    let manifest = format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\n");
+    // Reconstruct the manifest from the release record. When the release
+    // captured full dependency coordinates, emit a faithful `[dependencies]`
+    // table (carrying both git and vcs references where the source declared
+    // both); otherwise a bare `[package]` (pre-dependency-capture releases).
+    let mut manifest = format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\n");
+    let dep_lines: Vec<String> = dependency_specs
+        .iter()
+        .filter_map(|(dep_name, spec)| spec.to_toml_inline().map(|inline| format!("{dep_name} = {inline}")))
+        .collect();
+    if !dep_lines.is_empty() {
+        manifest.push_str("\n[dependencies]\n");
+        for line in dep_lines {
+            manifest.push_str(&line);
+            manifest.push('\n');
+        }
+    }
     let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     {
         let mut ar = tar::Builder::new(&mut enc);
@@ -2660,6 +2755,38 @@ fn pkg_delete_handler(state: &State, name: &str) -> Response<std::io::Cursor<Vec
 }
 
 #[cfg(test)]
+mod dep_spec_tests {
+    use super::DepSpec;
+
+    #[test]
+    fn a_dual_spec_renders_both_git_and_vcs_refs_vcs_first() {
+        let spec = DepSpec {
+            registry: Some("vcs.lexlang.org/lex-official/lex-schema".into()),
+            version: Some("^0.9".into()),
+            git: Some("https://github.com/alpibrusl/lex-schema".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            spec.to_toml_inline().as_deref(),
+            Some("{ registry = \"vcs.lexlang.org/lex-official/lex-schema\", version = \"^0.9\", git = \"https://github.com/alpibrusl/lex-schema\" }"),
+        );
+    }
+
+    #[test]
+    fn bare_git_and_bare_registry_specs_render_their_own_keys() {
+        let git = DepSpec { git: Some("https://x/g".into()), tag: Some("v1".into()), ..Default::default() };
+        assert_eq!(git.to_toml_inline().as_deref(), Some("{ git = \"https://x/g\", tag = \"v1\" }"));
+        let reg = DepSpec { registry: Some("vcs/r".into()), version: Some("1.0.0".into()), ..Default::default() };
+        assert_eq!(reg.to_toml_inline().as_deref(), Some("{ registry = \"vcs/r\", version = \"1.0.0\" }"));
+    }
+
+    #[test]
+    fn an_empty_spec_renders_nothing() {
+        assert_eq!(DepSpec::default().to_toml_inline(), None);
+    }
+}
+
+#[cfg(test)]
 mod policy_ceiling_tests {
     use super::*;
     use lex_runtime::Policy;
@@ -2752,6 +2879,7 @@ mod public_read_tests {
             published_at: 1,
             function_names: vec![format!("{name}.f")],
             dependencies: vec![],
+            dependency_specs: Default::default(),
             ops: vec![],
         };
         save_pkg_record(root, &record, Some(format!("ARCHIVE:{name}@{version}").as_bytes()))

@@ -184,6 +184,18 @@ fn cmd_add(args: &[String]) -> Result<()> {
 /// verify the archive against it before trusting it — `--trusted-keys`
 /// additionally pins the signer, and `--require-contracts` refuses any
 /// registry dep the registry serves unsigned.
+/// Apply a `--source git|vcs` selection for dual (git + vcs) dependencies by
+/// setting the `LEX_DEP_SOURCE` seam the pure resolver reads
+/// (`workspace::dep_source_prefers_git`). `vcs` (the default) clears it.
+fn set_dep_source(v: &str) -> Result<()> {
+    match v {
+        "git" => std::env::set_var("LEX_DEP_SOURCE", "git"),
+        "vcs" => std::env::remove_var("LEX_DEP_SOURCE"),
+        other => bail!("--source must be `git` or `vcs` (got `{other}`)"),
+    }
+    Ok(())
+}
+
 fn cmd_install(args: &[String]) -> Result<()> {
     use std::collections::{HashMap, VecDeque};
 
@@ -205,6 +217,13 @@ fn cmd_install(args: &[String]) -> Result<()> {
             // a declared floor is a stated requirement, and installing
             // past one silently is what made #803 hard to diagnose.
             "--ignore-lex-floor" => ignore_lex_floor = true,
+            // For dual (git + vcs) deps, choose which reference resolves.
+            // Default is vcs (the primary); `--source git` uses the git mirror.
+            "--source" => {
+                i += 1;
+                let v = args.get(i).ok_or_else(|| anyhow::anyhow!("--source requires `git` or `vcs`"))?;
+                set_dep_source(v)?;
+            }
             other => bail!("unknown flag `{other}`"),
         }
         i += 1;
@@ -275,11 +294,20 @@ fn cmd_install(args: &[String]) -> Result<()> {
                 format!("{}{}", git, ref_desc)
             }
             Some(lex_syntax::workspace::Dependency::Path { path }) => path.clone(),
-            Some(lex_syntax::workspace::Dependency::Registry { registry, version }) => {
-                match lock.entry(&name) {
+            Some(dep @ lex_syntax::workspace::Dependency::Registry { .. })
+            | Some(dep @ lex_syntax::workspace::Dependency::Both { .. }) => {
+                // vcs is primary for both a bare registry dep and a dual dep;
+                // a dual dep also notes its git mirror.
+                let (registry, version) = dep.registry_coord().expect("registry coord");
+                let base = match lock.entry(&name) {
                     Some(e) if e.version != *version =>
                         format!("{registry}@{version} → {} (locked)", e.version),
                     _ => format!("{registry}@{version}"),
+                };
+                match (lex_syntax::workspace::dep_source_prefers_git(), dep.git_coord()) {
+                    (true, Some((git, ..))) => format!("{git} (git, selected)"),
+                    (false, Some(_)) => format!("{base} (+git mirror)"),
+                    _ => base,
                 }
             }
             None => "?".into(),
@@ -288,11 +316,17 @@ fn cmd_install(args: &[String]) -> Result<()> {
         print!("  {name}  {dep_display}{transitive_tag} ... ");
         std::io::Write::flush(&mut std::io::stdout()).ok();
 
-        // For registry deps: verify the published contract before installing.
-        if let Some(lex_syntax::workspace::Dependency::Registry { registry, version }) = &dep_owned {
+        // For registry deps (bare or the vcs-primary half of a dual dep):
+        // verify the published contract before installing. Skip when the CLI
+        // has selected the git source for a dual dep.
+        if let Some((registry, version)) = dep_owned
+            .as_ref()
+            .filter(|_| !lex_syntax::workspace::dep_source_prefers_git())
+            .and_then(|d| d.registry_coord())
+        {
             // Verify the exact release that will be fetched — the lock's pin,
             // not the constraint (a constraint has no `/contract` endpoint).
-            let effective = lock.entry(&name).map(|e| e.version.as_str()).unwrap_or(version.as_str());
+            let effective = lock.entry(&name).map(|e| e.version.as_str()).unwrap_or(version);
             match verify_registry_dep(registry, &name, effective, keyring.as_ref()) {
                 Ok(DepVerification::Verified { signer, signer_trusted, .. }) => {
                     let trust = if signer_trusted {
@@ -468,8 +502,6 @@ fn cmd_install(args: &[String]) -> Result<()> {
 /// not part of the semver lock; only `{ registry, version }` deps appear in
 /// `lex.lock`.
 fn cmd_lock(args: &[String], keep_existing: bool) -> Result<()> {
-    use lex_syntax::workspace::Dependency;
-
     if let Some(flag) = args.first() {
         bail!("`lex pkg {}` takes no arguments (got `{flag}`)",
             if keep_existing { "lock" } else { "update" });
@@ -492,10 +524,11 @@ fn cmd_lock(args: &[String], keep_existing: bool) -> Result<()> {
     let mut registry_deps: Vec<(String, String, String)> = manifest
         .dependencies
         .iter()
-        .filter_map(|(name, dep)| match dep {
-            Dependency::Registry { registry, version } =>
-                Some((name.clone(), registry.clone(), version.clone())),
-            _ => None,
+        .filter_map(|(name, dep)| {
+            // Both a bare registry dep and the vcs-primary half of a dual dep
+            // are semver-resolved into the lock.
+            dep.registry_coord()
+                .map(|(registry, version)| (name.clone(), registry.to_string(), version.to_string()))
         })
         .collect();
     registry_deps.sort();
@@ -593,6 +626,36 @@ fn cmd_lock(args: &[String], keep_existing: bool) -> Result<()> {
 /// The token (a store-scoped `evk_` key) comes from `--token` or
 /// `LEXHUB_TOKEN`. The hub applies the version-bump gate, so a too-small bump
 /// for the API change is refused here just as over HTTP.
+/// Build the `dependency_specs` payload for a release: each dependency's full
+/// coordinates (registry+version for a vcs dep, git+ref for a git dep, or BOTH
+/// for a dual dep), so the hub renders a faithful `[dependencies]` table into
+/// the install archive. Path deps are recorded as-is (informational).
+fn dependency_specs_json(
+    deps: &std::collections::HashMap<String, lex_syntax::workspace::Dependency>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    for (name, dep) in deps {
+        let mut spec = serde_json::Map::new();
+        if let Some((registry, version)) = dep.registry_coord() {
+            spec.insert("registry".into(), registry.into());
+            spec.insert("version".into(), version.into());
+        }
+        if let Some((git, branch, tag, rev)) = dep.git_coord() {
+            spec.insert("git".into(), git.into());
+            if let Some(b) = branch { spec.insert("branch".into(), b.into()); }
+            if let Some(t) = tag { spec.insert("tag".into(), t.into()); }
+            if let Some(r) = rev { spec.insert("rev".into(), r.into()); }
+        }
+        if let lex_syntax::workspace::Dependency::Path { path } = dep {
+            spec.insert("path".into(), path.clone().into());
+        }
+        if !spec.is_empty() {
+            out.insert(name.clone(), serde_json::Value::Object(spec));
+        }
+    }
+    out
+}
+
 fn cmd_release(args: &[String]) -> Result<()> {
     let mut hub: Option<String> = None;
     let mut version: Option<String> = None;
@@ -624,12 +687,16 @@ fn cmd_release(args: &[String]) -> Result<()> {
     let version = version.unwrap_or_else(|| pkg.version.clone());
     // Dependency-graph edges: the names of declared dependencies.
     let dependencies: Vec<String> = manifest.dependencies.keys().cloned().collect();
+    // Full coordinates (git + vcs refs) so the hub can render a faithful
+    // `[dependencies]` table into the install archive.
+    let dependency_specs = dependency_specs_json(&manifest.dependencies);
 
     let url = format!("{}/v1/pkg/{}/release", hub.trim_end_matches('/'), name);
     let body = serde_json::json!({
         "version": version,
         "branch": branch,
         "dependencies": dependencies,
+        "dependency_specs": dependency_specs,
     });
     print!("releasing {name}@{version}");
     if !dependencies.is_empty() {
@@ -686,7 +753,7 @@ enum DepIdentity {
 fn dep_identity(dep: &lex_syntax::workspace::Dependency, base_dir: &Path) -> DepIdentity {
     use lex_syntax::workspace::Dependency;
     match dep {
-        Dependency::Git { .. } | Dependency::Registry { .. } => {
+        Dependency::Git { .. } | Dependency::Registry { .. } | Dependency::Both { .. } => {
             DepIdentity::Concrete(dep_source_key(dep, base_dir))
         }
         Dependency::Path { path } => {
@@ -732,6 +799,20 @@ fn dep_source_key(dep: &lex_syntax::workspace::Dependency, base_dir: &Path) -> S
         }
         Dependency::Path { path } => format!("path:{}", base_dir.join(path).display()),
         Dependency::Registry { registry, version } => format!("registry:{registry}@{version}"),
+        // A dual dep's cache slot is keyed by whichever source will actually
+        // fill it: the git mirror when the CLI selected git, else the vcs
+        // primary — so it aliases a bare registry dep to the same coordinate.
+        Dependency::Both { registry, version, git, branch, tag, rev } => {
+            if lex_syntax::workspace::dep_source_prefers_git() {
+                let ref_part = branch.as_deref().map(|b| format!("@branch:{b}"))
+                    .or_else(|| tag.as_deref().map(|t| format!("@tag:{t}")))
+                    .or_else(|| rev.as_deref().map(|r| format!("@rev:{r}")))
+                    .unwrap_or_default();
+                format!("git:{git}{ref_part}")
+            } else {
+                format!("registry:{registry}@{version}")
+            }
+        }
     }
 }
 
@@ -793,6 +874,14 @@ fn cmd_list() -> Result<()> {
             }
             lex_syntax::workspace::Dependency::Registry { registry, version } =>
                 println!("  {name}  registry = {registry}  version = {version}"),
+            lex_syntax::workspace::Dependency::Both { registry, version, git, branch, tag, rev } => {
+                let pin = branch.as_deref().map(|b| format!(" branch={b}"))
+                    .or_else(|| tag.as_deref().map(|t| format!(" tag={t}")))
+                    .or_else(|| rev.as_deref().map(|r| format!(" rev={}", &r[..r.len().min(12)])))
+                    .unwrap_or_default();
+                println!("  {name}  registry = {registry}  version = {version}  (vcs primary)");
+                println!("  {}  git      = {git}{pin}  (fallback mirror)", " ".repeat(name.len()));
+            }
         }
     }
     Ok(())
