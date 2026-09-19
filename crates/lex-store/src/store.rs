@@ -2102,11 +2102,19 @@ impl Store {
             None => String::new(),
         };
 
-        // The target function's name + signature, from the recorded
-        // stage — a regenerator needs the interface, not just the hash.
+        // The target function's name + signature, from the recorded stage — a
+        // regenerator needs the interface, not just the hash.
+        //
+        // #980: report the *bare* name. A package publish mangles the recorded
+        // declaration (`lib_<hash>.twice`), and a dotted name is not valid Lex
+        // source — so the old, mangled `target_signature` asked regenerators
+        // for something unwritable, and every package-published op replayed as
+        // a false negative.
         let (target_name, target_signature) = match self.get_ast(&expected_stage_id) {
             Ok(lex_ast::Stage::FnDecl(fd)) => {
-                (Some(fd.name.clone()), Some(lex_vcs::render_signature(&fd)))
+                let mut bare = fd.clone();
+                bare.name = demangled_name(&fd.name).to_string();
+                (Some(bare.name.clone()), Some(lex_vcs::render_signature(&bare)))
             }
             _ => (None, None),
         };
@@ -2304,10 +2312,40 @@ impl Store {
         Ok(self.with_head_imports(Some(op_id), decls))
     }
 
+    /// See [`demangled_name`]; method form for call sites that already hold a
+    /// `Store`.
+    pub fn bare_declaration_name(name: &str) -> &str {
+        demangled_name(name)
+    }
+
+    /// The program at an op **as an author would write it** — declarations
+    /// under bare names (`twice`, not `lib_<hash>.twice`), with the head's
+    /// imports (#980).
+    ///
+    /// A package publish mangles every declaration with a path-derived prefix.
+    /// That prefix is a *storage* detail: a dotted name cannot be written as
+    /// Lex source at all (`fn lib_abc.twice(..)` is a parse error), so anything
+    /// that shows a program to an author — or asks one to regenerate a
+    /// function from it — has to de-mangle first.
+    ///
+    /// Falls back to the mangled reconstruction when de-mangling isn't
+    /// available (a multi-module head, pending #942), so callers degrade to the
+    /// previous behaviour rather than failing outright.
+    pub fn demangled_program_at_op(&self, op_id: &str) -> Result<Vec<Stage>, StoreError> {
+        match crate::render::demangled_head_stages(self, op_id) {
+            Ok(stages) => Ok(stages),
+            Err(StoreError::UnsupportedMultiModuleDependency) => self.program_stages_at_op(op_id),
+            Err(e) => Err(e),
+        }
+    }
+
     /// The program at an op, rendered to source. Used to give a replay
     /// regenerator the context the change was made against.
+    ///
+    /// #980: rendered from the *de-mangled* program, so what a regenerator is
+    /// shown is source it could actually have written.
     fn program_source_at_op(&self, op_id: &lex_vcs::OpId) -> Result<String, StoreError> {
-        Ok(lex_ast::print_stages(&self.program_stages_at_op(op_id)?))
+        Ok(lex_ast::print_stages(&self.demangled_program_at_op(op_id)?))
     }
 
     /// Open the attestation log rooted at this store. The log lives
@@ -4262,4 +4300,18 @@ fn canonical_bytes(stage: &Stage) -> Result<Vec<u8>, StoreError> {
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, StoreError> {
     let bytes = fs::read(path)?;
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// A declaration's name with the package loader's mangle prefix removed —
+/// `lib_62579d1a.twice` → `twice`; a name with no prefix is returned unchanged
+/// (#980).
+///
+/// The split is unambiguous: a Lex declaration name cannot contain a `.` in
+/// source (`fn a.b(..)` is a parse error), so any dot in a stored name is the
+/// loader's `<stem>_<hash>.` separator and never part of the author's name.
+pub fn demangled_name(name: &str) -> &str {
+    match name.split_once('.') {
+        Some((_prefix, bare)) => bare,
+        None => name,
+    }
 }

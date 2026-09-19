@@ -165,8 +165,33 @@ fn cmd_op_replay(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     // falls through to the behavioral tier. A regeneration that doesn't
     // parse, or defines no matching function, is a legitimate negative
     // result — recorded, not a hard error.
-    let expected_stages = store.program_stages_at_op(&op_id).unwrap_or_default();
-    let recorded_fd = crate::behavioral::fndecl_at_stage(&expected_stages, &req.expected_stage_id);
+    // #980: compare in DE-MANGLED space. A package publish mangles every
+    // declaration (`lib_<hash>.twice`), but a dotted name cannot be written as
+    // Lex source — so a regenerator necessarily emits the bare name, and
+    // matching it against the mangled record made every package-published op
+    // replay as a false negative. `replay_request` now reports the bare
+    // name/signature, so the regeneration and the record meet in the same
+    // space. The attestation still carries the real (mangled) stage id:
+    // `replay_record` looks it up from the op, so provenance is unchanged.
+    let expected_stages = store.demangled_program_at_op(&op_id).unwrap_or_default();
+    // The recorded stage id addresses the *mangled* declaration, so it won't be
+    // found here; locate the target by the bare name instead, falling back to
+    // the id for a head that was never mangled (a single-file publish).
+    let recorded_fd = req
+        .target_name
+        .as_deref()
+        .and_then(|want| {
+            expected_stages.iter().find_map(|s| match s {
+                lex_ast::Stage::FnDecl(fd) if fd.name == want => Some(fd),
+                _ => None,
+            })
+        })
+        .or_else(|| crate::behavioral::fndecl_at_stage(&expected_stages, &req.expected_stage_id));
+    // What "exact reproduction" means in this space: byte-identical to the
+    // recorded stage once its storage prefix is gone.
+    let expected_id_demangled = recorded_fd
+        .and_then(|fd| lex_ast::stage_id(&lex_ast::Stage::FnDecl(fd.clone())))
+        .unwrap_or_else(|| req.expected_stage_id.clone());
     let outcome = match lex_syntax::parse_source(&src) {
         Err(e) => store.replay_record_miss(&op_id, &format!("regenerated source did not parse: {e:?}"))?,
         Ok(prog) => {
@@ -184,7 +209,7 @@ fn cmd_op_replay(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             match cand {
                 Some(cand) => {
                     let produced = lex_ast::stage_id(&cand);
-                    let exact = produced.as_deref() == Some(req.expected_stage_id.as_str());
+                    let exact = produced.as_deref() == Some(expected_id_demangled.as_str());
                     if exact {
                         store.replay_record(&op_id, produced, true, None, None)?
                     } else if let Some(pid) = produced {
@@ -196,7 +221,7 @@ fn cmd_op_replay(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                         let behavioral = crate::behavioral::behavioral_equiv(
                             &expected_stages,
                             &cand,
-                            &req.expected_stage_id,
+                            &expected_id_demangled,
                         );
                         match behavioral {
                             Some(n) => store.replay_record(&op_id, Some(pid), true, Some(n), None)?,
