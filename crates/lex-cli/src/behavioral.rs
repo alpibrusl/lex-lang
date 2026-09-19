@@ -144,10 +144,57 @@ fn input_grid(params: &[Param]) -> Option<Vec<Vec<Value>>> {
     Some(rows)
 }
 
+/// Link a reconstructed head so it can be **executed** (#946).
+///
+/// Since #930 a head keeps `import "<pkg>/<module>" as <alias>` edges rather
+/// than inlining the dependency's code, so its stages type-check against the
+/// resolver's *signatures* but cannot run — the implementations simply are not
+/// in the op-log. This re-materializes the head as source and loads it through
+/// the same inlining loader `lex run` / `lex check` use, which resolves each
+/// import and rewrites cross-module references. Reusing that path is the point:
+/// a hand-rolled alias→prefix pass over the recorded AST would duplicate
+/// subtle, already-proven logic.
+///
+/// Returns `None` when there is nothing to link (no package imports), or when
+/// the dependencies aren't resolvable from here — replay run outside a package,
+/// or a dependency that was never installed. The caller then proceeds with the
+/// unlinked stages, so behaviour is unchanged for inlined and dependency-free
+/// heads.
+fn link_for_execution(stages: &[Stage]) -> Option<Vec<Stage>> {
+    let needs_link = stages.iter().any(|s| match s {
+        Stage::Import(i) => crate::dep_resolver::split_package_import(&i.reference).is_some(),
+        _ => false,
+    });
+    if !needs_link {
+        return None;
+    }
+
+    // The entry must live *inside* the package: `resolve_package_import` walks
+    // up from the importing file to find the `lex.toml` that declares the
+    // dependency, and a `path` dep resolves relative to that manifest. A
+    // synthesized temp directory would resolve registry/git deps but silently
+    // break path deps.
+    let cwd = std::env::current_dir().ok()?;
+    let (_toml, pkg_dir) = lex_syntax::find_manifest(&cwd)?;
+    let dir = pkg_dir.join(".lex");
+    std::fs::create_dir_all(&dir).ok()?;
+    let entry = dir.join(format!("replay-link-{}.lex", std::process::id()));
+    std::fs::write(&entry, lex_ast::print_stages(stages)).ok()?;
+    let loaded = lex_syntax::loader::load_program(&entry);
+    let _ = std::fs::remove_file(&entry);
+    Some(lex_ast::canonicalize_program(&loaded.ok()?))
+}
+
 /// Type-check (with the stdlib parse rewrite `lex run` also applies) and
 /// compile a program, or `None` if it doesn't type-check.
 fn compiled(stages: &[Stage]) -> Option<Program> {
-    let mut s = stages.to_vec();
+    // #946: link first, so a non-inlined head is executable. This belongs here
+    // rather than at the callers because every execution path — the recorded
+    // program, the candidate program, both behavioral tiers — funnels through
+    // this one function and must be linked identically. It also has to run
+    // *after* the candidate is swapped in, since linking rewrites cross-module
+    // references inside the bodies it inlines.
+    let mut s = link_for_execution(stages).unwrap_or_else(|| stages.to_vec());
     lex_types::check_and_rewrite_program(&mut s).ok()?;
     Some(compile_program(&s))
 }
