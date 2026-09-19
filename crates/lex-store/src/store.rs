@@ -2293,9 +2293,15 @@ impl Store {
             crate::branches::apply_transition(&mut map, &rec.produces);
         }
         let pairs: Vec<(String, String)> = map.into_iter().collect();
-        let stages: Vec<Stage> =
+        let decls: Vec<Stage> =
             self.get_asts_for_sigs_bulk(&pairs).into_iter().collect::<Result<_, _>>()?;
-        Ok(stages)
+        // #946: include the head's `import` edges. The SigId→stage map holds
+        // only fn/type declarations, so without this a non-inlined head
+        // reconstructs to a program whose `<alias>.name` calls have no import
+        // to bind against — and `replay_request` then hands a regenerator
+        // parent source that silently omits the very dependencies the code
+        // calls into, which is worse than useless as context.
+        Ok(self.with_head_imports(Some(op_id), decls))
     }
 
     /// The program at an op, rendered to source. Used to give a replay
