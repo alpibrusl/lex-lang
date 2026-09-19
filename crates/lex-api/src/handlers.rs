@@ -400,6 +400,7 @@ fn route(
         // op records reference. `batch` receives, `fetch` returns by id.
         (Method::Post, "/v1/stages/batch") => crate::sync_http::stages_batch_handler(state, body),
         (Method::Post, "/v1/stages/fetch") => crate::sync_http::stages_fetch_handler(state, body),
+        (Method::Post, "/v1/stages/missing") => crate::sync_http::stages_missing_handler(state, body),
         (Method::Post, "/v1/intents/batch") => crate::sync_http::intents_batch_handler(state, body),
         (Method::Post, "/v1/intents/fetch") => crate::sync_http::intents_fetch_handler(state, body),
         // #930 P2b-1: committed lockfiles travel with the package so the

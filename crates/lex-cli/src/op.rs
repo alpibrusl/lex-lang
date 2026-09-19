@@ -597,6 +597,14 @@ fn cmd_op_push(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     // (without this, a pulled op-log renders as `unknown stage_id`).
     push_objects(&remote, &to_send, &store, token.as_deref())?;
 
+    // Completeness safety net: guarantee the remote can render every op
+    // reachable from the head we're advancing to — not just the delta above.
+    // Closes the incremental/multi-store stranding that caused the
+    // multi-module archive-500 (see `reconcile_head_stages`).
+    if let Some(head) = local_head.as_ref() {
+        reconcile_head_stages(&remote, head, &store, token.as_deref())?;
+    }
+
     // #930 P2b-1: send the committed lex.lock for the head we're advancing to,
     // so the remote's write-time gate can resolve this head's pinned
     // dependencies. A dependency-free head has no committed lock — skip it.
@@ -807,6 +815,78 @@ fn push_objects(
     if !intents.is_empty() {
         post_json(remote, "/v1/intents/batch", &serde_json::to_value(&intents)?, token)?;
     }
+    Ok(())
+}
+
+/// Guarantee the remote holds every stage blob needed to render ANY op
+/// reachable from `head` — not just the incremental `to_send` delta.
+///
+/// [`push_objects`] pushes only the stages the delta ops produce. That is
+/// unsound across repeated/multi-store pushes: an op already on the remote
+/// (below the push cutoff) can reference a stage that a *prior* push never
+/// delivered — most visibly a `Replace`'s superseded `from` stage, which a
+/// later branch tip no longer names but a pinned **release op** still renders
+/// through. The result is a remote that serves the op-log but 500s on
+/// `unknown stage_id` when rendering an older release (the multi-module
+/// archive-500 that stranded lex-official's libraries).
+///
+/// This walks the full closure of `head`, asks the remote which of those
+/// stages it is missing (`/v1/stages/missing`, a cheap id-only check), and
+/// pushes exactly those. A stage the local store cannot produce but the remote
+/// needs is a hard error (surfacing the integrity gap) rather than a silent
+/// drop. On an older hub without the endpoint, it falls back to pushing the
+/// whole closure (idempotent, heavier once) so correctness never depends on
+/// the reconciler being present remotely.
+fn reconcile_head_stages(
+    remote: &str,
+    head: &str,
+    store: &Store,
+    token: Option<&str>,
+) -> Result<()> {
+    use std::collections::BTreeSet;
+    let log = lex_vcs::OpLog::open(store.root())?;
+    let mut closure: BTreeSet<String> = BTreeSet::new();
+    for rec in log.walk_forward(&head.to_string(), None)? {
+        for sid in rec.produces.stage_ids() {
+            closure.insert(sid);
+        }
+    }
+    if closure.is_empty() {
+        return Ok(());
+    }
+    let all_ids: Vec<String> = closure.into_iter().collect();
+
+    // Ask the remote which of the closure it lacks. On any failure (an old hub
+    // without the route, say), fall back to reconciling against the full
+    // closure — correctness over the round-trip saving.
+    let missing: Vec<String> = match post_json(
+        remote,
+        "/v1/stages/missing",
+        &serde_json::json!({ "ids": &all_ids }),
+        token,
+    ) {
+        Ok(v) => v
+            .get("missing")
+            .and_then(|m| m.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+            .unwrap_or_else(|| all_ids.clone()),
+        Err(_) => all_ids.clone(),
+    };
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let mut stages: Vec<lex_ast::Stage> = Vec::with_capacity(missing.len());
+    for id in &missing {
+        // A stage the head references but the local store can't produce is an
+        // integrity gap — surface it loudly instead of shipping a remote that
+        // will 500 on `unknown stage_id`.
+        let stage = store
+            .get_ast(id)
+            .map_err(|e| anyhow!("local store is missing stage {id} that the head requires: {e}"))?;
+        stages.push(stage);
+    }
+    post_json(remote, "/v1/stages/batch", &serde_json::to_value(&stages)?, token)?;
     Ok(())
 }
 

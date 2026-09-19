@@ -342,3 +342,53 @@ fn rejection_persists_nothing() {
     );
     let _ = a_id; // keep the binding name explicit
 }
+
+/// `/v1/stages/missing` reports exactly the requested ids the store lacks —
+/// the existence check `op push`'s head-closure reconciliation relies on to
+/// push only the stages a remote is actually missing (the fix for the
+/// multi-module archive-500, where an incremental push stranded a release
+/// op's blobs).
+#[test]
+fn stages_missing_reports_only_absent_stages() {
+    let (srv, _tmp) = start_server();
+    let prog = lex_syntax::parse_source(
+        "fn f(n :: Int) -> Int { n + 1 }\nfn g(m :: Int) -> Int { m + 2 }\n",
+    )
+    .unwrap();
+    let stages = lex_ast::canonicalize_program(&prog);
+    let pick = |name: &str| {
+        stages
+            .iter()
+            .find(|s| matches!(s, lex_ast::Stage::FnDecl(fd) if fd.name == name))
+            .cloned()
+            .expect("fn present")
+    };
+    let f = pick("f");
+    let g = pick("g");
+    let f_id = lex_ast::stage_id(&f).unwrap();
+    let g_id = lex_ast::stage_id(&g).unwrap();
+
+    // Seed only `f`.
+    let (s, _) = http(
+        &srv.addr,
+        "POST",
+        "/v1/stages/batch",
+        &serde_json::to_string(&vec![f]).unwrap(),
+    );
+    assert_eq!(s, 200);
+
+    // Ask about {f (present), g (absent), bogus (absent)}.
+    let q = serde_json::json!({ "ids": [f_id, g_id, "deadbeef"] }).to_string();
+    let (s, resp) = http(&srv.addr, "POST", "/v1/stages/missing", &q);
+    assert_eq!(s, 200, "{resp}");
+    let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    let missing: BTreeSet<String> = v["missing"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap().to_string())
+        .collect();
+    assert!(!missing.contains(&f_id), "f is present, must not be reported missing");
+    assert!(missing.contains(&g_id), "g is absent, must be reported missing");
+    assert!(missing.contains("deadbeef"), "unknown id must be reported missing");
+}
