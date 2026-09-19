@@ -5,6 +5,19 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [0.11.53] - 2026-09-19
+
+### Fixed
+
+- **Cross-package transitive type identity (#963).** When the loader inlines
+  a package dependency (dependency resolution and example runs), it now
+  prefixes that dependency's files by the dependency's own package identity
+  (its root and name) rather than the importer's. The same dependency module
+  reached two ways — a direct import and a copy inlined through another
+  dependency — mangles to one prefix, so its type has one identity. Only the
+  inlined-package path is affected; the non-inlined publish keeps package
+  edges, so op-log identities are unchanged.
+
 ## [0.11.52] - 2026-09-19
 
 ### Fixed
