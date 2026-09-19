@@ -5,6 +5,16 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [0.11.54] - 2026-09-19
+
+### Fixed
+
+- **Qualified dependency constructors resolve on the non-inlined path
+  (#963).** `<alias>.Ctor(args)` and a nullary `<alias>.Ctor` used as a value,
+  where the alias is a resolved dependency module and `Ctor` is one of its
+  exported constructors, now route to constructor checking instead of reading
+  as a field access on the dependency's module record.
+
 ## [0.11.53] - 2026-09-19
 
 ### Fixed
