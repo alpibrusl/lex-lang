@@ -615,6 +615,51 @@ impl Store {
         }
     }
 
+    /// The lock **governing** `head_op`: its own committed lock if it has one,
+    /// otherwise the nearest ancestor's (#975).
+    ///
+    /// [`Self::committed_lock`] is an exact-key lookup, and a lock is only ever
+    /// committed for a head a *client pushes*. Every head the **server** creates
+    /// therefore has none of its own — a merge op (`/v1/merge/<id>/commit`) and
+    /// a head landed through `/v1/patch` both — so the exact lookup returned
+    /// `None`, the dependency resolver got no pins, and a non-inlined head was
+    /// rejected as `unknown_identifier "<alias>"` even though every dependency
+    /// was resolvable. A head inherits its ancestors' pins until a new lock is
+    /// committed: the correct model, and it fixes merge and patch in one place
+    /// rather than special-casing each gate.
+    ///
+    /// Breadth-first, so the *nearest* ancestor wins. For a merge the parents
+    /// are equidistant and `dst` is visited first (the branch being merged
+    /// into), matching "the merge inherits the target's pins".
+    ///
+    /// **Known limitation:** this returns one ancestor's lock whole; it does not
+    /// union the two parents' locks. A merge whose *source* branch introduced a
+    /// brand-new dependency can still miss that pin — properly fixed by having
+    /// the merge commit compute and commit a merged lock, tracked separately.
+    pub fn committed_lock_inherited(&self, head_op: &str) -> Result<Option<String>, StoreError> {
+        use std::collections::{BTreeSet, VecDeque};
+        let log = lex_vcs::OpLog::open(self.root())?;
+        let mut queue: VecDeque<String> = VecDeque::new();
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        queue.push_back(head_op.to_string());
+        while let Some(id) = queue.pop_front() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            if let Some(lock) = self.committed_lock(&id)? {
+                return Ok(Some(lock));
+            }
+            // A missing or unreadable op just ends that branch of the walk: an
+            // incomplete local op-log must not fail dependency resolution.
+            if let Ok(Some(rec)) = log.get(&id) {
+                for p in rec.op.parents {
+                    queue.push_back(p);
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// All `key → sha` bindings in a namespace (e.g. every artifact in a
     /// sprint). Empty map if the namespace has no bindings yet.
     pub fn list_blob_refs(
