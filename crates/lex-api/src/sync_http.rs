@@ -58,6 +58,25 @@ pub(crate) fn stages_fetch_handler(state: &State, body: &str) -> Response<Cursor
     json_response(200, &serde_json::json!({ "stages": stages }))
 }
 
+/// `POST /v1/stages/missing` — existence check. Body: `{ "ids": ["<stage_id>",
+/// …] }`. Returns `{ "missing": [<the ids this store does NOT have>] }`. A cheap
+/// companion to `batch`/`fetch`: `op push` uses it to reconcile the full
+/// stage-closure of the head it's advancing to — push only the blobs the
+/// remote actually lacks — without downloading every stage body just to learn
+/// which are present (which `fetch` would force). Idempotent, read-only.
+pub(crate) fn stages_missing_handler(state: &State, body: &str) -> Response<Cursor<Vec<u8>>> {
+    let ids = match parse_ids(body) {
+        Ok(ids) => ids,
+        Err(resp) => return resp,
+    };
+    let store = state.store.lock().unwrap();
+    let missing: Vec<String> = ids
+        .into_iter()
+        .filter(|id| store.get_ast(id).is_err())
+        .collect();
+    json_response(200, &serde_json::json!({ "missing": missing }))
+}
+
 /// `POST /v1/intents/batch` — receive intent records (content-addressed).
 pub(crate) fn intents_batch_handler(state: &State, body: &str) -> Response<Cursor<Vec<u8>>> {
     let intents: Vec<Intent> = match serde_json::from_str(body) {
