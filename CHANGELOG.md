@@ -5,6 +5,21 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [0.11.56] - 2026-09-19
+
+### Fixed
+
+- **`op push` reconciles the full head stage-closure (#968).** Pushing
+  transferred only the stages produced by the incremental delta ops, so a
+  repeated or multi-store push could leave the remote unable to render an
+  older release op it already holds (`unknown stage_id`) — the root cause of
+  the multi-module registry archive-500. `op push` now walks the full closure
+  of the head it advances to, asks the remote which stages it lacks (new
+  `POST /v1/stages/missing` existence check), and pushes exactly those. A
+  stage the head needs but the local store cannot produce is now a hard error
+  instead of a silent drop; on a hub without the endpoint it falls back to
+  reconciling the whole closure.
+
 ## [0.11.55] - 2026-09-19
 
 ### Added
