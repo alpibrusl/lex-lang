@@ -30,7 +30,13 @@ impl ClientDepResolver {
         Self { importer }
     }
 
-    fn module_record(&self, pkg: &str, module: &str) -> Option<Ty> {
+    /// A dependency module's public surface: its function-signature record
+    /// *and* its exported type declarations (#930 completeness). Both are read
+    /// from the same loaded program — the value record feeds
+    /// [`lex_store::DepResolver::resolve_modules`], the type decls feed
+    /// [`lex_store::DepResolver::resolve_module_types`], so a dependent that
+    /// references a dependency's *type* (not just its functions) type-checks.
+    fn module_iface(&self, pkg: &str, module: &str) -> Option<(Ty, Vec<lex_ast::TypeDecl>)> {
         let module_file =
             lex_syntax::workspace::resolve_package_import(&self.importer, pkg, module).ok()?;
         // `load_program` inlines the dependency module's *local* closure and
@@ -43,7 +49,23 @@ impl ClientDepResolver {
             .fn_signatures
             .iter()
             .map(|(name, scheme)| (name.clone(), scheme.ty.clone()));
-        Some(lex_types::module_record_from_fields(fields))
+        let record = lex_types::module_record_from_fields(fields);
+        // Only the module's OWN types are part of its public surface. Types it
+        // inlined from its *own* transitive dependencies carry a mangle prefix
+        // (`constraints_<hash>.StrCheck`); a dependent that also imports that
+        // transitive dependency directly reaches those types through its own
+        // alias, so re-exposing the inlined copies here would register a second,
+        // distinct qualified name (and duplicate constructors) for the same
+        // type — a diamond mismatch. A module's own type names are bare (no
+        // dot), so exclude the dotted, inlined ones.
+        let type_decls: Vec<lex_ast::TypeDecl> = stages
+            .into_iter()
+            .filter_map(|s| match s {
+                lex_ast::Stage::TypeDecl(td) if !td.name.contains('.') => Some(td),
+                _ => None,
+            })
+            .collect();
+        Some((record, type_decls))
     }
 }
 
@@ -59,8 +81,28 @@ impl DepResolver for ClientDepResolver {
             let Some((pkg, module)) = split_package_import(&imp.reference) else {
                 continue;
             };
-            if let Some(ty) = self.module_record(pkg, module) {
+            if let Some((ty, _)) = self.module_iface(pkg, module) {
                 out.insert(imp.reference.clone(), ty);
+            }
+        }
+        out
+    }
+
+    fn resolve_module_types(
+        &self,
+        stages: &[lex_ast::Stage],
+        _head_op: Option<&str>,
+    ) -> BTreeMap<String, Vec<lex_ast::TypeDecl>> {
+        let mut out = BTreeMap::new();
+        for st in stages {
+            let lex_ast::Stage::Import(imp) = st else { continue };
+            let Some((pkg, module)) = split_package_import(&imp.reference) else {
+                continue;
+            };
+            if let Some((_, decls)) = self.module_iface(pkg, module) {
+                if !decls.is_empty() {
+                    out.insert(imp.reference.clone(), decls);
+                }
             }
         }
         out

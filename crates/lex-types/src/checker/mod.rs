@@ -56,7 +56,7 @@ pub fn check_program_with_positions(
     stages: &[a::Stage],
     positions: &BTreeMap<String, Position>,
 ) -> Result<ProgramTypes, Vec<PositionedError>> {
-    check_program_inner(stages, Some(positions), &BTreeMap::new())
+    check_program_inner(stages, Some(positions), &BTreeMap::new(), &BTreeMap::new())
         .map_err(|errs| errs.into_iter().map(|(e, fn_name)| {
             let pos = fn_name.as_deref().and_then(|n| positions.get(n)).cloned();
             PositionedError::new(e, pos)
@@ -64,7 +64,7 @@ pub fn check_program_with_positions(
 }
 
 pub fn check_program(stages: &[a::Stage]) -> Result<ProgramTypes, Vec<TypeError>> {
-    check_program_inner(stages, None, &BTreeMap::new())
+    check_program_inner(stages, None, &BTreeMap::new(), &BTreeMap::new())
         .map_err(|errs| errs.into_iter().map(|(e, _)| e).collect())
 }
 
@@ -85,7 +85,27 @@ pub fn check_program_with_modules(
     stages: &[a::Stage],
     modules: &BTreeMap<String, Ty>,
 ) -> Result<ProgramTypes, Vec<TypeError>> {
-    check_program_inner(stages, None, modules)
+    check_program_inner(stages, None, modules, &BTreeMap::new())
+        .map_err(|errs| errs.into_iter().map(|(e, _)| e).collect())
+}
+
+/// Like [`check_program_with_modules`], but a dependency also contributes its
+/// exported **type declarations** (#930 completeness gap): non-inlined
+/// resolution otherwise carried only a dependency's function signatures, so a
+/// package referencing a dependency's exported *type* (e.g. a record used in an
+/// annotation, or its ADT constructors in a match) could not resolve it — the
+/// type read as opaque, a matching record literal failed to unify, and field
+/// access on it errored. `module_types` maps the same import *reference* keys as
+/// `modules` to the dependency's type declarations (bare names); they are
+/// registered under the importing file's alias (`<alias>.<Name>`), so
+/// `<alias>.Type` annotations resolve and the dependency's constructors are in
+/// scope — exactly as an inlined dependency's `type` decls used to be.
+pub fn check_program_with_module_ifaces(
+    stages: &[a::Stage],
+    modules: &BTreeMap<String, Ty>,
+    module_types: &BTreeMap<String, Vec<a::TypeDecl>>,
+) -> Result<ProgramTypes, Vec<TypeError>> {
+    check_program_inner(stages, None, modules, module_types)
         .map_err(|errs| errs.into_iter().map(|(e, _)| e).collect())
 }
 
@@ -176,10 +196,122 @@ fn renumber_field_vars(ty: &Ty, next_ty: &mut u32, next_eff: &mut u32) -> Ty {
     out
 }
 
+/// Register a dependency's exported type declarations under an import `alias`
+/// (#930 completeness). Each declaration is registered under `<alias>.<Name>`,
+/// and every reference *within* these declarations to a sibling dependency type
+/// (a bare `Named` whose name is one of this dependency's own types) is
+/// rewritten to the same qualified form, so the registered definitions stay
+/// self-consistent inside the alias namespace. Constructors keep their bare
+/// names — Lex's flat constructor namespace — and map to the qualified owning
+/// type, exactly as an inlined dependency's `type` decls did.
+fn register_dep_types(env: &mut TypeEnv, alias: &str, decls: &[a::TypeDecl]) {
+    let own: std::collections::HashSet<&str> = decls.iter().map(|d| d.name.as_str()).collect();
+    for d in decls {
+        let mut def = d.definition.clone();
+        qualify_type_expr(&mut def, alias, &own, &d.params);
+        let qualified_name = format!("{alias}.{}", d.name);
+        let qualified = a::TypeDecl {
+            name: qualified_name.clone(),
+            params: d.params.clone(),
+            definition: def,
+        };
+        // The only error `add_user_type` raises is a recursive alias with no
+        // constructor, which a well-formed published dependency never has;
+        // dropping it here just leaves that (malformed) type unresolved.
+        let _ = env.add_user_type(&qualified_name, qualified);
+    }
+}
+
+/// Rewrite, in place, every `Named` reference in `t` that names one of the
+/// dependency's `own` types (and isn't shadowed by a local type `param`) to its
+/// `<alias>.`-qualified form. See [`register_dep_types`].
+fn qualify_type_expr(
+    t: &mut a::TypeExpr,
+    alias: &str,
+    own: &std::collections::HashSet<&str>,
+    params: &[String],
+) {
+    let qualify = |name: &mut String| {
+        if own.contains(name.as_str()) && !params.iter().any(|p| p == name) {
+            *name = format!("{alias}.{name}");
+        }
+    };
+    match t {
+        a::TypeExpr::Named { name, args } => {
+            qualify(name);
+            for a_ in args {
+                qualify_type_expr(a_, alias, own, params);
+            }
+        }
+        a::TypeExpr::Record { fields } => {
+            for f in fields {
+                qualify_type_expr(&mut f.ty, alias, own, params);
+            }
+        }
+        a::TypeExpr::Tuple { items } => {
+            for it in items {
+                qualify_type_expr(it, alias, own, params);
+            }
+        }
+        a::TypeExpr::Function { params: ps, ret, .. } => {
+            for p in ps {
+                qualify_type_expr(p, alias, own, params);
+            }
+            qualify_type_expr(ret, alias, own, params);
+        }
+        a::TypeExpr::Union { variants } => {
+            for v in variants {
+                if let Some(p) = &mut v.payload {
+                    qualify_type_expr(p, alias, own, params);
+                }
+            }
+        }
+        a::TypeExpr::RecordWithSpreads { spreads, fields } => {
+            for s in spreads.iter_mut() {
+                qualify(s);
+            }
+            for f in fields {
+                qualify_type_expr(&mut f.ty, alias, own, params);
+            }
+        }
+        a::TypeExpr::Refined { base, .. } => qualify_type_expr(base, alias, own, params),
+    }
+}
+
+/// Return a copy of `ty` with every `Ty::Con(name, ..)` whose `name` is one of
+/// the dependency's `own` type names rewritten to `<alias>.name` — so a
+/// dependency's value-record signatures name the same qualified types that
+/// [`register_dep_types`] registers. See the dep-import branch of
+/// [`check_program_inner`].
+fn qualify_ty_cons(ty: &Ty, alias: &str, own: &std::collections::HashSet<&str>) -> Ty {
+    match ty {
+        Ty::Con(name, args) => {
+            let n = if own.contains(name.as_str()) {
+                format!("{alias}.{name}")
+            } else {
+                name.clone()
+            };
+            Ty::Con(n, args.iter().map(|a| qualify_ty_cons(a, alias, own)).collect())
+        }
+        Ty::List(inner) => Ty::List(Box::new(qualify_ty_cons(inner, alias, own))),
+        Ty::Tuple(items) => Ty::Tuple(items.iter().map(|a| qualify_ty_cons(a, alias, own)).collect()),
+        Ty::Record(fs) => Ty::Record(
+            fs.iter().map(|(k, v)| (k.clone(), qualify_ty_cons(v, alias, own))).collect(),
+        ),
+        Ty::Function { params, effects, ret } => Ty::Function {
+            params: params.iter().map(|a| qualify_ty_cons(a, alias, own)).collect(),
+            effects: effects.clone(),
+            ret: Box::new(qualify_ty_cons(ret, alias, own)),
+        },
+        Ty::Var(_) | Ty::Prim(_) | Ty::Unit | Ty::Never => ty.clone(),
+    }
+}
+
 fn check_program_inner(
     stages: &[a::Stage],
     _positions: Option<&BTreeMap<String, Position>>,
     modules: &BTreeMap<String, Ty>,
+    module_types: &BTreeMap<String, Vec<a::TypeDecl>>,
 ) -> Result<ProgramTypes, Vec<(TypeError, Option<String>)>> {
     let mut tcx = Checker::new();
     // Each entry is (error, optional fn name the error came from)
@@ -211,12 +343,33 @@ fn check_program_inner(
             // dependency's signatures but without its bodies present. The
             // record is already generalized per export, so generalize it as
             // a whole the same way a stdlib module scope is bound above.
+            // #930 completeness: the dependency's exported type names, so both
+            // its value-record signatures and its own `type` decls can be
+            // rewritten to the alias namespace consistently (a dependency fn
+            // `make() -> Rec` and the registered `<alias>.Rec` must name the
+            // same type).
+            let own: std::collections::HashSet<&str> = module_types
+                .get(&i.reference)
+                .map(|ds| ds.iter().map(|d| d.name.as_str()).collect())
+                .unwrap_or_default();
             if let Some(ty) = modules.get(&i.reference) {
+                // Rewrite `Con(<DepType>)` in the value record to
+                // `Con(<alias>.<DepType>)` so a call like `<alias>.make()`
+                // returns the same type the annotation `<alias>.Rec` resolves to.
+                let ty = qualify_ty_cons(ty, &i.alias, &own);
                 tcx.globals.insert(i.alias.clone(), Scheme {
-                    vars: collect_vars(ty),
-                    eff_vars: collect_eff_vars(ty),
-                    ty: ty.clone(),
+                    vars: collect_vars(&ty),
+                    eff_vars: collect_eff_vars(&ty),
+                    ty,
                 });
+            }
+            // Bring the dependency's exported TYPE declarations into scope,
+            // registered under this file's alias (`<alias>.<Name>`), so
+            // `<alias>.Type` annotations resolve to the dependency's record/ADT
+            // and its constructors are usable — the same visibility an inlined
+            // dependency's `type` decls had.
+            if let Some(decls) = module_types.get(&i.reference) {
+                register_dep_types(&mut tcx.type_env, &i.alias, decls);
             }
         }
     }
@@ -316,6 +469,19 @@ pub fn check_and_rewrite_program_with_modules(
     modules: &BTreeMap<String, Ty>,
 ) -> Result<ProgramTypes, Vec<TypeError>> {
     let pt = check_program_with_modules(&*stages, modules)?;
+    rewrite_parse_calls(stages, &pt);
+    Ok(pt)
+}
+
+/// Like [`check_and_rewrite_program_with_modules`], but a dependency also
+/// contributes its exported type declarations (#930 completeness — see
+/// [`check_program_with_module_ifaces`]).
+pub fn check_and_rewrite_program_with_module_ifaces(
+    stages: &mut [a::Stage],
+    modules: &BTreeMap<String, Ty>,
+    module_types: &BTreeMap<String, Vec<a::TypeDecl>>,
+) -> Result<ProgramTypes, Vec<TypeError>> {
+    let pt = check_program_with_module_ifaces(&*stages, modules, module_types)?;
     rewrite_parse_calls(stages, &pt);
     Ok(pt)
 }
