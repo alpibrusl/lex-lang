@@ -5,6 +5,20 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [0.11.58] - 2026-09-19
+
+### Fixed
+
+- **A head inherits its ancestors' committed lock (#975).** `committed_lock` is
+  an exact-key lookup and a lock is only committed for a head a *client pushes*,
+  so every head the server creates — a merge op, or one landed through
+  `/v1/patch` — had none, leaving the dependency resolver with no pins and
+  rejecting a valid non-inlined head as `unknown_identifier "<alias>"`. New
+  `Store::committed_lock_inherited` walks back to the nearest ancestor carrying
+  a lock. Known limitation: it returns one ancestor's lock whole rather than
+  unioning both parents', so a merge whose *source* branch introduced a new
+  dependency can still miss that pin.
+
 ## [0.11.57] - 2026-09-19
 
 ### Fixed
