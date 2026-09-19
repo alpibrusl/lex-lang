@@ -165,7 +165,7 @@ impl DepResolver for ClientDepResolver {
 /// Classify `import "<ref>"`: `Some((pkg, module))` for a registry/git package
 /// reference `<pkg>/<module>`, `None` for a local (`./`, `../`, `/`) or stdlib
 /// (`std.*`) import. Mirrors the loader's own classification.
-fn split_package_import(reference: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_package_import(reference: &str) -> Option<(&str, &str)> {
     if reference.starts_with("./")
         || reference.starts_with("../")
         || reference.starts_with('/')
