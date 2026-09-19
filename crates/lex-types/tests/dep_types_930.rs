@@ -111,3 +111,77 @@ fn build() -> s.Rec { { title: 42, fields: [] } }
         "a record whose `title` is an Int must not satisfy s.Rec (title :: Str)"
     );
 }
+
+// ── #963: prefixed mode (transitive/within-package type identity) ────────────
+
+use lex_types::check_program_with_deps;
+
+// A dependency `dep` whose module `a` defines `Shared`, and whose module `b`
+// re-exposes `Shared` in its own signature. Resolved as one package, both name
+// the SAME canonical `a_h.Shared` (the diamond). The consumer imports both
+// modules and also annotates with `sa.Shared`.
+fn diamond_modules() -> BTreeMap<String, Ty> {
+    let a = module_record_from_fields(vec![(
+        "mk".into(),
+        Ty::function(vec![], EffectSet::empty(), Ty::Con("a_h.Shared".into(), vec![])),
+    )]);
+    // `b.passthru()` returns the SAME `a_h.Shared` (b inlined a under a_h).
+    let b = module_record_from_fields(vec![(
+        "passthru".into(),
+        Ty::function(vec![], EffectSet::empty(), Ty::Con("a_h.Shared".into(), vec![])),
+    )]);
+    BTreeMap::from([("dep/a".into(), a), ("dep/b".into(), b)])
+}
+fn diamond_types() -> BTreeMap<String, Vec<lex_ast::TypeDecl>> {
+    // Prefix-named decl, as the whole-package resolver produces it: parse bare
+    // (dots aren't legal in a source type name), then rename to the loader's
+    // mangled form.
+    let shared: Vec<lex_ast::TypeDecl> = stages("type Shared = { n :: Int }")
+        .into_iter()
+        .filter_map(|s| match s {
+            lex_ast::Stage::TypeDecl(mut td) => {
+                td.name = "a_h.Shared".to_string();
+                Some(td)
+            }
+            _ => None,
+        })
+        .collect();
+    // Both modules of the package carry the whole package's type decls.
+    BTreeMap::from([("dep/a".into(), shared.clone()), ("dep/b".into(), shared)])
+}
+fn diamond_prefixes() -> BTreeMap<String, String> {
+    BTreeMap::from([("dep/a".into(), "a_h".into()), ("dep/b".into(), "b_h".into())])
+}
+
+const DIAMOND_CONSUMER: &str = "\
+import \"dep/a\" as sa
+import \"dep/b\" as sb
+fn width(x :: sa.Shared) -> Int { x.n }
+fn from_b() -> Int { width(sb.passthru()) }
+fn from_a() -> Int { width(sa.mk()) }
+";
+
+#[test]
+fn prefixed_mode_unifies_a_type_reached_two_ways() {
+    let s = stages(DIAMOND_CONSUMER);
+    // `sa.Shared` (annotation) normalizes to `a_h.Shared`; `sb.passthru()` and
+    // `sa.mk()` both return `a_h.Shared` — all one type.
+    check_program_with_deps(&s, &diamond_modules(), &diamond_types(), &diamond_prefixes())
+        .unwrap_or_else(|errs| panic!("diamond must unify under prefixed mode: {errs:#?}"));
+}
+
+#[test]
+fn prefixed_mode_still_enforces_shape() {
+    // `width` reads `.n :: Int`; calling it with an Int (not a Shared) fails.
+    let bad = "\
+import \"dep/a\" as sa
+fn width(x :: sa.Shared) -> Int { x.n }
+fn oops() -> Int { width(5) }
+";
+    let s = stages(bad);
+    assert!(
+        check_program_with_deps(&s, &diamond_modules(), &diamond_types(), &diamond_prefixes())
+            .is_err(),
+        "passing an Int where sa.Shared is expected must fail"
+    );
+}

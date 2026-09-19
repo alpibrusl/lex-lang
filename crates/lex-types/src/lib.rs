@@ -16,8 +16,9 @@ pub mod trust;
 pub mod authority;
 
 pub use checker::{
-    check_and_rewrite_program, check_and_rewrite_program_with_modules,
-    check_and_rewrite_program_with_module_ifaces, check_program, check_program_with_modules,
+    check_and_rewrite_program, check_and_rewrite_program_with_deps,
+    check_and_rewrite_program_with_modules, check_and_rewrite_program_with_module_ifaces,
+    check_program, check_program_with_deps, check_program_with_modules,
     check_program_with_module_ifaces, check_program_with_positions, module_record_from_fields,
     rewrite_parse_calls, ParseSite, ProgramTypes,
 };

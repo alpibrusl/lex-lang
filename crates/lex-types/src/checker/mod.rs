@@ -56,7 +56,7 @@ pub fn check_program_with_positions(
     stages: &[a::Stage],
     positions: &BTreeMap<String, Position>,
 ) -> Result<ProgramTypes, Vec<PositionedError>> {
-    check_program_inner(stages, Some(positions), &BTreeMap::new(), &BTreeMap::new())
+    check_program_inner(stages, Some(positions), &BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new())
         .map_err(|errs| errs.into_iter().map(|(e, fn_name)| {
             let pos = fn_name.as_deref().and_then(|n| positions.get(n)).cloned();
             PositionedError::new(e, pos)
@@ -64,7 +64,7 @@ pub fn check_program_with_positions(
 }
 
 pub fn check_program(stages: &[a::Stage]) -> Result<ProgramTypes, Vec<TypeError>> {
-    check_program_inner(stages, None, &BTreeMap::new(), &BTreeMap::new())
+    check_program_inner(stages, None, &BTreeMap::new(), &BTreeMap::new(), &BTreeMap::new())
         .map_err(|errs| errs.into_iter().map(|(e, _)| e).collect())
 }
 
@@ -85,7 +85,7 @@ pub fn check_program_with_modules(
     stages: &[a::Stage],
     modules: &BTreeMap<String, Ty>,
 ) -> Result<ProgramTypes, Vec<TypeError>> {
-    check_program_inner(stages, None, modules, &BTreeMap::new())
+    check_program_inner(stages, None, modules, &BTreeMap::new(), &BTreeMap::new())
         .map_err(|errs| errs.into_iter().map(|(e, _)| e).collect())
 }
 
@@ -105,7 +105,26 @@ pub fn check_program_with_module_ifaces(
     modules: &BTreeMap<String, Ty>,
     module_types: &BTreeMap<String, Vec<a::TypeDecl>>,
 ) -> Result<ProgramTypes, Vec<TypeError>> {
-    check_program_inner(stages, None, modules, module_types)
+    check_program_inner(stages, None, modules, module_types, &BTreeMap::new())
+        .map_err(|errs| errs.into_iter().map(|(e, _)| e).collect())
+}
+
+/// Like [`check_program_with_module_ifaces`], but each dependency import also
+/// carries its **module mangle prefix** (#963), when the dependency was
+/// resolved as a whole package. In that mode `module_types` are prefix-named
+/// (`error_<hash>.DbErr`) and globally unique — registered as-is — and the
+/// import alias is mapped to the prefix so an alias-qualified type reference
+/// (`e.DbErr`) unfolds to the same type the dependency's own prefix-qualified
+/// signatures name. This makes a directly-imported module and the copies of it
+/// inlined into its sibling modules one type (the diamond). References with no
+/// entry in `module_prefixes` keep the #930 bare/alias-qualified path.
+pub fn check_program_with_deps(
+    stages: &[a::Stage],
+    modules: &BTreeMap<String, Ty>,
+    module_types: &BTreeMap<String, Vec<a::TypeDecl>>,
+    module_prefixes: &BTreeMap<String, String>,
+) -> Result<ProgramTypes, Vec<TypeError>> {
+    check_program_inner(stages, None, modules, module_types, module_prefixes)
         .map_err(|errs| errs.into_iter().map(|(e, _)| e).collect())
 }
 
@@ -222,6 +241,36 @@ fn register_dep_types(env: &mut TypeEnv, alias: &str, decls: &[a::TypeDecl]) {
     }
 }
 
+/// Register a dependency package's exported type declarations when it was
+/// resolved as a whole package (#963): the decls are already **prefix-named**
+/// (`error_<hash>.DbErr`) and their internal references are prefix-qualified by
+/// the loader, so they register as-is (globally unique — no alias
+/// qualification). For each type belonging to *this* import's module (name
+/// under `prefix`), an `<alias>.<Local>` alias entry is also registered so an
+/// alias-qualified annotation unfolds to the canonical prefixed type — the same
+/// type the module's own signatures name, and the same the copies inlined into
+/// sibling modules carry. `decls` is the whole loaded package, so every type
+/// the module's surface exposes resolves; re-registering across sibling imports
+/// is idempotent (content-identical).
+fn register_dep_types_prefixed(
+    env: &mut TypeEnv,
+    alias: &str,
+    prefix: &str,
+    decls: &[a::TypeDecl],
+) {
+    for d in decls {
+        // Register the canonical, prefix-named type as-is (its internal
+        // references are already prefix-qualified by the loader, and its name is
+        // globally unique — no alias rewriting).
+        let _ = env.add_user_type(&d.name, d.clone());
+    }
+    // Map this import's alias to the module prefix, so `ty_from_canon_env`
+    // normalizes an alias-qualified annotation (`e.DbErr`) to the canonical
+    // `error_<hash>.DbErr` — the same type the value record and inlined sibling
+    // copies name.
+    env.dep_alias_prefixes.insert(alias.to_string(), prefix.to_string());
+}
+
 /// Rewrite, in place, every `Named` reference in `t` that names one of the
 /// dependency's `own` types (and isn't shadowed by a local type `param`) to its
 /// `<alias>.`-qualified form. See [`register_dep_types`].
@@ -312,6 +361,7 @@ fn check_program_inner(
     _positions: Option<&BTreeMap<String, Position>>,
     modules: &BTreeMap<String, Ty>,
     module_types: &BTreeMap<String, Vec<a::TypeDecl>>,
+    module_prefixes: &BTreeMap<String, String>,
 ) -> Result<ProgramTypes, Vec<(TypeError, Option<String>)>> {
     let mut tcx = Checker::new();
     // Each entry is (error, optional fn name the error came from)
@@ -343,33 +393,48 @@ fn check_program_inner(
             // dependency's signatures but without its bodies present. The
             // record is already generalized per export, so generalize it as
             // a whole the same way a stdlib module scope is bound above.
-            // #930 completeness: the dependency's exported type names, so both
-            // its value-record signatures and its own `type` decls can be
-            // rewritten to the alias namespace consistently (a dependency fn
-            // `make() -> Rec` and the registered `<alias>.Rec` must name the
-            // same type).
-            let own: std::collections::HashSet<&str> = module_types
-                .get(&i.reference)
-                .map(|ds| ds.iter().map(|d| d.name.as_str()).collect())
-                .unwrap_or_default();
-            if let Some(ty) = modules.get(&i.reference) {
-                // Rewrite `Con(<DepType>)` in the value record to
-                // `Con(<alias>.<DepType>)` so a call like `<alias>.make()`
-                // returns the same type the annotation `<alias>.Rec` resolves to.
-                let ty = qualify_ty_cons(ty, &i.alias, &own);
-                tcx.globals.insert(i.alias.clone(), Scheme {
-                    vars: collect_vars(&ty),
-                    eff_vars: collect_eff_vars(&ty),
-                    ty,
-                });
-            }
-            // Bring the dependency's exported TYPE declarations into scope,
-            // registered under this file's alias (`<alias>.<Name>`), so
-            // `<alias>.Type` annotations resolve to the dependency's record/ADT
-            // and its constructors are usable — the same visibility an inlined
-            // dependency's `type` decls had.
-            if let Some(decls) = module_types.get(&i.reference) {
-                register_dep_types(&mut tcx.type_env, &i.alias, decls);
+            // #963 prefixed mode: the dependency was resolved as a whole
+            // package, so `module_types` are prefix-named (`error_<hash>.DbErr`)
+            // and the value record already references them by prefix — register
+            // the decls as-is and map this import's alias to the module prefix
+            // so an alias-qualified annotation (`e.DbErr`) unfolds to the same
+            // canonical type. A reference with no prefix keeps the #930 bare /
+            // alias-qualified path.
+            match module_prefixes.get(&i.reference) {
+                Some(prefix) => {
+                    if let Some(ty) = modules.get(&i.reference) {
+                        tcx.globals.insert(i.alias.clone(), Scheme {
+                            vars: collect_vars(ty),
+                            eff_vars: collect_eff_vars(ty),
+                            ty: ty.clone(),
+                        });
+                    }
+                    if let Some(decls) = module_types.get(&i.reference) {
+                        register_dep_types_prefixed(&mut tcx.type_env, &i.alias, prefix, decls);
+                    }
+                }
+                None => {
+                    // #930 completeness (bare mode): the dependency's exported
+                    // type names, so both its value-record signatures and its
+                    // own `type` decls are rewritten to the alias namespace
+                    // consistently (a dependency fn `make() -> Rec` and the
+                    // registered `<alias>.Rec` must name the same type).
+                    let own: std::collections::HashSet<&str> = module_types
+                        .get(&i.reference)
+                        .map(|ds| ds.iter().map(|d| d.name.as_str()).collect())
+                        .unwrap_or_default();
+                    if let Some(ty) = modules.get(&i.reference) {
+                        let ty = qualify_ty_cons(ty, &i.alias, &own);
+                        tcx.globals.insert(i.alias.clone(), Scheme {
+                            vars: collect_vars(&ty),
+                            eff_vars: collect_eff_vars(&ty),
+                            ty,
+                        });
+                    }
+                    if let Some(decls) = module_types.get(&i.reference) {
+                        register_dep_types(&mut tcx.type_env, &i.alias, decls);
+                    }
+                }
             }
         }
     }
@@ -482,6 +547,20 @@ pub fn check_and_rewrite_program_with_module_ifaces(
     module_types: &BTreeMap<String, Vec<a::TypeDecl>>,
 ) -> Result<ProgramTypes, Vec<TypeError>> {
     let pt = check_program_with_module_ifaces(&*stages, modules, module_types)?;
+    rewrite_parse_calls(stages, &pt);
+    Ok(pt)
+}
+
+/// Like [`check_and_rewrite_program_with_module_ifaces`], but each dependency
+/// import also carries its module mangle prefix (#963 — see
+/// [`check_program_with_deps`]).
+pub fn check_and_rewrite_program_with_deps(
+    stages: &mut [a::Stage],
+    modules: &BTreeMap<String, Ty>,
+    module_types: &BTreeMap<String, Vec<a::TypeDecl>>,
+    module_prefixes: &BTreeMap<String, String>,
+) -> Result<ProgramTypes, Vec<TypeError>> {
+    let pt = check_program_with_deps(&*stages, modules, module_types, module_prefixes)?;
     rewrite_parse_calls(stages, &pt);
     Ok(pt)
 }
