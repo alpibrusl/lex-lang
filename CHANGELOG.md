@@ -5,6 +5,27 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [0.11.55] - 2026-09-19
+
+### Added
+
+- **Dual git+vcs dependency references (#967).** A `lex.toml` dependency can now
+  declare both a vcs/registry reference and a git mirror in one entry —
+  `{ registry = "host/tenant/pkg", version = "^0.9", git = "https://…" }`. The
+  vcs registry is the primary, default resolution source (pinned via
+  `lex.lock`); git is a recorded fallback used when the registry is unreachable
+  or when `lex pkg install --source git` selects it. New `Dependency::Both`
+  variant with `registry_coord()` / `git_coord()` accessors.
+
+### Fixed
+
+- **Hosted install archives now carry `[dependencies]` (#967).** An
+  op-log-hosted release rendered its install archive's `lex.toml` as
+  `[package]`-only, dropping every dependency reference. `lex pkg release` now
+  captures each dependency's full coordinates (`dependency_specs`), and the hub
+  reconstructs a faithful `[dependencies]` table — carrying both the git and
+  vcs references where the source declared both.
+
 ## [0.11.54] - 2026-09-19
 
 ### Fixed
