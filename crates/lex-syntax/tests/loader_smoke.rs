@@ -928,3 +928,54 @@ fn load_package_rejects_one_alias_bound_to_two_modules() {
     let imports = pkg.program.items.iter().filter(|i| matches!(i, Item::Import(_))).count();
     assert_eq!(imports, 1, "one import item for one (module, alias) pair");
 }
+
+// #963 cross-package identity: a dependency's type must mangle to the SAME
+// prefix whether reached by loading that dependency's package directly or by
+// loading another package that inlines it — because it is prefixed by its own
+// package identity, not the importer's. The write-time gate resolves each
+// dependency package in a SEPARATE load, so `prefix_for`'s per-load memoization
+// does not help; only deterministic (namespace, relative-path) keying does.
+#[test]
+fn cross_package_shared_type_has_one_prefix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let mk = |name: &str, toml: &str, module: &str, src: &str| {
+        let d = root.join(name);
+        fs::create_dir_all(d.join("src")).unwrap();
+        fs::write(d.join("lex.toml"), toml).unwrap();
+        fs::write(d.join("src").join(module), src).unwrap();
+        d
+    };
+    let dep = mk(
+        "dep",
+        "[package]\nname = \"dep\"\nversion = \"0.1.0\"\n",
+        "m.lex",
+        "type Shared = { n :: Int }\nfn zero() -> Shared { { n: 0 } }\n",
+    );
+    // mid depends on dep and re-exposes Shared in its own signature.
+    let mid = mk(
+        "mid",
+        "[package]\nname = \"mid\"\nversion = \"0.1.0\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n",
+        "mm.lex",
+        "import \"dep/m\" as d\nfn passthru(x :: d.Shared) -> d.Shared { x }\n",
+    );
+
+    let shared_prefix = |dir: &std::path::Path, entry: &str, ns: &str| -> String {
+        let loaded = load_package(&[dir.join(entry)], dir, ns, true).expect("load");
+        let prefixes: std::collections::BTreeSet<String> = type_names(&loaded.program)
+            .into_iter()
+            .filter_map(|n| n.strip_suffix(".Shared").map(|p| p.to_string()))
+            .collect();
+        assert_eq!(prefixes.len(), 1, "one Shared per load, got {prefixes:?}");
+        prefixes.into_iter().next().unwrap()
+    };
+
+    // Reached by loading `dep` directly vs by loading `mid` (which inlines dep)
+    // — two separate loads, as the gate resolves two separate dependencies.
+    let direct = shared_prefix(&dep, "src/m.lex", "dep");
+    let via_mid = shared_prefix(&mid, "src/mm.lex", "mid");
+    assert_eq!(
+        direct, via_mid,
+        "dep's Shared must share a prefix reached directly ({direct}) and via mid ({via_mid})"
+    );
+}
