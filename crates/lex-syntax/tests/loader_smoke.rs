@@ -902,12 +902,16 @@ fn load_package_records_package_imports_as_edges_when_not_inlining() {
     assert!(names.iter().any(|n| n.ends_with(".reduce") || n == "reduce"), "got: {names:?}");
 }
 
-/// An alias bound to two different modules cannot survive the merge into
-/// one program — the checker's alias scope is name-keyed, so one file's
-/// calls would silently resolve against the other file's module. Rejected
-/// rather than merged.
+/// An alias bound to two different modules cannot survive the merge into one
+/// program *as-is* — the checker's alias scope is name-keyed, so one file's
+/// calls would silently resolve against the other file's module.
+///
+/// #984: the later binding is therefore **re-bound**, not rejected. Per-file
+/// aliases are legal Lex (each file type-checks alone), so rejecting them made
+/// valid packages unpublishable. Merging would still be wrong; renaming keeps
+/// both modules reachable and each file's calls pointed at its own.
 #[test]
-fn load_package_rejects_one_alias_bound_to_two_modules() {
+fn load_package_rebinds_one_alias_bound_to_two_modules() {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("src");
     fs::create_dir_all(&src).unwrap();
@@ -915,11 +919,27 @@ fn load_package_rejects_one_alias_bound_to_two_modules() {
     write(&src, "b.lex", "import \"std.list\" as m\nfn two(l :: List[Int]) -> Int { m.len(l) }\n");
     let entries = vec![src.join("a.lex"), src.join("b.lex")];
 
-    let err = load_package(&entries, dir.path(), "pkg", true).expect_err("must be rejected");
-    match err {
-        LoadError::ConflictingAlias { alias, .. } => assert_eq!(alias, "m"),
-        other => panic!("expected ConflictingAlias, got {other:?}"),
-    }
+    let loaded = load_package(&entries, dir.path(), "pkg", true)
+        .expect("a reused alias must be re-bound, not rejected (#984)");
+    let imports: Vec<(String, String)> = loaded
+        .program
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Import(imp) => Some((imp.reference.clone(), imp.alias.clone())),
+            _ => None,
+        })
+        .collect();
+    let str_alias = &imports.iter().find(|(r, _)| r == "std.str").expect("std.str kept").1;
+    let list_alias = &imports.iter().find(|(r, _)| r == "std.list").expect("std.list kept").1;
+    assert_ne!(
+        str_alias, list_alias,
+        "both modules must survive under distinct aliases: {imports:?}"
+    );
+    assert!(
+        str_alias == "m" || list_alias == "m",
+        "the first binding keeps the author's alias: {imports:?}"
+    );
 
     // The same alias for the same module in two files is fine, and the
     // import is emitted once.
