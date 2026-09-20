@@ -103,14 +103,128 @@ pub fn render_source(store: &Store, head: &PackageHead) -> Result<RenderedSource
 /// resolving a dependency that itself has registry/git dependencies is the
 /// recursive extension that follows.
 pub fn module_record_at_op(store: &Store, head_op: &str) -> Result<lex_types::Ty, StoreError> {
-    let stages = demangled_head_stages(store, head_op)?;
+    module_record_at_op_for(store, head_op, None)
+}
+
+/// [`module_record_at_op`] scoped to **one module** of a (possibly multi-file)
+/// package head (#942).
+///
+/// `module` is the `<module>` half of `import "<pkg>/<module>" as x`. With
+/// `None` the head must be a single file — the pre-#942 behaviour, kept so
+/// existing callers are unaffected.
+///
+/// A multi-file head can't simply be de-mangled wholesale: two files may each
+/// define `validate` (#818), so flattening every prefix to a bare name would
+/// collapse them onto one. Instead only the *requested* module is de-mangled;
+/// its siblings stay under their own prefixes, which keeps the program
+/// type-checkable (references from the requested module still resolve) and
+/// makes that module's surface exactly the set of names with no prefix left.
+pub fn module_record_at_op_for(
+    store: &Store,
+    head_op: &str,
+    module: Option<&str>,
+) -> Result<lex_types::Ty, StoreError> {
+    let stages = match module {
+        Some(m) => demangled_module_stages(store, head_op, m)?,
+        None => demangled_head_stages(store, head_op)?,
+    };
     let types = lex_types::check_program(&stages).map_err(StoreError::TypeError)?;
-    // Every top-level function is part of the module's callable surface.
+    // Every top-level function is part of the module's callable surface — and
+    // after the scoped rewrite, "belongs to this module" is exactly "has no
+    // mangle prefix left".
     let fields = types
         .fn_signatures
         .iter()
+        .filter(|(name, _)| !name.contains('.'))
         .map(|(name, scheme)| (name.clone(), scheme.ty.clone()));
     Ok(lex_types::module_record_from_fields(fields))
+}
+
+/// The file in `files` that `module` names — `model` → `src/model.lex`, else
+/// `model.lex`, else any file whose stem matches. Mirrors the loader's own
+/// resolution order (`lex_syntax::workspace::find_module_file`) so a dependent
+/// resolves the same file the compiler would.
+fn module_file<'a>(files: impl Iterator<Item = &'a String>, module: &str) -> Option<String> {
+    let want_src = format!("src/{module}.lex");
+    let want_flat = format!("{module}.lex");
+    let mut stem_match: Option<String> = None;
+    for f in files {
+        if *f == want_src || *f == want_flat {
+            return Some(f.clone());
+        }
+        let stem = f.rsplit('/').next().unwrap_or(f).trim_end_matches(".lex");
+        if stem == module && stem_match.is_none() {
+            stem_match = Some(f.clone());
+        }
+    }
+    stem_match
+}
+
+/// The head's stages with **one module** de-mangled to bare names and every
+/// other file left under its own prefix (#942). See [`module_record_at_op_for`]
+/// for why the siblings are deliberately not flattened.
+pub(crate) fn demangled_module_stages(
+    store: &Store,
+    head_op: &str,
+    module: &str,
+) -> Result<Vec<lex_ast::Stage>, StoreError> {
+    let head = package_head_at_op(store, head_op)?;
+    let pairs: Vec<(String, String)> =
+        head.map.iter().map(|(s, st)| (s.clone(), st.clone())).collect();
+    let asts = store.get_asts_for_sigs_bulk(&pairs);
+
+    let mut by_file: BTreeMap<String, Vec<lex_ast::Stage>> = BTreeMap::new();
+    for ((sig, _), ast) in pairs.iter().zip(asts) {
+        let stage = ast?;
+        let file = head.sig_files.get(sig).cloned().unwrap_or_default();
+        by_file.entry(file).or_default().push(stage);
+    }
+
+    let target = module_file(by_file.keys(), module)
+        .ok_or(StoreError::UnsupportedMultiModuleDependency)?;
+
+    let own_stages = by_file.get(&target).cloned().unwrap_or_default();
+    let own_prefix = own_stages.iter().find_map(stage_prefix).unwrap_or_default();
+    let mut bound_locals = BTreeSet::new();
+    for s in &own_stages {
+        collect_bound_locals(s, &mut bound_locals);
+    }
+    let mut rw = FileRewrite {
+        own_prefix: &own_prefix,
+        own_file: &target,
+        prefix_to_file: &BTreeMap::new(),
+        bound_locals: &bound_locals,
+        local_imports: BTreeMap::new(),
+        flatten_unknown_prefixes: false,
+    };
+
+    // The flattened head's imports are a single global alias map — the exact
+    // namespace these stages were type-checked in when published.
+    let mut stages: Vec<lex_ast::Stage> = head
+        .flat_imports
+        .iter()
+        .map(|(reference, alias)| {
+            lex_ast::Stage::Import(lex_ast::Import {
+                reference: reference.clone(),
+                alias: alias.clone(),
+            })
+        })
+        .collect();
+    // Rewrite EVERY stage, not just the target module's. The rewriter strips
+    // only `own_prefix` (the target's) and — with no `prefix_to_file` and
+    // flattening off — leaves every other prefix untouched. Applying it
+    // wholesale therefore also fixes the siblings' *inbound* references: a
+    // sibling calling `util_<hash>.helper` follows the declaration down to
+    // bare `helper`. Rewriting only the target file left those references
+    // dangling at a name that no longer existed.
+    for file_stages in by_file.values() {
+        for s in file_stages {
+            let mut s = s.clone();
+            rw.rewrite_stage(&mut s);
+            stages.push(s);
+        }
+    }
+    Ok(stages)
 }
 
 /// A single-file package head as a *de-mangled* canonical program: the
@@ -155,6 +269,7 @@ pub(crate) fn demangled_head_stages(
         prefix_to_file: &BTreeMap::new(),
         bound_locals: &bound_locals,
         local_imports: BTreeMap::new(),
+        flatten_unknown_prefixes: true,
     };
     for s in &mut decls {
         rw.rewrite_stage(s);
@@ -198,6 +313,7 @@ fn render_singlefile(store: &Store, head: &PackageHead) -> Result<String, StoreE
         prefix_to_file: &BTreeMap::new(),
         bound_locals: &bound_locals,
         local_imports: BTreeMap::new(),
+        flatten_unknown_prefixes: true,
     };
     for s in &mut decls {
         rw.rewrite_stage(s);
@@ -245,6 +361,7 @@ fn render_multifile(store: &Store, head: &PackageHead) -> Result<BTreeMap<String
             prefix_to_file: &prefix_to_file,
             bound_locals: &bound_locals,
             local_imports: BTreeMap::new(),
+            flatten_unknown_prefixes: true,
         };
         let rewritten: Vec<lex_ast::Stage> = stages
             .iter()
@@ -430,6 +547,17 @@ struct FileRewrite<'a> {
     prefix_to_file: &'a BTreeMap<String, String>,
     bound_locals: &'a BTreeSet<String>,
     local_imports: BTreeMap<String, String>,
+    /// Whether a mangle prefix that maps to no file should be flattened to a
+    /// bare name. True for every *source-rendering* path, where such a prefix
+    /// is an inlined dependency the loader folded into this package's
+    /// namespace and a dotted declaration would be invalid source.
+    ///
+    /// False when rewriting a single module of a multi-file head for its
+    /// *type surface* (#942): there the sibling modules' declarations are
+    /// still present under their own prefixes, so flattening them would
+    /// collapse distinct functions onto one bare name (two files may each
+    /// define `validate`, #818) and break the references that point at them.
+    flatten_unknown_prefixes: bool,
 }
 
 impl FileRewrite<'_> {
@@ -459,7 +587,7 @@ impl FileRewrite<'_> {
                 // this package's namespace); leaving `prefix.name` would emit
                 // an invalid dotted declaration/reference. Stdlib aliases
                 // (`int.to_str`) don't match the mangle pattern and pass through.
-                if is_mangle_prefix(q) {
+                if self.flatten_unknown_prefixes && is_mangle_prefix(q) {
                     return rest.to_string();
                 }
             }
