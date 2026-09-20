@@ -228,6 +228,7 @@ pub fn load_package(
         prefix_root: Some(root),
         prefix_namespace: Some(namespace.to_string()),
         imports_by_file: BTreeMap::new(),
+        claimed_aliases: HashMap::new(),
         inline_packages,
     };
     // Deliberately no empty-prefix seeding: see the doc comment above.
@@ -243,6 +244,12 @@ pub fn load_package(
                 match aliases.get(&imp.alias) {
                     // Same module under the same alias: one import is enough.
                     Some(existing) if existing == &imp.reference => continue,
+                    // #984: unreachable in practice — `LoaderState` re-binds a
+                    // conflicting alias (and rewrites that file's references)
+                    // before the item gets here. Kept as a guard so a future
+                    // path that bypasses the re-bind fails loudly rather than
+                    // silently resolving one file's calls against another
+                    // file's module.
                     Some(existing) => {
                         return Err(LoadError::ConflictingAlias {
                             alias: imp.alias.clone(),
@@ -289,6 +296,7 @@ fn load_rooted(entry: &Path, prefix_root: Option<PathBuf>) -> Result<Program, Lo
         prefix_root,
         prefix_namespace: None,
         imports_by_file: BTreeMap::new(),
+        claimed_aliases: HashMap::new(),
         // Single-entry loads (`lex run`/`lex check`) inline every dependency
         // so the program is self-contained without a resolver, as before #930.
         inline_packages: true,
@@ -336,6 +344,18 @@ struct LoaderState {
     /// packages sharing an internal layout (two `src/error.lex` files)
     /// do not mangle to one set of names. Only [`load_package`] sets it.
     prefix_namespace: Option<String>,
+    /// Aliases already bound by an earlier file in this package load, mapping
+    /// alias -> the import reference that claimed it (#984).
+    ///
+    /// Import aliases are *file-scoped* in the language — two files may each
+    /// `import … as ev` for different modules, and both type-check. But a
+    /// package flattens into ONE program, where the checker's alias scope is
+    /// name-keyed, so a single alias cannot mean two things. Rather than
+    /// rejecting code that compiles (which made valid packages unpublishable),
+    /// a later file's conflicting alias is renamed and that file's references
+    /// are rewritten with it — the same treatment declarations already get
+    /// through mangling (#818).
+    claimed_aliases: HashMap<String, String>,
     /// Non-inlined imports each file makes itself — stdlib always, and (when
     /// `inline_packages` is false) registry/git package imports too — keyed by
     /// the file's root-relative path, each mapping the import *reference* to
@@ -389,6 +409,19 @@ impl LoaderState {
     /// `imports_by_file` is reported under, which is why it carries no
     /// namespace: those keys name files in the archive, and history
     /// already records them under exactly this spelling.
+    /// An alias derived from `base` that no file in this package has claimed
+    /// (#984). Suffixed rather than hashed so the rename stays readable in the
+    /// recorded import edge and in rendered source.
+    fn fresh_alias(&self, base: &str) -> String {
+        for n in 2.. {
+            let cand = format!("{base}__{n}");
+            if !self.claimed_aliases.contains_key(&cand) {
+                return cand;
+            }
+        }
+        unreachable!("alias space is unbounded")
+    }
+
     fn relative_key(&self, canonical: &Path) -> Option<String> {
         let root = self.prefix_root.as_ref()?;
         let rel = canonical.strip_prefix(root).ok()?;
@@ -455,6 +488,9 @@ impl LoaderState {
 
         // alias used by this file → mangling prefix of the imported file
         let mut path_imports: HashMap<String, String> = HashMap::new();
+        // #984: aliases this file had to re-bind because an earlier file in the
+        // package already claimed them for a different module.
+        let mut alias_renames: HashMap<String, String> = HashMap::new();
         let mut merged_children: Vec<Item> = Vec::new();
         let mut std_imports: Vec<Item> = Vec::new();
         let mut my_items: Vec<Item> = Vec::new();
@@ -515,7 +551,37 @@ impl LoaderState {
                     self.prefix_namespace = saved_ns;
                     merged_children.extend(child_prog.items);
                 }
-                Item::Import(_) => std_imports.push(item),
+                Item::Import(ref imp) => {
+                    // #984: a non-inlined import (stdlib, or a package edge
+                    // when not inlining) keeps its alias in the flattened
+                    // program, so the alias must be unique across the package.
+                    // Re-bind rather than reject when a later file reuses an
+                    // alias for a different module.
+                    match self.claimed_aliases.get(&imp.alias) {
+                        Some(claimed) if claimed == &imp.reference => {
+                            // Same module, same alias: one import is enough.
+                            std_imports.push(item);
+                        }
+                        Some(_) => {
+                            let fresh = self.fresh_alias(&imp.alias);
+                            // Recorded separately from `path_imports`: the
+                            // Mangler must keep this a field access on the new
+                            // alias, not flatten it to a dotted declaration
+                            // name (see `Mangler::alias_renames`).
+                            alias_renames.insert(imp.alias.clone(), fresh.clone());
+                            self.claimed_aliases
+                                .insert(fresh.clone(), imp.reference.clone());
+                            let mut renamed = imp.clone();
+                            renamed.alias = fresh;
+                            std_imports.push(Item::Import(renamed));
+                        }
+                        None => {
+                            self.claimed_aliases
+                                .insert(imp.alias.clone(), imp.reference.clone());
+                            std_imports.push(item);
+                        }
+                    }
+                }
                 _ => my_items.push(item),
             }
         }
@@ -538,6 +604,7 @@ impl LoaderState {
             prefix: my_prefix,
             local_names: &local_names,
             path_imports: &path_imports,
+            alias_renames: &alias_renames,
         };
         let mangled: Vec<Item> = my_items
             .into_iter()
@@ -623,6 +690,13 @@ struct Mangler<'a> {
     /// `m.foo` rewrites to `<imported_prefix>.foo` regardless of which
     /// alias `m` was, so two parents importing the same module agree.
     path_imports: &'a HashMap<String, String>,
+    /// Alias -> replacement alias for a package import this file had to
+    /// re-bind (#984). Distinct from `path_imports`: that maps an alias to an
+    /// inlined file's *mangling prefix*, so `m.foo` flattens to the declaration
+    /// `prefix.foo`. A renamed alias is still an alias — the declaration lives
+    /// in another package — so the reference must stay a field access on the
+    /// new alias (`ev__2.foo`), not collapse into a dotted name.
+    alias_renames: &'a HashMap<String, String>,
 }
 
 impl<'a> Mangler<'a> {
@@ -760,6 +834,10 @@ impl<'a> Mangler<'a> {
     /// Rewrite a possibly-qualified type name to its mangled form.
     fn rewrite_type_name(&self, name: &str) -> String {
         if let Some((alias, rest)) = name.split_once('.') {
+            // #984: a re-bound alias still qualifies its types by alias.
+            if let Some(fresh) = self.alias_renames.get(alias) {
+                return format!("{fresh}.{rest}");
+            }
             if let Some(child) = self.path_imports.get(alias) {
                 return format!("{child}.{rest}");
             }
@@ -809,6 +887,15 @@ impl<'a> Mangler<'a> {
                 if let Expr::Field { value, field } = (*callee).clone() {
                     if let Expr::Var(alias) = *value {
                         if !shadow.contains(&alias) {
+                            if let Some(fresh) = self.alias_renames.get(&alias) {
+                                return Expr::Call {
+                                    callee: Box::new(Expr::Field {
+                                        value: Box::new(Expr::Var(fresh.clone())),
+                                        field,
+                                    }),
+                                    args: mangled_args,
+                                };
+                            }
                             if let Some(child) = self.path_imports.get(&alias) {
                                 return Expr::Call {
                                     callee: Box::new(Expr::Var(format!("{child}.{field}"))),
@@ -831,6 +918,12 @@ impl<'a> Mangler<'a> {
             Expr::Field { value, field } => {
                 if let Expr::Var(alias) = (*value).clone() {
                     if !shadow.contains(&alias) {
+                        if let Some(fresh) = self.alias_renames.get(&alias) {
+                            return Expr::Field {
+                                value: Box::new(Expr::Var(fresh.clone())),
+                                field,
+                            };
+                        }
                         if let Some(child) = self.path_imports.get(&alias) {
                             return Expr::Var(format!("{child}.{field}"));
                         }
