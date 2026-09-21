@@ -34,10 +34,44 @@ pub struct PackageHead {
 }
 
 /// Rendered package source: one module, or a `relpath → source` tree.
+///
+/// The single-module arm carries the module's `path` when the head knows it,
+/// for the same reason the multi arm does — so no caller has to invent one
+/// (#988). Both callers used to hard-code a name here, and *different* ones
+/// (`src/lib.lex` for the registry archive, `src.lex` for the git mirror),
+/// which silently **renamed** any package whose module was not called `lib`:
+/// `lex-jobs` ships `src/jobs.lex`, so dependents writing
+/// `import "lex-jobs/src/jobs"` could not resolve a module that was present
+/// under another name.
+///
+/// `path: None` means the head genuinely records no source path — every op
+/// predates `in_file` — so there is nothing to recover and any name would be
+/// a guess. Each caller then applies its *own* convention, which is why this
+/// is an `Option` rather than a default filled in here: the two conventions
+/// differ, and collapsing them would change the git mirror's layout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RenderedSource {
-    Single(String),
+    Single { path: Option<String>, src: String },
     Multi(BTreeMap<String, String>),
+}
+
+/// The file a single-module head's declarations were declared in, or `None`
+/// when the head cannot say.
+///
+/// Note this reads the *partial* map deliberately. A head that mixes
+/// pre-`in_file` ops with newer ones renders as `Single` (the multi-module
+/// test demands `in_file` on **every** sig) while still knowing perfectly well
+/// which file it came from — which is exactly the shape a legacy package takes
+/// when it is re-pushed onto its existing op-log.
+fn single_module_path(head: &PackageHead) -> Option<String> {
+    let distinct: std::collections::BTreeSet<&String> =
+        head.sig_files.values().filter(|f| !f.is_empty()).collect();
+    match distinct.len() {
+        1 => Some(distinct.into_iter().next().expect("length checked").clone()),
+        // Nothing recorded, or — defensively — several despite a single-module
+        // render. Neither can name a file honestly.
+        _ => None,
+    }
 }
 
 /// Walk the op-log from `head_op` and assemble the [`PackageHead`] — the same
@@ -82,7 +116,10 @@ pub fn render_source(store: &Store, head: &PackageHead) -> Result<RenderedSource
     if multi {
         Ok(RenderedSource::Multi(render_multifile(store, head)?))
     } else {
-        Ok(RenderedSource::Single(render_singlefile(store, head)?))
+        Ok(RenderedSource::Single {
+            path: single_module_path(head),
+            src: render_singlefile(store, head)?,
+        })
     }
 }
 
