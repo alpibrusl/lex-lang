@@ -141,6 +141,41 @@ impl StageTransition {
             StageTransition::Merge { entries } => entries.values().flatten().cloned().collect(),
         }
     }
+
+    /// Every `(sig_id, stage_id)` pair this transition references (#986).
+    ///
+    /// A `StageId` hashes the structural signature plus the implementation and
+    /// deliberately **not** the name (#826), so two functions differing only in
+    /// name share one StageId while having two distinct SigIds — and two
+    /// separate ASTs, one stored under each sig. Rendering therefore resolves a
+    /// stage through [`crate`]'s `(sig, stage)` pair, never the id alone.
+    ///
+    /// [`Self::stage_ids`] is consequently not enough for object sync: asking a
+    /// peer "do you have this stage id?" can answer yes while the variant the
+    /// head actually names is absent. Sync paths should use these pairs.
+    pub fn stage_pairs(&self) -> Vec<(SigId, StageId)> {
+        match self {
+            StageTransition::Create { sig_id, stage_id } => {
+                vec![(sig_id.clone(), stage_id.clone())]
+            }
+            StageTransition::Replace { sig_id, from, to } => vec![
+                (sig_id.clone(), from.clone()),
+                (sig_id.clone(), to.clone()),
+            ],
+            StageTransition::Remove { sig_id, last } => vec![(sig_id.clone(), last.clone())],
+            // The body exists under both identities across a rename, so a peer
+            // may need it under either.
+            StageTransition::Rename { from, to, body_stage_id } => vec![
+                (from.clone(), body_stage_id.clone()),
+                (to.clone(), body_stage_id.clone()),
+            ],
+            StageTransition::ImportOnly => Vec::new(),
+            StageTransition::Merge { entries } => entries
+                .iter()
+                .filter_map(|(sig, stage)| stage.as_ref().map(|st| (sig.clone(), st.clone())))
+                .collect(),
+        }
+    }
 }
 
 /// The kinds of operations that produce stage transitions. Mirrors
