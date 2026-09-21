@@ -65,11 +65,44 @@ pub(crate) fn stages_fetch_handler(state: &State, body: &str) -> Response<Cursor
 /// remote actually lacks — without downloading every stage body just to learn
 /// which are present (which `fetch` would force). Idempotent, read-only.
 pub(crate) fn stages_missing_handler(state: &State, body: &str) -> Response<Cursor<Vec<u8>>> {
+    let v: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return error_response(400, format!("body must be JSON: {e}")),
+    };
+    let store = state.store.lock().unwrap();
+
+    // Preferred shape (#986): `{ "pairs": [[sig_id, stage_id], …] }`.
+    //
+    // A StageId does not encode the name (#826), so two sigs can share one
+    // stage id while holding *different* ASTs. Rendering resolves through the
+    // `(sig, stage)` pair, so an id-only check can answer "present" while the
+    // variant the head names is absent — which is exactly how #968's closure
+    // reconciliation was defeated. Answer per pair.
+    if let Some(arr) = v.get("pairs").and_then(|p| p.as_array()) {
+        let pairs: Vec<(String, String)> = arr
+            .iter()
+            .filter_map(|p| {
+                let a = p.as_array()?;
+                Some((a.first()?.as_str()?.to_string(), a.get(1)?.as_str()?.to_string()))
+            })
+            .collect();
+        let have = store.get_asts_for_sigs_bulk(&pairs);
+        let missing: Vec<serde_json::Value> = pairs
+            .iter()
+            .zip(have)
+            .filter(|(_, got)| got.is_err())
+            .map(|((sig, stage), _)| serde_json::json!([sig, stage]))
+            .collect();
+        return json_response(200, &serde_json::json!({ "missing": missing }));
+    }
+
+    // Legacy id-only shape, kept so an older `op push` still gets an answer.
+    // Necessarily approximate: "present under *some* sig" is the most this
+    // form can mean.
     let ids = match parse_ids(body) {
         Ok(ids) => ids,
         Err(resp) => return resp,
     };
-    let store = state.store.lock().unwrap();
     let missing: Vec<String> = ids
         .into_iter()
         .filter(|id| store.get_ast(id).is_err())

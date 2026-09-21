@@ -870,46 +870,65 @@ fn reconcile_head_stages(
 ) -> Result<()> {
     use std::collections::BTreeSet;
     let log = lex_vcs::OpLog::open(store.root())?;
-    let mut closure: BTreeSet<String> = BTreeSet::new();
+    // #986: reconcile (sig, stage) PAIRS, not bare stage ids. A StageId does
+    // not encode the name (#826), so two sigs can share one id while holding
+    // different ASTs; asking "do you have this id?" can answer yes while the
+    // variant this head names is missing — which silently defeated the
+    // reconciliation this function exists to perform.
+    let mut closure: BTreeSet<(String, String)> = BTreeSet::new();
     for rec in log.walk_forward(&head.to_string(), None)? {
-        for sid in rec.produces.stage_ids() {
-            closure.insert(sid);
+        for pair in rec.produces.stage_pairs() {
+            closure.insert(pair);
         }
     }
     if closure.is_empty() {
         return Ok(());
     }
-    let all_ids: Vec<String> = closure.into_iter().collect();
+    let all_pairs: Vec<(String, String)> = closure.into_iter().collect();
 
-    // Ask the remote which of the closure it lacks. On any failure (an old hub
-    // without the route, say), fall back to reconciling against the full
-    // closure — correctness over the round-trip saving.
-    let missing: Vec<String> = match post_json(
+    // Ask the remote which pairs it lacks. On any failure (an older hub that
+    // does not understand the pair shape, say) fall back to reconciling the
+    // whole closure — correctness over the round-trip saving.
+    let wire: Vec<serde_json::Value> =
+        all_pairs.iter().map(|(sig, st)| serde_json::json!([sig, st])).collect();
+    let missing: Vec<(String, String)> = match post_json(
         remote,
         "/v1/stages/missing",
-        &serde_json::json!({ "ids": &all_ids }),
+        &serde_json::json!({ "pairs": wire }),
         token,
     ) {
         Ok(v) => v
             .get("missing")
             .and_then(|m| m.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
-            .unwrap_or_else(|| all_ids.clone()),
-        Err(_) => all_ids.clone(),
+            .map(|a| {
+                a.iter()
+                    .filter_map(|p| {
+                        let q = p.as_array()?;
+                        Some((
+                            q.first()?.as_str()?.to_string(),
+                            q.get(1)?.as_str()?.to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|| all_pairs.clone()),
+        Err(_) => all_pairs.clone(),
     };
     if missing.is_empty() {
         return Ok(());
     }
 
+    // Read each missing stage through the sig the head names it by, so the
+    // right variant is sent even where several share a stage id.
     let mut stages: Vec<lex_ast::Stage> = Vec::with_capacity(missing.len());
-    for id in &missing {
-        // A stage the head references but the local store can't produce is an
+    for (ast, (sig, stage)) in store.get_asts_for_sigs_bulk(&missing).into_iter().zip(&missing) {
+        // A stage the head references but the local store cannot produce is an
         // integrity gap — surface it loudly instead of shipping a remote that
         // will 500 on `unknown stage_id`.
-        let stage = store
-            .get_ast(id)
-            .map_err(|e| anyhow!("local store is missing stage {id} that the head requires: {e}"))?;
-        stages.push(stage);
+        let ast = ast.map_err(|e| {
+            anyhow!("local store is missing stage {stage} for sig {sig}, which the head requires: {e}")
+        })?;
+        stages.push(ast);
     }
     post_json(remote, "/v1/stages/batch", &serde_json::to_value(&stages)?, token)?;
     Ok(())
@@ -933,10 +952,23 @@ fn pull_objects(
             produced_stages.insert(sid);
         }
     }
+    // #986: decide what to fetch per `(sig, stage)` pair, not per stage id. A
+    // StageId does not encode the name (#826), so holding that id under *some*
+    // other sig does not mean the variant these ops name is present — and an
+    // id-only check therefore skips fetching it, leaving a head that cannot be
+    // rendered. This is where the gap originates; the push-side reconciler
+    // cannot recover a variant the pull never brought down.
+    let mut pairs: BTreeSet<(String, String)> = BTreeSet::new();
+    for rec in ops {
+        for pair in rec.produces.stage_pairs() {
+            pairs.insert(pair);
+        }
+    }
+    let pairs: Vec<(String, String)> = pairs.into_iter().collect();
     let mut want_stages: BTreeSet<String> = BTreeSet::new();
-    for sid in &produced_stages {
-        if store.get_ast(sid).is_err() {
-            want_stages.insert(sid.clone());
+    for (have, (_sig, stage)) in store.get_asts_for_sigs_bulk(&pairs).into_iter().zip(&pairs) {
+        if have.is_err() {
+            want_stages.insert(stage.clone());
         }
     }
     let mut stages_added = 0usize;
