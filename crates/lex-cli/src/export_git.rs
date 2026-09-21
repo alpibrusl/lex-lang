@@ -122,21 +122,23 @@ pub fn cmd_export_git(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             flat_imports: flat_imports.clone(),
             file_imports: file_imports.clone(),
         };
-        match lex_store::render::render_source(&store, &head)? {
-            lex_store::render::RenderedSource::Single(src) => {
-                std::fs::write(&src_path, src)
-                    .with_context(|| format!("writing {}", src_path.display()))?;
+        // #988: the single-module arm now carries its own path, so the mirror
+        // keeps a package's real module name instead of renaming it to `lib`.
+        let tree: Vec<(String, String)> = match lex_store::render::render_source(&store, &head)? {
+            // The mirror's own convention for a head that records no file:
+            // `src.lex` at the repo root, as it has always been (#988).
+            lex_store::render::RenderedSource::Single { path, src } => {
+                vec![(path.unwrap_or_else(|| "src.lex".to_string()), src)]
             }
-            lex_store::render::RenderedSource::Multi(tree) => {
-                for (relpath, src) in tree {
-                    let path = out_dir.join(&relpath);
-                    if let Some(parent) = path.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    std::fs::write(&path, src)
-                        .with_context(|| format!("writing {}", path.display()))?;
-                }
+            lex_store::render::RenderedSource::Multi(tree) => tree.into_iter().collect(),
+        };
+        for (relpath, src) in tree {
+            let path = out_dir.join(&relpath);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
             }
+            std::fs::write(&path, src)
+                .with_context(|| format!("writing {}", path.display()))?;
         }
 
         // Commit message: the intent prompt, else a kind summary.

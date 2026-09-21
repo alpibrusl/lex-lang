@@ -2609,11 +2609,16 @@ fn pkg_archive_handler(state: &State, name: &str, version: &str) -> Response<std
     error_response(404, format!("archive for {name:?}@{version:?} not found"))
 }
 
-/// Build a gzip-tar package archive (`lex.toml` + `src/lib.lex`) by rendering
-/// the op-log head `head_op` to source — the composition of a registry release
-/// (#911) with the op-log, so an `op push`-hosted package is installable
-/// without a separately-uploaded archive (#920). Single-module only, matching
-/// the hosting limit (#894).
+/// The archive path for a single-module head that records no source file of
+/// its own — every op predating `in_file`. Historical, and kept so already
+/// released packages in that state do not change name underneath their
+/// dependents; the cure for them is a re-push, not a rename here (#988).
+const DEFAULT_ARCHIVE_MODULE: &str = "src/lib.lex";
+
+/// Build a gzip-tar package archive (`lex.toml` + the package's `src/*.lex`)
+/// by rendering the op-log head `head_op` to source — the composition of a
+/// registry release (#911) with the op-log, so an `op push`-hosted package is
+/// installable without a separately-uploaded archive (#920).
 fn render_op_log_archive(
     state: &State,
     name: &str,
@@ -2621,10 +2626,11 @@ fn render_op_log_archive(
     head_op: &str,
     dependency_specs: &std::collections::BTreeMap<String, DepSpec>,
 ) -> Result<Vec<u8>, String> {
-    // De-flatten the head into its source tree — one `src/lib.lex` for a
-    // single-module package, or the full `src/*.lex` layout for a
-    // multi-module one (#894). The same renderer `lex export-git` uses, so
-    // the installed source matches the git mirror.
+    // De-flatten the head into its source tree — one file for a single-module
+    // package, or the full `src/*.lex` layout for a multi-module one (#894).
+    // The same renderer `lex export-git` uses, so the installed source matches
+    // the git mirror. Either way the *names* come from the head itself; this
+    // used to invent `src/lib.lex` for the single-module arm (#988).
     let files: Vec<(String, String)> = {
         let store = state.store.lock().unwrap();
         let head = lex_store::render::package_head_at_op(&store, head_op)
@@ -2632,7 +2638,11 @@ fn render_op_log_archive(
         match lex_store::render::render_source(&store, &head)
             .map_err(|e| format!("rendering source at {head_op}: {e}"))?
         {
-            lex_store::render::RenderedSource::Single(src) => vec![("src/lib.lex".to_string(), src)],
+            lex_store::render::RenderedSource::Single { path, src } => {
+                // A head that records no file keeps the registry's historical
+                // name; one that does keeps its own (#988).
+                vec![(path.unwrap_or_else(|| DEFAULT_ARCHIVE_MODULE.to_string()), src)]
+            }
             lex_store::render::RenderedSource::Multi(tree) => tree.into_iter().collect(),
         }
     };
