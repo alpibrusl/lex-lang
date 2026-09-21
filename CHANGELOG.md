@@ -5,6 +5,30 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [0.11.62] - 2026-09-21
+
+### Fixed
+
+- **An effect change moves the sig, it does not replace it (#992).** A `SigId`
+  covers the effect row — which is what makes `ChangeEffectSig` a *sig* change —
+  but its transition was a `Replace`, binding the **old** sig to the **new**
+  stage. A store files an implementation under the sig its own AST hashes to,
+  and that AST declares the new effects, so the head was left naming a pair no
+  store can hold: unrenderable, and any release cut from it born broken
+  (`lex-web@0.4.0`). The op now carries `to_sig_id` and its transition is a
+  `Rename`. Two sites shared the assumption: `stage_for_kind` looked the stage
+  up under the old sig and so never wrote the AST at all, and `/v1/patch` built
+  the op the same way. Backwards compatible — pre-existing ops decode as `None`,
+  keep the old behaviour and serialize byte-identically, so no `OpId` rotates.
+
+  This prevents new corruption; it does not repair an already-corrupt head,
+  which is invisible to the name-keyed diff.
+
+- **`stage_pairs` for a rename asked for a pair that cannot exist (#986
+  follow-up).** A renamed body hashes to the new sig and is filed only there, so
+  demanding `(from, body_stage_id)` made the reconciler require a blob no store
+  holds and refuse an otherwise valid push.
+
 ## [0.11.61] - 2026-09-21
 
 ### Fixed
