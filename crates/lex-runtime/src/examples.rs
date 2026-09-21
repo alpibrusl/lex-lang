@@ -151,6 +151,7 @@ fn synthesize_helpers(stages: &[a::Stage]) -> Helpers {
 
 fn zero_arg_helper(name: &str, return_type: a::TypeExpr, body: a::CExpr) -> a::Stage {
     a::Stage::FnDecl(a::FnDecl {
+        doc: Vec::new(),
         name: name.into(),
         type_params: Vec::new(),
         params: Vec::new(),

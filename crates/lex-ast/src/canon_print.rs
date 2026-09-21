@@ -33,6 +33,19 @@ impl Printer {
     fn pad(&mut self) { for _ in 0..self.indent { self.out.push_str("  "); } }
 
     fn stage(&mut self, s: &Stage) {
+        // A declaration's own `#` comments, when the caller has restored them
+        // from the stage's metadata. They are absent from the stored AST by
+        // design (`doc` is `serde(skip)`, so it never touches a hash), so this
+        // is empty unless something deliberately put them back — which is what
+        // keeps a rendered package from arriving with its documentation gone.
+        let doc: &[String] = match s {
+            Stage::FnDecl(fd) => &fd.doc,
+            Stage::TypeDecl(td) => &td.doc,
+            Stage::Import(_) => &[],
+        };
+        for line in doc {
+            writeln!(self.out, "{line}").unwrap();
+        }
         match s {
             Stage::Import(i) => {
                 writeln!(self.out, "import \"{}\" as {}", i.reference, i.alias).unwrap();

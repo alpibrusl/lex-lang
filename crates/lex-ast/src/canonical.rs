@@ -45,6 +45,22 @@ pub struct FnDecl {
     /// to pre-#369 stages.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub examples: Vec<Example>,
+    /// The declaration's own `#` comments, in source order.
+    ///
+    /// `#[serde(skip)]` is the whole design: this never reaches the canonical
+    /// JSON, so it cannot touch `structural_sig_hash` or
+    /// `implementation_hash`, and therefore cannot move a SigId or StageId.
+    /// Editing a comment must not read as a code change — exact replay would
+    /// otherwise demand a model reproduce prose verbatim — and stored
+    /// `.ast.json` files stay bit-identical to existing ones.
+    ///
+    /// It exists only to carry comments across the syntax -> AST boundary on
+    /// the publish path, where they are written into the stage's `Metadata`
+    /// (outside the hash, like `name`) and read back by the renderer. Without
+    /// it, every package served from an op-log arrived stripped of all
+    /// documentation.
+    #[serde(skip)]
+    pub doc: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -58,6 +74,10 @@ pub struct TypeDecl {
     pub name: String,
     pub params: Vec<String>,
     pub definition: TypeExpr,
+    /// The declaration's own `#` comments. See [`FnDecl::doc`] — `serde(skip)`
+    /// keeps it out of every hash and out of the stored `.ast.json`.
+    #[serde(skip)]
+    pub doc: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

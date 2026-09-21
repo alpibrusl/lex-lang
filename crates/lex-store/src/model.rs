@@ -66,6 +66,25 @@ pub struct Metadata {
     /// Free-form notes (e.g. "fixes overflow on n>20").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// The declaration's own `#` comments, in source order, each including
+    /// its leading `#`.
+    ///
+    /// `lex-syntax` parses and attaches comments per declaration, and the
+    /// canonicalizer strips them so they never participate in a SigId or
+    /// StageId. That exclusion is right and load-bearing: editing a comment
+    /// must not read as a code change, or exact replay would demand a model
+    /// reproduce prose verbatim.
+    ///
+    /// But the op-log stored only the canonical (stripped) AST, and a registry
+    /// archive is *rendered* from that log — so every hosted package was served
+    /// with all documentation removed. `lex-ocpi` lost 2051 comment lines,
+    /// `lex-agent` 519; the module header explaining a package's schema and
+    /// purpose simply vanished between GitHub and the registry.
+    ///
+    /// They live here for exactly the reason `name` does: outside the hash, so
+    /// they survive the round trip without disturbing content addressing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub doc: Vec<String>,
     /// Optional Ed25519 signature over the UTF-8 bytes of `stage_id`
     /// (#227). Set on publish when the caller provides a signing key;
     /// consumers verify via [`lex_vcs::verify_stage_id`]. Absence

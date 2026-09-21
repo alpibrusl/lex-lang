@@ -642,6 +642,7 @@ pub fn extract_function(
 
     // Build the new fn stage from the extracted body + spec.
     let new_fn = Stage::FnDecl(FnDecl {
+        doc: Vec::new(),
         name: spec.name,
         type_params: spec.type_params,
         params: spec.params,
@@ -795,6 +796,7 @@ mod tests {
             return_type: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
             body,
             examples: Vec::new(),
+            doc: Vec::new(),
         })
     }
 
@@ -848,6 +850,7 @@ mod tests {
             return_type: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
             body,
             examples: Vec::new(),
+            doc: Vec::new(),
         });
         let out = rename_local(&stage, &NodeId("n_0.1".into()), "y").unwrap();
         let Stage::FnDecl(fd) = out else { panic!() };
@@ -893,6 +896,7 @@ mod tests {
             },
             body,
             examples: Vec::new(),
+            doc: Vec::new(),
         });
         let out = rename_local(&stage, &NodeId("n_0.1".into()), "y").unwrap();
         let Stage::FnDecl(fd) = out else { panic!() };
@@ -939,6 +943,7 @@ mod tests {
             return_type: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
             body,
             examples: Vec::new(),
+            doc: Vec::new(),
         });
         let out = rename_local(&stage, &NodeId("n_0.1".into()), "y").unwrap();
         let Stage::FnDecl(fd) = out else { panic!() };
@@ -986,6 +991,7 @@ mod tests {
             return_type: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
             body,
             examples: Vec::new(),
+            doc: Vec::new(),
         })
     }
 
@@ -1020,6 +1026,7 @@ mod tests {
             return_type: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
             body,
             examples: Vec::new(),
+            doc: Vec::new(),
         });
         let err = inline_let(&stage, &NodeId("n_0.1".into())).unwrap_err();
         assert!(matches!(err, TransformError::InlineLetRefused { .. }), "got {err:?}");
@@ -1057,6 +1064,7 @@ mod tests {
             return_type: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
             body,
             examples: Vec::new(),
+            doc: Vec::new(),
         });
         // Let `x` is at child index 2 (1 param + return + body slot).
         let err = inline_let(&stage, &NodeId("n_0.2".into())).unwrap_err();
@@ -1097,6 +1105,7 @@ mod tests {
             return_type: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
             body,
             examples: Vec::new(),
+            doc: Vec::new(),
         });
         let out = inline_let(&stage, &NodeId("n_0.2".into())).unwrap();
         let Stage::FnDecl(fd) = out else { panic!() };
@@ -1144,6 +1153,7 @@ mod tests {
             return_type: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
             body,
             examples: Vec::new(),
+            doc: Vec::new(),
         })
     }
 
@@ -1237,6 +1247,7 @@ mod tests {
             return_type: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
             body,
             examples: Vec::new(),
+            doc: Vec::new(),
         });
         let spec = ExtractFnSpec {
             name: "one".into(),
@@ -1263,6 +1274,7 @@ mod tests {
             name: "T".into(),
             params: Vec::new(),
             definition: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
+            doc: Vec::new(),
         });
         let err = extract_function(&stage, &NodeId("n_0.0".into()), double_n_spec())
             .unwrap_err();
@@ -1299,6 +1311,7 @@ mod tests {
             return_type: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
             body,
             examples: Vec::new(),
+            doc: Vec::new(),
         })
     }
 
@@ -1369,6 +1382,7 @@ mod tests {
             name: "T".into(),
             params: Vec::new(),
             definition: TypeExpr::Named { name: "Int".into(), args: Vec::new() },
+            doc: Vec::new(),
         });
         let err = replace_match_arm(&stage, &match_node_id(), 0,
             CExpr::Literal { value: CLit::Unit }).unwrap_err();
