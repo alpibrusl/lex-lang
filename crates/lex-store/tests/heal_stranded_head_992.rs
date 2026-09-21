@@ -232,3 +232,54 @@ fn a_healthy_head_is_left_alone() {
     publish_source(&store, &[WITH_FS, OTHER]);
     assert_eq!(before, store.branch_head(DEFAULT_BRANCH).unwrap(), "no-op republish must not move the head");
 }
+
+/// The case the first real `lex-web` attempt hit, and the reason the guard is
+/// store-wide rather than head-scoped.
+///
+/// Republishing re-adds the declaration under a freshly computed stage, so the
+/// sig that owns the orphaned AST stops pointing at it *from the head*. The
+/// content is still on disk — nothing was lost — but a head-scoped check
+/// cannot see it, declines to repair, and the package stays unreleasable.
+#[test]
+fn the_twin_counts_even_when_the_head_no_longer_points_at_it() {
+    let (store, _tmp, sig_io, sig_fs, stage_fs) = damaged();
+
+    // Move the owning sig on to a different stage, exactly as a republish
+    // does. `stage_fs` is now referenced only by the stranded entry.
+    let modified = "fn serve(p :: Str) -> [fs_read] Str { str_id(p) }\nfn str_id(s :: Str) -> Str { s }\n";
+    let st = only_fn(modified);
+    let new_stage = lex_ast::stage_id(&st).expect("stage");
+    store.publish(&st).unwrap();
+    let op = Operation::new(
+        OperationKind::ModifyBody {
+            sig_id: sig_fs.clone(),
+            from_stage_id: stage_fs.clone(),
+            to_stage_id: new_stage.clone(),
+            from_budget: None,
+            to_budget: None,
+        },
+        head_op_vec(&store),
+    );
+    store
+        .apply_operation(
+            DEFAULT_BRANCH,
+            op,
+            StageTransition::Replace { sig_id: sig_fs.clone(), from: stage_fs.clone(), to: new_stage },
+        )
+        .expect("apply");
+
+    let head = store.branch_head(DEFAULT_BRANCH).unwrap();
+    assert_ne!(head.get(&sig_fs), Some(&stage_fs), "setup: the owner moved on");
+    assert_eq!(head.get(&sig_io), Some(&stage_fs), "setup: the stranded entry remains");
+    assert!(
+        store.get_ast(&stage_fs).is_ok(),
+        "setup: but the AST is still on disk — that is what makes the repair safe"
+    );
+
+    let pairs: Vec<(String, String)> = head.into_iter().collect();
+    let heal = store.stranded_head_entries(&pairs);
+    assert_eq!(
+        heal.len(), 1,
+        "the twin still proves the content exists, so the entry must be retired: {heal:?}"
+    );
+}
