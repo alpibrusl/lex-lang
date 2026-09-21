@@ -918,16 +918,39 @@ fn reconcile_head_stages(
         return Ok(());
     }
 
+    // What the *head* names, as opposed to what history merely mentions. Only
+    // the former must be present: those are the pairs a render resolves, so a
+    // remote lacking one serves `500 unknown stage_id`.
+    let head_pairs: BTreeSet<(String, String)> =
+        lex_store::render::package_head_at_op(store, head)
+            .map(|h| h.map.into_iter().collect())
+            .unwrap_or_default();
+
     // Read each missing stage through the sig the head names it by, so the
     // right variant is sent even where several share a stage id.
     let mut stages: Vec<lex_ast::Stage> = Vec::with_capacity(missing.len());
     for (ast, (sig, stage)) in store.get_asts_for_sigs_bulk(&missing).into_iter().zip(&missing) {
-        // A stage the head references but the local store cannot produce is an
-        // integrity gap — surface it loudly instead of shipping a remote that
-        // will 500 on `unknown stage_id`.
-        let ast = ast.map_err(|e| {
-            anyhow!("local store is missing stage {stage} for sig {sig}, which the head requires: {e}")
-        })?;
+        let ast = match ast {
+            Ok(a) => a,
+            // A pair the head names but the store cannot produce is a genuine
+            // integrity gap — surface it loudly rather than ship a remote that
+            // will 500 on `unknown stage_id`.
+            Err(e) if head_pairs.contains(&(sig.clone(), stage.clone())) => {
+                return Err(anyhow!(
+                    "local store is missing stage {stage} for sig {sig}, \
+                     which the head requires: {e}"
+                ));
+            }
+            // A purely historical pair is best-effort (#992). Some of them
+            // *cannot* exist: a pre-#992 `ChangeEffectSig` bound the old sig to
+            // the new stage, and the AST there hashes to a different sig, so no
+            // store has ever held that pair. Demanding it made every push of
+            // such a package fail forever — including the push of the very
+            // repair that retires the entry. It is not needed to render the
+            // head, only to replay a point in history that was already
+            // unrenderable when it was written.
+            Err(_) => continue,
+        };
         stages.push(ast);
     }
     post_json(remote, "/v1/stages/batch", &serde_json::to_value(&stages)?, token)?;
