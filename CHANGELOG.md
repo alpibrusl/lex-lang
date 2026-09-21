@@ -5,6 +5,31 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [0.11.61] - 2026-09-21
+
+### Fixed
+
+- **Stage sync is keyed by `(sig_id, stage_id)`, not the id alone (#986).** A
+  `StageId` hashes the structural signature plus the implementation and
+  deliberately *not* the name (#826), so two functions differing only in name
+  share one StageId while owning two distinct ASTs — one per SigId. Every sync
+  path asked only "do you have this stage id?", which answers *present* while
+  the variant the head names is absent. That defeated #968's closure
+  reconciliation from the pull side, where the gap originates, and produced an
+  unrenderable release (`lex-web@0.4.0`, `500 … unknown stage_id`). `op push`,
+  `op pull`, `/v1/stages/missing` and the head reconciler now all carry pairs;
+  the id-only request shape still answers, for older clients.
+
+- **A single-module package keeps its real file name (#988).** The registry
+  archive and `lex export-git` each invented a path for a single-module render —
+  and different ones (`src/lib.lex` vs `src.lex`) — so a package whose module
+  was not called `lib` was silently renamed. `lex-jobs` ships `src/jobs.lex`,
+  so `import "lex-jobs/src/jobs"` could not resolve a module that was present
+  under another name; three libraries were blocked by it. `RenderedSource::Single`
+  now carries the head's own path, or `None` when the head records none (every
+  op predating `in_file`) — those keep each caller's historical name and are
+  repaired by a re-push, not by rendering.
+
 ## [0.11.60] - 2026-09-20
 
 ### Fixed
