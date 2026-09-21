@@ -163,12 +163,16 @@ impl StageTransition {
                 (sig_id.clone(), to.clone()),
             ],
             StageTransition::Remove { sig_id, last } => vec![(sig_id.clone(), last.clone())],
-            // The body exists under both identities across a rename, so a peer
-            // may need it under either.
-            StageTransition::Rename { from, to, body_stage_id } => vec![
-                (from.clone(), body_stage_id.clone()),
-                (to.clone(), body_stage_id.clone()),
-            ],
+            // Only `to` (#992). A SigId covers the declaration's identity, so
+            // the renamed body's AST hashes to the *new* sig and a store files
+            // it there and only there — `(from, body_stage_id)` is a pair no
+            // store can hold. Asking for it made the reconciler demand a blob
+            // that cannot exist and refuse an otherwise valid push. The
+            // transition agrees: `apply_transition` drops `from` and inserts
+            // `to → body_stage_id`, so the head never names `from` either.
+            StageTransition::Rename { to, body_stage_id, .. } => {
+                vec![(to.clone(), body_stage_id.clone())]
+            }
             StageTransition::ImportOnly => Vec::new(),
             StageTransition::Merge { entries } => entries
                 .iter()
@@ -264,6 +268,24 @@ pub enum OperationKind {
         from_budget: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to_budget: Option<u64>,
+        /// The SigId the declaration moves **to** (#992).
+        ///
+        /// A SigId covers the effect row, so changing a function's effects
+        /// changes its sig — the op's own name says as much. Without this the
+        /// transition was a `Replace`, which keeps the *old* sig pointing at
+        /// the *new* stage. But a store files an implementation under the sig
+        /// its own AST hashes to, and that AST declares the new effects, so
+        /// the head entry was unsatisfiable by construction: no store could
+        /// ever hold `(old_sig, new_stage)`. The head then could not be
+        /// rendered, and any release cut from it was born broken —
+        /// `lex-web@0.4.0` is exactly that.
+        ///
+        /// `None` is how every op written before this field existed decodes,
+        /// and it keeps their original `Replace` behaviour so historical logs
+        /// replay unchanged. `skip_serializing_if` keeps those ops
+        /// byte-identical, so their OpIds do not move.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_sig_id: Option<SigId>,
     },
     /// Import added to a file. `in_file` is the canonical path
     /// (relative to the repo root, forward-slashes) so two
@@ -844,6 +866,7 @@ mod tests {
                 to_effects: ["io".into()].into_iter().collect(),
                 from_budget: None,
                 to_budget: None,
+                to_sig_id: None,
             },
             ["op-parent".into()],
         );

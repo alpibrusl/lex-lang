@@ -694,6 +694,10 @@ fn patch_handler(state: &State, body: &str) -> Response<std::io::Cursor<Vec<u8>>
         // them.
         let from_budget = lex_vcs::operation_budget_from_effects(&original_effects);
         let to_budget = lex_vcs::operation_budget_from_effects(&patched_effects);
+        // #992: the patched stage declares the new effects, so it hashes to a
+        // different SigId and the store files it under that one. Record it, or
+        // the head keeps the old sig pointing at a stage no store holds there.
+        let to_sig_id = lex_ast::sig_id(&patched).filter(|s| *s != sig);
         lex_vcs::OperationKind::ChangeEffectSig {
             sig_id: sig.clone(),
             from_stage_id: req.stage_id.clone(),
@@ -702,6 +706,7 @@ fn patch_handler(state: &State, body: &str) -> Response<std::io::Cursor<Vec<u8>>
             to_effects: patched_effects,
             from_budget,
             to_budget,
+            to_sig_id,
         }
     } else {
         let budget = lex_vcs::operation_budget_from_effects(&original_effects);
