@@ -230,6 +230,7 @@ fn register_dep_types(env: &mut TypeEnv, alias: &str, decls: &[a::TypeDecl]) {
         qualify_type_expr(&mut def, alias, &own, &d.params);
         let qualified_name = format!("{alias}.{}", d.name);
         let qualified = a::TypeDecl {
+        doc: Vec::new(),
             name: qualified_name.clone(),
             params: d.params.clone(),
             definition: def,

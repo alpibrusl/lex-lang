@@ -475,6 +475,8 @@ impl LoaderState {
             path: canonical.display().to_string(),
             source,
         })?;
+        // This file's own top-of-file comments, kept for re-attachment below.
+        let file_header = prog.leading_comments.clone();
 
         let local_names: HashSet<String> = prog
             .items
@@ -606,10 +608,30 @@ impl LoaderState {
             path_imports: &path_imports,
             alias_renames: &alias_renames,
         };
-        let mangled: Vec<Item> = my_items
+        let mut mangled: Vec<Item> = my_items
             .into_iter()
             .map(|i| mangler.mangle_item(i))
             .collect();
+        // Hand this file's top-of-file comments to its own first declaration.
+        //
+        // They used to be dropped here (see the note below), which is
+        // defensible for the *merged* program but meant every package served
+        // from an op-log lost its module headers — the block explaining what a
+        // file is for. `lex-ocpi` lost 2051 comment lines that way.
+        //
+        // A declaration is the only carrier the op-log has, since it stores
+        // declarations rather than files; attaching per file, before merging,
+        // keeps each header with the file it came from.
+        if !file_header.is_empty() {
+            if let Some(first) = mangled.iter_mut().find(|i| !matches!(i, Item::Import(_))) {
+                let header = file_header.clone();
+                match first {
+                    Item::FnDecl(fd) => fd.leading_comments.splice(0..0, header),
+                    Item::TypeDecl(td) => td.leading_comments.splice(0..0, header),
+                    Item::Import(_) => unreachable!("imports are filtered out above"),
+                };
+            }
+        }
 
         self.in_progress.pop();
         self.loaded.insert(canonical.to_path_buf());

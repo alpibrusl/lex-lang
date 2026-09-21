@@ -780,6 +780,7 @@ impl Store {
         if !ast_path.exists() && !delta_path.exists() {
             self.persist_stage_bytes(&sig, &stage_id, stage, &ast_path, &delta_path)?;
         }
+        let doc = stage_doc(stage);
         if !meta_path.exists() {
             let signature = signer.map(|kp| kp.sign_stage_id(&stage_id));
             let metadata = Metadata {
@@ -788,9 +789,23 @@ impl Store {
                 name,
                 published_at: Self::now(),
                 note: None,
+                doc,
                 signature,
             };
             write_canonical_json(&meta_path, &metadata)?;
+        } else if !doc.is_empty() {
+            // Comments are deliberately outside the hash, so rewording one
+            // yields the same StageId and lands here rather than writing a
+            // fresh metadata file. Without this branch the first version's
+            // documentation would be pinned forever and a correction could
+            // never reach the registry. Metadata is not content-addressed, so
+            // refreshing it in place is safe.
+            if let Ok(mut existing) = self.get_metadata_for_sig(&sig, &stage_id) {
+                if existing.doc != doc {
+                    existing.doc = doc;
+                    write_canonical_json(&meta_path, &existing)?;
+                }
+            }
         }
 
         // Lifecycle: append a Draft transition for first publish.
@@ -1177,6 +1192,28 @@ impl Store {
         let bytes = fs::read(&delta_path)?;
         let delta: crate::delta::StageDelta = serde_json::from_slice(&bytes)?;
         Ok(delta.chain_length)
+    }
+
+    /// The metadata for a stage **under a named sig**.
+    ///
+    /// [`Self::get_metadata`] resolves the sig through the stage index, which
+    /// is a stage-id-only lookup — and a StageId does not encode the name
+    /// (#826), so two sigs can share one. Resolving by id then hands both
+    /// declarations whichever record the index happens to point at. Harmless
+    /// for a hash, not for content: it gave two different declarations the
+    /// *same* documentation, duplicating a module header into a package that
+    /// had it once.
+    ///
+    /// When the caller knows the sig — a head map is keyed by it — this is the
+    /// honest lookup.
+    pub fn get_metadata_for_sig(
+        &self,
+        sig_id: &str,
+        stage_id: &str,
+    ) -> Result<Metadata, StoreError> {
+        let path = self.impl_dir(sig_id).join(format!("{stage_id}.metadata.json"));
+        let bytes = fs::read(&path)?;
+        Ok(serde_json::from_slice(&bytes)?)
     }
 
     pub fn get_metadata(&self, stage_id: &str) -> Result<Metadata, StoreError> {
@@ -3879,6 +3916,16 @@ fn stage_for_kind<'a>(
     stages
         .iter()
         .find(|s| sig_id(s).as_deref() == Some(target_sig.as_str()))
+}
+
+/// A declaration's `#` comments, as carried across the syntax -> AST boundary.
+/// Empty for imports, which have no metadata record of their own.
+fn stage_doc(stage: &Stage) -> Vec<String> {
+    match stage {
+        Stage::FnDecl(fd) => fd.doc.clone(),
+        Stage::TypeDecl(td) => td.doc.clone(),
+        Stage::Import(_) => Vec::new(),
+    }
 }
 
 fn transition_for_kind(kind: &lex_vcs::OperationKind) -> lex_vcs::StageTransition {

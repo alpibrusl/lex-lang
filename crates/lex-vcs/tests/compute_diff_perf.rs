@@ -37,6 +37,7 @@ fn fn_decl(name: &str, lit: i64) -> FnDecl {
             rhs: Box::new(CExpr::Literal { value: lex_ast::CLit::Int { value: lit } }),
         },
         examples: Vec::new(),
+        doc: Vec::new(),
     }
 }
 

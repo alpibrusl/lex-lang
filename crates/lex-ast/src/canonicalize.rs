@@ -15,7 +15,26 @@ use crate::canonical::*;
 use lex_syntax::syntax as s;
 
 pub fn canonicalize_program(program: &s::Program) -> Vec<Stage> {
-    let raw: Vec<Stage> = program.items.iter().map(canonicalize_item).collect();
+    let mut raw: Vec<Stage> = program.items.iter().map(canonicalize_item).collect();
+    // The parser attaches comments *before the first item* to the program
+    // rather than to that item, so a module header — the block describing what
+    // a file is for, usually its most valuable documentation — would otherwise
+    // be dropped on the way into the op-log.
+    //
+    // Hand it to the first declaration, the only carrier the op-log has: it
+    // stores declarations, not files. On render it therefore reappears above
+    // that declaration rather than at the very top of the file. The text
+    // survives; its exact placement does not.
+    if !program.leading_comments.is_empty() {
+        if let Some(first) = raw.iter_mut().find(|st| !matches!(st, Stage::Import(_))) {
+            let header = program.leading_comments.clone();
+            match first {
+                Stage::FnDecl(fd) => fd.doc.splice(0..0, header),
+                Stage::TypeDecl(td) => td.doc.splice(0..0, header),
+                Stage::Import(_) => unreachable!("imports are filtered out above"),
+            };
+        }
+    }
     // Dead-branch elimination (#228): runs *here*, before type-check
     // and bytecode emission, so the inferred effect set reflects only
     // live branches. `if true { ... } else { ... }` is desugared into
@@ -40,6 +59,8 @@ fn canonicalize_type_decl(td: &s::TypeDecl) -> TypeDecl {
         name: td.name.clone(),
         params: td.params.clone(),
         definition: canonicalize_type(&td.definition),
+        // Carried, not hashed — `doc` is `serde(skip)`.
+        doc: td.leading_comments.clone(),
     }
 }
 
@@ -57,6 +78,8 @@ fn canonicalize_fn_decl(fd: &s::FnDecl) -> FnDecl {
         return_type: canonicalize_type(&fd.return_type),
         body: canonicalize_block(&fd.body),
         examples: fd.examples.iter().map(canonicalize_example).collect(),
+        // Carried, not hashed — `doc` is `serde(skip)`.
+        doc: fd.leading_comments.clone(),
     }
 }
 

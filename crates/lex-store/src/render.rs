@@ -325,12 +325,41 @@ pub(crate) fn demangled_head_stages(
 /// The whole head as one source string (single module / #895 path). Imports
 /// first, then the head stages read per-SigId (so structurally identical
 /// stages that share a StageId keep their distinct names).
+/// Restore each declaration's `#` comments from its stage metadata.
+///
+/// The stored AST carries none: `doc` is `serde(skip)` precisely so comments
+/// cannot touch a SigId or StageId. They live in the stage's `Metadata`
+/// instead — outside the hash, like `name` — and must be put back here, or
+/// everything rendered from an op-log (registry archives, `lex export-git`)
+/// arrives with all documentation stripped.
+///
+/// Read by `(sig, stage)`, never by stage id alone: two sigs can share a
+/// StageId (#826), and an id-only lookup handed both declarations the same
+/// metadata — which duplicated one module header across two declarations.
+///
+/// Best-effort per stage: a missing or unreadable record just means no
+/// comments, never a failed render.
+fn restore_doc(store: &Store, pairs: &[(String, String)], decls: &mut [lex_ast::Stage]) {
+    for ((sig_id, stage_id), decl) in pairs.iter().zip(decls.iter_mut()) {
+        let Ok(meta) = store.get_metadata_for_sig(sig_id, stage_id) else { continue };
+        if meta.doc.is_empty() {
+            continue;
+        }
+        match decl {
+            lex_ast::Stage::FnDecl(fd) => fd.doc = meta.doc,
+            lex_ast::Stage::TypeDecl(td) => td.doc = meta.doc,
+            lex_ast::Stage::Import(_) => {}
+        }
+    }
+}
+
 fn render_singlefile(store: &Store, head: &PackageHead) -> Result<String, StoreError> {
     let pairs: Vec<(String, String)> = head.map.iter().map(|(s, st)| (s.clone(), st.clone())).collect();
     let mut decls: Vec<lex_ast::Stage> = Vec::new();
     for ast in store.get_asts_for_sigs_bulk(&pairs) {
         decls.push(ast?);
     }
+    restore_doc(store, &pairs, &mut decls);
     // De-mangle: a single-module head still carries mangle prefixes (the
     // package loader mangles every declaration, and an inlined dependency
     // adds its own). With one module, everything belongs to this package's
@@ -376,8 +405,19 @@ fn render_multifile(store: &Store, head: &PackageHead) -> Result<BTreeMap<String
     // own names and file (#818/#894).
     let pairs: Vec<(String, String)> = head.map.iter().map(|(s, st)| (s.clone(), st.clone())).collect();
     let asts = store.get_asts_for_sigs_bulk(&pairs);
-    for ((sig, _), ast) in pairs.iter().zip(asts) {
-        let stage = ast?;
+    for ((sig, stage_id), ast) in pairs.iter().zip(asts) {
+        let mut stage = ast?;
+        // Put the declaration's comments back (see `restore_doc`): the stored
+        // AST omits them so they cannot touch a hash.
+        if let Ok(meta) = store.get_metadata_for_sig(sig, stage_id) {
+            if !meta.doc.is_empty() {
+                match &mut stage {
+                    lex_ast::Stage::FnDecl(fd) => fd.doc = meta.doc,
+                    lex_ast::Stage::TypeDecl(td) => td.doc = meta.doc,
+                    lex_ast::Stage::Import(_) => {}
+                }
+            }
+        }
         let file = head.sig_files.get(sig).cloned().unwrap_or_default();
         if let Some(prefix) = stage_prefix(&stage) {
             prefix_to_file.insert(prefix, file.clone());
