@@ -212,6 +212,12 @@ pub fn diff_to_ops(inputs: DiffInputs<'_>) -> Result<Vec<OperationKind>, DiffMap
                 // includes the `[budget(N)]` declaration itself.
                 let from_budget = crate::operation::budget_from_effects(&from_effects);
                 let to_budget = crate::operation::budget_from_effects(&to_effects);
+                // #992: record the sig the declaration moves *to*. A SigId
+                // covers the effect row, so the new stage belongs to a new
+                // sig; leaving the head bound to the old one produces an
+                // entry no store can ever satisfy. `None` when the sig is
+                // somehow unchanged, which keeps the plain Replace shape.
+                let to_sig_id = sig_id(stage).filter(|s| s != sig);
                 out.push(OperationKind::ChangeEffectSig {
                     sig_id: sig.clone(),
                     from_stage_id: from_id.clone(),
@@ -220,6 +226,7 @@ pub fn diff_to_ops(inputs: DiffInputs<'_>) -> Result<Vec<OperationKind>, DiffMap
                     to_effects,
                     from_budget,
                     to_budget,
+                    to_sig_id,
                 });
             }
             Stage::FnDecl(fd) => {

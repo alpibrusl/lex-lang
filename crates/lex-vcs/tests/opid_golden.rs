@@ -95,6 +95,7 @@ fn change_effect_sig() -> Operation {
             to_effects: to,
             from_budget: None,
             to_budget: None,
+            to_sig_id: None,
         },
         ["op-parent".into()],
     )

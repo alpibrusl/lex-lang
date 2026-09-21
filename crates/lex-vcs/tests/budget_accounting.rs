@@ -151,6 +151,7 @@ fn budget_delta_returns_the_right_pair_per_variant() {
         to_effects: BTreeSet::new(),
         from_budget: Some(50),
         to_budget: Some(100),
+        to_sig_id: None,
     };
     assert_eq!(change_effect.budget_delta(), (Some(50), Some(100)));
 
@@ -204,6 +205,7 @@ fn budget_chain_grow_shrink_reports_the_right_deltas() {
             to_effects: s("budget(100)"),
             from_budget: Some(50),
             to_budget: Some(100),
+            to_sig_id: None,
         },
         OperationKind::ModifyBody {
             sig_id: "fac".into(),
@@ -266,6 +268,7 @@ fn change_effect_sig_carries_budget_when_present_in_serialized_json() {
             to_effects: many(&["io", "budget(100)"]),
             from_budget: None,
             to_budget: Some(100),
+            to_sig_id: None,
         },
         ["op-parent".into()],
     );

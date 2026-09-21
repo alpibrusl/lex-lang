@@ -3782,9 +3782,16 @@ fn stage_for_kind<'a>(
 ) -> Option<&'a lex_ast::Stage> {
     use lex_vcs::OperationKind::*;
     let target_sig = match kind {
+        // #992: the stage this op publishes belongs to the sig it moves *to*.
+        // Looking it up under the old sig found nothing in the new program —
+        // the declaration is there, but under its new (effect-bearing) sig —
+        // so the AST was silently never written, leaving the head naming a
+        // pair no store held. Same reason `RenameSymbol` already uses `to`.
+        ChangeEffectSig { sig_id, to_sig_id, .. } => {
+            Some(to_sig_id.clone().unwrap_or_else(|| sig_id.clone()))
+        }
         AddFunction { sig_id, .. }
         | ModifyBody { sig_id, .. }
-        | ChangeEffectSig { sig_id, .. }
         | AddType { sig_id, .. }
         | ModifyType { sig_id, .. } => Some(sig_id.clone()),
         RenameSymbol { to, .. } => Some(to.clone()),
@@ -3817,6 +3824,25 @@ fn transition_for_kind(kind: &lex_vcs::OperationKind) -> lex_vcs::StageTransitio
         } => StageTransition::Remove {
             sig_id: sig_id.clone(),
             last: last_stage_id.clone(),
+        },
+        // #992: an effect change is a *sig* change, so the head entry has to
+        // move to the new sig rather than keep the old one pointing at the new
+        // stage. `Replace` would leave `(old_sig, new_stage)` at the head — a
+        // pair no store can hold, since the new AST declares the new effects
+        // and is filed under the sig it hashes to. `Rename` is exactly the
+        // right shape: drop the old sig, bind the new one to the body.
+        //
+        // Ops written before `to_sig_id` existed decode as `None` and keep the
+        // old `Replace` behaviour, so historical logs replay unchanged.
+        ChangeEffectSig {
+            sig_id,
+            to_stage_id,
+            to_sig_id: Some(to_sig),
+            ..
+        } if to_sig != sig_id => StageTransition::Rename {
+            from: sig_id.clone(),
+            to: to_sig.clone(),
+            body_stage_id: to_stage_id.clone(),
         },
         ModifyBody {
             sig_id,
