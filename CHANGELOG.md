@@ -5,6 +5,24 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [0.11.63] - 2026-09-21
+
+### Fixed
+
+- **A publish retires a head entry no store can hold (#992, repair half).**
+  v0.11.62 stopped `ChangeEffectSig` from stranding an entry, but could not
+  undo one already on disk: the publish diff is keyed by declaration name and
+  reads the old side through the ASTs it *can* resolve, so a stranded entry is
+  invisible to it and no op is ever emitted. A publish now retires head entries
+  whose `(sig, stage)` cannot be read back — **only** when that same stage *is*
+  readable under another sig at the head, which proves the content is present
+  and merely filed elsewhere. A store simply missing blobs (mid-pull, a partial
+  clone, a GC'd object) fails that test and is left strictly alone.
+
+  Verified against the real `lex-official/lex-web` store: one `remove_function`
+  for the stranded pair, after which the head has 364 entries, zero unreadable,
+  renders 27 modules, and defines `serve_from_dir` exactly once.
+
 ## [0.11.62] - 2026-09-21
 
 ### Fixed
