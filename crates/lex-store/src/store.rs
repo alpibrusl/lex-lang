@@ -1730,20 +1730,31 @@ impl Store {
         head_pairs: &[(String, String)],
     ) -> Vec<lex_vcs::OperationKind> {
         let asts = self.get_asts_for_sigs_bulk(head_pairs);
-        // stage_id → an AST genuinely filed under some sig at this head.
-        let resolvable: BTreeMap<&str, &lex_ast::Stage> = head_pairs
-            .iter()
-            .zip(asts.iter())
-            .filter_map(|((_, stage), ast)| Some((stage.as_str(), ast.as_ref().ok()?)))
-            .collect();
 
         head_pairs
             .iter()
             .zip(asts.iter())
             .filter(|(_, ast)| ast.is_err())
             .filter_map(|((sig, stage), _)| {
-                let twin = resolvable.get(stage.as_str())?;
-                Some(match twin {
+                // Is this stage readable under *any* sig in the store?
+                //
+                // Deliberately store-wide rather than head-scoped. Scoping it
+                // to the head looked tighter but made the repair miss the case
+                // it exists for: republishing re-adds the declaration under a
+                // freshly computed stage, so the sig that owns the orphaned AST
+                // no longer points at it *from the head*. The content sits
+                // right there on disk and a head-scoped check cannot see it,
+                // which is exactly what happened on the first real `lex-web`
+                // attempt. `get_ast` resolves a stage through the store's
+                // index, which is the question actually being asked: does some
+                // sig here hold this?
+                //
+                // The guarantee is unchanged, and it is the entire safety
+                // argument: retiring the entry discards nothing, because the
+                // AST demonstrably still exists. A store merely missing blobs
+                // fails this and is left strictly alone.
+                let twin = self.get_ast(stage).ok()?;
+                Some(match &twin {
                     lex_ast::Stage::TypeDecl(_) => lex_vcs::OperationKind::RemoveType {
                         sig_id: sig.clone(),
                         last_stage_id: stage.clone(),
