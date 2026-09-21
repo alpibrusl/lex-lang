@@ -5,6 +5,27 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [0.11.65] - 2026-09-21
+
+### Fixed
+
+- **`op push` treats historical stage pairs as best-effort (#992).**
+  `reconcile_head_stages` walked every op from the root and required every pair
+  any transition mentioned. Some cannot exist: a pre-#992 `ChangeEffectSig`
+  bound the old sig to the new stage, and the AST there hashes to a different
+  sig, so no store has ever held that pair. A package carrying such an op could
+  therefore never be pushed again — including the push of the very repair that
+  retires the entry, which is the deadlock `lex-web` sat in.
+
+  Only pairs the *head* names are mandatory now; those are what a render
+  resolves, so a remote missing one serves `500 unknown stage_id` and that
+  stays a hard error. A pair mentioned only by history is skipped — it is not
+  needed to render the head, only to replay a point in history that was already
+  unrenderable when it was written.
+
+  With this, `lex-official/lex-web` is repaired end to end: `0.5.0` serves all
+  27 modules. (`0.4.0` stays unrenderable — releases are immutable.)
+
 ## [0.11.64] - 2026-09-21
 
 ### Fixed
