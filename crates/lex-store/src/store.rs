@@ -1642,6 +1642,20 @@ impl Store {
         })
         .map_err(|e| StoreError::InvalidTransition(format!("diff_to_ops: {e}")))?;
 
+        // Retire any stranded head entry first, so the rest of this publish
+        // applies to a head every part of which can actually be read back.
+        // Normally this is empty and costs nothing; it fires only on a head
+        // already carrying pre-#992 damage.
+        let op_kinds = {
+            let mut heal = self.stranded_head_entries(&head_pairs);
+            if heal.is_empty() {
+                op_kinds
+            } else {
+                heal.extend(op_kinds);
+                heal
+            }
+        };
+
         let mut ops_out: Vec<PublishOp> = Vec::new();
         let mut last_op_id: Option<lex_vcs::OpId> = None;
         for kind in op_kinds {
@@ -1688,6 +1702,59 @@ impl Store {
             ops: ops_out,
             head_op,
         })
+    }
+
+    /// Head entries naming a `(sig, stage)` no store can hold, where that same
+    /// stage **is** readable under a different sig at the head (#992).
+    ///
+    /// This is the fingerprint a pre-#992 `ChangeEffectSig` leaves behind. It
+    /// bound the *old* sig to the *new* stage, while the store files an
+    /// implementation under the sig its own AST hashes to — and that AST
+    /// declares the new effects. The head then names one declaration twice and
+    /// one of the two can never be resolved, so every render of that head
+    /// fails and any release cut from it is born broken (`lex-web@0.4.0`).
+    ///
+    /// Fixing the op stops new ones appearing but cannot repair a head that
+    /// already has one: the publish diff is keyed by declaration name and
+    /// reads the old side through the ASTs it *can* resolve, so a stranded
+    /// entry is invisible to it and no op is ever emitted.
+    ///
+    /// **The second condition is the whole reason this is safe to do without
+    /// asking.** Requiring the stage to be resolvable under another sig proves
+    /// the content is present and merely filed elsewhere, so retiring the
+    /// entry discards nothing. A store that is simply missing blobs — mid-pull,
+    /// a partial clone, a GC'd object — fails that test, because there neither
+    /// sig resolves, and is left strictly alone.
+    pub fn stranded_head_entries(
+        &self,
+        head_pairs: &[(String, String)],
+    ) -> Vec<lex_vcs::OperationKind> {
+        let asts = self.get_asts_for_sigs_bulk(head_pairs);
+        // stage_id → an AST genuinely filed under some sig at this head.
+        let resolvable: BTreeMap<&str, &lex_ast::Stage> = head_pairs
+            .iter()
+            .zip(asts.iter())
+            .filter_map(|((_, stage), ast)| Some((stage.as_str(), ast.as_ref().ok()?)))
+            .collect();
+
+        head_pairs
+            .iter()
+            .zip(asts.iter())
+            .filter(|(_, ast)| ast.is_err())
+            .filter_map(|((sig, stage), _)| {
+                let twin = resolvable.get(stage.as_str())?;
+                Some(match twin {
+                    lex_ast::Stage::TypeDecl(_) => lex_vcs::OperationKind::RemoveType {
+                        sig_id: sig.clone(),
+                        last_stage_id: stage.clone(),
+                    },
+                    _ => lex_vcs::OperationKind::RemoveFunction {
+                        sig_id: sig.clone(),
+                        last_stage_id: stage.clone(),
+                    },
+                })
+            })
+            .collect()
     }
 
     pub fn derive_imports_from_oplog(
