@@ -5,6 +5,21 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [0.11.64] - 2026-09-21
+
+### Fixed
+
+- **The #992 heal guard looks store-wide, not just at the head.** v0.11.63 asked
+  whether a stranded stage was readable under another sig *at the head*, which
+  looked tighter and was wrong: republishing re-adds the declaration under a
+  freshly computed stage, so the sig owning the orphaned AST stops pointing at
+  it from the head. The content is still on disk, but a head-scoped check
+  cannot see it — so the repair declined and the package stayed unreleasable.
+  It now resolves the stage through the store's index instead.
+
+  The safety guarantee is unchanged: retiring an entry still requires proof the
+  AST exists, so a store merely missing blobs is left strictly alone.
+
 ## [0.11.63] - 2026-09-21
 
 ### Fixed
