@@ -6,9 +6,13 @@
 //! `import "<pkg>/mod"` exposes the module's top-level names). Two versions'
 //! surfaces are compared *structurally*: a function's signature is the JSON of
 //! its `(param types, return type, effects)` — never its body or examples, so
-//! a pure body change is a patch, not an API change. Names carry their
-//! path-derived mangle prefix (`schema_a1b2.validate`), which is stable across
-//! versions, so mangled names compare directly without de-mangling.
+//! a pure body change is a patch, not an API change.
+//!
+//! Names are keyed as `<module>.<name>` — the identity a consumer imports —
+//! **not** by the loader's `<stem>_<hash>` mangling (#991). That hash derives
+//! from the source file, so renaming a file rotated it on every declaration in
+//! that file and the diff read a pure rename as "every symbol removed, every
+//! symbol added".
 
 use std::collections::BTreeMap;
 
@@ -38,7 +42,41 @@ pub fn public_api_at_op(store: &Store, op_id: &str) -> Result<PublicApi, StoreEr
     let pairs: Vec<(String, String)> =
         head.map.iter().map(|(s, st)| (s.clone(), st.clone())).collect();
     let mut api = PublicApi::new();
-    for ast in store.get_asts_for_sigs_bulk(&pairs) {
+    for ((sig_id, _), ast) in pairs.iter().zip(store.get_asts_for_sigs_bulk(&pairs)) {
+        // Key by the identity a *consumer* sees: `<module>.<name>` (#991).
+        //
+        // The raw declaration name carries the loader's mangling prefix,
+        // `<stem>_<hash>`, whose hash derives from the source file. Renaming a
+        // file therefore rotates the prefix on every declaration in it, and the
+        // diff reads a pure rename as "every symbol removed, every symbol
+        // added" — demanding a major bump and reporting it as, say, "`JobOpts`
+        // was removed" when `JobOpts` is plainly still there. That is exactly
+        // what it said about `lex-jobs`, and it cost a major version.
+        //
+        // The module stays *in* the key rather than being stripped, for two
+        // reasons: two modules of one package may each define `validate`
+        // (#818) and must not be merged into one entry; and `<pkg>/<module>`
+        // is the import path, so moving a declaration between modules really
+        // does change what a consumer can import. What changes here is that the
+        // comparison runs on consumer-visible identities instead of
+        // hash-bearing ones, so the verdict is about the API rather than about
+        // how the files happen to be named.
+        let module = head
+            .sig_files
+            .get(sig_id)
+            .map(|f| {
+                let stem = f.rsplit('/').next().unwrap_or(f);
+                stem.trim_end_matches(".lex").to_string()
+            })
+            .unwrap_or_default();
+        let key = |name: &str| {
+            let bare = crate::store::demangled_name(name);
+            if module.is_empty() {
+                bare.to_string()
+            } else {
+                format!("{module}.{bare}")
+            }
+        };
         match ast? {
             lex_ast::Stage::FnDecl(fd) => {
                 // Signature = param types + return type + effects (JSON is a
@@ -47,11 +85,11 @@ pub fn public_api_at_op(store: &Store, op_id: &str) -> Result<PublicApi, StoreEr
                 let param_types: Vec<&lex_ast::TypeExpr> = fd.params.iter().map(|p| &p.ty).collect();
                 let sig = serde_json::to_string(&(&param_types, &fd.return_type, &fd.effects))
                     .unwrap_or_default();
-                api.insert(fd.name.clone(), format!("fn:{sig}"));
+                api.insert(key(&fd.name), format!("fn:{sig}"));
             }
             lex_ast::Stage::TypeDecl(td) => {
                 let sig = serde_json::to_string(&td.definition).unwrap_or_default();
-                api.insert(td.name.clone(), format!("type:{sig}"));
+                api.insert(key(&td.name), format!("type:{sig}"));
             }
             lex_ast::Stage::Import(_) => {}
         }
@@ -88,7 +126,15 @@ pub fn external_dependencies_at_op(store: &Store, op_id: &str) -> Result<Vec<Str
     Ok(deps.into_iter().collect())
 }
 
-/// Bare name for a message (strip the path-derived mangle prefix).
+/// Bare name (strip the leading `<module>.`) for the rename detector, whose
+/// output feeds `lex propagate --rename old=new` and so must be the symbol a
+/// consumer writes, not the module-qualified key.
+///
+/// Deliberately NOT used for the messages in [`classify_api_change`] (#991):
+/// keys are now `<module>.<name>`, so stripping the module there turns "the
+/// module moved" into "`JobOpts` was removed" — which is how a `lib.lex` →
+/// `jobs.lex` rename came to be reported as a vanished type, and cost
+/// `lex-jobs` a major version.
 fn bare(name: &str) -> &str {
     name.split_once('.').map(|(_, n)| n).unwrap_or(name)
 }
@@ -98,15 +144,15 @@ fn bare(name: &str) -> &str {
 pub fn classify_api_change(prev: &PublicApi, new: &PublicApi) -> ApiChange {
     for (name, sig) in prev {
         match new.get(name) {
-            None => return ApiChange::Breaking(format!("`{}` was removed", bare(name))),
+            None => return ApiChange::Breaking(format!("`{name}` was removed")),
             Some(new_sig) if new_sig != sig => {
-                return ApiChange::Breaking(format!("signature of `{}` changed", bare(name)))
+                return ApiChange::Breaking(format!("signature of `{name}` changed"))
             }
             _ => {}
         }
     }
     if let Some(added) = new.keys().find(|k| !prev.contains_key(*k)) {
-        return ApiChange::Additive(format!("`{}` was added", bare(added)));
+        return ApiChange::Additive(format!("`{added}` was added"));
     }
     ApiChange::None
 }
