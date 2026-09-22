@@ -656,6 +656,36 @@ fn dependency_specs_json(
     out
 }
 
+/// The dependencies a hosted gate cannot resolve (#944): declared with a git
+/// source only, so they have no `lex.lock` pin. Sorted for stable output.
+pub(crate) fn git_only_deps(
+    deps: &std::collections::HashMap<String, lex_syntax::workspace::Dependency>,
+) -> Vec<String> {
+    let mut out: Vec<String> = deps
+        .iter()
+        .filter(|(_, d)| d.git_coord().is_some() && d.registry_coord().is_none())
+        .map(|(n, _)| n.clone())
+        .collect();
+    out.sort();
+    out
+}
+
+/// Warn, before anything reaches a hosted store, about dependencies hosted
+/// verification will report as `unpinned_dependency` (#944): the hub resolves
+/// dependencies only through lock pins into its registry stores and never
+/// fetches git. A warning, not a refusal — an inlined publish still carries
+/// its dependencies whole.
+fn warn_git_only_deps(deps: &std::collections::HashMap<String, lex_syntax::workspace::Dependency>) {
+    for name in git_only_deps(deps) {
+        eprintln!(
+            "warning: dependency `{name}` has only a git source; hosted verification resolves \
+             dependencies through `lex.lock` registry pins and will report it as \
+             `unpinned_dependency`. Add a registry source (`{name} = {{ registry = \"<host>/<tenant>/<store>\", \
+             version = \"^X.Y\", git = … }}`) and run `lex pkg lock`."
+        );
+    }
+}
+
 fn cmd_release(args: &[String]) -> Result<()> {
     let mut hub: Option<String> = None;
     let mut version: Option<String> = None;
@@ -690,6 +720,7 @@ fn cmd_release(args: &[String]) -> Result<()> {
     // Full coordinates (git + vcs refs) so the hub can render a faithful
     // `[dependencies]` table into the install archive.
     let dependency_specs = dependency_specs_json(&manifest.dependencies);
+    warn_git_only_deps(&manifest.dependencies);
 
     let url = format!("{}/v1/pkg/{}/release", hub.trim_end_matches('/'), name);
     let body = serde_json::json!({
@@ -1092,6 +1123,7 @@ fn cmd_publish(args: &[String]) -> Result<()> {
     match (registry, token) {
         (Some(registry), Some(token)) => {
             println!("publishing {}@{} to {} ...", pkg.name, pkg.version, registry);
+            warn_git_only_deps(&manifest.dependencies);
             let url = format!("{}/v1/pkg/publish", registry.trim_end_matches('/'));
             let response = ureq::post(&url)
                 .header("Authorization", &format!("Bearer {token}"))
@@ -1387,6 +1419,32 @@ mod tests {
     }
     fn path(p: &str) -> Dependency {
         Dependency::Path { path: p.into() }
+    }
+
+    /// #944: only a dependency with no registry source is flagged — a dual
+    /// (git + registry) dependency locks through its registry half.
+    #[test]
+    fn git_only_deps_flags_exactly_the_unlockable_ones() {
+        let mut deps = std::collections::HashMap::new();
+        deps.insert("lex-agent".to_string(), git("https://github.com/alpibrusl/lex-agent"));
+        deps.insert("local".to_string(), path("../local"));
+        deps.insert(
+            "lex-nt".to_string(),
+            Dependency::Registry { registry: "vcs.lexlang.org/lex-official/lex-nt".into(), version: "^1.0".into() },
+        );
+        deps.insert(
+            "lex-fix".to_string(),
+            Dependency::Both {
+                registry: "vcs.lexlang.org/lex-official/lex-fix".into(),
+                version: "^1.0".into(),
+                git: "https://github.com/alpibrusl/lex-fix".into(),
+                branch: None,
+                tag: None,
+                rev: None,
+            },
+        );
+        deps.insert("lex-mcp".to_string(), git_tag("https://github.com/alpibrusl/lex-mcp", "v1.0.0"));
+        assert_eq!(git_only_deps(&deps), vec!["lex-agent".to_string(), "lex-mcp".to_string()]);
     }
 
     /// All conflict-detection scenarios from issue #637, exercised through the

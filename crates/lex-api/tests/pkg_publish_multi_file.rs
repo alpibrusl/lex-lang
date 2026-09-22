@@ -880,6 +880,36 @@ fn released_version_archive_is_rendered_from_the_op_log_head() {
     );
 }
 
+/// #943: the rendered archive ships the lock committed with the released
+/// head, so an installed package resolves its own dependencies against the
+/// pins it was published with (a cached package directory used to have no
+/// `lex.lock`, which made every caret registry dependency-of-a-dependency
+/// unresolvable). A head with no committed lock ships none.
+#[test]
+fn released_archive_ships_the_committed_lock() {
+    let (srv, _tmp) = start_server();
+    let archive = pkg_archive("lockpkg", "0.1.0", &[("lib.lex", "fn one() -> Int { 1 }\n")]);
+    assert_eq!(post_bytes(&srv.addr, "/v1/pkg/publish", &archive).0, 200, "publish");
+    let (s, b) = post_bytes(&srv.addr, "/v1/pkg/lockpkg/release", br#"{"version":"1.0.0"}"#);
+    assert_eq!(s, 201, "release: {b}");
+    let head = serde_json::from_str::<serde_json::Value>(&b).unwrap()["head_op"].as_str().unwrap().to_string();
+
+    // Control: no committed lock yet → no lex.lock in the archive.
+    let (status, body) = get_raw(&srv.addr, "/v1/pkg/lockpkg/1.0.0/archive");
+    assert_eq!(status, 200);
+    assert!(extract(&body, "lex.lock").is_none(), "no lock was committed, none may be invented");
+
+    let lock = "version = 1\n\n[[package]]\nname = \"lex-nt\"\nregistry = \"vcs.lexlang.org/lex-official/lex-nt\"\n\
+constraint = \"^1.0\"\nversion = \"1.2.0\"\nhead_op = \"op_nt\"\n";
+    let batch = serde_json::json!([{ "head_op": head, "lock": lock }]).to_string();
+    let (s, b) = post_bytes(&srv.addr, "/v1/locks/batch", batch.as_bytes());
+    assert_eq!(s, 200, "commit lock: {b}");
+
+    let (status, body) = get_raw(&srv.addr, "/v1/pkg/lockpkg/1.0.0/archive");
+    assert_eq!(status, 200);
+    assert_eq!(extract(&body, "lex.lock").as_deref(), Some(lock), "the committed lock must ship verbatim");
+}
+
 /// #894: a multi-module op-log package's rendered archive is the full
 /// `src/*.lex` tree (de-flattened), not a single flattened file — so both
 /// modules install and each import path resolves.

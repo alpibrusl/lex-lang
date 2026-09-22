@@ -2697,11 +2697,17 @@ fn render_op_log_archive(
     // The same renderer `lex export-git` uses, so the installed source matches
     // the git mirror. Either way the *names* come from the head itself; this
     // used to invent `src/lib.lex` for the single-module arm (#988).
-    let files: Vec<(String, String)> = {
+    let (files, lock): (Vec<(String, String)>, Option<String>) = {
         let store = state.store.lock().unwrap();
+        // #943: ship the lock this head was published against, so a consumer
+        // that installs this package resolves ITS dependencies against the
+        // pins it was built with. Without it a cached package directory has
+        // no `lex.lock`, and any caret registry dependency of a dependency
+        // was unresolvable (`UnlockedRegistryDep`).
+        let lock = store.committed_lock_inherited(head_op).ok().flatten();
         let head = lex_store::render::package_head_at_op(&store, head_op)
             .map_err(|e| format!("reading head {head_op}: {e}"))?;
-        match lex_store::render::render_source(&store, &head)
+        let files = match lex_store::render::render_source(&store, &head)
             .map_err(|e| format!("rendering source at {head_op}: {e}"))?
         {
             lex_store::render::RenderedSource::Single { path, src } => {
@@ -2710,7 +2716,8 @@ fn render_op_log_archive(
                 vec![(path.unwrap_or_else(|| DEFAULT_ARCHIVE_MODULE.to_string()), src)]
             }
             lex_store::render::RenderedSource::Multi(tree) => tree.into_iter().collect(),
-        }
+        };
+        (files, lock)
     };
 
     // Reconstruct the manifest from the release record. When the release
@@ -2740,6 +2747,9 @@ fn render_op_log_archive(
             ar.append_data(&mut h, p, data)
         };
         append("lex.toml", manifest.as_bytes()).map_err(|e| e.to_string())?;
+        if let Some(lock) = &lock {
+            append("lex.lock", lock.as_bytes()).map_err(|e| e.to_string())?;
+        }
         for (path, src) in &files {
             append(path, src.as_bytes()).map_err(|e| e.to_string())?;
         }

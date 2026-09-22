@@ -111,6 +111,41 @@ pub enum TypeError {
         /// Pretty-printed actual value the function body produced.
         got: String,
     },
+    /// A head imports a registry/git package (`import "<pkg>/<module>"`) that
+    /// its governing `lex.lock` does not pin (#944). A hosted gate resolves
+    /// dependencies only through lock pins into hosted stores — it never
+    /// fetches git — so a git-only dependency, or one missing from the lock,
+    /// cannot be verified there. Reported instead of the downstream
+    /// `unknown-identifier` on every `<alias>.name` the head uses.
+    UnpinnedDependency {
+        at_node: String,
+        /// The import reference, e.g. `"lex-nt/lib"`.
+        reference: String,
+        /// The package half of the reference, e.g. `"lex-nt"`.
+        package: String,
+        /// What to do about it.
+        hint: String,
+    },
+    /// A dependency the lock *does* pin could not be resolved (#943): its
+    /// pinned store is missing or not visible to this tenant, its own
+    /// dependencies do not resolve, the import names no module in it, or the
+    /// dependency graph cycles back on itself.
+    UnresolvedDependency {
+        at_node: String,
+        reference: String,
+        package: String,
+        reason: String,
+    },
+    /// One package is pinned to two different heads inside a head's
+    /// dependency closure (#943) — a diamond whose two sides disagree. Both
+    /// copies would share one type namespace, so the head cannot be checked
+    /// soundly until the pins agree.
+    DependencyConflict {
+        at_node: String,
+        package: String,
+        /// The distinct pinned heads, sorted.
+        heads: Vec<String>,
+    },
 }
 
 impl TypeError {
@@ -131,7 +166,10 @@ impl TypeError {
             | TypeError::RefinementViolation { at_node, .. }
             | TypeError::ExamplesOnEffectfulFn { at_node, .. }
             | TypeError::ExampleArityMismatch { at_node, .. }
-            | TypeError::ExampleMismatch { at_node, .. } => at_node,
+            | TypeError::ExampleMismatch { at_node, .. }
+            | TypeError::UnpinnedDependency { at_node, .. }
+            | TypeError::UnresolvedDependency { at_node, .. }
+            | TypeError::DependencyConflict { at_node, .. } => at_node,
         }
     }
 }
@@ -171,6 +209,14 @@ impl std::fmt::Display for TypeError {
             TypeError::ExampleMismatch { at_node, fn_name, case_index, expected, got } =>
                 write!(f, "example #{} of `{fn_name}` at {at_node}: expected {expected}, got {got}",
                     case_index + 1),
+            TypeError::UnpinnedDependency { reference, package, hint, .. } =>
+                write!(f, "unpinned dependency: `import \"{reference}\"` needs package `{package}`, \
+                          which the lock does not pin; {hint}"),
+            TypeError::UnresolvedDependency { reference, package, reason, .. } =>
+                write!(f, "unresolved dependency: `import \"{reference}\"` (package `{package}`): {reason}"),
+            TypeError::DependencyConflict { package, heads, .. } =>
+                write!(f, "dependency conflict: package `{package}` is pinned to {} different heads \
+                          in the dependency closure ({})", heads.len(), heads.join(", ")),
         }
     }
 }

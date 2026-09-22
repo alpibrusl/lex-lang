@@ -29,7 +29,8 @@ lex-ast = { path = "../lex-ast", version = "0.11.0" }
 # lex-runtime cycle.
 lex-trace = { path = "../lex-trace", version = "0.11.0", optional = true }
 # The `lex.lock` format (`lex_syntax::lock`): a merge commits the union of its
-# parents' locks (#977), so the store must parse and render lockfiles.
+# parents' locks (#977), so the store must parse and render lockfiles. Also
+# the package mangle-prefix formula for recursive dep resolution (#943).
 lex-syntax = { path = "../lex-syntax", version = "0.11.0" }
 lex-types = { path = "../lex-types", version = "0.11.0" }
 lex-vcs = { path = "../lex-vcs", version = "0.11.0" }
