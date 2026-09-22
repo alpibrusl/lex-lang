@@ -354,7 +354,7 @@ fn find_module_file(pkg_root: &Path, module_path: &str) -> Option<PathBuf> {
 // ── Git cache ─────────────────────────────────────────────────────────────────
 
 /// Parsed ref from a git dependency declaration.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum GitRef<'a> {
     Branch(&'a str),
     Tag(&'a str),
@@ -387,13 +387,61 @@ fn sanitize_ref(r: &str) -> String {
     r.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '.' { c } else { '_' }).collect()
 }
 
+/// Resolve a *moving* git ref to the commit it currently points at, via
+/// `git ls-remote`. `None` when git cannot be run or the ref is absent —
+/// callers fall back to the unresolved path so an offline build still works
+/// off whatever is already cached.
+fn resolve_remote_sha(url: &str, refname: &str) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["ls-remote", url, refname])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let sha = text.split_whitespace().next()?;
+    (sha.len() >= 12 && sha.chars().all(|c| c.is_ascii_hexdigit())).then(|| sha.to_string())
+}
+
 /// Return the local cache directory for `pkg_name`, cloning from `url`
 /// at the given ref if it isn't there yet.
 ///
 /// Cache root: `$LEX_PACKAGES_DIR` if set, otherwise `~/.lex/packages/`.
-/// Cache key:  `{pkg_name}{ref_slug}` so different tags/revs don't collide.
+/// Cache key:  `{pkg_name}{ref_slug}` so different refs don't collide.
+///
+/// **Moving refs are keyed by the commit they resolve to.** A branch — and the
+/// default branch especially — names different content over time, but the cache
+/// is checked with a bare `pkg_dir.exists()`, so a name-keyed slot is populated
+/// once and never revisited. `lex-economy` landed in `~/.lex/packages/lex-economy`
+/// on one day and every resolution afterwards read that checkout, months later:
+/// a rename upstream was invisible locally, `lex check` reported
+/// `unknown_variant` against an interface that no longer existed, and a
+/// dependency-drift guard comparing the lock against the cache found them in
+/// perfect agreement — all three symptoms of one stale directory.
+///
+/// Resolving first means the path encodes the content, exactly as registry
+/// packages are keyed `{name}-{version}`. A moved branch is then simply a
+/// different directory, so staleness stops being something to detect and
+/// becomes something that cannot happen.
 fn git_ensure_cached(pkg_name: &str, url: &str, git_ref: &GitRef<'_>) -> Result<PathBuf, PackageError> {
     let cache_root = packages_cache_dir()?;
+
+    // Pin moving refs to a concrete commit for the cache key *and* the clone.
+    // `Rev` is already exact; `Tag` is immutable by convention.
+    let resolved: Option<String> = match git_ref {
+        GitRef::DefaultBranch => resolve_remote_sha(url, "HEAD"),
+        GitRef::Branch(b) => resolve_remote_sha(url, b),
+        GitRef::Rev(_) | GitRef::Tag(_) => None,
+    };
+    let effective: GitRef<'_> = match resolved.as_deref() {
+        Some(sha) => GitRef::Rev(sha),
+        // Offline, or a ref git could not resolve: keep the old path so a build
+        // that already has the package cached still works.
+        None => *git_ref,
+    };
+    let git_ref = &effective;
+
     let dir_name = format!("{}{}", pkg_name, git_ref.cache_slug());
     let pkg_dir = cache_root.join(&dir_name);
     if pkg_dir.exists() {
