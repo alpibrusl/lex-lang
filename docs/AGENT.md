@@ -561,7 +561,11 @@ import "lex-schema/schema"   as s
 
 Module resolution: `{pkg_root}/src/{module}.lex`, then `{pkg_root}/{module}.lex`.
 
-Git dependencies are cloned to `~/.lex/packages/` on first use (override with `$LEX_PACKAGES_DIR`).
+Git dependencies are cloned to `~/.lex/packages/` on first use (override with `$LEX_PACKAGES_DIR`). An unpinned
+dependency (no `rev`) is resolved to its current commit with `git ls-remote`
+and cached under that commit; the answer is shared between `lex` processes for
+`$LEX_GIT_REF_TTL` seconds (default 60, `0` = ask every time), so a branch
+moved upstream is picked up within that window.
 
 Manage with `lex pkg init / add / list`.
 

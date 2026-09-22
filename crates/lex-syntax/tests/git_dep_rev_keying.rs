@@ -93,6 +93,14 @@ fn consumer(tmp: &Path, repo: &Path) -> PathBuf {
 /// Resolve the dep through the real loader and report which cache directory it
 /// used, plus whether the fetched source is the newest.
 fn resolve(consumer_dir: &Path, cache: &Path) -> Vec<String> {
+    // These tests pin the *strict* property — a moved branch is seen by the
+    // very next load — so the shared cross-process ref cache (#1015
+    // follow-up) is off unless a test turns it on with `resolve_with_ttl`.
+    resolve_with_ttl(consumer_dir, cache, 0)
+}
+
+fn resolve_with_ttl(consumer_dir: &Path, cache: &Path, ttl_secs: u64) -> Vec<String> {
+    std::env::set_var("LEX_GIT_REF_TTL", ttl_secs.to_string());
     // The loader reads the cache root from this env var.
     std::env::set_var("LEX_PACKAGES_DIR", cache);
     let entry = consumer_dir.join("src/main.lex");
@@ -111,6 +119,8 @@ fn resolve(consumer_dir: &Path, cache: &Path) -> Vec<String> {
         .map(|rd| {
             rd.filter_map(|e| e.ok())
                 .map(|e| e.file_name().to_string_lossy().to_string())
+                // `.git-refs` is the shared ref cache, not a package.
+                .filter(|n| !n.starts_with('.'))
                 .collect()
         })
         .unwrap_or_default();
@@ -250,15 +260,26 @@ fn one_load_asks_ls_remote_once_per_dependency() {
     )
     .unwrap();
 
+    let cache = tmp.path().join("cache");
+    let log = count_git(tmp.path(), || {
+        resolve(&cons, &cache);
+    });
+    assert_eq!(ls_remotes(&log), 1, "one dependency, one ls-remote per load; git calls:\n{log}");
+}
+
+/// Run `f` with a `git` shim first on PATH that logs every invocation;
+/// return the log.
+fn count_git(tmp: &Path, f: impl FnOnce()) -> String {
     let real_git = String::from_utf8(
         Command::new("sh").args(["-c", "command -v git"]).output().expect("which git").stdout,
     )
     .unwrap()
     .trim()
     .to_string();
-    let shim_dir = tmp.path().join("shim");
+    let shim_dir = tmp.join("shim");
     std::fs::create_dir_all(&shim_dir).unwrap();
-    let log = tmp.path().join("git.log");
+    let log = tmp.join("git.log");
+    let _ = std::fs::remove_file(&log);
     let shim = shim_dir.join("git");
     std::fs::write(
         &shim,
@@ -272,11 +293,68 @@ fn one_load_asks_ls_remote_once_per_dependency() {
     }
     let old_path = std::env::var("PATH").unwrap_or_default();
     std::env::set_var("PATH", format!("{}:{old_path}", shim_dir.display()));
-    let cache = tmp.path().join("cache");
-    resolve(&cons, &cache);
+    f();
     std::env::set_var("PATH", old_path);
+    std::fs::read_to_string(&log).unwrap_or_default()
+}
 
-    let calls = std::fs::read_to_string(&log).unwrap_or_default();
-    let ls_remotes = calls.lines().filter(|l| l.starts_with("ls-remote")).count();
-    assert_eq!(ls_remotes, 1, "one dependency, one ls-remote per load; git calls:\n{calls}");
+fn ls_remotes(log: &str) -> usize {
+    log.lines().filter(|l| l.starts_with("ls-remote")).count()
+}
+
+/// Across processes (#1015 follow-up): each `lex` process is its own load,
+/// so a CI job running `lex check` per file paid one ls-remote per dep per
+/// process. Within `LEX_GIT_REF_TTL`, a second load reuses the shared answer.
+#[test]
+fn a_second_load_within_the_ttl_reuses_the_resolved_ref() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = upstream(tmp.path(), "fn v() -> Int { 1 }\n");
+    let cons = consumer(tmp.path(), &repo);
+    let cache = tmp.path().join("cache");
+    let log = count_git(tmp.path(), || {
+        resolve_with_ttl(&cons, &cache, 60);
+        resolve_with_ttl(&cons, &cache, 60);
+    });
+    assert_eq!(ls_remotes(&log), 1, "two loads within the TTL, one ls-remote:\n{log}");
+}
+
+/// `LEX_GIT_REF_TTL=0` turns the shared cache off: every load asks.
+#[test]
+fn ttl_zero_asks_every_load() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = upstream(tmp.path(), "fn v() -> Int { 1 }\n");
+    let cons = consumer(tmp.path(), &repo);
+    let cache = tmp.path().join("cache");
+    let log = count_git(tmp.path(), || {
+        resolve_with_ttl(&cons, &cache, 0);
+        resolve_with_ttl(&cons, &cache, 0);
+    });
+    assert_eq!(ls_remotes(&log), 2, "TTL 0 must not share answers:\n{log}");
+    assert!(!cache.join(".git-refs").exists(), "TTL 0 must not write the shared cache");
+}
+
+/// The bound on freshness: within the TTL a moved branch is not yet seen;
+/// once the answer is older than the TTL, the next load sees the new commit.
+#[test]
+fn a_moved_branch_is_seen_once_the_ttl_expires() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = upstream(tmp.path(), "fn v() -> Int { 1 }\n");
+    let cons = consumer(tmp.path(), &repo);
+    let cache = tmp.path().join("cache");
+    let first = head_sha(&repo);
+    let before = resolve_with_ttl(&cons, &cache, 3);
+    advance(&repo, "fn v() -> Int { 2 }\n");
+    let within = resolve_with_ttl(&cons, &cache, 3);
+    assert_eq!(before, within, "inside the TTL the shared answer stands");
+    assert!(before.iter().any(|d| d.contains(&first[..12])), "{before:?}");
+    std::thread::sleep(std::time::Duration::from_millis(3200));
+    let second = head_sha(&repo);
+    let after = resolve_with_ttl(&cons, &cache, 3);
+    assert!(
+        after.iter().any(|d| d.contains(&second[..12])),
+        "after the TTL the moved branch must resolve to its new commit: {after:?}"
+    );
 }

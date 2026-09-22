@@ -442,13 +442,108 @@ fn resolve_remote_sha(url: &str, refname: &str) -> Option<String> {
     if let Some(hit) = SHA_SCOPE.with(|s| s.borrow().as_ref().and_then(|m| m.get(&key).cloned())) {
         return hit;
     }
-    let sha = ls_remote_sha(url, refname);
+    let sha = match shared_ref_cache_get(url, refname) {
+        Some(hit) => Some(hit),
+        None => {
+            let fresh = ls_remote_sha(url, refname);
+            if let Some(sha) = &fresh {
+                shared_ref_cache_put(url, refname, sha);
+            }
+            fresh
+        }
+    };
     SHA_SCOPE.with(|s| {
         if let Some(m) = s.borrow_mut().as_mut() {
             m.insert(key, sha.clone());
         }
     });
     sha
+}
+
+// ---- Across processes: a short-lived shared answer ----------------------
+//
+// The per-load memo stops the per-import storm, but every `lex` *process*
+// still asks once per dependency — and a CI job that runs `lex check` per
+// file, or a gate that spawns `lex` per tool, is hundreds of processes:
+// lex-code's CI went from 55s to ~10 minutes on 0.11.68. So a resolved
+// (url, ref) is also written beside the package cache and trusted for
+// `LEX_GIT_REF_TTL` seconds (default 60; 0 disables it).
+//
+// This bounds #1005's freshness rather than giving it up: a branch moved
+// upstream is seen once the answer is older than the TTL. Only successful
+// resolutions are recorded, so an offline run never pins a stale "no".
+
+const DEFAULT_GIT_REF_TTL_SECS: u64 = 60;
+
+fn git_ref_ttl() -> u64 {
+    std::env::var("LEX_GIT_REF_TTL")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(DEFAULT_GIT_REF_TTL_SECS)
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn shared_ref_cache_path(url: &str, refname: &str) -> Option<PathBuf> {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(url.as_bytes());
+    h.update([0u8]);
+    h.update(refname.as_bytes());
+    let key: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    Some(packages_cache_dir().ok()?.join(".git-refs").join(format!("{key}.json")))
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CachedRef {
+    url: String,
+    #[serde(rename = "ref")]
+    refname: String,
+    sha: String,
+    resolved_at: u64,
+}
+
+fn shared_ref_cache_get(url: &str, refname: &str) -> Option<String> {
+    let ttl = git_ref_ttl();
+    if ttl == 0 {
+        return None;
+    }
+    let bytes = std::fs::read(shared_ref_cache_path(url, refname)?).ok()?;
+    let c: CachedRef = serde_json::from_slice(&bytes).ok()?;
+    // The key is a hash; check the record really is for this (url, ref).
+    let fresh = now_secs().saturating_sub(c.resolved_at) < ttl;
+    (c.url == url && c.refname == refname && fresh).then_some(c.sha)
+}
+
+/// Best effort: a cache that cannot be written just means the next process
+/// asks the network again.
+fn shared_ref_cache_put(url: &str, refname: &str, sha: &str) {
+    if git_ref_ttl() == 0 {
+        return;
+    }
+    let Some(path) = shared_ref_cache_path(url, refname) else { return };
+    let Some(dir) = path.parent() else { return };
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let rec = CachedRef {
+        url: url.to_string(),
+        refname: refname.to_string(),
+        sha: sha.to_string(),
+        resolved_at: now_secs(),
+    };
+    let Ok(bytes) = serde_json::to_vec(&rec) else { return };
+    // Unique tmp name per process so concurrent writers never interleave;
+    // rename is atomic, so readers see a whole record or none.
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 fn ls_remote_sha(url: &str, refname: &str) -> Option<String> {
