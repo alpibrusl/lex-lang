@@ -55,7 +55,7 @@ mod scoring;
 pub use cache::{default_cache_root, CachingEmbedder};
 pub use embedder::{EmbedError, Embedder};
 pub use http::{HttpEmbedder, Provider};
-pub use index::{IndexedStage, SearchHit, SearchIndex};
+pub use index::{BuildOptions, IndexedStage, SearchHit, SearchIndex};
 pub use mock::MockEmbedder;
 pub use scoring::{cosine_similarity, fuse_scores};
 

@@ -798,7 +798,10 @@ pub(super) fn rewrite_branch_heads(
 
 /// `lex store search "<query>"` (#224). Embeds the query and ranks
 /// every active stage in the store by fused cosine similarity over
-/// description + signature + examples. Slice 1 ships only the
+/// description + signature + examples. `--include-draft` also ranks
+/// functions that only have a Draft stage (every stage of a pulled
+/// store, #969); without it, skipped drafts are counted and reported
+/// as a hint rather than silently yielding 0 hits. Slice 1 ships only the
 /// MockEmbedder for offline / deterministic ranking; the network-
 /// backed providers gate on `LEX_EMBED_URL` (slice 2).
 pub(super) fn cmd_store_search(fmt: &OutputFormat, args: &[String]) -> Result<()> {
@@ -810,7 +813,9 @@ pub(super) fn cmd_store_search(fmt: &OutputFormat, args: &[String]) -> Result<()
         return cmd_store_search_reindex(fmt, &args[1..]);
     }
     let (root, rest, _, _) = parse_store_flag(args);
+    const USAGE: &str = "usage: lex store search [--limit N] [--include-draft] \"<query>\"";
     let mut limit: usize = 10;
+    let mut include_draft = false;
     let mut query: Option<String> = None;
     let mut iter = rest.iter();
     while let Some(a) = iter.next() {
@@ -821,41 +826,79 @@ pub(super) fn cmd_store_search(fmt: &OutputFormat, args: &[String]) -> Result<()
                     .ok_or_else(|| anyhow!("--limit needs a value"))?;
                 limit = v.parse().context("--limit must be a positive integer")?;
             }
+            "--include-draft" => include_draft = true,
             other if !other.starts_with("--") => {
                 if query.is_some() {
-                    bail!("usage: lex store search [--limit N] \"<query>\"");
+                    bail!("{USAGE}");
                 }
                 query = Some(other.to_string());
             }
             other => bail!("unknown flag `{other}` for `lex store search`"),
         }
     }
-    let query = query.ok_or_else(|| anyhow!("usage: lex store search [--limit N] \"<query>\""))?;
+    let query = query.ok_or_else(|| anyhow!("{USAGE}"))?;
 
     let store =
         Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
     let embedder = build_embedder(&root)?;
-    let idx = lex_search::SearchIndex::build(&store, &*embedder)
+    // Where a function has several Draft versions, index the one the current
+    // branch head names. Best-effort: a store with no head just falls back to
+    // the newest Draft.
+    let prefer = if include_draft {
+        store
+            .branch_head(&store.current_branch())
+            .unwrap_or_default()
+    } else {
+        Default::default()
+    };
+    let opts = lex_search::BuildOptions {
+        include_draft,
+        prefer,
+    };
+    let idx = lex_search::SearchIndex::build_with(&store, &*embedder, &opts)
         .map_err(|e| anyhow!("building search index: {e}"))?;
     let hits = idx
         .query(&*embedder, &query, limit)
         .map_err(|e| anyhow!("query embedding: {e}"))?;
-    let v = serde_json::json!({
+    // #969: never let skipped Drafts read as "no matches". Lifecycle status is
+    // not carried by `op pull`, so every stage of a pulled store is Draft and
+    // an Active-only search sees none of it.
+    let hint = (idx.drafts_skipped > 0).then(|| {
+        format!(
+            "{} draft function(s) not searched (only Active stages are ranked by default; \
+             a pulled store is all Draft) -- re-run with --include-draft to include them",
+            idx.drafts_skipped
+        )
+    });
+    let mut v = serde_json::json!({
         "query": &query,
         "limit": limit,
+        "include_draft": include_draft,
         "indexed": idx.stages.len(),
+        "drafts_skipped": idx.drafts_skipped,
         "hits": serde_json::to_value(&hits)?,
     });
+    if let Some(h) = &hint {
+        v["hint"] = serde_json::Value::String(h.clone());
+    }
     acli::emit_or_text("store-search", v.clone(), fmt, || {
         println!("{} hit(s) for `{}`", hits.len(), query);
         for h in &hits {
+            let status = if h.status == lex_store::StageStatus::Active {
+                String::new()
+            } else {
+                format!("  [{}]", format!("{:?}", h.status).to_lowercase())
+            };
             println!(
-                "  {:>6.3}  {}::{}  {}",
-                h.score.fused, h.stage_id, h.name, h.signature,
+                "  {:>6.3}  {}::{}  {}{}",
+                h.score.fused, h.stage_id, h.name, h.signature, status,
             );
             if let Some(d) = &h.description {
                 println!("          note: {d}");
             }
+        }
+        if let Some(h) = &hint {
+            println!("hint: {h}");
         }
     });
     Ok(())
