@@ -5,6 +5,44 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [0.11.68] - 2026-09-22
+
+### Added
+
+- **Agent-refined acceptance for typed issues (#956).** A free-form issue can
+  be refined into a machine-checkable one: `lex issue propose <id> --shape S …
+  [--rationale R] [--by WHO]` records an `AcceptanceProposal`, `lex issue
+  proposals <id>` lists them, and `lex issue approve|reject <proposal> --by WHO`
+  records the human verdict as a `Review` attestation. The issue is never
+  rewritten (its id hashes its content): `verify` judges it against the latest
+  approved proposal under the same id, and `show` adds `effective_acceptance` /
+  `approved_proposal`. Only `free_form` issues are refinable; a same-second
+  approve/reject tie resolves to rejected.
+- **Binary blobs and a files manifest in lex-store (#1007, 1/8).**
+  `put_blob_bytes` / `get_blob_bytes` for exact bytes (text ids unchanged),
+  and `lex_store::files::Manifest` with a canonical, content-addressed encoding.
+- **`lex store search --include-draft` (#969).** Pulled stages land as Draft,
+  so search now reports how many it skipped and can index them on request.
+
+### Fixed
+
+- **`lex check` asked `git ls-remote` once per import site (#1015).** The
+  commit-keyed git cache from 0.11.67 resolved a moving ref on every
+  `resolve_package_import` call; a widely-importing module paid a network
+  round trip per site (~2 minutes for one file). Each load pass now resolves
+  each (url, ref) once — per load, not per process, so a branch that moves
+  between loads is still seen.
+- **A merge commits its own merged lock (#977).** A merge head inherited the
+  nearest ancestor's lock, so a dependency introduced on the source branch
+  failed as `unknown_identifier` after merging.
+- **`op replay` skips and reports unloadable parent stages (#868)** instead of
+  aborting on one GC'd or never-persisted stage.
+- **Op sync names HTTP failures and retries transient ones (#971).** An empty
+  502 during a hub cold start no longer surfaces as a JSON EOF; timeouts,
+  502/503/504 and truncated bodies are retried.
+- **`/v1/stages/{fetch,batch,missing}` resolve ids in one bulk pass (#971)** —
+  256 ids against a 30k-stage store: 2.2s → 52ms.
+
 ## [0.11.67] - 2026-09-22
 
 ### Fixed
