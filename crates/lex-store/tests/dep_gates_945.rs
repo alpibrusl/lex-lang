@@ -29,9 +29,10 @@ use lex_syntax::parse_source;
 use lex_types::{module_record_from_fields, EffectSet, Ty};
 use lex_vcs::{ImportMap, ImportRef};
 
-/// Supplies `lex-nt/lib` with `gcd(Int, Int) -> Int` — but **only for a head
-/// whose pins it can actually find**, exactly like the real `HubDepResolver`,
-/// which reads the committed lock.
+/// Supplies `lex-nt/lib` with `gcd(Int, Int) -> Int` (plus the `lex-mathx` and
+/// `lex-strx` packages the #977 tests add) — but **only for a head whose pins
+/// it can actually find**, exactly like the real `HubDepResolver`, which reads
+/// the committed lock.
 ///
 /// This lock-awareness is deliberate. A resolver that answers unconditionally
 /// hides #975: it would resolve for a merge or `/v1/patch` head that carries no
@@ -39,6 +40,11 @@ use lex_vcs::{ImportMap, ImportRef};
 /// `unknown_identifier`. That is precisely what happened — the original mock
 /// here was unconditional, and only a live prod merge exposed the gap. Keeping
 /// the fixture honest about the lock makes that class of bug catchable here.
+///
+/// #977 sharpens it further: a package resolves only if the governing lock
+/// **pins that package**, not merely if *some* lock governs the head. Otherwise
+/// a merge that inherited the wrong parent's lock (one missing a dependency the
+/// other branch introduced) would still resolve here and hide the bug.
 struct NtResolver {
     root: std::path::PathBuf,
 }
@@ -51,19 +57,32 @@ impl DepResolver for NtResolver {
         let mut m = BTreeMap::new();
         // `None` means "resolve from the caller's working copy" — what the
         // client resolver does on the publish path, so it always resolves.
-        // `Some(head)` is a *stored* head: it resolves only if a lock governs
-        // it (its own or, post-#975, an ancestor's), mirroring the hub.
-        if let Some(head) = head_op {
-            let Ok(store) = Store::open(&self.root) else { return m };
-            if !matches!(store.committed_lock_inherited(head), Ok(Some(_))) {
-                return m;
+        // `Some(head)` is a *stored* head: a package resolves only if the lock
+        // governing it (its own or, post-#975, an ancestor's) pins it.
+        let pinned: Option<BTreeSet<String>> = match head_op {
+            None => None,
+            Some(head) => {
+                let Ok(store) = Store::open(&self.root) else { return m };
+                let Ok(Some(lock)) = store.committed_lock_inherited(head) else { return m };
+                let Ok(lf) = lex_syntax::lock::LockFile::from_toml(&lock) else { return m };
+                Some(lf.packages.into_iter().map(|e| e.name).collect())
             }
+        };
+        let int_fn = |arity: usize| {
+            Ty::function(vec![Ty::int(); arity], EffectSet::empty(), Ty::int())
+        };
+        let catalog = [
+            ("lex-nt", "lex-nt/lib", "gcd", 2),
+            ("lex-mathx", "lex-mathx/lib", "sq", 1),
+            ("lex-strx", "lex-strx/lib", "twice", 1),
+        ];
+        for (pkg, reference, fname, arity) in catalog {
+            if pinned.as_ref().is_some_and(|p| !p.contains(pkg)) {
+                continue;
+            }
+            let rec = module_record_from_fields(vec![(fname.to_string(), int_fn(arity))]);
+            m.insert(reference.to_string(), rec);
         }
-        let rec = module_record_from_fields(vec![(
-            "gcd".to_string(),
-            Ty::function(vec![Ty::int(), Ty::int()], EffectSet::empty(), Ty::int()),
-        )]);
-        m.insert("lex-nt/lib".to_string(), rec);
         m
     }
 }
@@ -183,4 +202,187 @@ fn merge_commit_gate_resolves_a_non_inlined_head() {
 
     let head = store.branch_head(DEFAULT_BRANCH).unwrap();
     assert!(head.len() >= 2, "the merge should have landed extra alongside reduce: {head:?}");
+}
+
+// ---------------------------------------------------------------------------
+// #977: a merge commits its OWN lock — the union of both parents' pins.
+// ---------------------------------------------------------------------------
+
+/// Render a `lex.lock` pinning `(name, version)` pairs.
+fn lock_of(pins: &[(&str, &str)]) -> String {
+    let mut s = String::from("version = 1\n");
+    for (name, version) in pins {
+        s.push_str(&format!(
+            "\n[[package]]\nname = \"{name}\"\nregistry = \"vcs.lexlang.org/lex-official/{name}\"\n\
+             constraint = \"^{version}\"\nversion = \"{version}\"\nhead_op = \"op_{name}_{version}\"\n"
+        ));
+    }
+    s
+}
+
+fn fns_of(src: &str) -> BTreeMap<String, lex_ast::FnDecl> {
+    canonicalize_program(&parse_source(src).expect("parse"))
+        .into_iter()
+        .filter_map(|st| match st {
+            lex_ast::Stage::FnDecl(fd) => Some((fd.name.clone(), fd)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Publish the whole program `src` (previously `prev_src`) on `branch` with the
+/// given `(reference, alias)` imports, then commit `lock` for the new head —
+/// what `op push` does for a client-built head. Returns the new head.
+fn push_program(
+    store: &Store,
+    branch: &str,
+    prev_src: &str,
+    src: &str,
+    imports: &[(&str, &str)],
+    lock: &str,
+) -> String {
+    let stages = canonicalize_program(&parse_source(src).expect("parse"));
+    let et: BTreeMap<String, lex_ast::TypeDecl> = BTreeMap::new();
+    let diff = lex_vcs::compute_diff_with_types(&fns_of(prev_src), &fns_of(src), &et, &et, true);
+    let mut set = BTreeSet::new();
+    for (reference, alias) in imports {
+        set.insert(ImportRef { reference: reference.to_string(), alias: alias.to_string() });
+    }
+    let mut map: ImportMap = BTreeMap::new();
+    map.insert("src/main.lex".to_string(), set);
+    let head = store
+        .publish_program(branch, &stages, &diff, &map, true)
+        .expect("publish")
+        .head_op
+        .expect("head op");
+    store.set_committed_lock(&head, lock).expect("commit lock");
+    head
+}
+
+fn pinned_names(lock: &str) -> BTreeSet<String> {
+    lex_syntax::lock::LockFile::from_toml(lock)
+        .expect("a merged lock must parse as a lex.lock")
+        .packages
+        .into_iter()
+        .map(|e| e.name)
+        .collect()
+}
+
+/// The #977 case: the **feature** branch introduces a dependency the base lock
+/// never mentioned, and main independently introduces a different one. The
+/// merged head uses both, so it type-checks only against the *union* of the
+/// two parents' pins.
+///
+/// Before the fix the merge op carried no lock of its own and inherited `dst`'s
+/// whole (breadth-first, `dst` first), which does not pin `lex-mathx` — so the
+/// merge gate rejected the head as `unknown_identifier "mx"`. Taking `src`'s
+/// lock whole would fail the other way, on `sx`.
+#[test]
+fn merge_commits_the_union_of_both_parents_locks() {
+    let (store, _tmp) = store_with_non_inlined_head();
+    store.create_branch("feature", DEFAULT_BRANCH).unwrap();
+
+    let feat_src = format!(
+        "import \"lex-nt/lib\" as nt\nimport \"lex-mathx/lib\" as mx\n{}\
+         fn sq_gcd(a :: Int, b :: Int) -> Int {{ mx.sq(nt.gcd(a, b)) }}\n",
+        &BASE["import \"lex-nt/lib\" as nt\n".len()..]
+    );
+    let feat_head = push_program(
+        &store,
+        "feature",
+        BASE,
+        &feat_src,
+        &[("lex-nt/lib", "nt"), ("lex-mathx/lib", "mx")],
+        &lock_of(&[("lex-nt", "1.0.0"), ("lex-mathx", "0.3.0")]),
+    );
+
+    let main_src = format!(
+        "import \"lex-nt/lib\" as nt\nimport \"lex-strx/lib\" as sx\n{}\
+         fn dbl(a :: Int) -> Int {{ sx.twice(a) }}\n",
+        &BASE["import \"lex-nt/lib\" as nt\n".len()..]
+    );
+    let main_head = push_program(
+        &store,
+        DEFAULT_BRANCH,
+        BASE,
+        &main_src,
+        &[("lex-nt/lib", "nt"), ("lex-strx/lib", "sx")],
+        &lock_of(&[("lex-nt", "1.0.0"), ("lex-strx", "2.1.0")]),
+    );
+
+    let report = store.merge("feature", DEFAULT_BRANCH).expect("merge should compose");
+    assert!(report.conflicts.is_empty(), "disjoint edits must not conflict: {:?}", report.conflicts);
+    store
+        .commit_merge(DEFAULT_BRANCH, &report)
+        .expect("the merged head must resolve BOTH branches' dependencies");
+
+    let merge_head = store
+        .get_branch(DEFAULT_BRANCH)
+        .unwrap()
+        .and_then(|b| b.head_op)
+        .expect("main has a head");
+    assert_ne!(merge_head, main_head, "a merge op must have landed");
+    assert_ne!(merge_head, feat_head);
+
+    // The merge head carries its OWN lock (no inheritance needed) and it is
+    // the union of both parents' pins.
+    let own = store
+        .committed_lock(&merge_head)
+        .unwrap()
+        .expect("the merge op must commit its own lock (#977)");
+    let expected: BTreeSet<String> =
+        ["lex-mathx", "lex-nt", "lex-strx"].iter().map(|s| s.to_string()).collect();
+    assert_eq!(pinned_names(&own), expected, "merged lock must be the union: {own}");
+
+    let head = store.branch_head(DEFAULT_BRANCH).unwrap();
+    assert_eq!(head.len(), 3, "reduce, sq_gcd and dbl should all be at the merged head: {head:?}");
+}
+
+/// Both parents pin the **same** package at **different** versions. Silently
+/// picking one would change what the merged code was tested against, so the
+/// merge is refused with a dependency-conflict error naming the package and
+/// both versions — and, per the always-valid-HEAD invariant, neither branch
+/// moves.
+#[test]
+fn merge_refuses_a_same_package_different_version_conflict() {
+    let (store, _tmp) = store_with_non_inlined_head();
+    store.create_branch("feature", DEFAULT_BRANCH).unwrap();
+
+    // feature bumps lex-nt to 2.0.0 (a pushed head with its own lock) …
+    land(&store, "feature", "fn extra(a :: Int) -> Int { a + 1 }\n", "extra");
+    let feat_head = head_op_vec(&store, "feature").pop().unwrap();
+    store
+        .set_committed_lock(&feat_head, &lock_of(&[("lex-nt", "2.0.0")]))
+        .unwrap();
+
+    // … while main keeps 1.0.0 and moves on independently.
+    land(&store, DEFAULT_BRANCH, "fn other(a :: Int) -> Int { a + 2 }\n", "other");
+    let main_before = head_op_vec(&store, DEFAULT_BRANCH).pop().unwrap();
+
+    let report = store.merge("feature", DEFAULT_BRANCH).expect("merge report");
+    assert!(report.conflicts.is_empty(), "the code itself composes: {:?}", report.conflicts);
+    let err = store
+        .commit_merge(DEFAULT_BRANCH, &report)
+        .expect_err("a lex-nt 1.0.0 vs 2.0.0 conflict must refuse the merge");
+
+    match &err {
+        lex_store::StoreError::DependencyConflict { package, dst_version, src_version } => {
+            assert_eq!(package, "lex-nt");
+            assert_eq!(dst_version, "1.0.0");
+            assert_eq!(src_version, "2.0.0");
+        }
+        other => panic!("expected DependencyConflict, got {other:?}"),
+    }
+    let msg = err.to_string();
+    for needle in ["lex-nt", "1.0.0", "2.0.0"] {
+        assert!(msg.contains(needle), "error must name {needle}: {msg}");
+    }
+
+    // Always-valid HEAD: nothing advanced.
+    assert_eq!(head_op_vec(&store, DEFAULT_BRANCH), vec![main_before], "main must not move");
+    assert_eq!(head_op_vec(&store, "feature"), vec![feat_head], "feature must not move");
+    assert!(
+        store.get_branch(DEFAULT_BRANCH).unwrap().unwrap().merges.is_empty(),
+        "a refused merge must not be journaled"
+    );
 }

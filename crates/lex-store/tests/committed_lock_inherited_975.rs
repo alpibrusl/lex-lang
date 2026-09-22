@@ -90,15 +90,19 @@ fn a_head_with_its_own_lock_uses_it() {
 }
 
 #[test]
-fn a_merge_shaped_head_inherits_from_its_first_parent() {
+fn a_merge_shaped_head_without_its_own_lock_inherits_an_ancestors() {
     let (store, _tmp) = fresh();
-    // dst carries the lock; src does not — the merge op has neither.
+    // dst carries the lock; src does not — this merge-shaped op has neither.
+    // (A real merge commit now binds its own merged lock, #977; this pins the
+    // inheritance fallback for a two-parent head that carries none. Only ONE
+    // side has a lock here on purpose: `Operation::new` sorts `parents` by op
+    // id, so the walk's parent order is by hash, not [dst, src], and nothing
+    // may depend on which parent is visited first.)
     let dst = land(&store, DEFAULT_BRANCH, "dst", vec![]);
     store.set_committed_lock(&dst, LOCK_A).expect("set dst");
     store.create_branch("feature", DEFAULT_BRANCH).unwrap();
     let src = land(&store, "feature", "src", vec![dst.clone()]);
 
-    // The merge op's parents are [dst, src], exactly as the commit handler builds them.
     let merge = {
         let op = Operation::new(
             OperationKind::Merge { resolved: 0 },

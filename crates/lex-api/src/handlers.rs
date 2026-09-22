@@ -1057,6 +1057,9 @@ fn merge_resolve_handler(
 ///   pass to apply the custom op against the dst branch
 ///   first; deferred to a follow-up slice. Use TakeOurs /
 ///   TakeTheirs for now.
+/// - 409: dependency conflict (#977) — the branches pin the same
+///   package at different versions, so no merged lock exists. Body
+///   `detail` names the package and both versions; nothing is written.
 /// - 500: filesystem error while landing the merge op.
 fn merge_commit_handler(
     state: &State,
@@ -1181,6 +1184,27 @@ fn merge_commit_handler(
         })),
         Err(lex_store::StoreError::TypeError(errs)) => error_with_detail(
             422, "merged program has type errors", serde_json::to_value(&errs).unwrap_or_default()),
+        // #977: the two branches pin the same dependency at different
+        // versions. The merge commits the union of both parents' locks and
+        // refuses to pick a side silently; nothing was written, so the dst
+        // branch is unchanged. 409: the request is fine, the branches'
+        // states conflict — align the version on one branch and retry.
+        Err(e @ lex_store::StoreError::DependencyConflict { .. }) => {
+            let detail = match &e {
+                lex_store::StoreError::DependencyConflict { package, dst_version, src_version } => {
+                    serde_json::json!({
+                        "kind": "dependency_conflict",
+                        "package": package,
+                        "dst_branch": dst_branch,
+                        "dst_version": dst_version,
+                        "src_branch": wrapped.src_branch,
+                        "src_version": src_version,
+                    })
+                }
+                _ => serde_json::Value::Null,
+            };
+            error_with_detail(409, e.to_string(), detail)
+        }
         Err(e) => write_error_response("apply merge op", e),
     }
 }

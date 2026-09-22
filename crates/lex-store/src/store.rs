@@ -85,6 +85,19 @@ pub enum StoreError {
     /// failure.
     #[error("multi-module dependency resolution is not yet supported")]
     UnsupportedMultiModuleDependency,
+    /// A merge was refused because its two parents pin the **same**
+    /// dependency at **different** versions (#977). The merge commit records
+    /// the union of both parents' lock entries as its own lock; picking one of
+    /// two conflicting pins silently would change what the merged code was
+    /// tested against, so the merge is refused instead. Nothing moves —
+    /// neither branch advances. Resolve by aligning the version on one branch
+    /// (e.g. `lex pkg update` there, then push) and merging again.
+    #[error(
+        "dependency conflict: `{package}` is pinned at {dst_version} on the \
+         destination branch but {src_version} on the source branch; align the \
+         version on one branch and merge again"
+    )]
+    DependencyConflict { package: String, dst_version: String, src_version: String },
     /// A typed issue's example targets a function that isn't declared at
     /// the head being evaluated (#949) — the example cannot be attached, so
     /// the issue cannot be judged there.
@@ -718,23 +731,19 @@ impl Store {
     /// otherwise the nearest ancestor's (#975).
     ///
     /// [`Self::committed_lock`] is an exact-key lookup, and a lock is only ever
-    /// committed for a head a *client pushes*. Every head the **server** creates
-    /// therefore has none of its own — a merge op (`/v1/merge/<id>/commit`) and
-    /// a head landed through `/v1/patch` both — so the exact lookup returned
-    /// `None`, the dependency resolver got no pins, and a non-inlined head was
-    /// rejected as `unknown_identifier "<alias>"` even though every dependency
-    /// was resolvable. A head inherits its ancestors' pins until a new lock is
-    /// committed: the correct model, and it fixes merge and patch in one place
-    /// rather than special-casing each gate.
+    /// committed for a head a *client pushes* — or, since #977, for a merge op,
+    /// which commits the union of its parents' locks
+    /// ([`Self::merged_lock_for_parents`]). A head landed through `/v1/patch`
+    /// has none of its own, so the exact lookup returned `None`, the dependency
+    /// resolver got no pins, and a non-inlined head was rejected as
+    /// `unknown_identifier "<alias>"` even though every dependency was
+    /// resolvable. A head inherits its ancestors' pins until a new lock is
+    /// committed: the correct model for a patch head, which genuinely has no
+    /// new pins to record.
     ///
-    /// Breadth-first, so the *nearest* ancestor wins. For a merge the parents
-    /// are equidistant and `dst` is visited first (the branch being merged
-    /// into), matching "the merge inherits the target's pins".
-    ///
-    /// **Known limitation:** this returns one ancestor's lock whole; it does not
-    /// union the two parents' locks. A merge whose *source* branch introduced a
-    /// brand-new dependency can still miss that pin — properly fixed by having
-    /// the merge commit compute and commit a merged lock, tracked separately.
+    /// Breadth-first, so the *nearest* ancestor wins. That returns one lock
+    /// whole, which is only right along a single line of history — which is
+    /// why a merge op does not rely on it and commits its own merged lock.
     pub fn committed_lock_inherited(&self, head_op: &str) -> Result<Option<String>, StoreError> {
         use std::collections::{BTreeSet, VecDeque};
         let log = lex_vcs::OpLog::open(self.root())?;
@@ -757,6 +766,84 @@ impl Store {
             }
         }
         Ok(None)
+    }
+
+    /// The lock a merge op with `parents` commits as its own (#977): the
+    /// **union** of every parent's governing lock
+    /// ([`Self::committed_lock_inherited`]).
+    ///
+    /// Inheriting one parent's lock whole is wrong for a merge: if the *source*
+    /// branch introduced a dependency, only the source's lock pins it, and a
+    /// merge that inherited the destination's lock failed its gate as
+    /// `unknown_identifier "<alias>"`. Unioning fixes that.
+    ///
+    /// `parents` must be in merge order — the first is the branch being merged
+    /// INTO (`dst`), later ones are merged in. Note an `Operation`'s own
+    /// `parents` are *sorted* (so the op id is order-independent) and do not
+    /// carry that order; the caller supplies it. It only matters for naming
+    /// the sides of a conflict and for which entry is kept on a tie. When two parents pin the **same** package at
+    /// **different** versions the merge is refused with
+    /// [`StoreError::DependencyConflict`] rather than silently picking one:
+    /// either choice changes what one side's code was tested against. When the
+    /// versions agree, the first parent's entry is kept (filling in a
+    /// `head_op` it lacks from a later parent).
+    ///
+    /// `Ok(None)` when no parent is governed by any lock (a dependency-free
+    /// package), and also when a parent's lock can't be parsed — the merge then
+    /// carries no lock of its own and falls back to inheritance exactly as
+    /// before #977, rather than refusing a merge over an unreadable lock it
+    /// did not write. Read-only: nothing is written.
+    pub fn merged_lock_for_parents(
+        &self,
+        parents: &[lex_vcs::OpId],
+    ) -> Result<Option<String>, StoreError> {
+        use lex_syntax::lock::{LockEntry, LockFile, LOCK_FORMAT_VERSION};
+        let mut raws: Vec<String> = Vec::new();
+        for p in parents {
+            if let Some(raw) = self.committed_lock_inherited(p)? {
+                raws.push(raw);
+            }
+        }
+        match raws.len() {
+            0 => return Ok(None),
+            // A single governing lock (one parent, or only one side has deps):
+            // commit it verbatim — nothing to union, no reformatting churn.
+            1 => return Ok(raws.pop()),
+            _ if raws.iter().all(|r| r == &raws[0]) => return Ok(raws.pop()),
+            _ => {}
+        }
+        let mut locks: Vec<LockFile> = Vec::with_capacity(raws.len());
+        for raw in &raws {
+            match LockFile::from_toml(raw) {
+                Ok(lf) => locks.push(lf),
+                Err(_) => return Ok(None),
+            }
+        }
+        let mut merged: BTreeMap<String, LockEntry> = BTreeMap::new();
+        for lf in &locks {
+            for e in &lf.packages {
+                match merged.get_mut(&e.name) {
+                    None => {
+                        merged.insert(e.name.clone(), e.clone());
+                    }
+                    Some(kept) if kept.version != e.version => {
+                        return Err(StoreError::DependencyConflict {
+                            package: e.name.clone(),
+                            dst_version: kept.version.clone(),
+                            src_version: e.version.clone(),
+                        });
+                    }
+                    Some(kept) => {
+                        if kept.head_op.is_none() {
+                            kept.head_op = e.head_op.clone();
+                        }
+                    }
+                }
+            }
+        }
+        let version = locks.iter().map(|l| l.version).max().unwrap_or(LOCK_FORMAT_VERSION);
+        let out = LockFile { version, packages: merged.into_values().collect() };
+        out.to_toml().map(Some).map_err(|e| StoreError::Io(std::io::Error::other(e)))
     }
 
     /// All `key → sha` bindings in a namespace (e.g. every artifact in a
@@ -2144,9 +2231,43 @@ impl Store {
         // is moved into `apply_operation`; used for the TypeCheck
         // attestation below.
         let attestable = attestable_stage_ids(&transition);
+        // #977: the merge commits its OWN lock — the union of its parents'
+        // pins — so a dependency either branch introduced resolves at the
+        // merged head. Computed before anything is written: a same-package /
+        // different-version conflict refuses the merge with no side effect
+        // (always-valid HEAD), rather than landing the op and rolling back.
+        //
+        // `Operation::new` sorts `parents` by op id, so their order says
+        // nothing about which side is `dst`. The destination branch's current
+        // head does: a merge op can only land when that head is one of its
+        // parents, so put it first and a conflict names the sides correctly.
+        // If it is *not* among a multi-parent op's parents the op is stale
+        // and `apply_operation` refuses it below (`StaleParent`); computing a
+        // lock with unknown sides would only mislabel an error, so skip it.
+        let dst_pos = head_before.as_ref().and_then(|d| op.parents.iter().position(|p| p == d));
+        let merged_lock = match dst_pos {
+            Some(pos) => {
+                let mut ordered = op.parents.clone();
+                let dst_parent = ordered.remove(pos);
+                ordered.insert(0, dst_parent);
+                self.merged_lock_for_parents(&ordered)?
+            }
+            // No dst head (merging into an empty branch): the lone parent is
+            // the source, whose governing lock the merge simply carries.
+            None if head_before.is_none() => self.merged_lock_for_parents(&op.parents)?,
+            None => None,
+        };
         let op_id = self.apply_operation(branch, op, transition)?;
 
         let verdict = (|| -> Result<(), StoreError> {
+            // Bind the merged lock to the merge op before gating, so the gate
+            // (and every later re-verification of this head) resolves against
+            // the merge's own pins instead of inheriting one parent's whole.
+            // If the gate then rejects the head, the ref stays bound to an
+            // op no branch points at — harmless, and content-correct for it.
+            if let Some(lock) = &merged_lock {
+                self.set_committed_lock(op_id.as_str(), lock)?;
+            }
             let head = self.branch_head(branch)?;
             let pairs: Vec<(String, String)> = head.into_iter().collect();
             let decls: Vec<Stage> =
