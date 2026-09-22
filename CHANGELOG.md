@@ -5,6 +5,18 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [0.11.69] - 2026-09-22
+
+### Fixed
+
+- **Resolved git refs are shared across `lex` processes (#1015 follow-up).**
+  0.11.68 asks `git ls-remote` once per unpinned dependency per *load*, but
+  every separate `lex` process still asked — and CI jobs run hundreds of them
+  (lex-code's CI: 55s → ~10 min). A successful resolution is now cached beside
+  the package cache and reused for `LEX_GIT_REF_TTL` seconds (default 60, `0`
+  disables), so a branch moved upstream is picked up within that window.
+  lex-code's per-file check loop: 4m05s → 11.8s.
+
 ## [0.11.68] - 2026-09-22
 
 ### Added
