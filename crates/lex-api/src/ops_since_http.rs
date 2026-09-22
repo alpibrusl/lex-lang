@@ -19,6 +19,11 @@
 //! N-op store was O(N²/page): 136k ops in pages of 1000 re-read the log
 //! 137 times.
 //!
+//! Paged responses (`limit=` given) list the delta in its **canonical
+//! linearization** ([`HistoryIndex::topological`]): parents before
+//! children, and otherwise the old order, so a linear history pages exactly
+//! as it always did. Every page boundary is a position in that one order.
+//!
 //! Two things now bound a page's cost:
 //!
 //! 1. **One walk per head, not per page.** The first request against a
@@ -35,10 +40,44 @@
 //!    response. It is opaque to clients and survives a cache eviction or a
 //!    server restart (the index is rebuilt; the order is deterministic).
 //!
-//! Compatibility is additive: the body is the same array, the header is
-//! new, and `cursor=` is a parameter older servers ignore — so a client can
-//! always send `after=<last op>` alongside `cursor=` and get a correct next
-//! page from either generation of server. A malformed cursor, or one naming
+//! # Legacy `after=` paging is lossless (#971)
+//!
+//! Released clients page with `after=<last op received>`, which used to
+//! mean "ops not in that op's ancestry". On a merge-heavy history that is
+//! not "ops not yet sent": ops already sent from another line of history
+//! came back, and, because the old order put some ops before their own
+//! ancestors, ancestors of the page's last op that hadn't been sent yet
+//! never were. On a 50k-op store a full legacy pull delivered 48,647 of
+//! 49,991 ops, 1,264 of them twice.
+//!
+//! The server now remembers where each legacy paged response it served
+//! ended ([`Continuation`], persisted under the store root so it survives a
+//! restart). A later `after=X` (with `limit=`) for the same head,
+//! where X is the last op of one of those pages, resumes right after X's
+//! position in the same linearization: the rest of the delta, each op once,
+//! with no client change. X means only "a page ended here"; which delta it
+//! belongs to comes from the recorded continuation, not from X.
+//!
+//! Otherwise `after=X` keeps its old meaning, "ops not in X's ancestry",
+//! which is also the only correct reading of a first page: that `after` is
+//! the client's own branch head, and the client holds exactly its ancestry.
+//! (A position-only rule would be wrong there. It would skip every op
+//! ordered before X that X's ancestry doesn't contain, for example a side
+//! branch merged after the client last pulled.) Because the answer is now
+//! topologically ordered, this fallback can't lose ops even in the middle
+//! of a pull whose continuation was forgotten (more concurrent legacy pulls
+//! than [`MAX_CONTINUATIONS`], or an unwritable store root). Every ancestor
+//! of X came before X and has already been delivered. The fallback can
+//! re-send ops, which `OpLog::put` absorbs. With small pages over long
+//! unmerged lines it can also cycle between the two lines, exactly as the
+//! pre-#971 rule did, which is why continuations persist.
+//!
+//! The no-`limit` (unpaged) response is unchanged: `ops_since` reversed.
+//!
+//! Compatibility on the wire is additive: the body is the same array, the
+//! header is new, and `cursor=` is a parameter older servers ignore — so a
+//! client can always send `after=<last op>` alongside `cursor=` and get a
+//! correct next page from either generation of server. A malformed cursor, or one naming
 //! a head this store doesn't have, is a `400`, never an empty page a client
 //! would mistake for "done".
 
@@ -60,9 +99,27 @@ pub const NEXT_CURSOR_HEADER: &str = "X-Lex-Next-Cursor";
 /// in order and in the position map): ~25 MB at 136k ops.
 const MAX_INDEXES: usize = 2;
 const MAX_DELTAS: usize = 8;
+/// Page ends remembered for legacy `after=` resumption: one per legacy
+/// pull in flight (each resumption replaces its own entry), ~250 bytes each.
+const MAX_CONTINUATIONS: usize = 256;
+/// Where they persist, under the store root, so a restart or deploy in the
+/// middle of a legacy pull doesn't drop them. Best-effort: an unreadable or
+/// unwritable file only costs the ancestry fallback.
+const CONTINUATIONS_FILE: &str = "ops_since_continuations.json";
+/// A legacy client asks for its next page immediately; a page end older
+/// than this belongs to an abandoned pull (Ctrl-C, `op pull --limit`) and
+/// is dropped, so it can't be mistaken for another client's cutoff later.
+const CONTINUATION_TTL_SECS: u64 = 15 * 60;
 
-/// The ops reachable from `index.head()` but not from `base`, oldest-first,
-/// as positions into `index`.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The ops reachable from `index.head()` but not from `base`, in canonical
+/// (topological) order, as positions into `index`.
 struct Delta {
     index: Arc<HistoryIndex>,
     base: Option<OpId>,
@@ -76,6 +133,90 @@ struct Delta {
 pub(crate) struct OpsSinceCache {
     indexes: VecDeque<Arc<HistoryIndex>>,
     deltas: VecDeque<Arc<Delta>>,
+    /// `None` until first loaded from [`CONTINUATIONS_FILE`].
+    continuations: Option<VecDeque<Continuation>>,
+}
+
+/// "A paged response for `delta(head, base)` ended at `end`, and its last op
+/// was `last`." Lets a legacy `after=<last>` resume by position. Holds ids,
+/// not the delta: a delta is deterministic, so an evicted one is rebuilt
+/// with the same order and `end` stays valid.
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Continuation {
+    head: OpId,
+    last: OpId,
+    base: Option<OpId>,
+    end: usize,
+    /// Unix seconds when the page was served; see [`CONTINUATION_TTL_SECS`].
+    at: u64,
+}
+
+/// Run `f` over the continuations, loading them from disk on first use and
+/// writing them back if `f` changed them.
+fn with_continuations<R>(state: &State, f: impl FnOnce(&mut VecDeque<Continuation>) -> R) -> R {
+    let path = state.root.join(CONTINUATIONS_FILE);
+    let mut cache = state.ops_since.lock().unwrap();
+    let conts = cache.continuations.get_or_insert_with(|| {
+        std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    });
+    let before = conts.clone();
+    let cutoff = now_secs().saturating_sub(CONTINUATION_TTL_SECS);
+    conts.retain(|c| c.at >= cutoff);
+    let r = f(conts);
+    if *conts != before {
+        if let Ok(bytes) = serde_json::to_vec(&*conts) {
+            let tmp = path.with_extension("json.tmp");
+            if std::fs::write(&tmp, bytes).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
+    }
+    r
+}
+
+/// The recorded resumption point for a legacy `after=last` on `head`, if
+/// there is exactly one. The entry is consumed: the page served from it
+/// records its own successor.
+fn take_continuation(state: &State, head: &OpId, last: &OpId) -> Option<Continuation> {
+    with_continuations(state, |conts| {
+        let hits: Vec<usize> = conts
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| &c.head == head && &c.last == last)
+            .map(|(i, _)| i)
+            .collect();
+        let first = conts[*hits.first()?].clone();
+        // Two pulls whose pages ended on the same op but that started from
+        // different cutoffs: the op alone can't tell them apart, so fall
+        // back to the ancestry reading, which loses nothing for either.
+        if hits.iter().any(|&i| (&conts[i].base, conts[i].end) != (&first.base, first.end)) {
+            return None;
+        }
+        for &i in hits.iter().rev() {
+            conts.remove(i);
+        }
+        Some(first)
+    })
+}
+
+fn record_continuation(state: &State, c: Continuation) {
+    with_continuations(state, |conts| {
+        conts.retain(|o| !(o.head == c.head && o.last == c.last && o.base == c.base && o.end == c.end));
+        conts.push_back(c);
+        while conts.len() > MAX_CONTINUATIONS {
+            conts.pop_front();
+        }
+    })
+}
+
+/// A cursor-following client also sends `after=<last op>` (for servers
+/// that predate cursors). It doesn't need a continuation; drop any so it
+/// can't be mistaken for another client's cutoff.
+fn forget_continuation(state: &State, head: &OpId, last: &OpId) {
+    with_continuations(state, |conts| conts.retain(|c| !(&c.head == head && &c.last == last)))
 }
 
 fn touch<T>(list: &mut VecDeque<Arc<T>>, i: usize) -> Arc<T> {
@@ -114,7 +255,7 @@ fn delta_for(
             i
         }
     };
-    let order = index.since(log, base)?;
+    let order = index.topological(&index.since(log, base)?);
     let delta = Arc::new(Delta { index, base: base.cloned(), order });
     insert(&mut state.ops_since.lock().unwrap().deltas, Arc::clone(&delta), MAX_DELTAS);
     Ok(delta)
@@ -198,7 +339,13 @@ pub(crate) fn ops_since_handler(state: &State, query: &str) -> Response<Cursor<V
                     Err(e) => error_response(500, format!("ops_since: {e}")),
                 };
             }
-            (head, after, 0)
+            // Legacy paging: `after` is the last op of a page this server
+            // served for this head? Resume right after it. Otherwise it's a
+            // cutoff: the ops outside its ancestry. See the module docs.
+            match after.as_ref().and_then(|a| take_continuation(state, &head, a)) {
+                Some(c) => (head, c.base, c.end),
+                None => (head, after.clone(), 0),
+            }
         }
     };
 
@@ -226,6 +373,20 @@ pub(crate) fn ops_since_handler(state: &State, query: &str) -> Response<Cursor<V
         }
     }
 
+    if let (Some(_), Some(a)) = (&cursor, &after) {
+        forget_continuation(state, &head, a);
+    }
+    if end < total && cursor.is_none() {
+        if let Some(last) = ops.last() {
+            record_continuation(state, Continuation {
+                head: head.clone(),
+                last: last.op_id.clone(),
+                base: base.clone(),
+                end,
+                at: now_secs(),
+            });
+        }
+    }
     let resp = json_response(200, &serde_json::to_value(&ops).unwrap_or_default());
     if end < total {
         let next = encode_cursor(&head, base.as_deref(), end);
@@ -247,6 +408,47 @@ mod tests {
             let c = encode_cursor(&h, base.as_deref(), 1000);
             assert_eq!(decode_cursor(&c), Some((h.clone(), base, 1000)));
         }
+    }
+
+    fn cont(last: &str, base: Option<&str>, end: usize, at: u64) -> Continuation {
+        Continuation { head: "h".into(), last: last.into(), base: base.map(String::from), end, at }
+    }
+
+    #[test]
+    fn a_continuation_is_taken_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = State::open(tmp.path().to_path_buf()).unwrap();
+        record_continuation(&state, cont("x", None, 5, now_secs()));
+        let got = take_continuation(&state, &"h".into(), &"x".into()).unwrap();
+        assert_eq!((got.base, got.end), (None, 5));
+        assert!(take_continuation(&state, &"h".into(), &"x".into()).is_none());
+        assert!(take_continuation(&state, &"other".into(), &"x".into()).is_none());
+    }
+
+    #[test]
+    fn continuations_survive_a_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        record_continuation(&State::open(tmp.path().to_path_buf()).unwrap(), cont("x", Some("b"), 7, now_secs()));
+        let fresh = State::open(tmp.path().to_path_buf()).unwrap();
+        let got = take_continuation(&fresh, &"h".into(), &"x".into()).unwrap();
+        assert_eq!((got.base.as_deref(), got.end), (Some("b"), 7));
+    }
+
+    #[test]
+    fn an_abandoned_continuation_expires() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = State::open(tmp.path().to_path_buf()).unwrap();
+        record_continuation(&state, cont("x", None, 5, now_secs() - CONTINUATION_TTL_SECS - 1));
+        assert!(take_continuation(&state, &"h".into(), &"x".into()).is_none());
+    }
+
+    #[test]
+    fn two_readings_of_one_page_end_fall_back_to_the_cutoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = State::open(tmp.path().to_path_buf()).unwrap();
+        record_continuation(&state, cont("x", None, 5, now_secs()));
+        record_continuation(&state, cont("x", Some("b"), 2, now_secs()));
+        assert!(take_continuation(&state, &"h".into(), &"x".into()).is_none());
     }
 
     #[test]

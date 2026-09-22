@@ -1,8 +1,8 @@
 //! `lex op pull` over a multi-page history (#971): the real binary against
 //! a real `lex-api` server, with a history longer than one pull page
 //! (1000 ops) that includes merges. The client must follow the server's
-//! `X-Lex-Next-Cursor` and receive exactly the op sequence the unpaged
-//! delta would have been.
+//! `X-Lex-Next-Cursor` and receive every op of the delta exactly once, in
+//! the server's canonical (parents-first) order.
 
 use std::collections::BTreeSet;
 use std::process::Command;
@@ -110,7 +110,18 @@ fn op_pull_follows_the_cursor_across_pages() {
         .map(|s| s.as_str().unwrap().to_string())
         .collect();
     assert!(want.len() > 2000, "fixture must span three pages");
-    assert_eq!(got, want);
+    // Every op of the delta exactly once, parents before children, head last.
+    let log = OpLog::open(remote.path()).unwrap();
+    let distinct: BTreeSet<&String> = got.iter().collect();
+    assert_eq!(distinct.len(), got.len(), "duplicates");
+    assert_eq!(distinct, want.iter().collect::<BTreeSet<_>>());
+    let rank: std::collections::HashMap<&String, usize> = got.iter().enumerate().map(|(i, id)| (id, i)).collect();
+    for (i, id) in got.iter().enumerate() {
+        for p in &log.get(id).unwrap().unwrap().op.parents {
+            assert!(rank[p] < i, "{id} before its parent {p}");
+        }
+    }
+    assert_eq!(got.last(), Some(&head));
 
     let pages: Vec<String> =
         urls.lock().unwrap().iter().filter(|u| u.starts_with("/v1/ops/since")).cloned().collect();

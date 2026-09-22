@@ -116,6 +116,52 @@ impl HistoryIndex {
         }
         Ok((0..self.ids.len() as u32).rev().filter(|&i| !excluded[i as usize]).collect())
     }
+
+    /// The canonical linearization of a delta returned by [`Self::since`]:
+    /// the same ops, reordered so every op comes after all of its parents
+    /// that are in the delta (a topological order), staying as close to
+    /// `since`'s order as that allows. Ties go to the op `since` lists
+    /// first, so a delta that was already topological (any linear history)
+    /// comes back unchanged. Because of that, the head is always last.
+    ///
+    /// `since`'s order (`walk_back`'s BFS, reversed) is not topological once
+    /// merges join lines of different lengths: an op can come before one of
+    /// its own ancestors. Paging that treats "everything up to op X" as
+    /// "X's ancestry" then drops ops. See `lex-api`'s `ops_since_http`.
+    pub fn topological(&self, delta: &[u32]) -> Vec<u32> {
+        use std::collections::BinaryHeap;
+        let n = self.ids.len();
+        let mut in_delta = vec![false; n];
+        for &i in delta {
+            in_delta[i as usize] = true;
+        }
+        let mut indegree = vec![0u32; n];
+        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+        for &i in delta {
+            let (lo, hi) = (self.parent_start[i as usize] as usize, self.parent_start[i as usize + 1] as usize);
+            for &p in &self.parents[lo..hi] {
+                if in_delta[p as usize] {
+                    indegree[i as usize] += 1;
+                    children.entry(p).or_default().push(i);
+                }
+            }
+        }
+        // `since` lists ops by descending position, so the largest ready
+        // position is the one it would have emitted next.
+        let mut ready: BinaryHeap<u32> =
+            delta.iter().copied().filter(|&i| indegree[i as usize] == 0).collect();
+        let mut out = Vec::with_capacity(delta.len());
+        while let Some(i) = ready.pop() {
+            out.push(i);
+            for &c in children.get(&i).map(Vec::as_slice).unwrap_or(&[]) {
+                indegree[c as usize] -= 1;
+                if indegree[c as usize] == 0 {
+                    ready.push(c);
+                }
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -196,6 +242,64 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn topological_is_a_parent_first_permutation_that_keeps_topological_input() {
+        for seed in [3u64, 11, 77, 2024] {
+            let tmp = tempfile::tempdir().unwrap();
+            let log = OpLog::open(tmp.path()).unwrap();
+            let ids = random_dag(&log, 150, seed);
+            let ghost: OpId = "0".repeat(64);
+            for head in ids.iter().step_by(17).chain(ids.last()) {
+                let idx = HistoryIndex::build(&log, head).unwrap();
+                let bases = std::iter::once(None)
+                    .chain(ids.iter().step_by(11).map(Some))
+                    .chain(std::iter::once(Some(&ghost)));
+                for base in bases {
+                    let delta = idx.since(&log, base).unwrap();
+                    let topo = idx.topological(&delta);
+                    let mut a = delta.clone();
+                    let mut b = topo.clone();
+                    a.sort_unstable();
+                    b.sort_unstable();
+                    assert_eq!(a, b, "a permutation of the delta");
+                    let rank: HashMap<u32, usize> = topo.iter().enumerate().map(|(r, &i)| (i, r)).collect();
+                    for (r, &i) in topo.iter().enumerate() {
+                        let rec = log.get(idx.id(i)).unwrap().unwrap();
+                        for p in &rec.op.parents {
+                            if let Some(&pi) = idx.pos.get(p) {
+                                if let Some(&pr) = rank.get(&pi) {
+                                    assert!(pr < r, "parent after child (seed={seed})");
+                                }
+                            }
+                        }
+                    }
+                    if let (Some(&last), false) = (topo.last(), delta.is_empty()) {
+                        if delta.contains(&0) {
+                            assert_eq!(last, 0, "the head is last");
+                        }
+                    }
+                    // Idempotent: a topological input comes back unchanged.
+                    assert_eq!(idx.topological(&topo), topo);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn topological_leaves_a_linear_history_in_since_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = OpLog::open(tmp.path()).unwrap();
+        let mut prev: Vec<OpId> = vec![];
+        for i in 0..20 {
+            let r = rec(&prev.iter().collect::<Vec<_>>(), i);
+            log.put(&r).unwrap();
+            prev = vec![r.op_id];
+        }
+        let idx = HistoryIndex::build(&log, &prev[0]).unwrap();
+        let delta = idx.since(&log, None).unwrap();
+        assert_eq!(idx.topological(&delta), delta);
     }
 
     #[test]

@@ -11,8 +11,8 @@
 //! size, once with the legacy `after=<last op>` protocol and once
 //! following `X-Lex-Next-Cursor` when the server sends it, each against a
 //! fresh server (cold cache). Also reports how many distinct ops each
-//! protocol delivered: legacy paging over merges can repeat and drop ops
-//! (see `ops_since_paging_971.rs`).
+//! protocol delivered. Before #971 legacy paging over merges repeated and
+//! dropped ops; now both must deliver every op exactly once.
 
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
@@ -174,7 +174,11 @@ fn time_a_full_pull() {
     println!("{reachable} ops reachable from main");
 
     // A fresh server (cold cache) per protocol.
-    report("legacy after= paging", pull(&serve(tmp.path()), false));
-    let cursor = report("cursor paging       ", pull(&serve(tmp.path()), true));
-    assert_eq!(cursor, reachable);
+    let (legacy_total, legacy_distinct, times) = pull(&serve(tmp.path()), false);
+    report("legacy after= paging", (legacy_total, legacy_distinct, times));
+    let (cursor_total, cursor_distinct, times) = pull(&serve(tmp.path()), true);
+    report("cursor paging       ", (cursor_total, cursor_distinct, times));
+    // Both protocols: every reachable op, exactly once (#971).
+    assert_eq!((legacy_total, legacy_distinct), (reachable, reachable));
+    assert_eq!((cursor_total, cursor_distinct), (reachable, reachable));
 }
