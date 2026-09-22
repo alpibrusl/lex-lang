@@ -53,6 +53,13 @@ pub enum StoreError {
     /// is nothing to replay.
     #[error("cannot replay op {op_id}: its target stage {stage_id} cannot be loaded ({reason})")]
     ReplayTargetUnloadable { op_id: String, stage_id: String, reason: String },
+    /// A head stage exists but could not be read — corrupt bytes, a
+    /// permission error, any I/O or parse failure other than "absent".
+    /// Lenient reconstruction (#868) skips only *absent* stages; this is
+    /// surfaced instead so store corruption is never hidden behind an
+    /// "incomplete context" report.
+    #[error("stage {stage_id} (sig {sig_id}) is present but unreadable: {reason}")]
+    StageUnreadable { sig_id: String, stage_id: String, reason: String },
     /// A typed AST transform (#280) — e.g. `ReplaceMatchArm` — was
     /// asked to operate on a node it couldn't address (wrong kind,
     /// out-of-range arm index, unknown NodeId, etc.). Distinct from
@@ -2414,8 +2421,9 @@ impl Store {
     /// Load the declarations of a reconstructed head, in `pairs` order.
     ///
     /// Strict (`skip_unloadable = false`): the first unloadable stage is an
-    /// error — for callers that need a complete head. Lenient: unloadable
-    /// stages are dropped and reported as [`SkippedStage`]s (#868).
+    /// error — for callers that need a complete head. Lenient: *absent* stages
+    /// are dropped and reported as [`SkippedStage`]s (#868); a stage that is
+    /// present but unreadable is still [`StoreError::StageUnreadable`].
     pub(crate) fn load_head_decls(
         &self,
         pairs: &[(String, String)],
@@ -2426,6 +2434,16 @@ impl Store {
         for ((sig_id, stage_id), ast) in pairs.iter().zip(self.get_asts_for_sigs_bulk(pairs)) {
             match ast {
                 Ok(st) => decls.push(st),
+                // Only a genuinely *absent* stage is skipped. Anything else
+                // (corrupt JSON, permissions, other I/O) is corruption, and
+                // must fail loudly rather than read as "context incomplete".
+                Err(e) if skip_unloadable && !stage_is_absent(&e) => {
+                    return Err(StoreError::StageUnreadable {
+                        sig_id: sig_id.clone(),
+                        stage_id: stage_id.clone(),
+                        reason: e.to_string(),
+                    })
+                }
                 Err(e) if skip_unloadable => skipped.push(SkippedStage {
                     sig_id: sig_id.clone(),
                     stage_id: stage_id.clone(),
@@ -4343,6 +4361,17 @@ fn model_label(m: &lex_vcs::ModelDescriptor) -> String {
 /// Walks the stage's serialized form, so it covers calls, constructors and
 /// type references alike without a bespoke AST visitor; a local that happens
 /// to share a skipped declaration's name over-reports, which is the safe side.
+/// Whether a stage-load error means the stage is simply *absent* (GC'd,
+/// superseded, never persisted) — the only case lenient reconstruction may
+/// skip (#868). Corrupt or unreadable stages are not absent.
+fn stage_is_absent(e: &StoreError) -> bool {
+    match e {
+        StoreError::UnknownStage(_) => true,
+        StoreError::Io(io) => io.kind() == std::io::ErrorKind::NotFound,
+        _ => false,
+    }
+}
+
 fn referenced_names(stage: &Stage) -> std::collections::BTreeSet<String> {
     fn walk(v: &serde_json::Value, out: &mut std::collections::BTreeSet<String>) {
         match v {

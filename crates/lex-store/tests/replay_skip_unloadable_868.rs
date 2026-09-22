@@ -272,3 +272,36 @@ fn both_reconstruction_paths_skip_and_report() {
         "strict path stays strict"
     );
 }
+
+/// Only a genuinely *absent* stage may be skipped. A context stage that is
+/// present but corrupt is store corruption: replay must fail and name the
+/// stage, not quietly report "context incomplete".
+#[test]
+fn a_corrupt_context_stage_fails_replay_instead_of_being_skipped() {
+    let f = fixture();
+    let p = f
+        .tmp
+        .path()
+        .join("stages")
+        .join(&f.helper.0)
+        .join("implementations")
+        .join(format!("{}.ast.json", f.helper.1));
+    std::fs::write(&p, b"{ this is not json").unwrap();
+
+    let err = f
+        .store
+        .replay_request(&f.g_op)
+        .expect_err("a corrupt context stage must not be skipped");
+    assert!(
+        matches!(err, lex_store::StoreError::StageUnreadable { ref stage_id, .. } if *stage_id == f.helper.1),
+        "expected StageUnreadable for the corrupt stage, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains(&f.helper.1),
+        "error must name the stage: {err}"
+    );
+
+    // Both lenient reconstruction paths refuse it too.
+    assert!(f.store.demangled_program_at_op_skipping(&f.g_op).is_err());
+    assert!(f.store.program_stages_at_op_skipping(&f.g_op).is_err());
+}
