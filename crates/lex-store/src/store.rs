@@ -44,6 +44,9 @@ pub enum StoreError {
     UnknownBlob(String),
     #[error("unknown blob ref `{namespace}/{key}`")]
     UnknownBlobRef { namespace: String, key: String },
+    /// A files manifest (#1007) failed to decode or validate.
+    #[error("invalid files manifest: {0}")]
+    InvalidManifest(crate::files::ManifestError),
     #[error("unknown op_id `{0}`")]
     UnknownOp(lex_vcs::OpId),
     /// A typed AST transform (#280) — e.g. `ReplaceMatchArm` — was
@@ -522,13 +525,21 @@ impl Store {
     }
 
     /// Content-address `content` and persist it under `<root>/blobs/<sha>`.
-    /// Returns the sha. Idempotent: re-putting identical content is a no-op.
-    /// Concurrency-safe — writes to a unique temp file then atomically renames
-    /// onto the content-addressed path, so parallel writers of the same content
-    /// can't corrupt it.
+    /// Returns the sha. Text wrapper over [`Self::put_blob_bytes`]; the id is
+    /// the sha of the UTF-8 bytes, so it is unchanged from before #1007.
     pub fn put_blob(&self, content: &str) -> Result<String, StoreError> {
+        self.put_blob_bytes(content.as_bytes())
+    }
+
+    /// Content-address arbitrary `bytes` (#1007: files beside the op-log may
+    /// be binary) and persist them under `<root>/blobs/<sha>`. Returns the
+    /// lowercase hex SHA-256 — the same value `sha256sum` prints. Idempotent:
+    /// re-putting identical content is a no-op. Concurrency-safe — writes to a
+    /// unique temp file then atomically renames onto the content-addressed
+    /// path, so parallel writers of the same content can't corrupt it.
+    pub fn put_blob_bytes(&self, bytes: &[u8]) -> Result<String, StoreError> {
         use sha2::{Digest, Sha256};
-        let sha = hex::encode(Sha256::digest(content.as_bytes()));
+        let sha = hex::encode(Sha256::digest(bytes));
         let dir = self.blobs_dir();
         let path = dir.join(&sha);
         if path.exists() {
@@ -538,17 +549,32 @@ impl Store {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = dir.join(format!(".{sha}.{}.{n}.tmp", std::process::id()));
-        fs::write(&tmp, content.as_bytes())?;
+        fs::write(&tmp, bytes)?;
         // rename is atomic on the same filesystem; identical content makes a
         // last-writer-wins race harmless.
         fs::rename(&tmp, &path)?;
         Ok(sha)
     }
 
-    /// Read a blob by its sha. `UnknownBlob` if absent.
+    /// Read a blob by its sha as text. `UnknownBlob` if absent; an
+    /// `InvalidData` I/O error if the blob is not UTF-8 (use
+    /// [`Self::get_blob_bytes`] for binary content).
     pub fn get_blob(&self, sha: &str) -> Result<String, StoreError> {
-        match fs::read_to_string(self.blobs_dir().join(sha)) {
-            Ok(s) => Ok(s),
+        let bytes = self.get_blob_bytes(sha)?;
+        String::from_utf8(bytes).map_err(|e| {
+            StoreError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        })
+    }
+
+    /// Read a blob's exact bytes by its sha. `UnknownBlob` if absent.
+    pub fn get_blob_bytes(&self, sha: &str) -> Result<Vec<u8>, StoreError> {
+        // A blob id is 64 lowercase hex chars; anything else (e.g. `../x`)
+        // cannot name a blob and must never be joined onto the blobs dir.
+        if !crate::files::is_blob_id(sha) {
+            return Err(StoreError::UnknownBlob(sha.to_string()));
+        }
+        match fs::read(self.blobs_dir().join(sha)) {
+            Ok(b) => Ok(b),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 Err(StoreError::UnknownBlob(sha.to_string()))
             }
@@ -558,7 +584,7 @@ impl Store {
 
     /// Whether a blob with this sha exists.
     pub fn has_blob(&self, sha: &str) -> bool {
-        self.blobs_dir().join(sha).exists()
+        crate::files::is_blob_id(sha) && self.blobs_dir().join(sha).exists()
     }
 
     /// Bind `key` to a blob `sha` within `namespace` (e.g. namespace
