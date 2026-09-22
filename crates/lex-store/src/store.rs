@@ -58,6 +58,14 @@ pub enum StoreError {
     /// A files manifest (#1007) failed to decode or validate.
     #[error("invalid files manifest: {0}")]
     InvalidManifest(crate::files::ManifestError),
+    /// A `SetFiles` (#1007) names blobs — its manifest or entries — this
+    /// store does not hold. Nothing was written; the head is unchanged.
+    #[error("files manifest references {} missing blob(s)", .0.len())]
+    MissingBlobs(Vec<crate::files::BlobId>),
+    /// The op exists but has nothing a regenerator could reproduce, by
+    /// kind (#1007) — a typed refusal, not a replay miss.
+    #[error("op {op_id} is not replayable: {why}")]
+    NotReplayable { op_id: lex_vcs::OpId, why: crate::files::NotReplayable },
     #[error("unknown op_id `{0}`")]
     UnknownOp(lex_vcs::OpId),
     /// `replay_request` was asked to replay an op whose own produced stage
@@ -746,6 +754,14 @@ impl Store {
             }
             Err(e) => Err(StoreError::Io(e)),
         }
+    }
+
+    /// Byte length of a blob without reading it, or `None` if absent.
+    pub fn blob_len(&self, sha: &str) -> Option<u64> {
+        if !crate::files::is_blob_id(sha) {
+            return None;
+        }
+        fs::metadata(self.blobs_dir().join(sha)).ok().map(|m| m.len())
     }
 
     /// Whether a blob with this sha exists.
@@ -2570,12 +2586,15 @@ impl Store {
     ///
     /// Errors with `UnknownOp` if the op_id is unknown, or
     /// `InvalidTransition` if the op didn't produce a stage (a removal /
-    /// import / merge has nothing to regenerate).
+    /// import / merge has nothing to regenerate). A `SetFiles` op (#1007)
+    /// is refused by kind with `NotReplayable::Files` — typed, so replay
+    /// coverage can leave it out instead of counting it as a miss.
     pub fn replay_request(&self, op_id: &str) -> Result<ReplayRequest, StoreError> {
         let log = lex_vcs::OpLog::open(self.root())?;
         let record = log
             .get(&op_id.to_string())?
             .ok_or_else(|| StoreError::UnknownOp(op_id.to_string()))?;
+        crate::files::refuse_non_semantic(&record)?;
         let (target_sig, expected_stage_id) = produced_sig_stage(&record.produces)
             .ok_or_else(|| StoreError::InvalidTransition(format!("op {op_id} produced no stage to replay")))?;
 
@@ -2781,6 +2800,7 @@ impl Store {
         let record = log
             .get(&op_id.to_string())?
             .ok_or_else(|| StoreError::UnknownOp(op_id.to_string()))?;
+        crate::files::refuse_non_semantic(&record)?;
         produced_sig_stage(&record.produces)
             .ok_or_else(|| StoreError::InvalidTransition(format!("op {op_id} produced no stage to replay")))
     }
@@ -4553,6 +4573,8 @@ pub fn transition_for_kind(kind: &lex_vcs::OperationKind) -> lex_vcs::StageTrans
         // — the stage IS published on disk (Store::propose_candidate
         // calls publish before apply), but no head delta lands.
         Candidate { .. } => StageTransition::ImportOnly,
+        // #1007: files are not stages; the head map is untouched.
+        SetFiles { .. } => StageTransition::FilesOnly,
         // A Promote advances the head exactly like ModifyBody
         // (or Create when the sig had no head). The winner
         // stage is the new branch state for that sig.
@@ -4687,7 +4709,7 @@ fn produced_sig_stage(t: &lex_vcs::StageTransition) -> Option<(String, String)> 
         Create { sig_id, stage_id } => Some((sig_id.clone(), stage_id.clone())),
         Replace { sig_id, to, .. } => Some((sig_id.clone(), to.clone())),
         Rename { to, body_stage_id, .. } => Some((to.clone(), body_stage_id.clone())),
-        Remove { .. } | ImportOnly | Merge { .. } => None,
+        Remove { .. } | ImportOnly | FilesOnly | Merge { .. } => None,
     }
 }
 
@@ -4792,7 +4814,7 @@ fn attestable_stage_ids(transition: &lex_vcs::StageTransition) -> Vec<String> {
         Replace { to, .. } => vec![to.clone()],
         Rename { body_stage_id, .. } => vec![body_stage_id.clone()],
         Merge { entries } => entries.values().filter_map(|opt| opt.clone()).collect(),
-        Remove { .. } | ImportOnly => Vec::new(),
+        Remove { .. } | ImportOnly | FilesOnly => Vec::new(),
     }
 }
 

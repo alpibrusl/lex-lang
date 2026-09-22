@@ -74,7 +74,7 @@ pub use signing::{verify_message, verify_stage_id, Keypair, SigningError};
 pub use op_log::OpLog;
 pub use history_index::HistoryIndex;
 pub use operation::{
-    budget_from_effects as operation_budget_from_effects, default_import_alias, EffectSet,
+    budget_from_effects as operation_budget_from_effects, default_import_alias, BlobId, EffectSet,
     ModuleRef, OpId, Operation, OperationFormat, OperationKind, OperationRecord, SigId, StageId,
     StageTransition,
 };

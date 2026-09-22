@@ -6,10 +6,11 @@
 //! survives as orthogonal stage-status metadata; it no longer drives
 //! branch resolution.
 
+use crate::files::{resolve_manifest_at, ManifestAt};
 use crate::store::{Store, StoreError};
-use lex_vcs::{OpId, OpLog, StageTransition};
+use lex_vcs::{OpId, OpLog, OperationRecord, StageTransition};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::PathBuf;
 
@@ -59,6 +60,11 @@ pub const DEFAULT_BRANCH: &str = "main";
 struct HeadSnapshot {
     head_op: OpId,
     map: BTreeMap<String, String>,
+    /// The files manifest at `head_op` (#1007). `None` = not computed yet
+    /// (a snapshot written before #1007, or by a `branch_head` call that had
+    /// no cheap way to derive it); filled in lazily by `branch_manifest`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    files: Option<ManifestAt>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -228,8 +234,14 @@ impl Store {
     /// mid-write — same tradeoff `set_branch_head_op`'s own
     /// `fs::write` already makes for `branch_path`, and a torn write
     /// just fails `load_head_snapshot`'s parse on next read.
-    fn save_head_snapshot(&self, name: &str, head_op: &OpId, map: &BTreeMap<String, String>) {
-        let snap = HeadSnapshot { head_op: head_op.clone(), map: map.clone() };
+    fn save_head_snapshot(
+        &self,
+        name: &str,
+        head_op: &OpId,
+        map: &BTreeMap<String, String>,
+        files: &Option<ManifestAt>,
+    ) {
+        let snap = HeadSnapshot { head_op: head_op.clone(), map: map.clone(), files: files.clone() };
         if let Ok(s) = serde_json::to_string(&snap) {
             let _ = fs::write(self.head_snapshot_path(name), s);
         }
@@ -258,36 +270,76 @@ impl Store {
     /// walk over the *entire* history every time, since nothing
     /// persisted the result between calls.
     pub fn branch_head(&self, name: &str) -> Result<BTreeMap<String, String>, StoreError> {
+        Ok(self.head_view(name, false)?.0)
+    }
+
+    /// The files manifest at `name`'s head (#1007) — see
+    /// [`Store::manifest_at`]. Cached in the head snapshot alongside the
+    /// sig→stage map and extended the same way, so steady state costs
+    /// O(ops since the last call).
+    pub fn branch_manifest(&self, name: &str) -> Result<ManifestAt, StoreError> {
+        Ok(self.head_view(name, true)?.1.unwrap_or(ManifestAt::Absent))
+    }
+
+    /// `branch_head`'s map plus the head's files manifest. The manifest is
+    /// computed whenever the records needed are already in memory (a full
+    /// walk, or extending a snapshot that has it); otherwise only when
+    /// `need_files`, so `branch_head` never pays an extra history walk.
+    fn head_view(
+        &self,
+        name: &str,
+        need_files: bool,
+    ) -> Result<(BTreeMap<String, String>, Option<ManifestAt>), StoreError> {
         let b = match self.get_branch(name)? {
             Some(b) => b,
-            None if name == DEFAULT_BRANCH => return Ok(BTreeMap::new()),
+            None if name == DEFAULT_BRANCH => return Ok((BTreeMap::new(), Some(ManifestAt::Absent))),
             None => return Err(StoreError::UnknownBranch(name.into())),
         };
-        let Some(head) = b.head_op else { return Ok(BTreeMap::new()); };
+        let Some(head) = b.head_op else { return Ok((BTreeMap::new(), Some(ManifestAt::Absent))); };
         let log = OpLog::open(self.root())?;
+        let files_from = |memo: &mut HashMap<OpId, ManifestAt>, recs: &[OperationRecord]| {
+            let pre: HashMap<&str, &OperationRecord> =
+                recs.iter().map(|r| (r.op_id.as_str(), r)).collect();
+            resolve_manifest_at(&log, &head, memo, &pre)
+        };
 
         if let Some(snap) = self.load_head_snapshot(name) {
             if snap.head_op == head {
-                return Ok(snap.map);
+                if snap.files.is_some() || !need_files {
+                    return Ok((snap.map, snap.files));
+                }
+                let files = Some(files_from(&mut HashMap::new(), &[])?);
+                self.save_head_snapshot(name, &head, &snap.map, &files);
+                return Ok((snap.map, files));
             }
             if let Some(new_records) = log.walk_forward_since(&head, &snap.head_op)? {
                 let mut map = snap.map;
                 for rec in &new_records {
                     apply_transition(&mut map, &rec.produces);
                 }
-                self.save_head_snapshot(name, &head, &map);
-                return Ok(map);
+                let files = match snap.files {
+                    Some(at_snap) => {
+                        let mut memo = HashMap::from([(snap.head_op.clone(), at_snap)]);
+                        Some(files_from(&mut memo, &new_records)?)
+                    }
+                    None if need_files => Some(files_from(&mut HashMap::new(), &new_records)?),
+                    None => None,
+                };
+                self.save_head_snapshot(name, &head, &map, &files);
+                return Ok((map, files));
             }
             // Snapshot's op isn't an ancestor of the new head — fall
             // through to a full walk below, which also refreshes it.
         }
 
         let mut map = BTreeMap::new();
-        for rec in log.walk_forward(&head, None)? {
+        let records = log.walk_forward(&head, None)?;
+        for rec in &records {
             apply_transition(&mut map, &rec.produces);
         }
-        self.save_head_snapshot(name, &head, &map);
-        Ok(map)
+        let files = Some(files_from(&mut HashMap::new(), &records)?);
+        self.save_head_snapshot(name, &head, &map, &files);
+        Ok((map, files))
     }
 
     pub fn branch_log(&self, name: &str) -> Result<Vec<MergeRecord>, StoreError> {
@@ -626,7 +678,7 @@ pub(crate) fn apply_transition(map: &mut BTreeMap<String, String>, t: &StageTran
             map.remove(from);
             map.insert(to.clone(), body_stage_id.clone());
         }
-        StageTransition::ImportOnly => {}
+        StageTransition::ImportOnly | StageTransition::FilesOnly => {}
         StageTransition::Merge { entries } => {
             for (sig, stage) in entries {
                 match stage {

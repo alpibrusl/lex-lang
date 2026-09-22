@@ -214,7 +214,9 @@ fn apply_transition(map: &mut BTreeMap<String, String>, t: &StageTransition) {
             map.remove(from);
             map.insert(to.clone(), body_stage_id.clone());
         }
-        StageTransition::ImportOnly => {}
+        // FilesOnly (#1007): the files manifest is rendered separately
+        // (PR 6); the sig->stage map is untouched.
+        StageTransition::ImportOnly | StageTransition::FilesOnly => {}
         StageTransition::Merge { entries } => {
             for (sig, stage) in entries {
                 match stage {

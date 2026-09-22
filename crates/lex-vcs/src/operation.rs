@@ -36,6 +36,10 @@ pub type EffectSet = BTreeSet<String>;
 /// this crate doesn't pull in `lex-syntax`'s parser.
 pub type ModuleRef = String;
 
+/// Content hash of a blob in the store's `blobs/` dir (#1007): lowercase
+/// hex SHA-256 of its exact bytes. A `SetFiles` op names its manifest by one.
+pub type BlobId = String;
+
 /// The alias a module binds to when the import writes no explicit
 /// `as` — the module reference's last path segment, splitting on
 /// either `.` (stdlib, `std.sql` → `sql`) or `/` (local/package,
@@ -125,6 +129,9 @@ pub enum StageTransition {
     Merge {
         entries: BTreeMap<SigId, Option<StageId>>,
     },
+    /// Files-only change (#1007): a [`OperationKind::SetFiles`] op. The
+    /// sig→stage map is untouched.
+    FilesOnly,
 }
 
 impl StageTransition {
@@ -137,7 +144,7 @@ impl StageTransition {
             StageTransition::Replace { from, to, .. } => vec![from.clone(), to.clone()],
             StageTransition::Remove { last, .. } => vec![last.clone()],
             StageTransition::Rename { body_stage_id, .. } => vec![body_stage_id.clone()],
-            StageTransition::ImportOnly => Vec::new(),
+            StageTransition::ImportOnly | StageTransition::FilesOnly => Vec::new(),
             StageTransition::Merge { entries } => entries.values().flatten().cloned().collect(),
         }
     }
@@ -173,7 +180,7 @@ impl StageTransition {
             StageTransition::Rename { to, body_stage_id, .. } => {
                 vec![(to.clone(), body_stage_id.clone())]
             }
-            StageTransition::ImportOnly => Vec::new(),
+            StageTransition::ImportOnly | StageTransition::FilesOnly => Vec::new(),
             StageTransition::Merge { entries } => entries
                 .iter()
                 .filter_map(|(sig, stage)| stage.as_ref().map(|st| (sig.clone(), st.clone())))
@@ -463,9 +470,23 @@ pub enum OperationKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to_budget: Option<u64>,
     },
+    /// Non-semantic (#1007): set the repository's non-op-log files —
+    /// README, `lex.toml`, `tests/`, CI config — to the full snapshot named
+    /// by `manifest` (a blob holding a canonical files manifest, like a git
+    /// tree). Recorded, ordered and content-addressed with the rest of the
+    /// history, but never replayed, type-checked or gated as code; the
+    /// sig→stage map is untouched ([`StageTransition::FilesOnly`]).
+    SetFiles { manifest: BlobId },
 }
 
 impl OperationKind {
+    /// Whether this op changes the program (#1007). `false` only for
+    /// [`Self::SetFiles`], which replay, gates and replay coverage skip by
+    /// kind: a file snapshot has no stage to regenerate or type-check.
+    pub fn is_semantic(&self) -> bool {
+        !matches!(self, OperationKind::SetFiles { .. })
+    }
+
     /// The `(SigId, Option<StageId>)` an op kind targets, as used by
     /// `StageTransition::Merge::entries`. Used by the merge-commit
     /// path (#134) to translate a `Resolution::Custom { op }` into
@@ -499,7 +520,7 @@ impl OperationKind {
                 => Some((sig_id.clone(), None)),
             RenameSymbol { to, body_stage_id, .. }
                 => Some((to.clone(), Some(body_stage_id.clone()))),
-            AddImport { .. } | RemoveImport { .. } | Merge { .. } => None,
+            AddImport { .. } | RemoveImport { .. } | Merge { .. } | SetFiles { .. } => None,
             // Candidate ops don't advance the branch head; they
             // don't fit the (sig, Option<stage_id>) head-delta
             // shape that `merge_target` describes.
