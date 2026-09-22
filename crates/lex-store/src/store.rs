@@ -46,6 +46,13 @@ pub enum StoreError {
     UnknownBlobRef { namespace: String, key: String },
     #[error("unknown op_id `{0}`")]
     UnknownOp(lex_vcs::OpId),
+    /// `replay_request` was asked to replay an op whose own produced stage
+    /// can't be loaded (#868). Unloadable *context* in the parent program is
+    /// skipped and reported instead (`ReplayRequest::skipped`), but the
+    /// target is what a regeneration is compared against — without it there
+    /// is nothing to replay.
+    #[error("cannot replay op {op_id}: its target stage {stage_id} cannot be loaded ({reason})")]
+    ReplayTargetUnloadable { op_id: String, stage_id: String, reason: String },
     /// A typed AST transform (#280) — e.g. `ReplaceMatchArm` — was
     /// asked to operate on a node it couldn't address (wrong kind,
     /// out-of-range arm index, unknown NodeId, etc.). Distinct from
@@ -156,6 +163,72 @@ pub struct ReplayRequest {
     /// The program the change was made against — the parent state
     /// rendered to source — the context a regenerator needs.
     pub parent_program: String,
+    /// Declarations the parent state names but the store could not load
+    /// (#868) — GC'd, superseded or never-persisted stages. They are left out
+    /// of `parent_program` rather than failing the replay; an entry with
+    /// `called_by_target` means the regenerator is looking at a program with
+    /// a dangling reference. Omitted from JSON when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<SkippedStage>,
+}
+
+impl ReplayRequest {
+    /// Whether the parent program shown to the regenerator is missing
+    /// declarations (#868) — any skip at all makes the context incomplete.
+    pub fn context_incomplete(&self) -> bool {
+        !self.skipped.is_empty()
+    }
+
+    /// A one-line human note describing the incomplete context, suitable
+    /// for appending to a replay verdict's detail. `None` when nothing was
+    /// skipped.
+    pub fn context_note(&self) -> Option<String> {
+        if self.skipped.is_empty() {
+            return None;
+        }
+        let called: Vec<&str> = self
+            .skipped
+            .iter()
+            .filter(|s| s.called_by_target)
+            .map(|s| s.name.as_deref().unwrap_or(s.sig_id.as_str()))
+            .collect();
+        let mut note = format!(
+            "replay context incomplete: {} declaration(s) of the parent program could not be loaded",
+            self.skipped.len()
+        );
+        if !called.is_empty() {
+            note.push_str(&format!(", including {} called by the target", called.join(", ")));
+        }
+        Some(note)
+    }
+}
+
+/// A head declaration left out of a reconstructed program because its stage
+/// could not be loaded (#868).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SkippedStage {
+    pub sig_id: String,
+    pub stage_id: String,
+    /// The declaration's (de-mangled) name, when recoverable from the
+    /// stage's metadata or another stage of the same sig.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Why it could not be loaded (the underlying store error).
+    pub reason: String,
+    /// Whether the replay target references this declaration by name — i.e.
+    /// the regenerator's context has a dangling reference. Conservative (a
+    /// name match anywhere in the target counts) and `false` when the name
+    /// isn't recoverable. Only set by `replay_request`.
+    #[serde(default)]
+    pub called_by_target: bool,
+}
+
+/// A program reconstructed from the op-log with unloadable declarations
+/// skipped rather than failing the whole reconstruction (#868).
+#[derive(Debug, Clone)]
+pub struct ReconstructedProgram {
+    pub stages: Vec<Stage>,
+    pub skipped: Vec<SkippedStage>,
 }
 
 /// The result of comparing a regenerated candidate against an op's
@@ -178,6 +251,25 @@ pub struct ReplayOutcome {
     pub behavioral_samples: Option<usize>,
     /// The id of the `Replay` attestation this comparison emitted.
     pub attestation_id: String,
+    /// Set when the replay ran against an incomplete parent program —
+    /// declarations the store could not load were skipped (#868). A
+    /// not-reproduced verdict under incomplete context is weaker evidence
+    /// than one under full context. Omitted from JSON when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub context_incomplete: bool,
+    /// The skipped declarations (see [`ReplayRequest::skipped`]). Omitted
+    /// from JSON when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<SkippedStage>,
+}
+
+impl ReplayOutcome {
+    /// Carry a request's skipped-context report onto its verdict (#868).
+    pub fn with_context_of(mut self, req: &ReplayRequest) -> Self {
+        self.context_incomplete = req.context_incomplete();
+        self.skipped = req.skipped.clone();
+        self
+    }
 }
 
 /// One applied operation within a [`PublishOutcome`].
@@ -2242,10 +2334,31 @@ impl Store {
         // The program the op was applied against: the head state at its
         // (first) parent, rendered with the canonical printer. A root
         // op has no parent → empty program.
-        let parent_program = match record.op.parents.first() {
-            Some(parent) => self.program_source_at_op(parent)?,
-            None => String::new(),
+        // The op's own recorded stage is the one thing replay cannot do
+        // without — it's what a regeneration is compared against — so an
+        // unloadable target fails clearly here (#868), before any skipping.
+        let target_stage = self.load_replay_target(op_id, &target_sig, &expected_stage_id)?;
+
+        // #868: reconstruction skips (and reports) head declarations the
+        // store can't load instead of failing the whole replay — a long-lived
+        // history with GC'd or superseded intermediates is exactly where
+        // replay-as-verification is most useful.
+        let (parent_program, mut skipped) = match record.op.parents.first() {
+            Some(parent) => {
+                let rec = self.demangled_program_at_op_skipping(parent)?;
+                (lex_ast::print_stages(&rec.stages), rec.skipped)
+            }
+            None => (String::new(), Vec::new()),
         };
+        if !skipped.is_empty() {
+            let referenced = referenced_names(&target_stage);
+            for sk in &mut skipped {
+                // The target's own sig in the parent is its *previous*
+                // version (a modify), not a callee.
+                sk.called_by_target = sk.sig_id != target_sig
+                    && sk.name.as_deref().is_some_and(|n| referenced.contains(n));
+            }
+        }
 
         // The target function's name + signature, from the recorded stage — a
         // regenerator needs the interface, not just the hash.
@@ -2255,8 +2368,8 @@ impl Store {
         // source — so the old, mangled `target_signature` asked regenerators
         // for something unwritable, and every package-published op replayed as
         // a false negative.
-        let (target_name, target_signature) = match self.get_ast(&expected_stage_id) {
-            Ok(lex_ast::Stage::FnDecl(fd)) => {
+        let (target_name, target_signature) = match &target_stage {
+            lex_ast::Stage::FnDecl(fd) => {
                 let mut bare = fd.clone();
                 bare.name = demangled_name(&fd.name).to_string();
                 (Some(bare.name.clone()), Some(lex_vcs::render_signature(&bare)))
@@ -2274,7 +2387,71 @@ impl Store {
             model,
             session_id,
             parent_program,
+            skipped,
         })
+    }
+
+    /// Load the stage a replayable op produced, or fail with
+    /// [`StoreError::ReplayTargetUnloadable`] (#868). Tries the stage-id
+    /// lookup first (what replay always used), then the `(sig, stage)` read.
+    fn load_replay_target(&self, op_id: &str, sig: &str, stage_id: &str) -> Result<Stage, StoreError> {
+        match self.get_ast(stage_id) {
+            Ok(st) => Ok(st),
+            Err(first) => {
+                let pair = [(sig.to_string(), stage_id.to_string())];
+                match self.get_asts_for_sigs_bulk(&pair).pop() {
+                    Some(Ok(st)) => Ok(st),
+                    _ => Err(StoreError::ReplayTargetUnloadable {
+                        op_id: op_id.to_string(),
+                        stage_id: stage_id.to_string(),
+                        reason: first.to_string(),
+                    }),
+                }
+            }
+        }
+    }
+
+    /// Load the declarations of a reconstructed head, in `pairs` order.
+    ///
+    /// Strict (`skip_unloadable = false`): the first unloadable stage is an
+    /// error — for callers that need a complete head. Lenient: unloadable
+    /// stages are dropped and reported as [`SkippedStage`]s (#868).
+    pub(crate) fn load_head_decls(
+        &self,
+        pairs: &[(String, String)],
+        skip_unloadable: bool,
+    ) -> Result<(Vec<Stage>, Vec<SkippedStage>), StoreError> {
+        let mut decls = Vec::with_capacity(pairs.len());
+        let mut skipped = Vec::new();
+        for ((sig_id, stage_id), ast) in pairs.iter().zip(self.get_asts_for_sigs_bulk(pairs)) {
+            match ast {
+                Ok(st) => decls.push(st),
+                Err(e) if skip_unloadable => skipped.push(SkippedStage {
+                    sig_id: sig_id.clone(),
+                    stage_id: stage_id.clone(),
+                    name: self.recover_decl_name(sig_id, stage_id),
+                    reason: e.to_string(),
+                    called_by_target: false,
+                }),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok((decls, skipped))
+    }
+
+    /// Best-effort (de-mangled) name of a declaration whose AST can't be
+    /// loaded: its own metadata, else the metadata of any other stage of the
+    /// same sig (a SigId fixes the name, so every stage of it shares one).
+    fn recover_decl_name(&self, sig_id: &str, stage_id: &str) -> Option<String> {
+        let bare = |m: Metadata| demangled_name(&m.name).to_string();
+        if let Ok(m) = self.get_metadata_for_sig(sig_id, stage_id) {
+            return Some(bare(m));
+        }
+        self.sig_history(sig_id)
+            .ok()?
+            .into_iter()
+            .find_map(|h| self.get_metadata_for_sig(sig_id, &h.stage_id).ok())
+            .map(bare)
     }
 
     /// #836 G3: compare a regenerated `candidate` against what the op
@@ -2430,6 +2607,8 @@ impl Store {
             reproduced,
             behavioral_samples,
             attestation_id,
+            context_incomplete: false,
+            skipped: Vec::new(),
         })
     }
 
@@ -2439,6 +2618,21 @@ impl Store {
     /// state, so it can only be run in context. Exposed for the CLI's
     /// equivalence check; `op_id` may be any op in the log.
     pub fn program_stages_at_op(&self, op_id: &str) -> Result<Vec<Stage>, StoreError> {
+        Ok(self.program_stages_at_op_impl(op_id, false)?.stages)
+    }
+
+    /// [`Self::program_stages_at_op`], but head declarations whose stage
+    /// can't be loaded are skipped and reported instead of failing the
+    /// reconstruction (#868).
+    pub fn program_stages_at_op_skipping(&self, op_id: &str) -> Result<ReconstructedProgram, StoreError> {
+        self.program_stages_at_op_impl(op_id, true)
+    }
+
+    fn program_stages_at_op_impl(
+        &self,
+        op_id: &str,
+        skip_unloadable: bool,
+    ) -> Result<ReconstructedProgram, StoreError> {
         let oid: lex_vcs::OpId = op_id.to_string();
         let log = lex_vcs::OpLog::open(self.root())?;
         let mut map: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
@@ -2446,15 +2640,14 @@ impl Store {
             crate::branches::apply_transition(&mut map, &rec.produces);
         }
         let pairs: Vec<(String, String)> = map.into_iter().collect();
-        let decls: Vec<Stage> =
-            self.get_asts_for_sigs_bulk(&pairs).into_iter().collect::<Result<_, _>>()?;
+        let (decls, skipped) = self.load_head_decls(&pairs, skip_unloadable)?;
         // #946: include the head's `import` edges. The SigId→stage map holds
         // only fn/type declarations, so without this a non-inlined head
         // reconstructs to a program whose `<alias>.name` calls have no import
         // to bind against — and `replay_request` then hands a regenerator
         // parent source that silently omits the very dependencies the code
         // calls into, which is worse than useless as context.
-        Ok(self.with_head_imports(Some(op_id), decls))
+        Ok(ReconstructedProgram { stages: self.with_head_imports(Some(op_id), decls), skipped })
     }
 
     /// See [`demangled_name`]; method form for call sites that already hold a
@@ -2477,20 +2670,30 @@ impl Store {
     /// available (a multi-module head, pending #942), so callers degrade to the
     /// previous behaviour rather than failing outright.
     pub fn demangled_program_at_op(&self, op_id: &str) -> Result<Vec<Stage>, StoreError> {
-        match crate::render::demangled_head_stages(self, op_id) {
-            Ok(stages) => Ok(stages),
-            Err(StoreError::UnsupportedMultiModuleDependency) => self.program_stages_at_op(op_id),
-            Err(e) => Err(e),
-        }
+        Ok(self.demangled_program_at_op_impl(op_id, false)?.stages)
     }
 
-    /// The program at an op, rendered to source. Used to give a replay
-    /// regenerator the context the change was made against.
-    ///
-    /// #980: rendered from the *de-mangled* program, so what a regenerator is
-    /// shown is source it could actually have written.
-    fn program_source_at_op(&self, op_id: &lex_vcs::OpId) -> Result<String, StoreError> {
-        Ok(lex_ast::print_stages(&self.demangled_program_at_op(op_id)?))
+    /// [`Self::demangled_program_at_op`], but head declarations whose stage
+    /// can't be loaded (GC'd, superseded, never persisted) are skipped and
+    /// reported instead of failing the reconstruction (#868). This is what
+    /// replay uses: a partial context is still worth replaying against, and
+    /// the skips travel with the request and verdict.
+    pub fn demangled_program_at_op_skipping(&self, op_id: &str) -> Result<ReconstructedProgram, StoreError> {
+        self.demangled_program_at_op_impl(op_id, true)
+    }
+
+    fn demangled_program_at_op_impl(
+        &self,
+        op_id: &str,
+        skip_unloadable: bool,
+    ) -> Result<ReconstructedProgram, StoreError> {
+        match crate::render::demangled_head_stages_impl(self, op_id, skip_unloadable) {
+            Ok((stages, skipped)) => Ok(ReconstructedProgram { stages, skipped }),
+            Err(StoreError::UnsupportedMultiModuleDependency) => {
+                self.program_stages_at_op_impl(op_id, skip_unloadable)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Open the attestation log rooted at this store. The log lives
@@ -4135,6 +4338,29 @@ fn model_label(m: &lex_vcs::ModelDescriptor) -> String {
 /// The `(sig_id, stage_id)` an op recorded producing, or `None` for a
 /// transition that produces no stage (removal / import / merge) — those
 /// have nothing to regenerate for a replay.
+/// Every identifier-like string in a stage, de-mangled — a conservative
+/// "names this stage references" set for flagging skipped callees (#868).
+/// Walks the stage's serialized form, so it covers calls, constructors and
+/// type references alike without a bespoke AST visitor; a local that happens
+/// to share a skipped declaration's name over-reports, which is the safe side.
+fn referenced_names(stage: &Stage) -> std::collections::BTreeSet<String> {
+    fn walk(v: &serde_json::Value, out: &mut std::collections::BTreeSet<String>) {
+        match v {
+            serde_json::Value::String(s) => {
+                out.insert(demangled_name(s).to_string());
+            }
+            serde_json::Value::Array(xs) => xs.iter().for_each(|x| walk(x, out)),
+            serde_json::Value::Object(m) => m.values().for_each(|x| walk(x, out)),
+            _ => {}
+        }
+    }
+    let mut out = std::collections::BTreeSet::new();
+    if let Ok(v) = serde_json::to_value(stage) {
+        walk(&v, &mut out);
+    }
+    out
+}
+
 fn produced_sig_stage(t: &lex_vcs::StageTransition) -> Option<(String, String)> {
     use lex_vcs::StageTransition::*;
     match t {
