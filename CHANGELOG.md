@@ -5,6 +5,38 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [0.11.66] - 2026-09-21
+
+### Fixed
+
+- **Comments and documentation survive the op-log (#991 follow-up).** Every
+  package served from an op-log arrived with *all* documentation stripped:
+  `lex-ocpi` lost 2051 comment lines, `lex-agent` 519, `lex-fix` 293, and not
+  one of 18 sampled packages kept a single comment. `lex-syntax` parses
+  comments per declaration and the canonicalizer strips them so they never
+  reach a SigId or StageId — correctly, since editing a comment must not read
+  as a code change — but the op-log stored only that canonical AST, so nothing
+  rendered from it could carry them back.
+
+  Comments now ride in the stage's `Metadata`, outside the hash, for the same
+  reason `name` does. `canonical::{FnDecl,TypeDecl}` gain a `serde(skip)`
+  `doc` field, so hashes are untouched and stored `.ast.json` files stay
+  bit-identical; the loader hands each file's header to that file's own first
+  declaration; and the renderer reads them back by `(sig, stage)` — an id-only
+  lookup duplicated a module header across two declarations, since two sigs
+  can share a StageId (#826).
+
+  Verified end to end: `lex-memory` 82/82 comment lines, `lex-fix` 293/293,
+  `lex-agent` 519/519. Comments *inside* function bodies are still lost — the
+  AST has no node for them.
+
+- **The version gate diffs the consumer-visible API, not the file naming
+  (#991).** The API was keyed by the mangled declaration name, whose hash
+  derives from the source file, so renaming a file rotated every key and a pure
+  rename read as "every symbol removed, every symbol added" — reported as
+  "`JobOpts` was removed" when `JobOpts` was present in both versions. Keys are
+  now `<module>.<name>`.
+
 ## [0.11.65] - 2026-09-21
 
 ### Fixed
