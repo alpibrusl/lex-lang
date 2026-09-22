@@ -32,6 +32,11 @@ bumps may carry breaking changes when justified).
   round trip per site (~2 minutes for one file). Each load pass now resolves
   each (url, ref) once — per load, not per process, so a branch that moves
   between loads is still seen.
+- **Always-valid HEAD: a head can never bind a sig to a stage filed under a
+  different sig (#992).** New `StoreError::UnsatisfiablePair`, enforced wherever
+  a head moves — local writes, the ref half of `op push`, and `publish_program`
+  — closing the (old sig, new stage) damage class that #993–#999 repaired
+  case by case.
 - **A merge commits its own merged lock (#977).** A merge head inherited the
   nearest ancestor's lock, so a dependency introduced on the source branch
   failed as `unknown_identifier` after merging.
