@@ -139,6 +139,7 @@ mod tests {
                 to_stage_id: "s2".into(),
                 from_budget: None,
                 to_budget: None,
+                to_sig_id: None,
             },
             [head1.op_id.clone()],
         );
@@ -164,6 +165,7 @@ mod tests {
                 to_stage_id: "s2".into(),
                 from_budget: None,
                 to_budget: None,
+                to_sig_id: None,
             },
             ["someone-else".into()],
         );
@@ -251,6 +253,7 @@ mod tests {
                 to_stage_id: "s2".into(),
                 from_budget: None,
                 to_budget: None,
+                to_sig_id: None,
             },
             [head_a.op_id.clone(), "p2".into(), "p3".into()],
         );
@@ -273,6 +276,7 @@ mod tests {
                 to_stage_id: "s2".into(),
                 from_budget: None,
                 to_budget: None,
+                to_sig_id: None,
             },
             ["claimed-parent".into()],
         );

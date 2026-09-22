@@ -64,6 +64,7 @@ fn corpus() -> Vec<OperationKind> {
                 to_stage_id: format!("{stage}-next"),
                 from_budget: None,
                 to_budget: None,
+                to_sig_id: None,
             });
             out.push(OperationKind::AddType {
                 sig_id: sig.into(),
@@ -78,6 +79,7 @@ fn corpus() -> Vec<OperationKind> {
                 sig_id: sig.into(),
                 from_stage_id: stage.into(),
                 to_stage_id: format!("{stage}-next"),
+                to_sig_id: None,
             });
         }
     }

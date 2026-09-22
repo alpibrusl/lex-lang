@@ -130,6 +130,14 @@ fn group_by_sig(ops: &[OperationRecord]) -> BTreeMap<SigId, Vec<&OperationRecord
 
 fn touched_sigs(k: &OperationKind) -> Vec<SigId> {
     match k {
+        // #992: a sig-moving modification touches both sides, like a rename.
+        OperationKind::ModifyBody { sig_id, to_sig_id: Some(to), .. }
+        | OperationKind::ChangeEffectSig { sig_id, to_sig_id: Some(to), .. }
+        | OperationKind::ModifyType { sig_id, to_sig_id: Some(to), .. }
+            if to != sig_id =>
+        {
+            vec![sig_id.clone(), to.clone()]
+        }
         OperationKind::AddFunction { sig_id, .. }
         | OperationKind::RemoveFunction { sig_id, .. }
         | OperationKind::ModifyBody { sig_id, .. }
@@ -272,6 +280,7 @@ mod tests {
                 to_stage_id: to.into(),
                 from_budget: None,
                 to_budget: None,
+                to_sig_id: None,
             },
             [parent.clone()],
         );

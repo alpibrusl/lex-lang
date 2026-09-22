@@ -716,13 +716,15 @@ fn patch_handler(state: &State, body: &str) -> Response<std::io::Cursor<Vec<u8>>
             to_stage_id: new_id.clone(),
             from_budget: budget,
             to_budget: budget,
+            // #992: a patch that touches the signature (types, examples)
+            // moves the sig just as an effect change does.
+            to_sig_id: lex_ast::sig_id(&patched).filter(|s| *s != sig),
         }
     };
-    let transition = lex_vcs::StageTransition::Replace {
-        sig_id: sig.clone(),
-        from: req.stage_id.clone(),
-        to: new_id.clone(),
-    };
+    // #992: derive the transition from the op, never hard-code `Replace`. A
+    // sig-moving op must retire the old sig and bind the new one; a `Replace`
+    // here left `(old_sig, new_stage)` at the head — a pair no store holds.
+    let transition = lex_store::transition_for_kind(&kind);
     let op = lex_vcs::Operation::new(
         kind,
         head_now.into_iter().collect::<Vec<_>>(),

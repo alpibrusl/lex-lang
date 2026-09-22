@@ -110,6 +110,7 @@ fn apply_operation_checked_does_not_advance_head_after_rejection() {
             to_stage_id: "stg-2".into(),
             from_budget: None,
             to_budget: None,
+            to_sig_id: None,
         },
         [head1.clone()],
     );
@@ -250,6 +251,7 @@ fn apply_operation_checked_propagates_apply_errors() {
             to_stage_id: "stg-2".into(),
             from_budget: None,
             to_budget: None,
+            to_sig_id: None,
         },
         ["someone-else".into()],
     );

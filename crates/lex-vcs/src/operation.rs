@@ -240,6 +240,19 @@ pub enum OperationKind {
         from_budget: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         to_budget: Option<u64>,
+        /// The SigId the declaration moves **to**, when the modification
+        /// changed the signature itself (#992) — same field, same reason, as
+        /// [`OperationKind::ChangeEffectSig::to_sig_id`].
+        ///
+        /// A SigId covers the input/output types and the signature-level
+        /// `examples`, not just the name, so a same-name edit to any of those
+        /// is a new sig. The publish diff keys declarations by name and read
+        /// it as a plain modification, so the head kept the *old* sig bound to
+        /// the *new* stage: a pair no store can hold. `None` for a body-only
+        /// change — and for every op written before this field — keeping the
+        /// in-place `Replace` and byte-identical OpIds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_sig_id: Option<SigId>,
     },
     /// Symbol renamed. The body hash is preserved (`body_stage_id`)
     /// so two renames of the same body collapse to the same OpId
@@ -327,6 +340,10 @@ pub enum OperationKind {
         sig_id: SigId,
         from_stage_id: StageId,
         to_stage_id: StageId,
+        /// The SigId the type moves **to** when its params changed (#992).
+        /// See [`OperationKind::ModifyBody::to_sig_id`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_sig_id: Option<SigId>,
     },
     /// Merge of two branch heads. Carries only an informational count
     /// of resolved sigs so two structurally identical merges of
@@ -466,10 +483,12 @@ impl OperationKind {
             AddFunction { sig_id, stage_id, .. }
             | AddType { sig_id, stage_id, .. }
                 => Some((sig_id.clone(), Some(stage_id.clone()))),
-            ModifyBody { sig_id, to_stage_id, .. }
-            | ChangeEffectSig { sig_id, to_stage_id, .. }
-            | ModifyType { sig_id, to_stage_id, .. }
-            | ReplaceMatchArm { sig_id, to_stage_id, .. }
+            // #992: a sig-moving modification lands under the sig it moves to.
+            ModifyBody { sig_id, to_stage_id, to_sig_id, .. }
+            | ChangeEffectSig { sig_id, to_stage_id, to_sig_id, .. }
+            | ModifyType { sig_id, to_stage_id, to_sig_id, .. }
+                => Some((to_sig_id.as_ref().unwrap_or(sig_id).clone(), Some(to_stage_id.clone()))),
+            ReplaceMatchArm { sig_id, to_stage_id, .. }
             | RenameLocal { sig_id, to_stage_id, .. }
             | InlineLet { sig_id, to_stage_id, .. }
                 => Some((sig_id.clone(), Some(to_stage_id.clone()))),

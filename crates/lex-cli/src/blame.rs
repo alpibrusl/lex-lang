@@ -90,6 +90,12 @@ pub(super) fn cmd_blame(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                     .filter(|r| {
                         // Touch this sig (or, for renames, produce it as the new sig).
                         match &r.op.kind {
+                            // #992: a sig-moving modification produces the new sig.
+                            lex_vcs::OperationKind::ModifyBody { sig_id, to_sig_id: Some(to), .. }
+                            | lex_vcs::OperationKind::ChangeEffectSig { sig_id, to_sig_id: Some(to), .. }
+                            | lex_vcs::OperationKind::ModifyType { sig_id, to_sig_id: Some(to), .. } => {
+                                sig_id == &sig || to == &sig
+                            }
                             lex_vcs::OperationKind::AddFunction { sig_id, .. }
                             | lex_vcs::OperationKind::ModifyBody { sig_id, .. }
                             | lex_vcs::OperationKind::ChangeEffectSig { sig_id, .. }

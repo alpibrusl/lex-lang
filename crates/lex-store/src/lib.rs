@@ -53,6 +53,7 @@ pub use store::{
     CandidateInfo, DepResolver, HubCiVerdict, PublishOp, PublishOutcome, ReconstructedProgram,
     ReplayOutcome, ReplayRequest, SkippedStage, StageHistoryEntry, Store, StoreError,
 };
+pub use store::transition_for_kind;
 pub use branches::{
     Branch, BranchAdvance, MergeConflict, MergeEntry, MergeRecord, MergeReport, MergeSummary,
     DEFAULT_BRANCH,

@@ -67,6 +67,7 @@ fn modify_body() -> Operation {
             to_stage_id: "def456".into(),
             from_budget: None,
             to_budget: None,
+            to_sig_id: None,
         },
         ["op-parent".into()],
     )

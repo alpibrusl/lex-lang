@@ -194,6 +194,7 @@ mod tests {
             to_stage_id: "b".into(),
             from_budget: Some(10),
             to_budget: Some(15),
+            to_sig_id: None,
         };
         assert_eq!(monotonic_spend(&k), 5);
 
@@ -203,6 +204,7 @@ mod tests {
             to_stage_id: "b".into(),
             from_budget: Some(15),
             to_budget: Some(10),
+            to_sig_id: None,
         };
         assert_eq!(monotonic_spend(&k), 0, "decrease doesn't refund");
 
@@ -213,6 +215,7 @@ mod tests {
             to_stage_id: "b".into(),
             from_budget: None,
             to_budget: None,
+            to_sig_id: None,
         };
         assert_eq!(monotonic_spend(&k), 0);
     }

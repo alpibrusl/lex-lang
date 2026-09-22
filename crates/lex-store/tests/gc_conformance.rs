@@ -52,6 +52,7 @@ fn ops_reachable_from_branches_are_always_retained() {
             to_stage_id: "stg-fa-2".into(),
             from_budget: None,
             to_budget: None,
+            to_sig_id: None,
         },
         [id_a.clone()],
     );
@@ -87,6 +88,7 @@ fn parent_of_retained_orphan_is_retained_transitively() {
             to_stage_id: "stg-fa-2".into(),
             from_budget: None,
             to_budget: None,
+            to_sig_id: None,
         },
         [id_a.clone()],
     );
