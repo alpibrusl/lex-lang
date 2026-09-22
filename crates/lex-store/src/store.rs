@@ -1729,6 +1729,36 @@ impl Store {
             last_op_id = Some(op_id);
         }
 
+        // Record the documentation of *every* declaration in this program, not
+        // just the ones that produced an op.
+        //
+        // Comments live outside the hash, so a declaration whose code is
+        // unchanged emits no op — `publish_signed` never runs for it, and its
+        // metadata keeps whatever doc it had. That is exactly the shape of a
+        // re-publish that exists only to carry documentation: the first attempt
+        // emitted 2 ops for a 25-declaration package and the other 23 stayed
+        // undocumented, so the release was as bare as the one it replaced.
+        //
+        // Metadata is not content-addressed, so this is a cheap in-place write
+        // and a no-op when the doc already matches.
+        for stg in stages {
+            let doc = stage_doc(stg);
+            if doc.is_empty() {
+                continue;
+            }
+            let (Some(sig), Some(sid)) = (sig_id(stg), stage_id(stg)) else { continue };
+            let meta_path = self.impl_dir(&sig).join(format!("{sid}.metadata.json"));
+            if !meta_path.exists() {
+                continue;
+            }
+            if let Ok(mut existing) = self.get_metadata_for_sig(&sig, &sid) {
+                if existing.doc != doc {
+                    existing.doc = doc;
+                    write_canonical_json(&meta_path, &existing)?;
+                }
+            }
+        }
+
         let head_op = match last_op_id {
             Some(id) => Some(id),
             // No ops applied; return whatever the head was already.

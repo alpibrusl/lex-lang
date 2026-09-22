@@ -181,3 +181,63 @@ fn rewording_a_comment_updates_the_stored_doc() {
         "and the superseded wording must be gone, got {doc:?}"
     );
 }
+
+/// Re-publishing a package purely to carry documentation must document
+/// **every** declaration, not only the ones whose code changed.
+///
+/// Comments are outside the hash, so an unchanged declaration emits no op and
+/// `publish_signed` never runs for it. The first real attempt at this emitted
+/// 2 ops for a 25-declaration package and left the other 23 bare, so the new
+/// release was as undocumented as the one it replaced — and burned a version
+/// finding that out.
+#[test]
+fn republishing_documents_declarations_that_emitted_no_op() {
+    let (store, _tmp) = store();
+
+    // First publish: no comments anywhere.
+    let bare = "fn a(n :: Int) -> Int { n }\nfn b(n :: Int) -> Int { n + 1 }\n";
+    let stages = canonicalize_program(&parse_source(bare).expect("parse"));
+    let new: BTreeMap<String, lex_ast::FnDecl> = stages
+        .iter()
+        .filter_map(|st| match st {
+            lex_ast::Stage::FnDecl(fd) => Some((fd.name.clone(), fd.clone())),
+            _ => None,
+        })
+        .collect();
+    let et: BTreeMap<String, lex_ast::TypeDecl> = BTreeMap::new();
+    let diff = lex_vcs::compute_diff_with_types(&BTreeMap::new(), &new, &et, &et, true);
+    store
+        .publish_program(DEFAULT_BRANCH, &stages, &diff, &BTreeMap::new(), true)
+        .expect("first publish");
+
+    // Second publish: identical code, now documented. No op should be emitted
+    // for either declaration — that is the whole point.
+    let documented = "# what a does\nfn a(n :: Int) -> Int { n }\n# what b does\nfn b(n :: Int) -> Int { n + 1 }\n";
+    let stages2 = canonicalize_program(&parse_source(documented).expect("parse"));
+    let new2: BTreeMap<String, lex_ast::FnDecl> = stages2
+        .iter()
+        .filter_map(|st| match st {
+            lex_ast::Stage::FnDecl(fd) => Some((fd.name.clone(), fd.clone())),
+            _ => None,
+        })
+        .collect();
+    let diff2 = lex_vcs::compute_diff_with_types(&new, &new2, &et, &et, true);
+    let out = store
+        .publish_program(DEFAULT_BRANCH, &stages2, &diff2, &BTreeMap::new(), true)
+        .expect("second publish");
+    assert!(
+        out.ops.is_empty(),
+        "documenting existing code changes no hash, so it must emit no ops: {:?}",
+        out.ops
+    );
+
+    for st in &stages2 {
+        let sid = lex_ast::stage_id(st).unwrap();
+        let sig = lex_ast::sig_id(st).unwrap();
+        let doc = store.get_metadata_for_sig(&sig, &sid).expect("metadata").doc;
+        assert!(
+            !doc.is_empty(),
+            "every declaration must be documented, even with no op emitted"
+        );
+    }
+}
