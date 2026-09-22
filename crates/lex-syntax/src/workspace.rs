@@ -387,11 +387,71 @@ fn sanitize_ref(r: &str) -> String {
     r.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '.' { c } else { '_' }).collect()
 }
 
+// ---- One `ls-remote` per (url, ref) per load (#1015) ---------------------
+//
+// `resolve_package_import` runs once per import *site*, so resolving a moving
+// ref on every call turned one `lex check` into a storm of network round
+// trips — 13 `ls-remote`s of the same repo for one small file, ~2 minutes for
+// a module that imports widely. A load pass therefore opens a resolution
+// scope and each (url, ref) is asked once inside it.
+//
+// The scope is per load, not per process, on purpose: a process-wide memo
+// would reintroduce exactly the staleness #1005 removed for anything that
+// loads more than once (a long-running server, or a branch that moves
+// between two loads) — the next load must see where the branch is *now*.
+
+type ShaMemo = std::collections::HashMap<(String, String), Option<String>>;
+
+thread_local! {
+    static SHA_SCOPE: std::cell::RefCell<Option<ShaMemo>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Guard for one load pass. Nested scopes share the outermost one; the memo
+/// is dropped when the outermost guard is.
+pub struct ResolutionScope {
+    outermost: bool,
+}
+
+pub fn resolution_scope() -> ResolutionScope {
+    SHA_SCOPE.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.is_some() {
+            ResolutionScope { outermost: false }
+        } else {
+            *s = Some(ShaMemo::new());
+            ResolutionScope { outermost: true }
+        }
+    })
+}
+
+impl Drop for ResolutionScope {
+    fn drop(&mut self) {
+        if self.outermost {
+            SHA_SCOPE.with(|s| *s.borrow_mut() = None);
+        }
+    }
+}
+
 /// Resolve a *moving* git ref to the commit it currently points at, via
-/// `git ls-remote`. `None` when git cannot be run or the ref is absent —
-/// callers fall back to the unresolved path so an offline build still works
-/// off whatever is already cached.
+/// `git ls-remote` — once per (url, ref) inside a [`resolution_scope`].
+/// `None` when git cannot be run or the ref is absent — callers fall back to
+/// the unresolved path so an offline build still works off whatever is
+/// already cached.
 fn resolve_remote_sha(url: &str, refname: &str) -> Option<String> {
+    let key = (url.to_string(), refname.to_string());
+    if let Some(hit) = SHA_SCOPE.with(|s| s.borrow().as_ref().and_then(|m| m.get(&key).cloned())) {
+        return hit;
+    }
+    let sha = ls_remote_sha(url, refname);
+    SHA_SCOPE.with(|s| {
+        if let Some(m) = s.borrow_mut().as_mut() {
+            m.insert(key, sha.clone());
+        }
+    });
+    sha
+}
+
+fn ls_remote_sha(url: &str, refname: &str) -> Option<String> {
     let out = std::process::Command::new("git")
         .args(["ls-remote", url, refname])
         .output()

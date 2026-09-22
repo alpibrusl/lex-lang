@@ -135,6 +135,7 @@ pub enum LoadError {
 /// Load a multi-file Lex program, expanding local imports relative to
 /// the entry path. Stdlib imports (`std.*`) pass through unchanged.
 pub fn load_program(entry: &Path) -> Result<Program, LoadError> {
+    let _scope = crate::workspace::resolution_scope();
     load_rooted(entry, None)
 }
 
@@ -153,6 +154,7 @@ pub fn load_program_with_root(entry: &Path, root: &Path) -> Result<Program, Load
     // temp dirs being the common case) would never prefix-match the
     // canonicalized file paths otherwise.
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let _scope = crate::workspace::resolution_scope();
     load_rooted(entry, Some(root))
 }
 
@@ -220,6 +222,7 @@ pub fn load_package(
     namespace: &str,
     inline_packages: bool,
 ) -> Result<LoadedPackage, LoadError> {
+    let _scope = crate::workspace::resolution_scope();
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let mut state = LoaderState {
         in_progress: Vec::new(),

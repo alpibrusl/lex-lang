@@ -227,3 +227,56 @@ fn an_explicit_rev_keeps_its_existing_cache_name() {
         "a pinned rev keeps the name it already had, got {dirs:?}"
     );
 }
+
+/// #1015: resolution runs once per import *site*, so without a per-load memo
+/// every site paid its own `git ls-remote` — a module importing a dep from a
+/// dozen places asked the network a dozen times. One load, several sites,
+/// one dep → exactly one `ls-remote`. A `git` shim on PATH counts them.
+#[test]
+fn one_load_asks_ls_remote_once_per_dependency() {
+    let _g = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = upstream(tmp.path(), "fn v() -> Int { 1 }\nfn w() -> Int { 2 }\n");
+    let cons = consumer(tmp.path(), &repo);
+    // Three import sites of the same dep across two files.
+    std::fs::write(
+        cons.join("src/main.lex"),
+        "import \"dep/lib\" as d\nimport \"./other\" as o\n\nfn go() -> Int { d.v() + o.more() }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        cons.join("src/other.lex"),
+        "import \"dep/lib\" as d\nimport \"dep/lib\" as d2\n\nfn more() -> Int { d.w() + d2.v() }\n",
+    )
+    .unwrap();
+
+    let real_git = String::from_utf8(
+        Command::new("sh").args(["-c", "command -v git"]).output().expect("which git").stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let shim_dir = tmp.path().join("shim");
+    std::fs::create_dir_all(&shim_dir).unwrap();
+    let log = tmp.path().join("git.log");
+    let shim = shim_dir.join("git");
+    std::fs::write(
+        &shim,
+        format!("#!/bin/sh\necho \"$*\" >> '{}'\nexec '{}' \"$@\"\n", log.display(), real_git),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let old_path = std::env::var("PATH").unwrap_or_default();
+    std::env::set_var("PATH", format!("{}:{old_path}", shim_dir.display()));
+    let cache = tmp.path().join("cache");
+    resolve(&cons, &cache);
+    std::env::set_var("PATH", old_path);
+
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    let ls_remotes = calls.lines().filter(|l| l.starts_with("ls-remote")).count();
+    assert_eq!(ls_remotes, 1, "one dependency, one ls-remote per load; git calls:\n{calls}");
+}
