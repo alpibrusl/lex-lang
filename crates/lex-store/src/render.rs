@@ -154,9 +154,10 @@ fn render_source_inner(store: &Store, head: &PackageHead) -> Result<RenderedSour
 /// [`StoreError::UnsupportedMultiModuleDependency`] rather than silently
 /// resolving the wrong surface; picking the imported module's file out of the
 /// de-flattened tree is a later extension. The dependency must also
-/// type-check on its own (a *leaf* — no unresolved dependencies of its own);
-/// resolving a dependency that itself has registry/git dependencies is the
-/// recursive extension that follows.
+/// type-check on its own (a *leaf* — no unresolved dependencies of its own).
+/// A dependency that itself has registry/git dependencies resolves through
+/// [`crate::deps::module_surface_at_op_with`] (#943), which checks it against
+/// its own committed lock's dependencies.
 pub fn module_record_at_op(store: &Store, head_op: &str) -> Result<lex_types::Ty, StoreError> {
     module_record_at_op_for(store, head_op, None)
 }
@@ -199,7 +200,7 @@ pub fn module_record_at_op_for(
 /// `model.lex`, else any file whose stem matches. Mirrors the loader's own
 /// resolution order (`lex_syntax::workspace::find_module_file`) so a dependent
 /// resolves the same file the compiler would.
-fn module_file<'a>(files: impl Iterator<Item = &'a String>, module: &str) -> Option<String> {
+pub(crate) fn module_file<'a>(files: impl Iterator<Item = &'a String>, module: &str) -> Option<String> {
     let want_src = format!("src/{module}.lex");
     let want_flat = format!("{module}.lex");
     let mut stem_match: Option<String> = None;
@@ -507,7 +508,7 @@ fn is_mangle_prefix(q: &str) -> bool {
 
 /// The mangling prefix of a declaration (`schema_a1b2.validate` →
 /// `schema_a1b2`), or `None` for an import or an unmangled name.
-fn stage_prefix(s: &lex_ast::Stage) -> Option<String> {
+pub(crate) fn stage_prefix(s: &lex_ast::Stage) -> Option<String> {
     let name = match s {
         lex_ast::Stage::FnDecl(fd) => &fd.name,
         lex_ast::Stage::TypeDecl(td) => &td.name,
@@ -699,135 +700,155 @@ impl FileRewrite<'_> {
     }
 
     fn rewrite_stage(&mut self, s: &mut lex_ast::Stage) {
-        match s {
-            lex_ast::Stage::FnDecl(fd) => {
-                fd.name = self.rename(&fd.name);
-                for p in &mut fd.params {
-                    self.rewrite_type(&mut p.ty);
-                }
-                self.rewrite_type(&mut fd.return_type);
-                self.rewrite_expr(&mut fd.body);
-                for ex in &mut fd.examples {
-                    for a in &mut ex.args {
-                        self.rewrite_expr(a);
-                    }
-                    self.rewrite_expr(&mut ex.expected);
-                }
-            }
-            lex_ast::Stage::TypeDecl(td) => {
-                td.name = self.rename(&td.name);
-                self.rewrite_type(&mut td.definition);
-            }
-            lex_ast::Stage::Import(_) => {}
-        }
+        map_stage_names(s, &mut |_site, name| self.rename(name));
     }
+}
 
-    fn rewrite_expr(&mut self, e: &mut lex_ast::CExpr) {
-        use lex_ast::CExpr::*;
-        match e {
-            Var { name } => *name = self.rename(name),
-            Literal { .. } => {}
-            Call { callee, args } => {
-                self.rewrite_expr(callee);
-                for a in args {
-                    self.rewrite_expr(a);
+/// Where a name appears in a declaration, for [`map_stage_names`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NameSite {
+    /// The declared name of a top-level fn or type.
+    Decl,
+    /// A value reference (`Var`).
+    Value,
+    /// A type reference (`Named`, or a record spread).
+    Type,
+}
+
+/// Apply `f` to every declaration, value and type name in `s` (not to
+/// constructor names — Lex's constructor namespace is flat and unmangled — nor
+/// to locally bound names, which are never qualified). The single traversal
+/// every name rewrite in this crate goes through, so the de-flattening renderer
+/// and dependency re-prefixing (`crate::deps`) visit exactly the same sites.
+pub(crate) fn map_stage_names(s: &mut lex_ast::Stage, f: &mut dyn FnMut(NameSite, &str) -> String) {
+    match s {
+        lex_ast::Stage::FnDecl(fd) => {
+            fd.name = f(NameSite::Decl, &fd.name);
+            for p in &mut fd.params {
+                map_type_names(&mut p.ty, f);
+            }
+            map_type_names(&mut fd.return_type, f);
+            map_expr_names(&mut fd.body, f);
+            for ex in &mut fd.examples {
+                for a in &mut ex.args {
+                    map_expr_names(a, f);
                 }
+                map_expr_names(&mut ex.expected, f);
             }
-            Let { value, body, ty, .. } => {
-                if let Some(t) = ty {
-                    self.rewrite_type(t);
-                }
-                self.rewrite_expr(value);
-                self.rewrite_expr(body);
-            }
-            Match { scrutinee, arms } => {
-                self.rewrite_expr(scrutinee);
-                for arm in arms {
-                    self.rewrite_expr(&mut arm.body);
-                }
-            }
-            Block { statements, result } => {
-                for s in statements {
-                    self.rewrite_expr(s);
-                }
-                self.rewrite_expr(result);
-            }
-            Constructor { args, .. } => {
-                for a in args {
-                    self.rewrite_expr(a);
-                }
-            }
-            RecordLit { fields } => {
-                for f in fields {
-                    self.rewrite_expr(&mut f.value);
-                }
-            }
-            TupleLit { items } | ListLit { items } => {
-                for i in items {
-                    self.rewrite_expr(i);
-                }
-            }
-            FieldAccess { value, .. } => self.rewrite_expr(value),
-            Lambda { params, return_type, body, .. } => {
-                for p in params {
-                    self.rewrite_type(&mut p.ty);
-                }
-                self.rewrite_type(return_type);
-                self.rewrite_expr(body);
-            }
-            BinOp { lhs, rhs, .. } => {
-                self.rewrite_expr(lhs);
-                self.rewrite_expr(rhs);
-            }
-            UnaryOp { expr, .. } => self.rewrite_expr(expr),
-            Return { value } => self.rewrite_expr(value),
         }
+        lex_ast::Stage::TypeDecl(td) => {
+            td.name = f(NameSite::Decl, &td.name);
+            map_type_names(&mut td.definition, f);
+        }
+        lex_ast::Stage::Import(_) => {}
     }
+}
 
-    fn rewrite_type(&mut self, t: &mut lex_ast::TypeExpr) {
-        use lex_ast::TypeExpr::*;
-        match t {
-            Named { name, args } => {
-                *name = self.rename(name);
-                for a in args {
-                    self.rewrite_type(a);
+fn map_expr_names(e: &mut lex_ast::CExpr, f: &mut dyn FnMut(NameSite, &str) -> String) {
+    use lex_ast::CExpr::*;
+    match e {
+        Var { name } => *name = f(NameSite::Value, name),
+        Literal { .. } => {}
+        Call { callee, args } => {
+            map_expr_names(callee, f);
+            for a in args {
+                map_expr_names(a, f);
+            }
+        }
+        Let { value, body, ty, .. } => {
+            if let Some(t) = ty {
+                map_type_names(t, f);
+            }
+            map_expr_names(value, f);
+            map_expr_names(body, f);
+        }
+        Match { scrutinee, arms } => {
+            map_expr_names(scrutinee, f);
+            for arm in arms {
+                map_expr_names(&mut arm.body, f);
+            }
+        }
+        Block { statements, result } => {
+            for s in statements {
+                map_expr_names(s, f);
+            }
+            map_expr_names(result, f);
+        }
+        Constructor { args, .. } => {
+            for a in args {
+                map_expr_names(a, f);
+            }
+        }
+        RecordLit { fields } => {
+            for fl in fields {
+                map_expr_names(&mut fl.value, f);
+            }
+        }
+        TupleLit { items } | ListLit { items } => {
+            for i in items {
+                map_expr_names(i, f);
+            }
+        }
+        FieldAccess { value, .. } => map_expr_names(value, f),
+        Lambda { params, return_type, body, .. } => {
+            for p in params {
+                map_type_names(&mut p.ty, f);
+            }
+            map_type_names(return_type, f);
+            map_expr_names(body, f);
+        }
+        BinOp { lhs, rhs, .. } => {
+            map_expr_names(lhs, f);
+            map_expr_names(rhs, f);
+        }
+        UnaryOp { expr, .. } => map_expr_names(expr, f),
+        Return { value } => map_expr_names(value, f),
+    }
+}
+
+fn map_type_names(t: &mut lex_ast::TypeExpr, f: &mut dyn FnMut(NameSite, &str) -> String) {
+    use lex_ast::TypeExpr::*;
+    match t {
+        Named { name, args } => {
+            *name = f(NameSite::Type, name);
+            for a in args {
+                map_type_names(a, f);
+            }
+        }
+        Record { fields } => {
+            for fl in fields {
+                map_type_names(&mut fl.ty, f);
+            }
+        }
+        Tuple { items } => {
+            for i in items {
+                map_type_names(i, f);
+            }
+        }
+        Function { params, ret, .. } => {
+            for p in params {
+                map_type_names(p, f);
+            }
+            map_type_names(ret, f);
+        }
+        Union { variants } => {
+            for v in variants {
+                if let Some(pl) = &mut v.payload {
+                    map_type_names(pl, f);
                 }
             }
-            Record { fields } => {
-                for f in fields {
-                    self.rewrite_type(&mut f.ty);
-                }
+        }
+        RecordWithSpreads { spreads, fields } => {
+            for s in spreads {
+                *s = f(NameSite::Type, s);
             }
-            Tuple { items } => {
-                for i in items {
-                    self.rewrite_type(i);
-                }
+            for fl in fields {
+                map_type_names(&mut fl.ty, f);
             }
-            Function { params, ret, .. } => {
-                for p in params {
-                    self.rewrite_type(p);
-                }
-                self.rewrite_type(ret);
-            }
-            Union { variants } => {
-                for v in variants {
-                    if let Some(pl) = &mut v.payload {
-                        self.rewrite_type(pl);
-                    }
-                }
-            }
-            RecordWithSpreads { spreads, fields } => {
-                for s in spreads {
-                    *s = self.rename(s);
-                }
-                for f in fields {
-                    self.rewrite_type(&mut f.ty);
-                }
-            }
-            Refined { base, predicate, .. } => {
-                self.rewrite_type(base);
-                self.rewrite_expr(predicate);
-            }
+        }
+        Refined { base, predicate, .. } => {
+            map_type_names(base, f);
+            map_expr_names(predicate, f);
         }
     }
 }

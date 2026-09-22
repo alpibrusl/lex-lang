@@ -29,6 +29,7 @@ mod budget;
 mod planner;
 mod store;
 pub mod render;
+pub mod deps;
 pub mod issues;
 pub mod api;
 mod model;
@@ -49,6 +50,7 @@ pub use files::{BlobId, Entry as FileEntry, Manifest, ManifestError};
 
 pub use lex_vcs::{OpId, Operation, OperationKind, OperationRecord, StageTransition};
 pub use model::{Lifecycle, Metadata, Spec, StageStatus, Test, Transition};
+pub use deps::{ModuleSurface, ResolvedDeps};
 pub use store::{
     CandidateInfo, DepResolver, HubCiVerdict, PublishOp, PublishOutcome, ReconstructedProgram,
     ReplayOutcome, ReplayRequest, SkippedStage, StageHistoryEntry, Store, StoreError,

@@ -419,6 +419,33 @@ pub trait DepResolver: Send + Sync {
     ) -> BTreeMap<String, String> {
         BTreeMap::new()
     }
+
+    /// Everything the gate needs in one call (#943/#944): the three maps
+    /// above plus structured **diagnostics** for imports that could not be
+    /// resolved (`unpinned_dependency`, `unresolved_dependency`,
+    /// `dependency_conflict`). The write-time gate calls only this.
+    ///
+    /// Defaulted to the three methods above with no diagnostics, so existing
+    /// resolvers behave exactly as before. A resolver that resolves
+    /// recursively overrides this (doing the work once) and may implement the
+    /// three methods in terms of it.
+    fn resolve(&self, stages: &[Stage], head_op: Option<&str>) -> crate::deps::ResolvedDeps {
+        crate::deps::ResolvedDeps {
+            modules: self.resolve_modules(stages, head_op),
+            types: self.resolve_module_types(stages, head_op),
+            prefixes: self.resolve_module_prefixes(stages, head_op),
+            diagnostics: Vec::new(),
+        }
+    }
+}
+
+/// Whether a dependency diagnostic is about `import "<reference>"`.
+fn names_import(d: &lex_types::TypeError, reference: &str) -> bool {
+    match d {
+        lex_types::TypeError::UnpinnedDependency { reference: r, .. }
+        | lex_types::TypeError::UnresolvedDependency { reference: r, .. } => r == reference,
+        _ => false,
+    }
 }
 
 pub struct Store {
@@ -453,44 +480,56 @@ impl Store {
         self.resolver = Some(resolver);
     }
 
-    /// The resolved dependency module map for a head being gated — the
-    /// installed resolver's answer, or empty when none is installed (#930).
-    fn resolved_modules(
-        &self,
-        stages: &[Stage],
-        head_op: Option<&str>,
-    ) -> BTreeMap<String, lex_types::Ty> {
+    /// The resolved dependencies for a head being gated — the installed
+    /// resolver's answer, or nothing when none is installed (#930): then only
+    /// stdlib binds and an external reference is an unbound-name error.
+    fn resolved_deps(&self, stages: &[Stage], head_op: Option<&str>) -> crate::deps::ResolvedDeps {
         match &self.resolver {
-            Some(r) => r.resolve_modules(stages, head_op),
-            None => BTreeMap::new(),
+            Some(r) => r.resolve(stages, head_op),
+            None => crate::deps::ResolvedDeps::default(),
         }
     }
 
-    /// The resolved dependencies' exported type declarations for a head being
-    /// gated (#930 completeness) — the installed resolver's answer, or empty
-    /// when none is installed.
-    fn resolved_module_types(
+    /// Type-check a gated head against its resolved dependencies (#930). A
+    /// dependency that did not resolve is reported by its structured
+    /// diagnostic (#943/#944) — ahead of, and alongside, whatever the checker
+    /// then finds — and fails the gate even if the checker would not: an
+    /// import the gate cannot verify is not a verified head.
+    fn check_with_resolved_deps(
         &self,
         stages: &[Stage],
         head_op: Option<&str>,
-    ) -> BTreeMap<String, Vec<lex_ast::TypeDecl>> {
-        match &self.resolver {
-            Some(r) => r.resolve_module_types(stages, head_op),
-            None => BTreeMap::new(),
-        }
-    }
-
-    /// The resolved dependency import → module-prefix map for a head being
-    /// gated (#963) — the installed resolver's answer, or empty when none is
-    /// installed (then the gate keeps the #930 alias-qualified path).
-    fn resolved_module_prefixes(
-        &self,
-        stages: &[Stage],
-        head_op: Option<&str>,
-    ) -> BTreeMap<String, String> {
-        match &self.resolver {
-            Some(r) => r.resolve_module_prefixes(stages, head_op),
-            None => BTreeMap::new(),
+    ) -> Result<(), Vec<lex_types::TypeError>> {
+        let deps = self.resolved_deps(stages, head_op);
+        let checked = lex_types::check_program_with_deps(stages, &deps.modules, &deps.types, &deps.prefixes);
+        match (deps.diagnostics.is_empty(), checked) {
+            (true, Ok(_)) => Ok(()),
+            (true, Err(errors)) => Err(errors),
+            (false, result) => {
+                // The checker's `unknown_identifier` on an unresolved import's
+                // alias is the vague symptom the diagnostic replaces; keep
+                // every other checker error.
+                let failed_aliases: std::collections::BTreeSet<&str> = stages
+                    .iter()
+                    .filter_map(|s| match s {
+                        Stage::Import(i) if deps.diagnostics.iter().any(|d| names_import(d, &i.reference)) => {
+                            Some(i.alias.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let mut more: Vec<lex_types::TypeError> = result.err().unwrap_or_default();
+                more.retain(|e| match e {
+                    lex_types::TypeError::UnknownIdentifier { name, .. } => {
+                        let head = name.split('.').next().unwrap_or(name);
+                        !failed_aliases.contains(head)
+                    }
+                    _ => true,
+                });
+                let mut errors = deps.diagnostics;
+                errors.extend(more);
+                Err(errors)
+            }
         }
     }
 
@@ -1845,10 +1884,7 @@ impl Store {
         // the full program as loaded, so it already carries its own `import`
         // edges — unlike the map-reconstructed heads in the gates below, which
         // must add them via `with_head_imports`.
-        let modules = self.resolved_modules(stages, None);
-        let module_types = self.resolved_module_types(stages, None);
-        let dep_prefixes = self.resolved_module_prefixes(stages, None);
-        if let Err(errors) = lex_types::check_program_with_deps(stages, &modules, &module_types, &dep_prefixes) {
+        if let Err(errors) = self.check_with_resolved_deps(stages, None) {
             return Err(StoreError::TypeError(errors));
         }
 
@@ -2223,10 +2259,7 @@ impl Store {
         // write path exactly as it does on publish and on the hub's own gate.
         let base_head = self.get_branch(branch).ok().flatten().and_then(|b| b.head_op);
         let stages = self.with_head_imports(base_head.as_deref(), candidate.to_vec());
-        let modules = self.resolved_modules(&stages, base_head.as_deref()); // #930
-        let module_types = self.resolved_module_types(&stages, base_head.as_deref());
-        let dep_prefixes = self.resolved_module_prefixes(&stages, base_head.as_deref());
-        if let Err(errors) = lex_types::check_program_with_deps(&stages, &modules, &module_types, &dep_prefixes) {
+        if let Err(errors) = self.check_with_resolved_deps(&stages, base_head.as_deref()) {
             // #281: emit a `RepairHint` attestation against each
             // candidate stage the transition was about to produce.
             // The op record itself isn't persisted (the gate is
@@ -2384,10 +2417,7 @@ impl Store {
             // dependency correctly resolvable.
             let merged_head = op_id.as_str();
             let stages = self.with_head_imports(Some(merged_head), decls);
-            let modules = self.resolved_modules(&stages, Some(merged_head));
-            let module_types = self.resolved_module_types(&stages, Some(merged_head));
-            let dep_prefixes = self.resolved_module_prefixes(&stages, Some(merged_head));
-            if let Err(errors) = lex_types::check_program_with_deps(&stages, &modules, &module_types, &dep_prefixes) {
+            if let Err(errors) = self.check_with_resolved_deps(&stages, Some(merged_head)) {
                 return Err(StoreError::TypeError(errors));
             }
             Ok(())
@@ -2451,10 +2481,7 @@ impl Store {
         // bogus `unknown_identifier <alias>` and rejected valid resolutions.
         let base_head = self.get_branch(branch).ok().flatten().and_then(|b| b.head_op);
         let stages = self.with_head_imports(base_head.as_deref(), decls);
-        let modules = self.resolved_modules(&stages, base_head.as_deref()); // #930 (patch path)
-        let module_types = self.resolved_module_types(&stages, base_head.as_deref());
-        let dep_prefixes = self.resolved_module_prefixes(&stages, base_head.as_deref());
-        if let Err(errors) = lex_types::check_program_with_deps(&stages, &modules, &module_types, &dep_prefixes) {
+        if let Err(errors) = self.check_with_resolved_deps(&stages, base_head.as_deref()) {
             return Err(StoreError::TypeError(errors));
         }
         Ok(())
@@ -3167,10 +3194,7 @@ impl Store {
         // #930: the hub gate resolves this head's external dependencies from
         // the lock committed with `to_head` (via the installed cross-store
         // resolver); empty when none is installed or the head is inlined.
-        let modules = self.resolved_modules(&stages, Some(to_head));
-        let module_types = self.resolved_module_types(&stages, Some(to_head));
-        let dep_prefixes = self.resolved_module_prefixes(&stages, Some(to_head));
-        let result = match lex_types::check_program_with_deps(&stages, &modules, &module_types, &dep_prefixes) {
+        let result = match self.check_with_resolved_deps(&stages, Some(to_head)) {
             Ok(_) => lex_vcs::AttestationResult::Passed,
             Err(errors) => lex_vcs::AttestationResult::Failed {
                 detail: serde_json::to_string(&errors).unwrap_or_else(|_| "type errors".into()),

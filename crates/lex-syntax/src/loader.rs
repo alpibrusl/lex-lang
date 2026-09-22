@@ -158,6 +158,29 @@ pub fn load_program_with_root(entry: &Path, root: &Path) -> Result<Program, Load
     load_rooted(entry, Some(root))
 }
 
+/// `<stem>_<first 4 bytes of sha256(key), hex>` — the one mangle-prefix
+/// formula every loader path uses.
+fn mangle_prefix(stem: &str, key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(key.as_bytes());
+    let digest = hasher.finalize();
+    format!("{stem}_{:08x}", u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]))
+}
+
+/// The mangle prefix [`load_package`] gives the file at `rel` (package-root
+/// relative, `/`-joined, e.g. `src/error.lex`) of the package named
+/// `namespace` — the same prefix a dependency's files get when the loader
+/// inlines it (#963). Exposed so a consumer holding only a package's op-log
+/// (the hosted dependency resolver, #943) can name the dependency's
+/// declarations exactly as a client that loaded it from source does, whatever
+/// prefix the op-log itself was published under.
+pub fn package_file_prefix(namespace: &str, rel: &str) -> String {
+    let file = rel.rsplit('/').next().unwrap_or(rel);
+    let stem = file.strip_suffix(".lex").unwrap_or(file);
+    let stem = if stem.is_empty() { "module" } else { stem };
+    mangle_prefix(stem, &format!("{namespace}/{rel}"))
+}
+
 /// A package loaded as one unit by [`load_package`].
 #[derive(Debug)]
 pub struct LoadedPackage {
@@ -384,12 +407,7 @@ impl LoaderState {
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("module");
-        let mut hasher = Sha256::new();
-        hasher.update(self.mangling_key(canonical).as_bytes());
-        let digest = hasher.finalize();
-        let prefix = format!("{stem}_{:08x}", u32::from_be_bytes([
-            digest[0], digest[1], digest[2], digest[3],
-        ]));
+        let prefix = mangle_prefix(stem, &self.mangling_key(canonical));
         self.prefixes.insert(canonical.to_path_buf(), prefix.clone());
         prefix
     }

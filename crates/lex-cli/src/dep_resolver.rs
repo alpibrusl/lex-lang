@@ -8,10 +8,17 @@
 //! manifest and local package cache, load and type-check it, and return its
 //! public function signatures as a module record.
 //!
-//! Leaf dependencies only: a dependency that itself has unresolved external
-//! dependencies won't type-check standalone here and is skipped, leaving its
-//! references unbound so the gate reports them rather than silently accepting.
-//! (Recursive resolution of a dependency's own dependencies is a follow-up.)
+//! Transitive: each dependency is loaded as a whole package *with* its own
+//! registry/git dependencies inlined (`inline_packages = true`), so a
+//! dependency's dependencies resolve through the same source resolution —
+//! a registry dependency-of-a-dependency against the lock shipped in the
+//! dependency's installed archive (the hub renders the committed `lex.lock`
+//! into it, #943), a git one from its pinned ref. A dependency that still
+//! fails to load or check is skipped, leaving its references unbound so the
+//! gate reports them rather than silently accepting.
+//!
+//! The hosted gate (`lex-hub`) resolves the same graph without source: through
+//! committed locks into hosted stores, recursively (`lex_store::deps`).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

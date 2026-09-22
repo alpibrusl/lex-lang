@@ -13,7 +13,8 @@ pub mod registry;
 pub mod workspace;
 
 pub use loader::{
-    load_package, load_program, load_program_from_str, load_program_with_root, LoadError,
+    load_package, load_program, load_program_from_str, load_program_with_root, package_file_prefix,
+    LoadError,
     LoadedPackage,
 };
 pub use workspace::{find_manifest, Manifest, PackageError, StoreSection};

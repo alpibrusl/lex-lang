@@ -43,6 +43,9 @@ impl TypeError {
             TypeError::ExamplesOnEffectfulFn { .. } => "examples-on-effectful-fn",
             TypeError::ExampleArityMismatch { .. } => "example-arity-mismatch",
             TypeError::ExampleMismatch { .. } => "example-mismatch",
+            TypeError::UnpinnedDependency { .. } => "unpinned-dependency",
+            TypeError::UnresolvedDependency { .. } => "unresolved-dependency",
+            TypeError::DependencyConflict { .. } => "dependency-conflict",
         }
     }
 
@@ -98,6 +101,9 @@ function's parameter count.",
         "example-mismatch" => "A case inside an `examples { ... }` block (#369) ran successfully \
 but the function body's actual return value differs from the declared `expected` value. Either \
 update the example to match the new behavior, or fix the body to produce the declared value.",
+        "unpinned-dependency" => UNPINNED_DEPENDENCY,
+        "unresolved-dependency" => UNRESOLVED_DEPENDENCY,
+        "dependency-conflict" => DEPENDENCY_CONFLICT,
         _ => "Unknown rule. The rule_tag may have been introduced after this Lex release.",
     }
 }
@@ -123,6 +129,9 @@ pub fn all_rules() -> &'static [RuleInfo] {
         RuleInfo { tag: "examples-on-effectful-fn", explanation: EXAMPLES_ON_EFFECTFUL_FN },
         RuleInfo { tag: "example-arity-mismatch", explanation: EXAMPLE_ARITY_MISMATCH },
         RuleInfo { tag: "example-mismatch", explanation: EXAMPLE_MISMATCH },
+        RuleInfo { tag: "unpinned-dependency", explanation: UNPINNED_DEPENDENCY },
+        RuleInfo { tag: "unresolved-dependency", explanation: UNRESOLVED_DEPENDENCY },
+        RuleInfo { tag: "dependency-conflict", explanation: DEPENDENCY_CONFLICT },
     ]
 }
 
@@ -277,6 +286,18 @@ function's parameter count.";
 const EXAMPLE_MISMATCH: &str = "A case inside an `examples { ... }` block (#369) ran successfully \
 but the function body's actual return value differs from the declared `expected` value. Either \
 update the example to match the new behavior, or fix the body to produce the declared value.";
+const UNPINNED_DEPENDENCY: &str = "The head imports a package that its `lex.lock` does not pin \
+(#944). Hosted verification resolves dependencies only through lock pins into hosted registry \
+stores and never fetches git, so a git-only dependency cannot be checked there. Declare the \
+dependency with a registry source in `lex.toml` (`{ registry = \"<host>/<tenant>/<store>\", \
+version = \"^X.Y\" }`), run `lex pkg lock`, and publish again.";
+const UNRESOLVED_DEPENDENCY: &str = "A dependency pinned in `lex.lock` could not be resolved (#943): \
+its pinned store is missing or not visible to you, one of its own dependencies does not resolve, the \
+import names no module in it, or the dependency graph cycles. Read `reason`; re-pin with \
+`lex pkg lock` / `lex pkg update`, or fix the dependency first.";
+const DEPENDENCY_CONFLICT: &str = "The same package is pinned to two different heads inside the \
+dependency closure (#943) — a diamond whose sides disagree, so their types would collide. Align the \
+pins: update the dependencies so they agree on one release of the package, then re-lock.";
 
 #[cfg(test)]
 mod tests {
@@ -361,6 +382,23 @@ mod tests {
                 case_index: 0,
                 expected: "1".into(),
                 got: "2".into(),
+            },
+            TypeError::UnpinnedDependency {
+                at_node: "n_0".into(),
+                reference: "lex-nt/lib".into(),
+                package: "lex-nt".into(),
+                hint: "run `lex pkg lock`".into(),
+            },
+            TypeError::UnresolvedDependency {
+                at_node: "n_0".into(),
+                reference: "lex-nt/lib".into(),
+                package: "lex-nt".into(),
+                reason: "store not visible".into(),
+            },
+            TypeError::DependencyConflict {
+                at_node: "n_0".into(),
+                package: "lex-nt".into(),
+                heads: vec!["a".into(), "b".into()],
             },
         ];
         let catalog: std::collections::BTreeMap<&str, &str> =
