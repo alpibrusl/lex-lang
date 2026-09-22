@@ -5,6 +5,133 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [0.11.70] - 2026-09-22
+
+### Changed — behavior operators need to know
+
+- **Hosted dependency resolution is registry-only (#1019, #944).** The hub
+  resolves a dependency through the governing `lex.lock` and never fetches
+  git. A package whose dependency is declared git-only is therefore no longer
+  resolvable on the hub: its type-check now fails with the structured
+  `unpinned_dependency` error (with `reference`, `package` and a hint to
+  declare a registry source and re-run `lex pkg lock`) instead of a vague
+  `unknown_identifier` on the import alias. **Hosted `lex-guard`,
+  `lex-positions` and `lex-telemetry` fail this gate until their
+  dependencies get registry sources.** `lex pkg release` and
+  `lex pkg publish` warn about git-only dependencies before you upload.
+  Also in this class: an import that *is* pinned but does not resolve now
+  errors (`unresolved_dependency`, carrying the inner `reason`) even when
+  nothing in the package uses it — previously an unused broken import was
+  silently tolerated. A package pinned to two different heads anywhere in
+  the closure is reported as `dependency_conflict`. Cross-tenant private
+  dependencies never resolve, by construction.
+
+- **Paged `/v1/ops/since` results changed (#1024, #1022).** Paged responses
+  now list the delta parents-first (topological); unpaged responses and
+  linear histories are byte-for-byte unchanged, and the head is still the
+  last op of the pull. Legacy `after=` paging is now **lossless** — see
+  *Fixed* below for what it was doing instead. Clients and servers also
+  negotiate a capability: `/v1/health` advertises `{"caps":["files-v1"]}`,
+  new clients send `X-Lex-Caps: files-v1`, and a server returns **426
+  UpgradeRequired** (detail `{kind, required_cap, op_id}`) when the
+  requested delta contains a `SetFiles` op and the client did not advertise
+  `files-v1`. The refusal is judged on the whole delta *before* `limit`, so
+  an old client is turned away up front rather than partway through a pull.
+  Histories with no `SetFiles` op pull exactly as before, with or without
+  the header. Upgrade clients before publishing files to a store old
+  clients pull from.
+
+### Added
+
+- **Recursive, lock-driven dependency resolution (#943).** New
+  `lex_store::deps`: `resolve_with_lock` resolves each package import
+  through the governing lock, and each dependency's own imports through
+  *that dependency's* committed lock, recursively, with a `(store, head)`
+  cycle guard. Transitive type declarations travel with a module's surface,
+  so a dependent can name a type that only appears in a dependency's
+  signature. Stored per-file prefixes are rewritten to the canonical
+  package prefix, so two packages that both ship `src/error.lex` no longer
+  collide. Every gate path — publish, apply, merge, patch, hub verify —
+  goes through `Store::check_with_resolved_deps`. A released archive now
+  ships the head's committed `lex.lock`, so a caret registry dependency of
+  a dependency resolves from the installed cache.
+
+- **A files manifest in the op DAG: the non-semantic `SetFiles` op
+  (#1007, 2/8).** `OperationKind::SetFiles { manifest: BlobId }` with
+  `StageTransition::FilesOnly` — a full-snapshot pointer, like a git tree.
+  Both are additive serde tags, so **no existing OpId moves**.
+  `is_semantic()` is false only for `SetFiles`, and replay, gates and
+  replay coverage skip it by kind (`NotReplayable::Files`).
+  `Store::apply_set_files` validates the manifest's whole closure before
+  anything is written — a failure persists no op and leaves the head where
+  it was. `Store::manifest_at(op)` inherits from parents and reports
+  `Ambiguous` when they disagree, symmetric in parent order;
+  `branch_manifest` is cached in `HeadSnapshot` and never pays an extra
+  history walk. `lex op log` renders `set_files [files]` with its manifest.
+
+- **Blob sync routes and server-side `SetFiles` validation (#1007, 3/8).**
+  `POST /v1/blobs/{missing,batch,fetch}`, store-scoped. A batch decodes,
+  size-checks and re-hashes every entry *before writing any*: 409
+  `BlobIdMismatch`, 413 `BlobTooLarge`, 507 `BlobQuotaExceeded`, and
+  nothing is written on a refusal. Optional per-store `BlobLimits`
+  (`max_blob_bytes`, `store_quota_bytes`, `max_manifest_entries`) follow
+  the `policy_ceiling` pattern — `None` means unlimited, which is what
+  single-tenant `lex serve` uses; only *new* bytes count against a quota.
+  `/v1/ops/batch` now gates an incoming `SetFiles` (422 `InvalidTransition`
+  for a forged `produces`, `MissingBlobs`, `InvalidManifest`) and refuses
+  the whole batch on any failure, and a branch head can no longer advance
+  to an `Ambiguous` manifest (422 `AmbiguousManifest`) or to a manifest
+  whose closure is incomplete. This closes the window in which a peer
+  could land an unvalidated `SetFiles` over op push.
+
+- **Resumable `/v1/ops/since` paging.** A page that leaves ops behind
+  returns `X-Lex-Next-Cursor`; sending it back as `cursor=` resumes at an
+  offset, so the page costs O(page). The cursor is opaque, pins the head
+  and cutoff the pull started from, survives a server restart, and a
+  malformed or unknown-head cursor is a 400 — never an empty page a client
+  would read as "done". `lex op pull` sends `cursor=` alongside `after=`,
+  so new clients still work against older servers.
+
+### Fixed
+
+- **A paged `/v1/ops/since` pull over a merge history silently dropped
+  ops (#971).** Each legacy `after=` page was computed from the *ancestry*
+  of the last op received, which on a history with merges is not "everything
+  sent so far": already-sent ops came back, and because the order was not
+  topological an unsent ancestor could be treated as already known and never
+  sent at all. Measured on a 50,000-op store: a full legacy pull delivered
+  48,647 of 49,991 distinct ops — **1,344 never delivered, 1,264 delivered
+  twice**. The same rule could also loop forever, bouncing between two lines
+  of history; 40 of 66 pulls over an 18-op test DAG never terminated, hidden
+  until now by a 200-page cap in the test and its oracle. The server now
+  linearizes parents-first and records where each page ended (persisted,
+  expiring after 15 minutes, at most 256 in flight) so a legacy `after=`
+  resumes exactly where it stopped. **Released clients need no upgrade.**
+  A lost continuation can only cost duplicates, which `OpLog::put` absorbs;
+  it can no longer cost ops.
+
+- **Each `/v1/ops/since` page cost a full walk of the op DAG (#971).** Every
+  page re-walked the log from the head to genesis *and* from `after` to
+  genesis, one file read and JSON parse per op — a full pull of the 136k-op
+  hub store re-read the entire log 137 times. The new `lex_vcs::HistoryIndex`
+  walks a head's history once and keeps only ids and parent edges, cached per
+  tenant (2 head indexes, 8 deltas), and is checked element-for-element
+  against `ops_since` on random DAGs. On the 50k-op benchmark, a full pull at
+  the client's page size of 1000: **70.3s → 1.84s** for legacy clients and
+  1.67s with a cursor, with later pages at ~20ms instead of growing with how
+  far the pull had got.
+
+- **`/v1/publish` re-reported unchanged functions as new ones (#826 class).**
+  `publish_handler` resolved the old head one stage at a time via
+  `get_ast`, re-reading and re-parsing the whole `stage_index.jsonl` per
+  entry. Because a StageId does not depend on the function name, two
+  functions differing only in name share a StageId and the index resolved
+  both to whichever name it pointed at — so every republish of unchanged
+  source emitted a spurious `add_function` op for the twin. It now uses one
+  `Store::get_asts_for_sigs_bulk` pass keyed by the SigId the head names
+  each stage by, the same pattern `lex publish` already used, and never
+  touches the stage index.
+
 ## [0.11.69] - 2026-09-22
 
 ### Fixed
