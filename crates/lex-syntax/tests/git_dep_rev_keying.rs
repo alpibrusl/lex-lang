@@ -1,0 +1,229 @@
+//! A git dependency on a *moving* ref is cached by the commit it resolves to.
+//!
+//! The cache is consulted with a bare `pkg_dir.exists()`, so a name-keyed slot
+//! is populated once and never revisited. An unpinned git dep
+//! (`{ git = "…" }`, no rev) used to land in `~/.lex/packages/{name}` and stay
+//! there:
+//!
+//! * `lex-economy` was cloned into that slot on one day; a rename upstream weeks
+//!   later was invisible locally, and `lex check` reported `unknown_variant`
+//!   against an interface that no longer existed
+//! * the same stale directory made `bin/check-dep-drift.sh` — which compares
+//!   the lock against the cache — report perfect agreement while CI failed
+//! * and it nearly poisoned a 34-package registry migration, which type-checks
+//!   each package against its dependencies
+//!
+//! Registry packages never had this problem: they are keyed `{name}-{version}`.
+//! Keying a moving ref by its resolved commit gives git deps the same property —
+//! a moved branch is simply a different directory, so staleness stops being
+//! something to detect and becomes something that cannot happen.
+//!
+//! These tests drive a real local git repository, because the behaviour being
+//! checked is precisely the interaction with `git ls-remote`.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
+/// The cache root is read from a process-global env var, so these tests cannot
+/// run concurrently: one would point the loader at another's cache and see an
+/// empty directory. Serialising here rather than relying on `--test-threads=1`,
+/// which nothing enforces at the call site.
+fn serial() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn git(args: &[&str], cwd: &Path) {
+    let st = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@example.com")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@example.com")
+        .status()
+        .expect("run git");
+    assert!(st.success(), "git {args:?} failed");
+}
+
+/// A package repo whose default branch can be advanced between resolutions.
+fn upstream(tmp: &Path, body: &str) -> PathBuf {
+    let repo = tmp.join("upstream");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join("lex.toml"), "[package]\nname = \"dep\"\nversion = \"0.1.0\"\n").unwrap();
+    std::fs::write(repo.join("src/lib.lex"), body).unwrap();
+    git(&["init", "-q", "-b", "main"], &repo);
+    git(&["add", "-A"], &repo);
+    git(&["commit", "-q", "-m", "one"], &repo);
+    repo
+}
+
+fn advance(repo: &Path, body: &str) {
+    std::fs::write(repo.join("src/lib.lex"), body).unwrap();
+    git(&["add", "-A"], repo);
+    git(&["commit", "-q", "-m", "two"], repo);
+}
+
+fn head_sha(repo: &Path) -> String {
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .expect("rev-parse");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A consumer package declaring an unpinned git dep on `repo`.
+fn consumer(tmp: &Path, repo: &Path) -> PathBuf {
+    let dir = tmp.join("consumer");
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(
+        dir.join("lex.toml"),
+        format!(
+            "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\n\n[dependencies]\ndep = {{ git = \"{}\" }}\n",
+            repo.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(dir.join("src/main.lex"), "import \"dep/lib\" as d\n\nfn go() -> Int { d.v() }\n").unwrap();
+    dir
+}
+
+/// Resolve the dep through the real loader and report which cache directory it
+/// used, plus whether the fetched source is the newest.
+fn resolve(consumer_dir: &Path, cache: &Path) -> Vec<String> {
+    // The loader reads the cache root from this env var.
+    std::env::set_var("LEX_PACKAGES_DIR", cache);
+    let entry = consumer_dir.join("src/main.lex");
+    // Resolution happens as a side effect of loading the package; we only care
+    // that the cache directory it chose encodes a commit.
+    let _ = lex_syntax::loader::load_package(
+        &[entry],
+        consumer_dir,
+        "consumer",
+        // Inlining is what actually resolves a package dep through the cache;
+        // with it off (#930) the import stays an unresolved edge and nothing is
+        // fetched at all.
+        true,
+    );
+    let mut dirs: Vec<String> = std::fs::read_dir(cache)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    dirs.sort();
+    dirs
+}
+
+/// An unpinned git dep must be cached under the commit it resolved to, not a
+/// bare package name. A bare name is the slot that cannot be refreshed.
+#[test]
+fn an_unpinned_git_dep_is_cached_under_its_commit() {
+    let _serial = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = upstream(tmp.path(), "fn v() -> Int { 1 }\n");
+    let cons = consumer(tmp.path(), &repo);
+    let cache = tmp.path().join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
+
+    let dirs = resolve(&cons, &cache);
+    let sha = head_sha(&repo);
+    assert!(
+        dirs.iter().any(|d| d.contains("@rev-") && sha.starts_with(&d[d.find("@rev-").unwrap() + 5..])),
+        "cache dir must encode the resolved commit {}, got {dirs:?}",
+        &sha[..12]
+    );
+    assert!(
+        !dirs.iter().any(|d| d == "dep"),
+        "a bare name-keyed slot is the thing that cannot be refreshed: {dirs:?}"
+    );
+}
+
+/// **The property that matters.** Advance the branch and resolve again: the
+/// second resolution must use a *different* directory, so it cannot read the
+/// first checkout. This is the exact failure `lex-economy` caused.
+#[test]
+fn moving_the_branch_changes_the_cache_directory() {
+    let _serial = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = upstream(tmp.path(), "fn v() -> Int { 1 }\n");
+    let cons = consumer(tmp.path(), &repo);
+    let cache = tmp.path().join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
+
+    let before = resolve(&cons, &cache);
+    let sha_before = head_sha(&repo);
+
+    advance(&repo, "fn v() -> Int { 2 }\n");
+    let after = resolve(&cons, &cache);
+    let sha_after = head_sha(&repo);
+    assert_ne!(sha_before, sha_after, "setup: the branch really moved");
+
+    let new_dirs: Vec<&String> = after.iter().filter(|d| !before.contains(d)).collect();
+    assert!(
+        !new_dirs.is_empty(),
+        "a moved branch must resolve to a new cache directory, not reuse {before:?}"
+    );
+    assert!(
+        new_dirs.iter().any(|d| d.contains(&sha_after[..12])),
+        "…and that directory must name the new commit {}, got {new_dirs:?}",
+        &sha_after[..12]
+    );
+}
+
+/// The newly-cached checkout must actually contain the new content — keying by
+/// commit is pointless if the clone still fetches the old tree.
+#[test]
+fn the_new_directory_holds_the_new_source() {
+    let _serial = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = upstream(tmp.path(), "fn v() -> Int { 1 }\n");
+    let cons = consumer(tmp.path(), &repo);
+    let cache = tmp.path().join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
+
+    resolve(&cons, &cache);
+    advance(&repo, "fn v() -> Int { 2 }\n");
+    resolve(&cons, &cache);
+
+    let sha = head_sha(&repo);
+    let dir = std::fs::read_dir(&cache)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| e.file_name().to_string_lossy().contains(&sha[..12]))
+        .expect("a directory for the new commit");
+    let src = std::fs::read_to_string(dir.path().join("src/lib.lex")).expect("read cached source");
+    assert!(src.contains("2"), "the new checkout must hold the new source: {src}");
+}
+
+/// An explicitly pinned rev was never affected and must keep its existing
+/// directory name, so pinned builds do not re-clone on upgrade.
+#[test]
+fn an_explicit_rev_keeps_its_existing_cache_name() {
+    let _serial = serial();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = upstream(tmp.path(), "fn v() -> Int { 1 }\n");
+    let sha = head_sha(&repo);
+    let dir = tmp.path().join("pinned");
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(
+        dir.join("lex.toml"),
+        format!(
+            "[package]\nname = \"c\"\nversion = \"0.1.0\"\n\n[dependencies]\ndep = {{ git = \"{}\", rev = \"{sha}\" }}\n",
+            repo.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(dir.join("src/main.lex"), "import \"dep/lib\" as d\n\nfn go() -> Int { d.v() }\n").unwrap();
+
+    let cache = tmp.path().join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    let dirs = resolve(&dir, &cache);
+    assert!(
+        dirs.iter().any(|d| d == &format!("dep@rev-{}", &sha[..12])),
+        "a pinned rev keeps the name it already had, got {dirs:?}"
+    );
+}
