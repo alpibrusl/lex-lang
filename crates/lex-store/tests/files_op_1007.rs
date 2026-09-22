@@ -43,6 +43,7 @@ fn modify(s: &Store, sig: &str, from: &str, to: &str) -> String {
             to_stage_id: to.into(),
             from_budget: None,
             to_budget: None,
+            to_sig_id: None,
         },
         head(s),
     );
@@ -403,6 +404,7 @@ fn merge_with_disagreeing_parent_manifests_is_ambiguous_in_either_order() {
                 to_stage_id: "f2".into(),
                 from_budget: None,
                 to_budget: None,
+                to_sig_id: None,
             },
             [base.clone()],
         );

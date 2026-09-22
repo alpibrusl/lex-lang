@@ -2542,7 +2542,9 @@ name = "lex-api"
 version = "0.11.69"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "flate2",
+ "hex",
  "indexmap",
  "lex-ast",
  "lex-bytecode",
@@ -2554,6 +2556,7 @@ dependencies = [
  "lex-vcs",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tar",
  "tempfile",
  "tiny_http",

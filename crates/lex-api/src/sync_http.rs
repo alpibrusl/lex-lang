@@ -15,9 +15,10 @@
 use std::io::Cursor;
 use tiny_http::Response;
 
-use crate::handlers::{error_response, json_response, State};
+use crate::handlers::{error_response, error_with_detail, json_response, BlobLimits, State};
 use lex_ast::{stage_id, Stage};
-use lex_vcs::{Intent, IntentLog, Issue, IssueLog};
+use lex_store::{ManifestAt, Store, StoreError};
+use lex_vcs::{Intent, IntentLog, Issue, IssueLog, OperationKind, OperationRecord, StageTransition};
 
 /// `POST /v1/stages/batch` — receive stage blobs. Body: a JSON array of
 /// `Stage`. Each is stored content-addressed (idempotent); a stage that
@@ -297,6 +298,234 @@ pub(crate) fn issues_list_handler(state: &State) -> Response<Cursor<Vec<u8>>> {
     match log.list_ids() {
         Ok(ids) => json_response(200, &serde_json::json!({ "ids": ids })),
         Err(e) => error_response(500, format!("listing issues: {e}")),
+    }
+}
+
+// ── #1007: files beside the op-log ──────────────────────────────────────────
+//
+// A `SetFiles { manifest }` op names a canonical manifest blob, which names
+// one blob per file. Push order is blobs → ops → head, so `/v1/ops/batch`
+// can refuse a `SetFiles` whose closure is not already here (and a head can
+// never name files the store can't serve). Blobs are store-scoped: under
+// lex-hub each tenant store has its own blob space, so `missing` can't reveal
+// what another tenant holds.
+
+/// One blob on the wire: its content address and its exact bytes, base64.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WireBlob {
+    id: String,
+    data_b64: String,
+}
+
+fn b64() -> base64::engine::GeneralPurpose {
+    base64::engine::general_purpose::STANDARD
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// `POST /v1/blobs/missing` — `{ "ids": [...] }` → `{ "missing": [...] }`,
+/// the ids *this store* does not hold (anything that isn't a blob id counts
+/// as missing). Read-only; lets `op push` upload only what the remote lacks.
+pub(crate) fn blobs_missing_handler(state: &State, body: &str) -> Response<Cursor<Vec<u8>>> {
+    let ids = match parse_ids(body) {
+        Ok(ids) => ids,
+        Err(resp) => return resp,
+    };
+    let store = state.store.lock().unwrap();
+    let mut seen = std::collections::BTreeSet::new();
+    let missing: Vec<String> = ids
+        .into_iter()
+        .filter(|id| seen.insert(id.clone()) && !store.has_blob(id))
+        .collect();
+    json_response(200, &serde_json::json!({ "missing": missing }))
+}
+
+/// `POST /v1/blobs/batch` — receive blobs. Body: `[{ "id", "data_b64" }]`.
+///
+/// All-or-nothing: every entry is decoded, size-checked and re-hashed
+/// before any is written, so a bad entry leaves the store untouched.
+///
+/// * `400` — not that shape, or `data_b64` isn't base64.
+/// * `413` `BlobTooLarge` — a blob exceeds `blob_limits.max_blob_bytes`.
+/// * `409` `BlobIdMismatch` `{ mismatches: [{ id, actual }] }` — an entry's
+///   bytes don't hash to its `id` (content addressing must hold over the
+///   wire; a blob filed under a hash it doesn't own would shadow the real
+///   one).
+/// * `507` `BlobQuotaExceeded` — the new bytes would take the store past
+///   `blob_limits.store_quota_bytes`. Bytes already present don't count.
+///
+/// Idempotent: a blob already held is skipped.
+pub(crate) fn blobs_batch_handler(state: &State, body: &str) -> Response<Cursor<Vec<u8>>> {
+    use base64::Engine as _;
+    let wire: Vec<WireBlob> = match serde_json::from_str(body) {
+        Ok(w) => w,
+        Err(e) => return error_response(400, format!("body must be a JSON array of {{id, data_b64}}: {e}")),
+    };
+    let limits = state.blob_limits;
+    let mut decoded: Vec<(String, Vec<u8>)> = Vec::with_capacity(wire.len());
+    let mut mismatches = Vec::new();
+    for w in wire {
+        let bytes = match b64().decode(w.data_b64.as_bytes()) {
+            Ok(b) => b,
+            Err(e) => return error_response(400, format!("blob {}: data_b64 is not base64: {e}", w.id)),
+        };
+        if let Some(l) = limits {
+            if bytes.len() as u64 > l.max_blob_bytes {
+                return error_with_detail(413, "BlobTooLarge", serde_json::json!({
+                    "id": w.id,
+                    "size": bytes.len(),
+                    "max_blob_bytes": l.max_blob_bytes,
+                }));
+            }
+        }
+        let actual = sha256_hex(&bytes);
+        if actual != w.id {
+            mismatches.push(serde_json::json!({ "id": w.id, "actual": actual }));
+        }
+        decoded.push((w.id, bytes));
+    }
+    if !mismatches.is_empty() {
+        return error_with_detail(409, "BlobIdMismatch", serde_json::json!({ "mismatches": mismatches }));
+    }
+
+    let store = state.store.lock().unwrap();
+    // New bytes only — dedup against the store and within the batch.
+    let mut fresh = std::collections::BTreeSet::new();
+    let incoming: u64 = decoded
+        .iter()
+        .filter(|(id, _)| !store.has_blob(id) && fresh.insert(id.as_str()))
+        .map(|(_, b)| b.len() as u64)
+        .sum();
+    if let Some(l) = limits {
+        if incoming > 0 {
+            let used = match store.blob_bytes_used() {
+                Ok(u) => u,
+                Err(e) => return error_response(500, format!("measuring blob usage: {e}")),
+            };
+            if used.saturating_add(incoming) > l.store_quota_bytes {
+                return error_with_detail(507, "BlobQuotaExceeded", serde_json::json!({
+                    "used": used,
+                    "incoming": incoming,
+                    "store_quota_bytes": l.store_quota_bytes,
+                }));
+            }
+        }
+    }
+    let received = decoded.len();
+    for (id, bytes) in &decoded {
+        if let Err(e) = store.put_blob_bytes(bytes) {
+            return error_response(500, format!("put blob {id}: {e}"));
+        }
+    }
+    json_response(200, &serde_json::json!({
+        "received": received,
+        "added": fresh.len(),
+        "skipped": received - fresh.len(),
+    }))
+}
+
+/// `POST /v1/blobs/fetch` — `{ "ids": [...] }` → `{ "blobs": [{ id,
+/// data_b64 }] }` for the ids present (missing ones are omitted; the caller
+/// reconciles). A client chunks its requests by the manifest's `size`s.
+pub(crate) fn blobs_fetch_handler(state: &State, body: &str) -> Response<Cursor<Vec<u8>>> {
+    use base64::Engine as _;
+    let ids = match parse_ids(body) {
+        Ok(ids) => ids,
+        Err(resp) => return resp,
+    };
+    let store = state.store.lock().unwrap();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut blobs = Vec::new();
+    for id in ids {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        match store.get_blob_bytes(&id) {
+            Ok(bytes) => blobs.push(WireBlob { data_b64: b64().encode(bytes), id }),
+            Err(lex_store::StoreError::UnknownBlob(_)) => {}
+            Err(e) => return error_response(500, format!("read blob {id}: {e}")),
+        }
+    }
+    json_response(200, &serde_json::json!({ "blobs": blobs }))
+}
+
+/// Map a `validate_set_files` failure for the files set at `op_id`.
+fn set_files_error(op_id: &str, manifest: &str, e: StoreError) -> Response<Cursor<Vec<u8>>> {
+    match e {
+        StoreError::MissingBlobs(ids) => error_with_detail(422, "MissingBlobs", serde_json::json!({
+            "op_id": op_id,
+            "ids": ids,
+        })),
+        StoreError::InvalidManifest(m) => invalid_manifest(op_id, manifest, m.to_string()),
+        other => error_response(500, format!("validating manifest {manifest} of {op_id}: {other}")),
+    }
+}
+
+fn invalid_manifest(op_id: &str, manifest: &str, reason: String) -> Response<Cursor<Vec<u8>>> {
+    error_with_detail(422, "InvalidManifest", serde_json::json!({
+        "op_id": op_id,
+        "manifest": manifest,
+        "reason": reason,
+    }))
+}
+
+/// Server-side gate for a pushed `SetFiles` record (#1007), run by
+/// `/v1/ops/batch` before anything is persisted. A non-`SetFiles` record
+/// passes. A `SetFiles` must record `FilesOnly` (anything else would let a
+/// files op rewrite the sig→stage map), name a canonical, valid manifest
+/// this store holds together with every entry blob at its stated size, and
+/// stay within `blob_limits.max_manifest_entries`.
+pub(crate) fn check_set_files(
+    store: &Store,
+    limits: Option<BlobLimits>,
+    rec: &OperationRecord,
+) -> Result<(), Response<Cursor<Vec<u8>>>> {
+    let OperationKind::SetFiles { manifest } = &rec.op.kind else {
+        return Ok(());
+    };
+    if !matches!(rec.produces, StageTransition::FilesOnly) {
+        return Err(error_with_detail(422, "InvalidTransition", serde_json::json!({
+            "op_id": rec.op_id,
+            "reason": "a set_files op must produce files_only",
+        })));
+    }
+    let m = store
+        .validate_set_files(manifest)
+        .map_err(|e| set_files_error(&rec.op_id, manifest, e))?;
+    if let Some(l) = limits {
+        if m.entries.len() > l.max_manifest_entries {
+            return Err(invalid_manifest(&rec.op_id, manifest, format!(
+                "{} entries exceeds the limit of {}",
+                m.entries.len(),
+                l.max_manifest_entries
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Gate for advancing a branch head to `head_op` (#1007): the files in force
+/// there must be well-defined and complete. `Ambiguous` (a merge of
+/// disagreeing manifests with no `SetFiles` on top) → 422
+/// `AmbiguousManifest`; a manifest whose closure isn't here → 422
+/// `MissingBlobs` / `InvalidManifest`. No files, or an op this store doesn't
+/// know (the advance itself answers that), passes.
+pub(crate) fn check_head_files(store: &Store, head_op: &str) -> Result<(), Response<Cursor<Vec<u8>>>> {
+    match store.manifest_at(head_op) {
+        Ok(ManifestAt::Absent) | Err(StoreError::UnknownOp(_)) => Ok(()),
+        Ok(ManifestAt::Ambiguous) => Err(error_with_detail(422, "AmbiguousManifest", serde_json::json!({
+            "head_op": head_op,
+            "reason": "the head merges histories with different files manifests; \
+                       append a set_files op recording the merged manifest first",
+        }))),
+        Ok(ManifestAt::Set { manifest }) => store
+            .validate_set_files(&manifest)
+            .map(|_| ())
+            .map_err(|e| set_files_error(head_op, &manifest, e)),
+        Err(e) => Err(error_response(500, format!("manifest_at {head_op}: {e}"))),
     }
 }
 

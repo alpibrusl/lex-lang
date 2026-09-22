@@ -76,6 +76,38 @@ pub struct State {
     /// `/v1/ops/since` (#971), so a paged pull walks the op log once
     /// instead of once per page. See [`crate::ops_since_http`].
     pub(crate) ops_since: Mutex<crate::ops_since_http::OpsSinceCache>,
+    /// Optional server-imposed limits on the files-beside-the-op-log blob
+    /// space (#1007): `/v1/blobs/batch` refuses an oversize blob (413) or
+    /// one that would take the store past its quota (507), and
+    /// `/v1/ops/batch` refuses a `SetFiles` whose manifest has too many
+    /// entries. `None` (the default, single-tenant `lex serve`) is
+    /// unlimited. A hosted, multi-tenant embedder such as lex-hub should
+    /// set it — the same shape as [`policy_ceiling`](State::policy_ceiling).
+    pub blob_limits: Option<BlobLimits>,
+}
+
+/// Limits on one store's blob space (#1007). See [`State::blob_limits`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobLimits {
+    /// Largest single blob accepted, in decoded bytes.
+    pub max_blob_bytes: u64,
+    /// Total decoded bytes the store's blob space may hold.
+    pub store_quota_bytes: u64,
+    /// Most entries a `SetFiles` manifest may name.
+    pub max_manifest_entries: usize,
+}
+
+/// Capabilities this server advertises on `/v1/health` (#1007). A client
+/// states the ones it speaks in the `X-Lex-Caps` request header
+/// (comma-separated).
+pub const CAPS: &[&str] = &[CAP_FILES_V1];
+
+/// The server stores and serves `SetFiles` ops and their blobs (#1007).
+pub const CAP_FILES_V1: &str = "files-v1";
+
+/// Whether an `X-Lex-Caps` header value names `cap`.
+pub(crate) fn has_cap(header: Option<&str>, cap: &str) -> bool {
+    header.is_some_and(|h| h.split(',').any(|c| c.trim().eq_ignore_ascii_case(cap)))
 }
 
 /// Server-side wrapper around [`MergeSession`] carrying the
@@ -109,7 +141,14 @@ impl State {
             sessions: Mutex::new(HashMap::new()),
             policy_ceiling,
             ops_since: Mutex::new(Default::default()),
+            blob_limits: None,
         })
+    }
+
+    /// Install [`blob_limits`](State::blob_limits) (#1007).
+    pub fn with_blob_limits(mut self, limits: Option<BlobLimits>) -> Self {
+        self.blob_limits = limits;
+        self
     }
 
     /// Construct a per-tenant `State` by prefixing `store_root` with the
@@ -322,6 +361,11 @@ pub fn handle(state: Arc<State>, mut req: Request) -> std::io::Result<()> {
     let x_lex_user = req.headers().iter()
         .find(|h| h.field.equiv("x-lex-user"))
         .map(|h| h.value.as_str().to_string());
+    // `X-Lex-Caps` (#1007): the capabilities the client speaks, so a route
+    // can refuse to hand an old client history it would mis-store.
+    let x_lex_caps = req.headers().iter()
+        .find(|h| h.field.equiv("x-lex-caps"))
+        .map(|h| h.value.as_str().to_string());
 
     // POST /v1/pkg/publish sends a raw tar.gz body — read bytes before routing.
     if matches!(method, Method::Post) && path == "/v1/pkg/publish" {
@@ -334,7 +378,7 @@ pub fn handle(state: Arc<State>, mut req: Request) -> std::io::Result<()> {
     let mut body = String::new();
     let _ = req.as_reader().read_to_string(&mut body);
 
-    let resp = route(&state, &method, &path, &query, &body, x_lex_user.as_deref());
+    let resp = route(&state, &method, &path, &query, &body, x_lex_user.as_deref(), x_lex_caps.as_deref());
     req.respond(resp)
 }
 
@@ -365,6 +409,7 @@ fn route(
     query: &str,
     body: &str,
     x_lex_user: Option<&str>,
+    x_lex_caps: Option<&str>,
 ) -> Response<std::io::Cursor<Vec<u8>>> {
     match (method, path) {
         // ---- lex-tea v2 (HTML browser) ------------------------
@@ -402,7 +447,7 @@ fn route(
             crate::web::stage_decision_handler(state, id, body, decision, x_lex_user)
         }
         // ---- JSON API -----------------------------------------
-        (Method::Get, "/v1/health") => json_response(200, &serde_json::json!({"ok": true})),
+        (Method::Get, "/v1/health") => json_response(200, &serde_json::json!({"ok": true, "caps": CAPS})),
         (Method::Post, "/v1/parse") => parse_handler(body),
         (Method::Post, "/v1/check") => check_handler(body),
         (Method::Post, "/v1/publish") => publish_handler(state, body),
@@ -447,6 +492,11 @@ fn route(
         // write-time gate can resolve a head's pinned dependencies.
         (Method::Post, "/v1/locks/batch") => crate::sync_http::locks_batch_handler(state, body),
         (Method::Post, "/v1/locks/fetch") => crate::sync_http::locks_fetch_handler(state, body),
+        // #1007: files beside the op-log — content-addressed blobs a
+        // `SetFiles` manifest names. Pushed before the ops that need them.
+        (Method::Post, "/v1/blobs/missing") => crate::sync_http::blobs_missing_handler(state, body),
+        (Method::Post, "/v1/blobs/batch") => crate::sync_http::blobs_batch_handler(state, body),
+        (Method::Post, "/v1/blobs/fetch") => crate::sync_http::blobs_fetch_handler(state, body),
         // #949 phase 1: typed issues travel with the package (content-
         // addressed, like intents) so a pulled op-log carries its work items.
         (Method::Post, "/v1/issues/batch") => crate::sync_http::issues_batch_handler(state, body),
@@ -484,7 +534,7 @@ fn route(
         // ---- #260: append-only fetch (inverse of #242 push)
         // Body is a JSON array of OperationRecords reachable from
         // `branch.head_op` but not from `after`, oldest-first.
-        (Method::Get, "/v1/ops/since") => crate::ops_since_http::ops_since_handler(state, query),
+        (Method::Get, "/v1/ops/since") => crate::ops_since_http::ops_since_handler(state, query, x_lex_caps),
         (Method::Get, "/v1/attestations/since") => attestations_since_handler(state, query),
         // ---- #4: package concept ----------------------------------
         // POST /v1/pkg/publish is handled in handle() before route()
@@ -1334,6 +1384,11 @@ fn mint_merge_id() -> MergeSessionId {
 /// * `409` if the supplied `op_id` doesn't match the canonical
 ///   hash of the record's payload — content addressing must hold
 ///   over the wire.
+/// * `422` `MissingBlobs` `{ op_id, ids }` / `InvalidManifest`
+///   `{ op_id, manifest, reason }` for a `SetFiles` op (#1007) whose
+///   manifest or entry blobs this store lacks, or whose manifest is not
+///   a valid one — so a head can never name a file set it can't serve.
+///   Blobs go first (`/v1/blobs/batch`).
 ///
 /// Idempotency: a record whose `op_id` already exists is silently
 /// skipped (not added, not rejected). Pushing the same payload
@@ -1381,6 +1436,9 @@ pub(crate) fn ops_batch_handler(state: &State, body: &str)
                     "missing_parent": parent,
                 }));
             }
+        }
+        if let Err(resp) = crate::sync_http::check_set_files(&store, state.blob_limits, rec) {
+            return resp;
         }
         batch_ids.insert(rec.op_id.clone());
     }

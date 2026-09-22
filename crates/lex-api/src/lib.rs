@@ -20,7 +20,10 @@
 //!   POST /v1/ops/batch                [OperationRecord] → { received, added, skipped, added_ids }
 //!   POST /v1/attestations/batch       [Attestation] → { received, added, skipped, added_ids }
 //!   GET  /v1/branches/<name>/head     → { branch, head_op } (probe for `lex op push`)
-//!   GET  /v1/health          → { ok: true }
+//!   POST /v1/blobs/missing            { ids } → { missing } (#1007)
+//!   POST /v1/blobs/batch              [{ id, data_b64 }] → { received, added, skipped }
+//!   POST /v1/blobs/fetch              { ids } → { blobs: [{ id, data_b64 }] }
+//!   GET  /v1/health          → { ok: true, caps: ["files-v1"] }
 //!
 //! Web (lex-tea v2, read-only HTML; human-only audit + triage):
 //!   GET  /                      → activity stream (recent attestations)
