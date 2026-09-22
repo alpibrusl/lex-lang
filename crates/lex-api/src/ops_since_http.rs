@@ -88,7 +88,30 @@ use std::sync::Arc;
 use lex_vcs::{HistoryIndex, OpId, OpLog, OperationRecord};
 use tiny_http::{Header, Response};
 
-use crate::handlers::{error_response, json_response, State};
+use crate::handlers::{
+    error_response, error_with_detail, has_cap, json_response, State, CAP_FILES_V1,
+};
+
+/// Whether a record is a files snapshot (#1007) — the one op kind an
+/// older client cannot store, because its blobs travel out of band.
+fn is_set_files(rec: &OperationRecord) -> bool {
+    matches!(rec.op.kind, lex_vcs::OperationKind::SetFiles { .. })
+}
+
+/// 426 for a client that didn't announce `files-v1` (#1007). Sent instead
+/// of a delta holding a `SetFiles`: that client would record the op and
+/// silently hold a head whose files it never fetched.
+fn upgrade_required(rec: &OperationRecord) -> Response<Cursor<Vec<u8>>> {
+    error_with_detail(426, format!(
+        "this history carries repository files (a SetFiles op, #1007) that this client \
+         cannot store; upgrade lex to a version that speaks `{CAP_FILES_V1}` (it sends \
+         `X-Lex-Caps: {CAP_FILES_V1}`) and pull again"
+    ), serde_json::json!({
+        "kind": "UpgradeRequired",
+        "required_cap": CAP_FILES_V1,
+        "op_id": rec.op_id,
+    }))
+}
 
 /// Response header carrying the cursor for the next page.
 pub const NEXT_CURSOR_HEADER: &str = "X-Lex-Next-Cursor";
@@ -284,7 +307,9 @@ fn decode_cursor(c: &str) -> Option<(OpId, Option<OpId>, usize)> {
     Some((head.to_string(), base, offset.parse().ok()?))
 }
 
-pub(crate) fn ops_since_handler(state: &State, query: &str) -> Response<Cursor<Vec<u8>>> {
+pub(crate) fn ops_since_handler(state: &State, query: &str, x_lex_caps: Option<&str>)
+    -> Response<Cursor<Vec<u8>>>
+{
     let mut after: Option<String> = None;
     let mut branch = String::from("main");
     let mut limit: Option<usize> = None;
@@ -306,6 +331,7 @@ pub(crate) fn ops_since_handler(state: &State, query: &str) -> Response<Cursor<V
         }
     }
 
+    let files_v1 = has_cap(x_lex_caps, CAP_FILES_V1);
     let store = state.store.lock().unwrap();
     let log = match OpLog::open(store.root()) {
         Ok(l) => l,
@@ -333,6 +359,11 @@ pub(crate) fn ops_since_handler(state: &State, query: &str) -> Response<Cursor<V
                 // is already the cheapest way to produce it.
                 return match log.ops_since(&head, after.as_ref()) {
                     Ok(mut ops) => {
+                        if !files_v1 {
+                            if let Some(rec) = ops.iter().find(|r| is_set_files(r)) {
+                                return upgrade_required(rec);
+                            }
+                        }
                         ops.reverse();
                         json_response(200, &serde_json::to_value(&ops).unwrap_or_default())
                     }
@@ -370,6 +401,27 @@ pub(crate) fn ops_since_handler(state: &State, query: &str) -> Response<Cursor<V
             // Evicted by `lex op gc` since the index was built.
             Ok(None) => {}
             Err(e) => return error_response(500, format!("reading op {}: {e}", delta.index.id(i))),
+        }
+    }
+
+    // #1007: a client that can't store files is refused the whole delta,
+    // not just the page it asked for — at the start of a pull the ops past
+    // this page are scanned too (one read of the delta a full pull would
+    // read anyway), so it fails before recording a partial history rather
+    // than several pages in. A resumed page checks what it returns. A
+    // `files-v1` client pays nothing.
+    if !files_v1 {
+        if let Some(rec) = ops.iter().find(|r| is_set_files(r)) {
+            return upgrade_required(rec);
+        }
+        if cursor.is_none() && offset == 0 {
+            for &i in &delta.order[end..] {
+                match log.get(delta.index.id(i)) {
+                    Ok(Some(rec)) if is_set_files(&rec) => return upgrade_required(&rec),
+                    Ok(_) => {}
+                    Err(e) => return error_response(500, format!("reading op {}: {e}", delta.index.id(i))),
+                }
+            }
         }
     }
 

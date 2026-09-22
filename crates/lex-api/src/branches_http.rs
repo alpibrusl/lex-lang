@@ -31,6 +31,10 @@ pub(crate) fn branch_head_handler(state: &State, name: &str) -> Response<Cursor<
 /// diverged push can't clobber a shared branch. The op objects must
 /// already be present (the ops batch runs first); an unknown `head_op`
 /// reads as a non-fast-forward against a head it can't reach.
+///
+/// #1007: refused with 422 before anything moves when the new head's files
+/// manifest is `Ambiguous` (`AmbiguousManifest`) or incomplete
+/// (`MissingBlobs` / `InvalidManifest`).
 pub(crate) fn branch_advance_head_handler(state: &State, name: &str, body: &str)
     -> Response<Cursor<Vec<u8>>>
 {
@@ -43,6 +47,10 @@ pub(crate) fn branch_advance_head_handler(state: &State, name: &str, body: &str)
         None => return error_response(400, "missing string field `head_op`"),
     };
     let store = state.store.lock().unwrap();
+    // #1007: a head must name a well-defined, complete file set.
+    if let Err(resp) = crate::sync_http::check_head_files(&store, &head_op) {
+        return resp;
+    }
     // The head before the advance — the ops between it and the new head are
     // the ones the hosted CI runner (#93) attests.
     let prev_head = store.get_branch(name).ok().flatten().and_then(|b| b.head_op);

@@ -764,6 +764,26 @@ impl Store {
         fs::metadata(self.blobs_dir().join(sha)).ok().map(|m| m.len())
     }
 
+    /// Total bytes held in this store's blob space (#1007): the sum of every
+    /// stored blob's length, ignoring in-flight temp files. What a per-store
+    /// blob quota is measured against. O(number of blobs).
+    pub fn blob_bytes_used(&self) -> Result<u64, StoreError> {
+        let rd = match fs::read_dir(self.blobs_dir()) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        let mut total = 0u64;
+        for ent in rd {
+            let ent = ent?;
+            if !crate::files::is_blob_id(&ent.file_name().to_string_lossy()) {
+                continue;
+            }
+            total = total.saturating_add(ent.metadata()?.len());
+        }
+        Ok(total)
+    }
+
     /// Whether a blob with this sha exists.
     pub fn has_blob(&self, sha: &str) -> bool {
         crate::files::is_blob_id(sha) && self.blobs_dir().join(sha).exists()
