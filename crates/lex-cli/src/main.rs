@@ -280,7 +280,7 @@ fn print_usage() {
     println!("  store get [--store DIR] [--require-signed] [--trusted-key HEX] <stage>");
     println!("                                     print stage metadata + canonical AST;");
     println!("                                     verify Ed25519 signature when present.");
-    println!("  store search [--store DIR] [--limit N] \"<query>\"");
+    println!("  store search [--store DIR] [--limit N] [--include-draft] \"<query>\"");
     println!("  store migrate-ops [--store DIR] --to v1 [--dry-run | --confirm]");
     println!("                                     semantic search over active stages,");
     println!("                                     ranked by description+signature+examples.");

@@ -11,8 +11,9 @@ use crate::embedder::{EmbedError, Embedder};
 use crate::scoring::{cosine_similarity, fuse_scores};
 use crate::ScoreBreakdown;
 use lex_ast::{FnDecl, Stage, TypeExpr};
-use lex_store::Store;
+use lex_store::{StageStatus, Store};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// One indexed stage record. The three optional embedding fields
 /// carry the per-component vectors; ranking pulls them out to score
@@ -22,6 +23,9 @@ pub struct IndexedStage {
     pub stage_id: String,
     pub sig_id: String,
     pub name: String,
+    /// Lifecycle status of the indexed stage: `Active`, or `Draft` when the
+    /// index was built with [`BuildOptions::include_draft`] (#969).
+    pub status: StageStatus,
     /// Rendered `name(params) -> ret [effects]`. Always present.
     pub signature: String,
     /// Free-form note attached to the stage's metadata, when any.
@@ -43,6 +47,9 @@ pub struct SearchHit {
     pub stage_id: String,
     pub sig_id: String,
     pub name: String,
+    /// Lifecycle status of the hit, so a Draft result is never mistaken for
+    /// an Active one (#969).
+    pub status: StageStatus,
     pub signature: String,
     pub description: Option<String>,
     pub score: ScoreBreakdown,
@@ -56,36 +63,93 @@ pub enum BuildError {
     Embed(#[from] EmbedError),
 }
 
-/// Walk the active stages of `store`, render each into the three
+/// What [`SearchIndex::build_with`] indexes.
+#[derive(Debug, Clone, Default)]
+pub struct BuildOptions {
+    /// Also index functions that have **no** Active stage, using a Draft one.
+    ///
+    /// Lifecycle status is local to a store — it is not an op and is not
+    /// carried by `op push`/`op pull` — so every stage a store *received*
+    /// rather than authored is Draft (#969). Without this, a pulled store is
+    /// invisible to search.
+    pub include_draft: bool,
+    /// `SigId -> StageId` of a branch head. When a function has several
+    /// Draft stages (one per version), the one the head names is the one
+    /// indexed; otherwise the most recently transitioned Draft is used.
+    pub prefer: BTreeMap<String, String>,
+}
+
+/// Walk the searchable stages of `store`, render each into the three
 /// search-relevant strings, and embed everything in batch.
 ///
-/// Only `Active` stages are indexed: drafts and deprecated stages
-/// would inflate the result list with stale candidates. If a SigId
-/// has no active stage (all drafts) it's skipped.
+/// Per function (SigId) the Active stage is indexed. A function with no
+/// Active stage but at least one Draft is indexed from a Draft only under
+/// [`BuildOptions::include_draft`]; otherwise it is counted in
+/// [`SearchIndex::drafts_skipped`] so callers can say *why* a search came
+/// back empty instead of reporting "no matches". Deprecated and tombstoned
+/// stages are never indexed.
 pub struct SearchIndex {
     pub stages: Vec<IndexedStage>,
+    /// Functions left out because their only candidate stage is a Draft
+    /// (always 0 under [`BuildOptions::include_draft`]).
+    pub drafts_skipped: usize,
 }
 
 impl SearchIndex {
+    /// Index Active stages only — [`Self::build_with`] with default options.
     pub fn build(store: &Store, embedder: &dyn Embedder) -> Result<Self, BuildError> {
+        Self::build_with(store, embedder, &BuildOptions::default())
+    }
+
+    pub fn build_with(
+        store: &Store,
+        embedder: &dyn Embedder,
+        opts: &BuildOptions,
+    ) -> Result<Self, BuildError> {
         let mut staging: Vec<StagingRow> = Vec::new();
+        let mut drafts_skipped = 0usize;
         for sig in store.list_sigs()? {
-            let active = match store.resolve_sig(&sig)? {
-                Some(stage_id) => stage_id,
-                None => continue,
+            // Newest-first, one entry per stage with its latest status.
+            let history = store.sig_history(&sig)?;
+            let (chosen, status) = match history.iter().find(|e| e.status == StageStatus::Active) {
+                Some(e) => (e.stage_id.clone(), StageStatus::Active),
+                None => {
+                    let drafts: Vec<&str> = history
+                        .iter()
+                        .filter(|e| e.status == StageStatus::Draft)
+                        .map(|e| e.stage_id.as_str())
+                        .collect();
+                    let Some(newest) = drafts.first() else {
+                        continue;
+                    };
+                    let pick = opts
+                        .prefer
+                        .get(&sig)
+                        .map(String::as_str)
+                        .filter(|p| drafts.contains(p))
+                        .unwrap_or(newest);
+                    (pick.to_string(), StageStatus::Draft)
+                }
             };
-            let meta = match store.get_metadata(&active) {
+            // Read through the SigId we already hold: a StageId is
+            // name-independent and may be filed under several sigs (#826).
+            let meta = match store.get_metadata_for_sig(&sig, &chosen) {
                 Ok(m) => m,
                 Err(_) => continue,
             };
-            let ast = match store.get_ast(&active) {
-                Ok(s) => s,
-                Err(_) => continue,
+            let pair = [(sig.clone(), chosen.clone())];
+            let ast = match store.get_asts_for_sigs_bulk(&pair).pop() {
+                Some(Ok(s)) => s,
+                _ => continue,
             };
             let fd = match &ast {
                 Stage::FnDecl(fd) => fd,
                 _ => continue,
             };
+            if status == StageStatus::Draft && !opts.include_draft {
+                drafts_skipped += 1;
+                continue;
+            }
             let signature = render_signature(fd);
             let description = meta.note.clone().filter(|s| !s.is_empty());
             let examples = collect_examples(store, &sig);
@@ -93,6 +157,7 @@ impl SearchIndex {
                 stage_id: meta.stage_id.clone(),
                 sig_id: meta.sig_id.clone(),
                 name: meta.name.clone(),
+                status,
                 signature,
                 description,
                 examples,
@@ -124,6 +189,7 @@ impl SearchIndex {
             stage_id: row.stage_id,
             sig_id: row.sig_id,
             name: row.name,
+            status: row.status,
             signature: row.signature,
             description: row.description,
             examples: row.examples.clone(),
@@ -141,7 +207,7 @@ impl SearchIndex {
             }
         }
 
-        Ok(Self { stages: indexed })
+        Ok(Self { stages: indexed, drafts_skipped })
     }
 
     /// Rank every indexed stage against `query`. Returns the top
@@ -162,6 +228,7 @@ impl SearchIndex {
                 stage_id: s.stage_id.clone(),
                 sig_id: s.sig_id.clone(),
                 name: s.name.clone(),
+                status: s.status,
                 signature: s.signature.clone(),
                 description: s.description.clone(),
                 score: score_stage(&q, s),
@@ -198,6 +265,7 @@ struct StagingRow {
     stage_id: String,
     sig_id: String,
     name: String,
+    status: StageStatus,
     signature: String,
     description: Option<String>,
     examples: Vec<String>,
