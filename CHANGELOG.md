@@ -5,6 +5,32 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [0.11.67] - 2026-09-22
+
+### Fixed
+
+- **A publish documents every declaration, not only the ones that changed.**
+  Comments live outside the hash, so a declaration whose code is unchanged emits
+  no op — `publish_signed` never runs for it and its metadata keeps whatever
+  `doc` it had. A re-publish existing purely to carry documentation therefore
+  documented almost nothing: 2 ops for a 25-declaration package, with the other
+  23 left bare. `publish_program_with_intent` now refreshes the doc for every
+  declaration in the program it is handed.
+
+- **A git dependency is cached by the commit it resolves to, not by its name.**
+  An unpinned git dep (`{ git = "…" }`, no rev) was cached at `{name}` — a
+  single flat slot checked with a bare `exists()`, so whatever was cloned first
+  stayed there permanently. That one directory caused three separate failures:
+  a rename upstream was invisible locally and `lex check` reported
+  `unknown_variant` against an interface that no longer existed; a
+  dependency-drift guard comparing the lock against the cache reported perfect
+  agreement while CI failed on the same command; and it nearly poisoned a
+  34-package registry migration. Moving refs are now resolved with
+  `git ls-remote` before the cache path is chosen, so the path encodes the
+  content — as registry packages have always been keyed `{name}-{version}`.
+  Falls back to the old path when git cannot be run, so offline builds still
+  work off an existing cache.
+
 ## [0.11.66] - 2026-09-21
 
 ### Fixed
