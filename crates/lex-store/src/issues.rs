@@ -31,8 +31,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use lex_vcs::{
     render_signature, render_type_signature, Acceptance, ApiChangeKind, ApiEntry, Attestation,
-    AttestationId, AttestationKind, AttestationResult, IntentLog, Issue, IssueId, IssueLog, OpLog,
-    ProducerDescriptor,
+    AcceptanceProposal, AttestationId, AttestationKind, AttestationResult, IntentLog, Issue,
+    IssueId, IssueLog, OpLog, ProducerDescriptor, ProposalId, ReviewVerdict,
 };
 use serde::Serialize;
 
@@ -361,6 +361,132 @@ pub fn all_issue_status(store: &Store) -> Result<Vec<IssueStatus>, StoreError> {
         }
     }
     Ok(out)
+}
+
+// ---- Agent-refined acceptance (#956) ------------------------------------
+//
+// A proposal's verdict is a `Review` attestation keyed by the proposal id —
+// the same intent-arbiter record `lex stage review` writes for a candidate,
+// so an approval carries a named reviewer and lands in the same log. The
+// issue is never rewritten (its id would change); its *effective*
+// acceptance is derived: the latest approved proposal, else its own.
+
+/// Where a proposal stands, derived from its latest review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalStatus {
+    Pending,
+    Approved,
+    Rejected,
+}
+
+/// Only a free-form issue can be refined. A typed issue already has a
+/// machine-checkable contract; changing it is a different issue, and
+/// silently swapping the oracle under an existing id would let a verdict
+/// mean something other than what the issue said.
+pub fn check_refinable(issue: &Issue) -> Result<(), StoreError> {
+    match issue.acceptance {
+        Acceptance::FreeForm {} => Ok(()),
+        ref a => Err(StoreError::IssueRefinement(format!(
+            "issue {} is already {} — only a free_form issue takes a proposed acceptance; \
+             file a new issue to change a typed contract",
+            issue.issue_id,
+            a.shape()
+        ))),
+    }
+}
+
+/// Record a human's verdict on a proposal. `approve` → `Review{Approve}` /
+/// `Passed`; otherwise `Review{Reject}` / `Failed`. A later review
+/// supersedes an earlier one.
+pub fn record_proposal_review(
+    store: &Store,
+    proposal: &AcceptanceProposal,
+    reviewer: &str,
+    approve: bool,
+    notes: Option<String>,
+) -> Result<AttestationId, StoreError> {
+    let (verdict, result) = if approve {
+        (ReviewVerdict::Approve, AttestationResult::Passed)
+    } else {
+        (
+            ReviewVerdict::Reject,
+            AttestationResult::Failed {
+                detail: notes.clone().unwrap_or_else(|| "proposal rejected".into()),
+            },
+        )
+    };
+    let attestation = Attestation::new(
+        proposal.proposal_id.clone(),
+        None,
+        None,
+        AttestationKind::Review { reviewer: reviewer.to_string(), verdict, notes },
+        result,
+        issue_gate_producer(),
+        None,
+    );
+    store.attestation_log()?.put(&attestation)?;
+    Ok(attestation.attestation_id.clone())
+}
+
+/// The latest review of a proposal, if any: `(approved?, timestamp)`.
+fn latest_review(store: &Store, proposal_id: &ProposalId) -> Result<Option<(bool, u64)>, StoreError> {
+    let latest = store
+        .attestation_log()?
+        .list_for_stage(proposal_id)?
+        .into_iter()
+        .filter_map(|a| match a.kind {
+            AttestationKind::Review { verdict, .. } => {
+                Some((verdict == ReviewVerdict::Approve, a.timestamp))
+            }
+            _ => None,
+        })
+        // Timestamps are whole seconds, so two reviews can tie; a tie
+        // resolves to the rejection — never approve on ambiguity.
+        .max_by_key(|(approved, ts)| (*ts, !*approved));
+    Ok(latest)
+}
+
+pub fn proposal_status(store: &Store, proposal_id: &ProposalId) -> Result<ProposalStatus, StoreError> {
+    Ok(match latest_review(store, proposal_id)? {
+        None => ProposalStatus::Pending,
+        Some((true, _)) => ProposalStatus::Approved,
+        Some((false, _)) => ProposalStatus::Rejected,
+    })
+}
+
+/// The acceptance the gate evaluates for `issue`: its most recently
+/// approved proposal, or its own when none is approved. Returns the
+/// proposal id that supplied it, if any.
+pub fn effective_acceptance(
+    store: &Store,
+    issue: &Issue,
+) -> Result<(Acceptance, Option<ProposalId>), StoreError> {
+    let log = IssueLog::open(store.root())?;
+    let mut best: Option<(u64, AcceptanceProposal)> = None;
+    for p in log.proposals_for(&issue.issue_id)? {
+        if let Some((true, ts)) = latest_review(store, &p.proposal_id)? {
+            // Latest approval wins; a same-second tie breaks on the
+            // proposal id so the answer never depends on directory order.
+            if best
+                .as_ref()
+                .is_none_or(|(b, bp)| (ts, &p.proposal_id) > (*b, &bp.proposal_id))
+            {
+                best = Some((ts, p));
+            }
+        }
+    }
+    Ok(match best {
+        Some((_, p)) => (p.acceptance, Some(p.proposal_id)),
+        None => (issue.acceptance.clone(), None),
+    })
+}
+
+/// `issue` with its acceptance replaced by the effective one — same id, so
+/// verdicts, intents and the board still key on the issue itself.
+pub fn with_effective_acceptance(store: &Store, issue: &Issue) -> Result<Issue, StoreError> {
+    let (acceptance, _) = effective_acceptance(store, issue)?;
+    Ok(Issue { acceptance, ..issue.clone() })
 }
 
 fn issue_gate_producer() -> ProducerDescriptor {

@@ -285,6 +285,140 @@ impl IssueLog {
 
 // ---- Tests --------------------------------------------------------
 
+// ---- Agent-refined acceptance (#956) ------------------------------------
+//
+// An issue may start free-form; an agent then *proposes* a typed acceptance
+// for it, and a human approves or rejects the proposal. The issue itself is
+// never rewritten — its id is a hash of its content, acceptance included,
+// so "setting" the acceptance would make it a different issue and orphan
+// every intent and verdict that names it. A proposal is its own
+// content-addressed object that points at the issue; the approval is a
+// `Review` attestation keyed by the proposal id; the issue's *effective*
+// acceptance is its latest approved proposal. Rejected proposals stay in
+// the log, so the issue keeps its proposal history.
+
+pub type ProposalId = String;
+
+/// A proposed acceptance for an issue, awaiting a human verdict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptanceProposal {
+    pub proposal_id: ProposalId,
+    pub issue_id: IssueId,
+    pub acceptance: Acceptance,
+    /// Why this acceptance captures the issue — the agent's case to the
+    /// human arbiter. Not part of the identity.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rationale: String,
+    /// Who proposed it (an agent/model name, or a person). Not part of the
+    /// identity.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub proposed_by: String,
+    pub created_at: u64,
+}
+
+impl AcceptanceProposal {
+    pub fn new(
+        issue_id: impl Into<IssueId>,
+        acceptance: Acceptance,
+        rationale: impl Into<String>,
+        proposed_by: impl Into<String>,
+    ) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Self::with_timestamp(issue_id, acceptance, rationale, proposed_by, now)
+    }
+
+    pub fn with_timestamp(
+        issue_id: impl Into<IssueId>,
+        acceptance: Acceptance,
+        rationale: impl Into<String>,
+        proposed_by: impl Into<String>,
+        created_at: u64,
+    ) -> Self {
+        let issue_id = issue_id.into();
+        let proposal_id = compute_proposal_id(&issue_id, &acceptance);
+        Self {
+            proposal_id,
+            issue_id,
+            acceptance,
+            rationale: rationale.into(),
+            proposed_by: proposed_by.into(),
+            created_at,
+        }
+    }
+
+    pub fn id_is_consistent(&self) -> bool {
+        self.proposal_id == compute_proposal_id(&self.issue_id, &self.acceptance)
+    }
+}
+
+/// Identity = (issue, acceptance): proposing the same acceptance for the
+/// same issue twice is the same proposal, whoever proposed it and why.
+fn compute_proposal_id(issue_id: &str, acceptance: &Acceptance) -> ProposalId {
+    #[derive(Serialize)]
+    struct View<'a> {
+        proposal_for: &'a str,
+        acceptance: &'a Acceptance,
+    }
+    canonical::hash(&View { proposal_for: issue_id, acceptance })
+}
+
+impl IssueLog {
+    fn proposals_dir(&self) -> io::Result<PathBuf> {
+        let dir = self.dir.join("proposals");
+        fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+
+    /// Idempotent, like `put`.
+    pub fn put_proposal(&self, p: &AcceptanceProposal) -> io::Result<()> {
+        let path = self.proposals_dir()?.join(format!("{}.json", p.proposal_id));
+        if path.exists() {
+            return Ok(());
+        }
+        let bytes = serde_json::to_vec(p)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let tmp = path.with_extension("json.tmp");
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+        fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    pub fn get_proposal(&self, id: &ProposalId) -> io::Result<Option<AcceptanceProposal>> {
+        let path = self.proposals_dir()?.join(format!("{id}.json"));
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&path)?;
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    /// Every proposal for `issue_id`, oldest first.
+    pub fn proposals_for(&self, issue_id: &IssueId) -> io::Result<Vec<AcceptanceProposal>> {
+        let mut out = Vec::new();
+        for entry in fs::read_dir(self.proposals_dir()?)? {
+            let path = entry?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let bytes = fs::read(&path)?;
+            let p: AcceptanceProposal = serde_json::from_slice(&bytes)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            if &p.issue_id == issue_id {
+                out.push(p);
+            }
+        }
+        out.sort_by(|a, b| (a.created_at, &a.proposal_id).cmp(&(b.created_at, &b.proposal_id)));
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,5 +475,31 @@ mod tests {
         assert_eq!(log.get(&i.issue_id).unwrap(), Some(i.clone()));
         assert_eq!(log.list_ids().unwrap(), vec![i.issue_id.clone()]);
         assert_eq!(log.get(&"missing".to_string()).unwrap(), None);
+    }
+
+    #[test]
+    fn proposal_identity_is_issue_plus_acceptance() {
+        let a = AcceptanceProposal::with_timestamp("iss", gcd_delta(), "why", "qwen", 1);
+        let b = AcceptanceProposal::with_timestamp("iss", gcd_delta(), "other reason", "human", 9);
+        assert_eq!(a.proposal_id, b.proposal_id, "rationale/proposer/time are not identity");
+        let c = AcceptanceProposal::with_timestamp("other", gcd_delta(), "why", "qwen", 1);
+        assert_ne!(a.proposal_id, c.proposal_id, "a proposal is for one issue");
+        assert!(a.id_is_consistent());
+    }
+
+    #[test]
+    fn proposals_round_trip_and_do_not_leak_into_issue_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = IssueLog::open(dir.path()).unwrap();
+        let issue = Issue::with_timestamp("vague", "", Acceptance::FreeForm {}, None, BTreeSet::new(), None, 1);
+        log.put(&issue).unwrap();
+        let p = AcceptanceProposal::with_timestamp(issue.issue_id.clone(), gcd_delta(), "", "", 2);
+        log.put_proposal(&p).unwrap();
+        log.put_proposal(&p).unwrap();
+        assert_eq!(log.get_proposal(&p.proposal_id).unwrap(), Some(p.clone()));
+        assert_eq!(log.proposals_for(&issue.issue_id).unwrap(), vec![p]);
+        assert!(log.proposals_for(&"nope".to_string()).unwrap().is_empty());
+        // `list_ids` (which op push syncs) must still see only issues.
+        assert_eq!(log.list_ids().unwrap(), vec![issue.issue_id]);
     }
 }

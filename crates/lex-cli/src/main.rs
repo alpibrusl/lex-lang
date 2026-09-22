@@ -261,6 +261,12 @@ fn print_usage() {
     println!("  issue verify <id> [--at OP] [--store DIR]");
     println!("                                     evaluate its acceptance at a head (default: branch head)");
     println!("                                     and record the verdict; exit 1 if the oracle fails");
+    println!("  issue propose <id> --shape S [shape flags] [--rationale R] [--by WHO]");
+    println!("                                     propose a typed acceptance for a free_form issue");
+    println!("  issue proposals <id>               list its proposals (pending|approved|rejected)");
+    println!("  issue approve|reject <proposal> --by WHO [--notes N]");
+    println!("                                     a human verdict; the latest approval becomes the");
+    println!("                                     issue's effective acceptance (same issue id)");
     println!("  propagate --package <p> --rename <old>=<new> [--workspace <d>] [--apply]");
     println!("                                     push an upstream API change down its dependents");
     println!("  run [policy] <file> <fn> [args]    execute fn (args parsed as JSON)");

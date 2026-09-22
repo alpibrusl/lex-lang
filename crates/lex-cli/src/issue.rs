@@ -5,6 +5,9 @@
 //!                    [--base OP] [--dep ID]... [--project P] [--store DIR]
 //!   lex issue list  [--store DIR]
 //!   lex issue show <id> [--store DIR]
+//!   lex issue propose <id> --shape S [shape flags] [--rationale R] [--by WHO]
+//!   lex issue proposals <id>
+//!   lex issue approve|reject <proposal> --by WHO [--notes N]
 //!
 //! Shapes and their flags:
 //!   typed_delta      --api "name:signature[:added|changed|removed]"... [--example E]...
@@ -20,10 +23,12 @@ use std::collections::BTreeSet;
 
 use anyhow::{anyhow, bail, Result};
 use lex_store::issues::{
-    evaluate_static, prepare_example_stages, record_issue_verdict, IssueEvaluation,
+    check_refinable, effective_acceptance, evaluate_static, prepare_example_stages,
+    proposal_status, record_issue_verdict, record_proposal_review, with_effective_acceptance,
+    IssueEvaluation,
 };
 use lex_store::{Store, StoreError};
-use lex_vcs::{Acceptance, ApiChangeKind, ApiEntry, Issue, IssueLog};
+use lex_vcs::{Acceptance, AcceptanceProposal, ApiChangeKind, ApiEntry, Issue, IssueLog};
 
 use ::acli::OutputFormat;
 
@@ -39,8 +44,15 @@ pub fn cmd_issue(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "list" => list(&root),
         "show" => show(&root, tail),
         "verify" => verify(fmt, &root, tail),
+        "propose" => propose(fmt, &root, tail),
+        "proposals" => proposals(fmt, &root, tail),
+        "approve" => review(fmt, &root, tail, true),
+        "reject" => review(fmt, &root, tail, false),
         _ => bail!(
-            "usage: lex issue <create|list|show|verify> [--store DIR]\n\
+            "usage: lex issue <create|list|show|verify|propose|proposals|approve|reject> [--store DIR]\n\
+             propose: <issue> --shape S [shape flags] [--rationale R] [--by WHO]  propose a typed acceptance for a free_form issue\n\
+             proposals: <issue>  list proposals with their status (pending|approved|rejected)\n\
+             approve|reject: <proposal> --by WHO [--notes N]  a human verdict on a proposal\n\
              verify: <id> [--at OP]  evaluate the issue's acceptance at a head (default: branch head)\n\
              create: --title T [--body B] --shape typed_delta|failing_example|metric_invariant|evidence|free_form\n\
              \x20       [--api name:sig[:kind]]... [--example E]... [--predicate P --window W]\n\
@@ -49,16 +61,73 @@ pub fn cmd_issue(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     }
 }
 
+/// The shape flags `create` and `propose` share.
+#[derive(Default)]
+struct AcceptanceFlags {
+    shape: Option<String>,
+    api: Vec<ApiEntry>,
+    examples: Vec<String>,
+    predicate: Option<String>,
+    window: Option<String>,
+    subject: Option<String>,
+    invariants: Vec<String>,
+}
+
+impl AcceptanceFlags {
+    /// Consume `flag` (and its value) if it is a shape flag. `Ok(false)`
+    /// means "not mine" — the caller handles it.
+    fn take(&mut self, flag: &str, val: &mut dyn FnMut(&str) -> Result<String>) -> Result<bool> {
+        match flag {
+            "--shape" => self.shape = Some(val("--shape")?),
+            "--api" => self.api.push(parse_api_entry(&val("--api")?)?),
+            "--example" => self.examples.push(val("--example")?),
+            "--predicate" => self.predicate = Some(val("--predicate")?),
+            "--window" => self.window = Some(val("--window")?),
+            "--subject" => self.subject = Some(val("--subject")?),
+            "--invariant" => self.invariants.push(val("--invariant")?),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn build(self) -> Result<Acceptance> {
+        let AcceptanceFlags { shape, api, mut examples, predicate, window, subject, invariants } = self;
+        let shape = shape.ok_or_else(|| anyhow!("--shape is required"))?;
+        Ok(match shape.as_str() {
+            "typed_delta" => {
+                if api.is_empty() {
+                    bail!("typed_delta needs at least one --api name:signature");
+                }
+                Acceptance::TypedDelta { api, examples }
+            }
+            "failing_example" => {
+                let example =
+                    examples.pop().ok_or_else(|| anyhow!("failing_example needs --example"))?;
+                if !examples.is_empty() {
+                    bail!("failing_example takes exactly one --example");
+                }
+                Acceptance::FailingExample { example }
+            }
+            "metric_invariant" => Acceptance::MetricInvariant {
+                predicate: predicate.ok_or_else(|| anyhow!("metric_invariant needs --predicate"))?,
+                window: window.ok_or_else(|| anyhow!("metric_invariant needs --window"))?,
+            },
+            "evidence" => Acceptance::Evidence {
+                subject: subject.ok_or_else(|| anyhow!("evidence needs --subject"))?,
+                invariants,
+            },
+            "free_form" => Acceptance::FreeForm {},
+            other => bail!(
+                "unknown shape `{other}` (typed_delta|failing_example|metric_invariant|evidence|free_form)"
+            ),
+        })
+    }
+}
+
 fn create(fmt: &OutputFormat, root: &std::path::Path, args: &[String]) -> Result<()> {
     let mut title: Option<String> = None;
     let mut body = String::new();
-    let mut shape: Option<String> = None;
-    let mut api: Vec<ApiEntry> = Vec::new();
-    let mut examples: Vec<String> = Vec::new();
-    let mut predicate: Option<String> = None;
-    let mut window: Option<String> = None;
-    let mut subject: Option<String> = None;
-    let mut invariants: Vec<String> = Vec::new();
+    let mut flags = AcceptanceFlags::default();
     let mut base: Option<String> = None;
     let mut deps: BTreeSet<String> = BTreeSet::new();
     let mut project: Option<String> = None;
@@ -68,16 +137,12 @@ fn create(fmt: &OutputFormat, root: &std::path::Path, args: &[String]) -> Result
         let mut val = |flag: &str| -> Result<String> {
             it.next().cloned().ok_or_else(|| anyhow!("{flag} needs a value"))
         };
+        if flags.take(a, &mut val)? {
+            continue;
+        }
         match a.as_str() {
             "--title" => title = Some(val("--title")?),
             "--body" => body = val("--body")?,
-            "--shape" => shape = Some(val("--shape")?),
-            "--api" => api.push(parse_api_entry(&val("--api")?)?),
-            "--example" => examples.push(val("--example")?),
-            "--predicate" => predicate = Some(val("--predicate")?),
-            "--window" => window = Some(val("--window")?),
-            "--subject" => subject = Some(val("--subject")?),
-            "--invariant" => invariants.push(val("--invariant")?),
             "--base" => base = Some(val("--base")?),
             "--dep" => { deps.insert(val("--dep")?); }
             "--project" => project = Some(val("--project")?),
@@ -85,35 +150,7 @@ fn create(fmt: &OutputFormat, root: &std::path::Path, args: &[String]) -> Result
         }
     }
     let title = title.ok_or_else(|| anyhow!("--title is required"))?;
-    let shape = shape.ok_or_else(|| anyhow!("--shape is required"))?;
-
-    let acceptance = match shape.as_str() {
-        "typed_delta" => {
-            if api.is_empty() {
-                bail!("typed_delta needs at least one --api name:signature");
-            }
-            Acceptance::TypedDelta { api, examples }
-        }
-        "failing_example" => {
-            let example = examples.pop().ok_or_else(|| anyhow!("failing_example needs --example"))?;
-            if !examples.is_empty() {
-                bail!("failing_example takes exactly one --example");
-            }
-            Acceptance::FailingExample { example }
-        }
-        "metric_invariant" => Acceptance::MetricInvariant {
-            predicate: predicate.ok_or_else(|| anyhow!("metric_invariant needs --predicate"))?,
-            window: window.ok_or_else(|| anyhow!("metric_invariant needs --window"))?,
-        },
-        "evidence" => Acceptance::Evidence {
-            subject: subject.ok_or_else(|| anyhow!("evidence needs --subject"))?,
-            invariants,
-        },
-        "free_form" => Acceptance::FreeForm {},
-        other => bail!(
-            "unknown shape `{other}` (typed_delta|failing_example|metric_invariant|evidence|free_form)"
-        ),
-    };
+    let acceptance = flags.build()?;
 
     let issue = Issue::new(title, body, acceptance, base, deps, project);
     let log = IssueLog::open(root)?;
@@ -175,6 +212,10 @@ fn verify(fmt: &OutputFormat, root: &std::path::Path, args: &[String]) -> Result
     let log = IssueLog::open(root)?;
     let issue = log.get(&id)?.ok_or_else(|| anyhow!("unknown issue `{id}`"))?;
     let store = Store::open(root)?;
+    // A free-form issue refined by an approved proposal (#956) is judged
+    // against that proposal; the id — and so the verdict's key — is the
+    // issue's own.
+    let issue = with_effective_acceptance(&store, &issue)?;
     let head = match at {
         Some(h) => h,
         None => {
@@ -294,11 +335,140 @@ fn show(root: &std::path::Path, args: &[String]) -> Result<()> {
     let log = IssueLog::open(root)?;
     match log.get(id)? {
         Some(issue) => {
-            println!("{}", serde_json::to_string_pretty(&issue)?);
+            // The issue as stored, plus — once a proposal is approved (#956)
+            // — the acceptance the gate actually evaluates. Additive, so a
+            // reader that only knows `acceptance` keeps working.
+            let mut out = serde_json::to_value(&issue)?;
+            if let Ok(store) = Store::open(root) {
+                if let (acceptance, Some(pid)) = effective_acceptance(&store, &issue)? {
+                    out["effective_acceptance"] = serde_json::to_value(&acceptance)?;
+                    out["approved_proposal"] = serde_json::Value::String(pid);
+                }
+            }
+            println!("{}", serde_json::to_string_pretty(&out)?);
             Ok(())
         }
         None => bail!("unknown issue `{id}`"),
     }
+}
+
+/// `lex issue propose <issue> --shape S [shape flags] [--rationale R] [--by WHO]`
+/// — propose a typed acceptance for a free-form issue (#956). The agent
+/// does the spec labor; nothing changes until a human approves.
+fn propose(fmt: &OutputFormat, root: &std::path::Path, args: &[String]) -> Result<()> {
+    let mut id: Option<String> = None;
+    let mut flags = AcceptanceFlags::default();
+    let mut rationale = String::new();
+    let mut by = String::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut val = |flag: &str| -> Result<String> {
+            it.next().cloned().ok_or_else(|| anyhow!("{flag} needs a value"))
+        };
+        if flags.take(a, &mut val)? {
+            continue;
+        }
+        match a.as_str() {
+            "--rationale" => rationale = val("--rationale")?,
+            "--by" => by = val("--by")?,
+            other if !other.starts_with("--") && id.is_none() => id = Some(other.to_string()),
+            other => bail!("unexpected arg `{other}`"),
+        }
+    }
+    let id = id.ok_or_else(|| anyhow!("usage: lex issue propose <issue> --shape S [shape flags]"))?;
+    let acceptance = flags.build()?;
+    if !acceptance.is_machine_evaluable() {
+        bail!("a proposal must be a typed acceptance, not free_form");
+    }
+    let log = IssueLog::open(root)?;
+    let issue = log.get(&id)?.ok_or_else(|| anyhow!("unknown issue `{id}`"))?;
+    check_refinable(&issue)?;
+    let p = AcceptanceProposal::new(id.clone(), acceptance, rationale, by);
+    log.put_proposal(&p)?;
+    let store = Store::open(root)?;
+    let status = proposal_status(&store, &p.proposal_id)?;
+    let pid = p.proposal_id.clone();
+    let data = serde_json::json!({
+        "proposal_id": p.proposal_id,
+        "issue_id": id,
+        "shape": p.acceptance.shape(),
+        "status": status,
+    });
+    acli::emit_or_text("issue-propose", data, fmt, move || println!("{pid}"));
+    Ok(())
+}
+
+/// `lex issue proposals <issue>` — every proposal with its status.
+fn proposals(fmt: &OutputFormat, root: &std::path::Path, args: &[String]) -> Result<()> {
+    let id = args.first().ok_or_else(|| anyhow!("usage: lex issue proposals <issue>"))?;
+    let log = IssueLog::open(root)?;
+    log.get(id)?.ok_or_else(|| anyhow!("unknown issue `{id}`"))?;
+    let store = Store::open(root)?;
+    let mut rows = Vec::new();
+    for p in log.proposals_for(id)? {
+        let status = proposal_status(&store, &p.proposal_id)?;
+        rows.push((p, status));
+    }
+    let data = serde_json::json!({
+        "issue_id": id,
+        "proposals": rows.iter().map(|(p, st)| {
+            let mut v = serde_json::to_value(p).unwrap_or_default();
+            v["status"] = serde_json::to_value(st).unwrap_or_default();
+            v
+        }).collect::<Vec<_>>(),
+    });
+    let lines: Vec<String> = rows
+        .iter()
+        .map(|(p, st)| {
+            let st = serde_json::to_value(st).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default();
+            format!("{}  {:<9} {:<16} {}", p.proposal_id, st, p.acceptance.shape(), p.proposed_by)
+        })
+        .collect();
+    acli::emit_or_text("issue-proposals", data, fmt, move || {
+        for l in lines {
+            println!("{l}");
+        }
+    });
+    Ok(())
+}
+
+/// `lex issue approve|reject <proposal> --by WHO [--notes N]` — the human
+/// arbiter's verdict, recorded as a `Review` attestation on the proposal.
+/// `--by` is required: an approval nobody signed is not an approval.
+fn review(fmt: &OutputFormat, root: &std::path::Path, args: &[String], approve: bool) -> Result<()> {
+    let (verb, gerund, past) =
+        if approve { ("approve", "approving", "approved") } else { ("reject", "rejecting", "rejected") };
+    let mut id: Option<String> = None;
+    let mut by: Option<String> = None;
+    let mut notes: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--by" => by = Some(it.next().cloned().ok_or_else(|| anyhow!("--by needs a value"))?),
+            "--notes" => notes = Some(it.next().cloned().ok_or_else(|| anyhow!("--notes needs a value"))?),
+            other if !other.starts_with("--") && id.is_none() => id = Some(other.to_string()),
+            other => bail!("unexpected arg `{other}`"),
+        }
+    }
+    let id = id.ok_or_else(|| anyhow!("usage: lex issue {verb} <proposal> --by WHO [--notes N]"))?;
+    let by = by
+        .filter(|b| !b.trim().is_empty())
+        .ok_or_else(|| anyhow!("--by is required: name who is {gerund} this proposal"))?;
+    let log = IssueLog::open(root)?;
+    let p = log.get_proposal(&id)?.ok_or_else(|| anyhow!("unknown proposal `{id}`"))?;
+    let store = Store::open(root)?;
+    let attestation = record_proposal_review(&store, &p, &by, approve, notes)?;
+    let status = proposal_status(&store, &p.proposal_id)?;
+    let data = serde_json::json!({
+        "proposal_id": p.proposal_id,
+        "issue_id": p.issue_id,
+        "status": status,
+        "reviewer": by,
+        "attestation_id": attestation,
+    });
+    let line = format!("{past}: {} for issue {} (attestation {attestation})", p.proposal_id, p.issue_id);
+    acli::emit_or_text(&format!("issue-{verb}"), data, fmt, move || println!("{line}"));
+    Ok(())
 }
 
 #[cfg(test)]
