@@ -365,6 +365,7 @@ fn op_kind_tag(k: &lex_vcs::OperationKind) -> &'static str {
         InlineLet { .. } => "inline_let",
         Candidate { .. } => "candidate",
         Promote { .. } => "promote",
+        SetFiles { .. } => "set_files",
     }
 }
 

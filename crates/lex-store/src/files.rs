@@ -16,14 +16,15 @@
 //! [`Manifest::from_bytes`] accepts only that exact encoding, so one file set
 //! has exactly one manifest id.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use lex_vcs::{OpId, OpLog, OperationKind, OperationRecord};
 use serde::{Deserialize, Serialize};
 
 use crate::{Store, StoreError};
 
 /// Content hash of a blob: lowercase hex SHA-256 of its exact bytes.
-pub type BlobId = String;
+pub use lex_vcs::BlobId;
 
 /// The only manifest format version this build reads and writes.
 pub const MANIFEST_VERSION: u32 = 1;
@@ -82,6 +83,12 @@ pub enum ManifestError {
     InvalidMode { path: String, mode: String },
     #[error("`{path}`: `{blob}` is not a blob id")]
     InvalidBlobId { path: String, blob: String },
+    #[error("`{path}`: manifest says {expected} byte(s), blob holds {actual}")]
+    SizeMismatch {
+        path: String,
+        expected: u64,
+        actual: u64,
+    },
 }
 
 /// Whether `path` belongs to the op-log rather than the manifest:
@@ -230,5 +237,205 @@ impl Store {
             .filter(|id| !self.has_blob(id))
             .cloned()
             .collect()
+    }
+}
+
+// ── SetFiles: the manifest in the op DAG (#1007 PR 2) ───────────────────────
+
+/// Why an op has nothing to replay, by kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, thiserror::Error)]
+#[serde(rename_all = "snake_case")]
+pub enum NotReplayable {
+    /// A `SetFiles` snapshot: files are recorded, not regenerated.
+    #[error("files snapshot (set_files) — not a program change")]
+    Files,
+}
+
+/// Refuse a non-semantic op before any replay machinery sees it.
+pub(crate) fn refuse_non_semantic(rec: &OperationRecord) -> Result<(), StoreError> {
+    match rec.op.kind {
+        OperationKind::SetFiles { .. } => Err(StoreError::NotReplayable {
+            op_id: rec.op_id.clone(),
+            why: NotReplayable::Files,
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// The files manifest in force at an op.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ManifestAt {
+    /// No `SetFiles` in the op's history: the repository has no files
+    /// beyond the op-log.
+    Absent,
+    /// The manifest set by the nearest `SetFiles` ancestor (or the op
+    /// itself).
+    Set { manifest: BlobId },
+    /// A merge whose parents carry different manifests (or an ancestor
+    /// that is itself ambiguous). There is no well-defined file set until
+    /// a `SetFiles` on top of the merge records the merged manifest. Fails
+    /// closed; independent of parent order.
+    Ambiguous,
+}
+
+impl ManifestAt {
+    /// The manifest id, when there is exactly one.
+    pub fn manifest(&self) -> Option<&BlobId> {
+        match self {
+            ManifestAt::Set { manifest } => Some(manifest),
+            _ => None,
+        }
+    }
+}
+
+/// Combine parents' manifests: all equal → that value; otherwise
+/// `Ambiguous`. No parents → `Absent`. Symmetric, so parent order (which
+/// `Operation::new` sorts by OpId anyway) cannot change the answer.
+fn combine<'a>(mut parents: impl Iterator<Item = &'a ManifestAt>) -> ManifestAt {
+    let Some(first) = parents.next() else {
+        return ManifestAt::Absent;
+    };
+    if parents.all(|p| p == first) {
+        first.clone()
+    } else {
+        ManifestAt::Ambiguous
+    }
+}
+
+/// `manifest_at(op)` over the DAG, iteratively (histories are deep).
+///
+/// `memo` carries known answers in and out — a head snapshot seeds it with
+/// the snapshot op's value, so extending a cached head only visits new ops.
+/// `pre` holds records already in memory (e.g. from `walk_forward_since`),
+/// consulted before the on-disk log. A walk stops at the nearest `SetFiles`
+/// on every path. An op missing from an incomplete local log counts as
+/// `Absent`, the same leniency `branch_head` applies to its transitions.
+pub(crate) fn resolve_manifest_at(
+    log: &OpLog,
+    op: &OpId,
+    memo: &mut HashMap<OpId, ManifestAt>,
+    pre: &HashMap<&str, &OperationRecord>,
+) -> Result<ManifestAt, StoreError> {
+    let mut parents_of: HashMap<OpId, Vec<OpId>> = HashMap::new();
+    let mut stack: Vec<OpId> = vec![op.clone()];
+    while let Some(id) = stack.last().cloned() {
+        if memo.contains_key(&id) {
+            stack.pop();
+            continue;
+        }
+        if !parents_of.contains_key(&id) {
+            let loaded;
+            let rec = match pre.get(id.as_str()) {
+                Some(r) => Some(*r),
+                None => {
+                    loaded = log.get(&id)?;
+                    loaded.as_ref()
+                }
+            };
+            match rec {
+                None => {
+                    memo.insert(id, ManifestAt::Absent);
+                    stack.pop();
+                    continue;
+                }
+                Some(r) => {
+                    if let OperationKind::SetFiles { manifest } = &r.op.kind {
+                        memo.insert(
+                            id,
+                            ManifestAt::Set {
+                                manifest: manifest.clone(),
+                            },
+                        );
+                        stack.pop();
+                        continue;
+                    }
+                    parents_of.insert(id.clone(), r.op.parents.clone());
+                }
+            }
+        }
+        let parents = &parents_of[&id];
+        let pending: Vec<OpId> = parents
+            .iter()
+            .filter(|p| !memo.contains_key(*p))
+            .cloned()
+            .collect();
+        if !pending.is_empty() {
+            stack.extend(pending);
+            continue;
+        }
+        let value = combine(parents.iter().map(|p| &memo[p]));
+        memo.insert(id, value);
+        stack.pop();
+    }
+    Ok(memo[op].clone())
+}
+
+impl Store {
+    /// The files manifest in force at `op_id` (#1007): its own if it is a
+    /// `SetFiles`, else inherited through its parents — see [`ManifestAt`].
+    /// `UnknownOp` if `op_id` is not in the log.
+    pub fn manifest_at(&self, op_id: &str) -> Result<ManifestAt, StoreError> {
+        let log = OpLog::open(self.root())?;
+        let op_id = op_id.to_string();
+        if log.get(&op_id)?.is_none() {
+            return Err(StoreError::UnknownOp(op_id));
+        }
+        resolve_manifest_at(&log, &op_id, &mut HashMap::new(), &HashMap::new())
+    }
+
+    /// Check that `manifest` may become the file set of a head: it decodes
+    /// as a canonical, valid manifest (no reserved `src/**/*.lex` paths),
+    /// every entry blob is present, and each blob's length matches its
+    /// entry's `size`. Writes nothing.
+    pub fn validate_set_files(&self, manifest: &str) -> Result<Manifest, StoreError> {
+        if !self.has_blob(manifest) {
+            return Err(StoreError::MissingBlobs(vec![manifest.to_string()]));
+        }
+        let m = self.get_manifest(manifest)?;
+        let missing = self.manifest_closure_missing(&m);
+        if !missing.is_empty() {
+            return Err(StoreError::MissingBlobs(missing));
+        }
+        for (path, e) in &m.entries {
+            let actual = self.blob_len(&e.blob).unwrap_or(0);
+            if actual != e.size {
+                return Err(StoreError::InvalidManifest(ManifestError::SizeMismatch {
+                    path: path.clone(),
+                    expected: e.size,
+                    actual,
+                }));
+            }
+        }
+        Ok(m)
+    }
+
+    /// Append a `SetFiles { manifest }` op to `branch` (#1007): the
+    /// repository's non-op-log files become exactly the snapshot `manifest`
+    /// names. The sig→stage map is untouched.
+    ///
+    /// Validated first ([`Self::validate_set_files`]); on any failure
+    /// nothing is persisted and the head is unchanged. Goes through the
+    /// same CAS advance (and branch-advance policy gate) as every other op.
+    /// Always appends: a caller that wants "no op when unchanged" compares
+    /// against [`Self::branch_manifest`] first.
+    pub fn apply_set_files(
+        &self,
+        branch: &str,
+        manifest: &str,
+        intent_id: Option<&lex_vcs::IntentId>,
+    ) -> Result<OpId, StoreError> {
+        self.validate_set_files(manifest)?;
+        let head = self.get_branch(branch)?.and_then(|b| b.head_op);
+        let mut op = lex_vcs::Operation::new(
+            OperationKind::SetFiles {
+                manifest: manifest.to_string(),
+            },
+            head,
+        );
+        if let Some(i) = intent_id {
+            op = op.with_intent(i.clone());
+        }
+        self.apply_operation(branch, op, lex_vcs::StageTransition::FilesOnly)
     }
 }

@@ -227,7 +227,29 @@ const GOLDENS: &[Golden] = &[
         canonical_json: r#"{"op":"add_function","sig_id":"fetch_weather::Str->Str","stage_id":"stage-w-1","effects":["net(\"wttr.in\")"],"parents":["op-parent"]}"#,
         op_id: "3bfc418d9ff7b334eb784fa103216f23ed4e91a51c4ed7cc193cb6592ebea23f",
     },
+    // #1007 — additive; every golden above is byte-identical to before.
+    Golden {
+        name: "set_files",
+        op: set_files,
+        canonical_json: r#"{"op":"set_files","manifest":"dd78532ecbfda2ce0b0d40be6ded96c79bd065580de47f7c6a05664d0226566b","parents":["op-parent"],"intent_id":"intent-a"}"#,
+        op_id: "6416c93bedb7ede11d920fdd2529391fd6437365ea6c5e9ae2648360378a0723",
+    },
 ];
+
+/// #1007: the non-semantic files snapshot op. Carries an intent (a
+/// `SetFiles` still answers "why did CI change"), so the golden also pins
+/// that the intent rides in its canonical form like any other kind.
+fn set_files() -> Operation {
+    Operation::new(
+        OperationKind::SetFiles {
+            // The canonical-manifest golden from lex-store's
+            // files_manifest_1007.rs.
+            manifest: "dd78532ecbfda2ce0b0d40be6ded96c79bd065580de47f7c6a05664d0226566b".into(),
+        },
+        ["op-parent".into()],
+    )
+    .with_intent("intent-a")
+}
 
 /// Helper used during golden capture: print the live canonical pre-
 /// image and `op_id` for every entry. Run with `cargo test -p
@@ -318,6 +340,7 @@ fn every_variant_is_covered() {
         "add_import",
         "add_type",
         "merge",
+        "set_files",
     ];
     for tag in required {
         assert!(
@@ -345,5 +368,6 @@ fn variant_tag(k: &OperationKind) -> &'static str {
         OperationKind::InlineLet { .. } => "inline_let",
         OperationKind::Candidate { .. } => "candidate",
         OperationKind::Promote { .. } => "promote",
+        OperationKind::SetFiles { .. } => "set_files",
     }
 }

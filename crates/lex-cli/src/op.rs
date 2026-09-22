@@ -484,7 +484,13 @@ fn render_record(r: &OperationRecord) {
     let kind_label = serde_json::to_value(&r.op.kind).ok()
         .and_then(|v| v.get("op").and_then(|s| s.as_str().map(str::to_string)))
         .unwrap_or_else(|| "?".into());
-    println!("kind:    {kind_label}");
+    // #1007: a files snapshot is recorded history but not a program change;
+    // mark it so a reader never mistakes it for a semantic edit.
+    let files_mark = if r.op.kind.is_semantic() { "" } else { " [files]" };
+    println!("kind:    {kind_label}{files_mark}");
+    if let lex_vcs::OperationKind::SetFiles { manifest } = &r.op.kind {
+        println!("files:   {manifest}");
+    }
     if r.op.parents.is_empty() {
         println!("parents: (none)");
     } else {
