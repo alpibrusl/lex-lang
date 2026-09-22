@@ -612,9 +612,16 @@ pub(crate) fn publish_handler(state: &State, body: &str) -> Response<std::io::Cu
         Ok(h) => h,
         Err(e) => return error_response(500, format!("branch_head: {e}")),
     };
-    // Fns + types (#895) on both sides. Old side is the branch head.
+    // Fns + types (#895) on both sides. Old side is the branch head, read
+    // in one pass through the SigId the head names each stage by (#971):
+    // `get_ast` per entry re-read the whole stage index once per live
+    // declaration, and — StageIds being name-independent — resolved two
+    // functions differing only in name to one of the two, so the other was
+    // re-reported as an Add on every republish (#826).
+    let old_pairs: Vec<(String, String)> =
+        old_head.iter().map(|(sig, stg)| (sig.clone(), stg.clone())).collect();
     let old_head_stages: Vec<lex_ast::Stage> =
-        old_head.values().filter_map(|stg| store.get_ast(stg).ok()).collect();
+        store.get_asts_for_sigs_bulk(&old_pairs).into_iter().filter_map(Result::ok).collect();
     let old_fns = stage_fns(&old_head_stages);
     let new_fns = stage_fns(&stages);
     let old_types = stage_types(&old_head_stages);
