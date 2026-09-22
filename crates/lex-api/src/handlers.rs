@@ -72,6 +72,10 @@ pub struct State {
     /// (`allow_fs_read`, …) or it re-opens the wildcard. Granting
     /// none of those kinds is the safe default.
     pub policy_ceiling: Option<Policy>,
+    /// Per-head op-history indexes and paged deltas behind
+    /// `/v1/ops/since` (#971), so a paged pull walks the op log once
+    /// instead of once per page. See [`crate::ops_since_http`].
+    pub(crate) ops_since: Mutex<crate::ops_since_http::OpsSinceCache>,
 }
 
 /// Server-side wrapper around [`MergeSession`] carrying the
@@ -104,6 +108,7 @@ impl State {
             root,
             sessions: Mutex::new(HashMap::new()),
             policy_ceiling,
+            ops_since: Mutex::new(Default::default()),
         })
     }
 
@@ -479,7 +484,7 @@ fn route(
         // ---- #260: append-only fetch (inverse of #242 push)
         // Body is a JSON array of OperationRecords reachable from
         // `branch.head_op` but not from `after`, oldest-first.
-        (Method::Get, "/v1/ops/since") => ops_since_handler(state, query),
+        (Method::Get, "/v1/ops/since") => crate::ops_since_http::ops_since_handler(state, query),
         (Method::Get, "/v1/attestations/since") => attestations_since_handler(state, query),
         // ---- #4: package concept ----------------------------------
         // POST /v1/pkg/publish is handled in handle() before route()
@@ -607,9 +612,16 @@ pub(crate) fn publish_handler(state: &State, body: &str) -> Response<std::io::Cu
         Ok(h) => h,
         Err(e) => return error_response(500, format!("branch_head: {e}")),
     };
-    // Fns + types (#895) on both sides. Old side is the branch head.
+    // Fns + types (#895) on both sides. Old side is the branch head, read
+    // in one pass through the SigId the head names each stage by (#971):
+    // `get_ast` per entry re-read the whole stage index once per live
+    // declaration, and — StageIds being name-independent — resolved two
+    // functions differing only in name to one of the two, so the other was
+    // re-reported as an Add on every republish (#826).
+    let old_pairs: Vec<(String, String)> =
+        old_head.iter().map(|(sig, stg)| (sig.clone(), stg.clone())).collect();
     let old_head_stages: Vec<lex_ast::Stage> =
-        old_head.values().filter_map(|stg| store.get_ast(stg).ok()).collect();
+        store.get_asts_for_sigs_bulk(&old_pairs).into_iter().filter_map(Result::ok).collect();
     let old_fns = stage_fns(&old_head_stages);
     let new_fns = stage_fns(&stages);
     let old_types = stage_types(&old_head_stages);
@@ -1496,89 +1508,6 @@ pub(crate) fn attestations_batch_handler(state: &State, body: &str)
         "skipped": attestations.len() - added,
         "added_ids": added_ids,
     }))
-}
-
-/// `GET /v1/branches/<name>/head` (#242 follow-up). Probe endpoint
-/// the `lex op push` client uses to discover the remote head before
-/// computing a delta against `OpLog::ops_since`.
-///
-/// Response: `{ "branch": "main", "head_op": Option<OpId> }`.
-/// Returns 200 even when the branch doesn't exist locally — the
-/// answer in that case is `head_op: null`, which is the right
-/// signal for "send everything you have."
-/// `GET /v1/ops/since?after=<op_id>&branch=<name>&limit=<n>` (#260).
-/// Server endpoint for `lex op pull`.
-///
-/// Returns a JSON array of `OperationRecord`s reachable from
-/// `branch.head_op` but not from `<after>`, sorted **oldest-first**
-/// so the client can apply them in topological order without
-/// re-sorting. Empty array when:
-///
-/// * The branch doesn't exist on the remote.
-/// * The branch's `head_op` is `None`.
-/// * `after == branch.head_op` (caller is already at the remote's head).
-/// * `after` is *ahead of* the remote's head (caller is past the
-///   remote — the symmetric "remote behind" case from #260).
-///
-/// `branch` defaults to `main`. `limit` caps the response — useful
-/// for chunked pulls of large gaps; clients re-issue with the next
-/// `after` once the prefix has landed.
-///
-/// Failure modes:
-///
-/// * `400` if the query string is malformed.
-/// * `200` with `[]` for any of the empty-result cases above. "Caller
-///   is already up to date" is a normal answer, not an error.
-pub(crate) fn ops_since_handler(state: &State, query: &str)
-    -> Response<std::io::Cursor<Vec<u8>>>
-{
-    let mut after: Option<String> = None;
-    let mut branch = String::from("main");
-    let mut limit: Option<usize> = None;
-    for kv in query.split('&') {
-        let Some((k, v)) = kv.split_once('=') else { continue };
-        match k {
-            "after" => after = Some(v.to_string()),
-            "branch" => branch = v.to_string(),
-            "limit" => {
-                limit = Some(match v.parse::<usize>() {
-                    Ok(n) => n,
-                    Err(_) => return error_response(400,
-                        format!("limit must be a positive integer, got `{v}`")),
-                });
-            }
-            _ => {}
-        }
-    }
-
-    let store = state.store.lock().unwrap();
-    let log = match lex_vcs::OpLog::open(store.root()) {
-        Ok(l) => l,
-        Err(e) => return error_response(500, format!("opening op log: {e}")),
-    };
-    let head = match store.get_branch(&branch) {
-        Ok(Some(b)) => b.head_op,
-        Ok(None) => None,
-        Err(e) => return error_response(500, format!("get_branch: {e}")),
-    };
-    let Some(head) = head else {
-        return json_response(200, &serde_json::json!([]));
-    };
-
-    let ops_since = match log.ops_since(&head, after.as_ref()) {
-        Ok(o) => o,
-        Err(e) => return error_response(500, format!("ops_since: {e}")),
-    };
-    // ops_since walks newest-first; reverse so the client receives
-    // oldest-first and can apply them in topological order with
-    // `OpLog::put` straight through.
-    let mut ops = ops_since;
-    ops.reverse();
-    if let Some(n) = limit {
-        ops.truncate(n);
-    }
-
-    json_response(200, &serde_json::to_value(&ops).unwrap_or_default())
 }
 
 /// `GET /v1/attestations/since?after-op=<op_id>&limit=<n>` (#260).

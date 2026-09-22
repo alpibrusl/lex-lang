@@ -290,14 +290,16 @@ fn classify_transport(endpoint: &str, e: ureq::Error, timeout: Option<Duration>)
     }
 }
 
-/// One attempt: send, then classify status → body → JSON.
+/// One attempt: send, then classify status → body → JSON. `capture` names
+/// a response header to hand back alongside the body (`None` if absent).
 fn attempt<T: DeserializeOwned>(
     url: &str,
     endpoint: &str,
     body: Option<&str>,
     token: Option<&str>,
     policy: &RetryPolicy,
-) -> Result<T, SyncError> {
+    capture: Option<&str>,
+) -> Result<(T, Option<String>), SyncError> {
     let sent = match body {
         Some(b) => crate::op::with_auth(ureq::post(url), token)
             .config()
@@ -313,6 +315,10 @@ fn attempt<T: DeserializeOwned>(
     };
     let resp = sent.map_err(|e| classify_transport(endpoint, e, policy.timeout))?;
     let status = resp.status().as_u16();
+    let captured = capture
+        .and_then(|h| resp.headers().get(h))
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
     let read = resp
         .into_body()
         .with_config()
@@ -360,12 +366,14 @@ fn attempt<T: DeserializeOwned>(
             status,
         });
     }
-    serde_json::from_slice(&bytes).map_err(|e| SyncError::Parse {
-        endpoint: endpoint.into(),
-        status,
-        detail: e.to_string(),
-        body: snippet(&bytes),
-    })
+    serde_json::from_slice(&bytes)
+        .map(|v| (v, captured))
+        .map_err(|e| SyncError::Parse {
+            endpoint: endpoint.into(),
+            status,
+            detail: e.to_string(),
+            body: snippet(&bytes),
+        })
 }
 
 /// Send a sync request to `<remote><path>` and decode the JSON response.
@@ -379,6 +387,20 @@ pub(crate) fn request_json<T: DeserializeOwned>(
     retry: Retry,
     policy: &RetryPolicy,
 ) -> Result<T, SyncError> {
+    request_json_with_header(remote, path, body, token, retry, policy, None).map(|(v, _)| v)
+}
+
+/// [`request_json`], also returning the value of response header `capture`
+/// (e.g. `/v1/ops/since`'s `X-Lex-Next-Cursor`, #971) when present.
+pub(crate) fn request_json_with_header<T: DeserializeOwned>(
+    remote: &str,
+    path: &str,
+    body: Option<&str>,
+    token: Option<&str>,
+    retry: Retry,
+    policy: &RetryPolicy,
+    capture: Option<&str>,
+) -> Result<(T, Option<String>), SyncError> {
     let url = format!("{}{}", remote.trim_end_matches('/'), path);
     // Name the endpoint without the query string's cursor noise.
     let route = path.split('?').next().unwrap_or(path);
@@ -394,7 +416,7 @@ pub(crate) fn request_json<T: DeserializeOwned>(
     };
     let mut retries = 0u32;
     loop {
-        match attempt(&url, &endpoint, body, token, policy) {
+        match attempt(&url, &endpoint, body, token, policy, capture) {
             Ok(v) => return Ok(v),
             Err(e) if e.retryable() && retries < max_retries => {
                 let wait = policy.delay_for(retries);

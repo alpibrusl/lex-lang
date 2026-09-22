@@ -36,6 +36,7 @@ mod compute_diff;
 pub mod diff_report;
 mod diff_to_ops;
 mod gate;
+mod history_index;
 mod intent;
 mod issue;
 mod merge;
@@ -71,6 +72,7 @@ pub use merge_session::{
 pub use predicate::{evaluate, evaluate_with_resolver, IntentResolver, Predicate};
 pub use signing::{verify_message, verify_stage_id, Keypair, SigningError};
 pub use op_log::OpLog;
+pub use history_index::HistoryIndex;
 pub use operation::{
     budget_from_effects as operation_budget_from_effects, default_import_alias, EffectSet,
     ModuleRef, OpId, Operation, OperationFormat, OperationKind, OperationRecord, SigId, StageId,
