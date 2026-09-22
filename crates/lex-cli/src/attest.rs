@@ -759,26 +759,17 @@ pub(super) fn cmd_attest_push(fmt: &OutputFormat, args: &[String]) -> Result<()>
         return Ok(());
     }
 
-    let url = format!("{}/v1/attestations/batch", remote.trim_end_matches('/'));
     let body = serde_json::to_string(&to_send).map_err(|e| anyhow!("serializing batch: {e}"))?;
-    let resp = crate::op::with_auth(ureq::post(&url), token.as_deref())
-        .header("Content-Type", "application/json")
-        .send(body)
-        .map_err(|e| anyhow!("POST {url}: {e}"))?;
-    let status = resp.status().as_u16();
-    if status == 401 {
-        bail!(
-            "POST {url}: HTTP 401 unauthorized — pass --token or set LEXHUB_TOKEN \
-             (a tenant JWT or a store-scoped evk_ key)"
-        );
-    }
-    let resp_body: serde_json::Value = resp
-        .into_body()
-        .read_json()
-        .map_err(|e| anyhow!("decoding response: {e}"))?;
-    if status >= 400 {
-        bail!("server rejected batch (HTTP {status}): {resp_body}");
-    }
+    // Retry-safe: the server re-derives each content-addressed
+    // `attestation_id` and skips ones it already holds (#971).
+    let resp_body: serde_json::Value = crate::sync_client::request_json(
+        &remote,
+        "/v1/attestations/batch",
+        Some(&body),
+        token.as_deref(),
+        crate::sync_client::Retry::Idempotent,
+        &crate::sync_client::RetryPolicy::from_env(),
+    )?;
 
     let received = resp_body
         .get("received")
@@ -862,7 +853,7 @@ pub(super) fn cmd_attest_pull(fmt: &OutputFormat, args: &[String]) -> Result<()>
     ))?;
     let token = crate::op::resolve_token(token);
 
-    let mut url = format!("{}/v1/attestations/since", remote.trim_end_matches('/'),);
+    let mut url = String::from("/v1/attestations/since");
     let mut sep = '?';
     if let Some(op) = &since_op {
         url.push_str(&format!("{sep}after-op={op}"));
@@ -871,27 +862,15 @@ pub(super) fn cmd_attest_pull(fmt: &OutputFormat, args: &[String]) -> Result<()>
     if let Some(n) = limit {
         url.push_str(&format!("{sep}limit={n}"));
     }
-    let resp = crate::op::with_auth(ureq::get(&url), token.as_deref())
-        .call()
-        .map_err(|e| anyhow!("GET {url}: {e}"))?;
-    let status = resp.status().as_u16();
-    if status == 401 {
-        bail!(
-            "GET {url}: HTTP 401 unauthorized — pass --token or set LEXHUB_TOKEN \
-             (a tenant JWT or a store-scoped evk_ key)"
-        );
-    }
-    if status >= 400 {
-        let body = resp
-            .into_body()
-            .read_to_string()
-            .unwrap_or_else(|_| "(unreadable body)".into());
-        bail!("server returned HTTP {status}: {body}");
-    }
-    let received: Vec<lex_vcs::Attestation> = resp
-        .into_body()
-        .read_json()
-        .map_err(|e| anyhow!("decoding response from {url}: {e}"))?;
+    // Read-only, so retried on transient failures (#971).
+    let received: Vec<lex_vcs::Attestation> = crate::sync_client::request_json(
+        &remote,
+        &url,
+        None,
+        token.as_deref(),
+        crate::sync_client::Retry::Idempotent,
+        &crate::sync_client::RetryPolicy::from_env(),
+    )?;
 
     if dry_run {
         let ids: Vec<&String> = received.iter().map(|a| &a.attestation_id).collect();

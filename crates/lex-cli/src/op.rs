@@ -7,6 +7,8 @@ use lex_store::Store;
 use lex_vcs::{OpLog, OperationRecord};
 use std::path::PathBuf;
 
+use crate::sync_client::{request_json, Retry, RetryPolicy, SyncError};
+
 /// Prepare an outgoing request: disable ureq's "non-2xx is an error"
 /// behaviour and attach `Authorization: Bearer <token>` when a token is
 /// present (absent → unmodified, so unauthenticated `lex serve` remotes keep
@@ -660,22 +662,19 @@ fn cmd_op_push(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     }
 
     // Post the batch.
-    let url = format!("{}/v1/ops/batch", remote.trim_end_matches('/'));
+    // Retry-safe: the server skips any record whose content-addressed
+    // `op_id` it already holds (`ops_batch_handler`), so a re-send after a
+    // lost response converges to `added: 0` instead of duplicating.
     let body = serde_json::to_string(&to_send)
         .map_err(|e| anyhow!("serializing batch: {e}"))?;
-    let resp = with_auth(ureq::post(&url), token.as_deref())
-        .header("Content-Type", "application/json")
-        .send(body)
-        .map_err(|e| anyhow!("POST {url}: {e}"))?;
-    let status = resp.status().as_u16();
-    let resp_body: serde_json::Value = resp.into_body().read_json()
-        .map_err(|e| anyhow!("decoding response: {e}"))?;
-    if status == 401 {
-        bail!("remote requires auth (HTTP 401) — set LEXHUB_TOKEN or pass --token");
-    }
-    if status >= 400 {
-        bail!("server rejected batch (HTTP {status}): {resp_body}");
-    }
+    let resp_body: serde_json::Value = request_json(
+        &remote,
+        "/v1/ops/batch",
+        Some(&body),
+        token.as_deref(),
+        Retry::Idempotent,
+        &RetryPolicy::from_env(),
+    )?;
 
     let received = resp_body.get("received").and_then(|v| v.as_u64()).unwrap_or(0);
     let added = resp_body.get("added").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -689,27 +688,25 @@ fn cmd_op_push(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     // unpullable — the bug this fixes.
     let mut advance = String::from("unchanged");
     if let Some(head) = local_head.as_ref() {
-        let head_url = format!(
-            "{}/v1/branches/{}/head",
-            remote.trim_end_matches('/'),
-            branch,
-        );
         let head_body = serde_json::json!({ "head_op": head }).to_string();
-        let hr = with_auth(ureq::post(&head_url), token.as_deref())
-            .header("Content-Type", "application/json")
-            .send(head_body)
-            .map_err(|e| anyhow!("POST {head_url}: {e}"))?;
-        let hstatus = hr.status().as_u16();
-        let hbody: serde_json::Value = hr.into_body().read_json()
-            .map_err(|e| anyhow!("decoding branch-head response: {e}"))?;
-        if hstatus == 409 {
-            bail!("non-fast-forward: the remote branch `{branch}` has diverged from your local \
-                   head. The ops were uploaded, but the branch was not advanced. Pull and \
-                   reconcile first. ({hbody})");
-        }
-        if hstatus >= 400 {
-            bail!("server rejected branch-head advance (HTTP {hstatus}): {hbody}");
-        }
+        // Not retried: a ref update is only conditionally idempotent, and a
+        // retry racing a concurrent push could turn a success into a 409.
+        let hbody: serde_json::Value = match request_json(
+            &remote,
+            &format!("/v1/branches/{branch}/head"),
+            Some(&head_body),
+            token.as_deref(),
+            Retry::Once,
+            &RetryPolicy::from_env(),
+        ) {
+            Ok(v) => v,
+            Err(SyncError::Status { status: 409, body, .. }) => bail!(
+                "non-fast-forward: the remote branch `{branch}` has diverged from your local \
+                 head. The ops were uploaded, but the branch was not advanced. Pull and \
+                 reconcile first. ({body})"
+            ),
+            Err(e) => return Err(e.into()),
+        };
         advance = hbody.get("advance").and_then(|a| a.as_str()).unwrap_or("advanced").to_string();
     }
 
@@ -738,66 +735,44 @@ fn cmd_op_push(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 /// Err(_) on transport failure. The caller treats Err as "fall
 /// back to sending everything we have."
 pub(crate) fn probe_remote_head(remote: &str, branch: &str, token: Option<&str>) -> Result<Option<String>> {
-    let url = format!(
-        "{}/v1/branches/{branch}/head",
-        remote.trim_end_matches('/'),
-    );
-    let resp = with_auth(ureq::get(&url), token)
-        .call()
-        .map_err(|e| anyhow!("GET {url}: {e}"))?;
-    let status = resp.status().as_u16();
-    if status == 401 {
-        bail!("remote requires auth (HTTP 401) — set LEXHUB_TOKEN or pass --token");
-    }
-    let body: serde_json::Value = resp.into_body().read_json()
-        .map_err(|e| anyhow!("decoding response: {e}"))?;
+    let body: serde_json::Value = request_json(
+        remote,
+        &format!("/v1/branches/{branch}/head"),
+        None,
+        token,
+        Retry::Idempotent,
+        &RetryPolicy::from_env(),
+    )?;
     Ok(body.get("head_op")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string()))
 }
 
 /// POST a JSON body to `<remote><path>`, returning the parsed response.
-/// Shared by the stage/intent object-sync calls.
+/// Shared by the object-sync calls. Every caller is retry-safe: the `fetch` /
+/// `missing` endpoints are read-only, and the `batch` endpoints (stages,
+/// intents, issues, locks) store content-addressed and skip what they already
+/// hold, so a transient failure (#971) is retried with backoff.
 fn post_json(
     remote: &str,
     path: &str,
     body: &serde_json::Value,
     token: Option<&str>,
 ) -> Result<serde_json::Value> {
-    let url = format!("{}{}", remote.trim_end_matches('/'), path);
-    let resp = with_auth(ureq::post(&url), token)
-        .header("Content-Type", "application/json")
-        .send(body.to_string())
-        .map_err(|e| anyhow!("POST {url}: {e}"))?;
-    let status = resp.status().as_u16();
-    if status == 401 {
-        bail!("remote requires auth (HTTP 401) — set LEXHUB_TOKEN or pass --token");
-    }
-    let v: serde_json::Value = resp.into_body().with_config().limit(SYNC_BODY_LIMIT).read_json()
-        .map_err(|e| anyhow!("decoding {path} response: {e}"))?;
-    if status >= 400 {
-        bail!("server rejected {path} (HTTP {status}): {v}");
-    }
-    Ok(v)
+    Ok(request_json(
+        remote,
+        path,
+        Some(&body.to_string()),
+        token,
+        Retry::Idempotent,
+        &RetryPolicy::from_env(),
+    )?)
 }
 
 /// GET `<remote><path>`, returning the parsed JSON response. The read half's
 /// twin of [`post_json`], for the attestation-sync fetches.
 fn get_json(remote: &str, path: &str, token: Option<&str>) -> Result<serde_json::Value> {
-    let url = format!("{}{}", remote.trim_end_matches('/'), path);
-    let resp = with_auth(ureq::get(&url), token)
-        .call()
-        .map_err(|e| anyhow!("GET {url}: {e}"))?;
-    let status = resp.status().as_u16();
-    if status == 401 {
-        bail!("remote requires auth (HTTP 401) — set LEXHUB_TOKEN or pass --token");
-    }
-    let v: serde_json::Value = resp.into_body().with_config().limit(SYNC_BODY_LIMIT).read_json()
-        .map_err(|e| anyhow!("decoding {path} response: {e}"))?;
-    if status >= 400 {
-        bail!("server rejected {path} (HTTP {status}): {v}");
-    }
-    Ok(v)
+    Ok(request_json(remote, path, None, token, Retry::Idempotent, &RetryPolicy::from_env())?)
 }
 
 /// Stage/intent ids requested per `fetch` call. Stage blobs are ASTs and can
@@ -1312,10 +1287,6 @@ fn cmd_op_pull(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 /// stage/intent *ids*, not content), so a page of this many stays far under
 /// any response cap; content is fetched separately by `pull_objects`.
 const OPS_PAGE: usize = 1000;
-/// Belt-and-suspenders read cap for sync responses — ureq defaults to 10MB,
-/// which `/v1/ops/since` blew past on a large tenant. Pagination keeps pages
-/// small; this guards against a single oversized page/blob.
-const SYNC_BODY_LIMIT: u64 = 512 * 1024 * 1024;
 
 /// One page of `/v1/ops/since`: ops reachable from `branch.head_op` but not
 /// from `after`, oldest-first, capped at `limit`.
@@ -1326,26 +1297,11 @@ fn fetch_ops_since(
     limit: Option<usize>,
     token: Option<&str>,
 ) -> Result<Vec<OperationRecord>> {
-    let mut url = format!(
-        "{}/v1/ops/since?branch={branch}",
-        remote.trim_end_matches('/'),
-    );
-    if let Some(a) = after { url.push_str(&format!("&after={a}")); }
-    if let Some(n) = limit { url.push_str(&format!("&limit={n}")); }
-    let resp = with_auth(ureq::get(&url), token)
-        .call()
-        .map_err(|e| anyhow!("GET {url}: {e}"))?;
-    let status = resp.status().as_u16();
-    if status == 401 {
-        bail!("remote requires auth (HTTP 401) — set LEXHUB_TOKEN or pass --token");
-    }
-    if status >= 400 {
-        let body = resp.into_body().read_to_string()
-            .unwrap_or_else(|_| "(unreadable body)".into());
-        bail!("server returned HTTP {status}: {body}");
-    }
-    resp.into_body().with_config().limit(SYNC_BODY_LIMIT).read_json::<Vec<OperationRecord>>()
-        .map_err(|e| anyhow!("decoding response from {url}: {e}"))
+    let mut path = format!("/v1/ops/since?branch={branch}");
+    if let Some(a) = after { path.push_str(&format!("&after={a}")); }
+    if let Some(n) = limit { path.push_str(&format!("&limit={n}")); }
+    // Read-only and cursor-addressed, so safe to retry.
+    Ok(request_json(remote, &path, None, token, Retry::Idempotent, &RetryPolicy::from_env())?)
 }
 
 /// Pull the full op delta by paging through `/v1/ops/since` with a cursor,
