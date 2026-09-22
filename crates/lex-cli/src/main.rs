@@ -50,6 +50,7 @@ mod spec;
 mod stage;
 mod store;
 mod store_root;
+mod sync_client;
 mod test_runner;
 mod tool_registry;
 mod trust;
