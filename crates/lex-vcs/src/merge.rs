@@ -152,6 +152,9 @@ fn touched_sigs(k: &OperationKind) -> Vec<SigId> {
         // a sig's bake-off doesn't interact with concurrent
         // merges on other branches.
         OperationKind::Candidate { .. } => Vec::new(),
+        // Files are not sigs (#1007); a files-vs-files merge is decided
+        // by `manifest_at`, not here.
+        OperationKind::SetFiles { .. } => Vec::new(),
     }
 }
 
@@ -181,7 +184,7 @@ fn latest_stage(sig: &SigId, recs: &[&OperationRecord]) -> Option<StageId> {
             Replace { to, .. } => current = Some(to.clone()),
             Remove { .. } => current = None,
             Rename { body_stage_id, .. } => current = Some(body_stage_id.clone()),
-            ImportOnly | Merge { .. } => {}
+            ImportOnly | FilesOnly | Merge { .. } => {}
         }
     }
     current
@@ -199,7 +202,7 @@ fn head_at(op_log: &OpLog, head: &OpId) -> io::Result<BTreeMap<SigId, StageId>> 
                 map.remove(from);
                 map.insert(to.clone(), body_stage_id.clone());
             }
-            ImportOnly => {}
+            ImportOnly | FilesOnly => {}
             Merge { entries } => {
                 for (sig, stage) in entries {
                     match stage {
