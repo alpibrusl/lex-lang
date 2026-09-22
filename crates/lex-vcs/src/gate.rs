@@ -192,6 +192,7 @@ mod tests {
                 to_stage_id: "s2".into(),
                 from_budget: None,
                 to_budget: None,
+                to_sig_id: None,
             },
             ["someone-else".into()],
         );

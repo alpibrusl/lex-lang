@@ -89,6 +89,7 @@ fn modify_op(parent: &str, sig: &str, from: &str, to: &str) -> OperationRecord {
                 to_stage_id: to.into(),
                 from_budget: None,
                 to_budget: None,
+                to_sig_id: None,
             },
             [parent.to_string()],
         ),

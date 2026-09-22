@@ -28,6 +28,17 @@ pub enum StoreError {
     UnknownStage(String),
     #[error("unknown sig_id `{0}`")]
     UnknownSig(String),
+    /// A head names `(sig_id, stage_id)`, but the AST at `stage_id` is filed
+    /// under `filed_under` — the sig it actually hashes to — so no store can
+    /// ever hold the pair (#992). Distinct from [`Self::UnknownStage`]: the
+    /// content is present, it is just bound to the wrong identity. The shape
+    /// a pre-#992 `ChangeEffectSig` left behind (old sig, new stage).
+    #[error(
+        "unsatisfiable head entry: sig `{sig_id}` is bound to stage `{stage_id}`, \
+         but that stage is filed under sig `{filed_under}` (the sig its AST hashes to), \
+         so no store can hold the pair (#992)"
+    )]
+    UnsatisfiablePair { sig_id: String, stage_id: String, filed_under: String },
     #[error("invalid lifecycle transition: {0}")]
     InvalidTransition(String),
     #[error("unknown branch `{0}`")]
@@ -1925,6 +1936,24 @@ impl Store {
                 }
             }
             let transition = transition_for_kind(&kind);
+            // #992: a publish holds every stage it binds, so each pair the op
+            // leaves at the head must now be on disk. If it is not, the op and
+            // the stage it wrote disagree about the sig — refuse rather than
+            // advance onto a head no render can resolve. (The general gate in
+            // `cas_retry_advance` must tolerate a merely absent stage; this
+            // path has no such excuse.)
+            for (sig, stage) in bound_pairs(&transition) {
+                if !self.stage_file_exists(&sig, &stage) {
+                    return Err(match self.unsatisfiable_owner(&sig, &stage) {
+                        Some(owner) => StoreError::UnsatisfiablePair {
+                            sig_id: sig,
+                            stage_id: stage,
+                            filed_under: owner,
+                        },
+                        None => StoreError::UnknownStage(stage),
+                    });
+                }
+            }
             let attestable = attestable_stage_ids(&transition);
             let head_now = self.get_branch(branch)?.and_then(|b| b.head_op);
             let op =
@@ -1985,6 +2014,51 @@ impl Store {
             ops: ops_out,
             head_op,
         })
+    }
+
+    /// The sig `stage` is actually filed under, when binding it to `sig` is
+    /// **provably** unsatisfiable (#992): `(sig, stage)` cannot be read, yet
+    /// the store holds that very stage under a different sig. `None` when the
+    /// pair reads fine, and also when the stage is simply absent — an absent
+    /// blob (mid-pull, partial clone) proves nothing about satisfiability.
+    ///
+    /// Presence is judged by the stage file existing under the sig (a full
+    /// snapshot or a delta), not by decoding it: this runs over every head
+    /// entry on a ref advance, and a stat is all the question needs.
+    pub fn unsatisfiable_owner(&self, sig: &str, stage: &str) -> Option<String> {
+        if self.stage_file_exists(sig, stage) {
+            return None;
+        }
+        let (owner, _) = self.lookup_lifecycle(stage).ok()?;
+        if owner == sig || !self.stage_file_exists(&owner, stage) {
+            return None;
+        }
+        Some(owner)
+    }
+
+    fn stage_file_exists(&self, sig: &str, stage: &str) -> bool {
+        let dir = self.impl_dir(sig);
+        dir.join(format!("{stage}.ast.json")).exists()
+            || dir.join(format!("{stage}.delta.json")).exists()
+    }
+
+    /// Refuse the first provably unsatisfiable pair in `pairs` with
+    /// [`StoreError::UnsatisfiablePair`] — the write-time half of #992's
+    /// "always-valid HEAD". See [`Self::unsatisfiable_owner`] for what counts.
+    pub fn check_pairs_satisfiable<'a>(
+        &self,
+        pairs: impl IntoIterator<Item = (&'a String, &'a String)>,
+    ) -> Result<(), StoreError> {
+        for (sig, stage) in pairs {
+            if let Some(owner) = self.unsatisfiable_owner(sig, stage) {
+                return Err(StoreError::UnsatisfiablePair {
+                    sig_id: sig.clone(),
+                    stage_id: stage.clone(),
+                    filed_under: owner,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Head entries naming a `(sig, stage)` no store can hold, where that same
@@ -3755,6 +3829,7 @@ impl Store {
                 to_stage_id: modified_stage_id.clone(),
                 from_budget,
                 to_budget,
+                to_sig_id: None,
             },
             head_now.into_iter().collect::<Vec<_>>(),
         )
@@ -4012,6 +4087,12 @@ impl Store {
         // the same branch tip. Beyond that, surfacing `Contention`
         // is the right signal — clients should back off or batch.
         const MAX_ATTEMPTS: u32 = 32;
+        // #992: every single-op write funnels through here, so this is where
+        // "always-valid HEAD" is enforced for local writes. Refuse a
+        // transition that binds a sig to a stage filed under a *different*
+        // sig — the pair can never be read, so the head it produced could
+        // never be rendered. Checked before anything is persisted.
+        self.check_pairs_satisfiable(bound_pairs(&transition).iter().map(|(a, b)| (a, b)))?;
         // Single-parent ops can be rebuilt on retry; merge ops
         // can't (their two parents are meaningful, supplied by the
         // merge engine). For merges, single attempt: if CAS
@@ -4304,13 +4385,14 @@ fn stage_for_kind<'a>(
         // the declaration is there, but under its new (effect-bearing) sig —
         // so the AST was silently never written, leaving the head naming a
         // pair no store held. Same reason `RenameSymbol` already uses `to`.
-        ChangeEffectSig { sig_id, to_sig_id, .. } => {
+        // The same holds for any sig-moving modification: a type or example
+        // change under the same name is a new sig too.
+        ChangeEffectSig { sig_id, to_sig_id, .. }
+        | ModifyBody { sig_id, to_sig_id, .. }
+        | ModifyType { sig_id, to_sig_id, .. } => {
             Some(to_sig_id.clone().unwrap_or_else(|| sig_id.clone()))
         }
-        AddFunction { sig_id, .. }
-        | ModifyBody { sig_id, .. }
-        | AddType { sig_id, .. }
-        | ModifyType { sig_id, .. } => Some(sig_id.clone()),
+        AddFunction { sig_id, .. } | AddType { sig_id, .. } => Some(sig_id.clone()),
         RenameSymbol { to, .. } => Some(to.clone()),
         _ => None,
     };
@@ -4330,7 +4412,10 @@ fn stage_doc(stage: &Stage) -> Vec<String> {
     }
 }
 
-fn transition_for_kind(kind: &lex_vcs::OperationKind) -> lex_vcs::StageTransition {
+/// The head transition an op kind produces — the single source of truth for
+/// how an op moves the SigId→StageId map. Public so write paths that build
+/// ops by hand (`/v1/patch`) cannot drift from `publish_program` (#992).
+pub fn transition_for_kind(kind: &lex_vcs::OperationKind) -> lex_vcs::StageTransition {
     use lex_vcs::OperationKind::*;
     use lex_vcs::StageTransition;
     match kind {
@@ -4361,7 +4446,22 @@ fn transition_for_kind(kind: &lex_vcs::OperationKind) -> lex_vcs::StageTransitio
         //
         // Ops written before `to_sig_id` existed decode as `None` and keep the
         // old `Replace` behaviour, so historical logs replay unchanged.
+        //
+        // The same applies to `ModifyBody` / `ModifyType` whose signature
+        // (types, examples, type params) changed under an unchanged name.
         ChangeEffectSig {
+            sig_id,
+            to_stage_id,
+            to_sig_id: Some(to_sig),
+            ..
+        }
+        | ModifyBody {
+            sig_id,
+            to_stage_id,
+            to_sig_id: Some(to_sig),
+            ..
+        }
+        | ModifyType {
             sig_id,
             to_stage_id,
             to_sig_id: Some(to_sig),
@@ -4387,6 +4487,7 @@ fn transition_for_kind(kind: &lex_vcs::OperationKind) -> lex_vcs::StageTransitio
             sig_id,
             from_stage_id,
             to_stage_id,
+            ..
         }
         | ReplaceMatchArm {
             sig_id,
@@ -4501,6 +4602,21 @@ fn model_label(m: &lex_vcs::ModelDescriptor) -> String {
     match &m.version {
         Some(v) => format!("{}/{}@{}", m.provider, m.name, v),
         None => format!("{}/{}", m.provider, m.name),
+    }
+}
+
+/// Every `(sig, stage)` binding `t` leaves in the head map — what
+/// `apply_transition` inserts, as opposed to what it removes or supersedes.
+/// These are the pairs a render of the resulting head must be able to read
+/// (#992), so they are what the write-time gate checks.
+fn bound_pairs(t: &lex_vcs::StageTransition) -> Vec<(String, String)> {
+    use lex_vcs::StageTransition::*;
+    match t {
+        Merge { entries } => entries
+            .iter()
+            .filter_map(|(sig, stage)| stage.as_ref().map(|st| (sig.clone(), st.clone())))
+            .collect(),
+        other => produced_sig_stage(other).into_iter().collect(),
     }
 }
 

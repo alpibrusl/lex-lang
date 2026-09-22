@@ -70,6 +70,12 @@ fn land(store: &Store, src: &str) {
 
 /// Bind `sig` to `stage` even though `stage`'s AST is filed under another sig
 /// — the pre-#992 `Replace`, reproduced directly.
+///
+/// Every store write path now refuses this shape (see
+/// `unsatisfiable_pair_gate_992.rs`), so the damage is landed the way it
+/// actually reaches a store today: as history pulled from a remote, appended
+/// to the op log with the branch file fast-forwarded by hand, exactly as
+/// `lex op pull` does.
 fn strand(store: &Store, sig: &str, from: &str, to: &str) {
     let op = Operation::new(
         OperationKind::ModifyBody {
@@ -78,20 +84,28 @@ fn strand(store: &Store, sig: &str, from: &str, to: &str) {
             to_stage_id: to.to_string(),
             from_budget: None,
             to_budget: None,
+            to_sig_id: None,
         },
         head_op_vec(store),
     );
-    store
-        .apply_operation(
-            DEFAULT_BRANCH,
-            op,
-            StageTransition::Replace {
-                sig_id: sig.to_string(),
-                from: from.to_string(),
-                to: to.to_string(),
-            },
-        )
-        .expect("apply");
+    let parent = store.get_branch(DEFAULT_BRANCH).unwrap().and_then(|b| b.head_op);
+    let log = lex_vcs::OpLog::open(store.root()).unwrap();
+    let new_head = lex_vcs::apply(
+        &log,
+        parent.as_ref(),
+        op,
+        StageTransition::Replace {
+            sig_id: sig.to_string(),
+            from: from.to_string(),
+            to: to.to_string(),
+        },
+    )
+    .expect("append");
+    let path = store.root().join("branches").join(format!("{DEFAULT_BRANCH}.json"));
+    let mut branch: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    branch["head_op"] = serde_json::Value::String(new_head.op_id);
+    std::fs::write(&path, serde_json::to_vec_pretty(&branch).unwrap()).unwrap();
 }
 
 /// A store whose head carries exactly the `lex-web` damage: one declaration
@@ -257,6 +271,7 @@ fn the_twin_counts_even_when_the_head_no_longer_points_at_it() {
             to_stage_id: new_stage.clone(),
             from_budget: None,
             to_budget: None,
+            to_sig_id: None,
         },
         head_op_vec(&store),
     );

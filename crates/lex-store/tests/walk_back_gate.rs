@@ -67,6 +67,7 @@ fn modify_op(sig: &str, parent: &lex_vcs::OpId, from: &str, to: &str)
                 to_stage_id: to.into(),
                 from_budget: None,
                 to_budget: None,
+                to_sig_id: None,
             },
             [parent.clone()],
         ),

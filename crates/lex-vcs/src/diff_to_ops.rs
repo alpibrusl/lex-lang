@@ -203,6 +203,13 @@ pub fn diff_to_ops(inputs: DiffInputs<'_>) -> Result<Vec<OperationKind>, DiffMap
         };
         let effects_changed =
             !m.effect_changes.added.is_empty() || !m.effect_changes.removed.is_empty();
+        // #992: record the sig the declaration moves *to* whenever the new
+        // stage hashes to a different one. A SigId covers the effect row, the
+        // input/output types, the signature-level examples and (for a type)
+        // its params — so any of those changing under the same name is a sig
+        // move, and leaving the head bound to the old sig produces an entry no
+        // store can ever satisfy. `None` for a body-only change.
+        let to_sig_id = sig_id(stage).filter(|s| s != sig);
         match stage {
             Stage::FnDecl(fd) if effects_changed => {
                 let from_effects = inputs.old_effects.get(sig).cloned().unwrap_or_default();
@@ -212,12 +219,6 @@ pub fn diff_to_ops(inputs: DiffInputs<'_>) -> Result<Vec<OperationKind>, DiffMap
                 // includes the `[budget(N)]` declaration itself.
                 let from_budget = crate::operation::budget_from_effects(&from_effects);
                 let to_budget = crate::operation::budget_from_effects(&to_effects);
-                // #992: record the sig the declaration moves *to*. A SigId
-                // covers the effect row, so the new stage belongs to a new
-                // sig; leaving the head bound to the old one produces an
-                // entry no store can ever satisfy. `None` when the sig is
-                // somehow unchanged, which keeps the plain Replace shape.
-                let to_sig_id = sig_id(stage).filter(|s| s != sig);
                 out.push(OperationKind::ChangeEffectSig {
                     sig_id: sig.clone(),
                     from_stage_id: from_id.clone(),
@@ -243,6 +244,7 @@ pub fn diff_to_ops(inputs: DiffInputs<'_>) -> Result<Vec<OperationKind>, DiffMap
                     to_stage_id: to_id,
                     from_budget: budget,
                     to_budget: budget,
+                    to_sig_id,
                 });
             }
             Stage::TypeDecl(_) => {
@@ -250,6 +252,7 @@ pub fn diff_to_ops(inputs: DiffInputs<'_>) -> Result<Vec<OperationKind>, DiffMap
                     sig_id: sig.clone(),
                     from_stage_id: from_id.clone(),
                     to_stage_id: to_id,
+                    to_sig_id,
                 });
             }
             Stage::Import(_) => unreachable!(),

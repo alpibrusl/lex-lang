@@ -67,6 +67,7 @@ fn land_modify(s: &Store, branch: &str, src: &str, name: &str) -> String {
             to_stage_id: new_stg.clone(),
             from_budget: None,
             to_budget: None,
+            to_sig_id: None,
         },
         head_op_vec(s, branch),
     );
@@ -119,6 +120,7 @@ fn resolve_checked_rejects_a_pick_that_calls_a_dropped_helper() {
                 to_stage_id: new_stg.clone(),
                 from_budget: None,
                 to_budget: None,
+                to_sig_id: None,
             },
             head_op_vec(&s, "feature"),
         );

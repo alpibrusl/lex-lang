@@ -485,6 +485,7 @@ mod tests {
                     to_stage_id: "stage-1".into(),
                     from_budget: None,
                     to_budget: None,
+                    to_sig_id: None,
                 },
                 [r0.op_id.clone()],
             ),
@@ -504,6 +505,7 @@ mod tests {
                     to_stage_id: "stage-2".into(),
                     from_budget: None,
                     to_budget: None,
+                    to_sig_id: None,
                 },
                 [r0.op_id.clone()],
             ),
@@ -638,6 +640,7 @@ mod tests {
                 to_stage_id: "stage-X".into(),
                 from_budget: None,
                 to_budget: None,
+                to_sig_id: None,
             },
             [],
         );
@@ -667,6 +670,7 @@ mod tests {
                 to_stage_id: "stage-merged".into(),
                 from_budget: None,
                 to_budget: None,
+                to_sig_id: None,
             },
             [src.clone(), dst.clone()],
         );

@@ -59,6 +59,7 @@ fn apply_operation_chains_against_existing_head() {
             to_stage_id: "stg-2".into(),
             from_budget: None,
             to_budget: None,
+            to_sig_id: None,
         },
         [op_id1.clone()],
     );
@@ -94,6 +95,7 @@ fn apply_operation_with_stale_parent_errors() {
             to_stage_id: "stg-2".into(),
             from_budget: None,
             to_budget: None,
+            to_sig_id: None,
         },
         ["someone-else".into()],
     );

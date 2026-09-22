@@ -98,7 +98,13 @@ pub fn package_head_at_op(store: &Store, head_op: &str) -> Result<PackageHead, S
                     m.remove(module);
                 }
             }
-            OperationKind::RenameSymbol { from, to, .. } => {
+            // #992: a sig-moving modification carries its file across exactly
+            // as a rename does — otherwise the moved declaration loses its
+            // `in_file`, and a multi-module package silently renders as one.
+            OperationKind::RenameSymbol { from, to, .. }
+            | OperationKind::ChangeEffectSig { sig_id: from, to_sig_id: Some(to), .. }
+            | OperationKind::ModifyBody { sig_id: from, to_sig_id: Some(to), .. }
+            | OperationKind::ModifyType { sig_id: from, to_sig_id: Some(to), .. } => {
                 if let Some(f) = head.sig_files.remove(from) {
                     head.sig_files.insert(to.clone(), f);
                 }
@@ -112,6 +118,18 @@ pub fn package_head_at_op(store: &Store, head_op: &str) -> Result<PackageHead, S
 /// Render a package head to source. Multi-module iff every head fn/type stage
 /// records its source file; otherwise a single module.
 pub fn render_source(store: &Store, head: &PackageHead) -> Result<RenderedSource, StoreError> {
+    render_source_inner(store, head).map_err(|e| match e {
+        // #992: a head can already carry an entry no store can hold (written
+        // before the write-time gate existed; releases are immutable). The
+        // per-stage read reports that as a bare `unknown stage_id` — misleading,
+        // since the stage *is* in the store, just under the sig its AST hashes
+        // to. Diagnose only on failure, so a healthy render pays nothing.
+        StoreError::UnknownStage(_) => store.check_pairs_satisfiable(&head.map).err().unwrap_or(e),
+        other => other,
+    })
+}
+
+fn render_source_inner(store: &Store, head: &PackageHead) -> Result<RenderedSource, StoreError> {
     let multi = !head.map.is_empty() && head.map.keys().all(|s| head.sig_files.contains_key(s));
     if multi {
         Ok(RenderedSource::Multi(render_multifile(store, head)?))

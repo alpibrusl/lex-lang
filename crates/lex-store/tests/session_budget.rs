@@ -142,6 +142,7 @@ fn modify_body_increase_contributes_delta_only() {
             to_stage_id: "stg-2".into(),
             from_budget: Some(5),
             to_budget: Some(12),
+            to_sig_id: None,
         },
         [parent],
     ).with_intent(&alpha);
@@ -171,6 +172,7 @@ fn modify_body_decrease_does_not_refund() {
             to_stage_id: "stg-2".into(),
             from_budget: Some(20),
             to_budget: Some(5),
+            to_sig_id: None,
         },
         [parent],
     ).with_intent(&alpha);

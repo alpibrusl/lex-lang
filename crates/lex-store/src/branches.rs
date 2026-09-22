@@ -413,6 +413,8 @@ impl Store {
         let current = self.get_branch(name)?.and_then(|b| b.head_op);
         match current {
             None => {
+                let history = lex_vcs::OpLog::open(self.root())?.walk_forward(new_head, None)?;
+                self.check_head_satisfiable(&history)?;
                 // First push to this branch (any name, not just main) —
                 // create it pointing at new_head.
                 let b = Branch {
@@ -433,11 +435,10 @@ impl Store {
                 // Fast-forward iff the current head is reachable from the
                 // new head (i.e. an ancestor of it).
                 let log = lex_vcs::OpLog::open(self.root())?;
-                let is_ff = log
-                    .walk_forward(new_head, None)?
-                    .iter()
-                    .any(|rec| rec.op_id == cur);
+                let history = log.walk_forward(new_head, None)?;
+                let is_ff = history.iter().any(|rec| rec.op_id == cur);
                 if is_ff {
+                    self.check_head_satisfiable(&history)?;
                     self.set_branch_head_op(name, new_head.clone())?;
                     Ok(BranchAdvance::FastForward)
                 } else {
@@ -449,6 +450,25 @@ impl Store {
                 }
             }
         }
+    }
+
+    /// #992: the ref half of `op push` must not move a branch onto a head
+    /// that names a `(sig, stage)` pair no store can hold. The op records
+    /// arrive verbatim from the client — an older one can still carry a
+    /// pre-#992 `ChangeEffectSig` `Replace` — so the hub cannot rely on the
+    /// client having produced a valid head. Only the *head* is checked, not
+    /// every pair history mentions: a historical pair is not rendered, and
+    /// refusing it would make such a package unpushable forever (#999). A
+    /// stage that is merely absent is not refused either — it proves nothing.
+    ///
+    /// `history` is `head_op`'s full forward walk, which the fast-forward
+    /// test has already paid for.
+    fn check_head_satisfiable(&self, history: &[lex_vcs::OperationRecord]) -> Result<(), StoreError> {
+        let mut map = BTreeMap::new();
+        for rec in history {
+            apply_transition(&mut map, &rec.produces);
+        }
+        self.check_pairs_satisfiable(&map)
     }
 
     pub(crate) fn set_branch_head_op(

@@ -140,6 +140,7 @@ fn budget_delta_returns_the_right_pair_per_variant() {
         to_stage_id: "s2".into(),
         from_budget: Some(10),
         to_budget: Some(50),
+        to_sig_id: None,
     };
     assert_eq!(modify.budget_delta(), (Some(10), Some(50)));
 
@@ -196,6 +197,7 @@ fn budget_chain_grow_shrink_reports_the_right_deltas() {
             to_stage_id: "s2".into(),
             from_budget: Some(10),
             to_budget: Some(50),
+            to_sig_id: None,
         },
         OperationKind::ChangeEffectSig {
             sig_id: "fac".into(),
@@ -213,6 +215,7 @@ fn budget_chain_grow_shrink_reports_the_right_deltas() {
             to_stage_id: "s4".into(),
             from_budget: Some(100),
             to_budget: Some(20),
+            to_sig_id: None,
         },
     ];
 
@@ -246,6 +249,7 @@ fn modify_body_with_unchanged_budget_round_trips_canonically() {
             to_stage_id: "s2".into(),
             from_budget: Some(50),
             to_budget: Some(50),
+            to_sig_id: None,
         },
         ["op-parent".into()],
     );
@@ -288,6 +292,7 @@ fn stage_transition_is_unchanged_for_budget_bearing_variants() {
         to_stage_id: "new".into(),
         from_budget: Some(10),
         to_budget: Some(20),
+        to_sig_id: None,
     };
     let _: StageTransition = StageTransition::Replace {
         sig_id: "f".into(),

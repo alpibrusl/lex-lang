@@ -434,6 +434,7 @@ mod tests {
                 to_stage_id: to.into(),
                 from_budget: None,
                 to_budget: None,
+                to_sig_id: None,
             },
             [parent.clone()],
         );
