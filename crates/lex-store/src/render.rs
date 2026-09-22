@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use lex_vcs::{default_import_alias, OpLog, OperationKind};
 
-use crate::store::{Store, StoreError};
+use crate::store::{SkippedStage, Store, StoreError};
 
 /// A package head decomposed into what the renderer needs: the SigId→StageId
 /// head map, each SigId's source file, and the imports (flat, and per-file).
@@ -283,6 +283,17 @@ pub(crate) fn demangled_head_stages(
     store: &Store,
     head_op: &str,
 ) -> Result<Vec<lex_ast::Stage>, StoreError> {
+    Ok(demangled_head_stages_impl(store, head_op, false)?.0)
+}
+
+/// [`demangled_head_stages`] with a choice of what to do about a head stage
+/// the store can't load: fail (`skip_unloadable = false`), or drop it and
+/// report it as a [`SkippedStage`] (#868 — replay over a long-lived history).
+pub(crate) fn demangled_head_stages_impl(
+    store: &Store,
+    head_op: &str,
+    skip_unloadable: bool,
+) -> Result<(Vec<lex_ast::Stage>, Vec<SkippedStage>), StoreError> {
     let head = package_head_at_op(store, head_op)?;
     let distinct_files: BTreeSet<&String> = head.sig_files.values().collect();
     if distinct_files.len() > 1 {
@@ -290,10 +301,7 @@ pub(crate) fn demangled_head_stages(
     }
     let pairs: Vec<(String, String)> =
         head.map.iter().map(|(s, st)| (s.clone(), st.clone())).collect();
-    let mut decls: Vec<lex_ast::Stage> = Vec::new();
-    for ast in store.get_asts_for_sigs_bulk(&pairs) {
-        decls.push(ast?);
-    }
+    let (mut decls, skipped) = store.load_head_decls(&pairs, skip_unloadable)?;
     // De-mangle exactly as `render_singlefile` does.
     let own_prefix = decls.iter().find_map(stage_prefix).unwrap_or_default();
     let mut bound_locals = BTreeSet::new();
@@ -319,7 +327,7 @@ pub(crate) fn demangled_head_stages(
         }));
     }
     stages.extend(decls);
-    Ok(stages)
+    Ok((stages, skipped))
 }
 
 /// The whole head as one source string (single module / #895 path). Imports

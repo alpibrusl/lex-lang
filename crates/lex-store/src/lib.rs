@@ -48,8 +48,8 @@ pub use gc::{GcPlan, RetentionReason};
 pub use lex_vcs::{OpId, Operation, OperationKind, OperationRecord, StageTransition};
 pub use model::{Lifecycle, Metadata, Spec, StageStatus, Test, Transition};
 pub use store::{
-    CandidateInfo, DepResolver, HubCiVerdict, PublishOp, PublishOutcome, ReplayOutcome,
-    ReplayRequest, StageHistoryEntry, Store, StoreError,
+    CandidateInfo, DepResolver, HubCiVerdict, PublishOp, PublishOutcome, ReconstructedProgram,
+    ReplayOutcome, ReplayRequest, SkippedStage, StageHistoryEntry, Store, StoreError,
 };
 pub use branches::{
     Branch, BranchAdvance, MergeConflict, MergeEntry, MergeRecord, MergeReport, MergeSummary,

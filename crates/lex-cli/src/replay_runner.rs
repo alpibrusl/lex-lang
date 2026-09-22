@@ -35,6 +35,22 @@ pub fn regen_prompt(req: &ReplayRequest) -> String {
         p.push_str(&req.parent_program);
         p.push_str("\n\n");
     }
+    // #868: the parent program may be missing declarations the store could
+    // not load. Say so, so a regenerator doesn't take a dangling reference
+    // for a mistake to "fix" — the target may still call them by name.
+    if !req.skipped.is_empty() {
+        let names: Vec<String> = req
+            .skipped
+            .iter()
+            .map(|s| {
+                let n = s.name.as_deref().unwrap_or("<unknown>");
+                if s.called_by_target { format!("{n} (called by the target)") } else { n.to_string() }
+            })
+            .collect();
+        p.push_str("Note: these definitions exist in the program but could not be shown: ");
+        p.push_str(&names.join(", "));
+        p.push_str(". Assume they exist with their original meaning; do not redefine them.\n\n");
+    }
     match &req.prompt {
         Some(prompt) => {
             p.push_str("Intent (what was asked):\n");
@@ -195,6 +211,35 @@ fn strip_code_fences(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn req(skipped: Vec<lex_store::SkippedStage>) -> ReplayRequest {
+        ReplayRequest {
+            op_id: "op".into(),
+            target_sig: "sig".into(),
+            target_name: Some("g".into()),
+            target_signature: Some("fn g(x :: Int) -> Int".into()),
+            expected_stage_id: "st".into(),
+            prompt: None,
+            model: None,
+            session_id: None,
+            parent_program: "fn other(x :: Int) -> Int { x }\n".into(),
+            skipped,
+        }
+    }
+
+    #[test]
+    fn prompt_names_skipped_context_so_a_dangling_call_is_not_fixed() {
+        // #868: the regenerator must be told the parent program is partial.
+        assert!(!regen_prompt(&req(vec![])).contains("could not be shown"));
+        let p = regen_prompt(&req(vec![lex_store::SkippedStage {
+            sig_id: "hs".into(),
+            stage_id: "hst".into(),
+            name: Some("helper".into()),
+            reason: "unknown stage_id `hst`".into(),
+            called_by_target: true,
+        }]));
+        assert!(p.contains("could not be shown") && p.contains("helper (called by the target)"), "{p}");
+    }
 
     #[test]
     fn strips_fenced_output() {

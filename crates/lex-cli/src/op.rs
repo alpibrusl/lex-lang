@@ -133,6 +133,7 @@ fn cmd_op_replay(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                 None => println!("  prompt:          (none recorded)"),
             }
             println!("  parent program:  {} byte(s)", req.parent_program.len());
+            print_skipped(&req);
             println!("\nRegenerate with --candidate FILE, --ollama [MODEL], or --regenerate-cmd CMD\nto record the Replay attestation.");
         });
         return Ok(());
@@ -175,7 +176,20 @@ fn cmd_op_replay(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     // name/signature, so the regeneration and the record meet in the same
     // space. The attestation still carries the real (mangled) stage id:
     // `replay_record` looks it up from the op, so provenance is unchanged.
-    let expected_stages = store.demangled_program_at_op(&op_id).unwrap_or_default();
+    // #868: reconstruct skipping unloadable declarations (reported on
+    // `req.skipped`) rather than failing — or, as before, silently falling
+    // back to an empty program and losing the behavioral tier entirely.
+    let expected_stages = store
+        .demangled_program_at_op_skipping(&op_id)
+        .map(|r| r.stages)
+        .unwrap_or_default();
+    // #868: a negative verdict under incomplete context is weaker evidence —
+    // say so in the attestation's detail, not just in this process's output.
+    let ctx_note = req.context_note();
+    let detail = |d: String| match &ctx_note {
+        Some(n) => format!("{d} ({n})"),
+        None => d,
+    };
     // The recorded stage id addresses the *mangled* declaration, so it won't be
     // found here; locate the target by the bare name instead, falling back to
     // the id for a head that was never mangled (a single-file publish).
@@ -195,7 +209,7 @@ fn cmd_op_replay(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         .and_then(|fd| lex_ast::stage_id(&lex_ast::Stage::FnDecl(fd.clone())))
         .unwrap_or_else(|| req.expected_stage_id.clone());
     let outcome = match lex_syntax::parse_source(&src) {
-        Err(e) => store.replay_record_miss(&op_id, &format!("regenerated source did not parse: {e:?}"))?,
+        Err(e) => store.replay_record_miss(&op_id, &detail(format!("regenerated source did not parse: {e:?}")))?,
         Ok(prog) => {
             let stages = lex_ast::canonicalize_program(&prog);
             let cand = match recorded_fd {
@@ -228,19 +242,20 @@ fn cmd_op_replay(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                         match behavioral {
                             Some(n) => store.replay_record(&op_id, Some(pid), true, Some(n), None)?,
                             None => store.replay_record(&op_id, Some(pid), false, None,
-                                Some("regeneration did not reproduce the recorded stage".into()))?,
+                                Some(detail("regeneration did not reproduce the recorded stage".into())))?,
                         }
                     } else {
                         store.replay_record(&op_id, None, false, None,
-                            Some("regenerated candidate had no hashable stage".into()))?
+                            Some(detail("regenerated candidate had no hashable stage".into())))?
                     }
                 }
-                None => store.replay_record_miss(&op_id, &format!(
+                None => store.replay_record_miss(&op_id, &detail(format!(
                     "regenerated source did not define the target function {}",
-                    req.target_name.as_deref().unwrap_or(&req.target_sig)))?,
+                    req.target_name.as_deref().unwrap_or(&req.target_sig))))?,
             }
         }
-    };
+    }
+    .with_context_of(&req);
     let data = serde_json::to_value(&outcome)?;
     acli::emit_or_text("op-replay", data, fmt, move || {
         if outcome.reproduced {
@@ -258,8 +273,29 @@ fn cmd_op_replay(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                 outcome.produced_stage_id.as_deref().unwrap_or("(different sig / nothing)"));
         }
         println!("  Replay attestation: {}", outcome.attestation_id);
+        if outcome.context_incomplete {
+            println!("  note: replayed against an incomplete parent program");
+            print_skipped(&req);
+        }
     });
     Ok(())
+}
+
+/// List the parent-program declarations replay had to skip (#868).
+fn print_skipped(req: &lex_store::ReplayRequest) {
+    if req.skipped.is_empty() {
+        return;
+    }
+    println!("  skipped:         {} unloadable declaration(s) left out of the parent program", req.skipped.len());
+    for sk in &req.skipped {
+        println!(
+            "    - {} (stage {}){}: {}",
+            sk.name.as_deref().unwrap_or(&sk.sig_id),
+            sk.stage_id,
+            if sk.called_by_target { " [called by the target]" } else { "" },
+            sk.reason,
+        );
+    }
 }
 
 /// `lex op gc {--dry-run|--confirm} [--retain JSON ...] [--store DIR]`
