@@ -7,7 +7,7 @@ use lex_store::Store;
 use lex_vcs::{OpLog, OperationRecord};
 use std::path::PathBuf;
 
-use crate::sync_client::{request_json, Retry, RetryPolicy, SyncError};
+use crate::sync_client::{request_json, request_json_with_header, Retry, RetryPolicy, SyncError};
 
 /// Prepare an outgoing request: disable ureq's "non-2xx is an error"
 /// behaviour and attach `Authorization: Bearer <token>` when a token is
@@ -1361,26 +1361,38 @@ fn cmd_op_pull(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 const OPS_PAGE: usize = 1000;
 
 /// One page of `/v1/ops/since`: ops reachable from `branch.head_op` but not
-/// from `after`, oldest-first, capped at `limit`.
+/// from `after`, oldest-first, capped at `limit`, plus the server's
+/// `X-Lex-Next-Cursor` when more remain (#971). `cursor`, when set, resumes
+/// the pull where the previous page stopped; servers that predate cursors
+/// ignore it and answer from `after`, so both are always sent.
 fn fetch_ops_since(
     remote: &str,
     branch: &str,
     after: Option<&str>,
+    cursor: Option<&str>,
     limit: Option<usize>,
     token: Option<&str>,
-) -> Result<Vec<OperationRecord>> {
+) -> Result<(Vec<OperationRecord>, Option<String>)> {
     let mut path = format!("/v1/ops/since?branch={branch}");
     if let Some(a) = after { path.push_str(&format!("&after={a}")); }
+    if let Some(c) = cursor { path.push_str(&format!("&cursor={c}")); }
     if let Some(n) = limit { path.push_str(&format!("&limit={n}")); }
     // Read-only and cursor-addressed, so safe to retry.
-    Ok(request_json(remote, &path, None, token, Retry::Idempotent, &RetryPolicy::from_env())?)
+    Ok(request_json_with_header(
+        remote,
+        &path,
+        None,
+        token,
+        Retry::Idempotent,
+        &RetryPolicy::from_env(),
+        Some("X-Lex-Next-Cursor"),
+    )?)
 }
 
-/// Pull the full op delta by paging through `/v1/ops/since` with a cursor,
-/// so an arbitrarily long history transfers without a single response
-/// exceeding the read cap. `total_limit` (from `--limit`) caps the overall
-/// number pulled; `None` means all. Pages are oldest-first and stitched in
-/// order.
+/// Pull the full op delta by paging through `/v1/ops/since`, so an
+/// arbitrarily long history transfers without a single response exceeding
+/// the read cap. `total_limit` (from `--limit`) caps the overall number
+/// pulled; `None` means all. Pages are oldest-first and stitched in order.
 fn fetch_ops_paginated(
     remote: &str,
     branch: &str,
@@ -1388,24 +1400,49 @@ fn fetch_ops_paginated(
     total_limit: Option<usize>,
     token: Option<&str>,
 ) -> Result<Vec<OperationRecord>> {
+    page_ops(start_after, total_limit, OPS_PAGE, |after, cursor, want| {
+        fetch_ops_since(remote, branch, after, cursor, Some(want), token)
+    })
+}
+
+/// The paging loop behind [`fetch_ops_paginated`], over any page source
+/// `fetch(after, cursor, want) -> (page, next_cursor)`.
+///
+/// Each request carries `after=<last op received>` (what every server
+/// understands) and, once the server has sent one, the `cursor` it handed
+/// back, which lets a #971 server resume in O(page) instead of re-deriving
+/// the delta from `after`. A server that has sent cursors signals the end
+/// by omitting one; an older server never sends any, so for it the end is
+/// a short or empty page, as before.
+fn page_ops<F>(
+    start_after: Option<&str>,
+    total_limit: Option<usize>,
+    page_size: usize,
+    mut fetch: F,
+) -> Result<Vec<OperationRecord>>
+where
+    F: FnMut(Option<&str>, Option<&str>, usize) -> Result<(Vec<OperationRecord>, Option<String>)>,
+{
     let mut all: Vec<OperationRecord> = Vec::new();
-    let mut cursor: Option<String> = start_after.map(String::from);
+    let mut after: Option<String> = start_after.map(String::from);
+    let mut cursor: Option<String> = None;
     loop {
         let want = match total_limit {
             Some(t) if t <= all.len() => break,
-            Some(t) => (t - all.len()).min(OPS_PAGE),
-            None => OPS_PAGE,
+            Some(t) => (t - all.len()).min(page_size),
+            None => page_size,
         };
-        let page = fetch_ops_since(remote, branch, cursor.as_deref(), Some(want), token)?;
+        let (page, next) = fetch(after.as_deref(), cursor.as_deref(), want)?;
         if page.is_empty() {
             break;
         }
-        cursor = Some(page.last().unwrap().op_id.clone());
+        after = Some(page.last().unwrap().op_id.clone());
         let short = page.len() < want;
         all.extend(page);
-        if short {
+        if short || (cursor.is_some() && next.is_none()) {
             break; // last page
         }
+        cursor = next;
     }
     Ok(all)
 }
@@ -1477,5 +1514,83 @@ mod unsatisfiable_pair_tests {
         assert!(unsatisfiable_pair_message(422, &body).is_none());
         let body = serde_json::json!({ "error": "UnsatisfiablePair", "detail": {} });
         assert!(unsatisfiable_pair_message(500, &body).is_none());
+    }
+}
+
+#[cfg(test)]
+mod paging_tests {
+    use super::*;
+    use lex_vcs::{Operation, OperationKind, StageTransition};
+    use std::collections::BTreeSet;
+
+    fn ops(n: usize) -> Vec<OperationRecord> {
+        (0..n)
+            .map(|i| {
+                let kind = OperationKind::AddFunction {
+                    sig_id: format!("s{i}"),
+                    stage_id: format!("t{i}"),
+                    effects: BTreeSet::new(),
+                    budget_cost: None,
+                    in_file: None,
+                };
+                let t = StageTransition::Create { sig_id: format!("s{i}"), stage_id: format!("t{i}") };
+                OperationRecord::new(Operation::new(kind, []), t)
+            })
+            .collect()
+    }
+
+    fn pos_after(all: &[OperationRecord], after: Option<&str>) -> usize {
+        after.map_or(0, |a| all.iter().position(|r| r.op_id == a).unwrap() + 1)
+    }
+
+    /// A pre-#971 server: answers from `after`, never sends a cursor.
+    #[test]
+    fn legacy_server_pages_by_after_until_a_short_page() {
+        let all = ops(10);
+        let mut calls = Vec::new();
+        let got = page_ops(None, None, 3, |after, cursor, want| {
+            assert!(cursor.is_none());
+            let from = pos_after(&all, after);
+            calls.push(from);
+            Ok((all[from..(from + want).min(all.len())].to_vec(), None))
+        })
+        .unwrap();
+        assert_eq!(got.iter().map(|r| &r.op_id).collect::<Vec<_>>(), all.iter().map(|r| &r.op_id).collect::<Vec<_>>());
+        assert_eq!(calls, vec![0, 3, 6, 9]);
+    }
+
+    /// A #971 server: the client echoes the cursor (and still sends
+    /// `after`), and stops when the server stops sending one — no trailing
+    /// empty request when the delta is an exact multiple of the page.
+    #[test]
+    fn cursor_server_is_resumed_by_cursor_and_ends_without_an_empty_page() {
+        let all = ops(9);
+        let mut calls = Vec::new();
+        let got = page_ops(None, None, 3, |after, cursor, want| {
+            let from = match cursor {
+                Some(c) => c.parse::<usize>().unwrap(),
+                None => pos_after(&all, after),
+            };
+            assert_eq!(from, pos_after(&all, after), "`after` must track the cursor for old servers");
+            calls.push(from);
+            let end = (from + want).min(all.len());
+            let next = (end < all.len()).then(|| end.to_string());
+            Ok((all[from..end].to_vec(), next))
+        })
+        .unwrap();
+        assert_eq!(got.len(), 9);
+        assert_eq!(calls, vec![0, 3, 6]);
+    }
+
+    #[test]
+    fn total_limit_caps_the_pull() {
+        let all = ops(10);
+        let got = page_ops(None, Some(5), 3, |after, _, want| {
+            let from = pos_after(&all, after);
+            let end = (from + want).min(all.len());
+            Ok((all[from..end].to_vec(), (end < all.len()).then(|| end.to_string())))
+        })
+        .unwrap();
+        assert_eq!(got.len(), 5);
     }
 }
