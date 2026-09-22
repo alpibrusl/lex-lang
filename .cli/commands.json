@@ -1,6 +1,6 @@
 {
   "name": "lex",
-  "version": "0.11.66",
+  "version": "0.11.67",
   "acli_version": "0.1.0",
   "commands": [
     {
@@ -1717,7 +1717,7 @@
       "arguments": [
         {
           "name": "subcommand",
-          "type": "enum[create|list|show|verify]",
+          "type": "enum[create|list|show|verify|propose|proposals|approve|reject]",
           "description": "what to do",
           "required": true
         }
@@ -1749,6 +1749,14 @@
         {
           "description": "Verify an issue at the branch head — done is a proof the gate records, not a status",
           "invocation": "lex issue verify <id>"
+        },
+        {
+          "description": "Refine a free-form issue: an agent proposes a typed acceptance (#956)",
+          "invocation": "lex issue propose <id> --shape typed_delta --api \"clamp:(x :: Int, lo :: Int, hi :: Int) -> Int\" --example \"clamp(5, 0, 3) => 3\" --rationale \"inclusive bounds\" --by lex-code"
+        },
+        {
+          "description": "A human approves it — the issue is judged against it from then on",
+          "invocation": "lex issue approve <proposal> --by alfonso"
         }
       ]
     },

@@ -172,7 +172,12 @@ fn cmd_issue() -> CommandInfo {
          done is a proof the gate verifies at HEAD, not a status someone sets",
     )
     .idempotent(true)
-    .add_argument("subcommand", "enum[create|list|show|verify]", "what to do", true)
+    .add_argument(
+        "subcommand",
+        "enum[create|list|show|verify|propose|proposals|approve|reject]",
+        "what to do",
+        true,
+    )
     .with_examples(vec![
         (
             "Declare a feature as a typed delta (API entry + example)",
@@ -194,6 +199,15 @@ fn cmd_issue() -> CommandInfo {
         (
             "Verify an issue at the branch head — done is a proof the gate records, not a status",
             "lex issue verify <id>",
+        ),
+        (
+            "Refine a free-form issue: an agent proposes a typed acceptance (#956)",
+            "lex issue propose <id> --shape typed_delta --api \"clamp:(x :: Int, lo :: Int, hi :: Int) -> Int\" \
+             --example \"clamp(5, 0, 3) => 3\" --rationale \"inclusive bounds\" --by lex-code",
+        ),
+        (
+            "A human approves it — the issue is judged against it from then on",
+            "lex issue approve <proposal> --by alfonso",
         ),
     ])
 }

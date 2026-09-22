@@ -76,6 +76,10 @@ pub enum StoreError {
     /// the issue cannot be judged there.
     #[error("issue example targets `{0}`, which is not declared at this head")]
     IssueTarget(String),
+    /// A proposed acceptance was refused for the issue it names (#956) —
+    /// e.g. the issue is already typed, so it is not open to refinement.
+    #[error("{0}")]
+    IssueRefinement(String),
     /// The op was persisted but a `required_attestations` rule in
     /// `policy.json` (#245) refused to advance the branch head past
     /// it. The op record is durable — re-running with the missing

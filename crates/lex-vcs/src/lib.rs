@@ -60,7 +60,9 @@ pub use diff_report::DiffReport;
 pub use diff_to_ops::{diff_to_ops, DiffInputs, DiffMappingError, ImportMap, ImportRef};
 pub use gate::{check_and_apply, GateError};
 pub use intent::{Intent, IntentId, IntentLog, ModelDescriptor, SessionId};
-pub use issue::{Acceptance, ApiChangeKind, ApiEntry, Issue, IssueId, IssueLog};
+pub use issue::{
+    Acceptance, AcceptanceProposal, ApiChangeKind, ApiEntry, Issue, IssueId, IssueLog, ProposalId,
+};
 pub use merge::{merge, ConflictKind, MergeOutcome, MergeOutput};
 pub use merge_session::{
     CommitError, ConflictId, ConflictRecord, MergeSession, MergeSessionId, ResolutionChecker,
