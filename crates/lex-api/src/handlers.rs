@@ -219,6 +219,38 @@ pub(crate) fn error_with_detail(status: u16, msg: impl Into<String>, detail: ser
     }).unwrap())
 }
 
+/// The actionable next step for a refused unsatisfiable pair (#992). Shared
+/// with the `lex op push` client, which prints it verbatim.
+pub const UNSATISFIABLE_PAIR_HINT: &str =
+    "republish from source to retire the stranded entry (#995)";
+
+/// `StoreError::UnsatisfiablePair` → **422**, never 500 (#992). The request
+/// asked to move a head onto a `(sig, stage)` pair no store can hold — a
+/// problem with the client's data, not the server. The body names the pair,
+/// the sig that actually owns the stage, and what to do about it:
+///
+/// ```json
+/// { "error": "UnsatisfiablePair",
+///   "detail": { "sig_id": "...", "stage_id": "...", "filed_under": "...",
+///               "hint": "republish from source to retire the stranded entry (#995)" } }
+/// ```
+///
+/// `None` for any other error, so callers fall through to their own mapping.
+pub(crate) fn unsatisfiable_pair_response(err: &lex_store::StoreError)
+    -> Option<Response<std::io::Cursor<Vec<u8>>>>
+{
+    let lex_store::StoreError::UnsatisfiablePair { sig_id, stage_id, filed_under } = err else {
+        return None;
+    };
+    Some(error_with_detail(422, "UnsatisfiablePair", serde_json::json!({
+        "sig_id": sig_id,
+        "stage_id": stage_id,
+        "filed_under": filed_under,
+        "message": err.to_string(),
+        "hint": UNSATISFIABLE_PAIR_HINT,
+    })))
+}
+
 /// Map a `StoreError` from a write path (`apply_operation` /
 /// `apply_operation_checked`) to an HTTP response. The only special
 /// case today is `Contention` (#262 multi-writer CAS retries
@@ -227,6 +259,9 @@ pub(crate) fn error_with_detail(status: u16, msg: impl Into<String>, detail: ser
 fn write_error_response(prefix: &str, err: lex_store::StoreError)
     -> Response<std::io::Cursor<Vec<u8>>>
 {
+    if let Some(resp) = unsatisfiable_pair_response(&err) {
+        return resp;
+    }
     if let lex_store::StoreError::Contention { branch, attempts } = &err {
         let body = serde_json::to_vec(&ErrorEnvelope {
             error: format!("{prefix}: branch '{branch}' is contended (attempts={attempts})"),

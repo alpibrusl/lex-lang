@@ -70,7 +70,10 @@ pub(crate) fn branch_advance_head_handler(state: &State, name: &str, body: &str)
                 "current": current,
                 "attempted": attempted,
             })),
-        Err(e) => error_response(500, format!("advance_branch_head_ff: {e}")),
+        // #992: the pushed head names a pair no store can hold — the client's
+        // data, not a server fault. 422 with the pair and the fix.
+        Err(e) => crate::handlers::unsatisfiable_pair_response(&e)
+            .unwrap_or_else(|| error_response(500, format!("advance_branch_head_ff: {e}"))),
     }
 }
 

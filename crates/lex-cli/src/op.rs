@@ -741,7 +741,19 @@ fn cmd_op_push(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                  head. The ops were uploaded, but the branch was not advanced. Pull and \
                  reconcile first. ({body})"
             ),
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                // #992: the hub's 422 `UnsatisfiablePair` names the pair and
+                // the fix; print that rather than the raw body.
+                if let SyncError::Status { status, body, .. } = &e {
+                    let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+                    if let Some(msg) =
+                        parsed.and_then(|v| unsatisfiable_pair_message(*status, &v))
+                    {
+                        bail!("{msg}");
+                    }
+                }
+                return Err(e.into());
+            }
         };
         advance = hbody.get("advance").and_then(|a| a.as_str()).unwrap_or("advanced").to_string();
     }
@@ -852,6 +864,30 @@ fn push_objects(
         post_json(remote, "/v1/intents/batch", &serde_json::to_value(&intents)?, token)?;
     }
     Ok(())
+}
+
+/// The operator-facing message for a hub's 422 `UnsatisfiablePair` refusal
+/// (#992): the pushed head binds a sig to a stage filed under another sig, so
+/// the remote would never be able to render it. Names the pair and prints the
+/// hub's hint (republish from source, which retires the stranded entry via
+/// #995). `None` for any other response.
+pub(crate) fn unsatisfiable_pair_message(status: u16, body: &serde_json::Value) -> Option<String> {
+    if status != 422 || body.get("error").and_then(|e| e.as_str()) != Some("UnsatisfiablePair") {
+        return None;
+    }
+    let d = body.get("detail")?;
+    let field = |k: &str| d.get(k).and_then(|v| v.as_str()).unwrap_or("?").to_string();
+    Some(format!(
+        "the remote refused this head: sig {} is bound to stage {}, but that stage is filed \
+         under sig {}, so no store can hold the pair (#992). The branch was not advanced.\n\
+         hint: {}",
+        field("sig_id"),
+        field("stage_id"),
+        field("filed_under"),
+        d.get("hint")
+            .and_then(|v| v.as_str())
+            .unwrap_or("republish from source to retire the stranded entry (#995)"),
+    ))
 }
 
 /// Guarantee the remote holds every stage blob needed to render ANY op
@@ -1414,4 +1450,32 @@ fn fast_forward_branch_head(
     std::fs::write(&tmp, &new_bytes)?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod unsatisfiable_pair_tests {
+    use super::unsatisfiable_pair_message;
+
+    #[test]
+    fn a_hub_422_unsatisfiable_pair_prints_the_pair_and_the_hint() {
+        let body = serde_json::json!({
+            "error": "UnsatisfiablePair",
+            "detail": {
+                "sig_id": "old", "stage_id": "st", "filed_under": "new",
+                "hint": "republish from source to retire the stranded entry (#995)",
+            }
+        });
+        let msg = unsatisfiable_pair_message(422, &body).expect("recognised");
+        for want in ["old", "st", "new", "hint: republish from source to retire the stranded entry (#995)"] {
+            assert!(msg.contains(want), "missing {want:?} in: {msg}");
+        }
+    }
+
+    #[test]
+    fn other_errors_are_not_mistaken_for_it() {
+        let body = serde_json::json!({ "error": "NonFastForward", "detail": {} });
+        assert!(unsatisfiable_pair_message(422, &body).is_none());
+        let body = serde_json::json!({ "error": "UnsatisfiablePair", "detail": {} });
+        assert!(unsatisfiable_pair_message(500, &body).is_none());
+    }
 }
