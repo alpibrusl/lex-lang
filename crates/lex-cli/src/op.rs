@@ -8,11 +8,12 @@ use lex_vcs::{OpLog, OperationRecord};
 use std::path::PathBuf;
 
 use crate::sync_client::{request_json, request_json_with_header, Retry, RetryPolicy, SyncError};
+use lex_api::handlers::CAP_FILES_V1;
 
 /// Prepare an outgoing request: disable ureq's "non-2xx is an error"
-/// behaviour and attach `Authorization: Bearer <token>` when a token is
-/// present (absent → unmodified, so unauthenticated `lex serve` remotes keep
-/// working, #630).
+/// behaviour, announce this client's capabilities, and attach
+/// `Authorization: Bearer <token>` when a token is present (absent →
+/// unmodified, so unauthenticated `lex serve` remotes keep working, #630).
 ///
 /// ureq 3.x treats 4xx/5xx status codes as transport errors by default, so
 /// `.send()`/`.call()` bail before the caller can read the status — which
@@ -20,11 +21,21 @@ use crate::sync_client::{request_json, request_json_with_header, Retry, RetryPol
 /// auth hint never fired; batch-rejection bodies were never surfaced).
 /// Turning `http_status_as_error` off returns `Ok(resp)` for error statuses
 /// so those handlers run.
+///
+/// #1007 PR 5: every request carries `X-Lex-Caps: files-v1` — this build
+/// always understands `SetFiles` ops and their out-of-band blobs, so
+/// `/v1/ops/since` never needs to 426 a pull against it (see
+/// `ops_since_http::ops_since_handler`'s `files_v1` gate), and a server that
+/// doesn't recognize the header simply ignores it (additive, per #1007 §4).
 pub(crate) fn with_auth<B>(
     req: ureq::RequestBuilder<B>,
     token: Option<&str>,
 ) -> ureq::RequestBuilder<B> {
-    let req = req.config().http_status_as_error(false).build();
+    let req = req
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .header("X-Lex-Caps", CAP_FILES_V1);
     match token {
         Some(t) => req.header("Authorization", &format!("Bearer {t}")),
         None => req,
@@ -681,6 +692,32 @@ fn cmd_op_push(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         return Ok(());
     }
 
+    // #1007 PR 5: a `SetFiles` op's blob contents travel out of band
+    // (`/v1/blobs/*`), which only a hub advertising `files-v1` understands.
+    // An older hub has no such routes at all; a hub that runs the #1007
+    // `ops/batch` gate (`check_set_files`) but was never told about our
+    // caps would only discover the problem after we'd already uploaded the
+    // stage/intent content for nothing and posted the batch, refusing it
+    // with `MissingBlobs` (its own blob routes never having been asked).
+    // Check the remote's advertised capabilities BEFORE uploading anything
+    // — refuse fast and cleanly instead.
+    if to_send.iter().any(|r| matches!(r.op.kind, lex_vcs::OperationKind::SetFiles { .. })) {
+        let caps = remote_health_caps(&remote, token.as_deref()).map_err(|e| {
+            anyhow!(
+                "this push includes a files snapshot (SetFiles, #1007), but checking the \
+                 remote's capabilities first (GET {remote}/v1/health) failed: {e}"
+            )
+        })?;
+        if !caps.iter().any(|c| c.eq_ignore_ascii_case(CAP_FILES_V1)) {
+            bail!(
+                "cannot push: this push includes a files snapshot (SetFiles, #1007) but the \
+                 remote at {remote} does not advertise `{CAP_FILES_V1}` support (GET /v1/health \
+                 caps: {caps:?}) — upgrade the hub to a #1007-capable lex-hub, or publish/push a \
+                 history without files (`lex publish --no-files`). Nothing was uploaded."
+            );
+        }
+    }
+
     // Content first: push the stage + intent blobs these ops reference, so
     // a peer that pulls the op records always has the objects they point at
     // (without this, a pulled op-log renders as `unknown stage_id`).
@@ -693,6 +730,12 @@ fn cmd_op_push(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     if let Some(head) = local_head.as_ref() {
         reconcile_head_stages(&remote, head, &store, token.as_deref())?;
     }
+
+    // #1007 PR 5: push order is stages/intents → blobs → locks/issues → ops
+    // → head (design §4). Blobs must land before `/v1/ops/batch` sees the
+    // `SetFiles` records that name them, or the server's `check_set_files`
+    // gate refuses with `MissingBlobs`.
+    let blobs_pushed = push_blobs(&remote, &to_send, &store, token.as_deref())?;
 
     // #930 P2b-1: send the committed lex.lock for the head we're advancing to,
     // so the remote's write-time gate can resolve this head's pinned
@@ -790,6 +833,7 @@ fn cmd_op_push(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "received": received,
         "added": added,
         "skipped": skipped,
+        "blobs_pushed": blobs_pushed,
         "head_advance": advance,
     });
     let remote_text = remote.clone();
@@ -798,7 +842,8 @@ fn cmd_op_push(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     acli::emit_or_text("op-push", data, fmt, move || {
         println!(
             "pushed {received} ops to {remote_text} on branch `{branch_text}`: \
-             {added} added, {skipped} skipped (already present); head {advance_text}"
+             {added} added, {skipped} skipped (already present), {blobs_pushed} blob(s) \
+             uploaded; head {advance_text}"
         );
     });
     Ok(())
@@ -890,6 +935,110 @@ fn push_objects(
         post_json(remote, "/v1/intents/batch", &serde_json::to_value(&intents)?, token)?;
     }
     Ok(())
+}
+
+/// The `caps` array of `GET <remote>/v1/health` (#1007 §4), e.g.
+/// `["files-v1"]`. An old hub that predates capability advertisement
+/// answers `/v1/health` without a `caps` field (or doesn't have the route
+/// at all, which surfaces as a transport/status error to the caller) —
+/// either way this reads as "no capabilities", which is the conservative
+/// answer `cmd_op_push`'s files-v1 gate needs.
+fn remote_health_caps(remote: &str, token: Option<&str>) -> Result<Vec<String>> {
+    let body: serde_json::Value = get_json(remote, "/v1/health", token)?;
+    Ok(body
+        .get("caps")
+        .and_then(|c| c.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default())
+}
+
+/// Hex SHA-256 of `bytes` — the same content address blobs are keyed by
+/// (`Store::put_blob_bytes`, `lex-api`'s `sha256_hex`). Used client-side to
+/// re-verify a blob's claimed id before trusting or storing it, both when
+/// pushing (nothing here actually re-hashes on push — the store already
+/// computed the id when the blob was first written) and, critically, when
+/// pulling (#1007 PR 5 item 2): a blob the remote serves is only ever
+/// stored once *this* hash matches what was asked for.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// Request-size budget for one `/v1/blobs/{batch,fetch}` call, in *decoded*
+/// bytes (§4: "chunked by manifest `size`"). Kept well under both the
+/// server's 16 MiB body cap and the default 8 MiB single-blob limit even
+/// after base64 inflates the wire size by ~4/3, so a handful of
+/// near-the-limit files don't have to share one oversized request.
+const BLOB_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The blob half of `op push` (#1007 PR 5): upload the content a `SetFiles`
+/// op in `ops` needs — its manifest blob plus every blob the manifest's
+/// entries name — that the remote does not already hold. Returns the
+/// number of blobs actually uploaded (for `op push`'s summary and for
+/// tests asserting an incremental push re-sends only what changed).
+///
+/// Scope is deliberately just `ops`' own `SetFiles` closure, not the whole
+/// head's (unlike `reconcile_head_stages`'s stage reconciliation): a
+/// `SetFiles` already on the remote from an earlier push was already
+/// validated (and its blobs already accepted) at that time, so there is
+/// nothing new to reconcile for it here.
+fn push_blobs(remote: &str, ops: &[OperationRecord], store: &Store, token: Option<&str>) -> Result<usize> {
+    use base64::Engine as _;
+    use std::collections::BTreeSet;
+
+    let mut ids: BTreeSet<String> = BTreeSet::new();
+    for rec in ops {
+        if let lex_vcs::OperationKind::SetFiles { manifest } = &rec.op.kind {
+            ids.insert(manifest.clone());
+            let m = store
+                .get_manifest(manifest)
+                .map_err(|e| anyhow!("reading files manifest {manifest} to push: {e}"))?;
+            for entry in m.entries.values() {
+                ids.insert(entry.blob.clone());
+            }
+        }
+    }
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let ids: Vec<String> = ids.into_iter().collect();
+
+    // Ask the remote what it's missing rather than uploading blindly — an
+    // unchanged file republished alongside a real edit (or the same
+    // manifest pushed twice) costs one small request, not a re-upload.
+    let resp = post_json(remote, "/v1/blobs/missing", &serde_json::json!({ "ids": ids }), token)?;
+    let missing: Vec<String> = resp
+        .get("missing")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    if missing.is_empty() {
+        return Ok(0);
+    }
+
+    let mut chunk: Vec<serde_json::Value> = Vec::new();
+    let mut chunk_bytes: u64 = 0;
+    let mut uploaded = 0usize;
+    for id in &missing {
+        let bytes = store
+            .get_blob_bytes(id)
+            .map_err(|e| anyhow!("reading blob {id} to push (named by a manifest we're pushing): {e}"))?;
+        let len = bytes.len() as u64;
+        if !chunk.is_empty() && chunk_bytes.saturating_add(len) > BLOB_CHUNK_BYTES {
+            post_json(remote, "/v1/blobs/batch", &serde_json::Value::Array(std::mem::take(&mut chunk)), token)?;
+            chunk_bytes = 0;
+        }
+        chunk.push(serde_json::json!({
+            "id": id,
+            "data_b64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+        }));
+        chunk_bytes += len;
+        uploaded += 1;
+    }
+    if !chunk.is_empty() {
+        post_json(remote, "/v1/blobs/batch", &serde_json::Value::Array(chunk), token)?;
+    }
+    Ok(uploaded)
 }
 
 /// The operator-facing message for a hub's 422 `UnsatisfiablePair` refusal
@@ -1100,6 +1249,139 @@ fn pull_objects(
     }
 
     Ok((stages_added, intents_added))
+}
+
+/// The blob half of `op pull` (#1007 PR 5): fetch + store the blobs
+/// referenced by every `SetFiles` op in the pulled delta, plus the manifest
+/// in force at `head_after` (covering a manifest this pull's ops merely
+/// *inherit* through a merge rather than themselves set — the delta may
+/// contain no `SetFiles` at all while the head it produces still names one
+/// set by an earlier, already-local op). Returns the number of blobs
+/// fetched. Every blob is re-hashed against its claimed id on receipt
+/// (§4); a mismatch fails the whole pull rather than silently keeping the
+/// blobs that did check out, so a local store can never end up holding a
+/// blob filed under someone else's hash.
+///
+/// Called before the branch head is advanced (`cmd_op_pull`), so a failure
+/// here leaves the branch where it was — the ops themselves may already be
+/// in the local log (harmless: they're content-addressed and re-pullable),
+/// but nothing points at the corrupt/incomplete manifest as a head.
+fn pull_blobs(
+    remote: &str,
+    ops: &[OperationRecord],
+    head_after: &str,
+    store: &Store,
+    token: Option<&str>,
+) -> Result<usize> {
+    use std::collections::BTreeSet;
+
+    let mut manifest_ids: BTreeSet<String> = BTreeSet::new();
+    for rec in ops {
+        if let lex_vcs::OperationKind::SetFiles { manifest } = &rec.op.kind {
+            manifest_ids.insert(manifest.clone());
+        }
+    }
+    if let Ok(lex_store::ManifestAt::Set { manifest }) = store.manifest_at(head_after) {
+        manifest_ids.insert(manifest);
+    }
+    if manifest_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let mut fetched = 0usize;
+
+    // Manifests are small canonical JSON — one id-only fetch for all of them.
+    let want_manifests: Vec<String> =
+        manifest_ids.iter().filter(|id| !store.has_blob(id)).cloned().collect();
+    fetched += fetch_and_verify_blobs(remote, &want_manifests, store, token)?;
+
+    // Now that every manifest referenced is local, read them to discover
+    // their entry blobs, and fetch those too — chunked by the manifest's
+    // declared size (§4), not by count, so a handful of large files don't
+    // share one oversized request while many small ones batch together.
+    let mut want_entries: Vec<(String, u64)> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for mid in &manifest_ids {
+        let m = store
+            .get_manifest(mid)
+            .map_err(|e| anyhow!("reading pulled files manifest {mid}: {e}"))?;
+        for entry in m.entries.values() {
+            if seen.insert(entry.blob.clone()) && !store.has_blob(&entry.blob) {
+                want_entries.push((entry.blob.clone(), entry.size));
+            }
+        }
+    }
+    let mut chunk: Vec<String> = Vec::new();
+    let mut chunk_bytes: u64 = 0;
+    for (id, size) in want_entries {
+        if !chunk.is_empty() && chunk_bytes.saturating_add(size) > BLOB_CHUNK_BYTES {
+            fetched += fetch_and_verify_blobs(remote, &std::mem::take(&mut chunk), store, token)?;
+            chunk_bytes = 0;
+        }
+        chunk_bytes += size;
+        chunk.push(id);
+    }
+    if !chunk.is_empty() {
+        fetched += fetch_and_verify_blobs(remote, &chunk, store, token)?;
+    }
+    Ok(fetched)
+}
+
+/// Fetch `ids` via `POST /v1/blobs/fetch` and store each one — but only
+/// after re-hashing its bytes and confirming they match the id we asked
+/// for (#1007 PR 5 item 2). This is a genuine integrity check, not a
+/// decode-and-trust: a hub could otherwise serve corrupted or substituted
+/// bytes under a blob's name and a client would silently persist them. A
+/// mismatch, or the remote simply not returning one of the requested ids,
+/// fails the whole call — there is no partial-success return, so the
+/// caller can treat `Ok` as "every id in `ids` is now a verified local
+/// blob."
+fn fetch_and_verify_blobs(remote: &str, ids: &[String], store: &Store, token: Option<&str>) -> Result<usize> {
+    use base64::Engine as _;
+    use std::collections::BTreeSet;
+
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let resp = post_json(remote, "/v1/blobs/fetch", &serde_json::json!({ "ids": ids }), token)?;
+    let arr = resp.get("blobs").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+
+    let mut got: BTreeSet<String> = BTreeSet::new();
+    for wb in &arr {
+        let id = wb
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("/v1/blobs/fetch response entry missing `id`"))?;
+        let data_b64 = wb
+            .get("data_b64")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("/v1/blobs/fetch response for `{id}` missing `data_b64`"))?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data_b64)
+            .map_err(|e| anyhow!("blob `{id}`: remote sent invalid base64: {e}"))?;
+        let actual = sha256_hex(&bytes);
+        if actual != id {
+            bail!(
+                "blob integrity check failed: the remote served {} byte(s) for blob `{id}` that \
+                 hash to `{actual}` instead — refusing to store it. Pull aborted before the \
+                 branch head advanced (#1007 requires every blob to be re-hashed on receipt).",
+                bytes.len(),
+            );
+        }
+        store.put_blob_bytes(&bytes).map_err(|e| anyhow!("storing blob {id}: {e}"))?;
+        got.insert(id.to_string());
+    }
+    let missing: Vec<&String> = ids.iter().filter(|id| !got.contains(id.as_str())).collect();
+    if !missing.is_empty() {
+        bail!(
+            "remote did not return {} of the {} blob(s) requested from /v1/blobs/fetch: {:?} — \
+             pull aborted (a manifest referencing an absent blob would be incomplete)",
+            missing.len(),
+            ids.len(),
+            missing,
+        );
+    }
+    Ok(got.len())
 }
 
 /// Every stage id the given ops produce — used to fetch the attestations
@@ -1396,6 +1678,14 @@ fn cmd_op_pull(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         bail!("divergent histories — branch unchanged");
     }
 
+    // #1007 PR 5: fetch + re-hash the blobs any `SetFiles` op in this delta
+    // (or the manifest the new tip would inherit) names, BEFORE the branch
+    // head advances — a corrupt or incomplete blob must never become a
+    // "successfully pulled" head. The ops themselves are already in the
+    // local log at this point (harmless if we now bail: they're
+    // content-addressed and this pull is simply re-attempted later).
+    let blobs_pulled = pull_blobs(&remote, &received, &new_tip, &store, token.as_deref())?;
+
     // Fast-forward: advance the branch head to the new tip.
     // `Store::set_branch_head_op` is `pub(crate)`, so we go through
     // the JSON file directly. (#262 will replace this with a CAS
@@ -1516,6 +1806,7 @@ fn cmd_op_pull(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "branch": branch,
         "received": received.len(),
         "added": added,
+        "blobs_pulled": blobs_pulled,
         "attestations_added": att_outcome.added,
         "attestations_skipped": skipped_json,
         "fast_forwarded_to": new_tip,
