@@ -648,6 +648,26 @@ fn cmd_op_push(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     }
 
     if to_send.is_empty() {
+        // #1031: a re-lock (`lex pkg lock` + re-publish) of a head that was
+        // already pushed produces zero new ops — the head itself doesn't
+        // move — but the *committed lock* at that head can still have
+        // changed underneath it (a dependency re-resolved to a new pin).
+        // Sync it even though there's nothing else to push, or the remote's
+        // write-time gate keeps resolving against the stale pin it already
+        // had, or (if it never had one) never learns of it at all — worse
+        // than the known "rewrites an already-pushed head's lock" gap
+        // (#1007), because this path used to skip the sync attempt
+        // entirely.
+        if let Some(head) = local_head.as_ref() {
+            if let Some(lock) = store.committed_lock(head)? {
+                post_json(
+                    &remote,
+                    "/v1/locks/batch",
+                    &serde_json::json!([{ "head_op": head, "lock": lock }]),
+                    token.as_deref(),
+                )?;
+            }
+        }
         let data = serde_json::json!({
             "remote": remote,
             "branch": branch,

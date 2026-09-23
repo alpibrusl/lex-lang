@@ -241,12 +241,42 @@ pub fn resolve_package_import(
     let manifest = Manifest::load(&toml_path)
         .map_err(|e| PackageError::ManifestParse { path: toml_path.display().to_string(), detail: e })?;
 
-    let dep = manifest.dependencies.get(pkg_name).ok_or_else(|| {
-        PackageError::UnknownPackage {
-            name: pkg_name.to_string(),
-            manifest: toml_path.display().to_string(),
+    let dep = match manifest.dependencies.get(pkg_name) {
+        Some(dep) => dep,
+        // #1031: this package's own `lex.toml` has no `[dependencies]` entry
+        // for `pkg_name` at all — which is exactly what a registry archive
+        // rendered from an op-log release with no captured dependency
+        // coordinates looks like (an immutable release cut before a hub
+        // started sending them, or any other reason the manifest a hub
+        // synthesizes for the download ends up incomplete). The sibling
+        // `lex.lock` this package cache directory was installed with —
+        // `committed_lock_inherited` ships it in the very same archive,
+        // right next to the manifest — may still carry an exact, resolved
+        // pin for `pkg_name`. Fall back to that lock entry's own `registry`
+        // + `version` before giving up: a resolved pin is exactly what
+        // `resolve_registry_dep` needs, and it's sitting right there. A
+        // lock entry has no git mirror, `path`, or ref choice to weigh — go
+        // straight to the registry resolution the `Dependency::Registry`
+        // arm below would otherwise reach, and return directly so the
+        // `Dependency`-keyed match below never needs a borrowed fallback
+        // value to outlive it.
+        None => {
+            let Some(entry) =
+                crate::lock::LockFile::load_dir(&toml_dir).and_then(|lf| lf.entry(pkg_name).cloned())
+            else {
+                return Err(PackageError::UnknownPackage {
+                    name: pkg_name.to_string(),
+                    manifest: toml_path.display().to_string(),
+                });
+            };
+            let pkg_root = resolve_registry_dep(pkg_name, &entry.registry, &entry.version, &toml_dir)?;
+            return find_module_file(&pkg_root, module_path).ok_or_else(|| PackageError::ModuleNotFound {
+                pkg: pkg_name.to_string(),
+                module: module_path.to_string(),
+                pkg_root: pkg_root.display().to_string(),
+            });
         }
-    })?;
+    };
 
     let pkg_root = match dep {
         Dependency::Path { path } => {
@@ -696,11 +726,31 @@ fn registry_ensure_cached(
         detail: format!("GET {url}: {e}"),
     })?;
     if response.status() != 200 {
+        // A tenant-qualified registry is ambiguous in exactly one way: `GET`
+        // on the wrong store 404s identically to "package not found in the
+        // right one" — the hub-side routing that would tell them apart
+        // (`?store=…` → a specific named store) lives outside this crate, so
+        // the best this client can do is name the ambiguity itself rather
+        // than let a bare 404 pass for "no such package" (#1031).
+        let store_hint = match (response.status().as_u16(), crate::registry::public(registry)) {
+            (404, Some(pr)) if pr.store.is_none() => format!(
+                " — `{registry}` addresses the tenant's flat/default store; if `{pkg_name}` \
+                 was published to a NAMED store instead, add it: `{registry}/<store>`"
+            ),
+            (404, Some(pr)) => format!(
+                " — `{registry}` addresses the named store `{}`; if `{pkg_name}` was published \
+                 to the tenant's flat/default store instead, drop the store segment: \
+                 `{}`",
+                pr.store.as_deref().unwrap_or_default(),
+                registry.rsplit_once('/').map(|(rest, _)| rest).unwrap_or(registry),
+            ),
+            _ => String::new(),
+        };
         return Err(PackageError::RegistryFailed {
             name: pkg_name.to_string(),
             registry: registry.to_string(),
             version: version.to_string(),
-            detail: format!("GET {url} returned HTTP {}", response.status()),
+            detail: format!("GET {url} returned HTTP {}{store_hint}", response.status()),
         });
     }
 
