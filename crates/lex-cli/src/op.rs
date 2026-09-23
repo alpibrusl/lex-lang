@@ -1033,21 +1033,18 @@ fn reconcile_head_stages(
 /// The content half of `op pull`: fetch + store the stage and intent blobs
 /// the pulled ops reference but the local store is missing, so `export-git`
 /// and replay work on a pulled op-log.
+///
+/// Attestation sync (#916) is deliberately NOT part of this function — see
+/// [`sync_attestations`]'s doc for why (#1030). This function only ever
+/// touches the op/stage/intent DAG, which is why it's still safe for its
+/// caller to treat its success as "safe to fast-forward the branch head".
 fn pull_objects(
     remote: &str,
     ops: &[OperationRecord],
     store: &Store,
     token: Option<&str>,
-) -> Result<(usize, usize, usize)> {
+) -> Result<(usize, usize)> {
     use std::collections::BTreeSet;
-    // Every stage the pulled ops produce — used both to fetch missing stage
-    // ASTs and to pull the attestations keyed to those stages.
-    let mut produced_stages: BTreeSet<String> = BTreeSet::new();
-    for rec in ops {
-        for sid in rec.produces.stage_ids() {
-            produced_stages.insert(sid);
-        }
-    }
     // #986: decide what to fetch per `(sig, stage)` pair, not per stage id. A
     // StageId does not encode the name (#826), so holding that id under *some*
     // other sig does not mean the variant these ops name is present — and an
@@ -1102,27 +1099,131 @@ fn pull_objects(
         }
     }
 
-    // Attestations are stage-keyed, so pull them per produced stage (#916).
-    // Without this a puller never sees the remote's verdicts — e.g. the
-    // hosted CI runner's trusted `lex-hub-ci` TypeCheck attestation — so a
-    // require-attestation gate can't be checked locally. Idempotent: an
-    // attestation already present (content-addressed id) is skipped.
+    Ok((stages_added, intents_added))
+}
+
+/// Every stage id the given ops produce — used to fetch the attestations
+/// keyed to those stages (#916). Intentionally id-only (unlike
+/// `pull_objects`'s `(sig, stage)` pairing for content): the attestation log
+/// is indexed by raw stage id server-side (`AttestationLog::by_stage`), not
+/// by `(sig, stage)` variant.
+fn produced_stage_ids(ops: &[OperationRecord]) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for rec in ops {
+        for sid in rec.produces.stage_ids() {
+            out.insert(sid);
+        }
+    }
+    out
+}
+
+/// A stage whose attestations were skipped because the remote genuinely
+/// doesn't have it (see [`sync_attestations`]).
+struct AttestationSyncSkip {
+    stage_id: String,
+    reason: String,
+}
+
+/// A stage whose attestation fetch failed for a reason that is NOT a
+/// confirmed absence (see [`sync_attestations`]).
+struct AttestationSyncFailure {
+    stage_id: String,
+    detail: String,
+}
+
+/// Outcome of [`sync_attestations`]. Best-effort by construction: a per-stage
+/// problem lands in `skipped` or `failures` rather than aborting the whole
+/// sync, so the caller always gets back everything that DID succeed.
+struct AttestationSyncOutcome {
+    added: usize,
+    skipped: Vec<AttestationSyncSkip>,
+    failures: Vec<AttestationSyncFailure>,
+}
+
+/// Pull the attestations keyed to `stage_ids` (#916) — the trusted
+/// `lex-hub-ci` verdicts and any other evidence the remote holds. Without
+/// this a puller never sees them, and a `policy require-attestation` gate
+/// can't be checked locally.
+///
+/// #1030: on a large real history, one stage among tens of thousands can be
+/// genuinely absent from the remote's store — GC'd, never persisted, or a
+/// stranded pre-#992 reference (a `ChangeEffectSig`-class op names a
+/// `(sig, stage)` pair no store ever actually held content for). The
+/// server's `stage_attestations_handler` 404s in exactly that case — and
+/// only that case: it 404s iff `Store::get_metadata` can't find the stage
+/// under any sig, and every other failure it turns into a 5xx. So a `404`
+/// here is trustworthy evidence of genuine absence, mirroring the
+/// skip-vs-fail distinction #868 (PR #1012) established for replay's parent
+/// reconstruction: skip-and-report an absent stage's attestations, but never
+/// swallow a real error (corrupt body, 5xx, transport failure, a response
+/// that isn't a valid `Attestation`) as if it were one — those land in
+/// `failures` instead of being silently skipped.
+///
+/// This function itself never fails the pull: it has no side effect on the
+/// op/stage/intent DAG (unlike [`pull_objects`]), so treating one stage's
+/// attestation trouble as fatal to the whole pull — discarding a fully
+/// transferred 136k-op batch over one 404 — was the #1030 bug. `cmd_op_pull`
+/// now calls this only *after* the branch head has already advanced, and
+/// decides for itself whether a non-empty `failures` should fail the command
+/// (it does — "fail loud" — but only after everything that succeeded is
+/// already committed).
+fn sync_attestations(
+    remote: &str,
+    stage_ids: &std::collections::BTreeSet<String>,
+    store: &Store,
+    token: Option<&str>,
+) -> Result<AttestationSyncOutcome> {
     let attestation_log = lex_vcs::AttestationLog::open(store.root())?;
-    let mut attestations_added = 0usize;
-    for sid in &produced_stages {
-        let v = get_json(remote, &format!("/v1/stage/{sid}/attestations"), token)?;
-        if let Some(arr) = v.get("attestations").and_then(|a| a.as_array()) {
-            for av in arr {
-                let att: lex_vcs::Attestation = serde_json::from_value(av.clone())?;
-                if attestation_log.get(&att.attestation_id)?.is_none() {
-                    attestation_log.put(&att)?;
-                    attestations_added += 1;
+    let mut outcome = AttestationSyncOutcome {
+        added: 0,
+        skipped: Vec::new(),
+        failures: Vec::new(),
+    };
+    for sid in stage_ids {
+        let path = format!("/v1/stage/{sid}/attestations");
+        let fetched: std::result::Result<serde_json::Value, SyncError> = request_json(
+            remote, &path, None, token, Retry::Idempotent, &RetryPolicy::from_env(),
+        );
+        let v = match fetched {
+            Ok(v) => v,
+            Err(SyncError::Status { status: 404, .. }) => {
+                outcome.skipped.push(AttestationSyncSkip {
+                    stage_id: sid.clone(),
+                    reason: "stage unknown to remote (genuinely absent — GC'd, never \
+                             persisted, or a stranded pre-#992 reference)"
+                        .to_string(),
+                });
+                continue;
+            }
+            Err(e) => {
+                outcome.failures.push(AttestationSyncFailure {
+                    stage_id: sid.clone(),
+                    detail: e.to_string(),
+                });
+                continue;
+            }
+        };
+        let Some(arr) = v.get("attestations").and_then(|a| a.as_array()) else {
+            continue;
+        };
+        for av in arr {
+            let att: lex_vcs::Attestation = match serde_json::from_value(av.clone()) {
+                Ok(a) => a,
+                Err(e) => {
+                    outcome.failures.push(AttestationSyncFailure {
+                        stage_id: sid.clone(),
+                        detail: format!("malformed attestation in response: {e}"),
+                    });
+                    continue;
                 }
+            };
+            if attestation_log.get(&att.attestation_id)?.is_none() {
+                attestation_log.put(&att)?;
+                outcome.added += 1;
             }
         }
     }
-
-    Ok((stages_added, intents_added, attestations_added))
+    Ok(outcome)
 }
 
 /// `lex op pull <remote_url> [--branch NAME] [--since OP_ID]
@@ -1259,10 +1360,11 @@ fn cmd_op_pull(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         batch_ids.insert(rec.op_id.clone());
     }
 
-    // Content: fetch + store the stage (code), intent, and attestation blobs
-    // the pulled ops reference, so the pulled op-log actually renders, replays,
-    // and carries the remote's verdicts (#916).
-    let (_stages_pulled, _intents_pulled, attestations_pulled) =
+    // Content: fetch + store the stage (code) and intent blobs the pulled
+    // ops reference, so the pulled op-log actually renders and replays.
+    // Attestation sync (#916) happens later, deliberately after the branch
+    // head has advanced — see `sync_attestations`'s doc (#1030).
+    let (_stages_pulled, _intents_pulled) =
         pull_objects(&remote, &received, &store, token.as_deref())?;
 
     // Divergent-history detection: a clean fast-forward requires
@@ -1353,27 +1455,94 @@ fn cmd_op_pull(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         }
     }
 
+    // Attestation sync (#916), run only now that ops + stages + the branch
+    // head are all committed above. A stage whose attestations are
+    // unreachable must never re-discard a pull that has already fully
+    // landed — that was #1030. `sync_attestations` itself never fails the
+    // pull; this function decides whether a non-empty `failures` should.
+    let produced_stages = produced_stage_ids(&received);
+    let att_outcome = sync_attestations(&remote, &produced_stages, &store, token.as_deref())?;
+    let skipped_json: Vec<serde_json::Value> = att_outcome
+        .skipped
+        .iter()
+        .map(|s| serde_json::json!({"stage_id": s.stage_id, "reason": s.reason}))
+        .collect();
+
+    if !att_outcome.failures.is_empty() {
+        let failed_json: Vec<serde_json::Value> = att_outcome
+            .failures
+            .iter()
+            .map(|f| serde_json::json!({"stage_id": f.stage_id, "detail": f.detail}))
+            .collect();
+        let failed_count = att_outcome.failures.len();
+        let joined_details = att_outcome
+            .failures
+            .iter()
+            .map(|f| format!("{}: {}", f.stage_id, f.detail))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let envelope = serde_json::json!({
+            "remote": remote,
+            "branch": branch,
+            "received": received.len(),
+            "added": added,
+            "attestations_added": att_outcome.added,
+            "attestations_skipped": skipped_json,
+            "attestations_failed": failed_json,
+            "fast_forwarded_to": new_tip,
+            "error": "AttestationSyncFailed",
+            "remark": "ops and stages were committed and the branch head advanced to the new \
+                       tip; only attestation sync for the listed stage(s) failed. Those \
+                       failures are NOT confirmed absences (a genuinely absent stage is \
+                       reported in attestations_skipped, not here), so they are not silently \
+                       swallowed. Attestation sync is only attempted for stages produced by the \
+                       ops received in *this* pull, so a plain retry now that the branch is at \
+                       this tip will report \"nothing to pull\" rather than retrying just the \
+                       failed attestation(s) — a dedicated resync path is a follow-up.",
+        });
+        let env_clone = envelope.clone();
+        acli::emit_or_text("op-pull", envelope, fmt, move || {
+            eprintln!("{}", serde_json::to_string_pretty(&env_clone).unwrap());
+        });
+        bail!(
+            "attestation sync failed for {failed_count} stage(s); ops and stages were \
+             already committed and the branch head already advanced to {new_tip} (a plain \
+             retry will not redo that transfer): {joined_details}"
+        );
+    }
+
     let data = serde_json::json!({
         "remote": remote,
         "branch": branch,
         "received": received.len(),
         "added": added,
-        "attestations_added": attestations_pulled,
+        "attestations_added": att_outcome.added,
+        "attestations_skipped": skipped_json,
         "fast_forwarded_to": new_tip,
     });
     let total = received.len();
     let remote_text = remote.clone();
     let branch_text = branch.clone();
     let new_tip_text = new_tip.clone();
+    let attestations_added = att_outcome.added;
+    let attestations_skipped = att_outcome.skipped.len();
     acli::emit_or_text("op-pull", data, fmt, move || {
-        let att = if attestations_pulled > 0 {
-            format!(", {attestations_pulled} attestation(s)")
+        let att = if attestations_added > 0 {
+            format!(", {attestations_added} attestation(s)")
+        } else {
+            String::new()
+        };
+        let skip = if attestations_skipped > 0 {
+            format!(
+                ", {attestations_skipped} attestation fetch(es) skipped (stage genuinely \
+                 absent on remote)"
+            )
         } else {
             String::new()
         };
         println!(
             "pulled {total} ops from {remote_text} on branch `{branch_text}`: \
-             {added} new{att}, branch advanced to {new_tip_text}"
+             {added} new{att}{skip}, branch advanced to {new_tip_text}"
         );
     });
     Ok(())
