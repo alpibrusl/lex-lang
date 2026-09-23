@@ -68,6 +68,24 @@ pub enum TypeError {
         at_node: String,
         name: String,
     },
+    /// A user-defined generic type declares a parameter that's used as
+    /// an effect-row tail (`[| e]`) inside its own body (#1029) — e.g.
+    /// `type Router[e] = { handle :: (Req) -> [| e] Resp }`. Rejected
+    /// rather than silently mis-tracked: today `Ty::Con`'s type
+    /// arguments are all ordinary types, so there is no way to carry
+    /// an effect row through a generic type parameter. Unfolding such
+    /// an alias (`unfold_record_alias`) cannot rebind the embedded row
+    /// to the caller's actual variable, so the effect silently stops
+    /// propagating to any function that routes it through this type —
+    /// the function's declared row can understate what it actually
+    /// does, with no warning. Restructure so the effect-row-polymorphic
+    /// function takes the closure directly as its own row-polymorphic
+    /// parameter, not wrapped inside a generic record/type.
+    EffectRowTypeParam {
+        at_node: String,
+        type_name: String,
+        param: String,
+    },
     /// Refinement-type predicate provably violated at a call site
     /// (#209 slice 2). The type checker statically discharged the
     /// refinement and found the literal argument doesn't satisfy the
@@ -163,6 +181,7 @@ impl TypeError {
             | TypeError::InfiniteType { at_node, .. }
             | TypeError::AmbiguousType { at_node, .. }
             | TypeError::RecursiveTypeWithoutConstructor { at_node, .. }
+            | TypeError::EffectRowTypeParam { at_node, .. }
             | TypeError::RefinementViolation { at_node, .. }
             | TypeError::ExamplesOnEffectfulFn { at_node, .. }
             | TypeError::ExampleArityMismatch { at_node, .. }
@@ -197,6 +216,8 @@ impl std::fmt::Display for TypeError {
             TypeError::InfiniteType { at_node } => write!(f, "infinite type (occurs check) at {at_node}"),
             TypeError::AmbiguousType { at_node } => write!(f, "ambiguous type at {at_node}"),
             TypeError::RecursiveTypeWithoutConstructor { at_node, name } => write!(f, "recursive type {name} has no constructor at {at_node}"),
+            TypeError::EffectRowTypeParam { at_node, type_name, param } =>
+                write!(f, "type `{type_name}` at {at_node} uses its own type parameter `{param}` as an effect-row tail (`[| {param}]`) — generic types can't carry an effect row yet"),
             TypeError::RefinementViolation { at_node, fn_name, param_index, binding, reason } =>
                 write!(f, "refinement violated at {at_node}: argument {} of `{fn_name}` (binding `{binding}`): {reason}",
                     param_index + 1),

@@ -302,3 +302,76 @@ fn a_pure_body_needs_no_effects() {
     // as a rejection.)
     assert!(checks("fn f() -> Int {\n  1 + 2\n}\n"));
 }
+
+// ── #1029: effect rows embedded in a user-defined generic type's own
+// params must be rejected, not silently mis-tracked ──────────────────
+//
+// `type Router[e] = { handler :: (Int) -> [| e] Int }` looks like a
+// natural way to give a generic record a row-polymorphic field, mirroring
+// how `fn f[e](h :: (Int) -> [| e] Int) -> [| e] Int` works for a plain
+// function parameter. It silently doesn't: `Ty::Con`'s type arguments are
+// all ordinary types, so unfolding the alias can't rebind the embedded
+// row to the caller's actual variable (`unfold_record_alias`, checker/
+// mod.rs). Left unchecked, this is a real soundness hole — see
+// `an_effect_hidden_behind_a_generic_type_field_is_a_soundness_hole_if_unchecked`
+// below — so `add_user_type` now rejects the declaration outright.
+
+fn errors(src: &str) -> Vec<lex_types::TypeError> {
+    let p = parse_source(src).expect("parse");
+    let stages = canonicalize_program(&p);
+    check_program(&stages).err().unwrap_or_default()
+}
+
+const ROUTER_TYPE: &str = "\
+type Router[e] = { handler :: (Int) -> [| e] Int }
+fn new_router[e](h :: (Int) -> [| e] Int) -> Router[e] { { handler: h } }
+fn dispatch[e](r :: Router[e], x :: Int) -> [| e] Int { r.handler(x) }
+";
+
+#[test]
+fn a_generic_types_own_param_used_as_an_effect_row_is_rejected() {
+    let src = format!("{ROUTER_TYPE}fn f() -> Int {{ 1 }}\n");
+    let errs = errors(&src);
+    assert!(
+        errs.iter().any(|e| e.rule_tag() == "effect-row-type-param"),
+        "expected an effect-row-type-param rejection, got: {errs:?}"
+    );
+}
+
+#[test]
+fn an_effect_hidden_behind_a_generic_type_field_is_a_soundness_hole_if_unchecked() {
+    // Proves the rejection above guards a *real* hole, not a style
+    // nitpick: before this lint, a handler that actually performs [io],
+    // routed through Router[e], type-checked under a fully pure `-> Int`
+    // signature with no declared effects at all.
+    let src = format!(
+        "import \"std.io\" as io\n{ROUTER_TYPE}\n\
+         fn build() -> Router[io] {{ new_router(fn (x :: Int) -> [io] Int {{ io.print(\"x\"); x }}) }}\n\
+         fn handle_request(req :: Int) -> Int {{ dispatch(build(), req) }}\n"
+    );
+    // Must be rejected — and specifically for embedding a row in a
+    // generic type's own param, not some unrelated type error, so a
+    // future regression can't quietly swap this for a different
+    // (unrelated) rejection and still pass the assertion below.
+    let errs = errors(&src);
+    assert!(
+        errs.iter().any(|e| e.rule_tag() == "effect-row-type-param"),
+        "the io-hiding-behind-Router[e] program must be rejected as \
+         effect-row-type-param, got: {errs:?}"
+    );
+}
+
+#[test]
+fn an_ordinary_generic_type_with_no_effect_row_param_still_checks() {
+    // Control for false positives: an ordinary type parameter (not used
+    // as an effect row anywhere) must not trip the new rejection.
+    assert!(checks("type Box[T] = { value :: T }\nfn make(v :: Int) -> Box[Int] { { value: v } }\nfn f() -> Int { make(1).value }\n"));
+}
+
+#[test]
+fn a_functions_own_row_polymorphic_param_is_unaffected() {
+    // Control: the *supported* shape (row var directly on a function's
+    // own parameter/return, no user-defined generic type in between)
+    // must keep working exactly as before.
+    assert!(checks("fn apply[e](h :: (Int) -> [| e] Int, x :: Int) -> [| e] Int { h(x) }\nfn f() -> Int { apply(fn (x :: Int) -> Int { x }, 1) }\n"));
+}
