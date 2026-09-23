@@ -80,8 +80,13 @@ fn a_non_inlined_head_replays_behaviorally() {
          {\n  match n { 0 => 0, _ => m.clamp_low(n) * 2 }\n}\n",
     );
 
+    // --no-files (#1007 PR 4): a directory publish now also captures its
+    // non-op-log files as a trailing SetFiles op by default, which is
+    // deliberately not replayable — `a.last()` below picks the head's LAST
+    // op, and this test's whole point is replaying the semantic add_function
+    // op, not the files snapshot after it.
     let store = app.join(".lex/store").to_string_lossy().into_owned();
-    let v = json_in(&app, &["publish", ".", "--store", &store, "--activate"]);
+    let v = json_in(&app, &["publish", ".", "--store", &store, "--activate", "--no-files"]);
     let d = data(&v);
     let op_id = d["ops"]
         .as_array()

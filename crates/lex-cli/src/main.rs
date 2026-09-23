@@ -26,6 +26,7 @@ mod ci;
 mod diff;
 mod doc_sync;
 mod docs;
+mod files;
 mod fmt;
 mod init;
 mod lint;
@@ -140,6 +141,7 @@ fn run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "hash" => cmd_hash(fmt, &args[1..]),
         "blame" => cmd_blame(fmt, &args[1..]),
         "publish" => cmd_publish(fmt, &args[1..]),
+        "files" => files::cmd_files(fmt, &args[1..]),
         "store" => cmd_store(fmt, &args[1..]),
         "stage" => cmd_stage(fmt, &args[1..]),
         "attest" => cmd_attest(fmt, &args[1..]),
@@ -278,10 +280,16 @@ fn print_usage() {
     println!(
         "  canonical <encode|decode> <file>   encode/decode the canonical wire form of an AST"
     );
-    println!("  publish [--store DIR] [--branch NAME] [--activate] [--signing-key HEX] <file>");
+    println!("  publish [--store DIR] [--branch NAME] [--activate] [--signing-key HEX] [--no-files] <file|dir>");
     println!("                                     publish each stage to the store as Draft;");
     println!("                                     --signing-key (or LEX_SIGNING_KEY) attaches an");
-    println!("                                     Ed25519 signature over each StageId.");
+    println!("                                     Ed25519 signature over each StageId. A directory");
+    println!("                                     publish also captures its non-op-log files (README,");
+    println!("                                     lex.toml, lex.lock, tests/, ...) as one SetFiles op;");
+    println!("                                     --no-files opts a single publish out.");
+    println!("  files status|commit|ls|cat|checkout [--store DIR] [--branch NAME] ...");
+    println!("                                     work with the files manifest directly (#1007) --");
+    println!("                                     `lex files` with no subcommand prints full usage.");
     println!("  keygen                             print a fresh Ed25519 keypair (hex)");
     println!("  store list [--store DIR]           list SigIds in the store");
     println!("  store get [--store DIR] [--require-signed] [--trusted-key HEX] <stage>");

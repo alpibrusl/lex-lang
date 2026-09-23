@@ -12,6 +12,13 @@
 //! in-process `lex-api` server -- the same handler code a production
 //! `lex-hub` embeds for `POST /v1/pkg/{name}/release` and
 //! `GET /v1/pkg/{name}/{version}/archive`.
+//!
+//! Every `publish` below passes `--no-files` (#1007 PR 4): a directory
+//! publish now captures its non-op-log files into a `SetFiles` op by
+//! default, and `lex op push` cannot yet sync that op's blobs (blob sync
+//! lands in PR 5) -- pushing one here would 422 `MissingBlobs`. This test is
+//! about registry/archive dependency resolution, not files capture, so
+//! opting out keeps it isolated to what it actually exercises.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -112,7 +119,7 @@ const A_MAIN: &str = "import \"m1verify-b/wrap\" as b\n\nfn use_it() -> Int { b.
 /// Publish (writes the local store), push (syncs to `hub`) and release (cuts
 /// an immutable version) one package on `hub`'s default branch.
 fn publish_push_release(dir: &Path, env_root: &Path, hub: &str, version: &str) {
-    ok(dir, env_root, &["publish", "."]);
+    ok(dir, env_root, &["publish", "--no-files", "."]);
     ok(dir, env_root, &["op", "push", hub]);
     ok(dir, env_root, &["pkg", "release", hub, "--version", version, "--token", "t"]);
 }
@@ -168,7 +175,7 @@ fn a_locally_publishes_against_a_two_hop_registry_dependency() {
     // This is the exact reproduction from #1031: `lex publish .` on A
     // exercises the client resolver (`lex-cli/src/dep_resolver.rs`) named
     // there as the root cause.
-    let out = run_lex(&a_dir, env_root.path(), &["publish", "."]);
+    let out = run_lex(&a_dir, env_root.path(), &["publish", "--no-files", "."]);
     assert!(
         out.status.success(),
         "A's `lex publish .` must succeed against a real 2-hop registry \
@@ -222,7 +229,7 @@ fn a_locally_publishes_when_bs_archive_strips_the_dependencies_table() {
     ok(&b_dir, env_root.path(), &["pkg", "install"]);
     ok(&b_dir, env_root.path(), &["pkg", "lock"]);
     // Commits B's lex.lock (pinning C) into B's store head.
-    ok(&b_dir, env_root.path(), &["publish", "."]);
+    ok(&b_dir, env_root.path(), &["publish", "--no-files", "."]);
     ok(&b_dir, env_root.path(), &["op", "push", &b_hub]);
     // Strip [dependencies] from the manifest `pkg release` is about to
     // re-read — simulating a release whose captured `dependency_specs` came
@@ -260,7 +267,7 @@ fn a_locally_publishes_when_bs_archive_strips_the_dependencies_table() {
 
     // And the full publish path (the other command #1031 names) must also
     // succeed, not just report a different, more confusing symptom.
-    let out = run_lex(&a_dir, env_root.path(), &["publish", "."]);
+    let out = run_lex(&a_dir, env_root.path(), &["publish", "--no-files", "."]);
     assert!(
         out.status.success(),
         "A's `lex publish .` must recover C's coordinates from B's sibling \

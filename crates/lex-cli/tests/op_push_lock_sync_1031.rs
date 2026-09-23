@@ -1,16 +1,36 @@
-//! #1031 (adjacent finding 1): `lex op push` must sync the local head's
-//! committed `lex.lock` even when there are zero new ops to push.
+//! #1031 (adjacent finding 1), corrected by #1007 §0: `lex op push` still
+//! syncs a *local* committed-lock change to the remote even when there are
+//! zero new ops to push (`cmd_op_push` posts `/v1/locks/batch` outside the
+//! `to_send.is_empty()` early return) — but a local publish may no longer
+//! *produce* such a change out of thin air.
 //!
-//! `cmd_op_push` (`crates/lex-cli/src/op.rs`) used to post `/v1/locks/batch`
-//! only in the branch that also pushes new ops — the `to_send.is_empty()`
-//! case returned early, before ever reaching the lock-sync step. A re-lock
-//! (`lex pkg lock`) of an unchanged, already-pushed head moves nothing in the
-//! op DAG (no new ops), but the *committed lock* at that head can still
-//! change underneath it (a dependency re-resolved to a new pin) — and that
-//! change never reached the remote. This drives the real CLI end to end
-//! against a real in-process `lex-api` server and checks the server's
-//! stored lock via `POST /v1/locks/fetch`, the same surface `op push` posts
-//! to.
+//! #1031 originally relied on a flaw #1007 §0 identifies and fixes: a
+//! semantically no-op `lex publish` used to call `set_committed_lock` on the
+//! existing head regardless, silently attaching whatever `lex.lock` happened
+//! to be on disk *right now* to a head that publish call did not itself
+//! produce — including an already-pushed one. That is exactly the
+//! "re-lock with zero new ops" trick this test used to exercise: change
+//! `lex.lock` on disk, republish with no source change, and the old head's
+//! lock silently followed along.
+//!
+//! §0's fix refuses that: `cmd_publish` only writes a head's committed lock
+//! when *this* call actually produced (or is producing) that head — a
+//! semantic no-op with nothing else new no longer touches it. So the second
+//! half of this test now asserts the opposite of #1031's original claim:
+//! a re-lock with zero new ops leaves the already-pushed head's lock
+//! untouched, locally and therefore on the remote too. Updating a committed
+//! lock at a *stable* head is no longer implicit; going forward it takes a
+//! real op ([`lex files commit`], once files capture is on — see
+//! `--no-files` below for why this test keeps it off).
+//!
+//! Both publishes here pass `--no-files`: #1007 PR 4 makes a directory
+//! publish capture `lex.lock` itself into a files manifest by default, which
+//! would turn this test's `lex.lock`-only edit into a real `SetFiles` op —
+//! and `lex op push` cannot yet sync a `SetFiles` op's blobs (that's PR 5).
+//! `--no-files` keeps this test isolated to the op-DAG-level lock-sync
+//! mechanism it actually exercises.
+//!
+//! [`lex files commit`]: ../src/files.rs
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -105,7 +125,7 @@ fn ok(cwd: &Path, env_root: &Path, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
-fn a_relock_with_zero_new_ops_still_syncs_the_lock() {
+fn a_relock_with_zero_new_ops_leaves_the_pushed_head_lock_untouched() {
     let (server, _hub_tmp) = start_server();
     let hub = format!("http://{}", server.addr);
     let env_root = TempDir::new().unwrap();
@@ -130,7 +150,15 @@ fn a_relock_with_zero_new_ops_still_syncs_the_lock() {
     )
     .unwrap();
 
-    ok(&pkg, env_root.path(), &["publish", "."]);
+    // #1007 PR 4 made a directory publish capture `lex.lock` (and everything
+    // else non-op-log) into a files manifest by default, and lex.lock IS
+    // what this test changes between publishes — without --no-files that
+    // second publish would legitimately emit its own SetFiles op (a real,
+    // separate op in the DAG), which is exactly what this test's "zero new
+    // ops" premise needs to stay false. --no-files keeps this test isolated
+    // to the #1031 mechanic (a committed lock changing with zero *semantic*
+    // ops) it actually exercises.
+    ok(&pkg, env_root.path(), &["publish", "--no-files", "."]);
     ok(&pkg, env_root.path(), &["op", "push", &hub]);
 
     // The head this package published to, so we can ask the server for its
@@ -164,7 +192,7 @@ fn a_relock_with_zero_new_ops_still_syncs_the_lock() {
         "version = 1\n\n[[package]]\nname = \"dep\"\nversion = \"0.2.0\"\nhead_op = \"op_v2\"\n",
     )
     .unwrap();
-    ok(&pkg, env_root.path(), &["publish", "."]);
+    ok(&pkg, env_root.path(), &["publish", "--no-files", "."]);
     let push_out = ok(&pkg, env_root.path(), &["op", "push", &hub]);
     let push_text = format!(
         "{}{}",
@@ -176,10 +204,16 @@ fn a_relock_with_zero_new_ops_still_syncs_the_lock() {
         "this push must see zero new ops (source is unchanged): {push_text}"
     );
 
-    let second = fetch(&server.addr).expect("lock v2 must have synced on the zero-ops push");
+    // #1007 §0: the second publish produced no ops at all (source unchanged,
+    // --no-files), so it must not have rewritten `head_op`'s committed lock
+    // — even though `lex.lock` on disk now says v2. `op push`'s lock-sync
+    // step still runs (it always does, per #1031), but it has nothing new to
+    // sync: the LOCAL committed lock at this head is still v1.
+    let second = fetch(&server.addr).expect("the head must still have its original lock");
     assert!(
-        second.contains("op_v2"),
-        "a re-lock with zero new ops must still sync the new committed lock \
-         to the remote (#1031), got: {second}"
+        second.contains("op_v1") && !second.contains("op_v2"),
+        "a semantically no-op republish must NOT rewrite an already-pushed \
+         head's committed lock, even though lex.lock changed on disk \
+         (#1007 §0) — got: {second}"
     );
 }

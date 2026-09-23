@@ -101,6 +101,7 @@ fn commands() -> Vec<CommandInfo> {
         cmd_hash(),
         cmd_blame(),
         cmd_publish(),
+        cmd_files(),
         cmd_store(),
         cmd_stage(),
         cmd_attest(),
@@ -813,6 +814,12 @@ fn cmd_publish() -> CommandInfo {
         "with --intent-prompt: the typed issue (lex issue create) this publish realizes; the Intent carries issue_id so the ops link back to the work item and the derived issue state sees the work as started",
         None,
     )
+    .add_option(
+        "no-files",
+        "bool",
+        "a directory publish also captures its non-op-log files (README, lex.toml, lex.lock, tests/, ...) as one SetFiles op by default; opt this single publish out",
+        None,
+    )
     .with_examples(vec![
         ("Publish drafts", "lex publish app.lex"),
         ("Publish + activate", "lex publish --activate app.lex"),
@@ -824,8 +831,75 @@ fn cmd_publish() -> CommandInfo {
             "Publish as the realization of a typed issue",
             "lex publish --intent-prompt 'add triple()' --intent-issue <issue_id> app.lex",
         ),
+        (
+            "Publish a package's code only, skip capturing its files",
+            "lex publish --no-files my-package/",
+        ),
     ])
-    .with_see_also(vec!["store", "branch"])
+    .with_see_also(vec!["store", "branch", "files"])
+}
+
+fn cmd_files() -> CommandInfo {
+    let status = CommandInfo::new(
+        "status",
+        "working copy vs. the branch head's files manifest: added/modified/deleted/ignored",
+    )
+    .idempotent(true)
+    .add_argument("pkgdir", "string", "package directory (default: cwd)", false)
+    .add_option("store", "string", "store root directory", None)
+    .add_option("branch", "string", "branch to compare against (default: current)", None);
+    let commit = CommandInfo::new(
+        "commit",
+        "record a files-only SetFiles op for the working copy (warns if src/ has unpublished semantic changes)",
+    )
+    .idempotent(false)
+    .add_argument("pkgdir", "string", "package directory (default: cwd)", false)
+    .add_option("store", "string", "store root directory", None)
+    .add_option("branch", "string", "branch to commit onto (default: current)", None)
+    .add_option(
+        "intent-prompt",
+        "string",
+        "record an Intent for this commit (short form: -m)",
+        None,
+    )
+    .add_option("intent-model", "string", "with --intent-prompt: the model as provider/name", None)
+    .add_option("intent-session", "string", "with --intent-prompt: the agent session id", None)
+    .add_option("intent-issue", "string", "with --intent-prompt: the typed issue this commit realizes", None);
+    let ls = CommandInfo::new("ls", "list the files manifest in force")
+        .idempotent(true)
+        .add_option("store", "string", "store root directory", None)
+        .add_option("branch", "string", "branch to read (default: current)", None)
+        .add_option("at", "string", "a specific op id instead of the branch head", None);
+    let cat = CommandInfo::new("cat", "print one file's contents from the files manifest")
+        .idempotent(true)
+        .add_argument("path", "string", "manifest-relative path", true)
+        .add_option("store", "string", "store root directory", None)
+        .add_option("branch", "string", "branch to read (default: current)", None)
+        .add_option("at", "string", "a specific op id instead of the branch head", None);
+    let checkout = CommandInfo::new(
+        "checkout",
+        "materialize src/ + manifest files into a directory, without git",
+    )
+    .idempotent(false)
+    .add_argument("dir", "string", "target directory", true)
+    .add_option("store", "string", "store root directory", None)
+    .add_option("branch", "string", "branch to read (default: current)", None)
+    .add_option("at", "string", "a specific op id instead of the branch head", None);
+
+    let mut info = CommandInfo::new(
+        "files",
+        "work with the files manifest directly (#1007): the store's non-op-log files (README, lex.toml, lex.lock, tests/, ...)",
+    )
+    .with_examples(vec![
+        ("What changed since the last publish", "lex files status"),
+        ("Record a files-only change", "lex files commit -m 'update README'"),
+        ("List the head's manifest", "lex files ls"),
+        ("Print a manifest file", "lex files cat README.md"),
+        ("Materialize a package without git", "lex files checkout /tmp/out"),
+    ])
+    .with_see_also(vec!["publish", "store"]);
+    info.subcommands = vec![status, commit, ls, cat, checkout];
+    info
 }
 
 fn cmd_store() -> CommandInfo {
