@@ -20,8 +20,11 @@
 //!   lex export-git <out_dir> [--branch NAME] [--store DIR]
 
 use super::*;
+use lex_store::files::MODE_EXEC;
+use lex_store::{FileEntry, Manifest};
 use lex_vcs::{default_import_alias, IntentLog, OpLog, OperationKind, StageTransition};
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::process::Command;
 
 pub fn cmd_export_git(fmt: &OutputFormat, args: &[String]) -> Result<()> {
@@ -77,9 +80,22 @@ pub fn cmd_export_git(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     // package was published multi-module and we de-flatten it back into a
     // `src/*.lex` tree; otherwise we render one `src.lex`.
     let mut sig_files: BTreeMap<String, String> = BTreeMap::new();
+    // The files manifest in force (#1007 PR 6): starts empty (a store with
+    // no `SetFiles` op — the pre-#1007 shape — never touches it, so such a
+    // store exports byte-identically to the pre-#1007 renderer). Updated
+    // only by a `SetFiles` op; carried forward unchanged otherwise, exactly
+    // like `Store::manifest_at`'s single-parent inheritance.
+    let mut manifest = Manifest::new();
     let mut commits = 0usize;
 
     for rec in &records {
+        // Snapshot before this op's transition so we can diff old->new and
+        // only touch disk for a path that actually changed (§7 fidelity
+        // plan). `files_manifest_id` becomes `Some` only on the `SetFiles`
+        // op itself, for the commit's `Files:` trailer.
+        let prev_manifest = manifest.clone();
+        let mut files_manifest_id: Option<String> = None;
+
         apply_transition(&mut map, &rec.produces);
         match &rec.op.kind {
             OperationKind::AddFunction { sig_id, in_file: Some(f), .. }
@@ -103,6 +119,10 @@ pub fn cmd_export_git(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                 if let Some(f) = sig_files.remove(from) {
                     sig_files.insert(to.clone(), f);
                 }
+            }
+            OperationKind::SetFiles { manifest: manifest_id } => {
+                manifest = store.get_manifest(manifest_id).map_err(|e| anyhow!("{e}"))?;
+                files_manifest_id = Some(manifest_id.clone());
             }
             _ => {}
         }
@@ -141,9 +161,34 @@ pub fn cmd_export_git(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                 .with_context(|| format!("writing {}", path.display()))?;
         }
 
+        // The `remove_dir_all(src/)` above just wiped out any manifest file
+        // that happens to live *under* src/ (a non-`.lex` file nested there
+        // — only `src/**/*.lex` is op-log-reserved, so e.g. `src/data.bin`
+        // is a legal manifest path). Re-materialize those unconditionally,
+        // from the manifest now in force, *after* the clean — never before,
+        // or the wipe would take them right back out. This is the fix for
+        // the bug the design flagged: a naive per-commit full-manifest
+        // checkout done before the wipe loses anything nested under src/.
+        for (path, entry) in manifest.entries.iter().filter(|(p, _)| p.starts_with("src/")) {
+            write_manifest_entry(&store, &out_dir, path, entry)?;
+        }
+        // Everything else in the manifest lives outside src/, so it
+        // survived the wipe untouched — only touch disk for a path that
+        // actually changed between this commit and the last (removal,
+        // write, or chmod), per the §7 fidelity plan.
+        apply_manifest_diff(&store, &out_dir, &prev_manifest, &manifest)?;
+
         // Commit message: the intent prompt, else a kind summary.
-        let msg = commit_message(&intents, rec)?;
-        run_git(&out_dir, &["add", "-A"])?;
+        let msg = commit_message(&intents, rec, files_manifest_id.as_deref())?;
+        // `-f`: a manifest-captured file can be a *force-added* one in the
+        // source repo (tracked despite matching a `.gitignore` pattern —
+        // the manifest doesn't know or care why a path was captured, only
+        // that `git ls-files` said it was tracked). The exported repo gets
+        // its own copy of that same `.gitignore` as a manifest entry, so a
+        // plain `git add -A` here would silently drop the file again on
+        // every re-render. `-A` already covers deletions; `-f` just stops
+        // gitignore from re-filtering what the manifest already decided.
+        run_git(&out_dir, &["add", "-A", "-f"])?;
         // --allow-empty: an ImportOnly op (or a no-op transition)
         // doesn't change the tree, but the commit still records the op.
         run_git(&out_dir, &["commit", "-q", "--allow-empty", "-m", &msg])?;
@@ -167,8 +212,15 @@ pub fn cmd_export_git(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 /// One op → one commit message. The intent's prompt is the actual
 /// causal event (a commit message can be made up; the prompt is what
 /// happened), so prefer it; fall back to the op kind. The op id goes in
-/// a trailer so the git view is traceable back to the log.
-fn commit_message(intents: &IntentLog, rec: &lex_vcs::OperationRecord) -> Result<String> {
+/// a trailer so the git view is traceable back to the log. A `SetFiles`
+/// op carries an intent like any other (#1007), so it picks up the same
+/// prompt-as-subject convention; `files_manifest` (its own manifest id,
+/// `Some` only for a `SetFiles` op) adds a `Files:` trailer.
+fn commit_message(
+    intents: &IntentLog,
+    rec: &lex_vcs::OperationRecord,
+    files_manifest: Option<&str>,
+) -> Result<String> {
     let subject = match &rec.op.intent_id {
         Some(id) => intents
             .get(id)?
@@ -182,7 +234,10 @@ fn commit_message(intents: &IntentLog, rec: &lex_vcs::OperationRecord) -> Result
         .as_ref()
         .map(|id| format!("\nIntent: {id}"))
         .unwrap_or_default();
-    Ok(format!("{subject}\n\nOp: {}{intent_line}", rec.op_id))
+    let files_line = files_manifest
+        .map(|m| format!("\nFiles: {m}"))
+        .unwrap_or_default();
+    Ok(format!("{subject}\n\nOp: {}{intent_line}{files_line}", rec.op_id))
 }
 
 fn first_line(s: &str) -> String {
@@ -226,6 +281,61 @@ fn apply_transition(map: &mut BTreeMap<String, String>, t: &StageTransition) {
             }
         }
     }
+}
+
+/// Write one manifest entry's blob to `out_dir/path`, restoring its
+/// executable bit (`Entry::mode`). Creates parent directories as needed.
+fn write_manifest_entry(store: &Store, out_dir: &Path, path: &str, entry: &FileEntry) -> Result<()> {
+    let bytes = store.get_blob_bytes(&entry.blob).map_err(|e| anyhow!("{e}"))?;
+    let full = out_dir.join(path);
+    if let Some(parent) = full.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&full, &bytes).with_context(|| format!("writing {}", full.display()))?;
+    #[cfg(unix)]
+    if entry.mode == MODE_EXEC {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = std::fs::metadata(&full)?.permissions();
+        perm.set_mode(perm.mode() | 0o111);
+        std::fs::set_permissions(&full, perm)?;
+    }
+    Ok(())
+}
+
+/// Remove `out_dir/path` if present. Missing is not an error — the
+/// preceding `src/` wipe may already have taken a src/-nested path out.
+fn remove_manifest_path(out_dir: &Path, path: &str) -> Result<()> {
+    let full = out_dir.join(path);
+    match std::fs::remove_file(&full) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("removing {}", full.display())),
+    }
+}
+
+/// Apply the on-disk delta from `old` to `new`: drop a path the new
+/// manifest no longer carries, (re)write a path that's new or whose entry
+/// (blob or mode) changed. A path under `src/` is skipped here — the
+/// caller already re-materialized every such path, unconditionally, right
+/// after the render step wiped `src/` (see the call site) — so the only
+/// thing left for a src/-nested path is a removal, which the first loop
+/// below still covers (a no-op on disk, since the wipe got there first,
+/// but it keeps `git add -A` honest about the manifest's own bookkeeping).
+fn apply_manifest_diff(store: &Store, out_dir: &Path, old: &Manifest, new: &Manifest) -> Result<()> {
+    for path in old.entries.keys() {
+        if !new.entries.contains_key(path) {
+            remove_manifest_path(out_dir, path)?;
+        }
+    }
+    for (path, entry) in &new.entries {
+        if path.starts_with("src/") {
+            continue;
+        }
+        if old.entries.get(path) != Some(entry) {
+            write_manifest_entry(store, out_dir, path, entry)?;
+        }
+    }
+    Ok(())
 }
 
 fn run_git(dir: &std::path::Path, args: &[&str]) -> Result<()> {
