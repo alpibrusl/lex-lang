@@ -2,6 +2,7 @@
 
 use super::*;
 use lex_store::DepResolver; // #930: `resolve_modules` on the client resolver
+use lex_store::PublishOp;
 use lex_syntax::{load_package, Manifest};
 
 /// Read the source `lex publish` was given. A **directory** is a whole
@@ -12,7 +13,7 @@ use lex_syntax::{load_package, Manifest};
 /// (they collide). Returns the per-file import map for a package; a
 /// single **file** is loaded as before and returns `None` (the caller
 /// derives imports from the parsed `Import` stages).
-fn read_publish_source(
+pub(crate) fn read_publish_source(
     path: &str,
     inline_packages: bool,
 ) -> Result<(SynProgram, Option<lex_vcs::ImportMap>, BTreeMap<String, String>)> {
@@ -112,10 +113,17 @@ pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     // Intent (`Intent.issue_id`), so the ops link back to the work item and
     // the derived issue state can see "work has started" from provenance.
     let mut intent_issue: Option<String> = None;
+    // #1007 PR 4: a directory publish captures the working copy's non-op-log
+    // files (README, lex.toml, lex.lock, tests/, ...) into a `SetFiles` op by
+    // default. `--no-files` opts a single publish out; a single-**file**
+    // publish never captures files regardless of this flag.
+    let mut no_files = false;
     let mut positional: Vec<String> = Vec::new();
     let mut it = rest.iter();
     while let Some(a) = it.next() {
-        if a == "--branch" {
+        if a == "--no-files" {
+            no_files = true;
+        } else if a == "--branch" {
             branch = Some(
                 it.next()
                     .ok_or_else(|| anyhow!("--branch needs a value"))?
@@ -165,11 +173,15 @@ pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         anyhow!(
         "usage: lex publish [--store DIR] [--branch NAME] [--activate] [--signing-key HEX] \
          [--intent-prompt TEXT] [--intent-model PROVIDER/NAME] [--intent-session ID] \
-         [--intent-issue ISSUE_ID] <file>\n\
+         [--intent-issue ISSUE_ID] [--no-files] <file|dir>\n\
          \n\
          Every publish records an Intent. Without --intent-prompt it is recorded \
          as explicitly unattributed (#970) — pass --intent-prompt to say why the \
-         change was made, which is what makes `lex recall` and `lex op replay` useful.")
+         change was made, which is what makes `lex recall` and `lex op replay` useful.\n\
+         \n\
+         A directory publish also captures the working copy's non-op-log files \
+         (README, lex.toml, lex.lock, tests/, ...) as one SetFiles op, last, under \
+         the same intent (#1007) — pass --no-files to opt a single publish out.")
     })?;
     let signer = resolve_signing_key(signing_key_flag.as_deref())?;
 
@@ -380,45 +392,16 @@ pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    // #131 / #839: record the caller's Intent (prompt / model / session) so
-    // every op this publish emits carries *why* it happened.
-    //
-    // #970: this is no longer optional. Intent was opt-in, and the result was
-    // that the hosted corpus reached 136k ops with ZERO intents — the "why was
-    // this changed" provenance that distinguishes lex-vcs from git had no data
-    // at all on real history. Optional provenance reliably converges on no
-    // provenance, so a publish without `--intent-prompt` now records an
-    // explicitly *unattributed* intent instead of none.
-    //
-    // It does not invent a prompt. What it does record is worth having: the
-    // session (so one run's ops group together), the producer, and a marker
-    // that no prompt was declared — which is queryable, so "show me the ops
-    // nobody explained" becomes answerable rather than indistinguishable from
-    // the rest of history.
-    let intent_id: Option<lex_vcs::IntentId> = {
-        let prompt = intent_prompt
-            .clone()
-            .unwrap_or_else(|| UNATTRIBUTED_PROMPT.to_string());
-        // `split_model_ref(None)` already yields this toolchain's spelling for
-        // "the CLI made this, no model declared" (`cli/unknown`), which is the
-        // honest descriptor for an unattributed publish too.
-        let (provider, name) = split_model_ref(intent_model.as_deref());
-        let intent = lex_vcs::Intent::new(
-            prompt,
-            intent_session.clone().unwrap_or_else(default_intent_session),
-            lex_vcs::ModelDescriptor { provider, name, version: None },
-            None,
-        );
-        let intent = match &intent_issue {
-            Some(id) => intent.with_issue(id.clone()),
-            None => intent,
-        };
-        lex_vcs::IntentLog::open(&root)
-            .with_context(|| "opening intent log")?
-            .put(&intent)
-            .with_context(|| "recording intent")?;
-        Some(intent.intent_id.clone())
-    };
+    // #131 / #839 / #970: record the caller's Intent (prompt / model /
+    // session) so every op this publish emits carries *why* it happened.
+    // See `record_intent`'s doc comment for why this is unconditional.
+    let intent_id: Option<lex_vcs::IntentId> = record_intent(
+        &root,
+        intent_prompt.clone(),
+        intent_model.clone(),
+        intent_session.clone(),
+        intent_issue.clone(),
+    )?;
 
     let outcome = store.publish_program_with_intent(
         &branch,
@@ -430,15 +413,61 @@ pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         intent_id.clone(),
         &module_prefixes,
     )?;
-    // #930 P2b-1: capture the committed `lex.lock` at this head, so a peer
-    // (the hub's write-time gate) can resolve this head's dependencies
-    // against the exact pinned versions/heads it was built with, rather than
-    // inlining them. Best-effort on the read (a dependency-free package has no
-    // lock to commit); a store write error is real and propagates.
-    if let Some(head) = outcome.head_op.as_deref() {
-        if let Some((_toml, dir)) = lex_syntax::find_manifest(std::path::Path::new(path)) {
-            if let Ok(lock_toml) = std::fs::read_to_string(dir.join("lex.lock")) {
-                store.set_committed_lock(head, &lock_toml)?;
+
+    // #1007 PR 4: capture the working copy's non-op-log files into a
+    // `SetFiles` op — last, under the same intent as the semantic ops above.
+    // A directory publish only; a single-file publish is unaffected (there is
+    // no package directory to scan). `apply_set_files` reads the branch's
+    // CURRENT head at call time, so this correctly parents on whatever
+    // `publish_program_with_intent` just produced (or the pre-existing head,
+    // when nothing semantic changed).
+    let mut ops_out = outcome.ops.clone();
+    let mut files_op: Option<lex_vcs::OpId> = None;
+    let mut files_manifest_id: Option<lex_store::BlobId> = None;
+    if !no_files && std::path::Path::new(path).is_dir() {
+        if let Some((op_id, manifest_id)) =
+            crate::files::publish_files_if_changed(&store, &branch, std::path::Path::new(path), intent_id.clone())
+                .with_context(|| "capturing files manifest")?
+        {
+            ops_out.push(PublishOp {
+                op_id: op_id.clone(),
+                kind: serde_json::to_value(&lex_vcs::OperationKind::SetFiles {
+                    manifest: manifest_id.clone(),
+                })
+                .expect("SetFiles serializes"),
+            });
+            files_op = Some(op_id);
+            files_manifest_id = Some(manifest_id);
+        }
+    }
+    let final_head = files_op.clone().or_else(|| outcome.head_op.clone());
+    // Did THIS call actually produce (or is it producing) `final_head`? Only
+    // then may it rewrite that head's committed lock.
+    let produced_new_head = !outcome.ops.is_empty() || files_op.is_some();
+
+    // #1007 §0 / #930 P2b-1: capture the committed `lex.lock` at this head,
+    // so a peer (the hub's write-time gate) can resolve this head's
+    // dependencies against the exact pinned versions/heads it was built
+    // with, rather than inlining them.
+    //
+    // THE FIX (#1007 §0): a no-op publish used to call `set_committed_lock`
+    // on `outcome.head_op` regardless — and `publish_program_with_intent`
+    // returns the *existing* head, unchanged, when it applies zero ops. So a
+    // republish of an already-pushed, unchanged package silently rewrote
+    // that head's lock (to whatever `lex.lock` happens to be on disk right
+    // now, which may have drifted since the head was actually published) —
+    // corrupting a record a peer may already be relying on. Gate the write
+    // on `produced_new_head`: only a call that itself created `final_head`
+    // (via a semantic op or the `SetFiles` above) may set its lock.
+    //
+    // Best-effort on the read (a dependency-free package has no lock to
+    // commit); a store write error is real and propagates.
+    if produced_new_head {
+        if let Some(head) = final_head.as_deref() {
+            if let Some((_toml, dir)) = lex_syntax::find_manifest(std::path::Path::new(path)) {
+                if let Ok(lock_toml) = std::fs::read_to_string(dir.join("lex.lock")) {
+                    store.set_committed_lock(head, &lock_toml)?;
+                }
             }
         }
     }
@@ -461,15 +490,57 @@ pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     }
     let signed = signer.as_ref().map(|kp| kp.public_hex());
     let data = serde_json::json!({
-        "ops": outcome.ops,
-        "head_op": outcome.head_op,
+        "ops": ops_out,
+        "head_op": final_head,
         "signed_by": signed,
         // The recorded Intent's id when --intent-prompt was given, so a
         // harness (lex-code) can hand it to `lex recall` / `lex op replay`.
         "intent_id": intent_id,
+        "files_manifest": files_manifest_id,
     });
     acli::emit_or_text("publish", data, fmt, || {});
     Ok(())
+}
+
+/// Record the caller's Intent (prompt / model / session / issue) for a
+/// publish-shaped write — `lex publish` and `lex files commit` share this so
+/// both attribute their ops the same way.
+///
+/// #970: unconditional. Intent used to be opt-in, and the result was that
+/// the hosted corpus reached 136k ops with ZERO intents — the "why was this
+/// changed" provenance that distinguishes lex-vcs from git had no data at
+/// all on real history. A write without `--intent-prompt` now records an
+/// explicitly *unattributed* intent instead of none: it does not invent a
+/// prompt, but it does record the session (so one run's ops group
+/// together), the producer, and a marker that no prompt was declared —
+/// queryable, so "show me the ops nobody explained" becomes answerable.
+pub(crate) fn record_intent(
+    root: &std::path::Path,
+    prompt: Option<String>,
+    model: Option<String>,
+    session: Option<String>,
+    issue: Option<String>,
+) -> Result<Option<lex_vcs::IntentId>> {
+    let prompt = prompt.unwrap_or_else(|| UNATTRIBUTED_PROMPT.to_string());
+    // `split_model_ref(None)` already yields this toolchain's spelling for
+    // "the CLI made this, no model declared" (`cli/unknown`), which is the
+    // honest descriptor for an unattributed write too.
+    let (provider, name) = split_model_ref(model.as_deref());
+    let intent = lex_vcs::Intent::new(
+        prompt,
+        session.unwrap_or_else(default_intent_session),
+        lex_vcs::ModelDescriptor { provider, name, version: None },
+        None,
+    );
+    let intent = match issue {
+        Some(id) => intent.with_issue(id),
+        None => intent,
+    };
+    lex_vcs::IntentLog::open(root)
+        .with_context(|| "opening intent log")?
+        .put(&intent)
+        .with_context(|| "recording intent")?;
+    Ok(Some(intent.intent_id.clone()))
 }
 
 /// `provider/name` → `(provider, name)`. A bare name is attributed to

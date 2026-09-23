@@ -17,6 +17,7 @@ description: "Invoke the `lex` CLI. Commands: parse, check, authority, run…"
 - `lex hash` — print canonical SigId/StageId hashes for each function (idempotent)
 - `lex blame` — show each fn's stage history from the store (idempotent)
 - `lex publish` — publish each stage in a file to the store as Draft
+- `lex files` — work with the files manifest directly (#1007): the store's non-op-log files (README, lex.toml, lex.lock, tests/, ...)
 - `lex store` — browse the content-addressed code store
 - `lex stage` — print stage info, or list attestations for a stage (idempotent)
 - `lex attest` — cross-stage attestation queries (CI / dashboards)
@@ -247,6 +248,7 @@ publish each stage in a file to the store as Draft
 - `--intent-model` (string) — with --intent-prompt: the model as provider/name (e.g. ollama/qwen3.8:27b-mlx); default cli/unknown
 - `--intent-session` (string) — with --intent-prompt: the agent session id; default cli
 - `--intent-issue` (string) — with --intent-prompt: the typed issue (lex issue create) this publish realizes; the Intent carries issue_id so the ops link back to the work item and the derived issue state sees the work as started
+- `--no-files` (bool) — a directory publish also captures its non-op-log files (README, lex.toml, lex.lock, tests/, ...) as one SetFiles op by default; opt this single publish out
 
 ### Arguments
 
@@ -274,7 +276,45 @@ lex publish --intent-prompt 'add triple()' --intent-model ollama/qwen3.8:27b-mlx
 lex publish --intent-prompt 'add triple()' --intent-issue <issue_id> app.lex
 ```
 
-**See also:** `lex store`, `lex branch`
+```bash
+# Publish a package's code only, skip capturing its files
+lex publish --no-files my-package/
+```
+
+**See also:** `lex store`, `lex branch`, `lex files`
+
+## `lex files`
+
+work with the files manifest directly (#1007): the store's non-op-log files (README, lex.toml, lex.lock, tests/, ...)
+
+### Examples
+
+```bash
+# What changed since the last publish
+lex files status
+```
+
+```bash
+# Record a files-only change
+lex files commit -m 'update README'
+```
+
+```bash
+# List the head's manifest
+lex files ls
+```
+
+```bash
+# Print a manifest file
+lex files cat README.md
+```
+
+```bash
+# Materialize a package without git
+lex files checkout /tmp/out
+```
+
+**See also:** `lex publish`, `lex store`
 
 ## `lex store`
 
