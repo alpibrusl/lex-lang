@@ -80,19 +80,26 @@ fn a_non_inlined_head_replays_behaviorally() {
          {\n  match n { 0 => 0, _ => m.clamp_low(n) * 2 }\n}\n",
     );
 
-    // --no-files (#1007 PR 4): a directory publish now also captures its
-    // non-op-log files as a trailing SetFiles op by default, which is
-    // deliberately not replayable — `a.last()` below picks the head's LAST
-    // op, and this test's whole point is replaying the semantic add_function
-    // op, not the files snapshot after it.
+    // #1007 PR 4 makes a directory publish also capture its non-op-log files
+    // as a trailing SetFiles op by default, which is deliberately not
+    // replayable — the `.find(...).or_else(|| a.last())` below picks the
+    // semantic `add_function` op by kind rather than by position, so it
+    // still finds the right op even with a SetFiles appended after it.
+    // #1007 PR 5 makes `op push`/`op pull` able to sync that SetFiles op's
+    // blob contents, so there's no need to opt out with `--no-files` here
+    // any more (this test doesn't push at all, but keeping files capture on
+    // is the realistic default path and exercises the `.find` fallback).
     let store = app.join(".lex/store").to_string_lossy().into_owned();
-    let v = json_in(&app, &["publish", ".", "--store", &store, "--activate", "--no-files"]);
+    let v = json_in(&app, &["publish", ".", "--store", &store, "--activate"]);
     let d = data(&v);
     let op_id = d["ops"]
         .as_array()
         .and_then(|a| {
             a.iter()
-                .find(|o| o.get("op").and_then(|k| k.as_str()) == Some("add_function"))
+                .find(|o| {
+                    o.get("kind").and_then(|k| k.get("op")).and_then(|k| k.as_str())
+                        == Some("add_function")
+                })
                 .or_else(|| a.last())
         })
         .and_then(|o| o["op_id"].as_str())

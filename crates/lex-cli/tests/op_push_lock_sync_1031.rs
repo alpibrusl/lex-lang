@@ -23,12 +23,19 @@
 //! real op ([`lex files commit`], once files capture is on — see
 //! `--no-files` below for why this test keeps it off).
 //!
-//! Both publishes here pass `--no-files`: #1007 PR 4 makes a directory
-//! publish capture `lex.lock` itself into a files manifest by default, which
-//! would turn this test's `lex.lock`-only edit into a real `SetFiles` op —
-//! and `lex op push` cannot yet sync a `SetFiles` op's blobs (that's PR 5).
-//! `--no-files` keeps this test isolated to the op-DAG-level lock-sync
-//! mechanism it actually exercises.
+//! Both publishes here pass `--no-files`, DELIBERATELY, still — this is not
+//! a #1007 PR 5 gap. #1007 PR 4 made a directory publish capture `lex.lock`
+//! itself into a files manifest by default, and PR 5 (this op-log's own
+//! `push_blobs`/`pull_blobs`) now syncs a `SetFiles` op's blob contents just
+//! fine. But *this* test's second publish changes nothing but `lex.lock` on
+//! disk, and with files capture on that IS a real (files-only) change: it
+//! would legitimately emit its own `SetFiles` op, which makes `to_send`
+//! non-empty and directly contradicts the "zero new ops" premise this test
+//! is built to exercise (confirmed by trying it: the second `op push` then
+//! reports `1 ops ... added`, not `nothing to push`). `--no-files` keeps
+//! this test isolated to the op-DAG-level lock-sync mechanism it actually
+//! tests; the files-capture push/pull path itself is covered by
+//! `op_push_pull_files_1007.rs`.
 //!
 //! [`lex files commit`]: ../src/files.rs
 
@@ -150,14 +157,8 @@ fn a_relock_with_zero_new_ops_leaves_the_pushed_head_lock_untouched() {
     )
     .unwrap();
 
-    // #1007 PR 4 made a directory publish capture `lex.lock` (and everything
-    // else non-op-log) into a files manifest by default, and lex.lock IS
-    // what this test changes between publishes — without --no-files that
-    // second publish would legitimately emit its own SetFiles op (a real,
-    // separate op in the DAG), which is exactly what this test's "zero new
-    // ops" premise needs to stay false. --no-files keeps this test isolated
-    // to the #1031 mechanic (a committed lock changing with zero *semantic*
-    // ops) it actually exercises.
+    // --no-files here and below: see the module doc comment — this test's
+    // "zero new ops" premise only holds with files capture off.
     ok(&pkg, env_root.path(), &["publish", "--no-files", "."]);
     ok(&pkg, env_root.path(), &["op", "push", &hub]);
 
