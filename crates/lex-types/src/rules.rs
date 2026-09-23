@@ -39,6 +39,7 @@ impl TypeError {
             TypeError::InfiniteType { .. } => "infinite-type",
             TypeError::AmbiguousType { .. } => "ambiguous-type",
             TypeError::RecursiveTypeWithoutConstructor { .. } => "recursive-type-without-constructor",
+            TypeError::EffectRowTypeParam { .. } => "effect-row-type-param",
             TypeError::RefinementViolation { .. } => "refinement-violation",
             TypeError::ExamplesOnEffectfulFn { .. } => "examples-on-effectful-fn",
             TypeError::ExampleArityMismatch { .. } => "example-arity-mismatch",
@@ -88,6 +89,7 @@ annotation to disambiguate.",
         "recursive-type-without-constructor" => "A type alias references itself with no constructor in \
 between, so no value of the type can ever be built. Make the recursive position carry a constructor \
 (e.g. `Cons<T, List<T>> | Nil`).",
+        "effect-row-type-param" => EFFECT_ROW_TYPE_PARAM,
         "refinement-violation" => "A literal argument provably violates a refinement-type predicate \
 (#209). Adjust the argument to satisfy the predicate, or relax the predicate at the function \
 signature.",
@@ -125,6 +127,7 @@ pub fn all_rules() -> &'static [RuleInfo] {
         RuleInfo { tag: "infinite-type", explanation: INFINITE_TYPE },
         RuleInfo { tag: "ambiguous-type", explanation: AMBIGUOUS_TYPE },
         RuleInfo { tag: "recursive-type-without-constructor", explanation: RECURSIVE_NO_CTOR },
+        RuleInfo { tag: "effect-row-type-param", explanation: EFFECT_ROW_TYPE_PARAM },
         RuleInfo { tag: "refinement-violation", explanation: REFINEMENT_VIOLATION },
         RuleInfo { tag: "examples-on-effectful-fn", explanation: EXAMPLES_ON_EFFECTFUL_FN },
         RuleInfo { tag: "example-arity-mismatch", explanation: EXAMPLE_ARITY_MISMATCH },
@@ -273,6 +276,15 @@ annotation to disambiguate.";
 const RECURSIVE_NO_CTOR: &str = "A type alias references itself with no constructor in \
 between, so no value of the type can ever be built. Make the recursive position carry a constructor \
 (e.g. `Cons<T, List<T>> | Nil`).";
+const EFFECT_ROW_TYPE_PARAM: &str = "A user-defined generic type (`type Foo[e] = { ... }`) uses one \
+of its own type parameters as an effect-row tail (`[| e]`) somewhere inside its body — e.g. a record \
+field typed `(Req) -> [| e] Resp`. This isn't supported: a generic type's parameters are always \
+ordinary types internally, with no way to carry an effect row through them, so the row silently stops \
+propagating the moment the type is unfolded — a function that routes an effectful closure through such \
+a type can end up with a declared effect row that understates what it actually does, with no warning \
+from `lex check` (#1029). Restructure so the effect-row-polymorphic function takes the closure \
+directly as its own row-polymorphic parameter (`fn f[e](h :: (Req) -> [| e] Resp) -> [| e] Resp`), not \
+wrapped inside a generic record or other user-defined type.";
 const REFINEMENT_VIOLATION: &str = "A literal argument provably violates a refinement-type predicate \
 (#209). Adjust the argument to satisfy the predicate, or relax the predicate at the function \
 signature.";
@@ -357,6 +369,11 @@ mod tests {
             TypeError::RecursiveTypeWithoutConstructor {
                 at_node: "n_0".into(),
                 name: "Bad".into(),
+            },
+            TypeError::EffectRowTypeParam {
+                at_node: "n_0".into(),
+                type_name: "Router".into(),
+                param: "e".into(),
             },
             TypeError::RefinementViolation {
                 at_node: "n_0".into(),

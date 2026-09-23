@@ -444,10 +444,13 @@ fn check_program_inner(
     for stage in stages {
         if let a::Stage::TypeDecl(td) = stage {
             if let Err(e) = tcx.type_env.add_user_type(&td.name, td.clone()) {
-                errors.push((TypeError::RecursiveTypeWithoutConstructor {
-                    at_node: "n_0".into(),
-                    name: e,
-                }, None));
+                let err = match e {
+                    crate::env::AddTypeError::RecursiveWithoutConstructor(name) =>
+                        TypeError::RecursiveTypeWithoutConstructor { at_node: "n_0".into(), name },
+                    crate::env::AddTypeError::EffectRowTypeParam { type_name, param } =>
+                        TypeError::EffectRowTypeParam { at_node: "n_0".into(), type_name, param },
+                };
+                errors.push((err, None));
             }
         }
     }
@@ -625,8 +628,11 @@ fn collect_vars(t: &Ty) -> Vec<TyVarId> {
 
 /// Walk a type and collect every effect-row variable id that appears
 /// inside any function-type's effect set. Used to generalize stdlib
-/// HOF schemes alongside ordinary type vars.
-fn collect_eff_vars(t: &Ty) -> Vec<u32> {
+/// HOF schemes alongside ordinary type vars, and by `env::add_user_type`
+/// (#1029) to detect a generic type alias using one of its own params
+/// as a row var — something `Ty::Con`'s ordinary-type-only arguments
+/// can't actually carry.
+pub(crate) fn collect_eff_vars(t: &Ty) -> Vec<u32> {
     let mut out = Vec::new();
     fn walk(t: &Ty, out: &mut Vec<u32>) {
         match t {

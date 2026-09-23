@@ -26,6 +26,22 @@
 //!    closure variants (`serve_fn` / `serve_routed` / `serve_ws_fn` / …),
 //!    which thread the handler's effects to the call site.
 //!
+//! 4. **BARE_ROW_VAR** (#1028) — a bare effect name inside `[...]` that is
+//!    also one of the enclosing function's own generic type parameters,
+//!    with no `|` before it. `fn f[E](x :: T) -> [E] R` reads like "E is
+//!    the row variable this function is polymorphic over," and the
+//!    grammar accepts it silently — but `parse_effects` only recognises
+//!    an open-row tail after an explicit `|`. Without one, `E` is parsed
+//!    as an ordinary, concrete effect *named* "E": `fn f[E](...) -> [E] R`
+//!    type-checks fine on its own and is a completely different,
+//!    almost-certainly-unintended signature from `fn f[E](...) -> [| E] R`
+//!    (`E` as the actual open row). The two are visually near-identical,
+//!    and the mistake surfaces later as a confusing effect-row-mismatch at
+//!    a call site, not at the declaration that caused it. Found live: an
+//!    existing declaration in the ecosystem (`lex-web`'s `ws.dial[E]`) had
+//!    made exactly this mistake, undetected because nothing ever called
+//!    it.
+//!
 //! Separately from the lints, this module reports DEPRECATIONS
 //! ([`deprecations`]). They are advisory and must never fail a build:
 //! `lex check --strict` exits 1 on a lint warning and `lex ci` runs it, so
@@ -77,10 +93,10 @@ pub fn lint_program(prog: &Program) -> Vec<LintWarning> {
         })
         .collect();
 
-    let ctx = LintCtx { top_fns: &top_level_fns, net_aliases: &net_aliases };
-
     for item in &prog.items {
         if let Item::FnDecl(fd) = item {
+            let ctx = LintCtx { top_fns: &top_level_fns, net_aliases: &net_aliases, type_params: &fd.type_params };
+
             for param in &fd.params {
                 if ctx.top_fns.contains(&param.name) {
                     warnings.push(LintWarning {
@@ -91,6 +107,11 @@ pub fn lint_program(prog: &Program) -> Vec<LintWarning> {
                         ),
                         location: format!("in fn `{}`", fd.name),
                     });
+                }
+            }
+            for eff in &fd.effects {
+                if ctx.type_params.contains(&eff.name) {
+                    warnings.push(bare_row_var_warning(&eff.name, &fd.name));
                 }
             }
             lint_block(&fd.body, &fd.name, &ctx, &mut warnings);
@@ -104,6 +125,26 @@ pub fn lint_program(prog: &Program) -> Vec<LintWarning> {
 struct LintCtx<'a> {
     top_fns: &'a [String],
     net_aliases: &'a [String],
+    /// The enclosing top-level function's generic type parameters — used
+    /// only by BARE_ROW_VAR to recognise when a nested lambda's effect
+    /// list bare-names one of them.
+    type_params: &'a [String],
+}
+
+/// BARE_ROW_VAR (#1028): `name` is a declared type parameter appearing as
+/// a bare (no `|`) entry inside an effect list — almost certainly meant
+/// as `| name` (an open row), not a concrete effect named `name`.
+fn bare_row_var_warning(name: &str, fn_name: &str) -> LintWarning {
+    LintWarning {
+        code: "BARE_ROW_VAR",
+        message: format!(
+            "`{name}` is a type parameter of this function and also appears as a bare \
+             effect in `[...]`; did you mean `| {name}` (an open effect row) instead of a \
+             concrete effect literally named `{name}`? — the two parse to unrelated \
+             signatures"
+        ),
+        location: format!("in fn `{fn_name}`"),
+    }
 }
 
 fn lint_block(block: &Block, fn_name: &str, ctx: &LintCtx, out: &mut Vec<LintWarning>) {
@@ -201,6 +242,11 @@ fn lint_expr(expr: &Expr, fn_name: &str, ctx: &LintCtx, out: &mut Vec<LintWarnin
                         ),
                         location: format!("in fn `{fn_name}`"),
                     });
+                }
+            }
+            for eff in &lam.effects {
+                if ctx.type_params.contains(&eff.name) {
+                    out.push(bare_row_var_warning(&eff.name, fn_name));
                 }
             }
             lint_block(&lam.body, fn_name, ctx, out);
@@ -378,6 +424,11 @@ mod tests {
         lint_program(&prog).into_iter().map(|w| w.code).collect()
     }
 
+    fn messages(src: &str) -> Vec<String> {
+        let prog = parse_source(src).expect("parse");
+        lint_program(&prog).into_iter().map(|w| w.message).collect()
+    }
+
     fn dep_codes(src: &str) -> Vec<&'static str> {
         let prog = parse_source(src).expect("parse");
         deprecations(&prog).into_iter().map(|w| w.code).collect()
@@ -441,6 +492,83 @@ fn main() -> [net] Unit { web.serve(8080, "h") }
 "#;
         assert!(codes(src).contains(&"NET_SERVE_NAMED"),
             "renamed std.net alias should still be linted");
+    }
+
+    // ── BARE_ROW_VAR (#1028) ─────────────────────────────────────────────────
+
+    #[test]
+    fn bare_type_param_in_return_effects_is_flagged() {
+        // `E` is a type param and appears with no `|` — parses as a
+        // concrete effect literally named "E", almost certainly not what
+        // was intended.
+        let src = r#"
+fn f[E](x :: Str) -> [E] Str { x }
+"#;
+        assert!(codes(src).contains(&"BARE_ROW_VAR"),
+            "bare type-param-named effect should warn BARE_ROW_VAR");
+    }
+
+    #[test]
+    fn open_row_with_pipe_is_not_flagged() {
+        // The correct spelling: `| E` makes E an actual open row variable.
+        let src = r#"
+fn f[E](x :: Str) -> [| E] Str { x }
+"#;
+        assert!(!codes(src).contains(&"BARE_ROW_VAR"),
+            "`| E` is the correct open-row spelling and must not warn");
+    }
+
+    #[test]
+    fn mixed_row_with_pipe_is_not_flagged() {
+        let src = r#"
+fn f[E](x :: Str) -> [io, net | E] Str { x }
+"#;
+        assert!(!codes(src).contains(&"BARE_ROW_VAR"),
+            "concrete effects ahead of `| E` must not warn");
+    }
+
+    #[test]
+    fn ordinary_concrete_effect_unrelated_to_type_params_is_not_flagged() {
+        let src = r#"
+fn f[T](x :: T) -> [io] T { x }
+"#;
+        assert!(codes(src).is_empty(),
+            "an effect name that isn't a type param must not warn");
+    }
+
+    #[test]
+    fn bare_type_param_inside_a_nested_lambda_is_flagged() {
+        // The footgun also occurs one level down: a lambda argument to a
+        // HOF bare-naming the enclosing function's own row variable.
+        let src = r#"
+import "std.net" as net
+fn serve_it[E](h :: (Str) -> [| E] Str) -> [net | E] Unit {
+  net.serve_fn(8080, fn (req :: Str) -> [E] Str { h(req) })
+}
+"#;
+        assert!(codes(src).contains(&"BARE_ROW_VAR"),
+            "a nested lambda bare-naming the enclosing fn's type param should warn");
+    }
+
+    #[test]
+    fn the_real_ws_dial_shape_is_flagged() {
+        // The live bug this lint exists to catch: lex-web's `ws.dial[E]`
+        // declared `-> [net, E] Result[...]` — E meant as the row var but
+        // parsed as a second concrete effect literally named "E".
+        let src = r#"
+fn dial[E](url :: Str, on_open :: () -> [E] Unit) -> [net, E] Unit { on_open() }
+"#;
+        assert!(codes(src).contains(&"BARE_ROW_VAR"),
+            "the mixed-list bare-E shape from the real ws.dial bug must be caught");
+    }
+
+    #[test]
+    fn the_notice_suggests_the_pipe_fix() {
+        let src = r#"
+fn f[E](x :: Str) -> [E] Str { x }
+"#;
+        let m = messages(src).into_iter().find(|_| true).expect("one warning");
+        assert!(m.contains("| E"), "must suggest the `| E` fix: {m}");
     }
 
     // ── deprecations ─────────────────────────────────────────────────────────

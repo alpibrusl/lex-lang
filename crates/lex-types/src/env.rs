@@ -19,6 +19,31 @@ pub enum TypeDefKind {
     Opaque,
 }
 
+/// Error from [`TypeEnv::add_user_type`].
+#[derive(Debug, Clone)]
+pub enum AddTypeError {
+    /// A type alias references itself with no constructor in between
+    /// (currently never raised — see `add_user_type`'s doc comment).
+    #[allow(dead_code)]
+    RecursiveWithoutConstructor(String),
+    /// #1029: one of the type's own params is used as an effect-row
+    /// tail (`[| param]`) somewhere in its body. See
+    /// `TypeError::EffectRowTypeParam` for why this is rejected rather
+    /// than silently mis-tracked.
+    EffectRowTypeParam { type_name: String, param: String },
+}
+
+/// #1029: does `ty` use any of `params` as an effect-row variable
+/// (i.e. does `collect_eff_vars` find an id that's actually one of
+/// this type's own declared params, per the shared index-space
+/// convention `ty_from_canon` uses for `[| name]`)? Returns the first
+/// offending param name, for the error message.
+fn own_param_used_as_eff_var(ty: &Ty, params: &[String]) -> Option<String> {
+    crate::checker::collect_eff_vars(ty)
+        .into_iter()
+        .find_map(|id| params.get(id as usize).cloned())
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TypeEnv {
     /// Type-name → definition.
@@ -378,7 +403,7 @@ impl TypeEnv {
         e
     }
 
-    pub fn add_user_type(&mut self, name: &str, decl: lex_ast::TypeDecl) -> Result<(), String> {
+    pub fn add_user_type(&mut self, name: &str, decl: lex_ast::TypeDecl) -> Result<(), AddTypeError> {
         match &decl.definition {
             lex_ast::TypeExpr::Union { variants } => {
                 // Resolve payloads env-aware (#963: normalizes alias-qualified
@@ -388,6 +413,11 @@ impl TypeEnv {
                 let mut vmap = IndexMap::new();
                 for v in variants {
                     let payload = v.payload.as_ref().map(|p| ty_from_canon_env(p, &decl.params, self));
+                    if let Some(p) = &payload {
+                        if let Some(param) = own_param_used_as_eff_var(p, &decl.params) {
+                            return Err(AddTypeError::EffectRowTypeParam { type_name: name.to_string(), param });
+                        }
+                    }
                     vmap.insert(v.name.clone(), payload);
                 }
                 for v in variants {
@@ -400,6 +430,9 @@ impl TypeEnv {
             }
             other => {
                 let ty = ty_from_canon_env(other, &decl.params, self);
+                if let Some(param) = own_param_used_as_eff_var(&ty, &decl.params) {
+                    return Err(AddTypeError::EffectRowTypeParam { type_name: name.to_string(), param });
+                }
                 self.types.insert(name.to_string(), TypeDef {
                     params: decl.params.clone(),
                     kind: TypeDefKind::Alias(ty),
