@@ -148,5 +148,5 @@ fn handle(req :: Request) -> [io] Response {
 }
 
 fn main() -> [io, net] Nil {
-  net.serve(8090, "handle")
+  net.serve_fn(8090, handle)
 }

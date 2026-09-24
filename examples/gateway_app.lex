@@ -22,8 +22,12 @@
 # Run:
 #   lex run --allow-effects io,net,time \
 #           --allow-fs-read /tmp \
-#           --allow-net-host wttr.in,httpbin.org \
+#           --allow-net-host wttr.in --allow-net-host httpbin.org \
 #           examples/gateway_app.lex main
+#
+# (--allow-net-host takes exactly one host per flag — repeat it per host,
+# don't comma-join; a comma-joined value is a single literal hostname that
+# never matches.)
 #
 # Try:
 #   curl http://127.0.0.1:8210/now
@@ -161,5 +165,5 @@ fn handle(req :: Request) -> [net, time, io] Response {
 }
 
 fn main() -> [net, time, io] Nil {
-  net.serve(8210, "handle")
+  net.serve_fn(8210, handle)
 }

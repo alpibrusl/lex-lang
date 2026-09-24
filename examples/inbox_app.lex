@@ -136,5 +136,5 @@ fn handle(req :: Request) -> [net, time, io] Response {
 }
 
 fn main() -> [net, time, io] Nil {
-  net.serve(8200, "handle")
+  net.serve_fn(8200, handle)
 }

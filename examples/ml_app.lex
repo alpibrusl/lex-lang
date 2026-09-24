@@ -224,5 +224,5 @@ fn handle(req :: Request) -> [io] Response {
 }
 
 fn main() -> [io, net] Nil {
-  net.serve(8100, "handle")
+  net.serve_fn(8100, handle)
 }

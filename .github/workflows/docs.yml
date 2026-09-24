@@ -22,6 +22,29 @@ name: docs
 # job builds `lex` from this checkout, so the docs always track the current
 # toolchain. Merge order matters: this can only run green once #564 is on
 # `main`.
+#
+# #1042 adds real proof on top of the rendered doc comments: every example
+# is `lex check --strict`'d against this checkout's own freshly-built `lex`
+# (a hard pass/fail — see scripts/verify-docs-examples.py), and the subset
+# whose doc comment shows a real `lex run ...`/`lex check ...` command gets
+# that command actually EXECUTED, plus a self-hosted terminal recording of
+# the real execution (scripts/record-docs-examples.py — best-effort,
+# soft-fail; see that script's own doc comment for why recording tooling
+# availability is never a reason to fail this job, while the check/run
+# proof always is).
+#
+# Release gating: this repo has no separate pre-tag gate workflow today —
+# release.yml triggers directly off `v*` tag pushes (or workflow_dispatch)
+# with no dependency on other workflows' status, and verify-release.yml
+# explicitly documents itself as running only *after* a release is
+# published, as a post-hoc smoke test, "intentionally NOT a gate on the
+# release itself". The thing that already functions as a pre-release gate
+# in this project is this job's own `push: branches: [main]` /
+# `pull_request` triggers (same as ci.yml's tests) — a tag only gets cut
+# once main is green, and green here now requires every docs example to
+# still check and run. So #1042's verification step is added to *this*
+# existing job/trigger pair rather than inventing a parallel
+# release-gating mechanism.
 
 on:
   push:
@@ -32,6 +55,9 @@ on:
       - 'sitegen/**'
       - 'crates/lex-cli/src/docs.rs'
       - 'scripts/check-docs-site.py'
+      - 'scripts/verify-docs-examples.py'
+      - 'scripts/record-docs-examples.py'
+      - 'scripts/docs_examples_lib.py'
       - '.github/workflows/docs.yml'
   pull_request:
     paths:
@@ -40,6 +66,9 @@ on:
       - 'sitegen/**'
       - 'crates/lex-cli/src/docs.rs'
       - 'scripts/check-docs-site.py'
+      - 'scripts/verify-docs-examples.py'
+      - 'scripts/record-docs-examples.py'
+      - 'scripts/docs_examples_lib.py'
       - '.github/workflows/docs.yml'
   workflow_dispatch:
     inputs:
@@ -96,6 +125,69 @@ jobs:
           print(f"documented {len(mods)} module(s), {fns} function(s)")
           assert mods, "no modules documented"
           PY
+      # #1042 hard gate: every examples/**.lex file must still
+      # `lex check --strict` against the `lex` this job just built, and
+      # every doc comment's own `Run:` command must actually behave as
+      # documented when executed for real (server examples are proven via
+      # their own documented `curl`/WS traffic, not just an exit code from
+      # a process that's designed to run forever — see the script's doc
+      # comment). Bare `lex` on PATH resolves to this checkout's binary so
+      # the doc comments' own literal `lex run ...` / `lex check ...`
+      # commands work unmodified — same commands a reader would copy-paste.
+      # Writes site/verify-results.json, which sitegen/verify.lex renders
+      # into each guide page's "✓ verified" badge, and
+      # site/runnable-examples.json, the exact {file, run} set the
+      # (soft-fail) recording step below replays — never re-derived, so a
+      # recording can never drift from what was actually proven to work.
+      - name: Verify docs examples (type-check + real run) — hard gate
+        env:
+          SRC: ${{ github.event.inputs.source-path || 'examples' }}
+        run: |
+          export PATH="$PWD/target/debug:$PATH"
+          python3 scripts/verify-docs-examples.py \
+            --lex-bin ./target/debug/lex \
+            --src "$SRC" \
+            --api-docs site/api-docs.json \
+            --out site/verify-results.json
+      - name: Show verify-results.json
+        if: always()
+        run: cat site/verify-results.json
+      # Best-effort only (see record-docs-examples.py's doc comment): a
+      # missing/broken `asciinema` here is a warning, never a failed
+      # build. pip over apt-get — a pinned, modern version without an
+      # `apt-get update` round trip, and it's what's actually reliable
+      # across ubuntu-latest images (apt's asciinema package version has
+      # drifted between runner images before).
+      - name: Install asciinema (best-effort)
+        continue-on-error: true
+        run: |
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          pip install --user --quiet 'asciinema>=2.4,<3'
+      - name: Record docs examples (best-effort)
+        continue-on-error: true
+        run: |
+          export PATH="$PWD/target/debug:$HOME/.local/bin:$PATH"
+          python3 scripts/record-docs-examples.py \
+            --runnable site/runnable-examples.json \
+            --api-docs site/api-docs.json \
+            --out-dir site/recordings
+      # Self-hosted playback (no runtime request to asciinema.org) —
+      # vendor asciinema-player's own published JS/CSS bundle once, at
+      # build time, same footing as the recordings themselves: regenerated
+      # every push, never committed. Best-effort, same reasoning as the
+      # recording step above: if a given CI environment can't reach
+      # jsdelivr, sitegen/verify.lex falls back to a plain download link
+      # for the raw .cast instead of a broken/missing player.
+      - name: Vendor asciinema-player (self-hosted, best-effort)
+        continue-on-error: true
+        env:
+          ASCIINEMA_PLAYER_VERSION: '3.17.0'
+        run: |
+          mkdir -p site/vendor
+          curl -fsSL --retry 3 -o site/vendor/asciinema-player.min.js \
+            "https://cdn.jsdelivr.net/npm/asciinema-player@${ASCIINEMA_PLAYER_VERSION}/dist/bundle/asciinema-player.min.js"
+          curl -fsSL --retry 3 -o site/vendor/asciinema-player.min.css \
+            "https://cdn.jsdelivr.net/npm/asciinema-player@${ASCIINEMA_PLAYER_VERSION}/dist/bundle/asciinema-player.min.css"
       # The site generator is itself a Lex program (dogfooding, per
       # lex-www's generate.lex convention) — see sitegen/generate.lex for
       # why. `--allow-fs-write _site` scopes its write authority to
