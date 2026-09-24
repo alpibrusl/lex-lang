@@ -100,11 +100,14 @@ jobs:
       # lex-www's generate.lex convention) — see sitegen/generate.lex for
       # why. `--allow-fs-write _site` scopes its write authority to
       # exactly the output directory; it never touches the source tree.
+      # `--allow-fs-read examples` is new: the per-example on-site source
+      # pages (sitegen/generate.lex's build_source_page) read the real
+      # `.lex` files directly, not just the `site/api-docs.json` JSON.
       - name: Generate docs site
         run: |
           ./target/debug/lex run --allow-effects fs_read,fs_write \
             --allow-fs-read docs --allow-fs-read sitegen --allow-fs-read site \
-            --allow-fs-write _site \
+            --allow-fs-read examples --allow-fs-write _site \
             sitegen/generate.lex main
       # The CI gate for #567's "never drifts" requirement: a PR that
       # breaks Markdown rendering, drops a page, or dangles a link fails
