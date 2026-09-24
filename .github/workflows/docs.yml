@@ -1,12 +1,22 @@
 name: docs
 
 # Generate machine-readable API docs (`lex docs --output json`, #564) for
-# this repo's example Lex sources and publish them as a build artifact.
+# this repo's example Lex sources, render them (plus the curated docs/*.md
+# set and the landing page) into a static site with `sitegen/generate.lex`,
+# and — on push to `main` — publish it to GitHub Pages at doc.lexlang.org.
 #
-# This is the non-deploying half of #567: it produces the JSON that a
-# static-site renderer or a doc-gen agent consumes. Wiring the artifact to
-# a published site (GitHub Pages vs. the existing Caddy-served `docs/`) is a
-# separate deployment decision and is intentionally left out here.
+# This finishes #567: the `api-docs` job used to be the non-deploying half
+# (JSON only, uploaded as a build artifact); `docs-site` now wires that JSON
+# to a published site, and `deploy` publishes it via Actions-based Pages
+# (replacing the old branch+path `/docs` mechanism — see
+# scripts/setup-pages.sh, which targets that older mechanism and should not
+# be re-run now that Pages' build type is "workflow").
+#
+# `docs-site` runs on pull_request too (not just push) so a change that
+# breaks generation — a `sitegen/*.lex` bug, a docs/*.md edit that trips the
+# Markdown-lite converter, a `lex docs` schema change — fails CI on the PR,
+# before it ever reaches `main`, rather than only being noticed by looking
+# at the deployed site after merge.
 #
 # Requires a `lex` that supports `lex docs --output json <path>` (#564). The
 # job builds `lex` from this checkout, so the docs always track the current
@@ -18,7 +28,18 @@ on:
     branches: [main]
     paths:
       - 'examples/**.lex'
+      - 'docs/**.md'
+      - 'sitegen/**'
       - 'crates/lex-cli/src/docs.rs'
+      - 'scripts/check-docs-site.py'
+      - '.github/workflows/docs.yml'
+  pull_request:
+    paths:
+      - 'examples/**.lex'
+      - 'docs/**.md'
+      - 'sitegen/**'
+      - 'crates/lex-cli/src/docs.rs'
+      - 'scripts/check-docs-site.py'
       - '.github/workflows/docs.yml'
   workflow_dispatch:
     inputs:
@@ -30,8 +51,12 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  api-docs:
+  docs-site:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -60,7 +85,7 @@ jobs:
           ./target/debug/lex --output json docs "$SRC" > site/api-docs.json
           # Human-readable render to the job log for a quick eyeball.
           ./target/debug/lex docs "$SRC"
-      - name: Validate output
+      - name: Validate API docs JSON
         run: |
           python3 - <<'PY'
           import json
@@ -71,8 +96,51 @@ jobs:
           print(f"documented {len(mods)} module(s), {fns} function(s)")
           assert mods, "no modules documented"
           PY
+      # The site generator is itself a Lex program (dogfooding, per
+      # lex-www's generate.lex convention) — see sitegen/generate.lex for
+      # why. `--allow-fs-write _site` scopes its write authority to
+      # exactly the output directory; it never touches the source tree.
+      - name: Generate docs site
+        run: |
+          ./target/debug/lex run --allow-effects fs_read,fs_write \
+            --allow-fs-read docs --allow-fs-read sitegen --allow-fs-read site \
+            --allow-fs-write _site \
+            sitegen/generate.lex main
+      # The CI gate for #567's "never drifts" requirement: a PR that
+      # breaks Markdown rendering, drops a page, or dangles a link fails
+      # here, not just at deploy time.
+      - name: Validate generated site
+        run: python3 scripts/check-docs-site.py
       - uses: actions/upload-artifact@v7
         with:
           name: api-docs
           path: site/api-docs.json
           if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: docs-site
+          path: _site
+          if-no-files-found: error
+
+  deploy:
+    needs: docs-site
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: docs-site
+          path: _site
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4
