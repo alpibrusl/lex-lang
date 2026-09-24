@@ -27,7 +27,7 @@ fn spawn_ml_server(port: u16) {
     let csv_abs = workspace_root().join("examples/houses.csv");
     let csv_path = csv_abs.to_str().expect("utf-8 path");
     let src = include_str!("../../../examples/ml_app.lex")
-        .replace("net.serve(8100,", &format!("net.serve({port},"))
+        .replace("net.serve_fn(8100,", &format!("net.serve_fn({port},"))
         .replace("examples/houses.csv", csv_path);
     let prog = parse_source(&src).expect("parse");
     let stages = canonicalize_program(&prog);

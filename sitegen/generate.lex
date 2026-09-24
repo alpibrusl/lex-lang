@@ -34,6 +34,7 @@ import "./md" as md
 import "./layout" as layout
 import "./jsonx" as jx
 import "./highlight" as hl
+import "./verify" as verify
 
 # ── Small IO helpers ─────────────────────────────────────────────────────
 
@@ -274,7 +275,7 @@ fn build_source_page(file :: Str, slug :: Str) -> [fs_read, fs_write] Unit {
   write_page("_site/guides/" + slug + "-src.html", html)
 }
 
-fn build_module_page(m :: Json) -> [fs_read, fs_write] Unit {
+fn build_module_page(m :: Json, verify_results :: List[Json], recordings :: List[Tuple[Str, Json]], player_is_ready :: Bool) -> [fs_read, fs_write] Unit {
   let mo := jx.as_obj(m)
   let file := jx.field_str(mo, "file")
   let doc := jx.field_str(mo, "doc")
@@ -291,7 +292,13 @@ fn build_module_page(m :: Json) -> [fs_read, fs_write] Unit {
     "<a href=\"" + slug + "-src.html\"><code>" + file + "</code></a>" +
     "<a class=\"secondary\" href=\"https://github.com/alpibrusl/lex-lang/blob/main/" + file + "\">view on GitHub ↗</a>" +
     " &middot; " + int_to_str(list.len(fns)) + " function(s)</p>\n"
-  let body := "<h1>" + md.escape_html(file) + "</h1>\n" + src_note + doc_html + "<h2>Functions</h2>\n" + fns_html
+  # Proof this example still works against the current toolchain (#1042):
+  # a generated badge from site/verify-results.json, plus — for the
+  # subset with a real documented Run: command — an embedded terminal
+  # recording of that command actually executing. Both are build-time
+  # artifacts (see sitegen/verify.lex); neither is hand-maintained prose.
+  let verify_html := verify.badge_html(verify_results, file) + verify.recording_html(recordings, file, slug, player_is_ready)
+  let body := "<h1>" + md.escape_html(file) + "</h1>\n" + src_note + verify_html + doc_html + "<h2>Functions</h2>\n" + fns_html
   let html := layout.page("../", file, "Guide and API reference for " + file + ", generated from its doc comments and live signatures.", "guides", false, body)
   write_page("_site/guides/" + slug + ".html", html)
 }
@@ -311,7 +318,7 @@ fn digits(n :: Int) -> Str {
   }
 }
 
-fn guide_card(m :: Json) -> Str {
+fn guide_card(m :: Json, verify_results :: List[Json]) -> Str {
   let mo := jx.as_obj(m)
   let file := jx.field_str(mo, "file")
   let doc := jx.field_str(mo, "doc")
@@ -321,17 +328,27 @@ fn guide_card(m :: Json) -> Str {
     true => "<span class=\"badge\">reference only</span>",
     false => "<span class=\"badge pure\">documented</span>",
   }
+  let verified := match verify.find_verify_result(verify_results, file) {
+    None => "",
+    Some(r) => match verify.field_bool(r, "type_checked") {
+      false => " <span class=\"badge\">rejected by design</span>",
+      true => match verify.field_bool_opt(r, "ran") {
+        Some(true) => " <span class=\"badge pure\">verified</span>",
+        _ => "",
+      },
+    },
+  }
   # A plain `<div>`, not an `<a>`, because it needs *two* separate links
   # (the guide/doc page and the new on-site source page) — an `<a>`
   # can't nest another `<a>` inside it. `.card`'s box styling (border,
   # background, padding) applies the same to a div as it did to the
   # anchor this replaced.
-  "<div class=\"card guide-card\"><h3>" + md.escape_html(file) + "</h3><p>" + status + " &middot; " + int_to_str(list.len(fns)) + " fn</p>" +
+  "<div class=\"card guide-card\"><h3>" + md.escape_html(file) + "</h3><p>" + status + verified + " &middot; " + int_to_str(list.len(fns)) + " fn</p>" +
   "<p class=\"card-links\"><a href=\"" + slug + ".html\">Guide</a> &middot; <a href=\"" + slug + "-src.html\">Source</a></p></div>\n"
 }
 
-fn build_guides_index(modules :: List[Json]) -> [fs_read, fs_write] Unit {
-  let cards := list.fold(modules, "", fn (acc :: Str, m :: Json) -> Str { acc + guide_card(m) })
+fn build_guides_index(modules :: List[Json], verify_results :: List[Json]) -> [fs_read, fs_write] Unit {
+  let cards := list.fold(modules, "", fn (acc :: Str, m :: Json) -> Str { acc + guide_card(m, verify_results) })
   let body :=
     "<h1>Guides</h1>\n" +
     "<p class=\"lede\">One page per documented example under <code>examples/</code>, generated from " +
@@ -342,14 +359,45 @@ fn build_guides_index(modules :: List[Json]) -> [fs_read, fs_write] Unit {
   write_page("_site/guides/index.html", html)
 }
 
+fn copy_recordings_and_vendor(recordings :: List[Tuple[Str, Json]], player_is_ready :: Bool) -> [fs_read, fs_write] Unit {
+  match fs.mkdir_p("_site/recordings") { Ok(_) => (), Err(_) => () }
+  match fs.mkdir_p("_site/vendor") { Ok(_) => (), Err(_) => () }
+  # site/recordings/manifest.json maps file -> cast filename | null — copy
+  # only the real, non-null entries (a recording that failed for that
+  # file, per record-docs-examples.py's own soft-fail policy, is simply
+  # absent — never a stub file).
+  list.fold(recordings, (), fn (acc :: Unit, kv :: Tuple[Str, Json]) -> [fs_read, fs_write] Unit {
+    match tuple.snd(kv) {
+      JStr(name) => {
+        let cast := must_read("site/recordings/" + name)
+        match str.is_empty(cast) { true => (), false => write_page("_site/recordings/" + name, cast) }
+      },
+      _ => (),
+    }
+  })
+  match player_is_ready {
+    false => (),
+    true => {
+      write_page("_site/vendor/asciinema-player.min.js", must_read("site/vendor/asciinema-player.min.js"))
+      write_page("_site/vendor/asciinema-player.min.css", must_read("site/vendor/asciinema-player.min.css"))
+    },
+  }
+}
+
 fn build_guides() -> [fs_read, fs_write] Unit {
   let api_src := must_read("site/api-docs.json")
+  let verify_results := verify.load_verify_results()
+  let recordings := verify.load_recordings_manifest()
+  let player_is_ready := verify.player_ready()
+  copy_recordings_and_vendor(recordings, player_is_ready)
   match json.decode(api_src) {
     Ok(root) => {
       let data := match jx.obj_field(jx.as_obj(root), "data") { Some(v) => v, None => JNull }
       let modules := jx.field_list(jx.as_obj(data), "modules")
-      list.fold(modules, (), fn (acc :: Unit, m :: Json) -> [fs_read, fs_write] Unit { build_module_page(m) })
-      build_guides_index(modules)
+      list.fold(modules, (), fn (acc :: Unit, m :: Json) -> [fs_read, fs_write] Unit {
+        build_module_page(m, verify_results, recordings, player_is_ready)
+      })
+      build_guides_index(modules, verify_results)
     },
     Err(e) => (),
   }

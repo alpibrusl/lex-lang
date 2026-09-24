@@ -12,7 +12,7 @@
 # dependency-free.
 #
 # Adversarial scenario:
-#   handle()'s declared effects are exactly [net] (for net.serve to
+#   handle()'s declared effects are exactly [net] (for net.serve_fn to
 #   bind). If a future contributor edits handle() to log requests via
 #   io.write("/var/log/access.log", req.path), the type checker
 #   rejects at compile time:
@@ -74,5 +74,5 @@ fn handle(req :: Request) -> Response {
 }
 
 fn main() -> [net] Nil {
-  net.serve(8080, "handle")
+  net.serve_fn(8080, handle)
 }

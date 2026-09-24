@@ -21,7 +21,7 @@ fn spawn_inbox_server(port: u16) {
     // Per-port tmp paths so parallel tests don't collide on shared
     // log files. Each test owns its own port → owns its own logs.
     let src = include_str!("../../../examples/inbox_app.lex")
-        .replace("net.serve(8200,", &format!("net.serve({port},"))
+        .replace("net.serve_fn(8200,", &format!("net.serve_fn({port},"))
         .replace("/tmp/lex_inbox_spam.log",
                  &format!("/tmp/lex_inbox_spam_{port}.log"))
         .replace("/tmp/lex_inbox_followups.log",

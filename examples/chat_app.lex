@@ -10,7 +10,7 @@
 #
 # Adversarial scenario:
 #   on_message has effects [chat] only. Even though the host grants
-#   `net,chat` (so net.serve_ws can bind), the per-message handler
+#   `net,chat` (so net.serve_ws_fn can bind), the per-message handler
 #   is *narrower*: it can broadcast and send within the chat
 #   registry, but it cannot make outbound HTTP requests, cannot
 #   touch the filesystem, cannot read the clock. A compromised
@@ -23,20 +23,29 @@
 import "std.net" as net
 import "std.chat" as chat
 import "std.str" as str
-import "std.int" as int
-
-type WsEvent = { body :: Str, conn_id :: Int, room :: Str }
 
 # Each incoming text frame becomes a Lex call. We prefix the message
 # with the sender's connection id so other users can see who said what,
 # then broadcast to everyone in the same room (sender included — a
 # real client filters its own echoes).
-fn on_message(ev :: WsEvent) -> [chat] Nil {
-  let prefix := str.concat("[", str.concat(int.to_str(ev.conn_id), "] "))
-  let line   := str.concat(prefix, ev.body)
-  chat.broadcast(ev.room, line)
+#
+# `conn.path` carries the room name (see the header: /lobby, /general);
+# strip the leading slash, defaulting to the raw path if there somehow
+# isn't one. Only WsText frames carry a chat line — every other
+# WsMessage variant (ping/close/binary) is a no-op reply.
+fn on_message(conn :: WsConn, msg :: WsMessage) -> [chat] WsAction {
+  match msg {
+    WsText(body) => {
+      let room   := match str.strip_prefix(conn.path, "/") { Some(r) => r, None => conn.path }
+      let prefix := str.concat("[", str.concat(conn.id, "] "))
+      let line   := str.concat(prefix, body)
+      chat.broadcast(room, line)
+      WsNoOp
+    },
+    _ => WsNoOp,
+  }
 }
 
 fn main() -> [chat, net] Nil {
-  net.serve_ws(9090, "on_message")
+  net.serve_ws_fn(9090, "", on_message)
 }

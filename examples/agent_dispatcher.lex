@@ -10,13 +10,18 @@
 #
 # Run:
 #   lex run --allow-effects proc --allow-proc echo \
-#     examples/agent_dispatcher.lex run "echo" "hello world"
+#     examples/agent_dispatcher.lex run '"echo"' '["hello world"]'
+#
+# (CLI positional args after the function name are JSON-decoded into
+# that function's parameters — `run`'s signature is
+# `(cmd :: Str, args :: List[Str])`, so `cmd` is a quoted JSON string
+# and `args` is a JSON array, not bare shell words.)
 #
 # Adversarial scenario:
 #   The runtime *will* refuse to spawn a binary not in --allow-proc,
 #   even when [proc] itself is granted. Try:
 #     lex run --allow-effects proc --allow-proc echo \
-#       examples/agent_dispatcher.lex run "rm" "-rf" "/"
+#       examples/agent_dispatcher.lex run '"rm"' '["-rf", "/"]'
 #   → "process.run: `rm` not in --allow-proc [\"echo\"]"
 #
 #   Exit codes:

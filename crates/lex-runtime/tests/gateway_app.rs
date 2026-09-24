@@ -20,7 +20,7 @@ use common::wait_for_bind;
 
 fn spawn_gateway(port: u16) {
     let src = include_str!("../../../examples/gateway_app.lex")
-        .replace("net.serve(8210,", &format!("net.serve({port},"));
+        .replace("net.serve_fn(8210,", &format!("net.serve_fn({port},"));
     let prog = parse_source(&src).expect("parse");
     let stages = canonicalize_program(&prog);
     if let Err(errs) = lex_types::check_program(&stages) {

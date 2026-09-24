@@ -102,7 +102,7 @@ fn main() -> [net] Nil { net.serve(18092, "handle") }
 fn weather_app_responds_to_routes() {
     let src = include_str!("../../../examples/weather_app.lex");
     // Patch the example's port so the test owns its own.
-    let src = src.replace("net.serve(8080,", "net.serve(18093,");
+    let src = src.replace("net.serve_fn(8080,", "net.serve_fn(18093,");
     spawn_lex_server(&src, "main");
     wait_for_bind(18093, Duration::from_secs(5));
 
