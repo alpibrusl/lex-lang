@@ -4,8 +4,31 @@
 # (light-default, `prefers-color-scheme: dark` override) and stays close
 # to lex-www's accent hues so the two sites feel related without sharing
 # markup.
+#
+# Theme: `:root` carries the light values as the unconditional default.
+# The dark values (`dark_vars()`, one shared string so the two copies
+# below can't drift) are layered in twice — under `@media
+# (prefers-color-scheme: dark)` guarded by `:root:not([data-theme="light"])`
+# so an explicit *light* override always wins over a dark OS signal, and
+# again, unconditionally, under `:root[data-theme="dark"]` so an explicit
+# *dark* override always wins even when the OS/browser is reporting
+# light (a managed profile, a preview tool, or just daytime — see the PR
+# this followed up on). No `data-theme` attribute (the default, and what
+# "auto" means) falls through to the media query alone. See
+# `theme_head_script()` / `theme_toggle_script()` for how `data-theme`
+# gets set.
 
 import "std.str" as str
+
+fn dark_vars() -> Str {
+  "
+      --fg: #e8eaed; --muted: #a1a8b8; --bg: #15171c; --card: #1c1f26;
+      --border: #2d313b; --accent: #6f9aff; --rule: #2d313b;
+      --code-bg: #11141a; --good: #4dba6a; --bad: #ff6b65;
+      --tok-kw: #c678dd; --tok-ty: #61afef; --tok-st: #98c379;
+      --tok-cm: #7f8794; --tok-nu: #d19a66; --tok-ef: #ff6b65;
+  "
+}
 
 fn base_css() -> Str {
   "
@@ -13,14 +36,13 @@ fn base_css() -> Str {
     --fg: #1d1f24; --muted: #5a6072; --bg: #fcfcfd; --card: #ffffff;
     --border: #e3e6ec; --accent: #2b5cd9; --rule: #d8dde6;
     --code-bg: #f5f7fa; --good: #1a7f37; --bad: #b42318;
+    --tok-kw: #a626a4; --tok-ty: #0184bc; --tok-st: #50a14f;
+    --tok-cm: #8a9099; --tok-nu: #c18401; --tok-ef: #b42318;
   }
   @media (prefers-color-scheme: dark) {
-    :root {
-      --fg: #e8eaed; --muted: #a1a8b8; --bg: #15171c; --card: #1c1f26;
-      --border: #2d313b; --accent: #6f9aff; --rule: #2d313b;
-      --code-bg: #11141a; --good: #4dba6a; --bad: #ff6b65;
-    }
+    :root:not([data-theme=\"light\"]) {" + dark_vars() + "}
   }
+  :root[data-theme=\"dark\"] {" + dark_vars() + "}
   * { box-sizing: border-box; }
   body {
     margin: 0; background: var(--bg); color: var(--fg);
@@ -66,6 +88,8 @@ fn base_css() -> Str {
   .card:hover { border-color: var(--accent); }
   .card h3 { margin: 0 0 6px; font-size: 15px; }
   .card p { margin: 0; color: var(--muted); font-size: 13px; }
+  .card-links { margin-top: 8px !important; }
+  .card-links a { font-weight: 600; margin-right: 4px; }
   .fn-block { border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; margin: 0 0 18px; background: var(--card); }
   .fn-block h3 { margin: 0 0 8px; font-size: 15.5px; }
   .fn-sig { display: block; margin: 6px 0 10px; white-space: pre-wrap; word-break: break-word; }
@@ -89,6 +113,21 @@ fn base_css() -> Str {
   footer { border-top: 1px solid var(--rule); padding: 28px 0 60px; color: var(--muted); font-size: 13.5px; }
   footer a { color: var(--muted); }
   footer .wrap { max-width: 1080px; }
+  .theme-toggle {
+    background: none; border: 1px solid var(--border); border-radius: 6px;
+    color: var(--muted); font: inherit; font-size: 12.5px; padding: 5px 10px;
+    cursor: pointer; margin-left: 8px; line-height: 1.4;
+  }
+  .theme-toggle:hover { color: var(--fg); border-color: var(--accent); }
+  .src-line { display: flex; gap: 10px; flex-wrap: wrap; align-items: baseline; }
+  .src-line a.secondary { color: var(--muted); font-size: 13px; }
+  pre.lex-src { font-size: 13px; line-height: 1.6; }
+  pre.lex-src .kw { color: var(--tok-kw); font-weight: 600; }
+  pre.lex-src .ty { color: var(--tok-ty); }
+  pre.lex-src .st { color: var(--tok-st); }
+  pre.lex-src .cm { color: var(--tok-cm); font-style: italic; }
+  pre.lex-src .nu { color: var(--tok-nu); }
+  pre.lex-src .ef { color: var(--tok-ef); }
   @media (max-width: 680px) { h1 { font-size: 27px; } .toc ul { columns: 1; } .side-index { columns: 1; } }
   "
 }
@@ -107,7 +146,83 @@ fn nav_html(root :: Str, active :: Str) -> Str {
   nav_item(root + "vcs-hub/index.html", "VCS &amp; Hub", "vcs", active) +
   nav_item(root + "reference/index.html", "Reference", "reference", active) +
   "<a class=\"navlink gh\" href=\"https://github.com/alpibrusl/lex-lang\">GitHub ↗</a>\n" +
-  "</div></nav>\n"
+  "<button type=\"button\" id=\"theme-toggle\" class=\"theme-toggle\" aria-label=\"Toggle color theme (light, dark, or match system)\">auto</button>\n" +
+  "</div></nav>\n" +
+  theme_toggle_script()
+}
+
+# Read before first paint (called from `page()`, inside `<head>`, ahead of
+# the `<style>` tag) so an explicit stored choice applies before the CSS
+# cascade ever runs — the alternative is a visible flash to the "wrong"
+# theme on load. Every localStorage access is wrapped in try/catch: a
+# private-browsing window, a managed profile with storage blocked, or a
+# non-browser preview tool can all make `localStorage` throw or simply
+# not persist, and none of that should ever break the page — it just
+# falls back to "auto" (the media query) for that load.
+fn theme_key() -> Str { "lex-docs-theme" }
+
+fn theme_head_script() -> Str {
+  "<script>\n" +
+  "(function(){\n" +
+  "  try {\n" +
+  "    var v = localStorage.getItem('" + theme_key() + "');\n" +
+  "    if (v === 'dark' || v === 'light') {\n" +
+  "      document.documentElement.setAttribute('data-theme', v);\n" +
+  "    }\n" +
+  "  } catch (e) {}\n" +
+  "})();\n" +
+  "</script>\n"
+}
+
+# The toggle button's own behavior: cycles light -> dark -> auto and
+# persists the choice. `auto` is stored as "no key" (removed, not
+# written as the literal string) so a visitor who has never touched the
+# control and one who explicitly picked "auto" are indistinguishable —
+# both fall through to the OS media query, which is the point of "auto".
+# Emitted once per page, immediately after the nav markup that contains
+# `#theme-toggle`, so `getElementById` always finds an already-parsed
+# element (no `DOMContentLoaded` wait needed).
+fn theme_toggle_script() -> Str {
+  "<script>\n" +
+  "(function(){\n" +
+  "  var KEY = '" + theme_key() + "';\n" +
+  "  var ORDER = ['light', 'dark', 'auto'];\n" +
+  "  var btn = document.getElementById('theme-toggle');\n" +
+  "  if (!btn) { return; }\n" +
+  "  function readStored(){\n" +
+  "    try { return localStorage.getItem(KEY); } catch (e) { return null; }\n" +
+  "  }\n" +
+  "  function writeStored(v){\n" +
+  "    try {\n" +
+  "      if (v === 'auto') { localStorage.removeItem(KEY); }\n" +
+  "      else { localStorage.setItem(KEY, v); }\n" +
+  "    } catch (e) {}\n" +
+  "  }\n" +
+  "  function label(v){\n" +
+  "    if (v === 'dark') { return '☾ dark'; }\n" +
+  "    if (v === 'light') { return '☀ light'; }\n" +
+  "    return 'auto';\n" +
+  "  }\n" +
+  "  function apply(v){\n" +
+  "    if (v === 'dark' || v === 'light') {\n" +
+  "      document.documentElement.setAttribute('data-theme', v);\n" +
+  "    } else {\n" +
+  "      document.documentElement.removeAttribute('data-theme');\n" +
+  "    }\n" +
+  "    btn.textContent = label(v);\n" +
+  "    btn.setAttribute('data-theme-choice', v);\n" +
+  "  }\n" +
+  "  var current = readStored();\n" +
+  "  if (current !== 'dark' && current !== 'light') { current = 'auto'; }\n" +
+  "  apply(current);\n" +
+  "  btn.addEventListener('click', function(){\n" +
+  "    var idx = ORDER.indexOf(current);\n" +
+  "    current = ORDER[(idx + 1) % ORDER.length];\n" +
+  "    writeStored(current);\n" +
+  "    apply(current);\n" +
+  "  });\n" +
+  "})();\n" +
+  "</script>\n"
 }
 
 fn footer_html() -> Str {
@@ -129,6 +244,7 @@ fn page(root :: Str, title :: Str, description :: Str, active :: Str, wide :: Bo
   let main_class := match wide { true => "wrap wide", false => "wrap" }
   "<!doctype html>\n<html lang=\"en\">\n<head>\n" +
   "<meta charset=\"utf-8\">\n" +
+  theme_head_script() +
   "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n" +
   "<title>" + title + " — Lex docs</title>\n" +
   "<meta name=\"description\" content=\"" + description + "\">\n" +

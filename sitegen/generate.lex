@@ -13,14 +13,17 @@
 # Run from the repo root:
 #   lex run --allow-effects fs_read,fs_write \
 #     --allow-fs-read docs --allow-fs-read sitegen --allow-fs-read site \
-#     --allow-fs-write _site \
+#     --allow-fs-read examples --allow-fs-write _site \
 #     sitegen/generate.lex main
 #
-# (`--allow-fs-read` matches the literal path string a call site passes,
-# not a canonicalized path, so each directory this program actually
-# reads from — docs/, sitegen/, site/ — needs its own flag;
-# `--allow-fs-read .` does not cover `sitegen/landing.html` the way
-# you'd expect.)
+# (`--allow-fs-read` is checked path-component-wise (Rust's
+# `Path::starts_with`, crates/lex-runtime/src/handler/fs.rs), so
+# `--allow-fs-read examples` does cover a nested read like
+# `examples/agent_merge/v0_initial.lex` — but each *top-level* directory
+# this program actually reads from — docs/, sitegen/, site/, and now
+# examples/ (§ build_source_page, for the on-site source pages) — still
+# needs its own flag; `--allow-fs-read .` does not cover
+# `sitegen/landing.html` the way you'd expect.)
 
 import "std.fs" as fs
 import "std.json" as json
@@ -30,6 +33,7 @@ import "std.tuple" as tuple
 import "./md" as md
 import "./layout" as layout
 import "./jsonx" as jx
+import "./highlight" as hl
 
 # ── Small IO helpers ─────────────────────────────────────────────────────
 
@@ -247,18 +251,46 @@ fn function_html(f :: Json) -> Str {
   "</div>\n"
 }
 
+# A real, on-site rendering of `file`'s full source — not just a link
+# out to GitHub — so a reader can see the actual code without leaving
+# doc.lexlang.org. Reads the literal file from disk (needs
+# `--allow-fs-read examples`; see the header comment), not the
+# `site/api-docs.json` JSON that `build_module_page` otherwise works
+# from: that JSON only carries per-function signatures/doc comments,
+# never full bodies.
+fn build_source_page(file :: Str, slug :: Str) -> [fs_read, fs_write] Unit {
+  let raw := must_read(file)
+  let gh_url := "https://github.com/alpibrusl/lex-lang/blob/main/" + file
+  let nav_line :=
+    "<p class=\"meta-line src-line\">" +
+    "<a href=\"" + slug + ".html\">&larr; " + md.escape_html(file) + " guide</a>" +
+    "<a class=\"secondary\" href=\"" + gh_url + "\">view on GitHub ↗</a>" +
+    "</p>\n"
+  let body :=
+    "<h1>" + md.escape_html(file) + "</h1>\n" +
+    nav_line +
+    "<pre class=\"lex-src\"><code>" + hl.to_html(raw) + "</code></pre>\n"
+  let html := layout.page("../", file + " (source)", "Full on-site source for " + file + ", from the alpibrusl/lex-lang repository.", "guides", true, body)
+  write_page("_site/guides/" + slug + "-src.html", html)
+}
+
 fn build_module_page(m :: Json) -> [fs_read, fs_write] Unit {
   let mo := jx.as_obj(m)
   let file := jx.field_str(mo, "file")
   let doc := jx.field_str(mo, "doc")
   let fns := jx.field_list(mo, "functions")
   let slug := module_slug(file)
+  build_source_page(file, slug)
   let doc_html := match str.is_empty(str.trim(doc)) {
     true => "<p class=\"meta-line\">No module-level doc comment in this source file.</p>\n",
     false => md.to_html(doc),
   }
   let fns_html := list.fold(fns, "", fn (acc :: Str, f :: Json) -> Str { acc + function_html(f) })
-  let src_note := "<p class=\"meta-line\">Source: <a href=\"https://github.com/alpibrusl/lex-lang/blob/main/" + file + "\"><code>" + file + "</code></a> &middot; " + int_to_str(list.len(fns)) + " function(s)</p>\n"
+  let src_note :=
+    "<p class=\"meta-line src-line\">Source: " +
+    "<a href=\"" + slug + "-src.html\"><code>" + file + "</code></a>" +
+    "<a class=\"secondary\" href=\"https://github.com/alpibrusl/lex-lang/blob/main/" + file + "\">view on GitHub ↗</a>" +
+    " &middot; " + int_to_str(list.len(fns)) + " function(s)</p>\n"
   let body := "<h1>" + md.escape_html(file) + "</h1>\n" + src_note + doc_html + "<h2>Functions</h2>\n" + fns_html
   let html := layout.page("../", file, "Guide and API reference for " + file + ", generated from its doc comments and live signatures.", "guides", false, body)
   write_page("_site/guides/" + slug + ".html", html)
@@ -289,7 +321,13 @@ fn guide_card(m :: Json) -> Str {
     true => "<span class=\"badge\">reference only</span>",
     false => "<span class=\"badge pure\">documented</span>",
   }
-  "<a class=\"card\" href=\"" + slug + ".html\"><h3>" + md.escape_html(file) + "</h3><p>" + status + " &middot; " + int_to_str(list.len(fns)) + " fn</p></a>\n"
+  # A plain `<div>`, not an `<a>`, because it needs *two* separate links
+  # (the guide/doc page and the new on-site source page) — an `<a>`
+  # can't nest another `<a>` inside it. `.card`'s box styling (border,
+  # background, padding) applies the same to a div as it did to the
+  # anchor this replaced.
+  "<div class=\"card guide-card\"><h3>" + md.escape_html(file) + "</h3><p>" + status + " &middot; " + int_to_str(list.len(fns)) + " fn</p>" +
+  "<p class=\"card-links\"><a href=\"" + slug + ".html\">Guide</a> &middot; <a href=\"" + slug + "-src.html\">Source</a></p></div>\n"
 }
 
 fn build_guides_index(modules :: List[Json]) -> [fs_read, fs_write] Unit {
