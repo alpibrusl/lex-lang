@@ -27,7 +27,7 @@ fn spawn_analytics_server(port: u16) {
     let csv_abs = workspace_root().join("examples/orders.csv");
     let csv_path_lit = csv_abs.to_str().expect("utf-8 path");
     let src = include_str!("../../../examples/analytics_app.lex")
-        .replace("net.serve(8090,", &format!("net.serve({port},"))
+        .replace("net.serve_fn(8090,", &format!("net.serve_fn({port},"))
         // Per-request workers get a fresh DefaultHandler with no read_root,
         // so CWD-relative paths fail under `cargo test`. Pin the absolute path.
         .replace("examples/orders.csv", csv_path_lit);
