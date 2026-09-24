@@ -1,6 +1,6 @@
 {
   "name": "lex",
-  "version": "0.11.70",
+  "version": "0.11.71",
   "acli_version": "0.1.0",
   "commands": [
     {
@@ -335,6 +335,11 @@
           "name": "intent-issue",
           "type": "string",
           "description": "with --intent-prompt: the typed issue (lex issue create) this publish realizes; the Intent carries issue_id so the ops link back to the work item and the derived issue state sees the work as started"
+        },
+        {
+          "name": "no-files",
+          "type": "bool",
+          "description": "a directory publish also captures its non-op-log files (README, lex.toml, lex.lock, tests/, ...) as one SetFiles op by default; opt this single publish out"
         }
       ],
       "subcommands": [],
@@ -355,11 +360,208 @@
         {
           "description": "Publish as the realization of a typed issue",
           "invocation": "lex publish --intent-prompt 'add triple()' --intent-issue <issue_id> app.lex"
+        },
+        {
+          "description": "Publish a package's code only, skip capturing its files",
+          "invocation": "lex publish --no-files my-package/"
         }
       ],
       "see_also": [
         "store",
-        "branch"
+        "branch",
+        "files"
+      ]
+    },
+    {
+      "name": "files",
+      "description": "work with the files manifest directly (#1007): the store's non-op-log files (README, lex.toml, lex.lock, tests/, ...)",
+      "arguments": [],
+      "options": [],
+      "subcommands": [
+        {
+          "name": "status",
+          "description": "working copy vs. the branch head's files manifest: added/modified/deleted/ignored",
+          "arguments": [
+            {
+              "name": "pkgdir",
+              "type": "string",
+              "description": "package directory (default: cwd)",
+              "required": false
+            }
+          ],
+          "options": [
+            {
+              "name": "store",
+              "type": "string",
+              "description": "store root directory"
+            },
+            {
+              "name": "branch",
+              "type": "string",
+              "description": "branch to compare against (default: current)"
+            }
+          ],
+          "subcommands": [],
+          "idempotent": true
+        },
+        {
+          "name": "commit",
+          "description": "record a files-only SetFiles op for the working copy (warns if src/ has unpublished semantic changes)",
+          "arguments": [
+            {
+              "name": "pkgdir",
+              "type": "string",
+              "description": "package directory (default: cwd)",
+              "required": false
+            }
+          ],
+          "options": [
+            {
+              "name": "store",
+              "type": "string",
+              "description": "store root directory"
+            },
+            {
+              "name": "branch",
+              "type": "string",
+              "description": "branch to commit onto (default: current)"
+            },
+            {
+              "name": "intent-prompt",
+              "type": "string",
+              "description": "record an Intent for this commit (short form: -m)"
+            },
+            {
+              "name": "intent-model",
+              "type": "string",
+              "description": "with --intent-prompt: the model as provider/name"
+            },
+            {
+              "name": "intent-session",
+              "type": "string",
+              "description": "with --intent-prompt: the agent session id"
+            },
+            {
+              "name": "intent-issue",
+              "type": "string",
+              "description": "with --intent-prompt: the typed issue this commit realizes"
+            }
+          ],
+          "subcommands": [],
+          "idempotent": false
+        },
+        {
+          "name": "ls",
+          "description": "list the files manifest in force",
+          "arguments": [],
+          "options": [
+            {
+              "name": "store",
+              "type": "string",
+              "description": "store root directory"
+            },
+            {
+              "name": "branch",
+              "type": "string",
+              "description": "branch to read (default: current)"
+            },
+            {
+              "name": "at",
+              "type": "string",
+              "description": "a specific op id instead of the branch head"
+            }
+          ],
+          "subcommands": [],
+          "idempotent": true
+        },
+        {
+          "name": "cat",
+          "description": "print one file's contents from the files manifest",
+          "arguments": [
+            {
+              "name": "path",
+              "type": "string",
+              "description": "manifest-relative path",
+              "required": true
+            }
+          ],
+          "options": [
+            {
+              "name": "store",
+              "type": "string",
+              "description": "store root directory"
+            },
+            {
+              "name": "branch",
+              "type": "string",
+              "description": "branch to read (default: current)"
+            },
+            {
+              "name": "at",
+              "type": "string",
+              "description": "a specific op id instead of the branch head"
+            }
+          ],
+          "subcommands": [],
+          "idempotent": true
+        },
+        {
+          "name": "checkout",
+          "description": "materialize src/ + manifest files into a directory, without git",
+          "arguments": [
+            {
+              "name": "dir",
+              "type": "string",
+              "description": "target directory",
+              "required": true
+            }
+          ],
+          "options": [
+            {
+              "name": "store",
+              "type": "string",
+              "description": "store root directory"
+            },
+            {
+              "name": "branch",
+              "type": "string",
+              "description": "branch to read (default: current)"
+            },
+            {
+              "name": "at",
+              "type": "string",
+              "description": "a specific op id instead of the branch head"
+            }
+          ],
+          "subcommands": [],
+          "idempotent": false
+        }
+      ],
+      "examples": [
+        {
+          "description": "What changed since the last publish",
+          "invocation": "lex files status"
+        },
+        {
+          "description": "Record a files-only change",
+          "invocation": "lex files commit -m 'update README'"
+        },
+        {
+          "description": "List the head's manifest",
+          "invocation": "lex files ls"
+        },
+        {
+          "description": "Print a manifest file",
+          "invocation": "lex files cat README.md"
+        },
+        {
+          "description": "Materialize a package without git",
+          "invocation": "lex files checkout /tmp/out"
+        }
+      ],
+      "see_also": [
+        "publish",
+        "store"
       ]
     },
     {

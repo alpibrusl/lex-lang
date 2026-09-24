@@ -1,6 +1,6 @@
 # lex
 
-Version: 0.11.70
+Version: 0.11.71
 ACLI version: 0.1.0
 
 ## Commands
@@ -46,6 +46,10 @@ Idempotent: true
 publish each stage in a file to the store as Draft
 
 Idempotent: false
+
+### files
+
+work with the files manifest directly (#1007): the store's non-op-log files (README, lex.toml, lex.lock, tests/, ...)
 
 ### store
 

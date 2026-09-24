@@ -5,6 +5,105 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [0.11.71] - 2026-09-24
+
+### Changed — behavior operators need to know
+
+- **A registry dependency-of-dependency now falls back to the sibling
+  `lex.lock` (#1032, fixes #1031).** `resolve_package_import` used to learn
+  a transitive package exists at all solely from a cached dependency's own
+  `lex.toml` `[dependencies]` table. An already-cut, immutable release whose
+  captured `dependency_specs` came back empty (e.g. released before a hub
+  captured dependency coordinates) can carry an install archive with an
+  empty `[dependencies]` table even though its committed `lex.lock` — shipped
+  in the same archive/cache directory — still pins the transitive package
+  exactly. The resolver now falls back to that sibling lock when the
+  manifest's own table is silent on the package, so a 2-hop chain (A → B →
+  C) resolves instead of failing `check`/`publish` with
+  `package "C" not found in .../lex.toml`. No server-side archive changed;
+  already-published releases are immutable.
+- **`lex op push` now syncs the lock on a zero-new-ops push (#1032).**
+  `cmd_op_push`'s `to_send.is_empty()` early return used to skip the
+  `/v1/locks/batch` sync entirely, so a re-lock + republish of an unchanged,
+  already-pushed head never synced its new committed lock to the remote.
+  That sync now also happens on this path.
+- **`op pull` no longer aborts an entire pull over one absent attestation
+  (#1033, fixes #1030).** `stage_attestations_handler` 404s only when a
+  referenced stage is genuinely absent from the hub's store (GC'd, never
+  persisted, or a stranded pre-#992 reference) — every other failure is a
+  5xx. Previously any attestation-fetch error aborted the whole pull
+  *before* the branch head could advance, so one bad reference among many
+  discarded an entire transfer's progress and forced a full re-download on
+  retry (the reported case: a single bad attestation among 136k ops). A
+  pull now advances the branch head first, then syncs attestations: a 404
+  is skipped and reported (mirroring #868/#1012's skip-vs-fail split); any
+  other failure is still reported and still fails the command loud, but
+  only after everything that actually succeeded is already on disk.
+
+### Added
+
+- **`lex publish <dir>` captures the working copy's non-source files
+  (#1036, #1007 PR 4/8).** A directory publish now also builds a
+  content-addressed `Manifest` of the working copy (README, tests,
+  executable bits, arbitrary binaries — everything outside the op-log-owned
+  `src/**/*.lex`) and, if it differs from the manifest at the current head,
+  emits exactly one non-semantic `SetFiles` op, last, under the same intent
+  as the publish's semantic ops. Default ON for directory publishes;
+  `--no-files` opts a single publish out. Single-file publishes are
+  unaffected. New `lex files status|commit|ls|cat|checkout` command group
+  for inspecting, committing, and materializing captured files independent
+  of `src/`.
+- **`op push`/`op pull` transfer a `SetFiles` op's blob contents (#1037,
+  #1007 PR 5/8).** New `/v1/blobs/{missing,batch,fetch}` routes. `op push`
+  checks the remote advertises the `files-v1` capability before uploading,
+  computes the blob closure of every `SetFiles` op in the delta, and
+  uploads only what the remote is missing. `op pull` fetches that closure
+  and re-hashes every blob on receipt, rejecting the whole pull on any
+  mismatch before the branch head advances.
+- **`export-git` renders captured files alongside `src/` (#1038, #1007 PR
+  6/8).** A running files manifest is kept during the forward op-walk and
+  materialized beside the rendered source tree, with a `Files:
+  <manifest-blob-id>` trailer on the commit that changes it. New fidelity
+  harness (`scripts/fidelity/verify_export.sh` and
+  `cargo test --test fidelity_export_1007`) proves an exported tree matches
+  its source byte-for-byte (including file mode) and AST-for-AST.
+- **Merging branches with different file manifests surfaces real per-path
+  conflicts (#1039, #1007 PR 7/8).** A path edited on only one side of a
+  merge auto-resolves; a path edited differently on both sides is a new
+  `FileConflict { path, base, ours, theirs }`, surfaced through the same
+  `/v1/merge/{start,resolve,commit}` flow used for existing sig/lock
+  conflicts, resolved by taking one side or the other (3-way content
+  merging of blobs is out of scope by design). New `lex op gc --blobs
+  [--grace-hours N]` for blob garbage collection, built on the same
+  retained-op-set computation as existing op GC, so blob liveness can never
+  be looser than op liveness.
+- **`BARE_ROW_VAR` lint and an effect-row soundness check (#1034, #1028,
+  #1029).** New `BARE_ROW_VAR` lint catches a bare effect name inside
+  `[...]` that also names one of the enclosing function's own type params
+  (`fn f[E](x) -> [E] R`), which parses as a concrete effect literally
+  named "E" rather than the open row the pipe spelling (`[| E]`) gives. The
+  checker also now rejects effect rows in generic type params
+  (`type X[e] = { field :: (A) -> [| e] B }`, `TypeError::EffectRowTypeParam`)
+  as a soundness fix: such a declaration could type-check with a declared
+  effect row that omits effects the function actually performs, since
+  there is no way to carry an effect row through a generic type parameter
+  today.
+
+### Fixed
+
+- **A no-op directory republish silently rewrote an already-pushed head's
+  committed lock (#1036).** `cmd_publish` called `set_committed_lock()` on
+  the existing head whenever a publish produced zero ops, regardless of
+  whether *that call* actually produced the head. It now only writes a
+  head's committed lock when the call at hand is the one producing (or that
+  already produced) it.
+- **`export-git`'s per-commit `remove_dir_all(src/)` wiped a captured
+  non-`.lex` file nested under `src/` (#1038).** Only `src/**/*.lex` is
+  op-log-reserved; a manifest-captured file living elsewhere under `src/`
+  is now re-materialized unconditionally, from the manifest in force,
+  after the wipe — surviving both the commit that introduces it and any
+  later purely-semantic commit.
+
 ## [0.11.70] - 2026-09-22
 
 ### Changed — behavior operators need to know
