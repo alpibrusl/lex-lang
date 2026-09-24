@@ -439,3 +439,217 @@ impl Store {
         self.apply_operation(branch, op, lex_vcs::StageTransition::FilesOnly)
     }
 }
+
+// ── Merging manifests (#1007 PR 7) ──────────────────────────────────────────
+//
+// A merge whose two parents carry different `manifest_at` results is
+// `Ambiguous` (§1) until the merge commit appends a `SetFiles` recording
+// the merged manifest. [`Store::manifest_merge`] computes that merged
+// manifest with a git-style 3-way diff over paths:
+//
+// * A path unchanged from the base on ONE side auto-resolves to whatever
+//   the other side has (including "removed"). This is the common case —
+//   most merges touch disjoint files — and it never surfaces as a
+//   conflict.
+// * A path changed *differently* on both sides (including both sides
+//   adding it with different content — the file-level analogue of
+//   `ConflictKind::AddAdd`) is a real conflict: [`lex_vcs::FileConflict`].
+//
+// Real 3-way *content* merging (splicing text hunks the way `git merge`
+// does for source files) is deliberately OUT of scope here: manifest
+// entries are opaque, potentially binary blobs (#1007 §2 allows arbitrary
+// bytes), and there is no general way to merge two binary blobs' bytes
+// that is safe by construction. Text files under version control by a Lex
+// package are exactly `src/**/*.lex` (which the op-log — not the
+// manifest — owns and *does* merge semantically) plus `tests/`,
+// `lex.toml`, `README.md`, etc., which #1007 assigns to the manifest
+// precisely because they don't need that treatment. A `FileConflict`'s
+// only resolutions are therefore "take one side or the other"
+// ([`lex_vcs::FileResolution::TakeOurs`] /
+// `TakeTheirs`) — never a synthesized merge of the two blobs.
+impl Store {
+    /// Convert a manifest [`Entry`] to the blob-triple shape
+    /// [`lex_vcs::FileConflict`] carries (`lex-vcs` doesn't depend on
+    /// `lex-store`'s `Entry` type — see that module's doc comment).
+    fn entry_to_file_entry(e: &Entry) -> lex_vcs::FileEntry {
+        lex_vcs::FileEntry { blob: e.blob.clone(), mode: e.mode.clone(), size: e.size }
+    }
+
+    /// The [`Manifest`] a [`ManifestAt`] denotes, empty for `Absent`.
+    /// Callers must have already ruled out `Ambiguous` (see
+    /// [`Self::manifest_merge`]) — reads as empty for it here rather than
+    /// panicking, since an empty base is the conservative (over-surfaces
+    /// conflicts, never silently drops one) fallback if that invariant is
+    /// ever violated.
+    fn manifest_for_at(&self, at: &ManifestAt) -> Result<Manifest, StoreError> {
+        match at {
+            ManifestAt::Absent | ManifestAt::Ambiguous => Ok(Manifest::new()),
+            ManifestAt::Set { manifest } => self.get_manifest(manifest),
+        }
+    }
+
+    /// 3-way-merge the files manifests of a merge's `ours` (dst) and
+    /// `theirs` (src) heads against their `base` (the merge's LCA) — the
+    /// files-dimension counterpart of [`crate::merge::merge`] for sigs.
+    ///
+    /// `Ok(NoChange)` when `ours` and `theirs` already carry the exact
+    /// same [`ManifestAt`] (including both `Absent` — a package with no
+    /// files at all) — the merge needs no `SetFiles`, matching #1007 §1's
+    /// "files agree ⇒ no SetFiles" case. Otherwise `Ok(Needed { .. })`:
+    /// `auto_entries` holds every path that resolved without a conflict
+    /// (already reflecting the winning side, or absent if both sides
+    /// agree the path is gone); `conflicts` lists the paths that need an
+    /// explicit [`lex_vcs::FileResolution`].
+    ///
+    /// `Err(AmbiguousManifest)` if `ours` or `theirs` is itself
+    /// `Ambiguous` — an earlier merge in that side's history landed
+    /// without the `SetFiles` §1 requires. There is no well-defined
+    /// manifest to diff against on that side, so this merge refuses too;
+    /// see [`StoreError::AmbiguousManifest`].
+    pub fn manifest_merge(
+        &self,
+        base_head: Option<&str>,
+        ours_head: Option<&str>,
+        theirs_head: Option<&str>,
+    ) -> Result<ManifestMergeOutcome, StoreError> {
+        let ours_at = match ours_head {
+            Some(h) => self.manifest_at(h)?,
+            None => ManifestAt::Absent,
+        };
+        let theirs_at = match theirs_head {
+            Some(h) => self.manifest_at(h)?,
+            None => ManifestAt::Absent,
+        };
+        if ours_at == theirs_at {
+            return Ok(ManifestMergeOutcome::NoChange);
+        }
+        if matches!(ours_at, ManifestAt::Ambiguous) {
+            return Err(StoreError::AmbiguousManifest {
+                op_id: ours_head.unwrap_or_default().to_string(),
+            });
+        }
+        if matches!(theirs_at, ManifestAt::Ambiguous) {
+            return Err(StoreError::AmbiguousManifest {
+                op_id: theirs_head.unwrap_or_default().to_string(),
+            });
+        }
+        let base_at = match base_head {
+            Some(h) => self.manifest_at(h)?,
+            None => ManifestAt::Absent,
+        };
+        let base_m = self.manifest_for_at(&base_at)?;
+        let ours_m = self.manifest_for_at(&ours_at)?;
+        let theirs_m = self.manifest_for_at(&theirs_at)?;
+
+        let paths: BTreeSet<&String> = base_m
+            .entries
+            .keys()
+            .chain(ours_m.entries.keys())
+            .chain(theirs_m.entries.keys())
+            .collect();
+
+        let mut auto_entries: BTreeMap<String, Entry> = BTreeMap::new();
+        let mut conflicts: Vec<lex_vcs::FileConflict> = Vec::new();
+        for path in paths {
+            let b = base_m.entries.get(path);
+            let o = ours_m.entries.get(path);
+            let t = theirs_m.entries.get(path);
+            if o == t {
+                // Both sides agree (including both having removed it) —
+                // nothing to resolve.
+                if let Some(e) = o {
+                    auto_entries.insert(path.clone(), e.clone());
+                }
+                continue;
+            }
+            if o == b {
+                // Ours never touched it; theirs' edit (or removal) wins.
+                if let Some(e) = t {
+                    auto_entries.insert(path.clone(), e.clone());
+                }
+                continue;
+            }
+            if t == b {
+                // Theirs never touched it; ours' edit (or removal) wins.
+                if let Some(e) = o {
+                    auto_entries.insert(path.clone(), e.clone());
+                }
+                continue;
+            }
+            // Both sides touched it, disagreeing with each other AND with
+            // the base (or, if `b` is `None`, both added it differently) —
+            // a real conflict.
+            conflicts.push(lex_vcs::FileConflict {
+                path: path.clone(),
+                base: b.map(Self::entry_to_file_entry),
+                ours: o.map(Self::entry_to_file_entry),
+                theirs: t.map(Self::entry_to_file_entry),
+            });
+        }
+        Ok(ManifestMergeOutcome::Needed { auto_entries, conflicts })
+    }
+
+    /// Build the final merged [`Manifest`] once every conflict
+    /// [`Self::manifest_merge`] surfaced has a resolution (#1007 PR 7):
+    /// `auto_entries` (unconditionally included) plus, per conflict, the
+    /// resolved side's entry (omitted entirely if that side had none —
+    /// i.e. the resolution keeps a removal). Stores the manifest as a
+    /// blob and returns its id, ready for
+    /// [`Store::apply_merge_op_gated_with_manifest`].
+    ///
+    /// Callers are expected to have already rejected any
+    /// [`lex_vcs::FileResolution::Defer`] (the same contract
+    /// `MergeSession::commit` enforces before this is ever called) —
+    /// `Defer` here is treated the same as no resolution: the conflict's
+    /// path is simply left out of the merged manifest, which would
+    /// silently drop content, so this returns
+    /// [`StoreError::AmbiguousManifest`] instead to fail loud.
+    pub fn build_merged_manifest(
+        &self,
+        auto_entries: BTreeMap<String, Entry>,
+        conflicts: &[lex_vcs::FileConflict],
+        resolutions: &BTreeMap<lex_vcs::FilePath, lex_vcs::FileResolution>,
+        merge_op_id: &str,
+    ) -> Result<BlobId, StoreError> {
+        let mut entries = auto_entries;
+        for c in conflicts {
+            let chosen = match resolutions.get(&c.path) {
+                Some(lex_vcs::FileResolution::TakeOurs) => &c.ours,
+                Some(lex_vcs::FileResolution::TakeTheirs) => &c.theirs,
+                Some(lex_vcs::FileResolution::Defer) | None => {
+                    return Err(StoreError::AmbiguousManifest {
+                        op_id: merge_op_id.to_string(),
+                    });
+                }
+            };
+            match chosen {
+                Some(fe) => {
+                    entries.insert(
+                        c.path.clone(),
+                        Entry { blob: fe.blob.clone(), mode: fe.mode.clone(), size: fe.size },
+                    );
+                }
+                None => {
+                    entries.remove(&c.path);
+                }
+            }
+        }
+        let manifest = Manifest { version: MANIFEST_VERSION, entries };
+        self.put_manifest(&manifest)
+    }
+}
+
+/// The outcome of [`Store::manifest_merge`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManifestMergeOutcome {
+    /// `ours` and `theirs` already carry the same manifest (or both have
+    /// none) — no `SetFiles` needed.
+    NoChange,
+    /// The manifests disagree. `auto_entries` is every path that resolved
+    /// without a conflict; `conflicts` lists the paths that still need an
+    /// explicit resolution before a merged manifest can be built.
+    Needed {
+        auto_entries: BTreeMap<String, Entry>,
+        conflicts: Vec<lex_vcs::FileConflict>,
+    },
+}

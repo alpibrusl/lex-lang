@@ -45,8 +45,11 @@ pub use merge_checker::MergeResolutionChecker;
 pub use budget::SessionBudget;
 pub use planner::{Plan, PlanPath};
 pub use delta::{StageDelta, DELTA_CHAIN_CAP, DELTA_RATIO_THRESHOLD};
-pub use gc::{GcPlan, RetentionReason};
-pub use files::{BlobId, Entry as FileEntry, Manifest, ManifestAt, ManifestError, NotReplayable};
+pub use gc::{BlobGcPlan, GcPlan, RetentionReason};
+pub use files::{
+    BlobId, Entry as FileEntry, Manifest, ManifestAt, ManifestError, ManifestMergeOutcome,
+    NotReplayable,
+};
 
 pub use lex_vcs::{OpId, Operation, OperationKind, OperationRecord, StageTransition};
 pub use model::{Lifecycle, Metadata, Spec, StageStatus, Test, Transition};

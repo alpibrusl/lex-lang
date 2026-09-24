@@ -124,18 +124,38 @@ fn cmd_start(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         .head_op;
     let log = lex_vcs::OpLog::open(store.root())?;
     let merge_id = mint_merge_id();
-    let session = lex_vcs::MergeSession::start(
+    let mut session = lex_vcs::MergeSession::start(
         merge_id.clone(),
         &log,
         src_head.as_ref(),
         dst_head.as_ref(),
     )?;
+
+    // #1007 PR 7: the files dimension — see the HTTP handler's mirror
+    // (`merge_start_handler` in lex-api) for why this is computed here
+    // rather than inside `lex_vcs::MergeSession::start`.
+    let (file_conflicts, needs_setfiles) = match store.manifest_merge(
+        session.lca.as_deref(),
+        dst_head.as_deref(),
+        src_head.as_deref(),
+    )? {
+        lex_store::ManifestMergeOutcome::NoChange => (Vec::new(), false),
+        lex_store::ManifestMergeOutcome::Needed { conflicts, .. } => (conflicts, true),
+    };
+    session.attach_file_conflicts(file_conflicts, needs_setfiles);
+
     let conflicts: Vec<lex_vcs::ConflictRecord> = session
         .remaining_conflicts()
         .into_iter()
         .cloned()
         .collect();
+    let file_conflicts_out: Vec<lex_vcs::FileConflict> = session
+        .remaining_file_conflicts()
+        .into_iter()
+        .cloned()
+        .collect();
     let auto_resolved_count = session.auto_resolved.len();
+    let needs_setfiles_out = session.needs_setfiles();
 
     let file = MergeFile { src_branch, dst_branch, session };
     save_merge(&root, &file)?;
@@ -147,6 +167,8 @@ fn cmd_start(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "lca":                 file.session.lca,
         "conflicts":           conflicts,
         "auto_resolved_count": auto_resolved_count,
+        "file_conflicts":      file_conflicts_out,
+        "needs_setfiles":      needs_setfiles_out,
     });
     let conflicts_for_text = conflicts.clone();
     let merge_id_for_text = file.session.merge_id.clone();
@@ -169,11 +191,18 @@ fn cmd_status(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         .into_iter()
         .cloned()
         .collect();
+    let remaining_files: Vec<lex_vcs::FileConflict> = file.session
+        .remaining_file_conflicts()
+        .into_iter()
+        .cloned()
+        .collect();
     let data = serde_json::json!({
         "merge_id":            file.session.merge_id,
         "src_branch":          file.src_branch,
         "dst_branch":          file.dst_branch,
         "remaining_conflicts": remaining,
+        "remaining_file_conflicts": remaining_files,
+        "needs_setfiles":      file.session.needs_setfiles(),
     });
     let remaining_for_text = remaining.clone();
     let merge_id_for_text  = file.session.merge_id.clone();
@@ -196,32 +225,75 @@ struct ResolutionEntry {
     resolution: lex_vcs::Resolution,
 }
 
+/// One entry of a `--files <resolutions.json>` file (#1007 PR 7) — the
+/// file-conflict analogue of [`ResolutionEntry`], keyed by path instead
+/// of sig id.
+#[derive(Deserialize)]
+struct FileResolutionEntry {
+    path: lex_vcs::FilePath,
+    resolution: lex_vcs::FileResolution,
+}
+
 fn cmd_resolve(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let (root, rest) = parse_store_arg(args);
     let mut merge_id: Option<String> = None;
     let mut file_arg: Option<String> = None;
+    let mut files_arg: Option<String> = None;
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
             "--file" => { file_arg = rest.get(i + 1).cloned(); i += 2; }
+            // #1007 PR 7: a separate `--files` flag resolves file
+            // conflicts (keyed by path) in the same call. Kept apart
+            // from `--file`'s sig-conflict format rather than folding
+            // both into one schema, so `--file`'s existing wire shape
+            // (a bare JSON array of `{conflict_id, resolution}`) never
+            // changes for callers that only ever merged code.
+            "--files" => { files_arg = rest.get(i + 1).cloned(); i += 2; }
             other if merge_id.is_none() => { merge_id = Some(other.to_string()); i += 1; }
             other => bail!("unexpected arg `{other}`"),
         }
     }
-    let merge_id  = merge_id.ok_or_else(|| anyhow!("usage: lex merge resolve <merge_id> --file <resolutions.json>"))?;
-    let file_path = file_arg.ok_or_else(|| anyhow!("--file <resolutions.json> required"))?;
-    let raw = std::fs::read(&file_path)
-        .with_context(|| format!("read resolutions file {file_path}"))?;
-    let entries: Vec<ResolutionEntry> = serde_json::from_slice(&raw)
-        .with_context(|| format!("parse resolutions file {file_path}"))?;
+    let merge_id  = merge_id.ok_or_else(|| anyhow!(
+        "usage: lex merge resolve <merge_id> [--file <resolutions.json>] [--files <file_resolutions.json>]"
+    ))?;
+    if file_arg.is_none() && files_arg.is_none() {
+        bail!("at least one of --file or --files is required");
+    }
 
     let mut file = load_merge(&root, &merge_id)?;
-    let pairs: Vec<(String, lex_vcs::Resolution)> = entries.into_iter()
-        .map(|e| (e.conflict_id, e.resolution))
-        .collect();
-    let verdicts = file.session.resolve(pairs);
+
+    let verdicts = if let Some(file_path) = &file_arg {
+        let raw = std::fs::read(file_path)
+            .with_context(|| format!("read resolutions file {file_path}"))?;
+        let entries: Vec<ResolutionEntry> = serde_json::from_slice(&raw)
+            .with_context(|| format!("parse resolutions file {file_path}"))?;
+        let pairs: Vec<(String, lex_vcs::Resolution)> = entries.into_iter()
+            .map(|e| (e.conflict_id, e.resolution))
+            .collect();
+        file.session.resolve(pairs)
+    } else {
+        Vec::new()
+    };
+    let file_verdicts = if let Some(files_path) = &files_arg {
+        let raw = std::fs::read(files_path)
+            .with_context(|| format!("read file-resolutions file {files_path}"))?;
+        let entries: Vec<FileResolutionEntry> = serde_json::from_slice(&raw)
+            .with_context(|| format!("parse file-resolutions file {files_path}"))?;
+        let pairs: Vec<(lex_vcs::FilePath, lex_vcs::FileResolution)> = entries.into_iter()
+            .map(|e| (e.path, e.resolution))
+            .collect();
+        file.session.resolve_files(pairs)
+    } else {
+        Vec::new()
+    };
     let remaining: Vec<lex_vcs::ConflictRecord> = file.session
         .remaining_conflicts()
+        .into_iter()
+        .cloned()
+        .collect();
+    let remaining_files: Vec<lex_vcs::FileConflict> = file.session
+        .remaining_file_conflicts()
         .into_iter()
         .cloned()
         .collect();
@@ -230,15 +302,23 @@ fn cmd_resolve(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let data = serde_json::json!({
         "verdicts":            verdicts,
         "remaining_conflicts": remaining,
+        "file_verdicts":       file_verdicts,
+        "remaining_file_conflicts": remaining_files,
     });
     let verdicts_for_text = verdicts.clone();
     let remaining_for_text = remaining.clone();
+    let file_verdicts_for_text = file_verdicts.clone();
+    let remaining_files_for_text = remaining_files.clone();
     acli_mod::emit_or_text("merge", data, fmt, move || {
         for v in &verdicts_for_text {
             let mark = if v.accepted { "✓" } else { "✗" };
             println!("  {mark} {}", v.conflict_id);
         }
-        println!("remaining: {}", remaining_for_text.len());
+        for v in &file_verdicts_for_text {
+            let mark = if v.accepted { "✓" } else { "✗" };
+            println!("  {mark} {}", v.path);
+        }
+        println!("remaining: {} ({} file)", remaining_for_text.len(), remaining_files_for_text.len());
     });
     Ok(())
 }
@@ -308,6 +388,7 @@ fn cmd_commit(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let dst_branch = file.dst_branch.clone();
     let src_head   = file.session.src_head.clone();
     let dst_head   = file.session.dst_head.clone();
+    let lca        = file.session.lca.clone();
     let auto_resolved = file.session.auto_resolved.clone();
 
     // Translate auto-resolved + resolutions into the
@@ -320,14 +401,17 @@ fn cmd_commit(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         }
     }
 
-    let resolved = match file.session.commit() {
+    let commit_out = match file.session.commit() {
         Ok(r) => r,
         Err(lex_vcs::CommitError::ConflictsRemaining(ids)) => {
             bail!("conflicts remaining: {}", ids.join(", "));
         }
+        Err(lex_vcs::CommitError::FileConflictsRemaining(paths)) => {
+            bail!("file conflicts remaining: {}", paths.join(", "));
+        }
     };
 
-    for (conflict_id, resolution) in resolved {
+    for (conflict_id, resolution) in commit_out.resolved {
         match resolution {
             lex_vcs::Resolution::TakeOurs => {}
             lex_vcs::Resolution::TakeTheirs => {
@@ -351,17 +435,42 @@ fn cmd_commit(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 
     let resolved_count = entries.len();
     let mut parents: Vec<lex_vcs::OpId> = Vec::new();
-    if let Some(d) = dst_head { parents.push(d); }
-    if let Some(s) = src_head { parents.push(s); }
+    if let Some(d) = dst_head.clone() { parents.push(d); }
+    if let Some(s) = src_head.clone() { parents.push(s); }
     let op = lex_vcs::Operation::new(
         lex_vcs::OperationKind::Merge { resolved: resolved_count },
         parents,
     );
     let transition = lex_vcs::StageTransition::Merge { entries };
+
+    // #1007 PR 7: build the merged manifest (if the manifests disagreed
+    // at all) before landing anything — mirrors the HTTP handler.
+    let manifest_blob: Option<String> = if commit_out.needs_setfiles {
+        match store.manifest_merge(lca.as_deref(), dst_head.as_deref(), src_head.as_deref())? {
+            lex_store::ManifestMergeOutcome::NoChange => None,
+            lex_store::ManifestMergeOutcome::Needed { auto_entries, conflicts } => {
+                let file_resolutions: BTreeMap<lex_vcs::FilePath, lex_vcs::FileResolution> =
+                    commit_out.resolved_files.into_iter().collect();
+                Some(store.build_merged_manifest(
+                    auto_entries,
+                    &conflicts,
+                    &file_resolutions,
+                    "pending-merge",
+                )?)
+            }
+        }
+    } else {
+        None
+    };
+
     // Gated (#833): lands the merge op, type-checks the real
-    // post-merge head, rolls back on a TypeError. The session file is
-    // kept (we return before `delete_merge`) so the agent can retry.
-    let new_head_op = store.apply_merge_op_gated(&dst_branch, op, transition)?;
+    // post-merge head, rolls back on a TypeError — and (#1007 PR 7)
+    // appends the `SetFiles` above when `manifest_blob` is `Some`. The
+    // session file is kept (we return before `delete_merge`) so the
+    // agent can retry.
+    let new_head_op = store.apply_merge_op_gated_with_manifest(
+        &dst_branch, op, transition, manifest_blob.as_deref(), None,
+    )?;
 
     delete_merge(&root, merge_id)?;
 

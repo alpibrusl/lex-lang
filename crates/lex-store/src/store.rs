@@ -11,7 +11,7 @@ use crate::model::*;
 use lex_ast::{sig_id, stage_id, Stage};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -120,6 +120,17 @@ pub enum StoreError {
          version on one branch and merge again"
     )]
     DependencyConflict { package: String, dst_version: String, src_version: String },
+    /// A merge's file-manifest diff (#1007 PR 7) was asked to 3-way-merge
+    /// a side whose own `manifest_at` is already `Ambiguous` — a merge of
+    /// merges where an earlier merge landed without the `SetFiles` it
+    /// should have appended. There is no well-defined manifest on that
+    /// side to diff against, so this merge is refused too rather than
+    /// guessing. Resolve by appending a `SetFiles` on `op_id` first (the
+    /// same fix `check_head_files` names for a plain head advance).
+    #[error(
+        "ambiguous manifest at `{op_id}`: append a set_files op resolving it before merging"
+    )]
+    AmbiguousManifest { op_id: lex_vcs::OpId },
     /// A typed issue's example targets a function that isn't declared at
     /// the head being evaluated (#949) — the example cannot be attached, so
     /// the issue cannot be judged there.
@@ -787,6 +798,74 @@ impl Store {
     /// Whether a blob with this sha exists.
     pub fn has_blob(&self, sha: &str) -> bool {
         crate::files::is_blob_id(sha) && self.blobs_dir().join(sha).exists()
+    }
+
+    /// Every blob id currently on disk, paired with its file's last
+    /// modification time (#1007 PR 7 blob GC) — the age a blob's grace
+    /// period is measured against. `.tmp` write-in-progress files (see
+    /// [`Self::put_blob_bytes`]) never match `is_blob_id` and are
+    /// skipped, so a concurrent writer can't have its temp file swept.
+    pub(crate) fn list_blob_ids_with_mtime(&self) -> Result<Vec<(String, SystemTime)>, StoreError> {
+        let rd = match fs::read_dir(self.blobs_dir()) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = Vec::new();
+        for ent in rd {
+            let ent = ent?;
+            let name = ent.file_name().to_string_lossy().to_string();
+            if !crate::files::is_blob_id(&name) {
+                continue;
+            }
+            let mtime = ent.metadata()?.modified()?;
+            out.push((name, mtime));
+        }
+        Ok(out)
+    }
+
+    /// Delete a blob by id (#1007 PR 7 blob GC). No-op if the id doesn't
+    /// look like a blob id or the file is already gone — GC is expected
+    /// to run concurrently with itself across replicas without erroring.
+    pub(crate) fn delete_blob(&self, id: &str) -> Result<(), StoreError> {
+        if !crate::files::is_blob_id(id) {
+            return Ok(());
+        }
+        match fs::remove_file(self.blobs_dir().join(id)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Every blob sha bound anywhere under `blobrefs/**` (#1007 §3 blob
+    /// GC: "PLUS everything under the existing `blobrefs/**` namespace").
+    /// Walks the whole tree regardless of namespace depth or shape (locks
+    /// keyed by op id, loom artifacts keyed by node id, …) so a new
+    /// namespace never needs a GC update to stay safe — the cost of a
+    /// false "still live" is a few retained blobs, not a correctness bug.
+    pub(crate) fn all_blob_ref_shas(&self) -> Result<BTreeSet<String>, StoreError> {
+        let mut out = BTreeSet::new();
+        let mut stack = vec![self.blob_refs_dir()];
+        while let Some(dir) = stack.pop() {
+            let rd = match fs::read_dir(&dir) {
+                Ok(rd) => rd,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            for ent in rd {
+                let ent = ent?;
+                let ft = ent.file_type()?;
+                if ft.is_dir() {
+                    stack.push(ent.path());
+                } else if ft.is_file() {
+                    if let Ok(sha) = fs::read_to_string(ent.path()) {
+                        out.insert(sha.trim().to_string());
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Bind `key` to a blob `sha` within `namespace` (e.g. namespace
@@ -2479,6 +2558,48 @@ impl Store {
         // merge records nothing.
         self.record_typecheck_passed(&attestable, &op_id)?;
         Ok(op_id)
+    }
+
+    /// Like [`Self::apply_merge_op_gated`], but also appends the
+    /// `SetFiles` a disagreeing-manifest merge needs (#1007 §1 / PR 7).
+    ///
+    /// `manifest` is the already-computed, already-stored merged manifest
+    /// blob id — see [`crate::files::manifest_merge`] plus a merge
+    /// session's file-conflict resolutions for how the caller builds it.
+    /// `None` when dst's and src's manifests already agreed (the common
+    /// case): nothing to record, behaves exactly like
+    /// `apply_merge_op_gated`.
+    ///
+    /// On any failure — the sig-level type-check gate (as before), or the
+    /// follow-up `SetFiles` (which should essentially never fail here
+    /// since the caller already validated the manifest before calling
+    /// this, but a store can be modified concurrently) — the branch head
+    /// is rolled all the way back to where it was before this call. A
+    /// merge op is never left standing as a head with an `Ambiguous`
+    /// manifest; that would violate the always-valid-HEAD invariant
+    /// `check_head_files` polices for every other path onto a head.
+    pub fn apply_merge_op_gated_with_manifest(
+        &self,
+        branch: &str,
+        op: lex_vcs::Operation,
+        transition: lex_vcs::StageTransition,
+        manifest: Option<&str>,
+        intent_id: Option<&lex_vcs::IntentId>,
+    ) -> Result<lex_vcs::OpId, StoreError> {
+        let head_before = self.get_branch(branch)?.and_then(|b| b.head_op);
+        let merge_op_id = self.apply_merge_op_gated(branch, op, transition)?;
+        let Some(manifest) = manifest else {
+            return Ok(merge_op_id);
+        };
+        match self.apply_set_files(branch, manifest, intent_id) {
+            Ok(set_files_op_id) => Ok(set_files_op_id),
+            Err(e) => {
+                if let Some(prev) = head_before {
+                    self.set_branch_head_op(branch, prev)?;
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Type-check the program that would result from overlaying a merge

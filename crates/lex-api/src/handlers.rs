@@ -1053,7 +1053,7 @@ fn merge_start_handler(state: &State, body: &str) -> Response<std::io::Cursor<Ve
     // wall clock + a per-process counter avoids leaking session
     // ids' shape into the public surface.
     let merge_id = mint_merge_id();
-    let session = match MergeSession::start(
+    let mut session = match MergeSession::start(
         merge_id.clone(),
         &log,
         src_head.as_ref(),
@@ -1062,8 +1062,36 @@ fn merge_start_handler(state: &State, body: &str) -> Response<std::io::Cursor<Ve
         Ok(s) => s,
         Err(e) => return error_response(500, format!("merge start: {e}")),
     };
+    // #1007 PR 7: the files dimension of the merge. `lex-vcs` doesn't
+    // know about manifests (see `merge_session.rs`'s module docs), so
+    // the store computes the 3-way diff and the session just tracks the
+    // conflicts it surfaced — the same layering `MergeResolutionChecker`
+    // already uses for sig-conflict type-checking.
+    let manifest_outcome = match store.manifest_merge(
+        session.lca.as_deref(),
+        dst_head.as_deref(),
+        src_head.as_deref(),
+    ) {
+        Ok(o) => o,
+        Err(lex_store::StoreError::AmbiguousManifest { op_id }) => {
+            return error_with_detail(422, "AmbiguousManifest", serde_json::json!({
+                "op_id": op_id,
+                "reason": "a merge ancestor has an ambiguous files manifest; \
+                           append a set_files op resolving it before merging",
+            }));
+        }
+        Err(e) => return error_response(500, format!("manifest merge: {e}")),
+    };
+    let (file_conflicts, needs_setfiles): (Vec<lex_vcs::FileConflict>, bool) =
+        match manifest_outcome {
+            lex_store::ManifestMergeOutcome::NoChange => (Vec::new(), false),
+            lex_store::ManifestMergeOutcome::Needed { conflicts, .. } => (conflicts, true),
+        };
+    session.attach_file_conflicts(file_conflicts, needs_setfiles);
+
     let conflicts: Vec<&lex_vcs::ConflictRecord> = session.remaining_conflicts();
     let auto_resolved_count = session.auto_resolved.len();
+    let remaining_file_conflicts: Vec<&lex_vcs::FileConflict> = session.remaining_file_conflicts();
     let body = serde_json::json!({
         "merge_id": merge_id,
         "src_head": session.src_head,
@@ -1071,8 +1099,11 @@ fn merge_start_handler(state: &State, body: &str) -> Response<std::io::Cursor<Ve
         "lca":      session.lca,
         "conflicts": conflicts,
         "auto_resolved_count": auto_resolved_count,
+        "file_conflicts": remaining_file_conflicts,
+        "needs_setfiles": session.needs_setfiles(),
     });
     drop(conflicts);
+    drop(remaining_file_conflicts);
     drop(store);
     let wrapped = ApiMergeSession {
         inner: session,
@@ -1089,13 +1120,27 @@ struct MergeResolveReq {
     /// the same shape as `lex_vcs::Resolution`'s tagged JSON form
     /// — `{"kind":"take_ours"}`, `{"kind":"take_theirs"}`,
     /// `{"kind":"defer"}`, or `{"kind":"custom","op":{...}}`.
+    #[serde(default)]
     resolutions: Vec<MergeResolveEntry>,
+    /// File conflicts (#1007 PR 7), keyed by path instead of sig id.
+    /// Resolution shape is `lex_vcs::FileResolution`'s tagged JSON form
+    /// — `{"kind":"take_ours"}`, `{"kind":"take_theirs"}`, or
+    /// `{"kind":"defer"}` (no `custom`; see the module docs on
+    /// `merge_session::FileResolution` for why).
+    #[serde(default)]
+    file_resolutions: Vec<MergeFileResolveEntry>,
 }
 
 #[derive(Deserialize)]
 struct MergeResolveEntry {
     conflict_id: String,
     resolution: lex_vcs::Resolution,
+}
+
+#[derive(Deserialize)]
+struct MergeFileResolveEntry {
+    path: lex_vcs::FilePath,
+    resolution: lex_vcs::FileResolution,
 }
 
 /// `POST /v1/merge/<id>/resolve` (#134) — submit batched
@@ -1131,10 +1176,18 @@ fn merge_resolve_handler(
     let checker = lex_store::MergeResolutionChecker::new(&store, wrapped.dst_branch.clone());
     let verdicts = wrapped.inner.resolve_checked(pairs, &checker);
     drop(store);
+    let file_pairs: Vec<(lex_vcs::FilePath, lex_vcs::FileResolution)> = req.file_resolutions
+        .into_iter()
+        .map(|e| (e.path, e.resolution))
+        .collect();
+    let file_verdicts = wrapped.inner.resolve_files(file_pairs);
     let remaining: Vec<&lex_vcs::ConflictRecord> = wrapped.inner.remaining_conflicts();
+    let remaining_files: Vec<&lex_vcs::FileConflict> = wrapped.inner.remaining_file_conflicts();
     let body = serde_json::json!({
         "verdicts": verdicts,
         "remaining_conflicts": remaining,
+        "file_verdicts": file_verdicts,
+        "remaining_file_conflicts": remaining_files,
     });
     json_response(200, &body)
 }
@@ -1172,6 +1225,7 @@ fn merge_commit_handler(
     let dst_branch = wrapped.dst_branch.clone();
     let src_head = wrapped.inner.src_head.clone();
     let dst_head = wrapped.inner.dst_head.clone();
+    let lca = wrapped.inner.lca.clone();
     let auto_resolved = wrapped.inner.auto_resolved.clone();
 
     // Translate auto-resolved + resolutions into the StageTransition::Merge
@@ -1185,8 +1239,8 @@ fn merge_commit_handler(
         }
     }
 
-    // Conflict resolutions.
-    let resolved = match wrapped.inner.commit() {
+    // Conflict resolutions (sig conflicts, then file conflicts — #1007 PR 7).
+    let commit_out = match wrapped.inner.commit() {
         Ok(r) => r,
         Err(lex_vcs::CommitError::ConflictsRemaining(ids)) => {
             // Re-insert isn't possible since we removed above; the
@@ -1198,9 +1252,16 @@ fn merge_commit_handler(
                 serde_json::json!({"unresolved": ids}),
             );
         }
+        Err(lex_vcs::CommitError::FileConflictsRemaining(paths)) => {
+            return error_with_detail(
+                422,
+                "file conflicts remaining",
+                serde_json::json!({"unresolved_files": paths}),
+            );
+        }
     };
 
-    for (conflict_id, resolution) in resolved {
+    for (conflict_id, resolution) in commit_out.resolved {
         match resolution {
             lex_vcs::Resolution::TakeOurs => {
                 // Dst already has its head. No entry needed.
@@ -1266,17 +1327,56 @@ fn merge_commit_handler(
 
     let resolved_count = entries.len();
     let mut parents: Vec<lex_vcs::OpId> = Vec::new();
-    if let Some(d) = dst_head { parents.push(d); }
-    if let Some(s) = src_head { parents.push(s); }
+    if let Some(d) = dst_head.clone() { parents.push(d); }
+    if let Some(s) = src_head.clone() { parents.push(s); }
     let op = lex_vcs::Operation::new(
         lex_vcs::OperationKind::Merge { resolved: resolved_count },
         parents,
     );
     let transition = lex_vcs::StageTransition::Merge { entries };
     let store = state.store.lock().unwrap();
-    // Gated (#833): lands the merge op, type-checks the real
-    // post-merge head, rolls the head back on a TypeError.
-    match store.apply_merge_op_gated(&dst_branch, op, transition) {
+
+    // #1007 PR 7: if the manifests disagreed at all, build the merged
+    // manifest now — auto-resolved paths plus every resolved file
+    // conflict — so it can be landed as a `SetFiles` right after the
+    // merge op. Recomputes the same 3-way diff `merge/start` already
+    // showed the caller (over the same `lca`/`dst_head`/`src_head`, so
+    // it reproduces byte-for-byte unless the store's blobs changed
+    // underneath the session, which the manifest-closure check below
+    // would catch anyway).
+    let manifest_blob: Option<String> = if commit_out.needs_setfiles {
+        match store.manifest_merge(lca.as_deref(), dst_head.as_deref(), src_head.as_deref()) {
+            Ok(lex_store::ManifestMergeOutcome::NoChange) => None,
+            Ok(lex_store::ManifestMergeOutcome::Needed { auto_entries, conflicts }) => {
+                let file_resolutions: BTreeMap<lex_vcs::FilePath, lex_vcs::FileResolution> =
+                    commit_out.resolved_files.into_iter().collect();
+                match store.build_merged_manifest(
+                    auto_entries,
+                    &conflicts,
+                    &file_resolutions,
+                    "pending-merge",
+                ) {
+                    Ok(blob_id) => Some(blob_id),
+                    Err(e) => return write_error_response("build merged manifest", e),
+                }
+            }
+            Err(lex_store::StoreError::AmbiguousManifest { op_id }) => {
+                return error_with_detail(422, "AmbiguousManifest", serde_json::json!({
+                    "op_id": op_id,
+                }));
+            }
+            Err(e) => return write_error_response("manifest merge", e),
+        }
+    } else {
+        None
+    };
+
+    // Gated (#833): lands the merge op, type-checks the real post-merge
+    // head, rolls the head back on a TypeError — and (#1007 PR 7) also
+    // appends the `SetFiles` above when `manifest_blob` is `Some`,
+    // rolling all the way back if that fails too (see
+    // `apply_merge_op_gated_with_manifest`'s doc comment).
+    match store.apply_merge_op_gated_with_manifest(&dst_branch, op, transition, manifest_blob.as_deref(), None) {
         Ok(new_head_op) => json_response(200, &serde_json::json!({
             "new_head_op": new_head_op,
             "dst_branch": dst_branch,
@@ -1303,6 +1403,13 @@ fn merge_commit_handler(
                 _ => serde_json::Value::Null,
             };
             error_with_detail(409, e.to_string(), detail)
+        }
+        Err(e @ lex_store::StoreError::AmbiguousManifest { .. }) => {
+            error_with_detail(422, "AmbiguousManifest", serde_json::json!({"detail": e.to_string()}))
+        }
+        Err(e @ lex_store::StoreError::InvalidManifest(_))
+        | Err(e @ lex_store::StoreError::MissingBlobs(_)) => {
+            error_with_detail(422, e.to_string(), serde_json::Value::Null)
         }
         Err(e) => write_error_response("apply merge op", e),
     }

@@ -45,7 +45,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::merge::{ConflictKind, MergeOutcome, MergeOutput};
 use crate::op_log::OpLog;
-use crate::operation::{OpId, Operation, SigId, StageId};
+use crate::operation::{BlobId, OpId, Operation, SigId, StageId};
 
 /// Stable id for a merge in flight. Caller-supplied so the HTTP
 /// surface can map URLs to sessions without leaking session ids
@@ -74,6 +74,94 @@ pub struct ConflictRecord {
     /// Stage on the src (theirs) side of the merge. `None` if src
     /// removed it.
     pub theirs: Option<StageId>,
+}
+
+// ---- Files (#1007 PR 7): the manifest side of a merge ----
+//
+// `lex-vcs` doesn't know about `Manifest` or blob storage (that's
+// `lex-store`'s layer — see `crate::merge_session`'s module docs on
+// `ResolutionChecker` for the same layering reason). So a file conflict
+// here is described purely in terms of the blob triple a path resolved
+// to on each side — everything a caller needs to render or resolve it,
+// without this crate depending on `lex-store::files::{Entry, Manifest}`.
+// The caller (lex-store, via `Store::manifest_merge`) computes the 3-way
+// diff and hands the resulting conflicts to
+// [`MergeSession::attach_file_conflicts`]; this crate then tracks
+// resolutions the same way it tracks sig conflicts.
+
+/// A path in a files manifest (#1007). Distinct type alias from
+/// [`ConflictId`] even though both are `String` — a sig id and a file
+/// path are never interchangeable, and the alias documents which one a
+/// signature expects.
+pub type FilePath = String;
+
+/// One side of a [`FileConflict`]: the blob (and its metadata) a path
+/// resolved to in a manifest. Mirrors `lex_store::files::Entry` field
+/// for field, without this crate depending on `lex-store`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileEntry {
+    pub blob: BlobId,
+    pub mode: String,
+    pub size: u64,
+}
+
+/// A path whose manifest entry differs on both sides of a merge, and
+/// differs from the base too — a real content conflict, not a one-sided
+/// edit (those auto-resolve before this is ever surfaced; see
+/// `Store::manifest_merge`'s doc comment for the auto-resolve rule).
+///
+/// Blobs are opaque bytes (binary allowed, per #1007 §2) so there is no
+/// meaningful 3-way *content* merge the way there is for text lines —
+/// resolving a `FileConflict` means picking a side
+/// ([`FileResolution::TakeOurs`] / [`FileResolution::TakeTheirs`]), not
+/// splicing bytes. See the module docs on why real content merging is
+/// out of scope for #1007 PR 7.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileConflict {
+    pub path: FilePath,
+    /// The path's entry on the merge base (the LCA's manifest). `None`
+    /// if the path didn't exist there (both sides added it
+    /// differently — the file-level analogue of `ConflictKind::AddAdd`).
+    pub base: Option<FileEntry>,
+    /// The path's entry on dst's side. `None` if dst doesn't have it
+    /// (removed, or never added).
+    pub ours: Option<FileEntry>,
+    /// The path's entry on src's side. `None` if src doesn't have it.
+    pub theirs: Option<FileEntry>,
+}
+
+/// Choice for a single file conflict. No `Custom` variant (unlike
+/// [`Resolution`]): a file conflict has no "brand-new op" analogue — the
+/// only two things you can do with two divergent versions of an opaque
+/// blob are keep one or the other. See the module docs above.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FileResolution {
+    /// Keep dst's (ours) entry for this path; discard src's.
+    TakeOurs,
+    /// Keep src's (theirs) entry for this path; discard dst's.
+    TakeTheirs,
+    /// Punt to a human reviewer, same as [`Resolution::Defer`].
+    Defer,
+}
+
+/// Why a file resolution was rejected. Only the structural case applies
+/// today — a file resolution never fails a type-check the way a sig
+/// resolution can, since `SetFiles` carries no program semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FileResolutionRejection {
+    /// `path` doesn't refer to any pending file conflict in the
+    /// session — invented, or already resolved and pruned.
+    UnknownConflict { path: FilePath },
+}
+
+/// Per-path outcome of a `resolve_files` call. Mirrors [`ResolveVerdict`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileResolveVerdict {
+    pub path: FilePath,
+    pub accepted: bool,
+    pub rejection: Option<FileResolutionRejection>,
 }
 
 /// Choice for a single conflict.
@@ -164,10 +252,31 @@ pub struct ResolveVerdict {
 /// goes away.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommitError {
-    /// At least one conflict has no resolution or has
+    /// At least one sig conflict has no resolution or has
     /// [`Resolution::Defer`]. The session is still alive; submit
-    /// resolutions and retry.
+    /// resolutions and retry. Checked before file conflicts, so a
+    /// session with both kinds pending reports this first.
     ConflictsRemaining(Vec<ConflictId>),
+    /// At least one file conflict (#1007 PR 7) has no resolution or
+    /// has [`FileResolution::Defer`]. Only reachable once
+    /// `ConflictsRemaining` is empty.
+    FileConflictsRemaining(Vec<FilePath>),
+}
+
+/// What [`MergeSession::commit`] hands the caller to land: the resolved
+/// sig conflicts (as before #1007) plus the resolved file conflicts and
+/// whether the merge needs a `SetFiles` op at all (#1007 PR 7 — see
+/// [`MergeSession::attach_file_conflicts`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeCommitOutput {
+    pub resolved: Vec<(ConflictId, Resolution)>,
+    pub resolved_files: Vec<(FilePath, FileResolution)>,
+    /// True when dst's and src's files manifests disagreed at all (even
+    /// if every path auto-resolved with no [`FileConflict`]) — the
+    /// merge commit must append a `SetFiles` recording the merged
+    /// manifest, per #1007 §1. False when the session was never told
+    /// about a files dimension, or the manifests already agreed.
+    pub needs_setfiles: bool,
 }
 
 /// Stateful merge in flight. Hold one per active merge between
@@ -189,6 +298,19 @@ pub struct MergeSession {
     /// Resolutions accumulated across resolve calls. Validated
     /// against `conflicts` when applied.
     resolutions: BTreeMap<ConflictId, Resolution>,
+    /// File conflicts (#1007 PR 7), attached separately from `start`
+    /// via [`Self::attach_file_conflicts`] — `lex-vcs` doesn't compute
+    /// these itself (see the module docs above `FilePath`). Empty for
+    /// a session whose merge has no files dimension at all.
+    #[serde(default)]
+    file_conflicts: BTreeMap<FilePath, FileConflict>,
+    /// File resolutions accumulated across `resolve_files` calls.
+    #[serde(default)]
+    file_resolutions: BTreeMap<FilePath, FileResolution>,
+    /// Whether dst's and src's files manifests disagree at all — see
+    /// [`MergeCommitOutput::needs_setfiles`].
+    #[serde(default)]
+    needs_setfiles: bool,
 }
 
 impl MergeSession {
@@ -242,7 +364,69 @@ impl MergeSession {
             auto_resolved,
             conflicts,
             resolutions: BTreeMap::new(),
+            file_conflicts: BTreeMap::new(),
+            file_resolutions: BTreeMap::new(),
+            needs_setfiles: false,
         })
+    }
+
+    /// Attach the files dimension of the merge (#1007 PR 7): the
+    /// conflicts a 3-way manifest diff surfaced (paths edited
+    /// differently on both sides — see [`FileConflict`]) and whether
+    /// the merge needs a `SetFiles` op at all. Called once, right
+    /// after [`Self::start`], by the caller that holds the store (the
+    /// same layering [`ResolutionChecker`] uses: this crate tracks the
+    /// session's state machine, the caller computes the domain-specific
+    /// diff). A no-op call with an empty `conflicts` and
+    /// `needs_setfiles: false` — the default — leaves a session with
+    /// no files dimension, exactly as before this feature existed.
+    pub fn attach_file_conflicts(&mut self, conflicts: Vec<FileConflict>, needs_setfiles: bool) {
+        self.file_conflicts = conflicts.into_iter().map(|c| (c.path.clone(), c)).collect();
+        self.needs_setfiles = needs_setfiles;
+    }
+
+    /// Whether the merge needs a `SetFiles` op appended on commit, per
+    /// [`MergeCommitOutput::needs_setfiles`].
+    pub fn needs_setfiles(&self) -> bool {
+        self.needs_setfiles
+    }
+
+    /// Pending file conflicts (those without a non-defer resolution).
+    /// Mirrors [`Self::remaining_conflicts`].
+    pub fn remaining_file_conflicts(&self) -> Vec<&FileConflict> {
+        self.file_conflicts
+            .values()
+            .filter(|c| {
+                !matches!(
+                    self.file_resolutions.get(&c.path),
+                    Some(FileResolution::TakeOurs) | Some(FileResolution::TakeTheirs)
+                )
+            })
+            .collect()
+    }
+
+    /// Submit file resolutions in batch. Mirrors [`Self::resolve`]:
+    /// unlike sig resolutions there is no type-check to run (`SetFiles`
+    /// carries no program semantics), so this is the only resolve path
+    /// files need — no `resolve_files_checked` counterpart.
+    pub fn resolve_files(
+        &mut self,
+        resolutions: Vec<(FilePath, FileResolution)>,
+    ) -> Vec<FileResolveVerdict> {
+        let mut out = Vec::with_capacity(resolutions.len());
+        for (path, resolution) in resolutions {
+            if !self.file_conflicts.contains_key(&path) {
+                out.push(FileResolveVerdict {
+                    path: path.clone(),
+                    accepted: false,
+                    rejection: Some(FileResolutionRejection::UnknownConflict { path }),
+                });
+                continue;
+            }
+            self.file_resolutions.insert(path.clone(), resolution);
+            out.push(FileResolveVerdict { path, accepted: true, rejection: None });
+        }
+        out
     }
 
     /// Pending conflicts (those without a non-defer resolution).
@@ -420,12 +604,20 @@ impl MergeSession {
         Ok(())
     }
 
-    /// Finalize the merge. On success returns the resolved
-    /// resolutions in conflict_id order. The caller is responsible
-    /// for synthesizing the final `Operation::Merge` op against the
-    /// store and persisting it; this function returns the engine's
-    /// view of "what to land," not the persisted op id.
-    pub fn commit(self) -> Result<Vec<(ConflictId, Resolution)>, CommitError> {
+    /// Finalize the merge. On success returns the resolved sig and
+    /// file resolutions, in id order, plus whether the caller must
+    /// append a `SetFiles`. The caller is responsible for synthesizing
+    /// the final `Operation::Merge` (and, if `needs_setfiles`, the
+    /// follow-up `SetFiles`) op against the store and persisting them;
+    /// this function returns the engine's view of "what to land," not
+    /// the persisted op ids.
+    ///
+    /// Sig conflicts are checked before file conflicts: a session with
+    /// both kinds pending reports [`CommitError::ConflictsRemaining`]
+    /// first, exactly the precedence #977's merge gate already used for
+    /// dependency conflicts vs. type errors — one blocker surfaced at a
+    /// time keeps the agent's retry loop simple.
+    pub fn commit(self) -> Result<MergeCommitOutput, CommitError> {
         let unresolved: Vec<ConflictId> = self
             .conflicts
             .keys()
@@ -440,9 +632,26 @@ impl MergeSession {
         if !unresolved.is_empty() {
             return Err(CommitError::ConflictsRemaining(unresolved));
         }
+        let unresolved_files: Vec<FilePath> = self
+            .file_conflicts
+            .keys()
+            .filter(|path| {
+                !matches!(
+                    self.file_resolutions.get(*path),
+                    Some(FileResolution::TakeOurs) | Some(FileResolution::TakeTheirs)
+                )
+            })
+            .cloned()
+            .collect();
+        if !unresolved_files.is_empty() {
+            return Err(CommitError::FileConflictsRemaining(unresolved_files));
+        }
         let mut resolved: Vec<(ConflictId, Resolution)> = self.resolutions.into_iter().collect();
         resolved.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(resolved)
+        let mut resolved_files: Vec<(FilePath, FileResolution)> =
+            self.file_resolutions.into_iter().collect();
+        resolved_files.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(MergeCommitOutput { resolved, resolved_files, needs_setfiles: self.needs_setfiles })
     }
 }
 
@@ -700,8 +909,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let log = OpLog::open(tmp.path()).unwrap();
         let session = MergeSession::start("ms-9", &log, None, None).unwrap();
-        let resolved = session.commit().unwrap();
-        assert!(resolved.is_empty());
+        let out = session.commit().unwrap();
+        assert!(out.resolved.is_empty());
+        assert!(out.resolved_files.is_empty());
+        assert!(!out.needs_setfiles);
     }
 
     #[test]
@@ -714,6 +925,7 @@ mod tests {
             CommitError::ConflictsRemaining(ids) => {
                 assert_eq!(ids, vec!["fn::A".to_string()]);
             }
+            other => panic!("expected ConflictsRemaining, got {other:?}"),
         }
     }
 
@@ -728,6 +940,7 @@ mod tests {
             CommitError::ConflictsRemaining(ids) => {
                 assert_eq!(ids, vec!["fn::A".to_string()]);
             }
+            other => panic!("expected ConflictsRemaining, got {other:?}"),
         }
     }
 
@@ -737,10 +950,11 @@ mod tests {
         let mut session =
             MergeSession::start("ms-12", &log, Some(&src), Some(&dst)).unwrap();
         session.resolve(vec![("fn::A".into(), Resolution::TakeOurs)]);
-        let resolved = session.commit().unwrap();
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].0, "fn::A");
-        assert!(matches!(resolved[0].1, Resolution::TakeOurs));
+        let out = session.commit().unwrap();
+        assert_eq!(out.resolved.len(), 1);
+        assert_eq!(out.resolved[0].0, "fn::A");
+        assert!(matches!(out.resolved[0].1, Resolution::TakeOurs));
+        assert!(out.resolved_files.is_empty());
     }
 
     #[test]
@@ -891,5 +1105,122 @@ mod tests {
         res.insert("fn::A".to_string(), Resolution::TakeTheirs);
         let delta = session.projected_delta(&res);
         assert_eq!(delta.get("fn::A"), Some(&Some("stage-2".to_string())));
+    }
+
+    // ---- #1007 PR 7: file conflicts on a merge session ----
+
+    fn some_entry(n: u8) -> FileEntry {
+        FileEntry { blob: format!("{n:0>64}"), mode: "100644".into(), size: n as u64 }
+    }
+
+    fn file_conflict(path: &str) -> FileConflict {
+        FileConflict {
+            path: path.into(),
+            base: Some(some_entry(1)),
+            ours: Some(some_entry(2)),
+            theirs: Some(some_entry(3)),
+        }
+    }
+
+    #[test]
+    fn no_file_conflicts_by_default() {
+        // A session that never gets `attach_file_conflicts` called on
+        // it (every merge before #1007, and any merge whose manifests
+        // already agree) has no files dimension at all.
+        let tmp = tempfile::tempdir().unwrap();
+        let log = OpLog::open(tmp.path()).unwrap();
+        let session = MergeSession::start("ms-f0", &log, None, None).unwrap();
+        assert!(session.remaining_file_conflicts().is_empty());
+        assert!(!session.needs_setfiles());
+        let out = session.commit().unwrap();
+        assert!(out.resolved_files.is_empty());
+        assert!(!out.needs_setfiles);
+    }
+
+    #[test]
+    fn attach_file_conflicts_surfaces_them_as_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = OpLog::open(tmp.path()).unwrap();
+        let mut session = MergeSession::start("ms-f1", &log, None, None).unwrap();
+        session.attach_file_conflicts(vec![file_conflict("README.md")], true);
+        assert!(session.needs_setfiles());
+        let remaining = session.remaining_file_conflicts();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].path, "README.md");
+    }
+
+    #[test]
+    fn commit_blocked_by_unresolved_file_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = OpLog::open(tmp.path()).unwrap();
+        let mut session = MergeSession::start("ms-f2", &log, None, None).unwrap();
+        session.attach_file_conflicts(vec![file_conflict("README.md")], true);
+        let err = session.commit().unwrap_err();
+        match err {
+            CommitError::FileConflictsRemaining(paths) => {
+                assert_eq!(paths, vec!["README.md".to_string()]);
+            }
+            other => panic!("expected FileConflictsRemaining, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sig_conflicts_take_precedence_over_file_conflicts_in_commit_error() {
+        // A session with BOTH an unresolved sig conflict and an
+        // unresolved file conflict reports the sig one first — the
+        // agent fixes one blocker at a time.
+        let (_tmp, log, dst, src) = fixture();
+        let mut session = MergeSession::start("ms-f3", &log, Some(&src), Some(&dst)).unwrap();
+        session.attach_file_conflicts(vec![file_conflict("README.md")], true);
+        let err = session.commit().unwrap_err();
+        assert!(matches!(err, CommitError::ConflictsRemaining(_)));
+    }
+
+    #[test]
+    fn resolve_files_take_ours_clears_conflict_and_commits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = OpLog::open(tmp.path()).unwrap();
+        let mut session = MergeSession::start("ms-f4", &log, None, None).unwrap();
+        session.attach_file_conflicts(vec![file_conflict("README.md")], true);
+        let verdicts =
+            session.resolve_files(vec![("README.md".into(), FileResolution::TakeOurs)]);
+        assert!(verdicts[0].accepted);
+        assert!(session.remaining_file_conflicts().is_empty());
+        let out = session.commit().unwrap();
+        assert_eq!(out.resolved_files, vec![("README.md".to_string(), FileResolution::TakeOurs)]);
+        assert!(out.needs_setfiles);
+    }
+
+    #[test]
+    fn resolve_files_unknown_path_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = OpLog::open(tmp.path()).unwrap();
+        let mut session = MergeSession::start("ms-f5", &log, None, None).unwrap();
+        session.attach_file_conflicts(vec![file_conflict("README.md")], true);
+        let verdicts =
+            session.resolve_files(vec![("nope.txt".into(), FileResolution::TakeOurs)]);
+        assert!(!verdicts[0].accepted);
+        assert!(matches!(
+            verdicts[0].rejection,
+            Some(FileResolutionRejection::UnknownConflict { .. })
+        ));
+        // The real conflict is untouched.
+        assert_eq!(session.remaining_file_conflicts().len(), 1);
+    }
+
+    #[test]
+    fn defer_on_file_conflict_keeps_it_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = OpLog::open(tmp.path()).unwrap();
+        let mut session = MergeSession::start("ms-f6", &log, None, None).unwrap();
+        session.attach_file_conflicts(vec![file_conflict("README.md")], true);
+        let verdicts =
+            session.resolve_files(vec![("README.md".into(), FileResolution::Defer)]);
+        assert!(verdicts[0].accepted);
+        assert_eq!(session.remaining_file_conflicts().len(), 1, "defer is not a resolution");
+        assert!(matches!(
+            session.commit().unwrap_err(),
+            CommitError::FileConflictsRemaining(_)
+        ));
     }
 }
