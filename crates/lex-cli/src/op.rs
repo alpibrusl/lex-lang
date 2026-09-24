@@ -317,16 +317,36 @@ fn print_skipped(req: &lex_store::ReplayRequest) {
 /// head is always kept; ops matching `--retain` predicates or
 /// policy.json's `gc_retention.retain` entries are kept; every
 /// parent of a retained op is kept transitively (DAG integrity).
+///
+/// `lex op gc --blobs {--dry-run|--confirm} [--grace-hours N] [--store DIR]`
+/// (#1007 §3 / PR 7): a separate mode, mark-and-sweep over the blob space
+/// instead of the op log — live = every blob in a retained `SetFiles`
+/// op's manifest closure, plus everything bound under `blobrefs/**`
+/// (locks, loom artifacts). `--retain` doesn't apply here (blob
+/// liveness follows op retention, it isn't independently predicated);
+/// `--grace-hours` (default 24) is the minimum age before an
+/// unreferenced blob is swept, protecting a blob an in-flight push
+/// uploaded moments ago but whose op hasn't landed yet (push order is
+/// blobs → ops → head, per #1007 §4).
 fn cmd_op_gc(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let (root, rest) = parse_store(args);
     let mut dry_run = false;
     let mut confirm = false;
+    let mut blobs = false;
+    let mut grace_hours: u64 = 24;
     let mut cli_retain: Vec<lex_vcs::Predicate> = Vec::new();
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--dry-run" => dry_run = true,
             "--confirm" => confirm = true,
+            "--blobs" => blobs = true,
+            "--grace-hours" => {
+                let raw = it.next()
+                    .ok_or_else(|| anyhow!("--grace-hours needs N"))?;
+                grace_hours = raw.parse()
+                    .map_err(|e| anyhow!("--grace-hours: {e}"))?;
+            }
             "--retain" => {
                 let raw = it.next()
                     .ok_or_else(|| anyhow!("--retain needs a JSON predicate"))?;
@@ -337,7 +357,8 @@ fn cmd_op_gc(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                 cli_retain.push(p);
             }
             other => bail!("unexpected arg `{other}` (usage: lex op gc \
-                [--dry-run|--confirm] [--retain JSON]... [--store DIR])"),
+                [--dry-run|--confirm] [--retain JSON]... [--store DIR], \
+                or lex op gc --blobs [--dry-run|--confirm] [--grace-hours N] [--store DIR])"),
         }
     }
     if !dry_run && !confirm {
@@ -347,6 +368,34 @@ fn cmd_op_gc(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         bail!("--dry-run and --confirm are mutually exclusive");
     }
     let store = Store::open(&root)?;
+
+    if blobs {
+        let grace = std::time::Duration::from_secs(grace_hours.saturating_mul(3600));
+        let plan = store.plan_blob_gc(grace)?;
+        let removed = if confirm { store.apply_blob_gc(&plan)? } else { 0 };
+        let data = serde_json::json!({
+            "store": root.display().to_string(),
+            "dry_run": dry_run,
+            "grace_hours": grace_hours,
+            "blobs_to_delete": &plan.to_delete,
+            "blobs_within_grace": plan.skipped_within_grace.len(),
+            "blobs_live_count": plan.live.len(),
+            "removed": removed,
+        });
+        acli::emit_or_text("op", data, fmt, || {
+            let n = plan.to_delete.len();
+            if dry_run {
+                println!("plan: would delete {n} blob(s); {} live, {} within grace",
+                    plan.live.len(), plan.skipped_within_grace.len());
+            } else if removed == 0 {
+                println!("nothing to do (no unreferenced blobs past the grace period)");
+            } else {
+                println!("removed {removed} blob(s); {} live", plan.live.len());
+            }
+        });
+        return Ok(());
+    }
+
     let plan = store.plan_gc(&cli_retain)?;
     let removed = if confirm { store.apply_gc(&plan)? } else { 0 };
     let data = serde_json::json!({

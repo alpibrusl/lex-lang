@@ -66,8 +66,9 @@ pub use issue::{
 };
 pub use merge::{merge, ConflictKind, MergeOutcome, MergeOutput};
 pub use merge_session::{
-    CommitError, ConflictId, ConflictRecord, MergeSession, MergeSessionId, ResolutionChecker,
-    ResolveVerdict, Resolution, ResolutionRejection,
+    CommitError, ConflictId, ConflictRecord, FileConflict, FileEntry, FilePath,
+    FileResolution, FileResolutionRejection, FileResolveVerdict, MergeCommitOutput, MergeSession,
+    MergeSessionId, ResolutionChecker, ResolveVerdict, Resolution, ResolutionRejection,
 };
 pub use predicate::{evaluate, evaluate_with_resolver, IntentResolver, Predicate};
 pub use signing::{verify_message, verify_stage_id, Keypair, SigningError};

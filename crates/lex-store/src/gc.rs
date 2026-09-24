@@ -162,3 +162,113 @@ impl PolicyFile {
         Ok(crate::policy::load(root)?.unwrap_or_default())
     }
 }
+
+// ── Blob GC (#1007 §3 / PR 7) ────────────────────────────────────────────
+//
+// Mark-and-sweep over the blob space, independent of (but built on top
+// of) op GC:
+//
+// 1. **Mark**: every blob reachable from a retained op's `SetFiles`
+//    manifest, PLUS every blob bound under `blobrefs/**` (locks, loom
+//    artifacts — anything a namespace ref points at is live by
+//    definition, whether or not any op mentions it).
+// 2. **Sweep**: any blob NOT marked, and older than a grace period
+//    (default 24h) — never a blob younger than that. The grace period
+//    exists because push order is stages/intents → **blobs** →
+//    locks/issues → **ops** → head (#1007 §4): a blob is uploaded before
+//    the op that references it, so immediately after an upload there is
+//    a window where the blob exists but no op names it yet. A GC that
+//    ran in that window, with no grace period, would delete a blob out
+//    from under an in-flight push. 24h comfortably exceeds any
+//    realistic gap between a blob upload and the op batch that follows
+//    it.
+//
+// "Retained op" reuses exactly [`Store::plan_gc`]'s definition (branch
+// reachability + predicate retention + parent-of-retained closure) —
+// blob liveness must never be a stricter notion than op liveness, or
+// GC could delete a blob whose `SetFiles` op survives, leaving that op's
+// manifest referencing an object nobody can fetch again (#1007 always-
+// valid-HEAD would then fail retroactively for a head no one touched).
+
+/// The plan for a single blob-GC pass: which blobs are still referenced
+/// (`live`), which are slated for deletion, and which would be
+/// unreferenced but are still inside the grace period (kept for
+/// visibility — surfaced by `lex op gc --blobs --dry-run`, not acted on).
+#[derive(Debug, Clone)]
+pub struct BlobGcPlan {
+    pub live: BTreeSet<crate::files::BlobId>,
+    pub to_delete: Vec<crate::files::BlobId>,
+    pub skipped_within_grace: Vec<crate::files::BlobId>,
+}
+
+impl BlobGcPlan {
+    /// True when there's nothing to delete.
+    pub fn is_empty(&self) -> bool {
+        self.to_delete.is_empty()
+    }
+}
+
+impl Store {
+    /// Build a [`BlobGcPlan`]: mark every blob reachable from a retained
+    /// `SetFiles` op's manifest plus every `blobrefs/**` binding, then
+    /// sweep everything else older than `grace`. See the module docs
+    /// above for why the grace period exists and why "retained" mirrors
+    /// [`Self::plan_gc`] rather than recomputing branch reachability
+    /// independently.
+    pub fn plan_blob_gc(&self, grace: std::time::Duration) -> Result<BlobGcPlan, StoreError> {
+        let op_plan = self.plan_gc(&[])?;
+        let log = OpLog::open(self.root())?;
+
+        let mut live: BTreeSet<String> = BTreeSet::new();
+        for op_id in op_plan.retained.keys() {
+            let Some(rec) = log.get(op_id)? else { continue };
+            if let lex_vcs::OperationKind::SetFiles { manifest } = &rec.op.kind {
+                live.insert(manifest.clone());
+                // A manifest that fails to load (corrupt, or a blob
+                // already lost) contributes only its own id above —
+                // there's nothing else to mark, and GC must not error
+                // out of a whole pass over one bad manifest.
+                if let Ok(m) = self.get_manifest(manifest) {
+                    for e in m.entries.values() {
+                        live.insert(e.blob.clone());
+                    }
+                }
+            }
+        }
+        for sha in self.all_blob_ref_shas()? {
+            live.insert(sha);
+        }
+
+        let now = std::time::SystemTime::now();
+        let mut to_delete = Vec::new();
+        let mut skipped_within_grace = Vec::new();
+        for (id, mtime) in self.list_blob_ids_with_mtime()? {
+            if live.contains(&id) {
+                continue;
+            }
+            match now.duration_since(mtime) {
+                Ok(age) if age >= grace => to_delete.push(id),
+                // `Ok(age) if age < grace` (too young) or `Err` (mtime in
+                // the future — a clock skew we should never race ahead
+                // of) both mean "not provably safe to delete yet".
+                _ => skipped_within_grace.push(id),
+            }
+        }
+        to_delete.sort();
+        skipped_within_grace.sort();
+        Ok(BlobGcPlan { live, to_delete, skipped_within_grace })
+    }
+
+    /// Apply a [`BlobGcPlan`] — delete every blob in `plan.to_delete`.
+    /// Idempotent: a blob already gone (deleted by a concurrent GC pass,
+    /// e.g. another replica) is not an error. Returns the number of
+    /// blobs actually removed.
+    pub fn apply_blob_gc(&self, plan: &BlobGcPlan) -> Result<usize, StoreError> {
+        let mut removed = 0usize;
+        for id in &plan.to_delete {
+            self.delete_blob(id)?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+}
