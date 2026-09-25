@@ -23,7 +23,7 @@ use std::collections::BTreeSet;
 
 use anyhow::{anyhow, bail, Result};
 use lex_store::issues::{
-    check_refinable, effective_acceptance, evaluate_static, prepare_example_stages,
+    check_refinable, effective_acceptance, evaluate_static, is_verified, prepare_example_stages,
     proposal_status, record_issue_verdict, record_proposal_review, with_effective_acceptance,
     IssueEvaluation,
 };
@@ -227,6 +227,29 @@ fn verify(fmt: &OutputFormat, root: &std::path::Path, args: &[String]) -> Result
         }
     };
 
+    // A blocked dependency gates everything else: `--dep` was recorded at
+    // create time but nothing consulted it here, so an issue whose declared
+    // dependency had never itself verified could still come back `verified`
+    // — the derived board state (`issue_status`, #949 phase 3) already knows
+    // an unmet dep means `Blocked`; this is that same check, applied where a
+    // script actually branches on the verdict. Recorded as `Inconclusive`
+    // (never a pass the gate didn't check, and never a `Failed` either — the
+    // issue's own oracle was never even evaluated).
+    let mut unmet: Vec<String> = Vec::new();
+    for dep in &issue.deps {
+        if !is_verified(&store, dep)? {
+            unmet.push(dep.clone());
+        }
+    }
+    if !unmet.is_empty() {
+        let eval = IssueEvaluation::not_evaluable(format!(
+            "blocked on unverified dependenc{}: {}",
+            if unmet.len() == 1 { "y" } else { "ies" },
+            unmet.join(", ")
+        ));
+        return emit_verdict(fmt, &store, &issue, &id, &head, eval);
+    }
+
     // 1. Everything that needs no execution (the typed delta's API check).
     let mut eval = evaluate_static(&store, &issue, &head)?;
 
@@ -264,7 +287,22 @@ fn verify(fmt: &OutputFormat, root: &std::path::Path, args: &[String]) -> Result
         }
     }
 
-    let attestation = record_issue_verdict(&store, &issue, &head, &eval)?;
+    emit_verdict(fmt, &store, &issue, &id, &head, eval)
+}
+
+/// Record `eval` as the issue's verdict at `head` and print it — the tail
+/// both the blocked-on-a-dependency short-circuit and a fully-evaluated
+/// verdict share, so the two paths can't drift in what they report or how
+/// they exit.
+fn emit_verdict(
+    fmt: &OutputFormat,
+    store: &Store,
+    issue: &Issue,
+    id: &str,
+    head: &str,
+    eval: IssueEvaluation,
+) -> Result<()> {
+    let attestation = record_issue_verdict(store, issue, head, &eval)?;
     let (verdict, detail) = match &eval {
         IssueEvaluation::Passed => ("verified", String::new()),
         IssueEvaluation::NotEvaluable { reason } => ("inconclusive", reason.clone()),
