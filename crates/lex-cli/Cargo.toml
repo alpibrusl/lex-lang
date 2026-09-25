@@ -41,8 +41,10 @@ lex-api = { path = "../lex-api" }
 conformance = { path = "../conformance" }
 spec-checker = { path = "../spec-checker" }
 acli = "0.5"
+# #892 PR 4: `lex op import-git` materializes each commit's package into a
+# private scratch dir for the loader.
+tempfile = "3"
 notify = { version = "8", default-features = false, features = ["macos_kqueue"] }
 
 [dev-dependencies]
-tempfile = "3"
 tiny_http = "0.12"

@@ -2296,11 +2296,11 @@
     },
     {
       "name": "op",
-      "description": "inspect and sync the operation log (show|log|replay|push|pull|repack|gc)",
+      "description": "inspect and sync the operation log (show|log|replay|push|pull|repack|gc|import-git)",
       "arguments": [
         {
           "name": "subcommand",
-          "type": "enum[show|log|replay|push|pull|repack|gc]",
+          "type": "enum[show|log|replay|push|pull|repack|gc|import-git]",
           "description": "what to do",
           "required": true
         }
@@ -2320,6 +2320,10 @@
         {
           "description": "Garbage-collect",
           "invocation": "lex op gc --confirm"
+        },
+        {
+          "description": "Import a git repo's branch tip as one snapshot (#892)",
+          "invocation": "lex op import-git ./repo --head-only --store-branch imported"
         }
       ],
       "see_also": [
@@ -2397,6 +2401,16 @@
           "name": "store",
           "type": "string",
           "description": "store root directory"
+        },
+        {
+          "name": "incremental",
+          "type": "bool",
+          "description": "append only the ops after HEAD's `Op:` trailer to an existing export; never rewrites history"
+        },
+        {
+          "name": "no-verify",
+          "type": "bool",
+          "description": "with --incremental: skip checking that the repo's HEAD tree matches the store at that op"
         }
       ],
       "subcommands": [],
@@ -2409,6 +2423,10 @@
         {
           "description": "Export a feature branch",
           "invocation": "lex export-git ./out --branch feature"
+        },
+        {
+          "description": "Append new ops to an existing export",
+          "invocation": "lex export-git ./export --incremental"
         }
       ]
     },

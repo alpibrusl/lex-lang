@@ -413,9 +413,22 @@ fn cmd_export_git() -> CommandInfo {
         .add_argument("out_dir", "string", "directory to write the git repo into", true)
         .add_option("branch", "string", "branch to export (default: current)", None)
         .add_option("store", "string", "store root directory", None)
+        .add_option(
+            "incremental",
+            "bool",
+            "append only the ops after HEAD's `Op:` trailer to an existing export; never rewrites history",
+            None,
+        )
+        .add_option(
+            "no-verify",
+            "bool",
+            "with --incremental: skip checking that the repo's HEAD tree matches the store at that op",
+            None,
+        )
         .with_examples(vec![
             ("Export main to ./export", "lex export-git ./export"),
             ("Export a feature branch", "lex export-git ./out --branch feature"),
+            ("Append new ops to an existing export", "lex export-git ./export --incremental"),
         ])
 }
 
@@ -437,12 +450,12 @@ fn cmd_recall() -> CommandInfo {
 fn cmd_op() -> CommandInfo {
     CommandInfo::new(
         "op",
-        "inspect and sync the operation log (show|log|replay|push|pull|repack|gc)",
+        "inspect and sync the operation log (show|log|replay|push|pull|repack|gc|import-git)",
     )
     .idempotent(false)
     .add_argument(
         "subcommand",
-        "enum[show|log|replay|push|pull|repack|gc]",
+        "enum[show|log|replay|push|pull|repack|gc|import-git]",
         "what to do",
         true,
     )
@@ -450,6 +463,10 @@ fn cmd_op() -> CommandInfo {
         ("List ops", "lex op log"),
         ("Replay-verify an op", "lex op replay <op_id> --candidate regen.lex"),
         ("Garbage-collect", "lex op gc --confirm"),
+        (
+            "Import a git repo's branch tip as one snapshot (#892)",
+            "lex op import-git ./repo --head-only --store-branch imported",
+        ),
     ])
     .with_see_also(vec!["log", "store"])
 }
