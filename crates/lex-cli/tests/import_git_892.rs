@@ -416,7 +416,8 @@ fn twin_imports_and_a_clone_at_another_path_converge() {
     // different OpIds — the equality above is a real property.
     let repo2 = t.path().join("repo2");
     lex_repo(&repo2);
-    git(&repo2, &["commit", "-q", "--amend", "--allow-empty", "-m", "another message"]);
+    git(&repo2, &["reset", "-q", "--soft", "HEAD~1"]);
+    commit(&repo2, "another message");
     let d = t.path().join("store-d");
     assert!(env.import(&repo2, &d, &[]).0.status.success());
     assert_ne!(head(&d, "main").unwrap(), ha);
