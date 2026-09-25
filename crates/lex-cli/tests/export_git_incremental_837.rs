@@ -595,3 +595,87 @@ fn a_marker_from_another_intent_is_refused() {
     let res = export(&store, out.path(), &["--incremental"]);
     assert_refused(&res, "`Intent:` trailer");
 }
+
+// ── 4. manifest-only stores (#892 PR 4: a non-Lex repo has no declarations) ─
+
+/// Two origin-bearing `SetFiles` ops and NO declaration: the shape
+/// `op import-git` gives a non-Lex repo. The export skips the synthetic empty
+/// `src.lex` for these commits, and so must the state a resume verifies against.
+fn manifest_only_store(dir: &Path) -> Fx {
+    let fx = Fx::new(dir);
+    for (i, (src, who)) in [(SRC_A, "Ada"), (SRC_B, "Bo")].into_iter().enumerate() {
+        let it = intent(
+            &format!("docs commit {i}\n"),
+            "git-import:root",
+            Some(origin(src, person(who, "w@example.org", 1_700_000_000 + i as i64, "+0200"), None)),
+        );
+        let body = format!("# docs v{i}\n");
+        fx.set_files(&it, &[("README.md", body.as_bytes(), "100644"), ("run.sh", b"#!/bin/sh\n", "100755")]);
+    }
+    fx
+}
+
+#[test]
+fn manifest_only_store_resumed_at_every_k_equals_a_full_export() {
+    let work = tempdir().unwrap();
+    let fx = manifest_only_store(work.path());
+    let n = ops(&fx.root).len();
+    assert_eq!(n, 2);
+    for k in 1..=n {
+        let (inc, reference, data) = cut_and_resume(&fx.root, k);
+        assert_identical(inc.path(), reference.path(), &format!("manifest-only k={k}"));
+        assert_eq!(data["new_commits"], n - k);
+        assert_eq!(git(inc.path(), &["ls-files"]), "README.md\nrun.sh\n", "no synthetic src.lex");
+    }
+}
+
+/// The real thing: `lex op import-git` of a non-Lex repo (one `SetFiles` op),
+/// exported, then more origin ops arrive on the branch and it is resumed.
+#[test]
+fn an_imported_non_lex_repo_can_be_resumed_after_more_ops_arrive() {
+    let work = tempdir().unwrap();
+    let repo = work.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let g = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C").arg(&repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "Ada").env("GIT_AUTHOR_EMAIL", "ada@example.org")
+            .env("GIT_AUTHOR_DATE", "2024-03-05T10:20:30+0530")
+            .env("GIT_COMMITTER_NAME", "Carl").env("GIT_COMMITTER_EMAIL", "carl@example.org")
+            .env("GIT_COMMITTER_DATE", "2024-03-06T23:59:01-0700")
+            .args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    g(&["init", "-q", "-b", "main"]);
+    write(&repo, "README.md", "# just docs\n");
+    write(&repo, "scripts/run.sh", "#!/bin/sh\n");
+    g(&["add", "-A"]);
+    g(&["commit", "-q", "-m", "docs only"]);
+
+    let store = work.path().join("store");
+    let home = tempdir().unwrap();
+    let imp = Command::new(lex_bin())
+        .env("HOME", home.path())
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(["op", "import-git", repo.to_str().unwrap(), "--head-only", "--store", store.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(imp.status.success(), "import: {}", stderr(&imp));
+    assert_eq!(ops(&store).len(), 1, "a non-Lex repo is one SetFiles op");
+
+    // Two more origin-bearing manifest snapshots on top of the imported one.
+    let fx = Fx::new(work.path());
+    for (i, src) in [SRC_A, SRC_B].into_iter().enumerate() {
+        let it = intent(&format!("later docs {i}\n"), "git-import:later", Some(origin(src, person("Bo", "bo@example.org", 1_710_000_000 + i as i64, "-0700"), None)));
+        let body = format!("# later {i}\n");
+        fx.set_files(&it, &[("README.md", body.as_bytes(), "100644")]);
+    }
+    assert_eq!(ops(&store).len(), 3);
+    for k in 1..=3 {
+        let (inc, reference, _) = cut_and_resume(&store, k);
+        assert_identical(inc.path(), reference.path(), &format!("imported non-Lex k={k}"));
+    }
+}
