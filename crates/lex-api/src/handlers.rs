@@ -346,7 +346,7 @@ pub(crate) fn unsatisfiable_pair_response(err: &lex_store::StoreError)
 /// case today is `Contention` (#262 multi-writer CAS retries
 /// exhausted), which maps to 503 with a `Retry-After` header so
 /// clients back off rather than hammering the same branch tip.
-fn write_error_response(prefix: &str, err: lex_store::StoreError)
+pub(crate) fn write_error_response(prefix: &str, err: lex_store::StoreError)
     -> Response<std::io::Cursor<Vec<u8>>>
 {
     if let Some(resp) = unsatisfiable_pair_response(&err) {
@@ -498,6 +498,7 @@ fn route(
         (Method::Post, "/v1/check") => check_handler(body),
         (Method::Post, "/v1/publish") => publish_handler(state, body),
         (Method::Post, "/v1/patch") => patch_handler(state, body),
+        (Method::Post, "/v1/transform") => crate::transform_http::transform_handler(state, body),
         (Method::Get, p) if p.starts_with("/v1/stage/") => {
             let suffix = &p["/v1/stage/".len()..];
             // Match `/v1/stage/<id>/attestations` first so a literal
@@ -769,15 +770,41 @@ struct PatchReq {
     stage_id: String,
     patch: lex_ast::Patch,
     #[serde(default)] activate: bool,
+    /// #837 piece A: the branch to write to. Absent keeps the historical
+    /// behaviour (the server's global current branch); a supplied name is
+    /// honoured, and an unknown one is a 404.
+    #[serde(default)] branch: Option<String>,
+    /// #837 piece A: attribute the write. Absent records no intent, as before.
+    #[serde(default)] intent: Option<crate::transform_http::IntentSpec>,
 }
 
 /// POST /v1/patch — apply a structured edit to a stored stage's
 /// canonical AST, type-check the result, and publish a new stage.
+///
+/// Optional `branch` / `intent` (#837 piece A) name the branch explicitly and
+/// attribute the op; without them the request behaves exactly as it always did.
+/// For the typed transforms, and a request that *requires* a branch, see
+/// `POST /v1/transform`.
 fn patch_handler(state: &State, body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
     let req: PatchReq = match serde_json::from_str(body) {
         Ok(r) => r, Err(e) => return error_response(400, format!("bad request: {e}")),
     };
+    let intent = match req.intent.clone() {
+        Some(spec) => match spec.into_intent(crate::transform_http::default_http_session) {
+            Ok(i) => Some(i),
+            Err(e) => return error_response(400, format!("bad request: {e}")),
+        },
+        None => None,
+    };
     let store = state.store.lock().unwrap();
+    let explicit_branch = req.branch.is_some();
+    if let Some(b) = &req.branch {
+        match store.list_branches() {
+            Ok(bs) if bs.iter().any(|x| x == b) => {}
+            Ok(_) => return error_response(404, format!("unknown branch `{b}`")),
+            Err(e) => return error_response(500, format!("list_branches: {e}")),
+        }
+    }
 
     // 1. Load.
     let original = match store.get_ast(&req.stage_id) {
@@ -801,7 +828,7 @@ fn patch_handler(state: &State, body: &str) -> Response<std::io::Cursor<Vec<u8>>
     // Routing through the gated apply so /v1/patch participates in the
     // op DAG. We know this op is always a body change on the existing
     // sig (a patch can't add a brand-new fn).
-    let branch = store.current_branch();
+    let branch = req.branch.clone().unwrap_or_else(|| store.current_branch());
 
     // Find the sig — patched stage's sig must match the original's.
     let sig = match lex_ast::sig_id(&patched) {
@@ -872,7 +899,11 @@ fn patch_handler(state: &State, body: &str) -> Response<std::io::Cursor<Vec<u8>>
         kind,
         head_now.into_iter().collect::<Vec<_>>(),
     );
-    let op_id = match store.apply_operation_gated(&branch, op, transition) {
+    let op = match &intent {
+        Some(i) => op.with_intent(i.intent_id.clone()),
+        None => op,
+    };
+    let op_id = match store.apply_operation_gated_with_intent(&branch, op, transition, intent.as_ref()) {
         Ok(id) => id,
         Err(lex_store::StoreError::TypeError(errs)) => return error_with_detail(
             422, "type errors after patch", serde_json::to_value(&errs).unwrap_or_default()),
@@ -886,13 +917,22 @@ fn patch_handler(state: &State, body: &str) -> Response<std::io::Cursor<Vec<u8>>
 
     let status = format!("{:?}",
         store.get_status(&new_id).unwrap_or(lex_store::StageStatus::Draft)).to_lowercase();
-    json_response(200, &serde_json::json!({
+    let mut resp = serde_json::json!({
         "old_stage_id": req.stage_id,
         "new_stage_id": new_id,
         "sig_id": sig,
         "status": status,
         "op_id": op_id,
-    }))
+    });
+    // Only echoed when the caller opted in, so a request without `branch` /
+    // `intent` gets the response it always got, byte for byte.
+    if explicit_branch {
+        resp["branch"] = serde_json::json!(branch);
+    }
+    if let Some(i) = &intent {
+        resp["intent_id"] = serde_json::json!(i.intent_id);
+    }
+    json_response(200, &resp)
 }
 
 pub(crate) fn stage_handler(state: &State, id: &str) -> Response<std::io::Cursor<Vec<u8>>> {

@@ -95,6 +95,47 @@ snapshot, alongside your code. Pass `--no-files` to skip the second part.
 `--intent-prompt` matters: it's what makes `lex recall` and `lex op replay`
 useful later — every op should say *why*, not just *what*.
 
+#### Typed edits, without a text edit (`lex ws transform` / `POST /v1/transform`)
+
+An agent harness that already knows *which* edit it wants can write it through
+the op log directly, with no text edit and no `lex publish`. Four typed
+transforms are available; each lands as a typed op (`ReplaceMatchArm`,
+`RenameLocal`, `InlineLet`, or `AddFunction` + `ModifyBody` for
+`extract_function`), through the same write-time type-check gate publish uses,
+attributed to an intent:
+
+```sh
+# local store on disk
+lex ws transform --store .lex/store --branch main \
+  --intent-prompt "clearer name" --intent-session run-1 \
+  rename_local --json '{"from_stage_id":"<stage>","let_node":"n_0.2","new_name":"total"}'
+
+# the same edit against a hub
+curl -X POST "$HUB/v1/transform" -d '{
+  "branch": "main",
+  "intent": {"prompt": "clearer name", "session": "run-1"},
+  "transform": {"kind": "rename_local", "from_stage_id": "<stage>",
+                "let_node": "n_0.2", "new_name": "total"}
+}'
+```
+
+| `kind` | params (besides `from_stage_id`) |
+|---|---|
+| `replace_match_arm` | `match_node`, `arm_index`, `new_body` (a canonical-AST expression) |
+| `rename_local` | `let_node`, `new_name` |
+| `inline_let` | `let_node` |
+| `extract_function` | `expr_node`, `spec` = `{name, params:[{name,type}], return_type, type_params?, effects?}` |
+
+`branch` is required — the write never lands on "whatever the server's current
+branch is". `intent` is optional; without it the write is recorded as
+explicitly *unattributed* (#970), and an omitted `session` defaults to a
+per-process id, so pin `session` when you need a reproducible OpId. A transform
+that would leave the branch head failing the type-check is refused with `422`
+and the diagnostics; the head does not move and no op or intent is written.
+`from_stage_id` must be the stage the head currently binds to that function
+(`409` otherwise). `POST /v1/patch` accepts the same optional `branch` and
+`intent`.
+
 ### 4. Push (creates the store on first push)
 
 ```sh

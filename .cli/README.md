@@ -51,6 +51,10 @@ Idempotent: false
 
 work with the files manifest directly (#1007): the store's non-op-log files (README, lex.toml, lex.lock, tests/, ...)
 
+### ws
+
+local-first workspace commands (#837): write typed edits straight through the op log of an on-disk store, no text edit + publish
+
 ### store
 
 browse the content-addressed code store
