@@ -92,6 +92,7 @@ fn corpus() -> Vec<OperationKind> {
                     from: from.into(),
                     to: to.into(),
                     body_stage_id: stage.into(),
+                    in_file: None,
                 });
             }
         }

@@ -166,6 +166,7 @@ fn budget_delta_returns_the_right_pair_per_variant() {
         from: "a".into(),
         to: "b".into(),
         body_stage_id: "s".into(),
+        in_file: None,
     };
     assert_eq!(rename.budget_delta(), (None, None));
 

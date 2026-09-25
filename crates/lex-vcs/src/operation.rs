@@ -285,6 +285,18 @@ pub enum OperationKind {
         from: SigId,
         to: SigId,
         body_stage_id: StageId,
+        /// The package source file the declaration lives in **after** the
+        /// rename, recorded only when that differs from where it was (#1060).
+        ///
+        /// A multi-module package mangles each declaration with a prefix
+        /// derived from its file's path, so moving `src/util.lex` to
+        /// `src/lib/util.lex` renames every declaration in it. The rename
+        /// leaves the body alone, so without this the head kept the *old*
+        /// `in_file` and `export-git` rendered the moved declaration back
+        /// into the old file. `None` for an in-place rename — and for every op
+        /// written before this field — so those keep their `OpId`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        in_file: Option<String>,
     },
     /// Effect signature changed. Captures both old and new effect
     /// sets so the write-time gate (#130) can verify importers
@@ -848,10 +860,39 @@ mod tests {
             from: "parse::Str->Int".into(),
             to: "parse_int::Str->Int".into(),
             body_stage_id: "abc123".into(),
+            in_file: None,
         };
         let a = Operation::new(kind.clone(), ["op-parent".into()]);
         let b = Operation::new(kind, ["op-parent".into()]);
         assert_eq!(a.op_id(), b.op_id());
+    }
+
+    /// #1060: `in_file` is additive. A rename without it serializes and hashes
+    /// exactly as it did before the field existed, and a record written by an
+    /// older client (no key) still loads.
+    #[test]
+    fn rename_in_file_is_additive_and_defaults_to_none() {
+        let old_json = serde_json::json!({
+            "op": "rename_symbol",
+            "from": "parse::Str->Int",
+            "to": "parse_int::Str->Int",
+            "body_stage_id": "abc123",
+        });
+        let kind: OperationKind = serde_json::from_value(old_json.clone()).expect("pre-#1060 record loads");
+        assert!(matches!(&kind, OperationKind::RenameSymbol { in_file: None, .. }));
+        assert_eq!(serde_json::to_value(&kind).unwrap(), old_json, "None adds no key");
+
+        let moved = OperationKind::RenameSymbol {
+            from: "parse::Str->Int".into(),
+            to: "parse_int::Str->Int".into(),
+            body_stage_id: "abc123".into(),
+            in_file: Some("src/lib/parse.lex".into()),
+        };
+        let with = Operation::new(moved.clone(), ["op-parent".into()]).op_id();
+        let without = Operation::new(kind, ["op-parent".into()]).op_id();
+        assert_ne!(with, without, "the destination file is part of the op's identity");
+        let round: OperationKind = serde_json::from_value(serde_json::to_value(&moved).unwrap()).unwrap();
+        assert_eq!(round, moved);
     }
 
     #[test]
@@ -864,6 +905,7 @@ mod tests {
                 from: "parse::Str->Int".into(),
                 to: "parse_int::Str->Int".into(),
                 body_stage_id: "abc123".into(),
+                in_file: None,
             },
             ["op-parent".into()],
         );
