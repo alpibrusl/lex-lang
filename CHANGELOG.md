@@ -5,6 +5,20 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [0.11.72] - 2026-09-25
+
+### Fixed
+
+- **`lex issue verify` now honors `--dep` (#1045).** `--dep` was recorded at
+  create time (and folds into the issue's content-addressed id) but nothing
+  consulted it at verify time — an issue could come back `verified` even
+  though a dependency it declared had never itself passed, or didn't exist
+  at all. The derived board state already computed this correctly
+  (`issue_status`/`IssueState::Blocked`, #949 phase 3); `verify` now applies
+  the same check before evaluating the issue's own acceptance, recording
+  `Inconclusive` (never a silent `Passed`) when a dependency is unverified
+  or unknown.
+
 ## [0.11.71] - 2026-09-24
 
 ### Changed — behavior operators need to know
