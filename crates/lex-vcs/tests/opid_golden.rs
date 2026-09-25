@@ -115,6 +115,21 @@ fn add_import() -> Operation {
     )
 }
 
+/// #909: a *local* import (`./error`) recorded with its non-default alias so
+/// `export-git` can write `import "./error" as e` back. Additive: the
+/// `alias` field is the same optional one #895 added, and a default-alias
+/// import (local or not) still omits it — see `add_import` above.
+fn add_import_local_alias() -> Operation {
+    Operation::new(
+        OperationKind::AddImport {
+            in_file: "src/json_value.lex".into(),
+            module: "./error".into(),
+            alias: Some("e".into()),
+        },
+        ["op-parent".into()],
+    )
+}
+
 fn add_type() -> Operation {
     Operation::new(
         OperationKind::AddType {
@@ -234,6 +249,13 @@ const GOLDENS: &[Golden] = &[
         op: set_files,
         canonical_json: r#"{"op":"set_files","manifest":"dd78532ecbfda2ce0b0d40be6ded96c79bd065580de47f7c6a05664d0226566b","parents":["op-parent"],"intent_id":"intent-a"}"#,
         op_id: "6416c93bedb7ede11d920fdd2529391fd6437365ea6c5e9ae2648360378a0723",
+    },
+    // #909 — additive; every golden above is byte-identical to before.
+    Golden {
+        name: "add_import_local_alias",
+        op: add_import_local_alias,
+        canonical_json: r#"{"op":"add_import","in_file":"src/json_value.lex","module":"./error","alias":"e","parents":["op-parent"]}"#,
+        op_id: "4736a408ddf078bf0bf0d550d787662f4312c2e24971a7fc1e93b8b7638b3105",
     },
 ];
 

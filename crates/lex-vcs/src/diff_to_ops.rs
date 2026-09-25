@@ -91,17 +91,23 @@ pub fn diff_to_ops(inputs: DiffInputs<'_>) -> Result<Vec<OperationKind>, DiffMap
     //    state is consistent before any sig ops apply.
     for (file, modules) in inputs.new_imports {
         let old = inputs.old_imports.get(file).cloned().unwrap_or_default();
+        // Removes BEFORE adds (#909). A re-alias (`as e` → `as err`) is a
+        // remove + add of the SAME module reference, and a `RemoveImport` is
+        // keyed by reference alone (it carries no alias) — so replaying
+        // add-then-remove leaves the import gone rather than re-aliased, and
+        // `export-git` falls back to a derived alias. Remove-then-add leaves it
+        // bound to the new alias, which is what the pair means.
+        for m in old.difference(modules) {
+            out.push(OperationKind::RemoveImport {
+                in_file: file.clone(),
+                module: m.reference.clone(),
+            });
+        }
         for m in modules.difference(&old) {
             out.push(OperationKind::AddImport {
                 in_file: file.clone(),
                 module: m.reference.clone(),
                 alias: explicit_alias(m),
-            });
-        }
-        for m in old.difference(modules) {
-            out.push(OperationKind::RemoveImport {
-                in_file: file.clone(),
-                module: m.reference.clone(),
             });
         }
     }
@@ -467,6 +473,56 @@ mod tests {
                 assert_eq!(alias, &Some("e".to_string()));
             }
             other => panic!("expected AddImport, got {other:?}"),
+        }
+    }
+
+    /// #909: re-aliasing an import is a remove + add of the SAME reference. A
+    /// `RemoveImport` carries no alias, so the remove must come FIRST or a
+    /// replay (add, then remove-by-reference) leaves the import gone.
+    #[test]
+    fn realiasing_an_import_removes_before_it_adds() {
+        for reference in ["./error", "std.sql"] {
+            let mut old_imports = ImportMap::new();
+            old_imports.insert("main.lex".into(),
+                std::iter::once(ImportRef { reference: reference.into(), alias: "e".into() }).collect());
+            let mut new_imports = ImportMap::new();
+            new_imports.insert("main.lex".into(),
+                std::iter::once(ImportRef { reference: reference.into(), alias: "err".into() }).collect());
+            let head = BTreeMap::new();
+            let eff = BTreeMap::new();
+            let stages: Vec<Stage> = Vec::new();
+            let diff = dr();
+            let ops = diff_to_ops(DiffInputs {
+                old_head: &head, old_effects: &eff,
+                old_imports: &old_imports, new_stages: &stages, new_imports: &new_imports, diff: &diff,
+                module_prefixes: &BTreeMap::new(),
+            }).expect("ok");
+            assert_eq!(ops.len(), 2, "{ops:?}");
+            assert!(matches!(&ops[0], OperationKind::RemoveImport { module, .. } if module == reference), "{ops:?}");
+            assert!(matches!(&ops[1], OperationKind::AddImport { alias: Some(a), .. } if a == "err"), "{ops:?}");
+        }
+    }
+
+    #[test]
+    fn a_default_alias_local_import_omits_the_alias() {
+        let mut new_imports = ImportMap::new();
+        new_imports.insert("src/main.lex".into(), [
+            ImportRef { reference: "./error".into(), alias: "error".into() },
+            ImportRef { reference: "./util/strings".into(), alias: "strings".into() },
+        ].into_iter().collect());
+        let head = BTreeMap::new();
+        let eff = BTreeMap::new();
+        let oi = ImportMap::new();
+        let stages: Vec<Stage> = Vec::new();
+        let diff = dr();
+        let ops = diff_to_ops(DiffInputs {
+            old_head: &head, old_effects: &eff,
+            old_imports: &oi, new_stages: &stages, new_imports: &new_imports, diff: &diff,
+            module_prefixes: &BTreeMap::new(),
+        }).expect("ok");
+        assert_eq!(ops.len(), 2);
+        for op in &ops {
+            assert!(matches!(op, OperationKind::AddImport { alias: None, .. }), "{op:?}");
         }
     }
 

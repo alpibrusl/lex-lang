@@ -186,15 +186,23 @@ pub fn package_file_prefix(namespace: &str, rel: &str) -> String {
 pub struct LoadedPackage {
     /// Every file's declarations, each exactly once, all prefix-mangled.
     pub program: Program,
-    /// The non-inlined imports each file makes *itself* — stdlib always, plus
-    /// registry/git package imports when the package was loaded without
-    /// inlining (#930) — keyed by the file's path relative to the package root
-    /// (`src/schema.lex`), each mapping the import *reference* to its `as`
-    /// alias. Unlike `program`, this is per-file: the flattening entry points
-    /// cannot report it, because by the time they return, a file's imports and
-    /// those of everything it imports are one undifferentiated list. The alias
-    /// is preserved so a non-default `import "lex-nt/lib" as nt` round-trips as
-    /// `nt` rather than the default last-segment `lib` (#909).
+    /// The imports each file makes *itself* — stdlib always, registry/git
+    /// package imports when the package was loaded without inlining (#930), and
+    /// **local** (`./`, `../`) imports of sibling files (#909) — keyed by the
+    /// file's path relative to the package root (`src/schema.lex`), each
+    /// mapping the import *reference* to its `as` alias. Unlike `program`, this
+    /// is per-file: the flattening entry points cannot report it, because by
+    /// the time they return, a file's imports and those of everything it
+    /// imports are one undifferentiated list. The alias is preserved so a
+    /// non-default `import "lex-nt/lib" as nt` round-trips as `nt` rather than
+    /// the default last-segment `lib`.
+    ///
+    /// A local import is recorded here even though the mangler has flattened it
+    /// out of `program` (`e.format` is `error_<hash>.format` there): the alias
+    /// is otherwise unrecoverable, and `export-git` needs it to write
+    /// `import "./error" as e` back verbatim. A consumer that wants only the
+    /// imports the *program* carries (the type-check gates) must skip the
+    /// local ones — see `lex_vcs::is_local_import`.
     pub imports_by_file: BTreeMap<String, BTreeMap<String, String>>,
     /// Mangling prefix → the file it belongs to (`schema_a1b2` →
     /// `src/schema.lex`), for every file in the package. A declaration's
@@ -516,6 +524,9 @@ impl LoaderState {
         let mut alias_renames: HashMap<String, String> = HashMap::new();
         let mut merged_children: Vec<Item> = Vec::new();
         let mut std_imports: Vec<Item> = Vec::new();
+        // (reference, alias) of this file's own local imports, as written. The
+        // mangler flattens these away, so they are recorded separately (#909).
+        let mut local_imports: Vec<(String, String)> = Vec::new();
         let mut my_items: Vec<Item> = Vec::new();
 
         for item in prog.items {
@@ -524,6 +535,7 @@ impl LoaderState {
                     let resolved = resolve_import(canonical, &imp.reference)?;
                     let child_prefix = self.prefix_for(&resolved);
                     path_imports.insert(imp.alias.clone(), child_prefix);
+                    local_imports.push((imp.reference.clone(), imp.alias.clone()));
                     let child_prog = self.load(&resolved)?;
                     merged_children.extend(child_prog.items);
                 }
@@ -609,7 +621,7 @@ impl LoaderState {
             }
         }
 
-        // Attribute this file's own stdlib imports to this file, before
+        // Attribute this file's own imports to this file, before
         // the merge below makes them indistinguishable from its
         // children's. Every file gets an entry, imports or not, so a
         // file that has dropped its last import is still represented.
@@ -619,6 +631,13 @@ impl LoaderState {
                 if let Item::Import(imp) = item {
                     entry.insert(imp.reference.clone(), imp.alias.clone());
                 }
+            }
+            // #909: the local imports too, with their real alias. They never
+            // appear in `std_imports` (the mangler flattens them into
+            // qualified references), so without this the op-log has no record
+            // that `json_value.lex` said `import "./error" as e`.
+            for (reference, alias) in &local_imports {
+                entry.insert(reference.clone(), alias.clone());
             }
         }
 

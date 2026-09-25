@@ -777,8 +777,11 @@ fn imports_are_attributed_to_the_file_that_declares_them() {
     assert_eq!(status, 200, "publish must succeed, got: {body}");
     let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON response");
     let ops = parsed["ops"].as_array().expect("ops array");
+    // Non-local imports only: a *local* import (`./helper`) is recorded too
+    // since #909, but it is main.lex's own, which is the point of attribution.
+    let module_of = |op: &serde_json::Value| op["kind"]["module"].as_str().unwrap_or("?").to_string();
     let import_files: Vec<&str> = ops.iter()
-        .filter(|op| op["kind"]["op"] == "add_import")
+        .filter(|op| op["kind"]["op"] == "add_import" && !module_of(op).starts_with("./"))
         .map(|op| op["kind"]["in_file"].as_str().unwrap_or("?"))
         .collect();
     assert_eq!(
@@ -786,6 +789,13 @@ fn imports_are_attributed_to_the_file_that_declares_them() {
         "`std.str` is imported by helper.lex alone; main.lex merely imports helper. \
          Got: {ops:#?}",
     );
+    // #909: main.lex's own local import is recorded against main.lex — not
+    // against helper.lex, and not as a std import.
+    let local: Vec<(String, String)> = ops.iter()
+        .filter(|op| op["kind"]["op"] == "add_import" && module_of(op).starts_with("./"))
+        .map(|op| (op["kind"]["in_file"].as_str().unwrap().to_string(), module_of(op)))
+        .collect();
+    assert_eq!(local, vec![("src/main.lex".to_string(), "./helper".to_string())]);
 }
 
 /// A type error anywhere in the package publishes nothing at all. Before
@@ -939,6 +949,39 @@ fn released_multimodule_archive_renders_the_full_src_tree() {
     // Neither file leaks a mangle prefix into a declaration.
     assert!(!lib_out.contains("fn lib_") && !util_out.contains("fn util_"),
         "declarations must be de-mangled");
+}
+
+/// #909: the registry archive renders through the same de-flattener as
+/// `export-git`, so a non-default local alias survives an HTTP publish +
+/// release + install too — and the same publish leaves the head valid for the
+/// hub's own gates (a local import must never read as an unpinned package).
+#[test]
+fn released_multimodule_archive_preserves_the_local_import_alias() {
+    let (srv, _tmp) = start_server();
+
+    let util = "fn twice(x :: Int) -> Int { x + x }\n";
+    let lib = "import \"./util\" as u\n\nfn quad(x :: Int) -> Int {\n  u.twice(u.twice(x))\n}\n";
+    let archive = pkg_archive("alias", "0.1.0", &[("util.lex", util), ("lib.lex", lib)]);
+    let (status, body) = post_bytes(&srv.addr, "/v1/pkg/publish", &archive);
+    assert_eq!(status, 200, "publish: {body}");
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let alias_ops: Vec<(String, Option<String>)> = parsed["ops"].as_array().unwrap().iter()
+        .filter(|op| op["kind"]["op"] == "add_import" && op["kind"]["module"] == "./util")
+        .map(|op| (
+            op["kind"]["in_file"].as_str().unwrap().to_string(),
+            op["kind"]["alias"].as_str().map(str::to_string),
+        ))
+        .collect();
+    assert_eq!(alias_ops, vec![("src/lib.lex".to_string(), Some("u".to_string()))]);
+
+    assert_eq!(
+        post_bytes(&srv.addr, "/v1/pkg/alias/release", br#"{"version":"1.0.0"}"#).0,
+        201, "release"
+    );
+    let (status, body) = get_raw(&srv.addr, "/v1/pkg/alias/1.0.0/archive");
+    assert_eq!(status, 200);
+    let lib_out = extract(&body, "src/lib.lex").expect("archive has src/lib.lex");
+    assert_eq!(lib_out, lib, "the alias must come back verbatim");
 }
 
 #[test]

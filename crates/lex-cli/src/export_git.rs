@@ -22,7 +22,7 @@
 use super::*;
 use lex_store::files::MODE_EXEC;
 use lex_store::{FileEntry, Manifest};
-use lex_vcs::{default_import_alias, IntentLog, OpLog, OperationKind, StageTransition};
+use lex_vcs::{IntentLog, OpLog, OperationKind, StageTransition};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
@@ -73,8 +73,7 @@ pub fn cmd_export_git(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     // directly. `flat_imports` is `reference` → `alias` for the
     // single-file render (#895); `file_imports` is the same per source
     // file, for the multi-file render (#894 slice 2b).
-    let mut flat_imports: BTreeMap<String, String> = BTreeMap::new();
-    let mut file_imports: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    let mut head_imports = lex_store::render::PackageHead::default();
     // SigId → the source file its declaration came from (from each
     // AddFunction/AddType's `in_file`). When every head stage has one, the
     // package was published multi-module and we de-flatten it back into a
@@ -104,16 +103,12 @@ pub fn cmd_export_git(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             }
             OperationKind::AddImport { in_file, module, alias } => {
                 // The op omits the alias when it's the module's default;
-                // reconstruct it the same way the store does.
-                let alias = alias.clone().unwrap_or_else(|| default_import_alias(module));
-                flat_imports.insert(module.clone(), alias.clone());
-                file_imports.entry(in_file.clone()).or_default().insert(module.clone(), alias);
+                // `PackageHead` reconstructs it the same way the store does,
+                // and keeps a local import (#909) out of the flat map.
+                head_imports.add_import(in_file, module, alias.as_deref());
             }
             OperationKind::RemoveImport { in_file, module } => {
-                flat_imports.remove(module);
-                if let Some(m) = file_imports.get_mut(in_file) {
-                    m.remove(module);
-                }
+                head_imports.remove_import(in_file, module);
             }
             OperationKind::RenameSymbol { from, to, .. } => {
                 if let Some(f) = sig_files.remove(from) {
@@ -139,8 +134,8 @@ pub fn cmd_export_git(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         let head = lex_store::render::PackageHead {
             map: map.clone(),
             sig_files: sig_files.clone(),
-            flat_imports: flat_imports.clone(),
-            file_imports: file_imports.clone(),
+            flat_imports: head_imports.flat_imports.clone(),
+            file_imports: head_imports.file_imports.clone(),
         };
         // #988: the single-module arm now carries its own path, so the mirror
         // keeps a package's real module name instead of renaming it to `lib`.

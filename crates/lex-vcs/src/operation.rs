@@ -40,6 +40,22 @@ pub type ModuleRef = String;
 /// hex SHA-256 of its exact bytes. A `SetFiles` op names its manifest by one.
 pub type BlobId = String;
 
+/// Whether an `AddImport`/`RemoveImport` `module` is a **local** import — a
+/// path to a sibling file in the same package (`./error`, `../shared/util`,
+/// `/abs/x`) — rather than a stdlib module (`std.io`) or a package
+/// (`lex-nt/lib`) (#909).
+///
+/// A local import is recorded in the op-log only as metadata for `export-git`
+/// (the alias the source spelled it under). The mangler has already flattened it
+/// out of the program, so it is not an import *edge* in any sense a type-check
+/// gate, dependency resolver, or head reconstruction cares about: every reader
+/// that turns a head's imports into `Stage::Import`s must skip these, or a
+/// `./error` would be handed to a resolver/loader as though it named a
+/// registry package. Mirrors the loader's own path-import test.
+pub fn is_local_import(module: &str) -> bool {
+    module.starts_with("./") || module.starts_with("../") || module.starts_with('/')
+}
+
 /// The alias a module binds to when the import writes no explicit
 /// `as` — the module reference's last path segment, splitting on
 /// either `.` (stdlib, `std.sql` → `sql`) or `/` (local/package,
@@ -748,6 +764,16 @@ impl OperationRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_imports_are_told_from_stdlib_and_packages() {
+        for local in ["./error", "../shared/util", "/abs/mod", "./util/strings"] {
+            assert!(is_local_import(local), "{local}");
+        }
+        for other in ["std.io", "lex-nt/lib", "lex-nt", "lonely"] {
+            assert!(!is_local_import(other), "{other}");
+        }
+    }
 
     fn add_factorial() -> OperationKind {
         OperationKind::AddFunction {

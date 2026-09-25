@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use lex_vcs::{default_import_alias, OpLog, OperationKind};
+use lex_vcs::{default_import_alias, is_local_import, OpLog, OperationKind};
 
 use crate::store::{SkippedStage, Store, StoreError};
 
@@ -31,6 +31,38 @@ pub struct PackageHead {
     pub flat_imports: BTreeMap<String, String>,
     /// file → (module → alias) (multi-module render).
     pub file_imports: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+impl PackageHead {
+    /// Fold one `AddImport` into the head. The op omits the alias when it is the
+    /// module's default; it is reconstructed the same way the store does.
+    ///
+    /// A **local** import (`./error`, #909) is recorded per file only. It is
+    /// deliberately kept out of `flat_imports`: that map is what every gate,
+    /// dependency resolver and head reconstruction turns into `Stage::Import`s,
+    /// and a path import there would be handed to them as though it named a
+    /// registry package (the mangler already flattened the import away, so it
+    /// is metadata for the renderer, not an edge in the program).
+    pub fn add_import(&mut self, in_file: &str, module: &str, alias: Option<&str>) {
+        let alias = alias.map(str::to_string).unwrap_or_else(|| default_import_alias(module));
+        if !is_local_import(module) {
+            self.flat_imports.insert(module.to_string(), alias.clone());
+        }
+        self.file_imports
+            .entry(in_file.to_string())
+            .or_default()
+            .insert(module.to_string(), alias);
+    }
+
+    /// Fold one `RemoveImport` into the head — the inverse of [`Self::add_import`].
+    pub fn remove_import(&mut self, in_file: &str, module: &str) {
+        if !is_local_import(module) {
+            self.flat_imports.remove(module);
+        }
+        if let Some(m) = self.file_imports.get_mut(in_file) {
+            m.remove(module);
+        }
+    }
 }
 
 /// Rendered package source: one module, or a `relpath → source` tree.
@@ -88,15 +120,10 @@ pub fn package_head_at_op(store: &Store, head_op: &str) -> Result<PackageHead, S
                 head.sig_files.insert(sig_id.clone(), f.clone());
             }
             OperationKind::AddImport { in_file, module, alias } => {
-                let alias = alias.clone().unwrap_or_else(|| default_import_alias(module));
-                head.flat_imports.insert(module.clone(), alias.clone());
-                head.file_imports.entry(in_file.clone()).or_default().insert(module.clone(), alias);
+                head.add_import(in_file, module, alias.as_deref());
             }
             OperationKind::RemoveImport { in_file, module } => {
-                head.flat_imports.remove(module);
-                if let Some(m) = head.file_imports.get_mut(in_file) {
-                    m.remove(module);
-                }
+                head.remove_import(in_file, module);
             }
             // #992: a sig-moving modification carries its file across exactly
             // as a rename does — otherwise the moved declaration loses its
@@ -251,6 +278,7 @@ pub(crate) fn demangled_module_stages(
         prefix_to_file: &BTreeMap::new(),
         bound_locals: &bound_locals,
         local_imports: BTreeMap::new(),
+        recorded_local: BTreeMap::new(),
         flatten_unknown_prefixes: false,
     };
 
@@ -333,6 +361,7 @@ pub(crate) fn demangled_head_stages_impl(
         prefix_to_file: &BTreeMap::new(),
         bound_locals: &bound_locals,
         local_imports: BTreeMap::new(),
+        recorded_local: BTreeMap::new(),
         flatten_unknown_prefixes: true,
     };
     for s in &mut decls {
@@ -406,6 +435,7 @@ fn render_singlefile(store: &Store, head: &PackageHead) -> Result<String, StoreE
         prefix_to_file: &BTreeMap::new(),
         bound_locals: &bound_locals,
         local_imports: BTreeMap::new(),
+        recorded_local: BTreeMap::new(),
         flatten_unknown_prefixes: true,
     };
     for s in &mut decls {
@@ -459,12 +489,33 @@ fn render_multifile(store: &Store, head: &PackageHead) -> Result<BTreeMap<String
         for s in stages {
             collect_bound_locals(s, &mut bound_locals);
         }
+        // #909: the local imports this file recorded, keyed by the file each
+        // one resolves to — so a reference into that file is spelled with the
+        // alias the source used, not one derived from the target's name. Empty
+        // for an old log that never recorded them (the derivation is the
+        // fallback in `FileRewrite::rename`).
+        let mut recorded_local: BTreeMap<String, (String, String)> = BTreeMap::new();
+        if let Some(imports) = head.file_imports.get(file) {
+            for (reference, alias) in imports {
+                if !is_local_import(reference) {
+                    continue;
+                }
+                if let Some(target) = resolve_local_import(file, reference) {
+                    // Iterating a BTreeMap by reference makes the winner
+                    // deterministic if one file imports the same target twice
+                    // under different aliases: the mangler collapses both to one
+                    // prefix, so the source cannot be told apart anyway.
+                    recorded_local.entry(target).or_insert((reference.clone(), alias.clone()));
+                }
+            }
+        }
         let mut rw = FileRewrite {
             own_prefix: &own_prefix,
             own_file: file,
             prefix_to_file: &prefix_to_file,
             bound_locals: &bound_locals,
             local_imports: BTreeMap::new(),
+            recorded_local,
             flatten_unknown_prefixes: true,
         };
         let rewritten: Vec<lex_ast::Stage> = stages
@@ -515,6 +566,40 @@ pub(crate) fn stage_prefix(s: &lex_ast::Stage) -> Option<String> {
         lex_ast::Stage::Import(_) => return None,
     };
     name.split_once('.').map(|(p, _)| p.to_string())
+}
+
+/// The package file a local import `reference` (`./error`, `../shared/util`)
+/// written in `from` (`src/json_value.lex`) names — `src/error.lex`. Mirrors
+/// the loader's `resolve_import` on the archive's relative paths: joined onto
+/// the importing file's directory, `.`/`..` collapsed, `.lex` appended when the
+/// reference has no extension. `None` for an absolute path or one that climbs
+/// out of the package root, neither of which can name a package file.
+pub(crate) fn resolve_local_import(from: &str, reference: &str) -> Option<String> {
+    if reference.starts_with('/') {
+        return None;
+    }
+    let mut parts: Vec<&str> = from
+        .rsplit_once('/')
+        .map(|(d, _)| d)
+        .unwrap_or("")
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    for seg in reference.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            s => parts.push(s),
+        }
+    }
+    let last = parts.last()?;
+    let mut out = parts.join("/");
+    if std::path::Path::new(last).extension().is_none() {
+        out.push_str(".lex");
+    }
+    Some(out)
 }
 
 /// `("src/schema.lex", "src/error.lex")` → `("./error", "error")`.
@@ -651,6 +736,11 @@ struct FileRewrite<'a> {
     prefix_to_file: &'a BTreeMap<String, String>,
     bound_locals: &'a BTreeSet<String>,
     local_imports: BTreeMap<String, String>,
+    /// The local imports recorded in the op-log for `own_file` (#909), keyed by
+    /// the resolved target file → `(reference, alias)`. Consulted before the
+    /// derived stem/prefix alias, which only old logs (no recorded local
+    /// imports) fall back to.
+    recorded_local: BTreeMap<String, (String, String)>,
     /// Whether a mangle prefix that maps to no file should be flattened to a
     /// bare name. True for every *source-rendering* path, where such a prefix
     /// is an inlined dependency the loader folded into this package's
@@ -675,6 +765,12 @@ impl FileRewrite<'_> {
         if let Some((q, rest)) = name.split_once('.') {
             if q != self.own_prefix {
                 if let Some(other_file) = self.prefix_to_file.get(q) {
+                    // #909: the alias this file's source actually wrote. The
+                    // import itself is already in the file's import list, so
+                    // nothing to record.
+                    if let Some((_, alias)) = self.recorded_local.get(other_file) {
+                        return format!("{alias}.{rest}");
+                    }
                     let (import_ref, stem) = relative_import(self.own_file, other_file);
                     let alias = if self.bound_locals.contains(&stem) {
                         q.to_string()

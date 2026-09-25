@@ -859,9 +859,13 @@ fn load_package_attributes_imports_to_the_declaring_file() {
     let helper = pkg.imports_by_file.get("src/helper.lex").expect("helper keyed");
     let main = pkg.imports_by_file.get("src/main.lex").expect("main keyed");
     assert!(helper.contains_key("std.str"), "helper declares std.str, got: {helper:?}");
-    assert!(
-        main.is_empty(),
-        "main imports only ./helper, which is not a module import: {main:?}",
+    // #909: a local import IS recorded (with its real alias), so `export-git`
+    // can write `import "./helper" as h` back. It is the only entry: main
+    // imports no stdlib module.
+    assert_eq!(
+        main.iter().collect::<Vec<_>>(),
+        vec![(&"./helper".to_string(), &"h".to_string())],
+        "main imports only ./helper as h: {main:?}",
     );
 }
 
