@@ -64,7 +64,7 @@ fn parse_store(args: &[String]) -> (PathBuf, Vec<String>) {
 
 pub fn cmd_op(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let sub = args.first().ok_or_else(|| anyhow!(
-        "usage: lex op {{show|log|replay|push|pull|repack|gc}} [--store DIR] ..."))?;
+        "usage: lex op {{show|log|replay|push|pull|repack|gc|import-git}} [--store DIR] ..."))?;
     let rest = &args[1..];
     match sub.as_str() {
         "show"   => cmd_op_show(fmt, rest),
@@ -74,6 +74,7 @@ pub fn cmd_op(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "pull"   => cmd_op_pull(fmt, rest),
         "repack" => cmd_op_repack(fmt, rest),
         "gc"     => cmd_op_gc(fmt, rest),
+        "import-git" => crate::import_git::cmd_import_git(fmt, rest),
         other    => bail!("unknown `lex op` subcommand: {other}"),
     }
 }
