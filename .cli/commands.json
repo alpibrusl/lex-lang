@@ -2324,6 +2324,16 @@
           "name": "store",
           "type": "string",
           "description": "store root directory"
+        },
+        {
+          "name": "incremental",
+          "type": "bool",
+          "description": "append only the ops after HEAD's `Op:` trailer to an existing export; never rewrites history"
+        },
+        {
+          "name": "no-verify",
+          "type": "bool",
+          "description": "with --incremental: skip checking that the repo's HEAD tree matches the store at that op"
         }
       ],
       "subcommands": [],
@@ -2336,6 +2346,10 @@
         {
           "description": "Export a feature branch",
           "invocation": "lex export-git ./out --branch feature"
+        },
+        {
+          "description": "Append new ops to an existing export",
+          "invocation": "lex export-git ./export --incremental"
         }
       ]
     },

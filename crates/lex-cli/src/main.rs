@@ -383,7 +383,7 @@ fn print_usage() {
     println!("  log [branch]                       show the operation log for a branch (alias of `branch log`)");
     println!("  recall {{--intent ID|--session ID|--predicate JSON|--all}} [--limit N] [--store DIR]");
     println!("                                     predicate query over the op log (#836)");
-    println!("  export-git <out_dir> [--branch NAME] [--store DIR]");
+    println!("  export-git <out_dir> [--branch NAME] [--store DIR] [--incremental [--no-verify]]");
     println!("                                     render a branch's op history as a git repo (#837)");
     println!(
         "  agent-guidelines [--version-only]  emit the AI-agent authoring contract (idiom rules)"

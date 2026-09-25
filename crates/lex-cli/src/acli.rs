@@ -412,9 +412,22 @@ fn cmd_export_git() -> CommandInfo {
         .add_argument("out_dir", "string", "directory to write the git repo into", true)
         .add_option("branch", "string", "branch to export (default: current)", None)
         .add_option("store", "string", "store root directory", None)
+        .add_option(
+            "incremental",
+            "bool",
+            "append only the ops after HEAD's `Op:` trailer to an existing export; never rewrites history",
+            None,
+        )
+        .add_option(
+            "no-verify",
+            "bool",
+            "with --incremental: skip checking that the repo's HEAD tree matches the store at that op",
+            None,
+        )
         .with_examples(vec![
             ("Export main to ./export", "lex export-git ./export"),
             ("Export a feature branch", "lex export-git ./out --branch feature"),
+            ("Append new ops to an existing export", "lex export-git ./export --incremental"),
         ])
 }
 
