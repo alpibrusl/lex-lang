@@ -13,8 +13,17 @@
 //! `src/*.lex` tree for a multi-module package, #894) is done by the shared
 //! `lex_store::render`, so the git view is byte-identical to the source a
 //! consumer installs from the hosted registry. A git-import path (text diff →
-//! typed ops via `diff_to_ops`) and per-op author/date from the intent's
-//! model are follow-ups on #837.
+//! typed ops via `diff_to_ops`) is a follow-up on #837.
+//!
+//! **Origin-aware (#892 PR 3).** An op whose intent carries an
+//! [`Origin`] (it was imported from a git commit) is exported as that commit
+//! again, not as a synthetic one: the commit message is the intent's prompt
+//! verbatim, the author and committer identities and dates come from the
+//! origin, a `Git-Source:` trailer names the source commit, and the run of
+//! consecutive ops that share the intent (one imported commit yields many
+//! ops) collapses into ONE git commit. Everything above is gated on
+//! `origin.is_some()`: a store with no origin-bearing intent exports
+//! byte-identically to before.
 //!
 //! Usage:
 //!   lex export-git <out_dir> [--branch NAME] [--store DIR]
@@ -22,7 +31,7 @@
 use super::*;
 use lex_store::files::MODE_EXEC;
 use lex_store::{FileEntry, Manifest};
-use lex_vcs::{IntentLog, OpLog, OperationKind, StageTransition};
+use lex_vcs::{Intent, IntentLog, OpLog, OperationKind, Origin, Person, StageTransition};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
@@ -87,13 +96,41 @@ pub fn cmd_export_git(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let mut manifest = Manifest::new();
     let mut commits = 0usize;
 
+    // Each record's intent origin (#892 PR 3), resolved once up front. `None`
+    // for an op with no intent, an intent missing from the log, or a native
+    // intent — all of which take the pre-#892 one-commit-per-op path.
+    // Holds the intent id when (and only when) that intent has an origin, and
+    // the origin-bearing intents themselves, once each.
+    let mut origin_intents: BTreeMap<String, Intent> = BTreeMap::new();
+    let mut origin_ids: Vec<Option<String>> = Vec::with_capacity(records.len());
     for rec in &records {
-        // Snapshot before this op's transition so we can diff old->new and
-        // only touch disk for a path that actually changed (§7 fidelity
-        // plan). `files_manifest_id` becomes `Some` only on the `SetFiles`
-        // op itself, for the commit's `Files:` trailer.
-        let prev_manifest = manifest.clone();
-        let mut files_manifest_id: Option<String> = None;
+        let mut id = None;
+        if let Some(intent_id) = &rec.op.intent_id {
+            if origin_intents.contains_key(intent_id) {
+                id = Some(intent_id.clone());
+            } else if let Some(i) = intents.get(intent_id)? {
+                if i.origin.is_some() {
+                    origin_intents.insert(intent_id.clone(), i);
+                    id = Some(intent_id.clone());
+                }
+            }
+        }
+        origin_ids.push(id);
+    }
+
+    // The manifest as of the last landed commit: the base every commit's
+    // on-disk delta (only touch disk for a path that actually changed, §7
+    // fidelity plan) is taken against. For a one-op commit this is the
+    // manifest before that op, exactly as before; for a grouped commit it is
+    // the manifest before the group's first op.
+    let mut committed_manifest = Manifest::new();
+    // Ops folded into the commit being assembled, and the last `SetFiles`
+    // manifest among them (`Some` only when one is, for the `Files:` trailer).
+    let mut group_ops = 0usize;
+    let mut files_manifest_id: Option<String> = None;
+
+    for (idx, rec) in records.iter().enumerate() {
+        group_ops += 1;
 
         apply_transition(&mut map, &rec.produces);
         match &rec.op.kind {
@@ -120,6 +157,13 @@ pub fn cmd_export_git(fmt: &OutputFormat, args: &[String]) -> Result<()> {
                 files_manifest_id = Some(manifest_id.clone());
             }
             _ => {}
+        }
+
+        // Ops that share an origin-bearing intent are ONE git commit: keep
+        // replaying (the state above is cumulative) and land it after the
+        // group's last op. Only CONSECUTIVE ops group; a native op never does.
+        if continues_group(&origin_ids, idx) {
+            continue;
         }
 
         // Start each commit from a clean tree so a stage moving files, or a
@@ -171,10 +215,17 @@ pub fn cmd_export_git(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         // survived the wipe untouched — only touch disk for a path that
         // actually changed between this commit and the last (removal,
         // write, or chmod), per the §7 fidelity plan.
-        apply_manifest_diff(&store, &out_dir, &prev_manifest, &manifest)?;
+        apply_manifest_diff(&store, &out_dir, &committed_manifest, &manifest)?;
+        committed_manifest = manifest.clone();
 
         // Commit message: the intent prompt, else a kind summary.
-        let msg = commit_message(&intents, rec, files_manifest_id.as_deref())?;
+        let origin_intent = origin_ids[idx].as_ref().map(|id| &origin_intents[id]);
+        let msg = match origin_intent {
+            Some(i) => origin_message(rec, i, group_ops, files_manifest_id.as_deref()),
+            None => commit_message(&intents, rec, files_manifest_id.as_deref())?,
+        };
+        group_ops = 0;
+        files_manifest_id = None;
         // `-f`: a manifest-captured file can be a *force-added* one in the
         // source repo (tracked despite matching a `.gitignore` pattern —
         // the manifest doesn't know or care why a path was captured, only
@@ -186,7 +237,10 @@ pub fn cmd_export_git(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         run_git(&out_dir, &["add", "-A", "-f"])?;
         // --allow-empty: an ImportOnly op (or a no-op transition)
         // doesn't change the tree, but the commit still records the op.
-        run_git(&out_dir, &["commit", "-q", "--allow-empty", "-m", &msg])?;
+        match origin_intent.and_then(|i| i.origin.as_ref()) {
+            Some(o) => commit_as_origin(&out_dir, &msg, o)?,
+            None => run_git(&out_dir, &["commit", "-q", "--allow-empty", "-m", &msg])?,
+        }
         commits += 1;
     }
 
@@ -233,6 +287,135 @@ fn commit_message(
         .map(|m| format!("\nFiles: {m}"))
         .unwrap_or_default();
     Ok(format!("{subject}\n\nOp: {}{intent_line}{files_line}", rec.op_id))
+}
+
+/// True when record `idx` is followed by another op of the same
+/// origin-bearing intent, i.e. its git commit is not landed yet. Only the
+/// IMMEDIATELY next record counts: an intent that reappears after a
+/// different one starts a new commit.
+fn continues_group(origin_ids: &[Option<String>], idx: usize) -> bool {
+    origin_ids[idx].is_some() && origin_ids.get(idx + 1) == Some(&origin_ids[idx])
+}
+
+/// The commit message of an origin-bearing commit (#892): the intent's prompt
+/// VERBATIM, then a blank line, then the trailer block — `Op:` (the LAST op
+/// of the group), `Intent:`, `Files:` (when the group holds a `SetFiles`),
+/// `Git-Source:` (the source commit) and `Ops:` (how many ops it folds).
+///
+/// Only trailing newlines of the prompt are dropped, so the separator is
+/// exactly one blank line. That blank line is what keeps the verbatim body
+/// and the trailers apart for `git interpret-trailers`: git parses trailers
+/// from the LAST paragraph only, so a message that itself ends in
+/// `Signed-off-by:` / `Op: fake` lines stays a separate, earlier paragraph
+/// and cannot be mistaken for — or merge into — ours. (Written with
+/// `--cleanup=verbatim`, see [`commit_as_origin`], so git does not
+/// re-normalize the body.)
+fn origin_message(
+    rec: &lex_vcs::OperationRecord,
+    intent: &Intent,
+    ops: usize,
+    files_manifest: Option<&str>,
+) -> String {
+    let body = intent.prompt.trim_end_matches(['\n', '\r']);
+    // A blank prompt cannot head a trailer block; keep today's placeholder.
+    let body = if body.trim().is_empty() { "(empty prompt)" } else { body };
+    let commit = intent.origin.as_ref().map(|o| o.commit.as_str()).unwrap_or_default();
+    let mut msg = format!("{body}\n\nOp: {}\nIntent: {}", rec.op_id, intent.intent_id);
+    if let Some(m) = files_manifest {
+        msg.push_str(&format!("\nFiles: {m}"));
+    }
+    msg.push_str(&format!("\nGit-Source: {commit}\nOps: {ops}\n"));
+    msg
+}
+
+/// Land the staged tree as one commit carrying the origin's identities and
+/// dates (#892). The identity and dates are set through the environment, which
+/// outranks every git config, so the local `user.*` never leaks in; the
+/// committer falls back to the author when the source recorded no distinct
+/// one. Signing (`commit.gpgsign`), hooks and the message cleanup mode are
+/// pinned off so the user's own git config can neither prompt, fail nor
+/// rewrite the verbatim message.
+fn commit_as_origin(dir: &Path, msg: &str, origin: &Origin) -> Result<()> {
+    use std::io::Write;
+    let author = &origin.author;
+    let committer = origin.committer.as_ref().unwrap_or(author);
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["commit", "-q", "--allow-empty", "--no-verify", "--no-gpg-sign"])
+        .args(["--cleanup=verbatim", "-F", "-"])
+        .env("GIT_AUTHOR_NAME", ident_name(author))
+        .env("GIT_AUTHOR_EMAIL", &author.email)
+        .env("GIT_AUTHOR_DATE", git_date(author))
+        .env("GIT_COMMITTER_NAME", ident_name(committer))
+        .env("GIT_COMMITTER_EMAIL", &committer.email)
+        .env("GIT_COMMITTER_DATE", git_date(committer))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("running git commit")?;
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(msg.as_bytes())
+        .context("writing the commit message to git")?;
+    let out = child.wait_with_output().context("waiting for git commit")?;
+    if !out.status.success() {
+        bail!("git commit failed: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    Ok(())
+}
+
+/// git refuses an empty name (an empty email is fine), but a source commit
+/// can carry one; fall back to the email so the export still lands.
+fn ident_name(p: &Person) -> &str {
+    let name = p.name.trim();
+    if !name.is_empty() {
+        &p.name
+    } else if !p.email.trim().is_empty() {
+        &p.email
+    } else {
+        "unknown"
+    }
+}
+
+/// `GIT_*_DATE` in git's raw form: `@<unix-seconds> <±HHMM>`. The `@` keeps a
+/// small timestamp from being misread as another date format. A malformed zone
+/// is replaced by `+0000` — git would otherwise silently substitute the LOCAL
+/// zone — and a moment git cannot represent (before the epoch once the zone
+/// is applied) is clamped to it.
+fn git_date(p: &Person) -> String {
+    match tz_offset_secs(&p.tz) {
+        Some(offset) => git_date_at(p.when, &p.tz, offset),
+        None => {
+            eprintln!("warning: origin timezone `{}` is not ±HHMM; exporting it as +0000", p.tz);
+            git_date_at(p.when, "+0000", 0)
+        }
+    }
+}
+
+/// Seconds east of UTC for a `±HHMM` zone; `None` for anything else.
+fn tz_offset_secs(tz: &str) -> Option<i64> {
+    let b = tz.as_bytes();
+    if b.len() != 5 || !(b[0] == b'+' || b[0] == b'-') || !b[1..].iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let (h, m) = (tz[1..3].parse::<i64>().ok()?, tz[3..5].parse::<i64>().ok()?);
+    if h >= 24 || m >= 60 {
+        return None;
+    }
+    let mag = h * 3600 + m * 60;
+    Some(if b[0] == b'-' { -mag } else { mag })
+}
+
+fn git_date_at(when: i64, tz: &str, offset_secs: i64) -> String {
+    if when + offset_secs < 0 {
+        eprintln!("warning: origin date {when} {tz} is before the Unix epoch; exporting it as the epoch");
+        return "@0 +0000".to_string();
+    }
+    format!("@{when} {tz}")
 }
 
 fn first_line(s: &str) -> String {
