@@ -191,6 +191,12 @@ pub fn cmd_export_git(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             }
             lex_store::render::RenderedSource::Multi(tree) => tree.into_iter().collect(),
         };
+        // #892 PR 4: a manifest-only import (a non-Lex repo) has NO declarations,
+        // so it has no source tree to render: skip the synthetic empty `src.lex`
+        // the renderer would otherwise add, or the export could never be
+        // byte-identical to the imported tree. Gated on the commit being an
+        // origin-bearing one, so a native store exports exactly as before.
+        let tree = if origin_ids[idx].is_some() && map.is_empty() { Vec::new() } else { tree };
         for (relpath, src) in tree {
             let path = out_dir.join(&relpath);
             if let Some(parent) = path.parent() {

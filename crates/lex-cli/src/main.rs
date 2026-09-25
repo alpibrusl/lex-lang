@@ -28,6 +28,7 @@ mod doc_sync;
 mod docs;
 mod files;
 mod fmt;
+mod import_git;
 mod init;
 mod lint;
 mod merge;
@@ -374,8 +375,11 @@ fn print_usage() {
     println!(
         "                                     trusted-keys keyring of producers above a score"
     );
-    println!("  op {{show|log|push|pull|repack|gc}} [--store DIR]");
+    println!("  op {{show|log|replay|push|pull|repack|gc|import-git}} [--store DIR]");
     println!("                                     inspect and sync the operation log");
+    println!("  op import-git <repo> --head-only [--branch B] [--store-branch S] [--store DIR]");
+    println!("          [--strict] [--examples tip|all|none] [--max-file-bytes N]");
+    println!("                                     import a git branch tip as one snapshot (#892)");
     println!("  log [branch]                       show the operation log for a branch (alias of `branch log`)");
     println!("  recall {{--intent ID|--session ID|--predicate JSON|--all}} [--limit N] [--store DIR]");
     println!("                                     predicate query over the op log (#836)");

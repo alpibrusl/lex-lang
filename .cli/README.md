@@ -233,7 +233,7 @@ Idempotent: true
 
 ### op
 
-inspect and sync the operation log (show|log|replay|push|pull|repack|gc)
+inspect and sync the operation log (show|log|replay|push|pull|repack|gc|import-git)
 
 Idempotent: false
 
