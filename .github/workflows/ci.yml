@@ -86,6 +86,13 @@ jobs:
       # the message, never a discovery.
       - name: Generated docs current (doc-sync --check)
         run: cargo run -q -p lex-cli -- doc-sync --check
+      # .cli/ (README.md, commands.json, examples/*.sh) is rewritten from the
+      # live command tree by the acli crate whenever `lex` runs from the repo
+      # root, but nothing enforced that anyone actually ran it (#1036: `lex
+      # files` and `lex publish --no-files` landed without a synced .cli/ and
+      # drifted silently). Mirrors the doc-sync --check step above.
+      - name: .cli/ current (check-cli-sync)
+        run: ./scripts/check-cli-sync.sh
       # Manifesto demo: effects are machine-verifiable constraints. The
       # honest effect row type-checks; a [net] call under an [io]
       # signature is rejected. lex-cli is already compiled by the
