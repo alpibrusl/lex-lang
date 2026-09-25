@@ -89,6 +89,7 @@ pub(crate) struct Published {
 }
 
 /// Why a publish did not happen.
+#[derive(Debug)]
 pub(crate) enum PublishError {
     /// The head does not type-check (with its dependencies resolved).
     TypeCheck(Vec<lex_types::TypeError>),
@@ -472,4 +473,295 @@ pub(crate) fn publish_stages(
         intent_id,
         files_manifest: files_manifest_id,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    //! `publish_dir`-level properties the importer (#892 PR 4+) relies on. The
+    //! byte-for-byte "nothing changed for `lex publish`" proof lives in
+    //! `tests/publish_core_892.rs`; these pin the *new* capabilities.
+
+    use super::*;
+    use lex_store::files::{is_reserved_path, MODE_EXEC, MODE_FILE};
+    const ERROR_LEX: &str = "type Err = { code :: Int, msg :: Str }\n\n\
+        fn format(e :: Err) -> Str {\n  e.msg\n}\n";
+    const LIB_LEX: &str = "import \"./error\" as e\n\n\
+        fn render(x :: e.Err) -> Str {\n  e.format(x)\n}\n\n\
+        fn double(n :: Int) -> Int {\n  n * 2\n}\n";
+
+    fn write(dir: &Path, name: &str, contents: &[u8]) {
+        let p = dir.join(name);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, contents).unwrap();
+    }
+
+    fn package(dir: &Path) {
+        write(dir, "lex.toml", b"[package]\nname = \"corepkg\"\nversion = \"0.1.0\"\n");
+        write(dir, "src/error.lex", ERROR_LEX.as_bytes());
+        write(dir, "src/lib.lex", LIB_LEX.as_bytes());
+        write(dir, "README.md", b"# corepkg\n");
+        write(dir, "bin/run.sh", b"#!/bin/sh\necho hi\n");
+        write(dir, "logo.bin", &[0, 1, 2, 0xff, 0xfe]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                dir.join("bin/run.sh"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+    }
+
+    /// A deterministic Intent of the kind the importer passes: fixed session,
+    /// fixed model, no `cli-<pid>-<epoch>`.
+    fn import_intent(created_at: u64) -> Intent {
+        Intent::with_timestamp(
+            "the commit message",
+            "git-import:deadbeef",
+            lex_vcs::ModelDescriptor {
+                provider: "git".into(),
+                name: "import".into(),
+                version: Some("1".into()),
+            },
+            None,
+            created_at,
+        )
+    }
+
+    fn published(o: Outcome) -> Published {
+        match o {
+            Outcome::Published(p) => p,
+            Outcome::DryRun(_) => panic!("expected a real publish"),
+        }
+    }
+
+    fn publish(root: &Path, dir: &Path, opts: PublishOptions<'_>) -> Result<Published, PublishError> {
+        publish_dir(root, dir, None, opts).map(published)
+    }
+
+    fn err_text(e: PublishError) -> String {
+        format!("{:#}", e.into_anyhow())
+    }
+
+    fn op_ids(p: &Published) -> Vec<String> {
+        p.ops.iter().map(|o| o.op_id.clone()).collect()
+    }
+
+    #[test]
+    fn same_inputs_and_intent_give_identical_op_ids_across_stores_and_dirs() {
+        let t = tempfile::tempdir().unwrap();
+        let (dir_a, dir_b) = (t.path().join("a"), t.path().join("b-elsewhere"));
+        package(&dir_a);
+        package(&dir_b);
+        let (store_a, store_b) = (t.path().join("store_a"), t.path().join("store_b"));
+
+        // Different `created_at` (unhashed) and a different checkout path
+        // and store path: none of it may reach an op id.
+        let a = publish(&store_a, &dir_a, PublishOptions::new(import_intent(1))).unwrap();
+        let b = publish(&store_b, &dir_b, PublishOptions::new(import_intent(999))).unwrap();
+
+        assert!(!a.ops.is_empty());
+        assert_eq!(op_ids(&a), op_ids(&b), "identical inputs must give identical ops");
+        assert_eq!(a.head_op, b.head_op);
+        assert_eq!(a.intent_id, b.intent_id);
+        assert_eq!(a.files_manifest, b.files_manifest);
+        assert!(a.files_manifest.is_some(), "a directory publish captures files");
+
+        // The caller's intent is stamped on EVERY op — semantic ops and SetFiles alike.
+        let log = lex_vcs::OpLog::open(&store_a).unwrap();
+        let recs = log.walk_forward(a.head_op.as_ref().unwrap(), None).unwrap();
+        assert_eq!(recs.len(), a.ops.len());
+        assert!(
+            recs.iter().all(|r| r.op.intent_id.as_ref() == Some(&a.intent_id)),
+            "every op carries the caller-supplied intent"
+        );
+
+        // Republishing into the same store with the same intent is a no-op.
+        let again = publish(&store_a, &dir_a, PublishOptions::new(import_intent(1))).unwrap();
+        assert!(again.ops.is_empty(), "unchanged republish must emit zero ops");
+        assert_eq!(again.head_op, a.head_op);
+    }
+
+    #[test]
+    fn a_different_intent_changes_the_op_ids() {
+        // Negative control for the test above: the intent IS hashed, so the
+        // equality there is a real property and not an artefact of ignoring it.
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("pkg");
+        package(&dir);
+        let a = publish(&t.path().join("s1"), &dir, PublishOptions::new(import_intent(1))).unwrap();
+        let other = Intent::with_timestamp(
+            "another message",
+            "git-import:deadbeef",
+            lex_vcs::ModelDescriptor { provider: "git".into(), name: "import".into(), version: Some("1".into()) },
+            None,
+            1,
+        );
+        let b = publish(&t.path().join("s2"), &dir, PublishOptions::new(other)).unwrap();
+        assert_ne!(op_ids(&a), op_ids(&b));
+    }
+
+    /// The op kinds' `op` tags of `p.ops`.
+    fn kinds(p: &Published) -> Vec<String> {
+        p.ops
+            .iter()
+            .map(|o| o.kind["op"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn empty_program_on_a_non_empty_head_emits_removals_and_a_valid_empty_head() {
+        let t = tempfile::tempdir().unwrap();
+        let (dir, root) = (t.path().join("pkg"), t.path().join("store"));
+        package(&dir);
+        let first = publish(&root, &dir, PublishOptions::new(import_intent(1))).unwrap();
+        assert!(kinds(&first).contains(&"add_function".to_string()));
+        let store = Store::open(&root).unwrap();
+        assert_eq!(store.branch_head("main").unwrap().len(), 4, "double, render, format + the Err type");
+
+        // The commit deletes every src/**/*.lex but keeps lex.toml and the rest.
+        std::fs::remove_dir_all(dir.join("src")).unwrap();
+
+        // `lex publish` semantics are untouched: an empty package is an error.
+        let refused = publish(&root, &dir, PublishOptions::new(import_intent(2)));
+        assert!(
+            err_text(refused.err().expect("must be refused")).contains("has no src/ directory"),
+            "without allow_empty the empty package is still the same error"
+        );
+        assert_eq!(store.branch_head("main").unwrap().len(), 4, "a refused publish writes nothing");
+
+        let mut opts = PublishOptions::new(import_intent(2));
+        opts.allow_empty = true;
+        let del = publish(&root, &dir, opts).unwrap();
+        let ks = kinds(&del);
+        assert!(ks.iter().any(|k| k == "remove_function"), "removals emitted: {ks:?}");
+        assert!(ks.iter().any(|k| k == "remove_type"), "the type is removed too: {ks:?}");
+        // Only `src/**/*.lex` left: the files manifest is unchanged, so no SetFiles.
+        assert!(!ks.iter().any(|k| k == "set_files"), "manifest untouched: {ks:?}");
+
+        // A valid, empty head: no live declarations, no derived imports, and
+        // a further identical publish is a true no-op.
+        assert!(store.branch_head("main").unwrap().is_empty());
+        assert!(ks.iter().any(|k| k == "remove_import"), "the file's import goes too: {ks:?}");
+        assert!(
+            store.derive_imports_from_oplog("main").unwrap().values().all(|s| s.is_empty()),
+            "no import survives the deletion"
+        );
+        assert_eq!(store.get_branch("main").unwrap().unwrap().head_op, del.head_op);
+        let mut opts = PublishOptions::new(import_intent(2));
+        opts.allow_empty = true;
+        let again = publish(&root, &dir, opts).unwrap();
+        assert!(again.ops.is_empty(), "republishing the empty program is a no-op");
+
+        // ...and the package can come back: the head is not wedged.
+        package(&dir);
+        let back = publish(&root, &dir, PublishOptions::new(import_intent(3))).unwrap();
+        assert!(kinds(&back).contains(&"add_function".to_string()));
+        assert_eq!(store.branch_head("main").unwrap().len(), 4);
+    }
+
+    #[test]
+    fn empty_program_when_the_whole_package_is_gone() {
+        let t = tempfile::tempdir().unwrap();
+        let (dir, root) = (t.path().join("pkg"), t.path().join("store"));
+        package(&dir);
+        publish(&root, &dir, PublishOptions::new(import_intent(1))).unwrap();
+
+        // Only a README survives: no lex.toml, no src/.
+        std::fs::remove_dir_all(dir.join("src")).unwrap();
+        std::fs::remove_file(dir.join("lex.toml")).unwrap();
+
+        let mut opts = PublishOptions::new(import_intent(2));
+        opts.allow_empty = true;
+        let del = publish(&root, &dir, opts).unwrap();
+        let ks = kinds(&del);
+        assert!(ks.iter().any(|k| k == "remove_function"), "{ks:?}");
+        // lex.toml left the manifest too: one SetFiles, last, under the same intent.
+        assert_eq!(ks.last().map(String::as_str), Some("set_files"), "{ks:?}");
+        assert!(Store::open(&root).unwrap().branch_head("main").unwrap().is_empty());
+    }
+
+    #[test]
+    fn allow_empty_never_papers_over_sources_that_exist() {
+        // lex.toml missing but .lex sources present is still the manifest
+        // error, not a silent "empty program" that would delete the package.
+        let t = tempfile::tempdir().unwrap();
+        let (dir, root) = (t.path().join("pkg"), t.path().join("store"));
+        package(&dir);
+        std::fs::remove_file(dir.join("lex.toml")).unwrap();
+        let mut opts = PublishOptions::new(import_intent(1));
+        opts.allow_empty = true;
+        let e = publish(&root, &dir, opts).err().expect("must be refused");
+        assert!(err_text(e).contains("a package publish needs it"));
+    }
+
+    #[test]
+    fn manifest_from_files_matches_build_manifest_on_the_working_copy() {
+        let t = tempfile::tempdir().unwrap();
+        let (dir, root) = (t.path().join("pkg"), t.path().join("store"));
+        package(&dir);
+        let store = Store::open(&root).unwrap();
+
+        // The bytes a git-object reader would hand over: every non-reserved
+        // file, with its mode, in an order unrelated to the scan's.
+        let mut entries: Vec<(String, &'static str, Vec<u8>)> = vec![
+            ("logo.bin".into(), MODE_FILE, vec![0, 1, 2, 0xff, 0xfe]),
+            ("bin/run.sh".into(), MODE_EXEC, b"#!/bin/sh\necho hi\n".to_vec()),
+            ("README.md".into(), MODE_FILE, b"# corepkg\n".to_vec()),
+            ("lex.toml".into(), MODE_FILE, b"[package]\nname = \"corepkg\"\nversion = \"0.1.0\"\n".to_vec()),
+        ];
+        entries.reverse();
+        assert!(entries.iter().all(|(p, _, _)| !is_reserved_path(p)));
+
+        let scanned = crate::files::build_manifest(&store, &dir).unwrap();
+        let from_bytes = crate::files::manifest_from_files(&store, entries).unwrap();
+        assert_eq!(from_bytes.id(), scanned.id(), "same bytes + modes => same manifest id");
+        assert_eq!(from_bytes.entries.len(), 4);
+        assert!(
+            !scanned.entries.keys().any(|k| k.starts_with("src/")),
+            "the scan excludes reserved src/**/*.lex"
+        );
+
+        // A different mode is a different manifest (negative control).
+        let flipped = crate::files::manifest_from_files(
+            &store,
+            vec![("bin/run.sh".to_string(), MODE_FILE, b"#!/bin/sh\necho hi\n".to_vec())],
+        )
+        .unwrap();
+        assert_ne!(flipped.id(), from_bytes.id());
+        // Reserved paths are rejected loudly, not dropped.
+        assert!(crate::files::manifest_from_files(
+            &store,
+            vec![("src/x.lex".to_string(), MODE_FILE, b"fn f() -> Int { 1 }".to_vec())],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn publish_manifest_if_changed_records_once_then_is_a_no_op() {
+        let t = tempfile::tempdir().unwrap();
+        let (dir, root) = (t.path().join("pkg"), t.path().join("store"));
+        package(&dir);
+        let p = publish(&root, &dir, PublishOptions::new(import_intent(1))).unwrap();
+        let store = Store::open(&root).unwrap();
+
+        // The manifest the publish captured is already in force: no new op.
+        let m = crate::files::build_manifest(&store, &dir).unwrap();
+        assert!(crate::files::publish_manifest_if_changed(&store, "main", &m, None)
+            .unwrap()
+            .is_none());
+
+        // A changed manifest lands as exactly one SetFiles op on the head.
+        let m2 = crate::files::manifest_from_files(
+            &store,
+            vec![("NOTES.md".to_string(), MODE_FILE, b"hi\n".to_vec())],
+        )
+        .unwrap();
+        let (op, manifest_id) =
+            crate::files::publish_manifest_if_changed(&store, "main", &m2, None).unwrap().unwrap();
+        assert_eq!(manifest_id, m2.id());
+        assert_eq!(store.get_branch("main").unwrap().unwrap().head_op, Some(op));
+        assert_ne!(p.head_op, store.get_branch("main").unwrap().unwrap().head_op);
+    }
 }
