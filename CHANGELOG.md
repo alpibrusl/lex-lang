@@ -5,6 +5,166 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [0.11.73] - 2026-09-26
+
+### Changed — behavior operators need to know
+
+- **Upgrade the hub BEFORE clients (#1063, #1060).** A new client's
+  file-move rename op carries the new optional `RenameSymbol.in_file`. An
+  older hub drops the unknown field, recomputes a different op id and
+  rejects the op. (`in_file` is set only when a rename changes the file a
+  declaration lives in, i.e. a multi-file file move; every existing and
+  single-file rename keeps its exact bytes and OpId.) The new `op pull`
+  also sends `pairs` alongside `ids` to `/v1/stages/fetch`; an older hub
+  ignores `pairs` and answers as before, so the pull still succeeds but
+  with the old behavior and a warning if the pulled head is unrenderable.
+  A history containing a rename or a file move that was pulled into a store
+  by an older client stays unrenderable (`export-git` fails with
+  `unsatisfiable head entry (#992)`) until it is repaired either by
+  `lex op pull --since <op before the rename>` (re-derives the missing
+  pair) or by a republish (the #995 self-heal). A plain re-pull does not
+  help — there is nothing new to receive. A file-move history recorded by
+  an older client keeps exporting the moved declaration into its old path
+  until that declaration changes, since that op never recorded the
+  destination.
+- **The attestation store layout gained `attestations/arrival/` and
+  `attestations/arrival.seq`; include them in backups (#1053).** The log now
+  assigns a server-side arrival sequence number the first time it persists
+  an attestation. The stamps are NOT rebuildable from the attestation
+  files (unlike `by-stage/`), so back them up with the log. The ordering of
+  review verdicts (`latest_review_verdict`, and so `promote_candidate`'s
+  "standing Reject", and `GET /v1/stage/<id>/attestations`) now follows
+  arrival order instead of the writer-chosen `timestamp`: a forged
+  far-future or backdated verdict can no longer outrank or lose to one that
+  actually arrived later. Attestations that predate the sidecar keep
+  timestamp order among themselves and sort before every stamped one.
+  `op pull` now preserves the remote's relative attestation order (each
+  pulled attestation gets a local stamp at pull time). Arrival order is not
+  authority: within a tenant any key can still post a later verdict.
+- **New hub capability `intent-origin-v1` (#1048, #892).** `Intent` gains an
+  optional `origin` (source VCS, commit, author, committer, parents, folded
+  commits) that joins the intent's content hash only when present, so every
+  intent without an origin hashes and serializes byte-identically to
+  before. `lex op push` refuses, before uploading anything, to send an
+  origin-bearing intent (produced by `lex op import-git`) to a hub whose
+  `/v1/health` does not advertise `intent-origin-v1`: an older hub would
+  silently drop `origin` and re-store the intent under an id that no longer
+  matches its bytes. A push with no origin-bearing intent does not query
+  `/v1/health` for this.
+- **Republishing a package published by an older client adds its missing
+  local-import ops once (#909, #1049).** `lex publish` now records a file's
+  local imports (`import "./error" as e`) in the op-log as `AddImport` ops
+  (alias stored only when non-default). Republishing such a package adds
+  the missing ops one time — import-only, declarations untouched, head
+  stays valid — and the next republish creates zero ops. Separately, within
+  a file `RemoveImport` is now emitted before `AddImport`, so re-aliasing
+  an import (`as sql` to `as db`, including stdlib imports) replays
+  correctly; this affects NEW publishes only, existing logs are unchanged.
+  Op order changes only for a publish that both adds and removes imports in
+  one file. Known limitation: a multi-file `lex op replay --candidate` with
+  a bare-named candidate does not reproduce (#1050).
+- **A hub that sets `State::with_reserved_producers` refuses client
+  attestations claiming a reserved producer (#1053).**
+  `POST /v1/attestations/batch` answers `403 {"error":"ReservedProducer"}`
+  and writes nothing (the whole batch is refused). Each entry is an exact
+  tool name, or a prefix when it ends in `*` (matching trims and ignores
+  ASCII case). lex-lang's default reserves nothing, so `lex serve` and
+  existing embedders behave exactly as before. New constants in
+  `lex_store`: `HUB_CI_PRODUCER_TOOL` (`"lex-hub-ci"`),
+  `REVIEW_PRODUCER_PREFIX` and `REVIEW_PRODUCER_RESERVATION`
+  (`"lex-store::review:*"`). A hub that reserves the review prefix also
+  refuses `lex attest push` of `Review` attestations from another store;
+  verdicts must go through the server-stamped routes.
+
+### Added
+
+- **`lex op import-git <path|url>`: import a git repository into the
+  op-log (#892 PR 4 and 5; #1054, #1059).** Imports a branch's tip as one
+  snapshot (`--head-only`), its full first-parent history, an incremental
+  re-import, or a clone from a URL. Reads git objects, never a checkout, so
+  `core.autocrlf` / `.gitattributes` cannot make OpIds machine-dependent.
+  The semantic pass is the same core `lex publish` uses, and every other
+  file lands as one trailing `SetFiles`; a repo with no Lex sources becomes
+  a manifest-only branch. Each imported commit carries a deterministic
+  intent with an `Origin`. A commit that does not load or type-check is
+  folded: skipped, and listed in the next importable commit's
+  `origin.folded`. Flags: `--branch`, `--store`, `--store-branch`,
+  `--on-error fold|stop`, `--strict`, `--examples tip|all|none`,
+  `--max-file-bytes`, `--depth N` (the shallow boundary becomes the lineage
+  root), `--since SHA`, `--max-commits N`. The watermark is derived from the
+  op-log, so it syncs; a rewritten history, a different repo's lineage or a
+  branch with native ops after the last import is refused with a
+  `--store-branch` instruction and nothing rewritten. Symlinks and
+  submodules are skipped and reported (`--strict` fails on them). Exit 0 iff
+  the tip of the run landed. Importing old history against today's floating
+  git dependencies folds heavily (a real 153-commit repo without a
+  `lex.lock` folded 42%); commit a `lex.lock`, or use `--since` /
+  `--head-only`.
+- **`lex export-git` is origin-aware (#892 PR 3, #1051).** For an op whose
+  intent carries an `origin`, the commit message is the prompt verbatim plus
+  the `Op:`, `Intent:`, `Files:`, `Git-Source:` and `Ops:` trailers, the
+  author and committer identity and dates come from the origin, and
+  consecutive ops sharing an origin-bearing intent become one commit.
+  Commit signing and hooks are disabled for the export. Ops without an
+  origin export exactly as before (pinned by a committed baseline).
+- **`lex export-git --incremental [--no-verify]` (#837 piece D, #1055).**
+  Resumes from HEAD's `Op:` trailer and appends only the ops after it,
+  never rewriting history; resuming at any commit boundary is byte-identical
+  to a one-shot export. Verifies HEAD's tree against the store's rendering
+  at the marker (`--no-verify` skips that). Refuses, touching nothing, on a
+  dirty or untracked tree, a HEAD with no single `Op:` trailer, an `Op:`
+  not on the branch's history, or a disagreeing `Intent:` trailer.
+  Re-running with nothing new is a no-op. `--no-verify` without
+  `--incremental` is a usage error.
+- **Typed-transform write surface: `POST /v1/transform` and
+  `lex ws transform` (#837 piece A, #1057).** Applies one of the four #280
+  transforms straight through the op-log's gated apply path, with an
+  optional intent. A refusal writes no op and no intent: 422 with
+  diagnostics on a type-check failure, 404 unknown branch or stage, 409
+  stale `from_stage_id`, 400 malformed. The CLI and the endpoint call the
+  same `lex_api::transform_http::apply_transform`, so they cannot diverge.
+  `POST /v1/patch` also accepts an optional `branch` and `intent`; absent
+  keeps the old behavior and response shape.
+- **`/v1/stages/fetch` accepts `pairs: [[sig, stage]]` (#1063).** It
+  resolves through the sig, so the two variants of a StageId that a rename
+  produces (one StageId under two sigs) can each be fetched. Additive;
+  `pairs` wins when both keys are present. See the upgrade-order note above.
+- **Internal:** the publish pipeline moved out of `cmd_publish` into a
+  shared `publish_core` (#892 PR 1, #1052) so `op import-git` and
+  `lex publish` share one tree-to-ops implementation and one set of gates;
+  `lex publish` behavior is unchanged. `.cli/` is now gated in CI against
+  drift from the lex-cli command tree (`scripts/check-cli-sync.sh`, #1047).
+
+### Fixed
+
+- **Renames and file moves survive `op push` then `op pull` then
+  `export-git` (#1060, #1063).** A StageId is name-independent, so a rename
+  puts one StageId under two sigs; `op pull` fetched by bare id, received
+  one variant and never got the head's `(new, S)` pair, so `export-git` on
+  the pulled store failed with `unsatisfiable head entry (#992)`. A moved
+  `.lex` file hit the same bug, plus `RenameSymbol` did not record the
+  destination file, so even the origin store exported the declaration back to
+  its old path. `op pull` now fetches by pair, and warns if the head is
+  still unrenderable after the fast-forward; `RenameSymbol.in_file` records
+  the destination. `export-git` also no longer collapses a multi-file
+  package into one `src.lex` across a signature change (#992 `to_sig_id`
+  move). Known limitation: a merged head can depend on DAG replay order
+  (#1062).
+- **`export-git` sets and clears the exec bit to match the manifest
+  (#1061).** It only ever set the bit, so a commit dropping `100755` to
+  `100644` on an existing file exported with the bit still set. It also
+  pins `core.fileMode=true` in the exported repo so a mirror created with
+  `core.fileMode=false` cannot swallow a mode-only change on an
+  `--incremental` resume.
+- **`extract_function` no longer strands a half-applied function (#1057).**
+  A refusal at its second op used to leave the newly extracted function on
+  the head; the two ops are now applied atomically (pre-flight of the final
+  program, head rollback).
+- **A stale `from_stage_id` on a transform now returns `409` (#1057).**
+- **`POST /v1/patch` honours `branch` (#1057).** It previously used the
+  server's global current branch regardless of the request; an unknown
+  branch is now 404.
+
 ## [0.11.72] - 2026-09-25
 
 ### Fixed
