@@ -1208,6 +1208,8 @@ render a branch's op history as a git repo (#837)
 
 - `--branch` (string) — branch to export (default: current)
 - `--store` (string) — store root directory
+- `--incremental` (bool) — append only the ops after HEAD's `Op:` trailer to an existing export; never rewrites history
+- `--no-verify` (bool) — with --incremental: skip checking that the repo's HEAD tree matches the store at that op
 
 ### Arguments
 
@@ -1223,6 +1225,11 @@ lex export-git ./export
 ```bash
 # Export a feature branch
 lex export-git ./out --branch feature
+```
+
+```bash
+# Append new ops to an existing export
+lex export-git ./export --incremental
 ```
 
 ## `lex plan`
