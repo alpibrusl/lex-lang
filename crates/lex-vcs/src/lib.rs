@@ -60,7 +60,7 @@ pub use compute_diff::{
 pub use diff_report::DiffReport;
 pub use diff_to_ops::{diff_to_ops, DiffInputs, DiffMappingError, ImportMap, ImportRef};
 pub use gate::{check_and_apply, GateError};
-pub use intent::{Intent, IntentId, IntentLog, ModelDescriptor, SessionId};
+pub use intent::{Intent, IntentId, IntentLog, ModelDescriptor, Origin, Person, SessionId};
 pub use issue::{
     Acceptance, AcceptanceProposal, ApiChangeKind, ApiEntry, Issue, IssueId, IssueLog, ProposalId,
 };

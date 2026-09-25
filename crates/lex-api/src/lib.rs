@@ -23,7 +23,7 @@
 //!   POST /v1/blobs/missing            { ids } → { missing } (#1007)
 //!   POST /v1/blobs/batch              [{ id, data_b64 }] → { received, added, skipped }
 //!   POST /v1/blobs/fetch              { ids } → { blobs: [{ id, data_b64 }] }
-//!   GET  /v1/health          → { ok: true, caps: ["files-v1"] }
+//!   GET  /v1/health          → { ok: true, caps: ["files-v1", "intent-origin-v1"] }
 //!
 //! Web (lex-tea v2, read-only HTML; human-only audit + triage):
 //!   GET  /                      → activity stream (recent attestations)

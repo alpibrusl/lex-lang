@@ -173,7 +173,7 @@ fn health_advertises_files_v1() {
     let (st, v) = http(&srv, "GET", "/v1/health", "");
     assert_eq!(st, 200);
     assert_eq!(v["ok"], true);
-    assert_eq!(v["caps"], json!(["files-v1"]));
+    assert_eq!(v["caps"], json!(["files-v1", "intent-origin-v1"]));
 }
 
 // ── blob routes ────────────────────────────────────────────────────────────
