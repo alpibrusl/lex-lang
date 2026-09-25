@@ -8,7 +8,7 @@ use lex_vcs::{OpLog, OperationRecord};
 use std::path::PathBuf;
 
 use crate::sync_client::{request_json, request_json_with_header, Retry, RetryPolicy, SyncError};
-use lex_api::handlers::CAP_FILES_V1;
+use lex_api::handlers::{CAP_FILES_V1, CAP_INTENT_ORIGIN_V1};
 
 /// Prepare an outgoing request: disable ureq's "non-2xx is an error"
 /// behaviour, announce this client's capabilities, and attach
@@ -767,6 +767,34 @@ fn cmd_op_push(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         }
     }
 
+    // #892 PR 2: an intent carrying `origin` (external-VCS provenance)
+    // only survives a hub that stores the field. An older hub would
+    // deserialize the intent, silently drop `origin` and re-store bytes that
+    // no longer match the intent's id. Check the remote's advertised
+    // capabilities BEFORE uploading anything — refuse fast and cleanly.
+    // Pushes with no origin-bearing intent never even query `/v1/health`.
+    let origin_intents = origin_bearing_intents(&store, &to_send)?;
+    if !origin_intents.is_empty() {
+        let caps = remote_health_caps(&remote, token.as_deref()).map_err(|e| {
+            anyhow!(
+                "this push includes {} intent(s) with git-import provenance (`origin`, #892), \
+                 but checking the remote's capabilities first (GET {remote}/v1/health) failed: {e}",
+                origin_intents.len()
+            )
+        })?;
+        if !caps.iter().any(|c| c.eq_ignore_ascii_case(CAP_INTENT_ORIGIN_V1)) {
+            bail!(
+                "cannot push: this push includes {} intent(s) carrying `origin` provenance \
+                 (#892, e.g. {}) but the remote at {remote} does not advertise \
+                 `{CAP_INTENT_ORIGIN_V1}` support (GET /v1/health caps: {caps:?}) — an older \
+                 hub would silently drop the provenance. Upgrade the hub to an \
+                 #892-capable lex-hub. Nothing was uploaded.",
+                origin_intents.len(),
+                origin_intents[0],
+            );
+        }
+    }
+
     // Content first: push the stage + intent blobs these ops reference, so
     // a peer that pulls the op records always has the objects they point at
     // (without this, a pulled op-log renders as `unknown stage_id`).
@@ -986,12 +1014,34 @@ fn push_objects(
     Ok(())
 }
 
+/// Ids of the intents referenced by `ops` that carry an `origin` (#892).
+/// Sorted, de-duplicated (an intent is shared by many ops).
+fn origin_bearing_intents(store: &Store, ops: &[OperationRecord]) -> Result<Vec<String>> {
+    use std::collections::BTreeSet;
+    let intent_log = lex_vcs::IntentLog::open(store.root())?;
+    let mut ids: BTreeSet<&String> = BTreeSet::new();
+    for rec in ops {
+        if let Some(id) = &rec.op.intent_id {
+            ids.insert(id);
+        }
+    }
+    let mut out = Vec::new();
+    for id in ids {
+        if let Some(intent) = intent_log.get(id).ok().flatten() {
+            if intent.origin.is_some() {
+                out.push(id.clone());
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// The `caps` array of `GET <remote>/v1/health` (#1007 §4), e.g.
-/// `["files-v1"]`. An old hub that predates capability advertisement
+/// `["files-v1", "intent-origin-v1"]`. An old hub that predates capability advertisement
 /// answers `/v1/health` without a `caps` field (or doesn't have the route
 /// at all, which surfaces as a transport/status error to the caller) —
 /// either way this reads as "no capabilities", which is the conservative
-/// answer `cmd_op_push`'s files-v1 gate needs.
+/// answer `cmd_op_push`'s files-v1 and intent-origin-v1 gates need.
 fn remote_health_caps(remote: &str, token: Option<&str>) -> Result<Vec<String>> {
     let body: serde_json::Value = get_json(remote, "/v1/health", token)?;
     Ok(body

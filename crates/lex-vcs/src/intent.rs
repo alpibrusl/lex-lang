@@ -91,6 +91,14 @@ pub struct Intent {
     /// `None`, so pre-existing intents keep their ids byte-for-byte.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issue_id: Option<crate::issue::IssueId>,
+    /// Where this intent came from when it was imported from another VCS
+    /// (#892): the source commit's SHA, author/committer identity and
+    /// dates, parents and any commits folded into it. `None` for native
+    /// intents; omitted from the serialized form (and the id hash) when
+    /// `None`, so every intent without an origin keeps its id byte-for-byte.
+    /// The commit *message* is not duplicated here — it stays in `prompt`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<Origin>,
     /// Wall-clock seconds since epoch when this intent was first
     /// created. Excluded from `intent_id` so the dedup property
     /// holds across runs.
@@ -128,7 +136,7 @@ impl Intent {
         let prompt = prompt.into();
         let session_id = session_id.into();
         let intent_id =
-            compute_intent_id(&prompt, &session_id, &model, parent_intent.as_deref(), None);
+            compute_intent_id(&prompt, &session_id, &model, parent_intent.as_deref(), None, None);
         Self {
             intent_id,
             prompt,
@@ -136,6 +144,7 @@ impl Intent {
             model,
             parent_intent,
             issue_id: None,
+            origin: None,
             created_at,
         }
     }
@@ -151,10 +160,65 @@ impl Intent {
             &self.model,
             self.parent_intent.as_deref(),
             Some(issue_id.as_str()),
+            self.origin.as_ref(),
         );
         self.issue_id = Some(issue_id);
         self
     }
+
+    /// Attach the external-VCS provenance of this intent (#892),
+    /// recomputing the id: the same prompt imported from two different
+    /// commits (or authors, or dates) is two distinct intents. An intent
+    /// without an origin serializes and hashes exactly as before.
+    pub fn with_origin(mut self, origin: Origin) -> Self {
+        self.intent_id = compute_intent_id(
+            &self.prompt,
+            &self.session_id,
+            &self.model,
+            self.parent_intent.as_deref(),
+            self.issue_id.as_deref(),
+            Some(&origin),
+        );
+        self.origin = Some(origin);
+        self
+    }
+}
+
+/// A person as recorded by the source VCS (#892): identity plus the
+/// timestamp and timezone the source recorded for them. Plain values only
+/// (no maps), so the canonical encoding is deterministic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Person {
+    pub name: String,
+    pub email: String,
+    /// Seconds since the Unix epoch, as the source VCS recorded it.
+    pub when: i64,
+    /// UTC offset as the source wrote it, e.g. `"+0200"`. Kept verbatim
+    /// (not derived from `when`) so an export can reproduce it.
+    pub tz: String,
+}
+
+/// Provenance of an intent imported from another VCS (#892). Hashed into
+/// the intent id, so the field order below and the `Vec`/struct-only shape
+/// are part of the canonical form — do not reorder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Origin {
+    /// Source VCS kind; `"git"` today.
+    pub vcs: String,
+    /// The full source commit id (40/64 hex for git).
+    pub commit: String,
+    pub author: Person,
+    /// `None` when the source recorded no distinct committer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committer: Option<Person>,
+    /// All parents of the source commit, in source order; the first is the
+    /// line that was imported.
+    #[serde(default)]
+    pub parents: Vec<String>,
+    /// Source commits folded into this one because they were skipped
+    /// (e.g. did not type-check), oldest first.
+    #[serde(default)]
+    pub folded: Vec<String>,
 }
 
 fn compute_intent_id(
@@ -163,6 +227,7 @@ fn compute_intent_id(
     model: &ModelDescriptor,
     parent_intent: Option<&str>,
     issue_id: Option<&str>,
+    origin: Option<&Origin>,
 ) -> IntentId {
     let view = CanonicalIntentView {
         prompt,
@@ -170,6 +235,7 @@ fn compute_intent_id(
         model,
         parent_intent,
         issue_id,
+        origin,
     };
     canonical::hash(&view)
 }
@@ -188,6 +254,10 @@ struct CanonicalIntentView<'a> {
     /// did before #949 — id stability for every pre-existing intent.
     #[serde(skip_serializing_if = "Option::is_none")]
     issue_id: Option<&'a str>,
+    /// Omitted when `None` so an intent with no origin hashes exactly as it
+    /// did before #892 — id stability for every pre-existing intent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin: Option<&'a Origin>,
 }
 
 // ---- Persistence -------------------------------------------------

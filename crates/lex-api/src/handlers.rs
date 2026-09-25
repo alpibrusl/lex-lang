@@ -100,10 +100,17 @@ pub struct BlobLimits {
 /// Capabilities this server advertises on `/v1/health` (#1007). A client
 /// states the ones it speaks in the `X-Lex-Caps` request header
 /// (comma-separated).
-pub const CAPS: &[&str] = &[CAP_FILES_V1];
+pub const CAPS: &[&str] = &[CAP_FILES_V1, CAP_INTENT_ORIGIN_V1];
 
 /// The server stores and serves `SetFiles` ops and their blobs (#1007).
 pub const CAP_FILES_V1: &str = "files-v1";
+
+/// The server stores and serves `Intent.origin` (#892) — the external-VCS
+/// provenance of an imported intent. A server without it deserializes an
+/// origin-bearing intent, silently drops the unknown field and re-stores an
+/// intent whose bytes no longer match its id, so `lex op push` refuses to
+/// send one to a hub that doesn't advertise this.
+pub const CAP_INTENT_ORIGIN_V1: &str = "intent-origin-v1";
 
 /// Whether an `X-Lex-Caps` header value names `cap`.
 pub(crate) fn has_cap(header: Option<&str>, cap: &str) -> bool {
