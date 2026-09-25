@@ -25,8 +25,17 @@
 //! `origin.is_some()`: a store with no origin-bearing intent exports
 //! byte-identically to before.
 //!
+//! **Incremental (#837 piece D).** `--incremental` resumes an export instead
+//! of re-committing every op: given an existing repo this tool produced, it
+//! reads the `Op:` trailer of `HEAD` (which names the LAST op of that commit's
+//! group), finds it in the branch's op history, rebuilds the exporter's state
+//! at that op WITHOUT committing, and runs the ordinary commit loop over only
+//! the ops after it, appending on top of `HEAD`. History is never rewritten:
+//! see [`resume_point`] for the refusal conditions, and [`verify_tree`] for the
+//! (default-on) check that the repo's tree is what the store renders there.
+//!
 //! Usage:
-//!   lex export-git <out_dir> [--branch NAME] [--store DIR]
+//!   lex export-git <out_dir> [--branch NAME] [--store DIR] [--incremental [--no-verify]]
 
 use super::*;
 use lex_store::files::MODE_EXEC;
@@ -36,22 +45,32 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
+const USAGE: &str =
+    "lex export-git <out_dir> [--branch NAME] [--store DIR] [--incremental [--no-verify]]";
+
 pub fn cmd_export_git(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let mut out_dir: Option<PathBuf> = None;
     let mut branch: Option<String> = None;
     let mut store_root: Option<PathBuf> = None;
+    let mut incremental = false;
+    let mut no_verify = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--branch" => { branch = args.get(i + 1).cloned(); i += 2; }
             "--store" => { store_root = args.get(i + 1).map(PathBuf::from); i += 2; }
+            "--incremental" => { incremental = true; i += 1; }
+            "--no-verify" => { no_verify = true; i += 1; }
             other if !other.starts_with("--") && out_dir.is_none() => {
                 out_dir = Some(PathBuf::from(other)); i += 1;
             }
-            other => bail!("unexpected arg `{other}` (usage: lex export-git <out_dir> [--branch NAME] [--store DIR])"),
+            other => bail!("unexpected arg `{other}` (usage: {USAGE})"),
         }
     }
-    let out_dir = out_dir.ok_or_else(|| anyhow!("usage: lex export-git <out_dir> [--branch NAME] [--store DIR]"))?;
+    let out_dir = out_dir.ok_or_else(|| anyhow!("usage: {USAGE}"))?;
+    if no_verify && !incremental {
+        bail!("--no-verify only applies to --incremental (usage: {USAGE})");
+    }
     let root = store_root.unwrap_or_else(default_store_root);
     let store = Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
     let branch = branch.unwrap_or_else(|| store.current_branch());
@@ -67,34 +86,14 @@ pub fn cmd_export_git(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         None => Vec::new(),
     };
 
-    std::fs::create_dir_all(&out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
-    if !out_dir.join(".git").exists() {
-        run_git(&out_dir, &["init", "-q"])?;
-    }
-    // Deterministic identity so re-exporting the same log is stable.
-    run_git(&out_dir, &["config", "user.name", "lex-export"])?;
-    run_git(&out_dir, &["config", "user.email", "lex-export@localhost"])?;
-
-    let src_path = out_dir.join("src.lex");
-    let mut map: BTreeMap<String, String> = BTreeMap::new();
-    // Imports live outside the SigId→StageId head map (they replay as
-    // `ImportOnly`, a no-op there), so track them from the op kinds
-    // directly. `flat_imports` is `reference` → `alias` for the
-    // single-file render (#895); `file_imports` is the same per source
-    // file, for the multi-file render (#894 slice 2b).
-    let mut head_imports = lex_store::render::PackageHead::default();
-    // SigId → the source file its declaration came from (from each
-    // AddFunction/AddType's `in_file`). When every head stage has one, the
-    // package was published multi-module and we de-flatten it back into a
-    // `src/*.lex` tree; otherwise we render one `src.lex`.
-    let mut sig_files: BTreeMap<String, String> = BTreeMap::new();
-    // The files manifest in force (#1007 PR 6): starts empty (a store with
-    // no `SetFiles` op — the pre-#1007 shape — never touches it, so such a
-    // store exports byte-identically to the pre-#1007 renderer). Updated
-    // only by a `SetFiles` op; carried forward unchanged otherwise, exactly
-    // like `Store::manifest_at`'s single-parent inheritance.
-    let mut manifest = Manifest::new();
-    let mut commits = 0usize;
+    // Incremental mode against an existing repo: decide where to resume and
+    // check the repo is safe to append to, all BEFORE anything is written.
+    let existing = incremental && out_dir.join(".git").exists() && has_head(&out_dir);
+    let resume: Option<usize> = if existing {
+        Some(resume_point(&out_dir, &records, &branch)?)
+    } else {
+        None
+    };
 
     // Each record's intent origin (#892 PR 3), resolved once up front. `None`
     // for an op with no intent, an intent missing from the log, or a native
@@ -118,45 +117,60 @@ pub fn cmd_export_git(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         origin_ids.push(id);
     }
 
+    // The state a full export has at each op: replayed (never committed) up to
+    // the resume point, then carried through the ordinary commit loop below.
+    // Imports live outside the SigId→StageId head map (they replay as
+    // `ImportOnly`, a no-op there), so `State` tracks them from the op kinds
+    // directly; see [`State`].
+    let mut st = State::default();
     // The manifest as of the last landed commit: the base every commit's
     // on-disk delta (only touch disk for a path that actually changed, §7
     // fidelity plan) is taken against. For a one-op commit this is the
     // manifest before that op, exactly as before; for a grouped commit it is
     // the manifest before the group's first op.
     let mut committed_manifest = Manifest::new();
+    let mut start = 0usize;
+    if let Some(marker) = resume {
+        for rec in &records[..=marker] {
+            st.apply(&store, rec)?;
+        }
+        if !no_verify {
+            verify_tree(&store, &out_dir, &st, origin_ids[marker].is_some())?;
+        }
+        // The repo's tree IS the state at the marker, so the next commit's
+        // on-disk delta is taken against that manifest, not an empty one.
+        committed_manifest = st.manifest.clone();
+        start = marker + 1;
+    }
+    let resumed_from = resume.map(|m| records[m].op_id.clone());
+    let exported_ops = records.len() - start;
+    let mut commits = 0usize;
+
+    // Nothing after the marker: an incremental re-run is a no-op and leaves
+    // the repo byte-for-byte alone (not even its config is rewritten).
+    if exported_ops > 0 || resume.is_none() {
+        std::fs::create_dir_all(&out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
+        if !out_dir.join(".git").exists() {
+            run_git(&out_dir, &["init", "-q"])?;
+        }
+        // Deterministic identity so re-exporting the same log is stable.
+        run_git(&out_dir, &["config", "user.name", "lex-export"])?;
+        run_git(&out_dir, &["config", "user.email", "lex-export@localhost"])?;
+    }
+
     // Ops folded into the commit being assembled, and the last `SetFiles`
     // manifest among them (`Some` only when one is, for the `Files:` trailer).
+    // An incremental run starts a fresh group at `start`: even when the op at
+    // `start` shares the marker's intent, it becomes a NEW commit (never an
+    // amend of the one already in the repo).
     let mut group_ops = 0usize;
     let mut files_manifest_id: Option<String> = None;
 
-    for (idx, rec) in records.iter().enumerate() {
+    for (idx, rec) in records.iter().enumerate().skip(start) {
         group_ops += 1;
 
-        apply_transition(&mut map, &rec.produces);
-        match &rec.op.kind {
-            OperationKind::AddFunction { sig_id, in_file: Some(f), .. }
-            | OperationKind::AddType { sig_id, in_file: Some(f), .. } => {
-                sig_files.insert(sig_id.clone(), f.clone());
-            }
-            OperationKind::AddImport { in_file, module, alias } => {
-                // The op omits the alias when it's the module's default;
-                // `PackageHead` reconstructs it the same way the store does,
-                // and keeps a local import (#909) out of the flat map.
-                head_imports.add_import(in_file, module, alias.as_deref());
-            }
-            OperationKind::RemoveImport { in_file, module } => {
-                head_imports.remove_import(in_file, module);
-            }
-            OperationKind::RenameSymbol { from, to, .. } => {
-                if let Some(f) = sig_files.remove(from) {
-                    sig_files.insert(to.clone(), f);
-                }
-            }
-            OperationKind::SetFiles { manifest: manifest_id } => {
-                manifest = store.get_manifest(manifest_id).map_err(|e| anyhow!("{e}"))?;
-                files_manifest_id = Some(manifest_id.clone());
-            }
-            _ => {}
+        if let Some(id) = st.apply(&store, rec)? {
+            files_manifest_id = Some(id);
         }
 
         // Ops that share an origin-bearing intent are ONE git commit: keep
@@ -166,63 +180,8 @@ pub fn cmd_export_git(fmt: &OutputFormat, args: &[String]) -> Result<()> {
             continue;
         }
 
-        // Start each commit from a clean tree so a stage moving files, or a
-        // file emptying out, is reflected (git add -A then picks up the net
-        // change). Cheap relative to the op replay itself.
-        let _ = std::fs::remove_file(&src_path);
-        let _ = std::fs::remove_dir_all(out_dir.join("src"));
-
-        // Render the head via the shared `lex-store` renderer — the same code
-        // the hosted registry's archive endpoint uses, so the git view and an
-        // installed package are byte-identical source (#894).
-        let head = lex_store::render::PackageHead {
-            map: map.clone(),
-            sig_files: sig_files.clone(),
-            flat_imports: head_imports.flat_imports.clone(),
-            file_imports: head_imports.file_imports.clone(),
-        };
-        // #988: the single-module arm now carries its own path, so the mirror
-        // keeps a package's real module name instead of renaming it to `lib`.
-        let tree: Vec<(String, String)> = match lex_store::render::render_source(&store, &head)? {
-            // The mirror's own convention for a head that records no file:
-            // `src.lex` at the repo root, as it has always been (#988).
-            lex_store::render::RenderedSource::Single { path, src } => {
-                vec![(path.unwrap_or_else(|| "src.lex".to_string()), src)]
-            }
-            lex_store::render::RenderedSource::Multi(tree) => tree.into_iter().collect(),
-        };
-        // #892 PR 4: a manifest-only import (a non-Lex repo) has NO declarations,
-        // so it has no source tree to render: skip the synthetic empty `src.lex`
-        // the renderer would otherwise add, or the export could never be
-        // byte-identical to the imported tree. Gated on the commit being an
-        // origin-bearing one, so a native store exports exactly as before.
-        let tree = if origin_ids[idx].is_some() && map.is_empty() { Vec::new() } else { tree };
-        for (relpath, src) in tree {
-            let path = out_dir.join(&relpath);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&path, src)
-                .with_context(|| format!("writing {}", path.display()))?;
-        }
-
-        // The `remove_dir_all(src/)` above just wiped out any manifest file
-        // that happens to live *under* src/ (a non-`.lex` file nested there
-        // — only `src/**/*.lex` is op-log-reserved, so e.g. `src/data.bin`
-        // is a legal manifest path). Re-materialize those unconditionally,
-        // from the manifest now in force, *after* the clean — never before,
-        // or the wipe would take them right back out. This is the fix for
-        // the bug the design flagged: a naive per-commit full-manifest
-        // checkout done before the wipe loses anything nested under src/.
-        for (path, entry) in manifest.entries.iter().filter(|(p, _)| p.starts_with("src/")) {
-            write_manifest_entry(&store, &out_dir, path, entry)?;
-        }
-        // Everything else in the manifest lives outside src/, so it
-        // survived the wipe untouched — only touch disk for a path that
-        // actually changed between this commit and the last (removal,
-        // write, or chmod), per the §7 fidelity plan.
-        apply_manifest_diff(&store, &out_dir, &committed_manifest, &manifest)?;
-        committed_manifest = manifest.clone();
+        materialize(&store, &out_dir, &st.head(), &st.manifest, &committed_manifest, origin_ids[idx].is_some())?;
+        committed_manifest = st.manifest.clone();
 
         // Commit message: the intent prompt, else a kind summary.
         let origin_intent = origin_ids[idx].as_ref().map(|id| &origin_intents[id]);
@@ -250,17 +209,344 @@ pub fn cmd_export_git(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         commits += 1;
     }
 
-    let data = serde_json::json!({
+    let mut data = serde_json::json!({
         "out_dir": out_dir.display().to_string(),
         "branch": branch,
         "commits": commits,
     });
+    if incremental {
+        data["mode"] = "incremental".into();
+        data["resumed_from"] = resumed_from.clone().into();
+        data["exported_ops"] = exported_ops.into();
+        data["new_commits"] = commits.into();
+    }
     let out_for_text = out_dir.display().to_string();
     let branch_for_text = branch.clone();
-    acli::emit_or_text("export-git", data, fmt, move || {
-        println!("exported {commits} commit(s) from branch {branch_for_text} to {out_for_text}");
+    acli::emit_or_text("export-git", data, fmt, move || match (&resumed_from, incremental) {
+        (Some(op), true) if exported_ops == 0 => println!(
+            "nothing to export: {out_for_text} is already at op {op} (branch {branch_for_text})"
+        ),
+        (Some(op), true) => println!(
+            "exported {commits} new commit(s) ({exported_ops} op(s)) from branch {branch_for_text} to {out_for_text}, resuming after op {op}"
+        ),
+        _ => println!("exported {commits} commit(s) from branch {branch_for_text} to {out_for_text}"),
     });
     Ok(())
+}
+
+/// The exporter's cumulative state at some op: everything a full export has
+/// accumulated by then. Replaying ops through [`State::apply`] without
+/// committing reconstructs it at a resume point (#837 piece D).
+#[derive(Default)]
+struct State {
+    /// SigId → StageId at the head.
+    map: BTreeMap<String, String>,
+    /// Imports (`flat_imports` for the single-file render #895, `file_imports`
+    /// per source file for the multi-file render #894 slice 2b, local aliases
+    /// #909). Only the import maps of this `PackageHead` are used; `map` and
+    /// `sig_files` live beside it.
+    imports: lex_store::render::PackageHead,
+    /// SigId → the source file its declaration came from (from each
+    /// AddFunction/AddType's `in_file`). When every head stage has one, the
+    /// package was published multi-module and we de-flatten it back into a
+    /// `src/*.lex` tree; otherwise we render one `src.lex`.
+    sig_files: BTreeMap<String, String>,
+    /// The files manifest in force (#1007 PR 6): starts empty (a store with
+    /// no `SetFiles` op — the pre-#1007 shape — never touches it, so such a
+    /// store exports byte-identically to the pre-#1007 renderer). Updated
+    /// only by a `SetFiles` op; carried forward unchanged otherwise, exactly
+    /// like `Store::manifest_at`'s single-parent inheritance.
+    manifest: Manifest,
+}
+
+impl State {
+    /// Fold one op into the state. Returns the new manifest id when the op is a
+    /// `SetFiles` (for the commit's `Files:` trailer).
+    fn apply(&mut self, store: &Store, rec: &lex_vcs::OperationRecord) -> Result<Option<String>> {
+        apply_transition(&mut self.map, &rec.produces);
+        let mut set_files = None;
+        match &rec.op.kind {
+            OperationKind::AddFunction { sig_id, in_file: Some(f), .. }
+            | OperationKind::AddType { sig_id, in_file: Some(f), .. } => {
+                self.sig_files.insert(sig_id.clone(), f.clone());
+            }
+            OperationKind::AddImport { in_file, module, alias } => {
+                // The op omits the alias when it's the module's default;
+                // `PackageHead` reconstructs it the same way the store does,
+                // and keeps a local import (#909) out of the flat map.
+                self.imports.add_import(in_file, module, alias.as_deref());
+            }
+            OperationKind::RemoveImport { in_file, module } => {
+                self.imports.remove_import(in_file, module);
+            }
+            OperationKind::RenameSymbol { from, to, .. } => {
+                if let Some(f) = self.sig_files.remove(from) {
+                    self.sig_files.insert(to.clone(), f);
+                }
+            }
+            OperationKind::SetFiles { manifest: manifest_id } => {
+                self.manifest = store.get_manifest(manifest_id).map_err(|e| anyhow!("{e}"))?;
+                set_files = Some(manifest_id.clone());
+            }
+            _ => {}
+        }
+        Ok(set_files)
+    }
+
+    fn head(&self) -> lex_store::render::PackageHead {
+        lex_store::render::PackageHead {
+            map: self.map.clone(),
+            sig_files: self.sig_files.clone(),
+            flat_imports: self.imports.flat_imports.clone(),
+            file_imports: self.imports.file_imports.clone(),
+        }
+    }
+}
+
+/// Write the tree a commit at this state holds into `out_dir`. `committed` is
+/// the manifest the directory currently reflects (the last landed commit), the
+/// base for the manifest's on-disk delta; pass an empty one for a fresh dir.
+fn materialize(
+    store: &Store,
+    out_dir: &Path,
+    head: &lex_store::render::PackageHead,
+    manifest: &Manifest,
+    committed: &Manifest,
+    origin_commit: bool,
+) -> Result<()> {
+    // Start each commit from a clean tree so a stage moving files, or a
+    // file emptying out, is reflected (git add -A then picks up the net
+    // change). Cheap relative to the op replay itself.
+    let _ = std::fs::remove_file(out_dir.join("src.lex"));
+    let _ = std::fs::remove_dir_all(out_dir.join("src"));
+
+    // Render the head via the shared `lex-store` renderer — the same code
+    // the hosted registry's archive endpoint uses, so the git view and an
+    // installed package are byte-identical source (#894).
+    // #988: the single-module arm now carries its own path, so the mirror
+    // keeps a package's real module name instead of renaming it to `lib`.
+    let tree: Vec<(String, String)> = match lex_store::render::render_source(store, head)? {
+        // The mirror's own convention for a head that records no file:
+        // `src.lex` at the repo root, as it has always been (#988).
+        lex_store::render::RenderedSource::Single { path, src } => {
+            vec![(path.unwrap_or_else(|| "src.lex".to_string()), src)]
+        }
+        lex_store::render::RenderedSource::Multi(tree) => tree.into_iter().collect(),
+    };
+    // #892 PR 4: a manifest-only import (a non-Lex repo) has NO declarations,
+    // so it has no source tree to render: skip the synthetic empty `src.lex`
+    // the renderer would otherwise add, or the export could never be
+    // byte-identical to the imported tree. Gated on the commit being an
+    // origin-bearing one, so a native store exports exactly as before.
+    let tree = if origin_commit && head.map.is_empty() { Vec::new() } else { tree };
+    for (relpath, src) in tree {
+        let path = out_dir.join(&relpath);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, src)
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
+
+    // The `remove_dir_all(src/)` above just wiped out any manifest file
+    // that happens to live *under* src/ (a non-`.lex` file nested there
+    // — only `src/**/*.lex` is op-log-reserved, so e.g. `src/data.bin`
+    // is a legal manifest path). Re-materialize those unconditionally,
+    // from the manifest now in force, *after* the clean — never before,
+    // or the wipe would take them right back out. This is the fix for
+    // the bug the design flagged: a naive per-commit full-manifest
+    // checkout done before the wipe loses anything nested under src/.
+    for (path, entry) in manifest.entries.iter().filter(|(p, _)| p.starts_with("src/")) {
+        write_manifest_entry(store, out_dir, path, entry)?;
+    }
+    // Everything else in the manifest lives outside src/, so it
+    // survived the wipe untouched — only touch disk for a path that
+    // actually changed between this commit and the last (removal,
+    // write, or chmod), per the §7 fidelity plan.
+    apply_manifest_diff(store, out_dir, committed, manifest)
+}
+
+/// True when `dir` is a git repo whose `HEAD` names a commit (an existing repo
+/// with no commit yet is treated like a fresh directory).
+fn has_head(dir: &Path) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--verify", "-q", "HEAD^{commit}"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// The index in `records` of the op `HEAD` was exported at, i.e. where an
+/// incremental export resumes (ops after it are appended). Refuses — with
+/// nothing touched — when appending would not be a pure extension:
+///
+/// - the working tree is dirty or holds untracked files (ignored ones
+///   included: the commit loop force-adds, so they would be committed);
+/// - `HEAD` carries no `Op:` trailer (a commit this tool did not write);
+/// - the `Op:` op is not on the store branch's history (the branch was
+///   rewritten, is a different branch, or the repo came from another store);
+/// - `HEAD`'s `Intent:` trailer disagrees with that op's intent.
+///
+/// The trailers are read with `git interpret-trailers --parse --no-divider`,
+/// i.e. from the message's LAST paragraph only (`--no-divider`: a `---` line in
+/// an origin-bearing verbatim body must not cut parsing short; and forged
+/// `Op:`-like lines in that body are earlier paragraphs, never read).
+fn resume_point(dir: &Path, records: &[lex_vcs::OperationRecord], branch: &str) -> Result<usize> {
+    let dirty = git_out(dir, &["status", "--porcelain", "--ignored", "--untracked-files=all"])?;
+    if !dirty.trim().is_empty() {
+        let shown: Vec<&str> = dirty.lines().take(10).collect();
+        bail!(
+            "refusing to export incrementally: {} has uncommitted changes or untracked files \
+             (commit, stash or remove them first):\n{}",
+            dir.display(),
+            shown.join("\n")
+        );
+    }
+    let message = git_out(dir, &["log", "-1", "--format=%B", "HEAD"])?;
+    let trailers = parse_trailers(&message)?;
+    let ops: Vec<&str> = trailers
+        .iter()
+        .filter(|(k, _)| k == "Op")
+        .map(|(_, v)| v.as_str())
+        .collect();
+    let marker = match ops.as_slice() {
+        [op] => *op,
+        [] => bail!(
+            "refusing to export incrementally: HEAD of {} has no `Op:` trailer, so it was not \
+             written by `lex export-git` (a foreign commit); export into a fresh directory instead",
+            dir.display()
+        ),
+        _ => bail!(
+            "refusing to export incrementally: HEAD of {} has {} `Op:` trailers; cannot tell \
+             which op it was exported at",
+            dir.display(),
+            ops.len()
+        ),
+    };
+    let Some(idx) = records.iter().position(|r| r.op_id == marker) else {
+        bail!(
+            "refusing to export incrementally: op {marker} (HEAD's `Op:` trailer) is not on the \
+             history of store branch `{branch}`. The branch was rewritten, is a different branch, \
+             or {} was exported from another store. History is never rewritten: export into a \
+             fresh directory instead.",
+            dir.display()
+        );
+    };
+    let want_intent = records[idx].op.intent_id.as_deref();
+    let have_intent = trailers.iter().find(|(k, _)| k == "Intent").map(|(_, v)| v.as_str());
+    if want_intent != have_intent {
+        bail!(
+            "refusing to export incrementally: HEAD's `Intent:` trailer ({}) does not match the \
+             intent of op {marker} on branch `{branch}` ({}); the repo does not belong to this history",
+            have_intent.unwrap_or("none"),
+            want_intent.unwrap_or("none"),
+        );
+    }
+    Ok(idx)
+}
+
+/// `key: value` pairs of a commit message's trailer block, via git itself.
+fn parse_trailers(message: &str) -> Result<Vec<(String, String)>> {
+    use std::io::Write;
+    let mut child = Command::new("git")
+        .args(["interpret-trailers", "--parse", "--no-divider"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("running git interpret-trailers")?;
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(message.as_bytes())
+        .context("writing the message to git interpret-trailers")?;
+    let out = child.wait_with_output().context("waiting for git interpret-trailers")?;
+    if !out.status.success() {
+        bail!("git interpret-trailers failed: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .collect())
+}
+
+/// A scratch directory removed on drop.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new() -> Result<Scratch> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let p = std::env::temp_dir().join(format!("lex-export-verify-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&p).with_context(|| format!("creating {}", p.display()))?;
+        Ok(Scratch(p))
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// `path → (mode, blob)` of every entry in `HEAD`'s tree in `dir`, or of the
+/// tree `treeish` names.
+fn tree_entries(dir: &Path, treeish: &str) -> Result<BTreeMap<String, (String, String)>> {
+    let raw = git_out(dir, &["ls-tree", "-r", "-z", treeish])?;
+    let mut out = BTreeMap::new();
+    for rec in raw.split('\0').filter(|r| !r.is_empty()) {
+        // "<mode> <type> <oid>\t<path>"
+        let (meta, path) = rec.split_once('\t').ok_or_else(|| anyhow!("unparseable ls-tree entry"))?;
+        let mut m = meta.split(' ');
+        let (mode, _kind, oid) = (m.next().unwrap_or(""), m.next(), m.next().unwrap_or(""));
+        out.insert(path.to_string(), (mode.to_string(), oid.to_string()));
+    }
+    Ok(out)
+}
+
+/// The safety check for an incremental export: the repo's `HEAD` tree must
+/// equal what the store renders at the resume point. Renders `st` into a
+/// scratch repo (with the same `git add -A -f` the commit loop uses, so a
+/// force-added file counts) and compares the two trees entry by entry — path,
+/// mode and blob id, which is exactly tree-id equality. A mismatch (someone
+/// edited the mirror by hand) is refused with a diff summary.
+fn verify_tree(store: &Store, out_dir: &Path, st: &State, origin_commit: bool) -> Result<()> {
+    let scratch = Scratch::new()?;
+    materialize(store, &scratch.0, &st.head(), &st.manifest, &Manifest::new(), origin_commit)?;
+    run_git(&scratch.0, &["init", "-q"])?;
+    run_git(&scratch.0, &["add", "-A", "-f"])?;
+    let tree_id = git_out(&scratch.0, &["write-tree"])?;
+    let want = tree_entries(&scratch.0, tree_id.trim())?;
+    let have = tree_entries(out_dir, "HEAD")?;
+    if want == have {
+        return Ok(());
+    }
+    let mut diff: Vec<String> = Vec::new();
+    for (path, w) in &want {
+        match have.get(path) {
+            None => diff.push(format!("  missing from the repo: {path}")),
+            Some(h) if h != w => diff.push(format!("  differs: {path}")),
+            Some(_) => {}
+        }
+    }
+    for path in have.keys().filter(|p| !want.contains_key(*p)) {
+        diff.push(format!("  not in the store's rendering: {path}"));
+    }
+    let total = diff.len();
+    diff.truncate(20);
+    bail!(
+        "refusing to export incrementally: the HEAD tree of {} is not what the store renders at \
+         its `Op:` ({total} path(s) differ) — the repo was edited outside `lex export-git`. \
+         Restore it, or pass --no-verify to append anyway:\n{}",
+        out_dir.display(),
+        diff.join("\n")
+    );
 }
 
 
@@ -520,6 +806,20 @@ fn apply_manifest_diff(store: &Store, out_dir: &Path, old: &Manifest, new: &Mani
         }
     }
     Ok(())
+}
+
+/// Run git in `dir` and return its stdout (lossy UTF-8).
+fn git_out(dir: &Path, args: &[&str]) -> Result<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .with_context(|| format!("running git {}", args.join(" ")))?;
+    if !out.status.success() {
+        bail!("git {} failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 fn run_git(dir: &std::path::Path, args: &[&str]) -> Result<()> {

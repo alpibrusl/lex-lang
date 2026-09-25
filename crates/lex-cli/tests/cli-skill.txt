@@ -18,6 +18,7 @@ description: "Invoke the `lex` CLI. Commands: parse, check, authority, run…"
 - `lex blame` — show each fn's stage history from the store (idempotent)
 - `lex publish` — publish each stage in a file to the store as Draft
 - `lex files` — work with the files manifest directly (#1007): the store's non-op-log files (README, lex.toml, lex.lock, tests/, ...)
+- `lex ws` — local-first workspace commands (#837): write typed edits straight through the op log of an on-disk store, no text edit + publish
 - `lex store` — browse the content-addressed code store
 - `lex stage` — print stage info, or list attestations for a stage (idempotent)
 - `lex attest` — cross-stage attestation queries (CI / dashboards)
@@ -315,6 +316,19 @@ lex files checkout /tmp/out
 ```
 
 **See also:** `lex publish`, `lex store`
+
+## `lex ws`
+
+local-first workspace commands (#837): write typed edits straight through the op log of an on-disk store, no text edit + publish
+
+### Examples
+
+```bash
+# Inline a let binding
+lex ws transform --branch main inline_let --json '{"from_stage_id":"<stage>","let_node":"n_0.2"}'
+```
+
+**See also:** `lex publish`, `lex files`, `lex repair`, `lex op`
 
 ## `lex store`
 
@@ -1213,6 +1227,8 @@ render a branch's op history as a git repo (#837)
 
 - `--branch` (string) — branch to export (default: current)
 - `--store` (string) — store root directory
+- `--incremental` (bool) — append only the ops after HEAD's `Op:` trailer to an existing export; never rewrites history
+- `--no-verify` (bool) — with --incremental: skip checking that the repo's HEAD tree matches the store at that op
 
 ### Arguments
 
@@ -1228,6 +1244,11 @@ lex export-git ./export
 ```bash
 # Export a feature branch
 lex export-git ./out --branch feature
+```
+
+```bash
+# Append new ops to an existing export
+lex export-git ./export --incremental
 ```
 
 ## `lex plan`
