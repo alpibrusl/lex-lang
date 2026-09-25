@@ -25,7 +25,7 @@ fn lex_bin() -> std::path::PathBuf {
 
 struct Server {
     addr: SocketAddr,
-    _tmp: TempDir,
+    tmp: TempDir,
 }
 
 fn start_server() -> Server {
@@ -38,7 +38,7 @@ fn start_server() -> Server {
     let state = Arc::new(State::open(tmp.path().to_path_buf()).unwrap());
     thread::spawn(move || lex_api::serve_on(server, state));
     thread::sleep(Duration::from_millis(50));
-    Server { addr, _tmp: tmp }
+    Server { addr, tmp }
 }
 
 fn run(args: &[&str]) -> std::process::Output {
@@ -93,4 +93,58 @@ fn op_pull_syncs_hosted_ci_attestations() {
         listing.contains("lex-hub-ci") && listing.contains("type_check") && listing.contains("passed"),
         "pulled store must carry the hosted-CI TypeCheck attestation, got:\n{listing}"
     );
+}
+
+/// H1 (lex-hub M3 hardening): a pulled store keeps the remote's ARRIVAL order
+/// of review verdicts (each pulled attestation gets a local stamp at pull
+/// time), so a forged future-dated Approve that arrived before the owner's
+/// Reject on the remote does not come out on top locally.
+#[test]
+fn op_pull_preserves_remote_arrival_order_of_review_verdicts() {
+    use lex_vcs::{Attestation, AttestationKind, AttestationLog, AttestationResult, ProducerDescriptor, ReviewVerdict};
+
+    let srv = start_server();
+    let url = format!("http://{}", srv.addr);
+    let tmp = TempDir::new().unwrap();
+    let author = tmp.path().join("author");
+    let consumer = tmp.path().join("consumer");
+    let src = tmp.path().join("lib.lex");
+    std::fs::write(&src, "fn triple(x :: Int) -> Int { x * 3 }\n").unwrap();
+    assert!(run(&["publish", "--store", author.to_str().unwrap(), "--branch", "main", "--activate", src.to_str().unwrap()]).status.success());
+    assert!(run(&["op", "push", &url, "--store", author.to_str().unwrap()]).status.success());
+
+    // The server's store: find the pushed stage, then append two verdicts
+    // in a known arrival order with timestamps that disagree with it.
+    let server_log = AttestationLog::open(srv.tmp.path()).unwrap();
+    let stage_id = server_log.list_all().unwrap().first().expect("hub-ci attestation").stage_id.clone();
+    let verdict = |v: ReviewVerdict, who: &str, ts: u64| {
+        let result = match v {
+            ReviewVerdict::Approve => AttestationResult::Passed,
+            _ => AttestationResult::Failed { detail: "no".into() },
+        };
+        Attestation::with_timestamp(
+            stage_id.clone(), None, None,
+            AttestationKind::Review { reviewer: who.into(), verdict: v, notes: None },
+            result,
+            ProducerDescriptor { tool: format!("t:{who}"), version: "0".into(), model: None },
+            None, ts,
+        )
+    };
+    server_log.put(&verdict(ReviewVerdict::Approve, "mallory", u64::MAX / 2)).unwrap();
+    server_log.put(&verdict(ReviewVerdict::Reject, "owner", 1)).unwrap();
+
+    assert!(run(&["op", "pull", &url, "--store", consumer.to_str().unwrap()]).status.success());
+    let store = lex_store::Store::open(&consumer).unwrap();
+    assert_eq!(
+        store.latest_review_verdict(&stage_id).unwrap(),
+        Some(ReviewVerdict::Reject),
+        "pull must keep the remote's arrival order, not re-derive it from timestamps"
+    );
+    let clog = store.attestation_log().unwrap();
+    for a in clog.list_for_stage(&stage_id).unwrap() {
+        assert!(
+            clog.arrival_seq(&a.attestation_id).unwrap().is_some(),
+            "pulled attestation must carry a LOCAL arrival stamp"
+        );
+    }
 }

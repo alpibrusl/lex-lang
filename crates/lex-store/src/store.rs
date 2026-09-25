@@ -3462,23 +3462,34 @@ impl Store {
     }
 
     /// The latest `Review` verdict recorded on a stage, if any
-    /// (#836 G4). "Latest" is by attestation timestamp; ties keep the
-    /// last one seen. Used by `promote_candidate` to honor a standing
-    /// Reject.
+    /// (#836 G4). "Latest" is **arrival order** in the attestation
+    /// log — a server-assigned sequence number — NOT the
+    /// attestation's `timestamp`, which the writer chooses and which
+    /// is excluded from the attestation id. So a verdict pushed with a
+    /// far-future timestamp does not outrank one that actually arrived
+    /// later. Legacy attestations with no arrival stamp order by
+    /// timestamp among themselves and below every stamped one; see
+    /// [`lex_vcs::AttestationLog::sort_by_arrival`]. Used by
+    /// `promote_candidate` to honor a standing Reject.
+    ///
+    /// This fixes *ordering* only. It does not authenticate who wrote a
+    /// verdict: any writer that can reach the log can still append a
+    /// later one.
     pub fn latest_review_verdict(
         &self,
         stage_id: &str,
     ) -> Result<Option<lex_vcs::ReviewVerdict>, StoreError> {
         let log = self.attestation_log()?;
-        let mut latest: Option<(u64, lex_vcs::ReviewVerdict)> = None;
-        for a in log.list_for_stage(&stage_id.to_string())? {
-            if let lex_vcs::AttestationKind::Review { verdict, .. } = a.kind {
-                if latest.as_ref().map(|(t, _)| a.timestamp >= *t).unwrap_or(true) {
-                    latest = Some((a.timestamp, verdict));
-                }
-            }
-        }
-        Ok(latest.map(|(_, v)| v))
+        // Oldest first; the last Review in that order is the latest.
+        let latest = log
+            .list_for_stage_by_arrival(&stage_id.to_string())?
+            .into_iter()
+            .rev()
+            .find_map(|a| match a.kind {
+                lex_vcs::AttestationKind::Review { verdict, .. } => Some(verdict),
+                _ => None,
+            });
+        Ok(latest)
     }
 
     /// Consult `policy.session_budgets` for the op's session
@@ -4750,13 +4761,19 @@ fn typecheck_producer() -> lex_vcs::ProducerDescriptor {
     }
 }
 
+/// The `produced_by.tool` name of the hub's own server-side CI
+/// attestations (see [`Store::verify_head_and_attest`]). Exported so an
+/// embedder can reserve it (`lex_api::State::with_reserved_producers`)
+/// without duplicating the string.
+pub const HUB_CI_PRODUCER_TOOL: &str = "lex-hub-ci";
+
 /// Producer for attestations the hosted CI runner writes (#93). A
 /// distinct tool name so a `require-attestation` gate — via the
 /// producer-trust model — can weight "the hub verified this
 /// server-side" above a client-attached `TypeCheck`.
 fn hub_ci_producer() -> lex_vcs::ProducerDescriptor {
     lex_vcs::ProducerDescriptor {
-        tool: "lex-hub-ci".into(),
+        tool: HUB_CI_PRODUCER_TOOL.into(),
         version: env!("CARGO_PKG_VERSION").into(),
         model: None,
     }
@@ -4866,11 +4883,22 @@ fn examples_producer() -> lex_vcs::ProducerDescriptor {
     }
 }
 
+/// Prefix of the `produced_by.tool` of `Review` attestations
+/// ([`Store::record_review`]); the suffix is the reviewer name, so it is
+/// variable. An embedder that stamps reviewer identity server-side reserves
+/// the whole family with [`REVIEW_PRODUCER_RESERVATION`].
+pub const REVIEW_PRODUCER_PREFIX: &str = "lex-store::review:";
+
+/// [`REVIEW_PRODUCER_PREFIX`] as a `lex_api::State::with_reserved_producers`
+/// entry (a trailing `*` means "prefix"), so a client cannot post `Review`
+/// attestations of its own through `POST /v1/attestations/batch`.
+pub const REVIEW_PRODUCER_RESERVATION: &str = "lex-store::review:*";
+
 /// Producer identity for `Review` attestations (#836). The reviewer's
 /// own id lives in the kind; this records which tool minted the record.
 fn review_producer(reviewer: &str) -> lex_vcs::ProducerDescriptor {
     lex_vcs::ProducerDescriptor {
-        tool: format!("lex-store::review:{reviewer}"),
+        tool: format!("{REVIEW_PRODUCER_PREFIX}{reviewer}"),
         version: env!("CARGO_PKG_VERSION").into(),
         model: None,
     }

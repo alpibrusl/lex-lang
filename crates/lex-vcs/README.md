@@ -212,6 +212,8 @@ before writing code that depends on a hash being stable.
 <root>/intents/<IntentId>.json
 <root>/attestations/<AttestationId>.json         # source of truth
 <root>/attestations/by-stage/<StageId>/<id>      # index (rebuildable)
+<root>/attestations/arrival/<id>                 # server-assigned arrival seq (NOT rebuildable)
+<root>/attestations/arrival.{seq,lock}           # sequence counter + its lock
 ```
 
 All writes are atomic (tempfile + rename) and idempotent on existing
