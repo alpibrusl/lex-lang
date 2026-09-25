@@ -79,6 +79,7 @@ fn rename_symbol() -> Operation {
             from: "parse::Str->Int".into(),
             to: "parse_int::Str->Int".into(),
             body_stage_id: "abc123".into(),
+            in_file: None,
         },
         ["op-parent".into()],
     )

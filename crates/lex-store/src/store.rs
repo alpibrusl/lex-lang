@@ -4893,6 +4893,7 @@ pub fn transition_for_kind(kind: &lex_vcs::OperationKind) -> lex_vcs::StageTrans
             from,
             to,
             body_stage_id,
+            ..
         } => StageTransition::Rename {
             from: from.clone(),
             to: to.clone(),

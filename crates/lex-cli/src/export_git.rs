@@ -280,16 +280,14 @@ impl State {
             OperationKind::RemoveImport { in_file, module } => {
                 self.imports.remove_import(in_file, module);
             }
-            OperationKind::RenameSymbol { from, to, .. } => {
-                if let Some(f) = self.sig_files.remove(from) {
-                    self.sig_files.insert(to.clone(), f);
-                }
-            }
             OperationKind::SetFiles { manifest: manifest_id } => {
                 self.manifest = store.get_manifest(manifest_id).map_err(|e| anyhow!("{e}"))?;
                 set_files = Some(manifest_id.clone());
             }
-            _ => {}
+            // A rename, and (#992) any sig-moving modification, carries its
+            // file to the new sig; a rename that moved the file also says
+            // where it went (#1060). See `carry_sig_file`.
+            other => lex_store::render::carry_sig_file(&mut self.sig_files, other),
         }
         Ok(set_files)
     }

@@ -125,21 +125,35 @@ pub fn package_head_at_op(store: &Store, head_op: &str) -> Result<PackageHead, S
             OperationKind::RemoveImport { in_file, module } => {
                 head.remove_import(in_file, module);
             }
-            // #992: a sig-moving modification carries its file across exactly
-            // as a rename does — otherwise the moved declaration loses its
-            // `in_file`, and a multi-module package silently renders as one.
-            OperationKind::RenameSymbol { from, to, .. }
-            | OperationKind::ChangeEffectSig { sig_id: from, to_sig_id: Some(to), .. }
-            | OperationKind::ModifyBody { sig_id: from, to_sig_id: Some(to), .. }
-            | OperationKind::ModifyType { sig_id: from, to_sig_id: Some(to), .. } => {
-                if let Some(f) = head.sig_files.remove(from) {
-                    head.sig_files.insert(to.clone(), f);
-                }
-            }
-            _ => {}
+            other => carry_sig_file(&mut head.sig_files, other),
         }
     }
     Ok(head)
+}
+
+/// Move a declaration's source file from the sig an op retires to the sig it
+/// binds — the one place that knows which ops do that, shared by
+/// [`package_head_at_op`] and `export-git`'s incremental head tracker so the
+/// two cannot drift.
+///
+/// * #992: a sig-moving modification carries its file across exactly as a
+///   rename does — otherwise the moved declaration loses its `in_file`, and a
+///   multi-module package silently renders as one.
+/// * #1060: a rename that also moved the file says where it went. A moved file
+///   renames every declaration in it (the mangling prefix is path-derived), so
+///   keeping the *old* file rendered the declaration back into a path that no
+///   longer exists.
+pub fn carry_sig_file(sig_files: &mut BTreeMap<String, String>, kind: &OperationKind) {
+    let (from, to, moved_to) = match kind {
+        OperationKind::RenameSymbol { from, to, in_file, .. } => (from, to, in_file.as_ref()),
+        OperationKind::ChangeEffectSig { sig_id: from, to_sig_id: Some(to), .. }
+        | OperationKind::ModifyBody { sig_id: from, to_sig_id: Some(to), .. }
+        | OperationKind::ModifyType { sig_id: from, to_sig_id: Some(to), .. } => (from, to, None),
+        _ => return,
+    };
+    if let Some(old) = sig_files.remove(from) {
+        sig_files.insert(to.clone(), moved_to.cloned().unwrap_or(old));
+    }
 }
 
 /// Render a package head to source. Multi-module iff every head fn/type stage

@@ -178,7 +178,7 @@ fn latest_stage(sig: &SigId, recs: &[&OperationRecord]) -> Option<StageId> {
     let mut current: Option<StageId> = None;
     for r in recs {
         // For renames: distinguish which side of the rename we're on.
-        if let OK::RenameSymbol { from, to, body_stage_id } = &r.op.kind {
+        if let OK::RenameSymbol { from, to, body_stage_id, .. } = &r.op.kind {
             if sig == from {
                 // From this sig's perspective, the rename removed it.
                 current = None;
@@ -351,6 +351,7 @@ mod tests {
                 from: "fac".into(),
                 to: "fac2".into(),
                 body_stage_id: "s0".into(),
+                in_file: None,
             },
             [root.clone()],
         );

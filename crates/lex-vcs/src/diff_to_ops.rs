@@ -188,10 +188,21 @@ pub fn diff_to_ops(inputs: DiffInputs<'_>) -> Result<Vec<OperationKind>, DiffMap
         let Some(body_id) = stage_id(stage) else {
             return Err(DiffMappingError::NoStageIdForStage(r.to.clone()));
         };
+        // #1060: a moved file renames every declaration in it (the mangling
+        // prefix is path-derived) but the rename op is body-preserving, so it
+        // has to say where the declaration went. Recorded only when the prefix
+        // changed: an in-place rename in a multi-file package, and every
+        // single-file one, keep the exact op — and OpId — they always had.
+        let in_file = if name_prefix(&r.from) != name_prefix(&r.to) {
+            origin_file(&r.to, inputs.module_prefixes)
+        } else {
+            None
+        };
         out.push(OperationKind::RenameSymbol {
             from: from_sig.clone(),
             to: to_sig,
             body_stage_id: body_id,
+            in_file,
         });
     }
 
@@ -291,8 +302,12 @@ fn effect_set(effs: &[Effect]) -> EffectSet {
 /// file. A single-file publish leaves names unmangled and passes an
 /// empty map, so this is `None` and the op's `in_file` is omitted.
 fn origin_file(name: &str, module_prefixes: &BTreeMap<String, String>) -> Option<String> {
-    let prefix = name.split_once('.')?.0;
-    module_prefixes.get(prefix).cloned()
+    module_prefixes.get(name_prefix(name)?).cloned()
+}
+
+/// The mangling prefix of a `<prefix>.<local>` name; `None` for a bare name.
+fn name_prefix(name: &str) -> Option<&str> {
+    name.split_once('.').map(|(prefix, _)| prefix)
 }
 
 /// The alias to record on an `AddImport`, or `None` when it is just the
@@ -372,13 +387,71 @@ mod tests {
         }).expect("ok");
         assert_eq!(ops.len(), 1);
         match &ops[0] {
-            OperationKind::RenameSymbol { from, to, body_stage_id } => {
+            OperationKind::RenameSymbol { from, to, body_stage_id, in_file } => {
+                assert_eq!(in_file, &None, "a single-file rename records no file");
                 assert_eq!(from, "parse-old-sig");
                 assert_eq!(to, &to_sig);
                 assert_eq!(body_stage_id, &to_stage);
             }
             other => panic!("expected RenameSymbol, got {other:?}"),
         }
+    }
+
+    /// The `in_file` of the one `RenameSymbol` a `from` -> `to` rename emits
+    /// under `prefixes`. Names are mangled (`<prefix>.<local>`), the way a
+    /// package publish names them.
+    fn rename_in_file(from: &str, to: &str, prefixes: &[(&str, &str)]) -> Option<String> {
+        let prog = lex_syntax::load_program_from_str("fn f(s :: Str) -> Int { 0 }").unwrap();
+        let mut stage = lex_ast::canonicalize_program(&prog).into_iter().next().unwrap();
+        if let Stage::FnDecl(fd) = &mut stage {
+            fd.name = to.to_string();
+        }
+        let mut head = BTreeMap::new();
+        head.insert("old-sig".to_string(), stage_id(&stage).unwrap());
+        let mut diff = dr();
+        diff.renamed.push(Renamed {
+            from: from.into(),
+            to: to.into(),
+            signature: String::new(),
+            old_sig_id: "old-sig".into(),
+        });
+        let prefixes: BTreeMap<String, String> =
+            prefixes.iter().map(|(p, f)| (p.to_string(), f.to_string())).collect();
+        let (eff, oi, ni) = (BTreeMap::new(), ImportMap::new(), ImportMap::new());
+        let ops = diff_to_ops(DiffInputs {
+            old_head: &head,
+            old_effects: &eff,
+            old_imports: &oi,
+            new_stages: &[stage],
+            new_imports: &ni,
+            diff: &diff,
+            module_prefixes: &prefixes,
+        })
+        .expect("ok");
+        match ops.as_slice() {
+            [OperationKind::RenameSymbol { in_file, .. }] => in_file.clone(),
+            other => panic!("expected one RenameSymbol, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_rename_that_moved_the_file_records_where_it_went() {
+        // `src/util.lex` -> `src/lib/util.lex`: the path-derived prefix changes.
+        assert_eq!(
+            rename_in_file("util_aaaaaa.add", "util_bbbbbb.add", &[("util_bbbbbb", "src/lib/util.lex")]),
+            Some("src/lib/util.lex".to_string()),
+        );
+    }
+
+    #[test]
+    fn an_in_place_rename_records_no_file_so_its_opid_is_unchanged() {
+        // Same file, same prefix: byte-identical to a pre-#1060 rename.
+        assert_eq!(
+            rename_in_file("util_aaaaaa.add", "util_aaaaaa.plus", &[("util_aaaaaa", "src/util.lex")]),
+            None,
+        );
+        // A single-file publish has no prefixes at all.
+        assert_eq!(rename_in_file("add", "plus", &[]), None);
     }
 
     #[test]

@@ -58,10 +58,38 @@ pub(crate) fn stages_batch_handler(state: &State, body: &str) -> Response<Cursor
     }))
 }
 
-/// `POST /v1/stages/fetch` — return stage blobs for a set of ids. Body:
-/// `{ "ids": ["<stage_id>", ...] }`. Returns a JSON array of the `Stage`s
-/// present (missing ids are silently omitted; the caller reconciles).
+/// `POST /v1/stages/fetch` — return stage blobs. Body: `{ "ids":
+/// ["<stage_id>", ...] }`, or (#1060) `{ "pairs": [["<sig_id>", "<stage_id>"],
+/// ...] }`. Returns a JSON array of the `Stage`s present (missing entries are
+/// silently omitted; the caller reconciles).
+///
+/// A StageId does not encode the name (#826), so a rename leaves the *same*
+/// StageId under two sigs holding two different ASTs. By id the store can only
+/// answer with the one variant `stage_index` names, so a peer asking for the
+/// renamed variant got the old one and filed it under the old sig — the pulled
+/// head then named a `(sig, stage)` pair nothing had ever supplied. `pairs`
+/// resolves each entry through the sig it names, exactly as the render does,
+/// and wins when both keys are present (an up-to-date client sends both so an
+/// older hub, which only reads `ids`, still answers).
 pub(crate) fn stages_fetch_handler(state: &State, body: &str) -> Response<Cursor<Vec<u8>>> {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(arr) = v.get("pairs").and_then(|p| p.as_array()) {
+            let pairs: Vec<(String, String)> = arr
+                .iter()
+                .filter_map(|p| {
+                    let a = p.as_array()?;
+                    Some((a.first()?.as_str()?.to_string(), a.get(1)?.as_str()?.to_string()))
+                })
+                .collect();
+            let store = state.store.lock().unwrap();
+            let stages: Vec<Stage> = store
+                .get_asts_for_sigs_bulk(&pairs)
+                .into_iter()
+                .filter_map(Result::ok)
+                .collect();
+            return json_response(200, &serde_json::json!({ "stages": stages }));
+        }
+    }
     let ids = match parse_ids(body) {
         Ok(ids) => ids,
         Err(resp) => return resp,

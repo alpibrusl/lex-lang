@@ -1307,16 +1307,27 @@ fn pull_objects(
         }
     }
     let pairs: Vec<(String, String)> = pairs.into_iter().collect();
-    let mut want_stages: BTreeSet<String> = BTreeSet::new();
-    for (have, (_sig, stage)) in store.get_asts_for_sigs_bulk(&pairs).into_iter().zip(&pairs) {
-        if have.is_err() {
-            want_stages.insert(stage.clone());
-        }
-    }
+    let want_pairs: Vec<(String, String)> = store
+        .get_asts_for_sigs_bulk(&pairs)
+        .into_iter()
+        .zip(pairs)
+        .filter(|(have, _)| have.is_err())
+        .map(|(_, pair)| pair)
+        .collect();
     let mut stages_added = 0usize;
-    let want_stages: Vec<String> = want_stages.into_iter().collect();
-    for chunk in want_stages.chunks(FETCH_CHUNK) {
-        let v = post_json(remote, "/v1/stages/fetch", &serde_json::json!({ "ids": chunk }), token)?;
+    for chunk in want_pairs.chunks(FETCH_CHUNK) {
+        // #1060: ask for the `(sig, stage)` pairs, not just the ids. A rename
+        // shares one StageId across two sigs holding two ASTs, and by id the
+        // hub can only answer with one of them — the pulled head then named a
+        // pair that was never supplied. `ids` rides along so a hub that
+        // predates `pairs` (it only reads `ids`) still answers.
+        let ids: BTreeSet<&String> = chunk.iter().map(|(_, stage)| stage).collect();
+        let v = post_json(
+            remote,
+            "/v1/stages/fetch",
+            &serde_json::json!({ "ids": ids, "pairs": chunk }),
+            token,
+        )?;
         if let Some(arr) = v.get("stages").and_then(|s| s.as_array()) {
             for sv in arr {
                 let stage: lex_ast::Stage = serde_json::from_value(sv.clone())?;
@@ -1349,6 +1360,24 @@ fn pull_objects(
     }
 
     Ok((stages_added, intents_added))
+}
+
+/// After a pull, say so if the head now names a `(sig, stage)` pair that no
+/// store can hold (#1060). That is what a hub serving `/v1/stages/fetch` by
+/// bare id (one that predates `pairs`) leaves behind for a renamed function: it
+/// answers with the pre-rename variant, and the head's renamed sig ends up
+/// bound to a stage filed under the old one. Advisory, never an error: a head
+/// already damaged upstream (a pre-#992 release) must stay pullable, and the
+/// pull itself is complete — it is the remote that cannot supply the pair.
+fn warn_if_head_unsatisfiable(store: &Store, branch: &str) {
+    let Ok(head) = store.branch_head(branch) else { return };
+    if let Err(e) = store.check_pairs_satisfiable(&head) {
+        eprintln!(
+            "warning: the pulled head is not renderable: {e}. The remote likely serves stages \
+             by id only and cannot supply a renamed declaration's own variant; upgrade the hub, \
+             then re-run `lex op pull --since <an op before the rename>` to fetch it."
+        );
+    }
 }
 
 /// The blob half of `op pull` (#1007 PR 5): fetch + store the blobs
@@ -1794,6 +1823,7 @@ fn cmd_op_pull(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     // path; for now we rely on the single-writer invariant.)
     fast_forward_branch_head(&root, &branch, &new_tip)
         .with_context(|| format!("advancing branch head to {new_tip}"))?;
+    warn_if_head_unsatisfiable(&store, &branch);
 
     // #930 P2b-1: fetch + store the committed lex.lock for the new tip, so the
     // write-time gate here can resolve this head's pinned dependencies the
