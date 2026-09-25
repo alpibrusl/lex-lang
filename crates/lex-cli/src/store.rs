@@ -1,8 +1,7 @@
-//! `lex publish` and `lex store *`: publishing stages into the content store, store maintenance and search.
+//! `lex publish` and `lex store *`: the publish CLI wrapper (the pipeline itself
+//! lives in `publish_core.rs`), store maintenance and search.
 
 use super::*;
-use lex_store::DepResolver; // #930: `resolve_modules` on the client resolver
-use lex_store::PublishOp;
 use lex_syntax::{load_package, Manifest};
 
 /// Read the source `lex publish` was given. A **directory** is a whole
@@ -17,9 +16,37 @@ pub(crate) fn read_publish_source(
     path: &str,
     inline_packages: bool,
 ) -> Result<(SynProgram, Option<lex_vcs::ImportMap>, BTreeMap<String, String>)> {
+    read_publish_source_opt(path, inline_packages, /*allow_empty=*/ false)
+}
+
+/// [`read_publish_source`], optionally accepting a package with no `.lex`
+/// sources as the **empty program** (#892 PR 1: an importer replaying a commit
+/// that deletes the package must be able to publish "nothing" so `diff_to_ops`
+/// emits the removals). Only an *absent* program is allowed: a package whose
+/// `src/` is missing or holds no `.lex` file. Sources that exist still need a
+/// valid `lex.toml`, exactly as before — `allow_empty` never papers over a
+/// half-present package. `lex publish` passes `false`, so running it in an
+/// empty package by mistake is still an error.
+pub(crate) fn read_publish_source_opt(
+    path: &str,
+    inline_packages: bool,
+    allow_empty: bool,
+) -> Result<(SynProgram, Option<lex_vcs::ImportMap>, BTreeMap<String, String>)> {
     let p = std::path::Path::new(path);
     if !p.is_dir() {
         return Ok((read_program(path)?, None, BTreeMap::new()));
+    }
+    if allow_empty {
+        let mut found: Vec<PathBuf> = Vec::new();
+        collect_lex_files(&p.join("src"), &mut found);
+        if found.is_empty() {
+            let empty = SynProgram {
+                items: Vec::new(),
+                leading_comments: Vec::new(),
+                trailing_comments: Vec::new(),
+            };
+            return Ok((empty, Some(lex_vcs::ImportMap::new()), BTreeMap::new()));
+        }
     }
     let manifest = Manifest::load(&p.join("lex.toml"))
         .map_err(|e| anyhow!("reading {path}/lex.toml (a package publish needs it): {e}"))?;
@@ -98,8 +125,6 @@ pub(crate) fn build_embedder(
 }
 
 pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
-    use lex_vcs::ImportMap;
-
     let (root, rest, activate, dry_run) = parse_store_flag(args);
     // Pull --branch and --signing-key off as well.
     let mut branch: Option<String> = None;
@@ -185,321 +210,78 @@ pub(super) fn cmd_publish(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     })?;
     let signer = resolve_signing_key(signing_key_flag.as_deref())?;
 
-    // A directory argument publishes the whole package (mangled, one op
-    // log, no sibling-name collisions); a file argument is a single
-    // module. `pkg_imports` is `Some` only for a package.
-    // #930: load without inlining registry/git deps, so the op-log keeps the
-    // `import` edges; the resolver below supplies their signatures to the gate.
-    let (prog, pkg_imports, module_prefixes) = read_publish_source(path, /*inline_packages=*/ false)?;
-    // #168: type-check *and* rewrite stdlib parse calls so a
-    // typed `toml.parse[T]` validates required fields before
-    // returning Ok. The mutation lands in the canonical AST so
-    // every downstream consumer (bytecode compile, store
-    // publish) sees the strict shape.
-    let mut stages = canonicalize_program(&prog);
-    // #930: resolve this head's external dependency signatures from the
-    // working copy, so the non-inlined head type-checks here exactly as the
-    // store gate will; the same resolver is installed on the store below.
-    let resolver = std::sync::Arc::new(crate::dep_resolver::ClientDepResolver::new(
-        std::path::PathBuf::from(path),
-    ));
-    let modules = resolver.resolve_modules(&stages, None);
-    let module_types = resolver.resolve_module_types(&stages, None);
-    let dep_prefixes = resolver.resolve_module_prefixes(&stages, None);
-    if let Err(errs) = lex_types::check_and_rewrite_program_with_deps(
-        &mut stages,
-        &modules,
-        &module_types,
-        &dep_prefixes,
-    ) {
-        let arr: Vec<serde_json::Value> = errs
-            .iter()
-            .map(|e| serde_json::to_value(e).unwrap())
-            .collect();
-        let data = serde_json::json!({ "phase": "type-check", "errors": arr });
-        acli::emit_or_text("publish", data, fmt, || {
-            for e in &errs {
-                if let Ok(j) = serde_json::to_string(e) {
-                    eprintln!("{j}");
-                }
-            }
-        });
-        std::process::exit(2);
-    }
-
-    // #835 Tier 1: behavioral example gate — run `examples {}` and refuse
-    // the publish on any mismatch, the same hard-error contract `lex check`
-    // uses. Type-level example checks already ran above.
-    //
-    // #930: examples RUN the code, so with external dependencies present they
-    // need those dependencies' *implementations* — the non-inlined `stages`
-    // above only carry the edges. Re-load with inlining for the example run;
-    // the op-log still gets the non-inlined `stages`. A dependency-free publish
-    // (the common case) skips the extra load — `stages` already inline
-    // everything local.
-    let example_stages = if modules.is_empty() {
-        stages.clone()
-    } else {
-        let (inlined_prog, _, _) = read_publish_source(path, /*inline_packages=*/ true)?;
-        let mut s = canonicalize_program(&inlined_prog);
-        // Rewrite parse calls in the inlined view too (deps inlined → no
-        // resolver needed); a type error here would have surfaced above.
-        let _ = lex_types::check_and_rewrite_program(&mut s);
-        s
-    };
-    let example_errors = lex_runtime::evaluate_examples(&example_stages);
-    if !example_errors.is_empty() {
-        let arr: Vec<serde_json::Value> = example_errors
-            .iter()
-            .map(|e| serde_json::to_value(e).unwrap())
-            .collect();
-        let data = serde_json::json!({ "phase": "examples", "errors": arr });
-        acli::emit_or_text("publish", data, fmt, || {
-            for e in &example_errors {
-                if let Ok(j) = serde_json::to_string(e) {
-                    eprintln!("{j}");
-                }
-            }
-        });
-        std::process::exit(2);
-    }
-
-    let mut store =
-        Store::open(&root).with_context(|| format!("opening store at {}", root.display()))?;
-    // #930 P2b-3: install the same client resolver on the store, so the
-    // write-time gate resolves this head's external deps exactly as the
-    // pre-check above did.
-    store.set_dep_resolver(resolver);
-    let branch = branch.unwrap_or_else(|| store.current_branch());
-
-    // Compute the diff. We need the old fns and new fns.
-    let old_head = store.branch_head(&branch)?;
-    // Read every live declaration through the `SigId` the head names it
-    // by — NOT by `StageId`. A `StageId` is name-independent, so two
-    // structurally identical helpers copy-pasted across a package's
-    // modules (`list_contains_str` in both `constraints.lex` and
-    // `migrate.lex`) share one `StageId`; reading the old side by
-    // `StageId` (`get_ast`) returns a single name for the pair and drops
-    // the other, so the diff re-adds it on every republish — unbounded op
-    // growth (#818/#826/#894). `get_asts_for_sigs_bulk` reads each
-    // `SigId`'s own stored AST, recovering the correct name for each. The
-    // HTTP publish path already reads the old side this way.
-    let head_pairs: Vec<(String, String)> = old_head
-        .iter()
-        .map(|(sig, stage)| (sig.clone(), stage.clone()))
-        .collect();
-    let mut old_fns: BTreeMap<String, lex_ast::FnDecl> = BTreeMap::new();
-    let mut old_types: BTreeMap<String, lex_ast::TypeDecl> = BTreeMap::new();
-    for ast in store
-        .get_asts_for_sigs_bulk(&head_pairs)
-        .into_iter()
-        .filter_map(|r| r.ok())
-    {
-        match ast {
-            Stage::FnDecl(fd) => {
-                old_fns.insert(fd.name.clone(), fd);
-            }
-            // Types too, so the op log captures `type`s (#895).
-            Stage::TypeDecl(td) => {
-                old_types.insert(td.name.clone(), td);
-            }
-            _ => {}
-        }
-    }
-    let new_fns: BTreeMap<String, lex_ast::FnDecl> = stages
-        .iter()
-        .filter_map(|s| match s {
-            Stage::FnDecl(fd) => Some((fd.name.clone(), fd.clone())),
-            _ => None,
-        })
-        .collect();
-    let new_types: BTreeMap<String, lex_ast::TypeDecl> = stages
-        .iter()
-        .filter_map(|s| match s {
-            Stage::TypeDecl(td) => Some((td.name.clone(), td.clone())),
-            _ => None,
-        })
-        .collect();
-    let report = lex_vcs::compute_diff_with_types(
-        &old_fns, &new_fns, &old_types, &new_types, /* body_patches: */ true,
-    );
-
-    // Build the new imports map. A package publish already attributed
-    // imports per source file (`src/schema.lex` → its modules); a single
-    // file groups all its imports under one stable, transport-independent
-    // `<source>` key so a CLI vs HTTP publish of the same file produces
-    // identical op_ids.
-    let new_imports: ImportMap = match pkg_imports {
-        Some(im) => im,
-        None => {
-            let mut new_imports = ImportMap::new();
-            let entry = new_imports.entry("<source>".to_string()).or_default();
-            for s in &stages {
-                if let Stage::Import(im) = s {
-                    entry.insert(lex_vcs::ImportRef {
-                        reference: im.reference.clone(),
-                        alias: im.alias.clone(),
-                    });
-                }
-            }
-            new_imports
-        }
-    };
-
-    if dry_run {
-        // Compute the op kinds for the dry-run preview using diff_to_ops
-        // directly, without persisting anything. `report` already
-        // carries each entry's own resolved `old_sig_id` (computed by
-        // `compute_diff` directly from the old FnDecl), so there's no
-        // separate name-keyed sig lookup to build here — see
-        // `diff_report`'s doc comments for why that used to be a bug
-        // (#818).
-        let old_effects: BTreeMap<String, BTreeSet<String>> = old_head
-            .iter()
-            .filter_map(|(sig, stg)| {
-                let ast = store.get_ast(stg).ok()?;
-                match ast {
-                    Stage::FnDecl(fd) => {
-                        let s: BTreeSet<String> =
-                            fd.effects.iter().map(|e| e.name.clone()).collect();
-                        Some((sig.clone(), s))
-                    }
-                    _ => None,
-                }
-            })
-            .collect();
-        let old_imports = store.derive_imports_from_oplog(&branch)?;
-        let op_kinds = lex_vcs::diff_to_ops(lex_vcs::DiffInputs {
-            old_head: &old_head,
-            old_effects: &old_effects,
-            old_imports: &old_imports,
-            new_stages: &stages,
-            new_imports: &new_imports,
-            diff: &report,
-            module_prefixes: &module_prefixes,
-        })
-        .map_err(|e| anyhow!("diff_to_ops: {e}"))?;
-        let actions: Vec<serde_json::Value> = op_kinds
-            .iter()
-            .map(|k| serde_json::to_value(k).unwrap())
-            .collect();
-        acli::emit_dry_run(
-            "publish",
-            fmt,
-            &format!("would apply {} op(s) to branch {}", op_kinds.len(), branch),
-            actions,
-        );
-        return Ok(());
-    }
-
-    // #131 / #839 / #970: record the caller's Intent (prompt / model /
-    // session) so every op this publish emits carries *why* it happened.
-    // See `record_intent`'s doc comment for why this is unconditional.
-    let intent_id: Option<lex_vcs::IntentId> = record_intent(
+    // Everything from here to the printed result is the shared publish core
+    // (#892 PR 1); this wrapper only builds its inputs and renders its outcome.
+    let intent = build_intent(intent_prompt, intent_model, intent_session, intent_issue);
+    let mut opts = crate::publish_core::PublishOptions::new(intent);
+    opts.activate = activate;
+    opts.files = !no_files;
+    opts.signer = signer.as_ref();
+    opts.dry_run = dry_run;
+    let outcome = match crate::publish_core::publish_dir(
         &root,
-        intent_prompt.clone(),
-        intent_model.clone(),
-        intent_session.clone(),
-        intent_issue.clone(),
-    )?;
-
-    let outcome = store.publish_program_with_intent(
-        &branch,
-        &stages,
-        &report,
-        &new_imports,
-        activate,
-        signer.as_ref(),
-        intent_id.clone(),
-        &module_prefixes,
-    )?;
-
-    // #1007 PR 4: capture the working copy's non-op-log files into a
-    // `SetFiles` op — last, under the same intent as the semantic ops above.
-    // A directory publish only; a single-file publish is unaffected (there is
-    // no package directory to scan). `apply_set_files` reads the branch's
-    // CURRENT head at call time, so this correctly parents on whatever
-    // `publish_program_with_intent` just produced (or the pre-existing head,
-    // when nothing semantic changed).
-    let mut ops_out = outcome.ops.clone();
-    let mut files_op: Option<lex_vcs::OpId> = None;
-    let mut files_manifest_id: Option<lex_store::BlobId> = None;
-    if !no_files && std::path::Path::new(path).is_dir() {
-        if let Some((op_id, manifest_id)) =
-            crate::files::publish_files_if_changed(&store, &branch, std::path::Path::new(path), intent_id.clone())
-                .with_context(|| "capturing files manifest")?
-        {
-            ops_out.push(PublishOp {
-                op_id: op_id.clone(),
-                kind: serde_json::to_value(&lex_vcs::OperationKind::SetFiles {
-                    manifest: manifest_id.clone(),
-                })
-                .expect("SetFiles serializes"),
+        std::path::Path::new(path),
+        branch.as_deref(),
+        opts,
+    ) {
+        Ok(o) => o,
+        Err(crate::publish_core::PublishError::TypeCheck(errs)) => {
+            emit_publish_gate_failure("type-check", &errs, fmt);
+            std::process::exit(2);
+        }
+        Err(crate::publish_core::PublishError::Examples(errs)) => {
+            emit_publish_gate_failure("examples", &errs, fmt);
+            std::process::exit(2);
+        }
+        Err(e) => return Err(e.into_anyhow()),
+    };
+    match outcome {
+        crate::publish_core::Outcome::DryRun(d) => {
+            let actions: Vec<serde_json::Value> = d
+                .op_kinds
+                .iter()
+                .map(|k| serde_json::to_value(k).unwrap())
+                .collect();
+            acli::emit_dry_run(
+                "publish",
+                fmt,
+                &format!("would apply {} op(s) to branch {}", d.op_kinds.len(), d.branch),
+                actions,
+            );
+            Ok(())
+        }
+        crate::publish_core::Outcome::Published(p) => {
+            let data = serde_json::json!({
+                "ops": p.ops,
+                "head_op": p.head_op,
+                "signed_by": p.signed_by,
+                // The recorded Intent's id, so a harness (lex-code) can hand
+                // it to `lex recall` / `lex op replay`.
+                "intent_id": p.intent_id,
+                "files_manifest": p.files_manifest,
             });
-            files_op = Some(op_id);
-            files_manifest_id = Some(manifest_id);
+            acli::emit_or_text("publish", data, fmt, || {});
+            Ok(())
         }
     }
-    let final_head = files_op.clone().or_else(|| outcome.head_op.clone());
-    // Did THIS call actually produce (or is it producing) `final_head`? Only
-    // then may it rewrite that head's committed lock.
-    let produced_new_head = !outcome.ops.is_empty() || files_op.is_some();
+}
 
-    // #1007 §0 / #930 P2b-1: capture the committed `lex.lock` at this head,
-    // so a peer (the hub's write-time gate) can resolve this head's
-    // dependencies against the exact pinned versions/heads it was built
-    // with, rather than inlining them.
-    //
-    // THE FIX (#1007 §0): a no-op publish used to call `set_committed_lock`
-    // on `outcome.head_op` regardless — and `publish_program_with_intent`
-    // returns the *existing* head, unchanged, when it applies zero ops. So a
-    // republish of an already-pushed, unchanged package silently rewrote
-    // that head's lock (to whatever `lex.lock` happens to be on disk right
-    // now, which may have drifted since the head was actually published) —
-    // corrupting a record a peer may already be relying on. Gate the write
-    // on `produced_new_head`: only a call that itself created `final_head`
-    // (via a semantic op or the `SetFiles` above) may set its lock.
-    //
-    // Best-effort on the read (a dependency-free package has no lock to
-    // commit); a store write error is real and propagates.
-    if produced_new_head {
-        if let Some(head) = final_head.as_deref() {
-            if let Some((_toml, dir)) = lex_syntax::find_manifest(std::path::Path::new(path)) {
-                if let Ok(lock_toml) = std::fs::read_to_string(dir.join("lex.lock")) {
-                    store.set_committed_lock(head, &lock_toml)?;
-                }
+/// Render a rejected publish (`phase` = `type-check` | `examples`): the ACLI
+/// envelope on stdout in JSON mode, one diagnostic JSON object per line on
+/// stderr in text mode. The caller exits 2.
+fn emit_publish_gate_failure(phase: &str, errs: &[lex_types::TypeError], fmt: &OutputFormat) {
+    let arr: Vec<serde_json::Value> = errs
+        .iter()
+        .map(|e| serde_json::to_value(e).unwrap())
+        .collect();
+    let data = serde_json::json!({ "phase": phase, "errors": arr });
+    acli::emit_or_text("publish", data, fmt, || {
+        for e in errs {
+            if let Ok(j) = serde_json::to_string(e) {
+                eprintln!("{j}");
             }
         }
-    }
-    // #835 Tier 1: record the behavioral-examples verdict for each
-    // published fn-stage that declares examples. Best-effort.
-    {
-        use std::collections::BTreeMap;
-        let op_for_stage: BTreeMap<String, String> = outcome.ops.iter()
-            .filter_map(|op| op.kind.get("stage_id").and_then(|v| v.as_str())
-                .map(|sid| (sid.to_string(), op.op_id.clone())))
-            .collect();
-        for stage in &stages {
-            let Stage::FnDecl(fd) = stage else { continue };
-            if fd.examples.is_empty() { continue; }
-            let Some(sid) = lex_ast::stage_id(stage) else { continue };
-            if let Some(op_id) = op_for_stage.get(&sid).cloned().or_else(|| outcome.head_op.clone()) {
-                let _ = store.record_examples_passed(&sid, &op_id, fd.examples.len());
-            }
-        }
-    }
-    let signed = signer.as_ref().map(|kp| kp.public_hex());
-    let data = serde_json::json!({
-        "ops": ops_out,
-        "head_op": final_head,
-        "signed_by": signed,
-        // The recorded Intent's id when --intent-prompt was given, so a
-        // harness (lex-code) can hand it to `lex recall` / `lex op replay`.
-        "intent_id": intent_id,
-        "files_manifest": files_manifest_id,
     });
-    acli::emit_or_text("publish", data, fmt, || {});
-    Ok(())
 }
 
 /// Record the caller's Intent (prompt / model / session / issue) for a
@@ -521,6 +303,24 @@ pub(crate) fn record_intent(
     session: Option<String>,
     issue: Option<String>,
 ) -> Result<Option<lex_vcs::IntentId>> {
+    let intent = build_intent(prompt, model, session, issue);
+    lex_vcs::IntentLog::open(root)
+        .with_context(|| "opening intent log")?
+        .put(&intent)
+        .with_context(|| "recording intent")?;
+    Ok(Some(intent.intent_id.clone()))
+}
+
+/// The Intent a publish-shaped CLI write carries, built (not recorded) from its
+/// `--intent-*` flags — see [`record_intent`] for the unattributed default.
+/// Split out so `lex publish` can hand it to the shared publish core (#892 PR 1),
+/// which records it at the same point in the pipeline as before.
+pub(crate) fn build_intent(
+    prompt: Option<String>,
+    model: Option<String>,
+    session: Option<String>,
+    issue: Option<String>,
+) -> lex_vcs::Intent {
     let prompt = prompt.unwrap_or_else(|| UNATTRIBUTED_PROMPT.to_string());
     // `split_model_ref(None)` already yields this toolchain's spelling for
     // "the CLI made this, no model declared" (`cli/unknown`), which is the
@@ -532,15 +332,10 @@ pub(crate) fn record_intent(
         lex_vcs::ModelDescriptor { provider, name, version: None },
         None,
     );
-    let intent = match issue {
+    match issue {
         Some(id) => intent.with_issue(id),
         None => intent,
-    };
-    lex_vcs::IntentLog::open(root)
-        .with_context(|| "opening intent log")?
-        .put(&intent)
-        .with_context(|| "recording intent")?;
-    Ok(Some(intent.intent_id.clone()))
+    }
 }
 
 /// `provider/name` → `(provider, name)`. A bare name is attributed to
