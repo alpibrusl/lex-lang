@@ -84,6 +84,24 @@ pub struct State {
     /// unlimited. A hosted, multi-tenant embedder such as lex-hub should
     /// set it — the same shape as [`policy_ceiling`](State::policy_ceiling).
     pub blob_limits: Option<BlobLimits>,
+    /// `produced_by.tool` names that clients may NOT claim. Defaults to
+    /// empty (single-tenant `lex serve` and existing embedders behave
+    /// exactly as before). When non-empty, `POST /v1/attestations/batch`
+    /// refuses — `403` `ReservedProducer`, whole batch, nothing written —
+    /// any attestation whose `produced_by.tool` matches an entry. An entry
+    /// is an exact name, or — when it ends in `*` — a prefix
+    /// (`"lex-store::review:*"` reserves every `lex-store::review:<who>`
+    /// producer, whose suffix is variable). Matching trims and ASCII
+    /// case-folds both sides; blank entries are ignored.
+    ///
+    /// The point is to keep a name that only the server writes (the hub's
+    /// own `lex-hub-ci`, see `lex_store::HUB_CI_PRODUCER_TOOL`, and the
+    /// `lex-store::review:*` family, see `lex_store::REVIEW_PRODUCER_RESERVATION`)
+    /// from being minted by a tenant key holder. Server-internal writers
+    /// (`Store::verify_head_and_attest`, `record_review`, …) call the
+    /// store directly and are unaffected. A hosted embedder such as
+    /// lex-hub should set it; there is deliberately no default name here.
+    pub reserved_producers: Vec<String>,
 }
 
 /// Limits on one store's blob space (#1007). See [`State::blob_limits`].
@@ -149,6 +167,7 @@ impl State {
             policy_ceiling,
             ops_since: Mutex::new(Default::default()),
             blob_limits: None,
+            reserved_producers: Vec::new(),
         })
     }
 
@@ -156,6 +175,26 @@ impl State {
     pub fn with_blob_limits(mut self, limits: Option<BlobLimits>) -> Self {
         self.blob_limits = limits;
         self
+    }
+
+    /// Install [`reserved_producers`](State::reserved_producers): the
+    /// `produced_by.tool` names clients may not claim through the
+    /// attestation-writing HTTP endpoints.
+    pub fn with_reserved_producers(mut self, tools: Vec<String>) -> Self {
+        self.reserved_producers = tools;
+        self
+    }
+
+    /// The reserved producer name `att` claims, if any.
+    fn reserved_producer_claimed(&self, att: &lex_vcs::Attestation) -> Option<&str> {
+        let claimed = att.produced_by.tool.trim().to_ascii_lowercase();
+        self.reserved_producers.iter().map(String::as_str).find(|entry| {
+            let entry = entry.trim().to_ascii_lowercase();
+            match entry.strip_suffix('*') {
+                Some(prefix) => !prefix.is_empty() && claimed.starts_with(prefix),
+                None => !entry.is_empty() && claimed == entry,
+            }
+        })
     }
 
     /// Construct a per-tenant `State` by prefixing `store_root` with the
@@ -873,7 +912,7 @@ pub(crate) fn stage_handler(state: &State, id: &str) -> Response<std::io::Cursor
 }
 
 /// `GET /v1/stage/<id>/attestations` — every persisted attestation
-/// for this stage, newest-first by timestamp. Issue #132's
+/// for this stage, newest-first by arrival order. Issue #132's
 /// queryable-evidence consumer surface.
 ///
 /// 404s on unknown stage_id (matches `/v1/stage/<id>`'s shape so a
@@ -889,11 +928,15 @@ pub(crate) fn stage_attestations_handler(state: &State, id: &str) -> Response<st
         Ok(l) => l,
         Err(e) => return error_response(500, format!("attestation log: {e}")),
     };
-    let mut listing = match log.list_for_stage(&id.to_string()) {
+    // Newest-first by ARRIVAL order (server-assigned), not by the
+    // writer-supplied timestamp; legacy unstamped entries sort below
+    // stamped ones. `lex op pull` re-puts these in reverse (oldest
+    // first) so a puller's local arrival order matches this store's.
+    let mut listing = match log.list_for_stage_by_arrival(&id.to_string()) {
         Ok(v) => v,
         Err(e) => return error_response(500, format!("list_for_stage: {e}")),
     };
-    listing.sort_by_key(|a| std::cmp::Reverse(a.timestamp));
+    listing.reverse();
     json_response(200, &serde_json::json!({"attestations": listing}))
 }
 
@@ -1601,6 +1644,9 @@ pub(crate) fn ops_batch_handler(state: &State, body: &str)
 ///   know about. Whole batch rejected.
 /// * `409` `AttestationIdMismatch` if the supplied id doesn't
 ///   match the canonical hash.
+/// * `403` `ReservedProducer` if any attestation claims a
+///   `produced_by.tool` in [`State::reserved_producers`]. Whole batch
+///   rejected, nothing written.
 ///
 /// Idempotency: same as the ops endpoint — content-addressed dedup.
 pub(crate) fn attestations_batch_handler(state: &State, body: &str)
@@ -1620,6 +1666,22 @@ pub(crate) fn attestations_batch_handler(state: &State, body: &str)
         Ok(l) => l,
         Err(e) => return error_response(500, format!("opening op log: {e}")),
     };
+
+    // Reserved producers first, over the WHOLE batch, so a mixed batch
+    // (one legitimate + one reserved) is refused outright and nothing is
+    // written. Server-internal writers (hosted CI, review, examples) call
+    // the store directly and never come through here.
+    for att in &attestations {
+        if let Some(reserved) = state.reserved_producer_claimed(att) {
+            return error_with_detail(403, "ReservedProducer", serde_json::json!({
+                "attestation_id": att.attestation_id,
+                "produced_by_tool": att.produced_by.tool,
+                "reserved_tool": reserved,
+                "message": "this producer name is reserved for the server; \
+                            clients may not submit attestations claiming it",
+            }));
+        }
+    }
 
     // Validate before persisting any record.
     for att in &attestations {

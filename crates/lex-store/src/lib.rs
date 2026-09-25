@@ -55,7 +55,7 @@ pub use lex_vcs::{OpId, Operation, OperationKind, OperationRecord, StageTransiti
 pub use model::{Lifecycle, Metadata, Spec, StageStatus, Test, Transition};
 pub use deps::{ModuleSurface, ResolvedDeps};
 pub use store::{
-    CandidateInfo, DepResolver, HubCiVerdict, PublishOp, PublishOutcome, ReconstructedProgram,
+    CandidateInfo, DepResolver, HubCiVerdict, PublishOp, HUB_CI_PRODUCER_TOOL, REVIEW_PRODUCER_PREFIX, REVIEW_PRODUCER_RESERVATION, PublishOutcome, ReconstructedProgram,
     ReplayOutcome, ReplayRequest, SkippedStage, StageHistoryEntry, Store, StoreError,
 };
 pub use store::transition_for_kind;

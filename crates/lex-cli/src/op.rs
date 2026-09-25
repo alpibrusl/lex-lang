@@ -1587,7 +1587,9 @@ fn sync_attestations(
         let Some(arr) = v.get("attestations").and_then(|a| a.as_array()) else {
             continue;
         };
-        for av in arr {
+        // The remote lists newest-first; put oldest-first so the local
+        // arrival stamps preserve the remote's relative order.
+        for av in arr.iter().rev() {
             let att: lex_vcs::Attestation = match serde_json::from_value(av.clone()) {
                 Ok(a) => a,
                 Err(e) => {

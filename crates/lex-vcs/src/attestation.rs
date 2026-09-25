@@ -736,10 +736,42 @@ struct CanonicalAttestationView<'a> {
 ///   `AttestationKind::Trace` entries are indexed here, so
 ///   `list_for_run` is `O(traces of that run)` rather than scanning
 ///   the whole log.
+///
+/// # Arrival order
+///
+/// `Attestation::timestamp` is supplied by the writer and is not part
+/// of the attestation id, so it must not decide "which verdict came
+/// last": a client can post any timestamp it likes. The log therefore
+/// assigns its own **arrival sequence number** the first time it
+/// persists an attestation, in a sidecar that does not participate in
+/// the id:
+///
+/// * `arrival/<AttestationId>` holds a decimal `u64`, allocated from a
+///   counter (`arrival.seq`) under an exclusive advisory lock
+///   (`arrival.lock`), so it is strictly increasing across restarts and
+///   across processes sharing the directory.
+/// * The stamp is written **once**. Re-putting an id that already
+///   exists never moves it (content-addressed idempotency), so a replay
+///   cannot promote an old attestation above a newer one.
+/// * An attestation only gets a stamp when `put` *creates* its primary
+///   file. A pre-existing primary file without a stamp (written before
+///   this sidecar existed) stays unstamped forever — re-putting it does
+///   not stamp it, or a replay of an old Approve would outrank an old
+///   Reject.
+/// * Attestations pulled from a remote are `put` locally like any
+///   other, so they get a *local* stamp at pull time; only their
+///   relative order is preserved (by the order the remote lists them).
+///
+/// [`AttestationLog::sort_by_arrival`] defines the resulting total
+/// order; see its doc for the legacy-fallback rule.
 pub struct AttestationLog {
     dir: PathBuf,
     by_stage: PathBuf,
     by_run: PathBuf,
+    /// `arrival/<AttestationId>` — one tiny file per attestation
+    /// holding the server-assigned arrival sequence number (see
+    /// "Arrival order" below).
+    arrival: PathBuf,
 }
 
 impl AttestationLog {
@@ -749,7 +781,133 @@ impl AttestationLog {
         let by_run = dir.join("by-run");
         fs::create_dir_all(&by_stage)?;
         fs::create_dir_all(&by_run)?;
-        Ok(Self { dir, by_stage, by_run })
+        let arrival = dir.join("arrival");
+        fs::create_dir_all(&arrival)?;
+        Ok(Self { dir, by_stage, by_run, arrival })
+    }
+
+    fn arrival_counter_path(&self) -> PathBuf {
+        self.dir.join("arrival.seq")
+    }
+
+    fn arrival_lock_path(&self) -> PathBuf {
+        self.dir.join("arrival.lock")
+    }
+
+    /// The server-assigned arrival sequence number of `id`, or `None`
+    /// for an attestation with no arrival record (written before the
+    /// sidecar existed, or not in the log at all).
+    pub fn arrival_seq(&self, id: &AttestationId) -> io::Result<Option<u64>> {
+        match fs::read_to_string(self.arrival.join(id)) {
+            Ok(s) => s
+                .trim()
+                .parse::<u64>()
+                .map(Some)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("arrival record for {id}: {e}"))),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Highest sequence number recorded in `arrival/`, used to rebuild
+    /// the counter if `arrival.seq` is missing or unreadable.
+    fn scan_arrival_high_water(&self) -> io::Result<u64> {
+        let mut max = 0u64;
+        for entry in fs::read_dir(&self.arrival)? {
+            let entry = entry?;
+            if let Ok(s) = fs::read_to_string(entry.path()) {
+                if let Ok(n) = s.trim().parse::<u64>() {
+                    max = max.max(n);
+                }
+            }
+        }
+        Ok(max)
+    }
+
+    /// Assign `id` its arrival sequence number if it has none.
+    /// Never overwrites an existing stamp.
+    fn stamp_arrival(&self, id: &AttestationId) -> io::Result<()> {
+        let record = self.arrival.join(id);
+        if record.exists() {
+            return Ok(());
+        }
+        // Exclusive advisory lock: serialises allocation across
+        // threads and across processes sharing this directory. It is
+        // released when `lock` is dropped.
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.arrival_lock_path())?;
+        lock.lock()?;
+        // Re-check under the lock: a concurrent put of the same id may
+        // have stamped it while we waited.
+        if record.exists() {
+            return Ok(());
+        }
+        let counter = self.arrival_counter_path();
+        let last = match fs::read_to_string(&counter).ok().and_then(|s| s.trim().parse::<u64>().ok()) {
+            Some(n) => n,
+            None => self.scan_arrival_high_water()?,
+        };
+        let next = last + 1;
+        // Counter first, record second: a crash in between burns a
+        // number (harmless gap) instead of ever reusing one.
+        let ctmp = counter.with_extension("seq.tmp");
+        fs::write(&ctmp, next.to_string())?;
+        fs::rename(&ctmp, &counter)?;
+        let rtmp = self.arrival.join(format!("{id}.tmp"));
+        {
+            let mut f = fs::File::create(&rtmp)?;
+            f.write_all(next.to_string().as_bytes())?;
+            f.sync_all()?;
+        }
+        fs::rename(&rtmp, &record)?;
+        Ok(())
+    }
+
+    /// Sort `atts` oldest-to-newest by **arrival order**, never by the
+    /// writer-supplied `timestamp` alone.
+    ///
+    /// The rule:
+    ///
+    /// 1. Attestations that carry an arrival stamp are ordered by it
+    ///    (ties, which only a cross-process race can produce, break on
+    ///    `attestation_id`).
+    /// 2. Attestations with **no** stamp are legacy entries persisted
+    ///    before the sidecar existed. Among themselves they order by
+    ///    `timestamp` (then `attestation_id`) — the only ordering
+    ///    information they have.
+    /// 3. Every legacy entry sorts **before** every stamped one. Any
+    ///    stamped entry was persisted after the sidecar shipped, hence
+    ///    genuinely after every legacy entry, so a stamp outranks any
+    ///    client timestamp: a stamped entry with a tiny timestamp still
+    ///    beats a legacy entry with a huge one.
+    pub fn sort_by_arrival(&self, atts: &mut Vec<Attestation>) -> io::Result<()> {
+        let mut keyed: Vec<(Option<u64>, Attestation)> = Vec::with_capacity(atts.len());
+        for a in atts.drain(..) {
+            let seq = self.arrival_seq(&a.attestation_id)?;
+            keyed.push((seq, a));
+        }
+        keyed.sort_by(|(sa, a), (sb, b)| match (sa, sb) {
+            (None, None) => a
+                .timestamp
+                .cmp(&b.timestamp)
+                .then_with(|| a.attestation_id.cmp(&b.attestation_id)),
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (Some(x), Some(y)) => x.cmp(y).then_with(|| a.attestation_id.cmp(&b.attestation_id)),
+        });
+        atts.extend(keyed.into_iter().map(|(_, a)| a));
+        Ok(())
+    }
+
+    /// [`Self::list_for_stage`] sorted oldest-to-newest by arrival
+    /// order (see [`Self::sort_by_arrival`]).
+    pub fn list_for_stage_by_arrival(&self, stage_id: &StageId) -> io::Result<Vec<Attestation>> {
+        let mut v = self.list_for_stage(stage_id)?;
+        self.sort_by_arrival(&mut v)?;
+        Ok(v)
     }
 
     fn primary_path(&self, id: &AttestationId) -> PathBuf {
@@ -763,6 +921,11 @@ impl AttestationLog {
     pub fn put(&self, attestation: &Attestation) -> io::Result<()> {
         let primary = self.primary_path(&attestation.attestation_id);
         if !primary.exists() {
+            // Stamp arrival BEFORE the primary file so a crash between
+            // the two leaves a stamp with no primary (a retry keeps the
+            // stamp) rather than an unstamped primary (which would be
+            // indistinguishable from a legacy entry).
+            self.stamp_arrival(&attestation.attestation_id)?;
             let bytes = serde_json::to_vec(attestation)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             let tmp = primary.with_extension("json.tmp");
@@ -810,6 +973,7 @@ impl AttestationLog {
             .join(&attestation.stage_id)
             .join(&attestation.attestation_id);
         let _ = fs::remove_file(&stage_idx);
+        let _ = fs::remove_file(self.arrival.join(&attestation.attestation_id));
         if let AttestationKind::Trace { run_id, .. } = &attestation.kind {
             let run_idx = self.by_run.join(run_id).join(&attestation.attestation_id);
             let _ = fs::remove_file(&run_idx);
