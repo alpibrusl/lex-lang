@@ -145,6 +145,11 @@ fn export_deflattens_a_multi_module_package() {
     let main = out.path().join("src/main.lex");
     assert!(util.exists() && main.exists(), "expected src/util.lex and src/main.lex");
     assert!(!out.path().join("src.lex").exists(), "should be a tree, not one src.lex");
+    // #909: the source's own alias comes back verbatim (`u`), even though the
+    // stem alias `util` is shadowed by the param — no derivation needed.
+    let main_src = std::fs::read_to_string(&main).unwrap();
+    assert!(main_src.contains("import \"./util\" as u\n") && main_src.contains("u.helper(util)"),
+        "main.lex must keep its `u` alias: {main_src}");
 
     // Both files type-check as a package.
     std::fs::copy(root.join("lex.toml"), out.path().join("lex.toml")).unwrap();
