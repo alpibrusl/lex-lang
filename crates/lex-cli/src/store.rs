@@ -321,35 +321,14 @@ pub(crate) fn build_intent(
     session: Option<String>,
     issue: Option<String>,
 ) -> lex_vcs::Intent {
-    let prompt = prompt.unwrap_or_else(|| UNATTRIBUTED_PROMPT.to_string());
-    // `split_model_ref(None)` already yields this toolchain's spelling for
-    // "the CLI made this, no model declared" (`cli/unknown`), which is the
-    // honest descriptor for an unattributed write too.
-    let (provider, name) = split_model_ref(model.as_deref());
-    let intent = lex_vcs::Intent::new(
-        prompt,
-        session.unwrap_or_else(default_intent_session),
-        lex_vcs::ModelDescriptor { provider, name, version: None },
-        None,
-    );
-    match issue {
-        Some(id) => intent.with_issue(id),
-        None => intent,
-    }
+    // One implementation for every write door (#837 piece A): `lex publish`,
+    // `lex ws transform` and the HTTP write endpoints all build their intent in
+    // `lex_api::transform_http::build_intent`, so an unattributed write is the
+    // same intent whichever way it arrives. `split_model_ref(None)` yields this
+    // toolchain's spelling for "the CLI made this, no model declared"
+    // (`cli/unknown`), the honest descriptor for an unattributed write too.
+    lex_api::transform_http::build_intent(prompt, model, session, issue, default_intent_session)
 }
-
-/// `provider/name` → `(provider, name)`. A bare name is attributed to
-/// provider `cli`; `None` → `("cli", "unknown")`. The model ref is
-/// recorded for audit and feeds the content-addressed IntentId, so the
-/// default must be stable, not empty.
-/// The prompt recorded when a publish declares no `--intent-prompt` (#970).
-///
-/// Deliberately *not* a plausible-looking prompt: it must be impossible to
-/// mistake a synthesized intent for one a caller actually supplied. It is a
-/// fixed string so it is exactly matchable — `lex recall --predicate` can list
-/// every unattributed op, which is what makes "who never explained their
-/// changes" answerable instead of invisible.
-pub(crate) const UNATTRIBUTED_PROMPT: &str = "(unattributed: published without --intent-prompt)";
 
 /// The session id for a publish that gave no `--intent-session` (#970).
 ///
@@ -359,7 +338,7 @@ pub(crate) const UNATTRIBUTED_PROMPT: &str = "(unattributed: published without -
 /// separate. A *constant* default would be worse than none — it would collapse
 /// every publish ever made on the machine into a single bogus "session", making
 /// `lex recall --session` useless precisely where it should help.
-fn default_intent_session() -> String {
+pub(crate) fn default_intent_session() -> String {
     if let Ok(s) = std::env::var("LEX_INTENT_SESSION") {
         if !s.trim().is_empty() {
             return s;
@@ -370,16 +349,6 @@ fn default_intent_session() -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     format!("cli-{}-{started}", std::process::id())
-}
-
-fn split_model_ref(m: Option<&str>) -> (String, String) {
-    match m {
-        None => ("cli".to_string(), "unknown".to_string()),
-        Some(s) => match s.split_once('/') {
-            Some((p, n)) if !p.is_empty() && !n.is_empty() => (p.to_string(), n.to_string()),
-            _ => ("cli".to_string(), s.to_string()),
-        },
-    }
 }
 
 pub(super) fn cmd_store(fmt: &OutputFormat, args: &[String]) -> Result<()> {

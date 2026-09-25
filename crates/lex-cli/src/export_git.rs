@@ -156,6 +156,7 @@ pub fn cmd_export_git(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         // Deterministic identity so re-exporting the same log is stable.
         run_git(&out_dir, &["config", "user.name", "lex-export"])?;
         run_git(&out_dir, &["config", "user.email", "lex-export@localhost"])?;
+        pin_file_mode(&out_dir)?;
     }
 
     // Ops folded into the commit being assembled, and the last `SetFiles`
@@ -364,6 +365,21 @@ fn materialize(
     apply_manifest_diff(store, out_dir, committed, manifest)
 }
 
+/// Make git track the executable bit in `dir`, whatever the host's git config
+/// says. The manifest's mode is part of the tree (`100755` vs `100644`), and a
+/// repo with `core.fileMode=false` (a pre-existing mirror created on a host
+/// that had it off) would stage every mode change as "no change", so the export
+/// would silently keep the old mode. Written to the repo's own config, which
+/// outranks the global one. Unix only: elsewhere the on-disk mode is not
+/// something this exporter sets.
+fn pin_file_mode(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    run_git(dir, &["config", "core.fileMode", "true"])?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
 /// True when `dir` is a git repo whose `HEAD` names a commit (an existing repo
 /// with no commit yet is treated like a fresh directory).
 fn has_head(dir: &Path) -> bool {
@@ -518,6 +534,7 @@ fn verify_tree(store: &Store, out_dir: &Path, st: &State, origin_commit: bool) -
     let scratch = Scratch::new()?;
     materialize(store, &scratch.0, &st.head(), &st.manifest, &Manifest::new(), origin_commit)?;
     run_git(&scratch.0, &["init", "-q"])?;
+    pin_file_mode(&scratch.0)?;
     run_git(&scratch.0, &["add", "-A", "-f"])?;
     let tree_id = git_out(&scratch.0, &["write-tree"])?;
     let want = tree_entries(&scratch.0, tree_id.trim())?;
@@ -760,12 +777,21 @@ fn write_manifest_entry(store: &Store, out_dir: &Path, path: &str, entry: &FileE
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&full, &bytes).with_context(|| format!("writing {}", full.display()))?;
+    // Set the exec bits to EXACTLY what the manifest says. `fs::write` onto an
+    // existing file keeps its permissions, so a mode-only change (100755 ->
+    // 100644, the same blob) reaches this function with the old bits still on
+    // disk: the bit must be cleared as well as set, or `git add` re-stages the
+    // stale mode and the export never shows the change.
     #[cfg(unix)]
-    if entry.mode == MODE_EXEC {
+    {
         use std::os::unix::fs::PermissionsExt;
         let mut perm = std::fs::metadata(&full)?.permissions();
-        perm.set_mode(perm.mode() | 0o111);
-        std::fs::set_permissions(&full, perm)?;
+        let mode = perm.mode();
+        let want = if entry.mode == MODE_EXEC { mode | 0o111 } else { mode & !0o111 };
+        if want != mode {
+            perm.set_mode(want);
+            std::fs::set_permissions(&full, perm)?;
+        }
     }
     Ok(())
 }

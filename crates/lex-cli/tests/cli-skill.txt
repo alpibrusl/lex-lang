@@ -18,6 +18,7 @@ description: "Invoke the `lex` CLI. Commands: parse, check, authority, run…"
 - `lex blame` — show each fn's stage history from the store (idempotent)
 - `lex publish` — publish each stage in a file to the store as Draft
 - `lex files` — work with the files manifest directly (#1007): the store's non-op-log files (README, lex.toml, lex.lock, tests/, ...)
+- `lex ws` — local-first workspace commands (#837): write typed edits straight through the op log of an on-disk store, no text edit + publish
 - `lex store` — browse the content-addressed code store
 - `lex stage` — print stage info, or list attestations for a stage (idempotent)
 - `lex attest` — cross-stage attestation queries (CI / dashboards)
@@ -315,6 +316,19 @@ lex files checkout /tmp/out
 ```
 
 **See also:** `lex publish`, `lex store`
+
+## `lex ws`
+
+local-first workspace commands (#837): write typed edits straight through the op log of an on-disk store, no text edit + publish
+
+### Examples
+
+```bash
+# Inline a let binding
+lex ws transform --branch main inline_let --json '{"from_stage_id":"<stage>","let_node":"n_0.2"}'
+```
+
+**See also:** `lex publish`, `lex files`, `lex repair`, `lex op`
 
 ## `lex store`
 
@@ -1171,6 +1185,11 @@ lex op gc --confirm
 ```bash
 # Import a git repo's branch tip as one snapshot (#892)
 lex op import-git ./repo --head-only --store-branch imported
+```
+
+```bash
+# Import a repo's full first-parent history, folding commits that do not type-check (re-run to extend)
+lex op import-git https://example.com/team/repo.git --on-error fold --examples tip
 ```
 
 **See also:** `lex log`, `lex store`

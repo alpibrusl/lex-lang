@@ -102,6 +102,7 @@ fn commands() -> Vec<CommandInfo> {
         cmd_blame(),
         cmd_publish(),
         cmd_files(),
+        cmd_ws(),
         cmd_store(),
         cmd_stage(),
         cmd_attest(),
@@ -465,6 +466,10 @@ fn cmd_op() -> CommandInfo {
         (
             "Import a git repo's branch tip as one snapshot (#892)",
             "lex op import-git ./repo --head-only --store-branch imported",
+        ),
+        (
+            "Import a repo's full first-parent history, folding commits that do not type-check (re-run to extend)",
+            "lex op import-git https://example.com/team/repo.git --on-error fold --examples tip",
         ),
     ])
     .with_see_also(vec!["log", "store"])
@@ -916,6 +921,44 @@ fn cmd_files() -> CommandInfo {
     ])
     .with_see_also(vec!["publish", "store"]);
     info.subcommands = vec![status, commit, ls, cat, checkout];
+    info
+}
+
+fn cmd_ws() -> CommandInfo {
+    let transform = CommandInfo::new(
+        "transform",
+        "apply a typed transform (replace_match_arm|rename_local|inline_let|extract_function) to a branch of a local store, through the gated op-log write path (#837)",
+    )
+    .idempotent(false)
+    .add_argument(
+        "kind",
+        "enum[replace_match_arm|rename_local|inline_let|extract_function]",
+        "which typed transform to apply",
+        true,
+    )
+    .add_option("json", "string", "the transform's params as a JSON object (same shape as `transform` in POST /v1/transform, minus `kind`)", None)
+    .add_option("branch", "string", "branch to write to (required; the store's current branch is never assumed)", None)
+    .add_option("store", "string", "store root directory", None)
+    .add_option("intent-prompt", "string", "why the change is made; without it the write is recorded as explicitly unattributed (#970)", None)
+    .add_option("intent-model", "string", "the model as provider/name; default cli/unknown", None)
+    .add_option("intent-session", "string", "the agent session id; pin it for a reproducible OpId", None)
+    .add_option("intent-issue", "string", "the typed issue this change realizes", None)
+    .with_examples(vec![
+        (
+            "Rename a let-bound local",
+            "lex ws transform --branch main --intent-prompt 'clearer name' --intent-session run-1 rename_local --json '{\"from_stage_id\":\"<stage>\",\"let_node\":\"n_0.2\",\"new_name\":\"total\"}'",
+        ),
+    ]);
+    let mut info = CommandInfo::new(
+        "ws",
+        "local-first workspace commands (#837): write typed edits straight through the op log of an on-disk store, no text edit + publish",
+    )
+    .with_examples(vec![(
+        "Inline a let binding",
+        "lex ws transform --branch main inline_let --json '{\"from_stage_id\":\"<stage>\",\"let_node\":\"n_0.2\"}'",
+    )])
+    .with_see_also(vec!["publish", "files", "repair", "op"]);
+    info.subcommands = vec![transform];
     info
 }
 

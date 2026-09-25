@@ -2367,6 +2367,24 @@ impl Store {
         transition: lex_vcs::StageTransition,
         candidate: &[lex_ast::Stage],
     ) -> Result<lex_vcs::OpId, StoreError> {
+        self.apply_operation_checked_with_intent(branch, op, transition, candidate, None)
+    }
+
+    /// [`Self::apply_operation_checked`] that also records `intent` in the
+    /// [`lex_vcs::IntentLog`] (#837 piece A). The caller stamps the intent's id on
+    /// `op` (`Operation::with_intent`); this only makes sure the intent record
+    /// exists, and does so *after* the type-check and session-budget gates and
+    /// before the head moves — so a rejected write leaves no op **and no
+    /// intent** behind, the same "no footprint" guarantee the gate already
+    /// gives the op record. `None` is exactly `apply_operation_checked`.
+    pub fn apply_operation_checked_with_intent(
+        &self,
+        branch: &str,
+        op: lex_vcs::Operation,
+        transition: lex_vcs::StageTransition,
+        candidate: &[lex_ast::Stage],
+        intent: Option<&lex_vcs::Intent>,
+    ) -> Result<lex_vcs::OpId, StoreError> {
         // #945: the candidate comes from the head's SigId→stage map, which holds
         // only fn/type declarations — the head's `import` edges are absent. Add
         // them and resolve against the head the op applies to (whose committed
@@ -2394,6 +2412,9 @@ impl Store {
         // without an intent_id, or with an intent whose session
         // has no cap configured, sail through.
         self.check_session_budget(&op)?;
+        if let Some(intent) = intent {
+            lex_vcs::IntentLog::open(self.root())?.put(intent)?;
+        }
         let attestable = attestable_stage_ids(&transition);
         let op_effects = op_declared_effects(&op.kind);
         // #262: CAS retry loop. Single-parent ops can be safely
@@ -2441,12 +2462,25 @@ impl Store {
         op: lex_vcs::Operation,
         transition: lex_vcs::StageTransition,
     ) -> Result<lex_vcs::OpId, StoreError> {
+        self.apply_operation_gated_with_intent(branch, op, transition, None)
+    }
+
+    /// [`Self::apply_operation_gated`] that also records `intent` (see
+    /// [`Self::apply_operation_checked_with_intent`]) — the write path for an
+    /// intent-carrying `/v1/patch` (#837 piece A).
+    pub fn apply_operation_gated_with_intent(
+        &self,
+        branch: &str,
+        op: lex_vcs::Operation,
+        transition: lex_vcs::StageTransition,
+        intent: Option<&lex_vcs::Intent>,
+    ) -> Result<lex_vcs::OpId, StoreError> {
         debug_assert!(
             op.parents.len() <= 1,
             "apply_operation_gated is single-parent only; merges use apply_merge_op_gated"
         );
         let candidate = self.candidate_program_for(branch, &transition)?;
-        self.apply_operation_checked(branch, op, transition, &candidate)
+        self.apply_operation_checked_with_intent(branch, op, transition, &candidate, intent)
     }
 
     /// The gated write path for **merge** commits (`commit_merge`,
@@ -3721,6 +3755,28 @@ impl Store {
         arm_index: usize,
         new_body: lex_ast::CExpr,
     ) -> Result<lex_vcs::OpId, StoreError> {
+        self.apply_replace_match_arm_with_intent(
+            branch,
+            from_stage_id,
+            match_node,
+            arm_index,
+            new_body,
+            None,
+        )
+    }
+
+    /// [`Self::apply_replace_match_arm`] with the write attributed to `intent`
+    /// (#837 piece A): the op is stamped with the intent's id and the intent
+    /// is recorded once the gate has passed. `None` is the intent-less form.
+    pub fn apply_replace_match_arm_with_intent(
+        &self,
+        branch: &str,
+        from_stage_id: &str,
+        match_node: &lex_ast::NodeId,
+        arm_index: usize,
+        new_body: lex_ast::CExpr,
+        intent: Option<&lex_vcs::Intent>,
+    ) -> Result<lex_vcs::OpId, StoreError> {
         let from_stage = self.get_ast(from_stage_id)?;
         let new_stage = lex_ast::replace_match_arm(&from_stage, match_node, arm_index, new_body)
             .map_err(StoreError::TransformError)?;
@@ -3776,7 +3832,11 @@ impl Store {
             to: to_stage_id.clone(),
         };
         let op = lex_vcs::Operation::new(kind, head_now.into_iter().collect::<Vec<_>>());
-        self.apply_operation_checked(branch, op, transition, &candidate)
+        let op = match intent {
+            Some(i) => op.with_intent(i.intent_id.clone()),
+            None => op,
+        };
+        self.apply_operation_checked_with_intent(branch, op, transition, &candidate, intent)
     }
 
     /// Apply a typed `RenameLocal` transform (#280) — rename a
@@ -3790,6 +3850,19 @@ impl Store {
         from_stage_id: &str,
         let_node: &lex_ast::NodeId,
         new_name: &str,
+    ) -> Result<lex_vcs::OpId, StoreError> {
+        self.apply_rename_local_with_intent(branch, from_stage_id, let_node, new_name, None)
+    }
+
+    /// [`Self::apply_rename_local`] with the write attributed to `intent`
+    /// (#837 piece A); see [`Self::apply_replace_match_arm_with_intent`].
+    pub fn apply_rename_local_with_intent(
+        &self,
+        branch: &str,
+        from_stage_id: &str,
+        let_node: &lex_ast::NodeId,
+        new_name: &str,
+        intent: Option<&lex_vcs::Intent>,
     ) -> Result<lex_vcs::OpId, StoreError> {
         let from_stage = self.get_ast(from_stage_id)?;
         // Read the old name before running the transform, so the
@@ -3838,7 +3911,11 @@ impl Store {
             to: to_stage_id.clone(),
         };
         let op = lex_vcs::Operation::new(kind, head_now.into_iter().collect::<Vec<_>>());
-        self.apply_operation_checked(branch, op, transition, &candidate)
+        let op = match intent {
+            Some(i) => op.with_intent(i.intent_id.clone()),
+            None => op,
+        };
+        self.apply_operation_checked_with_intent(branch, op, transition, &candidate, intent)
     }
 
     /// Apply a typed `InlineLet` transform (#280) — eliminate a
@@ -3851,6 +3928,18 @@ impl Store {
         branch: &str,
         from_stage_id: &str,
         let_node: &lex_ast::NodeId,
+    ) -> Result<lex_vcs::OpId, StoreError> {
+        self.apply_inline_let_with_intent(branch, from_stage_id, let_node, None)
+    }
+
+    /// [`Self::apply_inline_let`] with the write attributed to `intent`
+    /// (#837 piece A); see [`Self::apply_replace_match_arm_with_intent`].
+    pub fn apply_inline_let_with_intent(
+        &self,
+        branch: &str,
+        from_stage_id: &str,
+        let_node: &lex_ast::NodeId,
+        intent: Option<&lex_vcs::Intent>,
     ) -> Result<lex_vcs::OpId, StoreError> {
         let from_stage = self.get_ast(from_stage_id)?;
         let binding_name =
@@ -3896,7 +3985,11 @@ impl Store {
             to: to_stage_id.clone(),
         };
         let op = lex_vcs::Operation::new(kind, head_now.into_iter().collect::<Vec<_>>());
-        self.apply_operation_checked(branch, op, transition, &candidate)
+        let op = match intent {
+            Some(i) => op.with_intent(i.intent_id.clone()),
+            None => op,
+        };
+        self.apply_operation_checked_with_intent(branch, op, transition, &candidate, intent)
     }
 
     /// Apply a typed `ExtractFunction` transform (#280 slice 4) —
@@ -3921,6 +4014,30 @@ impl Store {
         from_stage_id: &str,
         expr_node: &lex_ast::NodeId,
         spec: lex_ast::ExtractFnSpec,
+    ) -> Result<(lex_vcs::OpId, lex_vcs::OpId), StoreError> {
+        self.apply_extract_function_with_intent(branch, from_stage_id, expr_node, spec, None)
+    }
+
+    /// [`Self::apply_extract_function`] with the write attributed to a
+    /// caller-supplied `intent` (#837 piece A). Both ops carry that intent
+    /// instead of the synthetic `[lex.transform.extract_function]` one — the
+    /// typed shape is still recoverable from the op pair itself
+    /// (`AddFunction` + `ModifyBody` under one intent). `None` keeps the
+    /// synthetic intent.
+    ///
+    /// Two ops means two gate passes, so this method makes the pair atomic
+    /// itself: the *final* program (source rewritten + new fn) is checked
+    /// before anything lands, and if the second op is refused anyway (a
+    /// non-type gate) the head is rolled back to where it started. A rejected
+    /// extraction therefore never leaves the new fn on the head without the
+    /// call that uses it.
+    pub fn apply_extract_function_with_intent(
+        &self,
+        branch: &str,
+        from_stage_id: &str,
+        expr_node: &lex_ast::NodeId,
+        spec: lex_ast::ExtractFnSpec,
+        supplied_intent: Option<&lex_vcs::Intent>,
     ) -> Result<(lex_vcs::OpId, lex_vcs::OpId), StoreError> {
         let from_stage = self.get_ast(from_stage_id)?;
         let new_fn_name = spec.name.clone();
@@ -3954,7 +4071,7 @@ impl Store {
         // / model fields here are not load-bearing — they exist to
         // make the IntentId content-addressed; downstream tooling
         // reads `prompt` to reconstruct the typed-transform shape.
-        let intent = lex_vcs::Intent::new(
+        let synthetic = lex_vcs::Intent::new(
             format!(
                 "[lex.transform.extract_function]\nnew_fn={new_fn_name}\nsource_sig={source_sig}\nfrom_stage={from_stage_id}\nexpr_node={node}",
                 node = expr_node.as_str(),
@@ -3967,8 +4084,65 @@ impl Store {
             },
             None,
         );
+        // A caller-supplied intent is recorded by the gated apply below
+        // (after the gate, so a refusal leaves no intent); the synthetic one
+        // keeps its original eager write (legacy behaviour, unchanged).
+        let (intent, intent_is_supplied) = match supplied_intent {
+            Some(i) => (i.clone(), true),
+            None => (synthetic, false),
+        };
         let intent_id = intent.intent_id.clone();
-        lex_vcs::IntentLog::open(self.root())?.put(&intent)?;
+        if !intent_is_supplied {
+            lex_vcs::IntentLog::open(self.root())?.put(&intent)?;
+        }
+        let record = intent_is_supplied.then_some(&intent);
+
+        // The program the pair produces: source rewritten, new fn alongside.
+        let mut candidate_with_modified: Vec<lex_ast::Stage> = Vec::with_capacity(head.len() + 1);
+        for (other_sig, other_stage_id) in &head {
+            if other_sig == &source_sig {
+                candidate_with_modified.push(modified_stage.clone());
+            } else {
+                candidate_with_modified.push(self.get_ast(other_stage_id)?);
+            }
+        }
+        candidate_with_modified.push(new_fn_stage.clone());
+
+        // Pre-flight the *final* program before either op lands: the pair is
+        // not atomic op-by-op (step 1 advances the head), so a rewrite that
+        // only fails at step 2 would otherwise strand the new fn on the head.
+        let head_before = self.get_branch(branch)?.and_then(|b| b.head_op);
+        {
+            let stages =
+                self.with_head_imports(head_before.as_deref(), candidate_with_modified.clone());
+            if let Err(errors) = self.check_with_resolved_deps(&stages, head_before.as_deref()) {
+                // Same repair hint the gated apply leaves for a refused op,
+                // against the op that would have been the modify step.
+                let would_be = lex_vcs::Operation::new(
+                    lex_vcs::OperationKind::ModifyBody {
+                        sig_id: source_sig.clone(),
+                        from_stage_id: from_stage_id.to_string(),
+                        to_stage_id: modified_stage_id.clone(),
+                        from_budget: budget_of_stage(&from_stage),
+                        to_budget: budget_of_stage(&modified_stage),
+                        to_sig_id: None,
+                    },
+                    head_before.iter().cloned().collect::<Vec<_>>(),
+                )
+                .with_intent(intent_id.clone());
+                let replace = lex_vcs::StageTransition::Replace {
+                    sig_id: source_sig.clone(),
+                    from: from_stage_id.to_string(),
+                    to: modified_stage_id.clone(),
+                };
+                let _ = self.record_repair_hint(
+                    &attestable_stage_ids(&replace),
+                    &would_be.op_id(),
+                    &errors,
+                );
+                return Err(StoreError::TypeError(errors));
+            }
+        }
 
         // Step 1 — emit the AddFunction op for the new fn. Build
         // the candidate program by appending the new fn to every
@@ -4000,23 +4174,18 @@ impl Store {
             sig_id: new_fn_sig.clone(),
             stage_id: new_fn_stage_id.clone(),
         };
-        let add_op_id =
-            self.apply_operation_checked(branch, add_op, add_transition, &candidate_with_new_fn)?;
+        let add_op_id = self.apply_operation_checked_with_intent(
+            branch,
+            add_op,
+            add_transition,
+            &candidate_with_new_fn,
+            record,
+        )?;
 
-        // Step 2 — emit the ModifyBody op for the source. Build
-        // the candidate program by replacing the source's stage
-        // with `modified_stage` and keeping the new fn alongside.
+        // Step 2 — emit the ModifyBody op for the source, gated against
+        // `candidate_with_modified` (built up front for the pre-flight).
         let from_budget = budget_of_stage(&from_stage);
         let to_budget = budget_of_stage(&modified_stage);
-        let mut candidate_with_modified: Vec<lex_ast::Stage> = Vec::with_capacity(head.len() + 1);
-        for (other_sig, other_stage_id) in &head {
-            if other_sig == &source_sig {
-                candidate_with_modified.push(modified_stage.clone());
-            } else {
-                candidate_with_modified.push(self.get_ast(other_stage_id)?);
-            }
-        }
-        candidate_with_modified.push(new_fn_stage.clone());
         let head_now = self.get_branch(branch)?.and_then(|b| b.head_op);
         let modify_op = lex_vcs::Operation::new(
             lex_vcs::OperationKind::ModifyBody {
@@ -4035,12 +4204,25 @@ impl Store {
             from: from_stage_id.to_string(),
             to: modified_stage_id,
         };
-        let modify_op_id = self.apply_operation_checked(
+        let modify_op_id = match self.apply_operation_checked_with_intent(
             branch,
             modify_op,
             modify_transition,
             &candidate_with_modified,
-        )?;
+            record,
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                // Step 1 already moved the head; put it back so a refused
+                // extraction is all-or-nothing. The orphaned `AddFunction`
+                // record is reclaimed by `lex op gc`. (Only reachable when a
+                // gate other than the pre-flighted type-check refuses.)
+                if let Some(prev) = head_before {
+                    self.set_branch_head_op(branch, prev)?;
+                }
+                return Err(e);
+            }
+        };
 
         Ok((add_op_id, modify_op_id))
     }

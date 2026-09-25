@@ -8,6 +8,8 @@
 //!   POST /v1/parse           { source } → CanonicalAst | [SyntaxError]
 //!   POST /v1/check           { source } → { ok: true } | [TypeError]
 //!   POST /v1/publish         { source, activate? } → [{ stage_id, sig_id, status }]
+//!   POST /v1/patch           { stage_id, patch, activate?, branch?, intent? } → { new_stage_id, op_id, ... }
+//!   POST /v1/transform       { branch, intent?, transform: {kind, ...} } → { op_id, new_head, ... } (see `transform_http`)
 //!   GET  /v1/stage/<id>      → { metadata, ast, status }
 //!   GET  /v1/stage/<id>/attestations → { attestations: [Attestation] }
 //!   POST /v1/run             { source, fn, args, policy } → { run_id, output | error }
@@ -45,6 +47,9 @@ mod ops_since_http;
 /// [`review_http`].
 pub mod issues_http;
 mod publish_examples;
+/// The typed-transform write surface (#837 piece A): `POST /v1/transform`,
+/// and the shared `apply_transform` that `lex ws transform` also calls.
+pub mod transform_http;
 mod web;
 pub mod mcp;
 

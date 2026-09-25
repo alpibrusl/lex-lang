@@ -565,6 +565,83 @@
       ]
     },
     {
+      "name": "ws",
+      "description": "local-first workspace commands (#837): write typed edits straight through the op log of an on-disk store, no text edit + publish",
+      "arguments": [],
+      "options": [],
+      "subcommands": [
+        {
+          "name": "transform",
+          "description": "apply a typed transform (replace_match_arm|rename_local|inline_let|extract_function) to a branch of a local store, through the gated op-log write path (#837)",
+          "arguments": [
+            {
+              "name": "kind",
+              "type": "enum[replace_match_arm|rename_local|inline_let|extract_function]",
+              "description": "which typed transform to apply",
+              "required": true
+            }
+          ],
+          "options": [
+            {
+              "name": "json",
+              "type": "string",
+              "description": "the transform's params as a JSON object (same shape as `transform` in POST /v1/transform, minus `kind`)"
+            },
+            {
+              "name": "branch",
+              "type": "string",
+              "description": "branch to write to (required; the store's current branch is never assumed)"
+            },
+            {
+              "name": "store",
+              "type": "string",
+              "description": "store root directory"
+            },
+            {
+              "name": "intent-prompt",
+              "type": "string",
+              "description": "why the change is made; without it the write is recorded as explicitly unattributed (#970)"
+            },
+            {
+              "name": "intent-model",
+              "type": "string",
+              "description": "the model as provider/name; default cli/unknown"
+            },
+            {
+              "name": "intent-session",
+              "type": "string",
+              "description": "the agent session id; pin it for a reproducible OpId"
+            },
+            {
+              "name": "intent-issue",
+              "type": "string",
+              "description": "the typed issue this change realizes"
+            }
+          ],
+          "subcommands": [],
+          "idempotent": false,
+          "examples": [
+            {
+              "description": "Rename a let-bound local",
+              "invocation": "lex ws transform --branch main --intent-prompt 'clearer name' --intent-session run-1 rename_local --json '{\"from_stage_id\":\"<stage>\",\"let_node\":\"n_0.2\",\"new_name\":\"total\"}'"
+            }
+          ]
+        }
+      ],
+      "examples": [
+        {
+          "description": "Inline a let binding",
+          "invocation": "lex ws transform --branch main inline_let --json '{\"from_stage_id\":\"<stage>\",\"let_node\":\"n_0.2\"}'"
+        }
+      ],
+      "see_also": [
+        "publish",
+        "files",
+        "repair",
+        "op"
+      ]
+    },
+    {
       "name": "store",
       "description": "browse the content-addressed code store",
       "arguments": [],
@@ -2247,6 +2324,10 @@
         {
           "description": "Import a git repo's branch tip as one snapshot (#892)",
           "invocation": "lex op import-git ./repo --head-only --store-branch imported"
+        },
+        {
+          "description": "Import a repo's full first-parent history, folding commits that do not type-check (re-run to extend)",
+          "invocation": "lex op import-git https://example.com/team/repo.git --on-error fold --examples tip"
         }
       ],
       "see_also": [

@@ -58,6 +58,7 @@ mod test_runner;
 mod tool_registry;
 mod trust;
 mod watch;
+mod ws;
 
 use ::acli::OutputFormat;
 use anyhow::{anyhow, bail, Context, Result};
@@ -175,6 +176,7 @@ fn run(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "issue" => issue::cmd_issue(fmt, &args[1..]),
         "recall" => recall::cmd_recall(fmt, &args[1..]),
         "export-git" => export_git::cmd_export_git(fmt, &args[1..]),
+        "ws" => ws::cmd_ws(fmt, &args[1..]),
         "docs" => docs::cmd_docs(fmt, &args[1..]),
         "doc-sync" => doc_sync::cmd_doc_sync(&args[1..]),
         "plan" => cmd_plan(fmt, &args[1..]),
@@ -289,6 +291,9 @@ fn print_usage() {
     println!("                                     publish also captures its non-op-log files (README,");
     println!("                                     lex.toml, lex.lock, tests/, ...) as one SetFiles op;");
     println!("                                     --no-files opts a single publish out.");
+    println!("  ws transform --branch B [--store DIR] [--intent-prompt T ...] <kind> --json '<params>'");
+    println!("                                     typed edit (replace_match_arm|rename_local|inline_let|");
+    println!("                                     extract_function) straight through the op log, gated (#837)");
     println!("  files status|commit|ls|cat|checkout [--store DIR] [--branch NAME] ...");
     println!("                                     work with the files manifest directly (#1007) --");
     println!("                                     `lex files` with no subcommand prints full usage.");
@@ -377,9 +382,11 @@ fn print_usage() {
     );
     println!("  op {{show|log|replay|push|pull|repack|gc|import-git}} [--store DIR]");
     println!("                                     inspect and sync the operation log");
-    println!("  op import-git <repo> --head-only [--branch B] [--store-branch S] [--store DIR]");
-    println!("          [--strict] [--examples tip|all|none] [--max-file-bytes N]");
-    println!("                                     import a git branch tip as one snapshot (#892)");
+    println!("  op import-git <path|url> [--head-only] [--branch B] [--store-branch S] [--store DIR]");
+    println!("          [--on-error fold|stop] [--strict] [--examples tip|all|none]");
+    println!("          [--max-file-bytes N] [--depth N] [--since SHA] [--max-commits N]");
+    println!("                                     import a git branch (first-parent history, or the tip");
+    println!("                                     with --head-only) into the op-log; re-run to extend (#892)");
     println!("  log [branch]                       show the operation log for a branch (alias of `branch log`)");
     println!("  recall {{--intent ID|--session ID|--predicate JSON|--all}} [--limit N] [--store DIR]");
     println!("                                     predicate query over the op log (#836)");
