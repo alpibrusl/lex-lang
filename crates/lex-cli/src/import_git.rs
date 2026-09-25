@@ -1,16 +1,16 @@
-//! `lex op import-git` — the first working git → op-log importer (#892 PR 4).
+//! `lex op import-git` — the git → op-log importer (#892 PR 4 + PR 5).
 //!
 //! ```text
 //! lex op import-git <path|url> [--branch B] [--store DIR] [--store-branch S]
 //!                   [--head-only] [--on-error fold|stop] [--strict]
 //!                   [--examples tip|all|none] [--max-file-bytes N]
+//!                   [--depth N] [--since SHA] [--max-commits N]
 //! ```
 //!
-//! **This PR imports the TIP of one branch as ONE snapshot** (`--head-only`,
-//! required). Full history, URL clones, incremental re-import and the
-//! `--on-error` policies are PR 5; the flags are parsed now so the surface does
-//! not change, and the per-commit work is [`import_commit`], which PR 5's loop
-//! calls once per commit.
+//! Without `--head-only` this imports the FIRST-PARENT history of one branch,
+//! one intent per commit; with it, the tip as one snapshot. Re-running extends
+//! the store branch from where the last run ended (the watermark is derived
+//! from the op-log, see [`watermark`]).
 //!
 //! ## What a commit becomes
 //!
@@ -20,11 +20,40 @@
 //!   with `files: false`. Tree → ops and every gate are therefore one
 //!   implementation; import and publish cannot disagree.
 //! * A `SetFiles` op, LAST, under the same intent: the manifest of every other
-//!   tracked file, built from git-object bytes with `manifest_from_files`
-//!   (`src/**/*.lex`, `src.lex`, `.git` and top-level `.lex` are excluded here —
-//!   `manifest_from_files` rejects reserved paths but does not filter).
+//!   tracked file, built from git-object bytes (`src/**/*.lex`, `src.lex`,
+//!   `.git` and top-level `.lex` are excluded — the manifest rejects reserved
+//!   paths but does not filter).
 //! * A tree with no `lex.toml` and no `src/**/*.lex` is a non-Lex repo: a
 //!   manifest-only branch (zero semantic ops) — a legitimate shape (#892 §1.7).
+//! * A commit that touches none of `src/**/*.lex`, `lex.toml`, `lex.lock`
+//!   skips the semantic pass entirely: a `SetFiles`-only op. A commit with no
+//!   net change is zero ops and leaves no trace in the op-log.
+//! * A commit that deletes the whole package runs the semantic pass on an
+//!   empty tree (`allow_empty`), so the removals are emitted.
+//!
+//! ## History shape
+//!
+//! First-parent only: a merge commit's tree diff (against its first parent)
+//! folds the side branch into ONE intent, and `origin.parents` lists every
+//! parent (the report adds the merged parents' subject lines). Renames are a
+//! remove + add, as in `lex publish`.
+//!
+//! ## Commits that do not import (`--on-error fold|stop`)
+//!
+//! A commit the gates refuse (type-check, examples, the store's write-time
+//! gate, an unusable tree) is skipped and — with `fold` (the default) — its
+//! changes ride into the NEXT importable commit for free: the next publish
+//! diffs against the last good head and the manifest is a full snapshot. That
+//! commit's `origin.folded` lists the skipped SHAs (hashed), and the report
+//! lists each with its phase and diagnostics. `stop` halts at the first
+//! refusal; earlier commits stay imported. Exit 0 iff the tip landed, 2 if it
+//! did not (the store is valid but stale at the last good commit) or `--strict`
+//! fired on an unsupported path. The gate is never skipped: a broken head is
+//! never imported.
+//!
+//! Historical commits are type-checked against TODAY'S dependencies: a package
+//! with floating git dependencies and no tracked `lex.lock` folds heavily.
+//! That is real, and the report's fold ratio says so.
 //!
 //! ## Determinism (what makes two imports converge on the same OpIds)
 //!
@@ -32,30 +61,50 @@
 //! commit message verbatim (lossy-UTF-8), the session is
 //! `git-import:<first-parent root sha>` (repo identity is the root commit, not
 //! the path or URL), the model is a constant, and author/committer/dates/parents
-//! ride in [`Origin`]. `created_at` (unhashed) is the committer date. Bytes come
-//! from `git ls-tree` / `git cat-file --batch`, never a checkout, so
+//! ride in the intent's `Origin`. `created_at` (unhashed) is the committer date. Bytes come
+//! from `git diff-tree` / `git cat-file --batch`, never a checkout, so
 //! `core.autocrlf`, `.gitattributes` and smudge filters cannot leak in.
+//!
+//! A shallow source (`--depth N` from a URL) makes the shallow boundary the
+//! lineage root: a DIFFERENT session, so different OpIds than a full import of
+//! the same repo, and the report says `shallow: true`. A shallow LOCAL repo is
+//! refused for the same reason.
 //!
 //! ## Atomicity
 //!
-//! A commit's ops (semantic, then `SetFiles`) land on a private WORK branch and
-//! the target branch is only moved (fast-forward from empty) once every step
-//! succeeded. Inside [`import_commit`] the work branch is checkpointed and
-//! restored on any failure, so PR 5's per-commit loop never sees a half-applied
-//! commit. A failed import therefore leaves the target branch exactly as it
-//! was (the only residue is unreachable content-addressed objects).
+//! A commit's ops (semantic, then `SetFiles`) land on a private WORK branch
+//! and the target branch is only moved (fast-forward) once the run is over.
+//! Inside [`import_commit`] the work branch is checkpointed and restored on any
+//! failure, so the loop never sees a half-applied commit. A run that fails
+//! part-way leaves the target branch at the last good commit (or, for an
+//! infrastructure error, advanced to it before the error is reported).
+//!
+//! ## Scale
+//!
+//! The manifest is an in-memory map updated only from each commit's changed
+//! paths (`git diff-tree`), with a bounded oid → blob cache: per-commit cost is
+//! O(changed files), not O(head). See [`tree`].
 
-use crate::publish_core::{self, Outcome, PublishError, PublishOptions};
+mod commit;
+mod git;
+mod report;
+mod source;
+mod tree;
+mod watermark;
+
+use crate::publish_core;
 use ::acli::OutputFormat;
 use anyhow::{anyhow, bail, Context, Result};
-use lex_store::files::{is_reserved_path, validate_path, MODE_EXEC, MODE_FILE};
+use commit::import_commit;
+use git::*;
 use lex_store::Store;
-use lex_vcs::{Intent, IntentLog, ModelDescriptor, OpId, Origin, Person};
+use lex_vcs::OpId;
+use report::{render, Folded, Report, Stats};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use source::Source;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use tree::{ObjMeta, TreeState};
 
 /// The importer's profile version, recorded as `model.version` of every
 /// imported intent. It is HASHED (into the intent id, hence every OpId): bumping
@@ -72,7 +121,7 @@ pub(crate) const MANIFEST_MAX_ENTRIES: usize = 10_000;
 
 const USAGE: &str = "usage: lex op import-git <path|url> [--branch B] [--store DIR] \
 [--store-branch S] [--head-only] [--on-error fold|stop] [--strict] \
-[--examples tip|all|none] [--max-file-bytes N]";
+[--examples tip|all|none] [--max-file-bytes N] [--depth N] [--since SHA] [--max-commits N]";
 
 // ── arguments ───────────────────────────────────────────────────────────────
 
@@ -96,12 +145,13 @@ struct ImportArgs {
     store: Option<PathBuf>,
     store_branch: Option<String>,
     head_only: bool,
-    // Parsed now so the flag surface is final; only PR 5's history loop acts on it.
-    #[allow(dead_code)]
     on_error: OnError,
     strict: bool,
     examples: ExamplesPolicy,
     max_file_bytes: u64,
+    depth: Option<u32>,
+    since: Option<String>,
+    max_commits: Option<usize>,
 }
 
 fn parse_args(args: &[String]) -> Result<ImportArgs> {
@@ -116,6 +166,9 @@ fn parse_args(args: &[String]) -> Result<ImportArgs> {
         strict: false,
         examples: ExamplesPolicy::Tip,
         max_file_bytes: MANIFEST_MAX_FILE_BYTES,
+        depth: None,
+        since: None,
+        max_commits: None,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -156,6 +209,21 @@ fn parse_args(args: &[String]) -> Result<ImportArgs> {
                 }
                 a.max_file_bytes = n;
             }
+            "--depth" => {
+                let v = value("--depth")?;
+                let n: u32 = v.parse().ok().filter(|n| *n >= 1).ok_or_else(|| {
+                    anyhow!("--depth needs a positive number of commits, not `{v}`")
+                })?;
+                a.depth = Some(n);
+            }
+            "--since" => a.since = Some(value("--since")?),
+            "--max-commits" => {
+                let v = value("--max-commits")?;
+                let n: usize = v.parse().ok().filter(|n| *n >= 1).ok_or_else(|| {
+                    anyhow!("--max-commits needs a positive number of commits, not `{v}`")
+                })?;
+                a.max_commits = Some(n);
+            }
             f if f.starts_with("--") => bail!("unexpected flag `{f}`\n{USAGE}"),
             p if source.is_none() => source = Some(p.to_string()),
             p => bail!("unexpected argument `{p}`\n{USAGE}"),
@@ -165,218 +233,51 @@ fn parse_args(args: &[String]) -> Result<ImportArgs> {
     Ok(a)
 }
 
-/// Whether `s` names a remote (a URL or scp-style address) rather than a path.
-fn looks_like_url(s: &str) -> bool {
-    if s.contains("://") {
-        return true;
-    }
-    // scp-like `user@host:path` / `host:path` — but not an existing local path.
-    !Path::new(s).exists() && s.contains(':') && !s.starts_with('/') && !s.starts_with('.')
-}
-
-// ── git plumbing (objects only) ─────────────────────────────────────────────
-
-/// A `git` invocation pinned to `dir`, with the caller's repo-selecting
-/// environment scrubbed (so a stray `GIT_DIR` cannot redirect the read) and
-/// nothing ever prompting.
-fn git_cmd(dir: &Path) -> Command {
-    let mut c = Command::new("git");
-    c.arg("-C").arg(dir);
-    for v in [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_INDEX_FILE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_NAMESPACE",
-    ] {
-        c.env_remove(v);
-    }
-    c.env("GIT_TERMINAL_PROMPT", "0").env("LC_ALL", "C").env("GIT_OPTIONAL_LOCKS", "0");
-    c
-}
-
-fn git_out(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let out = git_cmd(dir)
-        .args(args)
-        .output()
-        .with_context(|| format!("running `git {}` (is git installed?)", args.join(" ")))?;
-    if !out.status.success() {
-        bail!("`git {}` failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
-    }
-    Ok(out.stdout)
-}
-
-fn git_line(dir: &Path, args: &[&str]) -> Result<String> {
-    Ok(String::from_utf8_lossy(&git_out(dir, args)?).trim().to_string())
-}
-
-/// One long-lived `git cat-file --batch`: blob bytes straight from the object
-/// database, with no smudge/eol/attributes processing.
-struct CatFile {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-}
-
-impl CatFile {
-    fn spawn(dir: &Path) -> Result<CatFile> {
-        let mut child = git_cmd(dir)
-            .args(["cat-file", "--batch"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("spawning `git cat-file --batch`")?;
-        let stdin = child.stdin.take().expect("piped stdin");
-        let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
-        Ok(CatFile { child, stdin, stdout })
-    }
-
-    fn read(&mut self, oid: &str) -> Result<Vec<u8>> {
-        self.stdin
-            .write_all(format!("{oid}\n").as_bytes())
-            .and_then(|_| self.stdin.flush())
-            .context("writing to `git cat-file --batch`")?;
-        let mut header = String::new();
-        self.stdout.read_line(&mut header).context("reading `git cat-file --batch`")?;
-        let parts: Vec<&str> = header.split_whitespace().collect();
-        let size: usize = match parts.as_slice() {
-            [_, "blob", size] => size.parse().map_err(|_| anyhow!("bad cat-file header `{}`", header.trim()))?,
-            [_, "missing"] => bail!("git object {oid} is missing from the repository"),
-            _ => bail!("unexpected cat-file header `{}` for {oid}", header.trim()),
-        };
-        let mut buf = vec![0u8; size];
-        self.stdout.read_exact(&mut buf).with_context(|| format!("reading git object {oid}"))?;
-        let mut nl = [0u8; 1];
-        self.stdout.read_exact(&mut nl).context("reading cat-file terminator")?;
-        Ok(buf)
-    }
-}
-
-impl Drop for CatFile {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-/// One tree entry, straight from `git ls-tree -r -z -l`.
-#[derive(Debug, Clone)]
-struct TreeEntry {
-    mode: u32,
-    kind: String,
-    oid: String,
-    size: u64,
-    /// Raw path bytes (git paths are bytes; non-UTF-8 ones are refused).
-    path: Vec<u8>,
-}
-
-fn ls_tree(dir: &Path, sha: &str) -> Result<Vec<TreeEntry>> {
-    let raw = git_out(dir, &["ls-tree", "-r", "-z", "-l", "--full-tree", sha])?;
-    let mut out = Vec::new();
-    for rec in raw.split(|&b| b == 0).filter(|r| !r.is_empty()) {
-        let tab = rec
-            .iter()
-            .position(|&b| b == b'\t')
-            .ok_or_else(|| anyhow!("malformed ls-tree record"))?;
-        let meta = String::from_utf8_lossy(&rec[..tab]).to_string();
-        let f: Vec<&str> = meta.split_whitespace().collect();
-        let [mode, kind, oid, size] = f.as_slice() else {
-            bail!("malformed ls-tree record `{meta}`");
-        };
-        out.push(TreeEntry {
-            mode: u32::from_str_radix(mode, 8).map_err(|_| anyhow!("bad mode `{mode}`"))?,
-            kind: kind.to_string(),
-            oid: oid.to_string(),
-            // A submodule (`commit`) has no size (`-`).
-            size: size.parse().unwrap_or(0),
-            path: rec[tab + 1..].to_vec(),
-        });
-    }
-    Ok(out)
-}
-
-/// A parsed git commit object.
-#[derive(Debug, Clone)]
-struct CommitMeta {
-    sha: String,
-    parents: Vec<String>,
-    author: Person,
-    committer: Person,
-    /// The message verbatim (lossy UTF-8, so the decode is deterministic).
-    message: String,
-}
-
-/// Parse `git cat-file commit <sha>` directly — never localized `git log`
-/// output. Headers end at the first blank line; a continuation line (a
-/// `gpgsig` / `mergetag` body) starts with a space and is skipped.
-fn read_commit(dir: &Path, sha: &str) -> Result<CommitMeta> {
-    let raw = git_out(dir, &["cat-file", "commit", sha])?;
-    let split = raw.windows(2).position(|w| w == b"\n\n");
-    let (head, body) = match split {
-        Some(i) => (&raw[..i], &raw[i + 2..]),
-        None => (&raw[..], &raw[raw.len()..]),
-    };
-    let head = String::from_utf8_lossy(head);
-    let (mut parents, mut author, mut committer) = (Vec::new(), None, None);
-    for line in head.split('\n') {
-        if line.starts_with(' ') {
-            continue;
-        }
-        let (key, val) = line.split_once(' ').unwrap_or((line, ""));
-        match key {
-            "parent" => parents.push(val.to_string()),
-            "author" if author.is_none() => author = Some(parse_person(val)?),
-            "committer" if committer.is_none() => committer = Some(parse_person(val)?),
-            _ => {}
-        }
-    }
-    Ok(CommitMeta {
-        sha: sha.to_string(),
-        parents,
-        author: author.ok_or_else(|| anyhow!("commit {sha} has no author"))?,
-        committer: committer.ok_or_else(|| anyhow!("commit {sha} has no committer"))?,
-        message: String::from_utf8_lossy(body).into_owned(),
-    })
-}
-
-/// `Name <email> 1700000000 +0200` → [`Person`]. The zone is kept verbatim.
-fn parse_person(s: &str) -> Result<Person> {
-    let gt = s.rfind('>').ok_or_else(|| anyhow!("malformed identity `{s}`"))?;
-    let lt = s[..gt].rfind('<').ok_or_else(|| anyhow!("malformed identity `{s}`"))?;
-    let name = s[..lt].trim_end().to_string();
-    let email = s[lt + 1..gt].to_string();
-    let mut rest = s[gt + 1..].split_whitespace();
-    let when: i64 = rest
-        .next()
-        .and_then(|w| w.parse().ok())
-        .ok_or_else(|| anyhow!("malformed identity date in `{s}`"))?;
-    let tz = rest.next().unwrap_or("+0000").to_string();
-    Ok(Person { name, email, when, tz })
-}
-
 // ── the import state and per-commit result ──────────────────────────────────
 
 /// Everything [`import_commit`] needs, shared across the commits of one import.
 struct ImportState {
     repo: PathBuf,
     cat: CatFile,
+    info: ObjInfo,
     store_root: PathBuf,
     store: Store,
     /// The private branch commits are applied to; the target branch is only
-    /// advanced onto it after the whole import succeeded.
+    /// advanced onto it once the run is over.
     work_branch: String,
     /// First-parent root commit: the repo's identity (`git-import:<root>`).
     root_sha: String,
-    /// Run the behavioural examples gate for the commit being imported.
+    /// Run the behavioural examples gate for the commit being imported (the
+    /// loop sets it per commit from `--examples`).
     examples: bool,
+    /// `--strict`: a commit whose tree holds an unsupported path is refused.
+    strict: bool,
     max_file_bytes: u64,
-    /// Skipped symlinks/submodules, in encounter order.
+    /// Skipped symlinks/submodules: each listed once, with first/last sighting.
     unsupported: Vec<Unsupported>,
-    /// Commits skipped and folded into the next importable one (PR 5; always
-    /// empty in the tip-only import).
+    /// Commits skipped and folded into the next importable one; they land in
+    /// that commit's `origin.folded`.
     pending_folded: Vec<String>,
+    /// The incremental tree: the git tree of the last commit processed.
+    tree: TreeState,
+    /// The last commit the tree was advanced to (`None`: the next commit is a
+    /// snapshot).
+    prev: Option<String>,
+    /// The store's semantic head may be behind the tree (a commit was refused
+    /// or failed): the next commit re-runs the semantic pass even if it
+    /// touches no Lex path, so a `SetFiles`-only commit can never land on top
+    /// of a stale semantic head.
+    dirty: bool,
+    /// The private tree the loader reads: `lex.toml`, `lex.lock`, `src/**`,
+    /// kept in step with `tree` by changed paths only.
+    scratch: tempfile::TempDir,
+    /// oid → what is known about the object (size, stored blob): a bound on
+    /// object reads, not a correctness mechanism.
+    cache: HashMap<String, ObjMeta>,
+    stats: Stats,
+    /// The parents of the commit `import_commit` last read (for the report's
+    /// `merged` subject lines).
+    last_parents: Vec<String>,
     /// Test seam: fail after the semantic ops landed, before the `SetFiles`.
     #[cfg(test)]
     fail_after_semantic: bool,
@@ -388,7 +289,8 @@ struct ImportState {
 
 impl ImportState {
     /// Open the import: a fresh private work branch forked from `store_branch`
-    /// (absent or empty in this PR), the `cat-file` process, and the limits.
+    /// (absent, empty, or the branch being extended), the `cat-file`
+    /// processes, the scratch tree and the limits.
     fn open(
         repo: PathBuf,
         store_root: PathBuf,
@@ -404,15 +306,27 @@ impl ImportState {
         store.create_branch(&work_branch, store_branch).map_err(|e| anyhow!("{e}"))?;
         Ok(ImportState {
             cat: CatFile::spawn(&repo)?,
+            info: ObjInfo::spawn(&repo)?,
             repo,
             store_root,
             store,
             work_branch,
             root_sha,
             examples: a.examples != ExamplesPolicy::None,
+            strict: a.strict,
             max_file_bytes: a.max_file_bytes,
             unsupported: Vec::new(),
             pending_folded: Vec::new(),
+            tree: TreeState::default(),
+            prev: None,
+            dirty: false,
+            scratch: tempfile::Builder::new()
+                .prefix("lex-import-git-")
+                .tempdir()
+                .context("creating scratch dir")?,
+            cache: HashMap::new(),
+            stats: Stats::default(),
+            last_parents: Vec::new(),
             #[cfg(test)]
             fail_after_semantic: false,
             #[cfg(test)]
@@ -421,11 +335,14 @@ impl ImportState {
     }
 }
 
+/// A symlink or submodule the importer skipped. A persistent one is listed
+/// once: where it was first seen and where it was last seen.
 #[derive(Debug, Clone)]
 struct Unsupported {
     path: String,
     kind: &'static str,
-    commit: String,
+    first_seen: String,
+    last_seen: String,
 }
 
 /// Why a commit was not imported. `phase` says where; `reason` is a stable tag.
@@ -448,139 +365,12 @@ enum CommitOutcome {
     /// The commit produced `ops` ops (semantic ones plus the `SetFiles`), the
     /// last of which is `files_op` when a manifest changed. `head` is the work
     /// branch's head afterwards.
+    #[allow(dead_code)] // read by the atomicity unit test
     Imported { ops: usize, files_op: Option<OpId>, head: Option<OpId> },
     /// The commit changed nothing the store tracks.
     Noop,
     /// Nothing landed for this commit; the work branch is unchanged.
     Refused(Refusal),
-}
-
-/// The deterministic intent of `meta` (see the module docs).
-fn build_intent(root_sha: &str, meta: &CommitMeta, folded: &[String]) -> Intent {
-    let origin = Origin {
-        vcs: "git".into(),
-        commit: meta.sha.clone(),
-        author: meta.author.clone(),
-        committer: Some(meta.committer.clone()),
-        parents: meta.parents.clone(),
-        folded: folded.to_vec(),
-    };
-    Intent::with_timestamp(
-        meta.message.clone(),
-        format!("git-import:{root_sha}"),
-        ModelDescriptor {
-            provider: "git".into(),
-            name: "import".into(),
-            version: Some(IMPORT_PROFILE_VERSION.into()),
-        },
-        None,
-        meta.committer.when.max(0) as u64,
-    )
-    .with_origin(origin)
-}
-
-// ── one commit ──────────────────────────────────────────────────────────────
-
-/// A tracked file the commit will carry, classified.
-struct KeptFile {
-    path: String,
-    oid: String,
-    exec: bool,
-}
-
-/// The classified tree of one commit.
-struct Classified {
-    /// Everything but `src/**/*.lex`: goes into the manifest.
-    manifest: Vec<KeptFile>,
-    /// `src/**/*.lex` (op-log-owned): loaded by the semantic pass.
-    lex_sources: Vec<KeptFile>,
-    has_lex_toml: bool,
-    has_lex_lock: bool,
-    has_root_src_lex: bool,
-}
-
-/// Classify `sha`'s tree and run the local checks the hub only enforces on
-/// push. Nothing is written and no blob is read.
-fn classify_tree(state: &mut ImportState, sha: &str) -> Result<std::result::Result<Classified, Refusal>> {
-    let mut c = Classified {
-        manifest: Vec::new(),
-        lex_sources: Vec::new(),
-        has_lex_toml: false,
-        has_lex_lock: false,
-        has_root_src_lex: false,
-    };
-    let mut folded: BTreeMap<String, String> = BTreeMap::new();
-    for e in ls_tree(&state.repo, sha)? {
-        let Ok(path) = String::from_utf8(e.path.clone()) else {
-            return Ok(Err(Refusal::new(
-                "manifest:path",
-                "tree",
-                format!("a path is not valid UTF-8: {}", String::from_utf8_lossy(&e.path)),
-            )));
-        };
-        // Symlinks and submodules are not representable (files-v1): skip + list.
-        let kind = match (e.mode & 0o170000, e.kind.as_str()) {
-            (0o120000, _) => Some("symlink"),
-            (0o160000, _) | (_, "commit") => Some("submodule"),
-            _ => None,
-        };
-        if let Some(kind) = kind {
-            state.unsupported.push(Unsupported { path, kind, commit: sha.to_string() });
-            continue;
-        }
-        // The store's own directory / git internals are never content.
-        let first = path.split('/').next().unwrap_or("");
-        if path.split('/').any(|c| c.eq_ignore_ascii_case(".git")) || first.eq_ignore_ascii_case(".lex") {
-            continue;
-        }
-        if path.split('/').any(|c| c.is_empty() || c == "." || c == "..") || path.contains('\0') {
-            return Ok(Err(Refusal::new("manifest:path", "tree", format!("unusable path `{path}`"))));
-        }
-        if e.size > state.max_file_bytes {
-            return Ok(Err(Refusal::new(
-                "manifest:limit",
-                "manifest",
-                format!(
-                    "`{path}` is {} bytes, over the {}-byte per-file limit",
-                    e.size, state.max_file_bytes
-                ),
-            )));
-        }
-        if let Some(prev) = folded.insert(path.to_lowercase(), path.clone()) {
-            return Ok(Err(Refusal::new(
-                "manifest:case_collision",
-                "manifest",
-                format!("paths `{prev}` and `{path}` differ only in case"),
-            )));
-        }
-        let file = KeptFile { path: path.clone(), oid: e.oid, exec: e.mode & 0o111 != 0 };
-        if path == "src.lex" {
-            c.has_root_src_lex = true;
-        } else if is_reserved_path(&path) {
-            c.lex_sources.push(file);
-        } else {
-            match path.as_str() {
-                "lex.toml" => c.has_lex_toml = true,
-                "lex.lock" => c.has_lex_lock = true,
-                _ => {}
-            }
-            if let Err(err) = validate_path(&path) {
-                return Ok(Err(Refusal::new("manifest:path", "manifest", err.to_string())));
-            }
-            c.manifest.push(file);
-        }
-    }
-    if c.manifest.len() > MANIFEST_MAX_ENTRIES {
-        return Ok(Err(Refusal::new(
-            "manifest:limit",
-            "manifest",
-            format!(
-                "{} files, over the {MANIFEST_MAX_ENTRIES}-entry manifest limit",
-                c.manifest.len()
-            ),
-        )));
-    }
-    Ok(Ok(c))
 }
 
 /// Whether `lex.toml`'s bytes declare `[package] name`.
@@ -590,200 +380,6 @@ fn has_package_name(bytes: &[u8]) -> bool {
         .and_then(|s| toml::from_str::<toml::Value>(s).ok())
         .and_then(|v| v.get("package")?.get("name")?.as_str().map(|n| !n.trim().is_empty()))
         .unwrap_or(false)
-}
-
-/// Import ONE commit onto `state.work_branch`, atomically: semantic ops first,
-/// `SetFiles` last, one intent — or nothing at all. PR 5's history loop calls
-/// this once per commit.
-///
-/// `Ok(Refused(..))` is an expected outcome (a gate said no); `Err` is an
-/// infrastructure failure (git, IO). Either way the work branch is restored.
-fn import_commit(state: &mut ImportState, sha: &str) -> Result<CommitOutcome> {
-    let meta = read_commit(&state.repo, sha)?;
-    let cls = match classify_tree(state, sha)? {
-        Ok(c) => c,
-        Err(refusal) => return Ok(CommitOutcome::Refused(refusal)),
-    };
-    let is_package = if cls.lex_sources.is_empty() && !cls.has_root_src_lex {
-        false
-    } else {
-        // `src/**/*.lex` (or `src.lex`) present: those paths are reserved (they
-        // cannot go in a manifest), so the tree MUST be a loadable package.
-        if cls.has_root_src_lex {
-            return Ok(CommitOutcome::Refused(Refusal::new(
-                "lex:root_src_lex",
-                "tree",
-                "`src.lex` at the repository root is op-log-owned and not importable; \
-                 a Lex package keeps its sources under src/",
-            )));
-        }
-        if !cls.has_lex_toml {
-            return Ok(CommitOutcome::Refused(Refusal::new(
-                "lex:no_manifest",
-                "tree",
-                "the tree has src/**/*.lex but no lex.toml: those paths are reserved for the \
-                 op-log and cannot be carried in a files manifest, so this is not importable",
-            )));
-        }
-        let toml = state.cat.read(&cls.manifest.iter().find(|f| f.path == "lex.toml").expect("has_lex_toml").oid)?;
-        if !has_package_name(&toml) {
-            return Ok(CommitOutcome::Refused(Refusal::new(
-                "lex:not_a_package",
-                "tree",
-                "the tree has src/**/*.lex but its lex.toml has no [package] name",
-            )));
-        }
-        true
-    };
-
-    let intent = build_intent(&state.root_sha, &meta, &state.pending_folded);
-    let work = state.work_branch.clone();
-    let ckpt = format!("{work}.ckpt");
-    state.store.create_branch(&ckpt, &work).map_err(|e| anyhow!("{e}"))?;
-
-    let result = apply_commit(state, &cls, is_package, &intent);
-
-    match &result {
-        Ok(CommitOutcome::Imported { .. }) => {
-            delete_branch(&state.store_root, &state.store, &ckpt)?;
-            state.pending_folded.clear();
-        }
-        // Refused, Noop or an infrastructure error: put the work branch back
-        // exactly as it was before this commit.
-        _ => {
-            delete_branch(&state.store_root, &state.store, &work)?;
-            state.store.create_branch(&work, &ckpt).map_err(|e| anyhow!("{e}"))?;
-            delete_branch(&state.store_root, &state.store, &ckpt)?;
-        }
-    }
-    result
-}
-
-/// The mutating half of [`import_commit`]; the caller owns the checkpoint.
-fn apply_commit(
-    state: &mut ImportState,
-    cls: &Classified,
-    is_package: bool,
-    intent: &Intent,
-) -> Result<CommitOutcome> {
-    let work = state.work_branch.clone();
-    let mut ops = 0usize;
-    let mut lock_toml: Option<String> = None;
-
-    // ── the semantic pass ───────────────────────────────────────────────────
-    if is_package {
-        let scratch = tempfile::Builder::new().prefix("lex-import-git-").tempdir().context("creating scratch dir")?;
-        materialize(state, cls, scratch.path(), &mut lock_toml)?;
-        let mut opts = PublishOptions::new(intent.clone());
-        opts.files = false; // the manifest is built from git objects, below
-        opts.examples = state.examples;
-        opts.allow_empty = true;
-        match publish_core::publish_dir(&state.store_root, scratch.path(), Some(&work), opts) {
-            Ok(Outcome::Published(p)) => ops += p.ops.len(),
-            Ok(Outcome::DryRun(_)) => unreachable!("dry_run is never set"),
-            Err(PublishError::TypeCheck(errs)) => {
-                return Ok(CommitOutcome::Refused(Refusal {
-                    reason: "gate:type-check",
-                    phase: "type-check",
-                    message: format!("type-check failed with {} error(s)", errs.len()),
-                    diagnostics: errs.iter().filter_map(|e| serde_json::to_value(e).ok()).collect(),
-                }));
-            }
-            Err(PublishError::Examples(errs)) => {
-                return Ok(CommitOutcome::Refused(Refusal {
-                    reason: "gate:examples",
-                    phase: "examples",
-                    message: format!("examples failed with {} error(s)", errs.len()),
-                    diagnostics: errs.iter().filter_map(|e| serde_json::to_value(e).ok()).collect(),
-                }));
-            }
-            Err(PublishError::Load(e)) => {
-                return Ok(CommitOutcome::Refused(Refusal::new("lex:load", "load", format!("{e:#}"))));
-            }
-            // The store's write-time gate (or an unknown branch, IO, ...).
-            Err(PublishError::Store(e)) => {
-                return Ok(CommitOutcome::Refused(Refusal::new("gate:store", "store", e.to_string())));
-            }
-            Err(PublishError::Other(e)) => return Err(e),
-        }
-    }
-    #[cfg(test)]
-    if state.fail_after_semantic {
-        state.saw_partial_head = state.store.get_branch(&work)?.and_then(|b| b.head_op).is_some();
-        bail!("injected failure after the semantic ops");
-    }
-    // PR 5: a commit that DELETES the package (the work branch has live
-    // declarations, this tree has none) must run the semantic pass on an empty
-    // scratch dir with `allow_empty` so the removals are emitted. Unreachable
-    // in the tip-only import: the target branch is required to be empty.
-
-    // ── the manifest, LAST, under the same intent ──────────────────────────
-    let manifest = {
-        let mut read_err: Option<anyhow::Error> = None;
-        let cat = &mut state.cat;
-        let entries = cls.manifest.iter().map_while(|f| match cat.read(&f.oid) {
-            Ok(bytes) => Some((f.path.clone(), if f.exec { MODE_EXEC } else { MODE_FILE }, bytes)),
-            Err(e) => {
-                read_err = Some(e);
-                None
-            }
-        });
-        let built = crate::files::manifest_from_files(&state.store, entries);
-        match read_err {
-            Some(e) => return Err(e),
-            None => match built {
-                Ok(m) => m,
-                Err(e) => {
-                    return Ok(CommitOutcome::Refused(Refusal::new("manifest:invalid", "manifest", format!("{e:#}"))));
-                }
-            },
-        }
-    };
-    IntentLog::open(state.store.root())
-        .and_then(|l| l.put(intent))
-        .context("recording intent")?;
-    let files_op = match crate::files::publish_manifest_if_changed(
-        &state.store,
-        &work,
-        &manifest,
-        Some(intent.intent_id.clone()),
-    ) {
-        Ok(r) => r.map(|(op, _)| op),
-        Err(e) => return Ok(CommitOutcome::Refused(Refusal::new("gate:store", "manifest", format!("{e:#}")))),
-    };
-    if files_op.is_some() {
-        ops += 1;
-    }
-
-    let head = state.store.get_branch(&work)?.and_then(|b| b.head_op);
-    if ops == 0 {
-        return Ok(CommitOutcome::Noop);
-    }
-    // The committed lock rides on the final head, as `lex publish` leaves it.
-    if let (Some(h), Some(lock)) = (head.as_deref(), lock_toml.as_deref()) {
-        state.store.set_committed_lock(h, lock)?;
-    }
-    Ok(CommitOutcome::Imported { ops, files_op, head })
-}
-
-/// Write `lex.toml`, `lex.lock` (when present) and `src/**` to `dir` from git
-/// object bytes — the only files the loader needs.
-fn materialize(state: &mut ImportState, cls: &Classified, dir: &Path, lock: &mut Option<String>) -> Result<()> {
-    let wanted = cls.manifest.iter().filter(|f| {
-        f.path == "lex.toml" || f.path == "lex.lock" || f.path.starts_with("src/")
-    });
-    for f in wanted.chain(cls.lex_sources.iter()) {
-        let bytes = state.cat.read(&f.oid)?;
-        if f.path == "lex.lock" {
-            *lock = String::from_utf8(bytes.clone()).ok();
-        }
-        let dest = dir.join(&f.path);
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&dest, bytes).with_context(|| format!("writing {}", dest.display()))?;
-    }
-    Ok(())
 }
 
 /// Delete a branch and the by-products the store keeps beside its file.
@@ -797,36 +393,11 @@ fn delete_branch(root: &Path, store: &Store, name: &str) -> Result<()> {
 
 // ── the command ─────────────────────────────────────────────────────────────
 
-/// The result of a run, before rendering.
-struct Report {
-    imported: Vec<Value>,
-    noop: Vec<String>,
-    unsupported: Vec<Unsupported>,
-    tip_sha: String,
-    tip_landed: bool,
-    refusal: Option<Refusal>,
-    strict_violation: bool,
-    head_op: Option<OpId>,
-    store_branch: String,
-}
-
 pub fn cmd_import_git(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let a = parse_args(args)?;
-    if looks_like_url(&a.source) {
-        bail!(
-            "importing from a URL is not yet supported (#892 PR5); clone it first and pass \
-             the clone's path: `git clone --bare <url> repo.git && lex op import-git repo.git --head-only`"
-        );
-    }
-    if !a.head_only {
-        bail!(
-            "full history import lands in PR5 (#892); pass --head-only to import the tip of the \
-             branch as one snapshot"
-        );
-    }
     let report = run_import(&a)?;
     render(fmt, &report);
-    if report.tip_landed && !report.strict_violation {
+    if report.landed() {
         Ok(())
     } else {
         std::process::exit(2);
@@ -834,35 +405,25 @@ pub fn cmd_import_git(fmt: &OutputFormat, args: &[String]) -> Result<()> {
 }
 
 fn run_import(a: &ImportArgs) -> Result<Report> {
-    let repo = PathBuf::from(&a.source);
-    if !repo.is_dir() {
-        bail!("{} is not a directory", repo.display());
+    let started = std::time::Instant::now();
+    if a.head_only && (a.since.is_some() || a.max_commits.is_some()) {
+        bail!("--head-only imports one snapshot; it cannot be combined with --since or --max-commits");
     }
-    git_line(&repo, &["rev-parse", "--git-dir"])
-        .with_context(|| format!("{} is not a git repository", repo.display()))?;
-    if !git_line(&repo, &["rev-parse", "--show-cdup"])?.is_empty() {
-        bail!("{} is inside a repository; pass the repository root (the package root is the repo root)", repo.display());
-    }
-    if git_line(&repo, &["rev-parse", "--is-shallow-repository"])? == "true" {
-        bail!(
-            "{} is a shallow clone: the repo's identity is its root commit, which a shallow clone \
-             does not have, so the imported OpIds would not converge with other imports",
-            repo.display()
-        );
-    }
+    let src = Source::open(&a.source, a.depth, a.branch.as_deref())?;
+    let repo = src.repo.clone();
 
-    // The tip: `--branch` (a local branch) or the branch HEAD points at.
+    // The tip: `--branch` (a branch of the repo) or the branch HEAD points at.
     let git_branch = match &a.branch {
         Some(b) => b.clone(),
         None => git_line(&repo, &["symbolic-ref", "--quiet", "--short", "HEAD"]).map_err(|_| {
-            anyhow!("HEAD is detached or unborn in {}; pass --branch <name>", repo.display())
+            anyhow!("HEAD is detached or unborn in {}; pass --branch <name>", src.display)
         })?,
     };
     let tip = git_line(
         &repo,
         &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{git_branch}^{{commit}}")],
     )
-    .map_err(|_| anyhow!("no branch `{git_branch}` in {}", repo.display()))?;
+    .map_err(|_| source::no_branch(&git_branch, &src))?;
     let root_sha = git_line(&repo, &["rev-list", "--first-parent", "--max-parents=0", &tip])?
         .lines()
         .last()
@@ -878,123 +439,254 @@ fn run_import(a: &ImportArgs) -> Result<Report> {
     }
     let store_root = a.store.clone().unwrap_or_else(crate::default_store_root_pub);
     let store = Store::open(&store_root).with_context(|| format!("opening store at {}", store_root.display()))?;
-    if store.get_branch(&store_branch)?.and_then(|b| b.head_op).is_some() {
-        bail!(
-            "store branch `{store_branch}` already has history; this importer only fills an empty \
-             branch (incremental import is #892 PR5) — import into a fresh one with \
-             --store-branch <name>"
-        );
+
+    // ── where does this run start? ──────────────────────────────────────────
+    let wm = match watermark::derive(&store, &store_branch)? {
+        Ok(w) => w,
+        Err(watermark::WatermarkRefusal(msg)) => bail!("{msg}"),
+    };
+    if let Some(w) = &wm {
+        if a.head_only {
+            bail!(
+                "store branch `{store_branch}` already has history (last imported commit {}); \
+                 --head-only imports a snapshot into an EMPTY branch. Drop --head-only to import \
+                 the commits since, or import into a fresh branch with --store-branch <name>",
+                w.commit
+            );
+        }
+        if a.since.is_some() {
+            bail!(
+                "--since starts a NEW lineage at a commit and only applies to an empty store branch; \
+                 `{store_branch}` already has history (last imported commit {})",
+                w.commit
+            );
+        }
+        let expect = format!("git-import:{root_sha}");
+        if w.session != expect {
+            bail!(
+                "store branch `{store_branch}` was imported from a different repository (or a \
+                 shallow/full variant of this one): its lineage is `{}`, this source's is `{expect}`. \
+                 OpIds would not converge; import into a fresh branch with --store-branch <name>",
+                w.session
+            );
+        }
     }
 
-    let mut state = ImportState::open(repo, store_root.clone(), store, &store_branch, root_sha, a)?;
-    let work_branch = state.work_branch.clone();
+    let chain = if a.head_only { vec![tip.clone()] } else { first_parent_chain(&repo, &tip)? };
+    let mut start = 0usize;
+    let mut since_sha = None;
+    if let Some(w) = &wm {
+        match chain.iter().position(|c| *c == w.commit) {
+            Some(i) => start = i + 1,
+            None => {
+                let exists = git_ok(&repo, &["cat-file", "-e", &format!("{}^{{commit}}", w.commit)])?;
+                let why = if !exists {
+                    "not in this repository at all (a different repo, or history that was rewritten)"
+                } else if !git_ok(&repo, &["merge-base", "--is-ancestor", &w.commit, &tip])? {
+                    "not an ancestor of the branch tip (history was rewritten, amended or force-pushed)"
+                } else {
+                    "reachable from the tip only through a merge's second parent, not on its first-parent history"
+                };
+                bail!(
+                    "store branch `{store_branch}` was last imported at {}, which is {why}. Importing \
+                     must never rewrite history already in the store: import into a NEW branch with \
+                     --store-branch <name> (the existing branch is left untouched)",
+                    w.commit
+                );
+            }
+        }
+    } else if let Some(s) = &a.since {
+        let sha = git_line(&repo, &["rev-parse", "--verify", "--quiet", &format!("{s}^{{commit}}")])
+            .map_err(|_| anyhow!("--since {s}: no such commit in {}", src.display))?;
+        start = chain.iter().position(|c| *c == sha).ok_or_else(|| {
+            anyhow!("--since {s} is not on the first-parent history of `{git_branch}` ({tip})")
+        })?;
+        since_sha = Some(sha);
+    }
+    let mut commits: Vec<String> = chain[start..].to_vec();
+    let mut remaining = 0usize;
+    if let Some(n) = a.max_commits {
+        if commits.len() > n {
+            remaining = commits.len() - n;
+            commits.truncate(n);
+        }
+    }
+    let effective_tip = commits.last().cloned().unwrap_or_else(|| tip.clone());
 
     let mut report = Report {
+        source: src.display.clone(),
+        source_kind: if src.is_url { "url" } else { "path" },
+        shallow: src.shallow,
+        head_only: a.head_only,
+        git_branch: git_branch.clone(),
+        store_branch: store_branch.clone(),
+        watermark: wm.as_ref().map(|w| w.commit.clone()),
+        since: since_sha.clone(),
+        snapshot_base: None,
         imported: Vec::new(),
+        folded: Vec::new(),
         noop: Vec::new(),
         unsupported: Vec::new(),
-        tip_sha: tip.clone(),
+        tip_sha: effective_tip,
+        requested_tip: tip.clone(),
+        remaining,
         tip_landed: false,
-        refusal: None,
+        failed: None,
         strict_violation: false,
         head_op: None,
-        store_branch: store_branch.clone(),
+        total: 0,
+        blob_reads: 0,
+        size_queries: 0,
+        stats: Stats::default(),
+        elapsed_ms: 0,
+        notes: Vec::new(),
     };
-    let outcome = import_commit(&mut state, &tip);
-    report.unsupported = std::mem::take(&mut state.unsupported);
-
-    let finish = |state: &ImportState| delete_branch(&state.store_root, &state.store, &work_branch);
-    let outcome = match outcome {
-        Ok(o) => o,
-        Err(e) => {
-            let _ = finish(&state);
-            return Err(e);
-        }
+    // Where did this lineage start? A snapshot start (`--head-only`/`--since`)
+    // leaves earlier history out for good; a later run inherits that fact from
+    // the previous run's local report (a convenience copy: if it is gone, so is
+    // the note — the op-log itself has no such marker).
+    report.snapshot_base = match (&wm, a.head_only, &since_sha) {
+        (None, true, _) => Some(json!({ "commit": tip, "via": "head-only" })),
+        (None, false, Some(s)) => Some(json!({ "commit": s, "via": "since" })),
+        (Some(_), ..) => std::fs::read(store_root.join("import").join(format!("{store_branch}.json")))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .and_then(|v| v.get("snapshot_base").cloned())
+            .filter(|v| !v.is_null()),
+        _ => None,
     };
-    match outcome {
-        // `--strict`: an unsupported path is an error — nothing lands.
-        CommitOutcome::Imported { .. } | CommitOutcome::Noop if a.strict && !report.unsupported.is_empty() => {
-            report.strict_violation = true;
-            report.refusal = Some(Refusal::new(
-                "strict:unsupported",
-                "strict",
-                format!("--strict: {} unsupported path(s) (symlinks/submodules) in the tree", report.unsupported.len()),
+    if wm.is_some() {
+        if let Some(sb) = &report.snapshot_base {
+            report.notes.push(format!(
+                "history before {} (a --{} snapshot) was never imported and is not backfilled",
+                sb["commit"].as_str().unwrap_or("?"),
+                sb["via"].as_str().unwrap_or("snapshot")
             ));
         }
-        CommitOutcome::Imported { ops, files_op, head } => {
-            let head = head.ok_or_else(|| anyhow!("import produced ops but no head"))?;
-            // The single step that publishes the import: move the target branch
-            // (absent/empty → fast-forward) onto the work branch's head.
-            state.store.advance_branch_head_ff(&store_branch, &head).map_err(|e| anyhow!("{e}"))?;
-            report.imported.push(json!({ "sha": tip, "ops": ops, "files_op": files_op }));
-            report.head_op = Some(head);
-            report.tip_landed = true;
-        }
-        CommitOutcome::Noop => {
-            report.noop.push(tip.clone());
-            report.tip_landed = true;
-        }
-        CommitOutcome::Refused(r) => report.refusal = Some(r),
     }
-    finish(&state)?;
+    if a.head_only {
+        report.notes.push(
+            "--head-only imports the tip as one snapshot; history before it is NOT imported. A later \
+             full import continues forward from this snapshot and does not backfill earlier history"
+                .into(),
+        );
+    }
+    if let Some(s) = &since_sha {
+        report.notes.push(format!(
+            "--since: the lineage starts at {s} (imported as a snapshot); history before it is NOT imported \
+             and is not backfilled by later runs"
+        ));
+    }
+    if src.shallow {
+        report.notes.push(
+            "shallow import: the shallow boundary is the lineage root, so the session (and every OpId) \
+             differs from a full-history import of the same repository"
+                .into(),
+        );
+    }
+    if remaining > 0 {
+        report.notes.push(format!(
+            "--max-commits stopped the run with {remaining} commit(s) left; run again to continue"
+        ));
+    }
+
+    if commits.is_empty() {
+        // Nothing new: the watermark is the tip.
+        report.tip_landed = true;
+        report.head_op = store.get_branch(&store_branch)?.and_then(|b| b.head_op);
+        report.elapsed_ms = started.elapsed().as_millis();
+        report.write_file(&store_root);
+        return Ok(report);
+    }
+
+    let mut state = ImportState::open(repo.clone(), store_root.clone(), store, &store_branch, root_sha, a)?;
+    let work_branch = state.work_branch.clone();
+    let outcome = walk(&mut state, a, &wm, &commits, &mut report);
+    report.unsupported = std::mem::take(&mut state.unsupported);
+    report.stats = state.stats.clone();
+    report.blob_reads = state.cat.reads;
+    report.size_queries = state.info.queries;
+
+    // The single step that publishes the import: move the target branch onto
+    // the work branch's head — also after a failure, so earlier (atomic,
+    // gated) commits stay imported.
+    let work_head = state.store.get_branch(&work_branch)?.and_then(|b| b.head_op);
+    let advance = match (&work_head, report.imported.is_empty()) {
+        (Some(h), false) => state.store.advance_branch_head_ff(&store_branch, h).map(|_| ()),
+        _ => Ok(()),
+    };
+    let cleanup = delete_branch(&state.store_root, &state.store, &work_branch);
+    outcome?;
+    advance.map_err(|e| anyhow!("{e}"))?;
+    cleanup?;
+    report.head_op = state.store.get_branch(&store_branch)?.and_then(|b| b.head_op);
+    report.elapsed_ms = started.elapsed().as_millis();
+    report.write_file(&store_root);
     Ok(report)
 }
 
-fn render(fmt: &OutputFormat, r: &Report) {
-    let unsupported: Vec<Value> = r
-        .unsupported
-        .iter()
-        .map(|u| json!({ "path": u.path, "kind": u.kind, "commit": u.commit }))
-        .collect();
-    let mut tip = json!({ "sha": r.tip_sha, "landed": r.tip_landed && !r.strict_violation });
-    if let Some(f) = &r.refusal {
-        tip["phase"] = json!(f.phase);
-        tip["reason"] = json!(f.reason);
-        tip["message"] = json!(f.message);
-        tip["diagnostics"] = json!(f.diagnostics);
+/// The history loop: `import_commit` once per commit, folding or stopping on a
+/// refusal per `--on-error`.
+fn walk(
+    state: &mut ImportState,
+    a: &ImportArgs,
+    wm: &Option<watermark::Watermark>,
+    commits: &[String],
+    report: &mut Report,
+) -> Result<()> {
+    if let Some(w) = wm {
+        // Bring the incremental tree to the last imported commit: the store
+        // already holds exactly that tree's semantic state.
+        state
+            .advance_tree(&w.commit)
+            .with_context(|| format!("reading the last imported commit {}", w.commit))?;
     }
-    let data = json!({
-        "imported": r.imported,
-        "folded": [],
-        "noop": r.noop,
-        "unsupported": unsupported,
-        "tip": tip,
-        "store_branch": r.store_branch,
-        "head_op": r.head_op,
-        "toolchain": format!("lex {}", crate::acli::VERSION),
-    });
-    let text = || {
-        match (&r.refusal, r.tip_landed) {
-            (None, true) if r.imported.is_empty() => println!("tip {} changed nothing; nothing imported", r.tip_sha),
-            (None, true) => {
-                let i = &r.imported[0];
-                println!(
-                    "imported tip {} onto store branch `{}` ({} op(s){})",
-                    r.tip_sha,
-                    r.store_branch,
-                    i["ops"],
-                    match i["files_op"].as_str() {
-                        Some(f) => format!(", files op {f}"),
-                        None => String::new(),
+    let mut pending_idx: Vec<usize> = Vec::new();
+    let n = commits.len();
+    for (i, sha) in commits.iter().enumerate() {
+        let is_last = i + 1 == n;
+        state.examples = match a.examples {
+            ExamplesPolicy::All => true,
+            ExamplesPolicy::None => false,
+            ExamplesPolicy::Tip => is_last,
+        };
+        report.total += 1;
+        match import_commit(state, sha)? {
+            CommitOutcome::Imported { ops, files_op, .. } => {
+                let mut entry = json!({ "sha": sha, "ops": ops, "files_op": files_op });
+                if state.last_parents.len() > 1 {
+                    entry["merged"] = state.last_parents[1..]
+                        .iter()
+                        .map(|p| json!({ "sha": p, "subject": subject_of(&state.repo, p) }))
+                        .collect();
+                }
+                for idx in pending_idx.drain(..) {
+                    report.folded[idx].into = Some(sha.clone());
+                }
+                report.imported.push(entry);
+                report.tip_landed = is_last;
+            }
+            CommitOutcome::Noop => {
+                report.noop.push(sha.clone());
+                report.tip_landed = is_last;
+            }
+            CommitOutcome::Refused(r) => {
+                let halt = a.on_error == OnError::Stop || a.strict || r.reason == "strict:unsupported";
+                if halt || is_last {
+                    if r.reason == "strict:unsupported" {
+                        report.strict_violation = true;
                     }
-                );
-                if let Some(h) = &r.head_op {
-                    println!("head: {h}");
+                    report.failed = Some((sha.clone(), r));
+                    report.tip_landed = false;
+                    break;
                 }
+                state.pending_folded.push(sha.clone());
+                pending_idx.push(report.folded.len());
+                report.folded.push(Folded { sha: sha.clone(), refusal: r, into: None });
             }
-            (Some(f), _) => {
-                println!("tip {} did NOT land ({}: {})", r.tip_sha, f.phase, f.message);
-                for d in &f.diagnostics {
-                    eprintln!("{d}");
-                }
-            }
-            (None, false) => println!("tip {} did NOT land", r.tip_sha),
         }
-        for u in &r.unsupported {
-            println!("unsupported {}: {} (commit {})", u.kind, u.path, u.commit);
-        }
-    };
-    crate::acli::emit_or_text("op-import-git", data, fmt, text);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
