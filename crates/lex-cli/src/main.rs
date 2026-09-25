@@ -41,6 +41,7 @@ mod pkg;
 mod pkg_lock;
 mod propagate;
 mod plan;
+mod publish_core;
 mod policy;
 mod repair;
 mod repl;

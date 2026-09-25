@@ -9,9 +9,12 @@
 //!   lex files checkout [--store DIR] [--branch NAME] [--at OP] <dir>
 //!
 //! `build_manifest`/`publish_files_if_changed` are also used by `lex
-//! publish` (`crate::store::cmd_publish`) to capture a directory publish's
+//! publish` (via `crate::publish_core`) to capture a directory publish's
 //! files into a `SetFiles` op — see that module for the write path this one
-//! shares.
+//! shares. The manifest pipeline is split into three reusable steps: the
+//! working-copy scan ([`scan_workdir`]), `manifest_from_files` (bytes in,
+//! canonical manifest out) and `publish_manifest_if_changed` (the `SetFiles`
+//! write).
 
 use super::*;
 use lex_store::files::{is_reserved_path, MODE_EXEC, MODE_FILE};
@@ -219,6 +222,35 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 // ── manifest building + the shared write path ───────────────────────────
 
+/// Build the canonical files [`Manifest`] from in-memory `(path, mode, bytes)`
+/// entries: put each file's bytes as a blob, then assemble and validate the
+/// manifest (`Manifest::validate` — the #1007 path/mode/size rules). `path` is
+/// manifest-relative and `/`-separated; `mode` is `MODE_FILE` (`100644`) or
+/// `MODE_EXEC` (`100755`).
+///
+/// This takes bytes, not a directory, so a caller with no checkout (`lex op
+/// import-git` reading git objects) produces exactly the manifest a working
+/// copy holding the same bytes would. It does **not** filter: reserved
+/// `src/**/*.lex` / `src.lex` paths and `.git/`/`.lex/` entries are the
+/// *scan's* job ([`scan_workdir`]) and a caller feeding entries directly must
+/// exclude them itself — `validate` rejects a reserved path rather than
+/// silently dropping it.
+pub(crate) fn manifest_from_files(
+    store: &Store,
+    files: impl IntoIterator<Item = (String, &'static str, Vec<u8>)>,
+) -> Result<Manifest> {
+    let mut m = Manifest::new();
+    for (rel, mode, bytes) in files {
+        let size = bytes.len() as u64;
+        let blob = store
+            .put_blob_bytes(&bytes)
+            .map_err(|e| anyhow!("storing blob for `{rel}`: {e}"))?;
+        m.entries.insert(rel, FileEntry { blob, mode: mode.to_string(), size });
+    }
+    m.validate().map_err(|e| anyhow!("building files manifest: {e}"))?;
+    Ok(m)
+}
+
 /// Build the files manifest for `pkg_dir`'s working copy: scan the file
 /// set ([`scan_workdir`]), hash and store each file as a blob, then
 /// assemble and validate the resulting [`Manifest`]. Every reserved
@@ -228,34 +260,37 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// never makes it into the files manifest.
 pub(crate) fn build_manifest(store: &Store, pkg_dir: &Path) -> Result<Manifest> {
     let scanned = scan_workdir(pkg_dir)?;
-    let mut m = Manifest::new();
-    for f in scanned {
-        let bytes = std::fs::read(&f.abs)
-            .with_context(|| format!("reading {}", f.abs.display()))?;
-        let size = bytes.len() as u64;
-        let blob = store
-            .put_blob_bytes(&bytes)
-            .map_err(|e| anyhow!("storing blob for `{}`: {e}", f.rel))?;
-        m.entries.insert(f.rel, FileEntry { blob, mode: f.mode.to_string(), size });
+    // Stream one file at a time (a working copy can hold large images): read
+    // lazily as `manifest_from_files` consumes the iterator, and surface the
+    // first read failure ahead of any manifest error it may have caused.
+    let mut read_err: Option<anyhow::Error> = None;
+    let entries = scanned.into_iter().map_while(|f| match std::fs::read(&f.abs) {
+        Ok(bytes) => Some((f.rel, f.mode, bytes)),
+        Err(e) => {
+            read_err = Some(anyhow::Error::new(e).context(format!("reading {}", f.abs.display())));
+            None
+        }
+    });
+    let built = manifest_from_files(store, entries);
+    match read_err {
+        Some(e) => Err(e),
+        None => built,
     }
-    m.validate().map_err(|e| anyhow!("building files manifest: {e}"))?;
-    Ok(m)
 }
 
-/// If `build_manifest(pkg_dir)` differs from `branch`'s current files
-/// manifest, store it and append exactly one `SetFiles` op — parented on
-/// `branch`'s CURRENT head at call time, so a caller that already applied
-/// semantic ops on this branch (`lex publish`) gets the `SetFiles` chained
-/// after them for free. Returns `None` (and writes nothing beyond the
-/// content-addressed blobs already put by `build_manifest`, which is
-/// idempotent) when nothing non-semantic changed.
-pub(crate) fn publish_files_if_changed(
+/// If `manifest` differs from `branch`'s current files manifest, store it and
+/// append exactly one `SetFiles` op — parented on `branch`'s CURRENT head at
+/// call time, so a caller that already applied semantic ops on this branch
+/// (`lex publish`, the import path) gets the `SetFiles` chained after them for
+/// free. Returns `None` (and writes nothing beyond the content-addressed blobs
+/// already put while building the manifest, which is idempotent) when nothing
+/// non-semantic changed.
+pub(crate) fn publish_manifest_if_changed(
     store: &Store,
     branch: &str,
-    pkg_dir: &Path,
+    manifest: &Manifest,
     intent_id: Option<lex_vcs::IntentId>,
 ) -> Result<Option<(lex_vcs::OpId, lex_store::BlobId)>> {
-    let manifest = build_manifest(store, pkg_dir)?;
     let new_id = manifest.id();
     let current = store
         .branch_manifest(branch)
@@ -264,12 +299,26 @@ pub(crate) fn publish_files_if_changed(
         return Ok(None);
     }
     let manifest_id = store
-        .put_manifest(&manifest)
+        .put_manifest(manifest)
         .map_err(|e| anyhow!("storing files manifest: {e}"))?;
     let op_id = store
         .apply_set_files(branch, &manifest_id, intent_id.as_ref())
         .map_err(|e| anyhow!("recording files manifest: {e}"))?;
     Ok(Some((op_id, manifest_id)))
+}
+
+/// If `build_manifest(pkg_dir)` differs from `branch`'s current files
+/// manifest, store it and append exactly one `SetFiles` op (see
+/// [`publish_manifest_if_changed`]). Returns `None` when nothing
+/// non-semantic changed.
+pub(crate) fn publish_files_if_changed(
+    store: &Store,
+    branch: &str,
+    pkg_dir: &Path,
+    intent_id: Option<lex_vcs::IntentId>,
+) -> Result<Option<(lex_vcs::OpId, lex_store::BlobId)>> {
+    let manifest = build_manifest(store, pkg_dir)?;
+    publish_manifest_if_changed(store, branch, &manifest, intent_id)
 }
 
 /// Best-effort: whether `pkg_dir`/src differs semantically from `branch`'s
