@@ -872,30 +872,22 @@ fn a_non_empty_target_branch_is_refused() {
 }
 
 #[test]
-fn history_url_and_flag_errors_point_at_pr5() {
+fn flag_surface_and_history_default() {
     let t = tempdir().unwrap();
     let env = Env::new();
     let repo = t.path().join("repo");
     lex_repo(&repo);
     let store = t.path().join("store");
 
-    // Without --head-only: full history is PR 5.
+    // PR 5: without --head-only the whole first-parent history is imported
+    // (tests/import_git_history_892.rs covers it in depth; URL sources too).
     let o = env.lex(&["op", "import-git", repo.to_str().unwrap(), "--store", store.to_str().unwrap()]);
-    assert_eq!(o.status.code(), Some(1));
-    assert!(format!("{}{}", stdout(&o), stderr(&o)).contains("PR5"), "{} {}", stdout(&o), stderr(&o));
-    assert_eq!(head(&store, "main"), None);
+    assert!(o.status.success(), "{} {}", stdout(&o), stderr(&o));
+    assert!(head(&store, "main").is_some());
 
-    // A URL is PR 5 too.
-    for url in ["https://example.com/x.git", "git@github.com:a/b.git"] {
-        let o = env.lex(&["op", "import-git", url, "--head-only", "--store", store.to_str().unwrap()]);
-        assert_eq!(o.status.code(), Some(1), "{url}");
-        let all = format!("{}{}", stdout(&o), stderr(&o));
-        assert!(all.contains("PR5") && all.contains("not yet supported"), "{url}: {all}");
-    }
-
-    // The flag surface is final: PR 5's flags parse and validate today.
+    // PR 5's flags parse and validate.
     assert!(env
-        .lex(&["op", "import-git", repo.to_str().unwrap(), "--head-only", "--on-error", "stop", "--examples", "all", "--store", store.to_str().unwrap()])
+        .lex(&["op", "import-git", repo.to_str().unwrap(), "--head-only", "--on-error", "stop", "--examples", "all", "--store", t.path().join("s2").to_str().unwrap()])
         .status
         .success());
     let o = env.lex(&["op", "import-git", repo.to_str().unwrap(), "--head-only", "--on-error", "bogus"]);

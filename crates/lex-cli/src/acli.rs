@@ -467,6 +467,10 @@ fn cmd_op() -> CommandInfo {
             "Import a git repo's branch tip as one snapshot (#892)",
             "lex op import-git ./repo --head-only --store-branch imported",
         ),
+        (
+            "Import a repo's full first-parent history, folding commits that do not type-check (re-run to extend)",
+            "lex op import-git https://example.com/team/repo.git --on-error fold --examples tip",
+        ),
     ])
     .with_see_also(vec!["log", "store"])
 }

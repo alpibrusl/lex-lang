@@ -382,9 +382,11 @@ fn print_usage() {
     );
     println!("  op {{show|log|replay|push|pull|repack|gc|import-git}} [--store DIR]");
     println!("                                     inspect and sync the operation log");
-    println!("  op import-git <repo> --head-only [--branch B] [--store-branch S] [--store DIR]");
-    println!("          [--strict] [--examples tip|all|none] [--max-file-bytes N]");
-    println!("                                     import a git branch tip as one snapshot (#892)");
+    println!("  op import-git <path|url> [--head-only] [--branch B] [--store-branch S] [--store DIR]");
+    println!("          [--on-error fold|stop] [--strict] [--examples tip|all|none]");
+    println!("          [--max-file-bytes N] [--depth N] [--since SHA] [--max-commits N]");
+    println!("                                     import a git branch (first-parent history, or the tip");
+    println!("                                     with --head-only) into the op-log; re-run to extend (#892)");
     println!("  log [branch]                       show the operation log for a branch (alias of `branch log`)");
     println!("  recall {{--intent ID|--session ID|--predicate JSON|--all}} [--limit N] [--store DIR]");
     println!("                                     predicate query over the op log (#836)");
