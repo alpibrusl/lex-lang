@@ -102,7 +102,48 @@ pub struct State {
     /// store directly and are unaffected. A hosted embedder such as
     /// lex-hub should set it; there is deliberately no default name here.
     pub reserved_producers: Vec<String>,
+    /// Attestation KINDS that clients may NOT file (#1066). Defaults to
+    /// empty (single-tenant `lex serve` and existing embedders behave
+    /// exactly as before). When non-empty, `POST /v1/attestations/batch`
+    /// refuses — `403` `ReservedKind`, whole batch, nothing written — any
+    /// attestation whose kind matches an entry.
+    ///
+    /// This is the counterpart of [`reserved_producers`](State::reserved_producers)
+    /// for readers that key on the KIND rather than on who produced it:
+    /// `Store::latest_review_verdict` (the review inbox, `promote`'s
+    /// "standing Reject") takes the latest `Review` on a stage whatever its
+    /// `produced_by.tool`, so reserving the `lex-store::review:*` producer
+    /// family alone does not protect verdicts — a client files a `Review`
+    /// under `evil-tool`. An embedder that stamps reviewer identity
+    /// server-side reserves [`REVIEW_KIND`] as well.
+    ///
+    /// An entry is the serde tag of `lex_vcs::AttestationKind`
+    /// (`"review"`, `"type_check"`, …; see the `*_KIND` consts). Matching
+    /// is against the kind of the PARSED attestation — exactly what the
+    /// store would persist — so no body shape can store a reserved kind
+    /// without being judged as it (a body with duplicate `"kind"` keys does
+    /// not parse at all: `400`).
+    /// Matching trims and ASCII case-folds both sides, and additionally
+    /// ignores `_`, so `"Review"`, `" REVIEW "`, `"TypeCheck"` and
+    /// `"type_check"` all mean what they say; an entry ending in `*` is a
+    /// prefix (as for producers); blank entries are ignored.
+    ///
+    /// Server-internal writers (`Store::verify_head_and_attest`,
+    /// `record_review`, `POST /v1/review/verdict`, …) call the store
+    /// directly and are unaffected. Reserving a kind is not authenticity
+    /// (a signature is): reserving `TypeCheck` should wait for
+    /// signature-checked gates.
+    pub reserved_kinds: Vec<String>,
 }
+
+/// Serde tag of `AttestationKind::Review` — the value an embedder passes to
+/// [`State::with_reserved_kinds`] to keep verdicts server-stamped (#1066).
+/// Pair it with `lex_store::REVIEW_PRODUCER_RESERVATION`.
+pub const REVIEW_KIND: &str = "review";
+
+/// Serde tag of `AttestationKind::TypeCheck` (#1066). Reserving it should
+/// wait for signature-checked gates; exported so the name is not retyped.
+pub const TYPE_CHECK_KIND: &str = "type_check";
 
 /// Limits on one store's blob space (#1007). See [`State::blob_limits`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +188,38 @@ pub struct ApiMergeSession {
     pub dst_branch: String,
 }
 
+/// The entry of `entries` that `claimed` matches: trim + ASCII case-fold
+/// (`fold`) both sides; an entry ending in `*` is a prefix; blank entries
+/// are ignored. Shared by `reserved_producers` and `reserved_kinds`.
+fn find_reserved<'a>(entries: &'a [String], claimed: &str, fold: fn(&str) -> String) -> Option<&'a str> {
+    let claimed = fold(claimed);
+    entries.iter().map(String::as_str).find(|entry| {
+        let entry = fold(entry);
+        match entry.strip_suffix('*') {
+            Some(prefix) => !prefix.is_empty() && claimed.starts_with(prefix),
+            None => !entry.is_empty() && claimed == entry,
+        }
+    })
+}
+
+fn fold_name(s: &str) -> String {
+    s.trim().to_ascii_lowercase()
+}
+
+/// Like [`fold_name`], and `_` is dropped so `TypeCheck` and `type_check`
+/// (the serde tag) are the same kind.
+fn fold_kind(s: &str) -> String {
+    s.trim().chars().filter(|c| *c != '_').map(|c| c.to_ascii_lowercase()).collect()
+}
+
+/// The serde tag of `kind` — the exact `"kind"` string the store persists.
+fn attestation_kind_tag(kind: &lex_vcs::AttestationKind) -> String {
+    serde_json::to_value(kind)
+        .ok()
+        .and_then(|v| v.get("kind").and_then(|t| t.as_str().map(str::to_string)))
+        .unwrap_or_default()
+}
+
 impl State {
     pub fn open(root: PathBuf) -> anyhow::Result<Self> {
         Self::open_with_ceiling(root, None)
@@ -168,6 +241,7 @@ impl State {
             ops_since: Mutex::new(Default::default()),
             blob_limits: None,
             reserved_producers: Vec::new(),
+            reserved_kinds: Vec::new(),
         })
     }
 
@@ -185,16 +259,26 @@ impl State {
         self
     }
 
+    /// Install [`reserved_kinds`](State::reserved_kinds): the attestation
+    /// kinds clients may not file through `POST /v1/attestations/batch`.
+    pub fn with_reserved_kinds(mut self, kinds: Vec<String>) -> Self {
+        self.reserved_kinds = kinds;
+        self
+    }
+
     /// The reserved producer name `att` claims, if any.
     fn reserved_producer_claimed(&self, att: &lex_vcs::Attestation) -> Option<&str> {
-        let claimed = att.produced_by.tool.trim().to_ascii_lowercase();
-        self.reserved_producers.iter().map(String::as_str).find(|entry| {
-            let entry = entry.trim().to_ascii_lowercase();
-            match entry.strip_suffix('*') {
-                Some(prefix) => !prefix.is_empty() && claimed.starts_with(prefix),
-                None => !entry.is_empty() && claimed == entry,
-            }
-        })
+        find_reserved(&self.reserved_producers, &att.produced_by.tool, fold_name)
+    }
+
+    /// The reserved kind entry `att`'s kind matches, if any, with the
+    /// kind's serde tag. Judges the PARSED kind (what the store persists).
+    fn reserved_kind_claimed(&self, att: &lex_vcs::Attestation) -> Option<(&str, String)> {
+        if self.reserved_kinds.is_empty() {
+            return None;
+        }
+        let tag = attestation_kind_tag(&att.kind);
+        find_reserved(&self.reserved_kinds, &tag, fold_kind).map(|entry| (entry, tag))
     }
 
     /// Construct a per-tenant `State` by prefixing `store_root` with the
@@ -1684,9 +1768,18 @@ pub(crate) fn ops_batch_handler(state: &State, body: &str)
 ///   know about. Whole batch rejected.
 /// * `409` `AttestationIdMismatch` if the supplied id doesn't
 ///   match the canonical hash.
+/// * `403` `ReservedKind` if any attestation's kind is in
+///   [`State::reserved_kinds`] (#1066). Whole batch rejected, nothing
+///   written.
 /// * `403` `ReservedProducer` if any attestation claims a
 ///   `produced_by.tool` in [`State::reserved_producers`]. Whole batch
 ///   rejected, nothing written.
+///
+/// Check order (deliberate; a hosted embedder's dispatcher-level guard
+/// answers the same way): malformed JSON `400` first — the kind is judged
+/// on the parsed `Attestation`, so nothing unparsable is ever judged —
+/// then `ReservedKind`, then `ReservedProducer` (a batch violating both
+/// answers `ReservedKind`), then `409`/`422` validation, then persist.
 ///
 /// Idempotency: same as the ops endpoint — content-addressed dedup.
 pub(crate) fn attestations_batch_handler(state: &State, body: &str)
@@ -1707,7 +1800,25 @@ pub(crate) fn attestations_batch_handler(state: &State, body: &str)
         Err(e) => return error_response(500, format!("opening op log: {e}")),
     };
 
-    // Reserved producers first, over the WHOLE batch, so a mixed batch
+    // Reserved kinds first (#1066), over the WHOLE batch and on the PARSED
+    // kind — the very value `log.put` serializes below — so a body that
+    // smuggles a second `"kind"` tag is judged as the one that would be
+    // stored. Readers such as `latest_review_verdict` key on kind, not on
+    // the producer name, so the producer reservation alone is not enough.
+    for att in &attestations {
+        if let Some((reserved, kind)) = state.reserved_kind_claimed(att) {
+            return error_with_detail(403, "ReservedKind", serde_json::json!({
+                "attestation_id": att.attestation_id,
+                "kind": kind,
+                "reserved_kind": reserved,
+                "message": "this attestation kind is reserved for the server; \
+                            clients may not submit attestations of it \
+                            (review verdicts go through POST /v1/review/verdict)",
+            }));
+        }
+    }
+
+    // Reserved producers next, over the WHOLE batch, so a mixed batch
     // (one legitimate + one reserved) is refused outright and nothing is
     // written. Server-internal writers (hosted CI, review, examples) call
     // the store directly and never come through here.
