@@ -21,6 +21,8 @@
 //!   POST /v1/merge/<id>/commit        → { new_head_op, dst_branch } | 422 conflicts remaining
 //!   POST /v1/ops/batch                [OperationRecord] → { received, added, skipped, added_ids }
 //!   POST /v1/attestations/batch       [Attestation] → { received, added, skipped, added_ids }
+//!                                     403 ReservedProducer / ReservedKind for names and
+//!                                     kinds an embedder reserved (`State::with_reserved_*`)
 //!   GET  /v1/branches/<name>/head     → { branch, head_op } (probe for `lex op push`)
 //!   POST /v1/blobs/missing            { ids } → { missing } (#1007)
 //!   POST /v1/blobs/batch              [{ id, data_b64 }] → { received, added, skipped }
