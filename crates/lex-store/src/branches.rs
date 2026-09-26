@@ -53,11 +53,20 @@ pub enum BranchAdvance {
 
 pub const DEFAULT_BRANCH: &str = "main";
 
+/// Current [`HeadSnapshot`] format/replay version (#1062).
+const HEAD_SNAPSHOT_VERSION: u32 = 1;
+
 /// Persisted, best-effort cache of `branch_head`'s computed view,
 /// keyed on the head it was computed for. See `Store::branch_head`'s
 /// doc comment for the incremental-replay design this backs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HeadSnapshot {
+    /// Which replay produced `map`. Snapshots written before #1062 lack it
+    /// (deserialize as 0) and are discarded: the incremental extension they
+    /// were built with mis-replayed merges, so a persisted merged head could
+    /// be wrong, and reusing one would keep serving it.
+    #[serde(default)]
+    v: u32,
     head_op: OpId,
     map: BTreeMap<String, String>,
     /// The files manifest at `head_op` (#1007). `None` = not computed yet
@@ -225,7 +234,8 @@ impl Store {
     /// never break correctness, only fall back to a full walk.
     fn load_head_snapshot(&self, name: &str) -> Option<HeadSnapshot> {
         let raw = fs::read_to_string(self.head_snapshot_path(name)).ok()?;
-        serde_json::from_str(&raw).ok()
+        let snap: HeadSnapshot = serde_json::from_str(&raw).ok()?;
+        (snap.v == HEAD_SNAPSHOT_VERSION).then_some(snap)
     }
 
     /// Best-effort write; a failure here (e.g. read-only filesystem)
@@ -241,7 +251,12 @@ impl Store {
         map: &BTreeMap<String, String>,
         files: &Option<ManifestAt>,
     ) {
-        let snap = HeadSnapshot { head_op: head_op.clone(), map: map.clone(), files: files.clone() };
+        let snap = HeadSnapshot {
+            v: HEAD_SNAPSHOT_VERSION,
+            head_op: head_op.clone(),
+            map: map.clone(),
+            files: files.clone(),
+        };
         if let Ok(s) = serde_json::to_string(&snap) {
             let _ = fs::write(self.head_snapshot_path(name), s);
         }
@@ -312,7 +327,17 @@ impl Store {
                 self.save_head_snapshot(name, &head, &snap.map, &files);
                 return Ok((snap.map, files));
             }
-            if let Some(new_records) = log.walk_forward_since(&head, &snap.head_op)? {
+            // Extend the snapshot only when the ops since it are a pure
+            // continuation of it. For a merge, `walk_forward_since` also
+            // returns the merged-in branch's whole history — pre-fork ops
+            // the snapshot already contains, possibly superseded since —
+            // and replaying those on top of the snapshot reverts newer
+            // changes (#1062). That case takes the full walk below.
+            if let Some(new_records) = log
+                .walk_forward_since(&head, &snap.head_op)?
+                .filter(|recs| OpLog::continues_from(recs, &snap.head_op))
+            {
+                let new_records = OpLog::linearize(new_records);
                 let mut map = snap.map;
                 for rec in &new_records {
                     apply_transition(&mut map, &rec.produces);
@@ -783,26 +808,104 @@ impl Store {
         Ok(report)
     }
 
+    /// The SigId → StageId map at `op_id`: the full replay of that op's
+    /// ancestry in [`OpLog::walk_forward`]'s canonical order, computed fresh
+    /// (never through a branch's incremental snapshot). This is the single
+    /// definition of "the head at an op"; `branch_head` must agree with it.
+    pub fn sig_map_at_op(&self, op_id: &str) -> Result<BTreeMap<String, String>, StoreError> {
+        let log = OpLog::open(self.root())?;
+        let mut map = BTreeMap::new();
+        for rec in log.walk_forward(&op_id.to_string(), None)? {
+            apply_transition(&mut map, &rec.produces);
+        }
+        Ok(map)
+    }
+
+    /// The `Merge` entries that pin every sig a merge **decided** to the
+    /// value it decided, so the merged head is a function of the resolved
+    /// merge and not of the order the two parallel histories are replayed in
+    /// (#1062).
+    ///
+    /// A merge op is replayed by re-applying both parents' ancestries and
+    /// then its own entries. Both sides' ops on a sig the merge decided are
+    /// concurrent and do not commute (a rename retires the sig a modify
+    /// rebinds), so whichever the replay happens to apply last used to win —
+    /// and a resolution that leaves the sig as dst already has it (`take_ours`,
+    /// or a sig only dst touched) changes nothing relative to dst, so it was
+    /// never listed and nothing outranked the replay. Listing it here does.
+    ///
+    /// * `Src` outcomes: src's stage (`None`: src removed it).
+    /// * `Dst` / `Both` outcomes and `TakeOurs`: the sig as dst's head has it
+    ///   (`None`: dst lacks it, so the merge keeps it absent).
+    /// * `TakeTheirs`: the sig as src's head has it.
+    ///
+    /// `Custom` resolutions carry their target in the op itself; callers add
+    /// them on top (and own the error for an op that has none).
+    pub fn merge_pins(
+        &self,
+        dst_head: Option<&OpId>,
+        src_head: Option<&OpId>,
+        auto_resolved: &[lex_vcs::MergeOutcome],
+        resolved: &[(lex_vcs::ConflictId, lex_vcs::Resolution)],
+    ) -> Result<BTreeMap<String, Option<String>>, StoreError> {
+        let map_at = |h: Option<&OpId>| match h {
+            Some(h) => self.sig_map_at_op(h),
+            None => Ok(BTreeMap::new()),
+        };
+        let dst = map_at(dst_head)?;
+        let src = if resolved.iter().any(|(_, r)| matches!(r, lex_vcs::Resolution::TakeTheirs)) {
+            map_at(src_head)?
+        } else {
+            BTreeMap::new()
+        };
+        let mut entries: BTreeMap<String, Option<String>> = BTreeMap::new();
+        for outcome in auto_resolved {
+            match outcome {
+                lex_vcs::MergeOutcome::Src { sig_id, stage_id } => {
+                    entries.insert(sig_id.clone(), stage_id.clone());
+                }
+                lex_vcs::MergeOutcome::Dst { sig_id, .. }
+                | lex_vcs::MergeOutcome::Both { sig_id, .. } => {
+                    entries.insert(sig_id.clone(), dst.get(sig_id).cloned());
+                }
+                lex_vcs::MergeOutcome::Conflict { .. } => {}
+            }
+        }
+        for (sig, resolution) in resolved {
+            match resolution {
+                lex_vcs::Resolution::TakeOurs => {
+                    entries.insert(sig.clone(), dst.get(sig).cloned());
+                }
+                lex_vcs::Resolution::TakeTheirs => {
+                    entries.insert(sig.clone(), src.get(sig).cloned());
+                }
+                lex_vcs::Resolution::Custom { .. } | lex_vcs::Resolution::Defer => {}
+            }
+        }
+        Ok(entries)
+    }
+
     pub fn commit_merge(&self, dst: &str, report: &MergeReport) -> Result<(), StoreError> {
         if !report.conflicts.is_empty() {
             return Err(StoreError::InvalidTransition(format!(
                 "{} conflicts; resolve before committing", report.conflicts.len())));
         }
         let dst_head_map = self.branch_head(dst)?;
+        // #1062: pin every sig the merge decided, not only the ones that
+        // differ from dst — see `merge_pins`. What dst already has is pinned
+        // to dst's own value.
         let mut entries: BTreeMap<String, Option<String>> = BTreeMap::new();
         for m in &report.merged {
-            let cur = dst_head_map.get(&m.sig_id);
-            if cur != Some(&m.stage_id) {
-                entries.insert(m.sig_id.clone(), Some(m.stage_id.clone()));
-            }
+            let value = match m.from {
+                "dst" | "both" => dst_head_map.get(&m.sig_id).cloned(),
+                _ => Some(m.stage_id.clone()),
+            };
+            entries.insert(m.sig_id.clone(), value);
         }
-        // #841: propagate removals the merge decided on. Only those dst
-        // still has need an entry (removing something dst lacks is a
-        // no-op).
+        // #841: propagate removals the merge decided on. A sig dst lacks is
+        // pinned absent too, so a replay cannot resurrect it (#1062).
         for sig in &report.removed {
-            if dst_head_map.contains_key(sig) {
-                entries.insert(sig.clone(), None);
-            }
+            entries.insert(sig.clone(), None);
         }
         let src_head = self.get_branch(&report.summary.src)?.and_then(|b| b.head_op);
         let dst_head_op = self.get_branch(dst)?.and_then(|b| b.head_op);

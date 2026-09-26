@@ -371,8 +371,19 @@ impl OpLog {
         Ok(out)
     }
 
-    /// Same set as walk_back but oldest-first. Used by branch_head
-    /// for left-to-right transition replay.
+    /// Same set as walk_back but oldest-first, and **topological**: every op
+    /// comes after all of its parents. Used by branch_head (and every other
+    /// consumer) for left-to-right transition replay, so this is the one
+    /// definition of "the order a head is replayed in".
+    ///
+    /// `walk_back` is a breadth-first walk, and its reverse is *not* a
+    /// topological order once a merge joins lines of different lengths: an op
+    /// reachable by a short path is emitted before its own descendant on the
+    /// long one, so it lands after that descendant here. Replaying it then
+    /// overwrote a later change with an earlier one (#1062). The order is now
+    /// repaired by [`Self::linearize`], which keeps the BFS order wherever it
+    /// was already topological — every linear history, and any merge of
+    /// equal-length lines — so those replay exactly as they always did.
     pub fn walk_forward(
         &self,
         head: &OpId,
@@ -380,10 +391,133 @@ impl OpLog {
     ) -> io::Result<Vec<OperationRecord>> {
         let mut all = self.walk_back(head, None)?;
         all.reverse();
+        let mut all = Self::linearize(all);
         if let Some(n) = limit {
             all.truncate(n);
         }
         Ok(all)
+    }
+
+    /// Reorder `records` into a topological order: every record comes after
+    /// all of its parents that are in the set (a parent missing from the set
+    /// — an incomplete local log — imposes no constraint, the same leniency
+    /// the walks have). Among the records ready at any point, the one listed
+    /// first in `records` goes first, so an input that is already
+    /// topological comes back unchanged, and the result is a pure function
+    /// of the input order.
+    pub fn linearize(records: Vec<OperationRecord>) -> Vec<OperationRecord> {
+        use std::cmp::Reverse;
+        use std::collections::{BinaryHeap, HashMap};
+        let index: HashMap<&str, usize> =
+            records.iter().enumerate().map(|(i, r)| (r.op_id.as_str(), i)).collect();
+        // Fast path (every linear history): nothing to reorder.
+        let already = records.iter().enumerate().all(|(i, r)| {
+            r.op.parents.iter().all(|p| index.get(p.as_str()).is_none_or(|&j| j < i))
+        });
+        if already {
+            return records;
+        }
+        let n = records.len();
+        let mut indegree = vec![0usize; n];
+        let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (i, r) in records.iter().enumerate() {
+            let mut seen: Vec<usize> = Vec::new();
+            for p in &r.op.parents {
+                if let Some(&j) = index.get(p.as_str()) {
+                    if j != i && !seen.contains(&j) {
+                        seen.push(j);
+                        indegree[i] += 1;
+                        children[j].push(i);
+                    }
+                }
+            }
+        }
+        let mut ready: BinaryHeap<Reverse<usize>> =
+            (0..n).filter(|&i| indegree[i] == 0).map(Reverse).collect();
+        let mut order: Vec<usize> = Vec::with_capacity(n);
+        while let Some(Reverse(i)) = ready.pop() {
+            order.push(i);
+            for &c in &children[i] {
+                indegree[c] -= 1;
+                if indegree[c] == 0 {
+                    ready.push(Reverse(c));
+                }
+            }
+        }
+        // A cycle is impossible for content-addressed ops; if a corrupt log
+        // ever produced one, keep the leftovers rather than dropping them.
+        if order.len() < n {
+            let placed: BTreeSet<usize> = order.iter().copied().collect();
+            order.extend((0..n).filter(|i| !placed.contains(i)));
+        }
+        let mut slots: Vec<Option<OperationRecord>> = records.into_iter().map(Some).collect();
+        order.into_iter().filter_map(|i| slots[i].take()).collect()
+    }
+
+    /// Whether `records` is exactly a continuation of `since`: every record
+    /// descends from `since` through parents that are themselves in
+    /// `records` (or are `since`), so none of them is an ancestor of `since`
+    /// and none has an ancestor outside the set. This is the shape
+    /// [`Self::walk_forward_since`] returns for a plain fast-forward, and
+    /// NOT the shape it returns for a merge: there it also walks the second
+    /// parent's history back to genesis, which is history `since` already
+    /// contains (#1062). Replaying such a set on top of a state computed for
+    /// `since` re-applies old changes over newer ones.
+    pub fn continues_from(records: &[OperationRecord], since: &OpId) -> bool {
+        use std::collections::HashMap;
+        let index: HashMap<&str, usize> =
+            records.iter().enumerate().map(|(i, r)| (r.op_id.as_str(), i)).collect();
+        // 0 = unvisited, 1 = in progress, 2 = descends from `since`, 3 = does not.
+        let mut state = vec![0u8; records.len()];
+        for start in 0..records.len() {
+            let mut stack = vec![start];
+            while let Some(&i) = stack.last() {
+                match state[i] {
+                    2 | 3 => {
+                        stack.pop();
+                        continue;
+                    }
+                    _ => {}
+                }
+                state[i] = 1;
+                let mut pending = false;
+                let mut reaches = false;
+                let parents = &records[i].op.parents;
+                if parents.is_empty() {
+                    state[i] = 3;
+                    stack.pop();
+                    continue;
+                }
+                for p in parents {
+                    if p == since {
+                        reaches = true;
+                    } else if let Some(&j) = index.get(p.as_str()) {
+                        match state[j] {
+                            2 => reaches = true,
+                            0 => {
+                                stack.push(j);
+                                pending = true;
+                            }
+                            // 3: an ancestor of `since` (or unrooted): the
+                            // set is not a pure continuation.
+                            _ => return false,
+                        }
+                    } else {
+                        // A parent that is neither `since` nor in the set.
+                        return false;
+                    }
+                }
+                if pending {
+                    continue;
+                }
+                state[i] = if reaches { 2 } else { 3 };
+                if state[i] == 3 {
+                    return false;
+                }
+                stack.pop();
+            }
+        }
+        true
     }
 
     /// Like [`Self::walk_forward`], but bounded: walk from `head` back
