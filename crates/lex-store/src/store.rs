@@ -2434,8 +2434,8 @@ impl Store {
     /// transition replayed over it, every resulting `(sig, stage)`
     /// bulk-loaded. Exact for a **single-parent** transition — the
     /// candidate [`Self::apply_operation_gated`] wants. Not valid for
-    /// a merge: a `StageTransition::Merge` records only the delta
-    /// relative to dst, while the op-DAG replay that computes a
+    /// a merge: a `StageTransition::Merge` pins only the sigs the
+    /// merge decided, while the op-DAG replay that computes a
     /// merge's real head walks both parents (#833).
     pub fn candidate_program_for(
         &self,
@@ -2486,10 +2486,10 @@ impl Store {
     /// The gated write path for **merge** commits (`commit_merge`,
     /// `POST /v1/merge/<id>/commit`, `lex merge commit`).
     ///
-    /// A `StageTransition::Merge` records only the delta relative to
-    /// dst; the sig->stage map every consumer reads is recomputed by
+    /// A `StageTransition::Merge` pins only the sigs the merge decided
+    /// (#1062); the sig->stage map every consumer reads is recomputed by
     /// replaying the op DAG, which for a merge walks *both* parents
-    /// and can surface sigs the delta never mentions. So the only way
+    /// and can surface sigs the entries never mention. So the only way
     /// to know the true post-merge program is to replay it — land the
     /// op and read `branch_head`. This lands the merge op,
     /// type-checks the resulting head, and on a failure rolls the
@@ -2515,8 +2515,22 @@ impl Store {
         let head_before = self.get_branch(branch)?.and_then(|b| b.head_op);
         // Capture the stages this merge introduces before `transition`
         // is moved into `apply_operation`; used for the TypeCheck
-        // attestation below.
-        let attestable = attestable_stage_ids(&transition);
+        // attestation below and for the attestation gate. A merge's entries
+        // pin every sig it decided (#1062), including the ones dst already
+        // holds; those stages are not introduced by the merge, so they are
+        // neither gated nor re-attested — exactly what the entries that
+        // differed from dst were before pinning.
+        let attestable = match &transition {
+            lex_vcs::StageTransition::Merge { entries } => {
+                let dst = self.branch_head(branch)?;
+                entries
+                    .iter()
+                    .filter(|(sig, stage)| stage.is_some() && dst.get(*sig) != stage.as_ref())
+                    .filter_map(|(_, stage)| stage.clone())
+                    .collect()
+            }
+            other => attestable_stage_ids(other),
+        };
         // #977: the merge commits its OWN lock — the union of its parents'
         // pins — so a dependency either branch introduced resolves at the
         // merged head. Computed before anything is written: a same-package /
@@ -2543,7 +2557,7 @@ impl Store {
             None if head_before.is_none() => self.merged_lock_for_parents(&op.parents)?,
             None => None,
         };
-        let op_id = self.apply_operation(branch, op, transition)?;
+        let op_id = self.apply_operation_attesting(branch, op, transition, attestable.clone())?;
 
         let verdict = (|| -> Result<(), StoreError> {
             // Bind the merged lock to the merge op before gating, so the gate
@@ -4438,6 +4452,18 @@ impl Store {
         transition: lex_vcs::StageTransition,
     ) -> Result<lex_vcs::OpId, StoreError> {
         let attestable = attestable_stage_ids(&transition);
+        self.apply_operation_attesting(branch, op, transition, attestable)
+    }
+
+    /// [`Self::apply_operation`] with the stages the write-time attestation
+    /// gate checks given explicitly rather than read off the transition.
+    fn apply_operation_attesting(
+        &self,
+        branch: &str,
+        op: lex_vcs::Operation,
+        transition: lex_vcs::StageTransition,
+        attestable: Vec<String>,
+    ) -> Result<lex_vcs::OpId, StoreError> {
         let op_effects = op_declared_effects(&op.kind);
         self.cas_retry_advance(branch, op, transition, |new_head| {
             self.run_required_attestations_gate(branch, &new_head.op_id, &attestable, &op_effects)

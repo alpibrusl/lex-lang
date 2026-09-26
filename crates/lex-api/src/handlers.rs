@@ -1318,17 +1318,6 @@ fn merge_commit_handler(
     let lca = wrapped.inner.lca.clone();
     let auto_resolved = wrapped.inner.auto_resolved.clone();
 
-    // Translate auto-resolved + resolutions into the StageTransition::Merge
-    // entries map. Only sigs whose head changes relative to dst go in.
-    let mut entries: BTreeMap<lex_vcs::SigId, Option<lex_vcs::StageId>> = BTreeMap::new();
-
-    // Auto-resolved: only `Src` (one-sided change on src) modifies dst.
-    for outcome in &auto_resolved {
-        if let lex_vcs::MergeOutcome::Src { sig_id, stage_id } = outcome {
-            entries.insert(sig_id.clone(), stage_id.clone());
-        }
-    }
-
     // Conflict resolutions (sig conflicts, then file conflicts — #1007 PR 7).
     let commit_out = match wrapped.inner.commit() {
         Ok(r) => r,
@@ -1351,28 +1340,24 @@ fn merge_commit_handler(
         }
     };
 
+    // Translate auto-resolved + resolutions into the StageTransition::Merge
+    // entries map. Every sig the merge decided goes in — including the ones
+    // dst already has (`take_ours`, dst-only changes) — so the merged head
+    // does not depend on the order a replay applies the two sides in
+    // (#1062); see `Store::merge_pins`. `take_theirs` is read from src's
+    // head, not reconstructed from the session (the commit consumed it).
+    let store = state.store.lock().unwrap();
+    let mut entries: BTreeMap<lex_vcs::SigId, Option<lex_vcs::StageId>> =
+        match store.merge_pins(dst_head.as_ref(), src_head.as_ref(), &auto_resolved, &commit_out.resolved) {
+            Ok(e) => e,
+            Err(e) => return write_error_response("resolve merge entries", e),
+        };
+
     for (conflict_id, resolution) in commit_out.resolved {
         match resolution {
-            lex_vcs::Resolution::TakeOurs => {
-                // Dst already has its head. No entry needed.
-            }
-            lex_vcs::Resolution::TakeTheirs => {
-                // Find the conflict's `theirs` stage_id in the
-                // session snapshot. We don't have direct access to
-                // it post-commit (commit consumed the session); but
-                // we can reconstruct from `auto_resolved` plus the
-                // session's pre-commit conflict map. Since we
-                // already moved the inner session, the cleanest fix
-                // for this slice is to rebuild from the on-disk
-                // graph: walk src_head, find the latest stage for
-                // the conflict's sig.
-                match resolve_take_theirs(state, &src_head, &conflict_id) {
-                    Ok(stage_id) => {
-                        entries.insert(conflict_id.clone(), stage_id);
-                    }
-                    Err(e) => return error_response(500, format!("resolve take_theirs: {e}")),
-                }
-            }
+            // Pinned by `merge_pins` above (dst already has its head; the
+            // `theirs` stage is src's).
+            lex_vcs::Resolution::TakeOurs | lex_vcs::Resolution::TakeTheirs => {}
             lex_vcs::Resolution::Custom { op } => {
                 // The agent's brand-new op carries the merge target
                 // in its kind (e.g. ModifyBody.to_stage_id). The op
@@ -1424,7 +1409,6 @@ fn merge_commit_handler(
         parents,
     );
     let transition = lex_vcs::StageTransition::Merge { entries };
-    let store = state.store.lock().unwrap();
 
     // #1007 PR 7: if the manifests disagreed at all, build the merged
     // manifest now — auto-resolved paths plus every resolved file
@@ -1503,45 +1487,6 @@ fn merge_commit_handler(
         }
         Err(e) => write_error_response("apply merge op", e),
     }
-}
-
-/// Walk the op log from `src_head` backwards to find the latest
-/// stage assigned to `sig`. Used by the commit handler to figure
-/// out what stage `TakeTheirs` should land. `Ok(None)` means src
-/// removed the sig.
-fn resolve_take_theirs(
-    state: &State,
-    src_head: &Option<lex_vcs::OpId>,
-    sig: &lex_vcs::SigId,
-) -> std::io::Result<Option<lex_vcs::StageId>> {
-    let store = state.store.lock().unwrap();
-    let log = lex_vcs::OpLog::open(store.root())?;
-    let Some(head) = src_head.as_ref() else { return Ok(None); };
-    // Walk forward from root → head, replaying each op's transition
-    // for `sig`; the last assignment wins.
-    let mut current: Option<lex_vcs::StageId> = None;
-    for record in log.walk_forward(head, None)? {
-        match &record.produces {
-            lex_vcs::StageTransition::Create { sig_id, stage_id }
-                if sig_id == sig => { current = Some(stage_id.clone()); }
-            lex_vcs::StageTransition::Replace { sig_id, to, .. }
-                if sig_id == sig => { current = Some(to.clone()); }
-            lex_vcs::StageTransition::Remove { sig_id, .. }
-                if sig_id == sig => { current = None; }
-            lex_vcs::StageTransition::Rename { from, to, body_stage_id }
-                if from == sig || to == sig => {
-                if from == sig { current = None; }
-                if to == sig   { current = Some(body_stage_id.clone()); }
-            }
-            lex_vcs::StageTransition::Merge { entries } => {
-                if let Some(opt) = entries.get(sig) {
-                    current = opt.clone();
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(current)
 }
 
 fn mint_merge_id() -> MergeSessionId {
