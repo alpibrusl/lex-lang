@@ -125,3 +125,51 @@ fn verify_rejects_an_id_together_with_a_project() {
     let out = lex(store, &["issue", "verify", &a, "--project", "pkg"]);
     assert!(!out.status.success());
 }
+
+#[test]
+fn verified_only_rechecks_what_was_done_and_ignores_unbuilt_work() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().to_str().unwrap();
+    let a = create(store, "one", "one:() -> Int", Some("one() => 1"), None, "pkg");
+    let b = create(store, "two", "two:() -> Int", Some("two() => 2"), Some(&a), "pkg");
+
+    // Only `one` exists. A plain project pass calls `two` failed; a
+    // regression pass must not — `two` was never done, so it cannot regress.
+    publish(store, tmp.path(), "m.lex", "fn one() -> Int { 1 }\n");
+    assert!(lex(store, &["issue", "verify", &a]).status.success());
+    let out = lex(store, &["issue", "verify", "--project", "pkg", "--verified-only"]);
+    assert!(out.status.success(), "unbuilt work is not a regression: {}", String::from_utf8_lossy(&out.stderr));
+    let v = data(&out);
+    assert_eq!(v["issues"].as_array().unwrap().len(), 1, "{v}");
+    assert_eq!(v["failed"], 0);
+
+    // Now drop `one`: the verified issue regresses, and only it is reported.
+    publish(store, tmp.path(), "m2.lex", "fn other() -> Int { 3 }\n");
+    let out = lex(store, &["issue", "verify", "--project", "pkg", "--verified-only"]);
+    assert_eq!(out.status.code(), Some(1));
+    let v = data(&out);
+    assert_eq!(v["issues"][0]["issue_id"], a.as_str());
+    let _ = b;
+}
+
+#[test]
+fn verified_only_needs_a_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().to_str().unwrap();
+    let out = lex(store, &["issue", "verify", "abc", "--verified-only"]);
+    assert!(!out.status.success());
+}
+
+#[test]
+fn a_record_signature_verifies_whatever_order_its_fields_are_declared_in() {
+    // Regression: the head renders record fields sorted by name, so a
+    // declaration written in source order (`zed` before `abc`) could never
+    // match — an unsatisfiable contract nothing reported as one.
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().to_str().unwrap();
+    let id = create(store, "rec", "f:() -> { zed :: Int, abc :: Int }", None, None, "pkg");
+    publish(store, tmp.path(), "m.lex", "fn f() -> { zed :: Int, abc :: Int } {\n  { zed: 1, abc: 2 }\n}\n");
+    let out = lex(store, &["issue", "verify", &id]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    assert_eq!(data(&out)["verdict"], "verified");
+}

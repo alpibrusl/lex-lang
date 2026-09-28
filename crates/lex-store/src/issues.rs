@@ -120,16 +120,16 @@ pub fn check_api_delta(
     };
     let mut problems: Vec<String> = Vec::new();
     for e in api {
-        let want = squash(&e.signature);
+        let want = normalize_signature(&e.signature);
         let at_head = head
             .get(&e.name)
             .and_then(|r| tail_after_name(r, &e.name))
-            .map(|t| squash(&t));
+            .map(|t| normalize_signature(&t));
         let at_base = base_surface
             .as_ref()
             .and_then(|b| b.get(&e.name))
             .and_then(|r| tail_after_name(r, &e.name))
-            .map(|t| squash(&t));
+            .map(|t| normalize_signature(&t));
         match e.kind {
             ApiChangeKind::Added => {
                 match &at_head {
@@ -530,6 +530,67 @@ fn squash(s: &str) -> String {
     s.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
+/// [`squash`], and record-type fields put in canonical (name) order.
+///
+/// The head's signature is rendered from the canonical AST, where a record
+/// type's fields are sorted by name — so `-> { zed :: Int, abc :: Int }`, as
+/// the source writes it, renders `{abc::Int,zed::Int}`. A declared signature
+/// compared as raw text therefore never matched a record whose fields were
+/// not already alphabetical: an unsatisfiable contract that nothing reports
+/// as one, and an agent can spend hours chasing it. Both sides go through
+/// this, so field order in a declaration is never semantic either.
+pub(crate) fn normalize_signature(sig: &str) -> String {
+    let chars: Vec<char> = squash(sig).chars().collect();
+    let (items, _) = parse_items(&chars, 0, None);
+    items.join(",")
+}
+
+/// Comma-separated items at one nesting level, up to `close` (consumed).
+/// Only a `{ .. }` whose items are all `name::Type` is a record type and
+/// gets its items sorted; tuples, generics and effect rows keep their order.
+fn parse_items(cs: &[char], mut i: usize, close: Option<char>) -> (Vec<String>, usize) {
+    let mut items = Vec::new();
+    let mut cur = String::new();
+    while i < cs.len() {
+        let c = cs[i];
+        match c {
+            '{' | '(' | '[' => {
+                let closer = match c {
+                    '{' => '}',
+                    '(' => ')',
+                    _ => ']',
+                };
+                let (mut inner, next) = parse_items(cs, i + 1, Some(closer));
+                if c == '{' && !inner.is_empty() && inner.iter().all(|it| it.contains("::")) {
+                    inner.sort_by(|a, b| field_name(a).cmp(field_name(b)));
+                }
+                cur.push(c);
+                cur.push_str(&inner.join(","));
+                cur.push(closer);
+                i = next;
+            }
+            ')' | ']' | '}' if Some(c) == close => {
+                items.push(cur);
+                return (items, i + 1);
+            }
+            ',' => {
+                items.push(std::mem::take(&mut cur));
+                i += 1;
+            }
+            _ => {
+                cur.push(c);
+                i += 1;
+            }
+        }
+    }
+    items.push(cur);
+    (items, i)
+}
+
+fn field_name(item: &str) -> &str {
+    item.split("::").next().unwrap_or(item)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,6 +604,28 @@ mod tests {
         assert_eq!(tail_after_name("type Shape = A | B", "Shape").as_deref(), Some("= A | B"));
         // Wrong name → no tail (never a false positive).
         assert_eq!(tail_after_name("fn gcd(a :: Int) -> Int", "lcm"), None);
+    }
+
+    #[test]
+    fn record_field_order_is_not_semantic() {
+        // As the source writes it vs. as the canonical AST renders it.
+        assert_eq!(
+            normalize_signature("() -> { zed :: Int, abc :: Int }"),
+            normalize_signature("() -> { abc :: Int, zed :: Int }")
+        );
+        // Nested records, and a record inside a generic.
+        assert_eq!(
+            normalize_signature("(x :: List[{ b :: { z :: Int, a :: Int }, a :: Str }]) -> Int"),
+            "(x::List[{a::Str,b::{a::Int,z::Int}}])->Int"
+        );
+        // Tuples, generics and effect rows keep their order.
+        assert_eq!(normalize_signature("(a :: Map[Str, Int], b :: Int) -> [net, io] Int"), "(a::Map[Str,Int],b::Int)->[net,io]Int");
+        // Still sensitive to everything that IS semantic.
+        assert_ne!(
+            normalize_signature("() -> { a :: Int, b :: Int }"),
+            normalize_signature("() -> { a :: Int, b :: Str }")
+        );
+        assert_ne!(normalize_signature("() -> { a :: Int }"), normalize_signature("() -> { b :: Int }"));
     }
 
     #[test]

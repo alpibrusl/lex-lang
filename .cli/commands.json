@@ -2034,6 +2034,10 @@
           "invocation": "lex issue verify --project pkg"
         },
         {
+          "description": "A regression pass: re-check only what had already verified",
+          "invocation": "lex issue verify --project pkg --verified-only"
+        },
+        {
           "description": "Show one as JSON",
           "invocation": "lex issue show <id>"
         },

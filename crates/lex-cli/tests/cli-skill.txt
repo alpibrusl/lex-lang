@@ -971,6 +971,11 @@ lex issue verify --project pkg
 ```
 
 ```bash
+# A regression pass: re-check only what had already verified
+lex issue verify --project pkg --verified-only
+```
+
+```bash
 # Show one as JSON
 lex issue show <id>
 ```

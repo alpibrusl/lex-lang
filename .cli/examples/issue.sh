@@ -22,6 +22,9 @@ lex issue next --project pkg
 # Re-check every issue of a project in dependency order (exit 1 on a regression)
 lex issue verify --project pkg
 
+# A regression pass: re-check only what had already verified
+lex issue verify --project pkg --verified-only
+
 # Show one as JSON
 lex issue show <id>
 

@@ -6,7 +6,7 @@
 //!   lex issue list  [--project P] [--state S] [--store DIR]
 //!   lex issue next  [--project P] [--limit N] [--store DIR]
 //!   lex issue show <id> [--store DIR]
-//!   lex issue verify <id> | --project P [--at OP] [--store DIR]
+//!   lex issue verify <id> | --project P [--verified-only] [--at OP] [--store DIR]
 //!   lex issue propose <id> --shape S [shape flags] [--rationale R] [--by WHO]
 //!   lex issue proposals <id>
 //!   lex issue approve|reject <proposal> --by WHO [--notes N]
@@ -58,7 +58,7 @@ pub fn cmd_issue(fmt: &OutputFormat, args: &[String]) -> Result<()> {
              propose: <issue> --shape S [shape flags] [--rationale R] [--by WHO]  propose a typed acceptance for a free_form issue\n\
              proposals: <issue>  list proposals with their status (pending|approved|rejected)\n\
              approve|reject: <proposal> --by WHO [--notes N]  a human verdict on a proposal\n\
-             verify: <id> | --project P [--at OP]  evaluate one issue — or every issue of a project, in dependency order — at a head (default: branch head)\n\
+             verify: <id> | --project P [--verified-only] [--at OP]  evaluate one issue — or every issue of a project, in dependency order — at a head (default: branch head); --verified-only re-checks just what had verified (a regression pass)\n\
              create: --title T [--body B] --shape typed_delta|failing_example|metric_invariant|evidence|free_form\n\
              \x20       [--api name:sig[:kind]]... [--example E]... [--predicate P --window W]\n\
              \x20       [--subject S] [--invariant I]... [--base OP] [--dep ID]... [--project P]"
@@ -206,6 +206,7 @@ fn verify(fmt: &OutputFormat, root: &std::path::Path, args: &[String]) -> Result
     let mut id: Option<String> = None;
     let mut at: Option<String> = None;
     let mut project: Option<String> = None;
+    let mut verified_only = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -213,11 +214,15 @@ fn verify(fmt: &OutputFormat, root: &std::path::Path, args: &[String]) -> Result
             "--project" => {
                 project = Some(it.next().cloned().ok_or_else(|| anyhow!("--project needs a name"))?)
             }
+            "--verified-only" => verified_only = true,
             other if !other.starts_with("--") && id.is_none() => id = Some(other.to_string()),
             other => bail!(
-                "unexpected arg `{other}` (usage: lex issue verify <id> | --project P [--at OP] [--store DIR])"
+                "unexpected arg `{other}` (usage: lex issue verify <id> | --project P [--verified-only] [--at OP] [--store DIR])"
             ),
         }
+    }
+    if verified_only && project.is_none() {
+        bail!("--verified-only applies to --project");
     }
     let store = Store::open(root)?;
     let head = resolve_head(&store, at)?;
@@ -225,7 +230,7 @@ fn verify(fmt: &OutputFormat, root: &std::path::Path, args: &[String]) -> Result
         if id.is_some() {
             bail!("pass an issue id or --project, not both");
         }
-        return verify_project(fmt, root, &store, &p, &head);
+        return verify_project(fmt, root, &store, &p, &head, verified_only);
     }
     let id = id.ok_or_else(|| {
         anyhow!("usage: lex issue verify <id> | --project P [--at OP] [--store DIR]")
@@ -354,17 +359,25 @@ fn verify_project(
     store: &Store,
     project: &str,
     head: &str,
+    verified_only: bool,
 ) -> Result<()> {
     let log = IssueLog::open(root)?;
     let mut issues: Vec<Issue> = Vec::new();
+    let mut in_project = 0usize;
     for id in log.list_ids()? {
         if let Some(i) = log.get(&id)? {
             if i.project.as_deref() == Some(project) {
-                issues.push(i);
+                in_project += 1;
+                // A regression pass only re-checks what had verified: an
+                // issue nobody has built yet is "not done", not "broken",
+                // and reporting it as failed would bury a real regression.
+                if !verified_only || is_verified(store, &i.issue_id)? {
+                    issues.push(i);
+                }
             }
         }
     }
-    if issues.is_empty() {
+    if in_project == 0 {
         bail!("no issues in project `{project}`");
     }
     let mut rows = Vec::new();
