@@ -5,6 +5,79 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [0.11.74] - 2026-09-28
+
+### Changed — behavior operators need to know
+
+- **A hub recomputes each branch's head snapshot once after upgrading
+  (#1065, #1062).** Cached head snapshots now carry a version field, and
+  snapshots written by an older binary (which may hold a wrongly merged head)
+  are discarded and rebuilt with one full walk per branch on first use. No
+  action is needed beyond that one-time cost; request and response shapes are
+  unchanged. Merge ops committed from now on carry more `entries` (see
+  Fixed), so they get different OpIds than the same merge would have had
+  before; no existing OpId changes, and merge ops already stored keep
+  loading.
+- **Attestation kinds can now be reserved on `/v1/attestations/batch`
+  (#1067, #1066).** See Added. The default reserves nothing, so `lex serve`
+  and existing embedders behave as before.
+
+### Added
+
+- **`State::with_reserved_kinds(Vec<String>)` refuses reserved attestation
+  kinds on `POST /v1/attestations/batch` (#1067, #1066).**
+  `State::reserved_producers` (#1053) reserves producer names, but
+  `Store::latest_review_verdict` (the review inbox and `promote`'s standing
+  Reject) keys on the attestation kind, so a client could post a `Review`
+  under an arbitrary producer and flip the verdict. A batch containing a
+  reserved kind is refused whole, nothing written, with
+  `403 {"error":"ReservedKind","detail":{"attestation_id","kind","reserved_kind","message"}}`.
+  Matching mirrors producers: exact names, a trailing `*` is a prefix, trim
+  and ASCII case-fold, blank entries ignored; `_` is additionally ignored on
+  both sides so `TypeCheck` and the serde tag `type_check` are the same
+  kind. The check runs on the parsed attestation, i.e. the value that is
+  persisted. Check order: `400` malformed JSON, `403 ReservedKind`,
+  `403 ReservedProducer`, `409 AttestationIdMismatch`, `422 UnknownOp`,
+  then persist. Server-internal writers (`verify_head_and_attest`,
+  `POST /v1/review/verdict`) are unaffected. `lex_api::handlers` exports
+  `REVIEW_KIND` (`"review"`) and `TYPE_CHECK_KIND` (`"type_check"`).
+
+### Fixed
+
+- **A merged head no longer depends on DAG replay order (#1065, #1062).**
+  Three independent defects in how a merge op's head is computed:
+  1. `Merge.entries` listed only sigs whose value differed from dst, so a
+     sig the merge decided but left as dst has it was never pinned and the
+     concurrent ops of the two parent histories (which do not commute)
+     decided it by replay order. `take_ours` could be lost or kept
+     depending on op ids, for every conflict kind (`modify_modify`,
+     `delete_modify`, `modify_delete`, `add_add`). Every commit path
+     (`lex merge commit`, `POST /v1/merge/<id>/commit`,
+     `Store::commit_merge`) now goes through `Store::merge_pins`, which pins
+     every sig either side touched since the base to its resolved value
+     (kept-as-ours and deleted included), so the head is identical under
+     every topological order.
+  2. `OpLog::walk_forward` was the reverse of a BFS, which is not a
+     topological order once a merge joins lines of different lengths (an
+     ancestor could replay after its own descendant). It is now a canonical
+     topological order (Kahn's algorithm with the old BFS position as
+     tie-break); wherever the old order was already topological, including
+     every linear history, the result is byte-identical.
+  3. `branch_head`'s incremental snapshot extension for a merge also
+     replayed the merged-in branch's whole pre-fork history on top of dst's
+     snapshot, silently reverting dst's own changes, so a client's head
+     could differ from a fresh replay (pull, `export-git`). The incremental
+     path is now used only for a pure continuation
+     (`OpLog::continues_from`); a merge takes the full walk.
+
+  Old logs: merge ops already stored keep loading and replay to one answer
+  on every route. Where the old order was not topological, or the old head
+  came from the buggy incremental path, the answer changes to the causally
+  correct one. A `take_ours` that was lost before stays lost: the resolution
+  was never recorded, so it cannot be recovered. The always-valid-HEAD gate
+  is unchanged in kind. The "merged head can depend on DAG replay order"
+  limitation noted under 0.11.73 is resolved by this change.
+
 ## [0.11.73] - 2026-09-26
 
 ### Changed — behavior operators need to know
