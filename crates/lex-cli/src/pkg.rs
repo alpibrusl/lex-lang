@@ -13,6 +13,10 @@
 //!   lex pkg update                                     — re-resolve every registry dep to
 //!                                                        the highest match and relock
 //!   lex pkg list                                       — list dependencies in lex.toml
+//!   lex pkg search <query…> [--json] [--limit N] [--org O]
+//!                                                      — find existing packages (name,
+//!                                                        description, README) and print the
+//!                                                        lex.toml line to add (pkg_search.rs)
 //!   lex pkg release <hub-url> [--version V] [--branch B] [--token TOK]
 //!                                                      — cut an immutable versioned release of
 //!                                                        the hosted head; version + dependency
@@ -40,14 +44,15 @@ pub fn cmd_pkg(args: &[String]) -> Result<()> {
         Some("init")    => cmd_init(),
         Some("add")     => cmd_add(&args[1..]),
         Some("list")    => cmd_list(),
+        Some("search")  => crate::pkg_search::cmd_search(&args[1..]),
         Some("install") => cmd_install(&args[1..]),
         Some("lock")    => cmd_lock(&args[1..], /*keep_existing=*/ true),
         Some("update")  => cmd_lock(&args[1..], /*keep_existing=*/ false),
         Some("publish") => cmd_publish(&args[1..]),
         Some("release") => cmd_release(&args[1..]),
         Some("verify")  => cmd_verify(&args[1..]),
-        Some(other)     => bail!("unknown pkg subcommand `{other}`; try: init, add, install, lock, update, list, publish, release, verify"),
-        None            => bail!("usage: lex pkg <init|add|install|lock|update|list|publish|release|verify>"),
+        Some(other)     => bail!("unknown pkg subcommand `{other}`; try: init, add, install, lock, update, list, search, publish, release, verify"),
+        None            => bail!("usage: lex pkg <init|add|install|lock|update|list|search|publish|release|verify>"),
     }
 }
 

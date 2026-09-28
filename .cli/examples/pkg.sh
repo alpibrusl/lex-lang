@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Examples for: pkg
 
+# Before hand-rolling routing/HTTP/JWT/SQL, look for an existing package (prints the lex.toml line to add)
+lex pkg search http router
+
 # Install deps
 lex pkg install
 

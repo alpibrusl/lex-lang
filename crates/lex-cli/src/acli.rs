@@ -227,16 +227,20 @@ fn cmd_issue() -> CommandInfo {
 fn cmd_pkg() -> CommandInfo {
     CommandInfo::new(
         "pkg",
-        "package manager: init, add, install, list deps; publish/verify signed capability contracts",
+        "package manager: init, add, install, list deps, search for existing packages; publish/verify signed capability contracts",
     )
     .idempotent(false)
     .add_argument(
         "subcommand",
-        "enum[init|add|install|lock|update|list|publish|release|verify]",
+        "enum[init|add|install|lock|update|list|search|publish|release|verify]",
         "what to do",
         true,
     )
     .with_examples(vec![
+        (
+            "Before hand-rolling routing/HTTP/JWT/SQL, look for an existing package (prints the lex.toml line to add)",
+            "lex pkg search http router",
+        ),
         ("Install deps", "lex pkg install"),
         (
             "Install, verifying each registry dep's signed contract against pinned publishers",

@@ -365,6 +365,37 @@ Use `dial_ws_actor` whenever the client must send unsolicited frames
 (OCPP Heartbeat, OCPP MeterValues, keep-alives). Use `dial_ws` for
 purely request/response clients.
 
+### 3.9 Look for an existing package before hand-rolling (MUST)
+
+The stdlib is only part of what already exists. The org publishes
+packages for the things a service needs next — an HTTP router and
+request validation, JWT/JOSE, an ORM, structured logging, an LLM client,
+protocol adapters. Writing your own router or JWT parser when one is one
+line away in `lex.toml` is the most expensive mistake on this list:
+more code to review, none of the package's tests, and a fork nobody else
+maintains.
+
+**Before you write any non-trivial capability, search.** Do it at the
+start, not after the design is fixed:
+
+```sh
+lex pkg search http router     # by capability words; several tries are cheap
+lex pkg search jwt
+lex pkg search orm --json      # machine-readable: name, description, git, toml_line
+```
+
+Each hit prints the exact `lex.toml` line to add and the equivalent
+`lex pkg add <name> --git <url>`. Then `lex pkg install`, read the
+package's `README.md` / `src/`, and build on it. Search by what the code
+*does* ("router", "jwt", "orm") rather than by what you would call it;
+if a search finds nothing, try one broader word before concluding there is
+nothing to reuse. Only hand-roll when the search comes back empty or the
+package genuinely can't do the job — and say which in the commit message.
+
+If the search itself is unavailable (offline, rate-limited), it says so
+and points at <https://github.com/orgs/alpibrusl/repositories?q=lex-&type=public>;
+browse that rather than skipping the check.
+
 ---
 
 ## 4. The repair-not-regenerate rule
@@ -545,6 +576,7 @@ emit. Avoid.
 |---|---|---|
 | `_ => "ok"` outside a try/catch-all | Swallows new variants silently | List exhaustively |
 | Hand-rolled crypto | One bug = full compromise | `std.crypto` |
+| Hand-rolled router / JWT / ORM / HTTP framework | It already ships as a package; yours is untested and unmaintained | `lex pkg search <word>`, then add the dep (§3.9) |
 | String-concat SQL | Injection | `sql.query(db, q, [args])` |
 | Wide `[net, io, fs_read, fs_write]` | Sandbox is meaningless | Narrow to what's used + path scopes |
 | `[io]` "just in case" | Pure fn won't typecheck anyway | Remove it |
@@ -574,6 +606,8 @@ Then verify by inspection:
       explaining why not — usually "trivial accessor").
 - [ ] No `_ =>` arms outside catch-all error paths.
 - [ ] Stdlib used in preference to roll-your-own.
+- [ ] You ran `lex pkg search` for each non-trivial capability before
+      writing it, and reused what it found (§3.9).
 - [ ] If you saw a `lex check` error during the task, you ran
       `lex repair --apply` rather than regenerating the body.
 - [ ] No SigId churn from cosmetic edits (param renames, fn reordering).
