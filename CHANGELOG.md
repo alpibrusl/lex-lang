@@ -5,7 +5,7 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
-## [Unreleased]
+## [0.11.75] - 2026-09-28
 
 ### Added
 
