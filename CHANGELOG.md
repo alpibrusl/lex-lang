@@ -22,16 +22,6 @@ bumps may carry breaking changes when justified).
   `--verified-only` limits that pass to issues that had verified — a
   regression pass — so work nobody has built yet is not reported as broken.
 
-### Fixed
-
-- **A typed issue whose signature names a record type could not verify unless
-  its fields were already alphabetical.** The head renders record fields
-  sorted by name, so `-> { zed :: Int, abc :: Int }` — as the source writes
-  it — never matched its own declaration: an unsatisfiable contract that
-  nothing reported as one, which a coding agent can spend hours chasing.
-  Declared and head signatures are now compared with record fields in
-  canonical order.
-
 - **`lex pkg search <query…>` — discover existing packages before
   hand-rolling one.** A coding agent in an empty `lex init` project had no
   supported way to learn that an HTTP router (`lex-web`), JWT library or ORM
@@ -41,12 +31,27 @@ bumps may carry breaking changes when justified).
   repos without a `lex.toml`, and prints each hit's name, version,
   description, git URL, toolchain floor and the exact `lex.toml`
   `[dependencies]` line to add. `--json` for machine output, `--limit`,
-  `--org`; `GITHUB_TOKEN` raises the rate limit. A multi-word query that ANDs
-  to nothing is retried as "any word"; an unreachable backend is an error with
-  a browse fallback, never a silent "no results".
+  `--org`; `GITHUB_TOKEN` raises the rate limit. Results rank name >
+  description > README-only. A multi-word query whose strict (all-words) search
+  is thin is topped up with the any-word search (stopwords dropped, at most six
+  terms — GitHub allows five boolean operators), so a long natural-language
+  query still surfaces the package that fits. `--` ends flags so a tool can
+  pass a model-written query. An unreachable backend is an error with a browse
+  fallback, never a silent "no results". The registry cannot back this: its
+  public listing is empty for private-by-default packages.
 - `lex agent-guidelines` § 3.9 ("look for an existing package before
   hand-rolling"), plus the § 8 anti-pattern row and § 9 checklist item, and
   the same step in the `lex init` `AGENTS.md`.
+
+### Fixed
+
+- **A typed issue whose signature names a record type could not verify unless
+  its fields were already alphabetical.** The head renders record fields
+  sorted by name, so `-> { zed :: Int, abc :: Int }` — as the source writes
+  it — never matched its own declaration: an unsatisfiable contract that
+  nothing reported as one, which a coding agent can spend hours chasing.
+  Declared and head signatures are now compared with record fields in
+  canonical order.
 
 ## [0.11.74] - 2026-09-28
 
