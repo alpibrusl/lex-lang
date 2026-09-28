@@ -931,7 +931,7 @@ typed issues (#949): a unit of work with a declared, verifiable acceptance — d
 
 ### Arguments
 
-- `subcommand` (enum[create|list|show|verify|propose|proposals|approve|reject], required) — what to do
+- `subcommand` (enum[create|list|next|show|verify|propose|proposals|approve|reject], required) — what to do
 
 ### Examples
 
@@ -951,8 +951,23 @@ lex issue create --title "p99 under 200ms" --shape metric_invariant --predicate 
 ```
 
 ```bash
-# List issues
+# List issues with their derived state
 lex issue list
+```
+
+```bash
+# Only one project's board
+lex issue list --project pkg
+```
+
+```bash
+# What can start now (unblocked, unverified)
+lex issue next --project pkg
+```
+
+```bash
+# Re-check every issue of a project in dependency order (exit 1 on a regression)
+lex issue verify --project pkg
 ```
 
 ```bash
