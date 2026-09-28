@@ -392,6 +392,18 @@ if a search finds nothing, try one broader word before concluding there is
 nothing to reuse. Only hand-roll when the search comes back empty or the
 package genuinely can't do the job — and say which in the commit message.
 
+Two ways this goes wrong even when the search works:
+
+- **Ruling a package out from its one-line description.** Judge it from
+  what it exposes: install it and read its README / `src/` first. A
+  framework often has a pure or lower-level entry point (e.g. an
+  effect-free dispatcher) that fits a pure-signature contract.
+- **Stopping at the stdlib primitive.** The stdlib is the primitive layer
+  (`net.serve_routed` is string-in / string-out: no status codes, path
+  params or validation); a package is the framework layer on top. If a
+  package provides what you would otherwise build on the primitive —
+  routing, validation, auth — use the package.
+
 If the search itself is unavailable (offline, rate-limited), it says so
 and points at <https://github.com/orgs/alpibrusl/repositories?q=lex-&type=public>;
 browse that rather than skipping the check.
