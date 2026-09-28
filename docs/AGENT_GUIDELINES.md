@@ -386,7 +386,8 @@ lex pkg search orm --json      # machine-readable: name, description, git, toml_
 
 Each hit prints the exact `lex.toml` line to add and the equivalent
 `lex pkg add <name> --git <url>`. Then `lex pkg install`, read the
-package's `README.md` / `src/`, and build on it. Search by what the code
+package's `README.md` / `src/` (installed source lives in
+`~/.lex/packages/<name>/`), and build on it. Search by what the code
 *does* ("router", "jwt", "orm") rather than by what you would call it;
 if a search finds nothing, try one broader word before concluding there is
 nothing to reuse. Only hand-roll when the search comes back empty or the

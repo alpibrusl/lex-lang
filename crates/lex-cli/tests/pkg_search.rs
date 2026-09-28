@@ -186,3 +186,25 @@ fn empty_query_prints_usage() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("usage: lex pkg search"));
 }
+
+const WEB_DESC_TOML: &str = "[package]\nname = \"acme-web\"\nversion = \"0.3.0\"\ndescription = \"HTTP REST framework with a typed router and path params\"\n";
+
+#[test]
+fn a_thin_strict_search_is_topped_up_and_the_best_match_ranks_first() {
+    // The regression this pins: a long natural-language query ANDed down to
+    // two accidental README matches, so the any-word fallback never ran and
+    // the package that fits (matches on name/description) was never shown.
+    let (base, seen) = start(
+        vec![repo("acme-noise", None)],
+        vec![repo("acme-noise", None), repo("acme-web", None)],
+        vec![("acme-noise", "[package]\nname = \"acme-noise\"\n"), ("acme-web", WEB_DESC_TOML)],
+    );
+    let out = search(&base, &["http", "router", "rest", "api", "server", "with", "path", "params"]);
+    let so = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{so}");
+    let web = so.find("acme-web").expect("the fitting package must be shown");
+    let noise = so.find("acme-noise").expect("the accidental match is still listed");
+    assert!(web < noise, "description matches outrank a README-only hit: {so}");
+    assert_eq!(seen.lock().unwrap().len(), 2, "AND then OR");
+    assert!(!seen.lock().unwrap()[1].contains(" with "), "stopwords never reach GitHub: {:?}", seen.lock().unwrap());
+}

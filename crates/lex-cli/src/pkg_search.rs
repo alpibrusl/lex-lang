@@ -104,13 +104,23 @@ fn query_terms(words: &[&str]) -> Vec<String> {
             .split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-'))
         {
             let t = t.trim_matches(|c| c == '.' || c == '-' || c == '_');
-            if t.len() >= 2 && t != "or" && t != "and" && t != "not" && !terms.iter().any(|x| x == t) {
+            if t.len() >= 2 && !STOPWORDS.contains(&t) && !terms.iter().any(|x| x == t) {
                 terms.push(t.to_string());
             }
         }
     }
+    // GitHub allows at most five boolean operators per query, and an "any of
+    // these" search over N terms spends N-1 of them.
+    terms.truncate(MAX_TERMS);
     terms
 }
+
+/// Words that match every README and would drown the real terms — and the
+/// boolean keywords, which must never reach GitHub as operators.
+const STOPWORDS: &[&str] = &[
+    "or", "and", "not", "the", "with", "for", "of", "to", "in", "on", "an", "is", "it", "as", "by", "at", "from",
+];
+const MAX_TERMS: usize = 6;
 
 fn search_query(terms: &[String], org: &str, joiner: &str) -> String {
     format!("{} org:{org} fork:false in:name,description,readme", terms.join(joiner))
@@ -304,16 +314,25 @@ pub fn cmd_search(args: &[String]) -> Result<()> {
 
     let unavailable = |e: anyhow::Error| anyhow::anyhow!("package search unavailable: {e}\nbrowse instead: {BROWSE_URL}");
 
-    let mut repos = backend.search(&search_query(&a.terms, &a.org, " "), pool).map_err(unavailable)?;
+    let mut hits = resolve(&backend, backend.search(&search_query(&a.terms, &a.org, " "), pool).map_err(unavailable)?);
     let mut widened = false;
-    if repos.is_empty() && a.terms.len() > 1 {
-        // GitHub ANDs terms; a multi-word task description rarely has every
-        // word in one README. Retry as "any of these".
-        repos = backend.search(&search_query(&a.terms, &a.org, " OR "), pool).map_err(unavailable)?;
-        widened = true;
+    if hits.len() < a.limit && a.terms.len() > 1 {
+        // GitHub ANDs terms, and a multi-word query (an agent describing the
+        // task) rarely has every word in one README — it either finds nothing
+        // or a couple of accidental matches. When the strict search is thin,
+        // add the "any of these" results; the re-rank below puts the ones
+        // whose name/description match the most terms first.
+        let known: Vec<String> = hits.iter().map(|h| h.git.clone()).collect();
+        let more = backend.search(&search_query(&a.terms, &a.org, " OR "), pool).map_err(unavailable)?;
+        let more: Vec<Repo> = more.into_iter().filter(|r| !known.contains(&r.html_url)).collect();
+        let base = hits.len();
+        for mut h in resolve(&backend, more) {
+            h.order += base;
+            hits.push(h);
+            widened = true;
+        }
     }
-
-    let hits: Vec<Hit> = rank(resolve(&backend, repos), &a.terms).into_iter().take(a.limit).collect();
+    let hits: Vec<Hit> = rank(hits, &a.terms).into_iter().take(a.limit).collect();
 
     if a.json {
         let results: Vec<_> = hits
@@ -387,6 +406,14 @@ mod tests {
         assert_eq!(query_terms(&["REST", "API", "org:evil", "OR", "rest"]), s(&["rest", "api", "org", "evil"]));
         assert_eq!(query_terms(&["a", "x"]), Vec::<String>::new());
         assert_eq!(query_terms(&["http-router"]), s(&["http-router"]));
+    }
+
+    #[test]
+    fn stopwords_and_term_cap() {
+        assert_eq!(query_terms(&["a", "router", "with", "the", "jwt", "for"]), s(&["router", "jwt"]));
+        let long: Vec<String> = (0..12).map(|i| format!("word{i}")).collect();
+        let refs: Vec<&str> = long.iter().map(|w| w.as_str()).collect();
+        assert_eq!(query_terms(&refs).len(), MAX_TERMS, "five OR operators is GitHub's ceiling");
     }
 
     #[test]
