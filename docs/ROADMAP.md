@@ -39,7 +39,7 @@ contract, build the kernel, prove one wedge — before going wider.**
 
 | Repo | Maturity | One-line status |
 |---|---|---|
-| **lex-lang** | v0.10.4, ~93k SLOC, 16 crates | Production-grade core: effect sandbox proven (7/7 adversarial), VCS tier-2 shipping. JIT is a phase-1 MVP. |
+| **lex-lang** | v0.11.74, ~93k SLOC, 16 crates | Production-grade core: effect sandbox proven (7/7 adversarial), VCS tier-2 shipping. JIT is a phase-1 MVP. |
 | **lex-os** | ~8.8k SLOC | Real Firecracker microVM perimeter (not stubbed) + host egress wall; simulated backend is the honest portable default. |
 | **lex-os-manifest** | v0.1, ~278 lines | Trust lattice / grant / budget / reversibility as pure Lex. Complete, minimal. |
 | **lex-spec** | v0.1, ~1.5k lines | Spec DSL + evaluator + SMT-LIB export + property check. Shells out to Z3; existentials/composition deferred. |
