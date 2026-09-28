@@ -5,6 +5,33 @@ All notable changes to lex-lang. The format follows
 versioning follows [SemVer](https://semver.org/) (pre-1.0; minor
 bumps may carry breaking changes when justified).
 
+## [Unreleased]
+
+### Added
+
+- **A project of typed issues can be driven, not just filed.** `lex issue list`
+  now shows each issue's derived state (open / in_progress / verified /
+  blocked) and takes `--project P` and `--state S`. `lex issue next
+  [--project P] [--limit N]` prints the issues that can start now — not
+  verified, every dependency verified — and reports `done` in JSON, so a
+  driver can tell "finished" from "nothing ready but work remains".
+  `lex issue verify --project P` re-evaluates every issue of a project at one
+  head in dependency order and exits 1 if any fails: the "no dependent
+  regresses" half of done, which nothing checked. Built for assembling a whole
+  package from a graph of issues instead of one function at a time.
+  `--verified-only` limits that pass to issues that had verified — a
+  regression pass — so work nobody has built yet is not reported as broken.
+
+### Fixed
+
+- **A typed issue whose signature names a record type could not verify unless
+  its fields were already alphabetical.** The head renders record fields
+  sorted by name, so `-> { zed :: Int, abc :: Int }` — as the source writes
+  it — never matched its own declaration: an unsatisfiable contract that
+  nothing reported as one, which a coding agent can spend hours chasing.
+  Declared and head signatures are now compared with record fields in
+  canonical order.
+
 ## [0.11.74] - 2026-09-28
 
 ### Changed — behavior operators need to know

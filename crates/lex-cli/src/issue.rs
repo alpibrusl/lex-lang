@@ -3,8 +3,10 @@
 //!
 //!   lex issue create --title T [--body B] --shape S [shape flags]
 //!                    [--base OP] [--dep ID]... [--project P] [--store DIR]
-//!   lex issue list  [--store DIR]
+//!   lex issue list  [--project P] [--state S] [--store DIR]
+//!   lex issue next  [--project P] [--limit N] [--store DIR]
 //!   lex issue show <id> [--store DIR]
+//!   lex issue verify <id> | --project P [--verified-only] [--at OP] [--store DIR]
 //!   lex issue propose <id> --shape S [shape flags] [--rationale R] [--by WHO]
 //!   lex issue proposals <id>
 //!   lex issue approve|reject <proposal> --by WHO [--notes N]
@@ -23,9 +25,9 @@ use std::collections::BTreeSet;
 
 use anyhow::{anyhow, bail, Result};
 use lex_store::issues::{
-    check_refinable, effective_acceptance, evaluate_static, is_verified, prepare_example_stages,
+    all_issue_status, check_refinable, effective_acceptance, evaluate_static, is_verified, prepare_example_stages,
     proposal_status, record_issue_verdict, record_proposal_review, with_effective_acceptance,
-    IssueEvaluation,
+    IssueEvaluation, IssueState, IssueStatus,
 };
 use lex_store::{Store, StoreError};
 use lex_vcs::{Acceptance, AcceptanceProposal, ApiChangeKind, ApiEntry, Issue, IssueLog};
@@ -41,7 +43,8 @@ pub fn cmd_issue(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let tail = if rest.is_empty() { &rest[..] } else { &rest[1..] };
     match sub {
         "create" => create(fmt, &root, tail),
-        "list" => list(&root),
+        "list" => list(fmt, &root, tail),
+        "next" => next(fmt, &root, tail),
         "show" => show(&root, tail),
         "verify" => verify(fmt, &root, tail),
         "propose" => propose(fmt, &root, tail),
@@ -49,11 +52,13 @@ pub fn cmd_issue(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         "approve" => review(fmt, &root, tail, true),
         "reject" => review(fmt, &root, tail, false),
         _ => bail!(
-            "usage: lex issue <create|list|show|verify|propose|proposals|approve|reject> [--store DIR]\n\
+            "usage: lex issue <create|list|next|show|verify|propose|proposals|approve|reject> [--store DIR]\n\
+             list: [--project P] [--state open|in_progress|verified|blocked]  every issue with its derived state\n\
+             next: [--project P] [--limit N]  issues ready to start: not verified, every dependency verified\n\
              propose: <issue> --shape S [shape flags] [--rationale R] [--by WHO]  propose a typed acceptance for a free_form issue\n\
              proposals: <issue>  list proposals with their status (pending|approved|rejected)\n\
              approve|reject: <proposal> --by WHO [--notes N]  a human verdict on a proposal\n\
-             verify: <id> [--at OP]  evaluate the issue's acceptance at a head (default: branch head)\n\
+             verify: <id> | --project P [--verified-only] [--at OP]  evaluate one issue — or every issue of a project, in dependency order — at a head (default: branch head); --verified-only re-checks just what had verified (a regression pass)\n\
              create: --title T [--body B] --shape typed_delta|failing_example|metric_invariant|evidence|free_form\n\
              \x20       [--api name:sig[:kind]]... [--example E]... [--predicate P --window W]\n\
              \x20       [--subject S] [--invariant I]... [--base OP] [--dep ID]... [--project P]"
@@ -200,58 +205,84 @@ fn parse_api_entry(s: &str) -> Result<ApiEntry> {
 fn verify(fmt: &OutputFormat, root: &std::path::Path, args: &[String]) -> Result<()> {
     let mut id: Option<String> = None;
     let mut at: Option<String> = None;
+    let mut project: Option<String> = None;
+    let mut verified_only = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--at" => at = Some(it.next().cloned().ok_or_else(|| anyhow!("--at needs an op id"))?),
+            "--project" => {
+                project = Some(it.next().cloned().ok_or_else(|| anyhow!("--project needs a name"))?)
+            }
+            "--verified-only" => verified_only = true,
             other if !other.starts_with("--") && id.is_none() => id = Some(other.to_string()),
-            other => bail!("unexpected arg `{other}` (usage: lex issue verify <id> [--at OP] [--store DIR])"),
+            other => bail!(
+                "unexpected arg `{other}` (usage: lex issue verify <id> | --project P [--verified-only] [--at OP] [--store DIR])"
+            ),
         }
     }
-    let id = id.ok_or_else(|| anyhow!("usage: lex issue verify <id> [--at OP] [--store DIR]"))?;
+    if verified_only && project.is_none() {
+        bail!("--verified-only applies to --project");
+    }
+    let store = Store::open(root)?;
+    let head = resolve_head(&store, at)?;
+    if let Some(p) = project {
+        if id.is_some() {
+            bail!("pass an issue id or --project, not both");
+        }
+        return verify_project(fmt, root, &store, &p, &head, verified_only);
+    }
+    let id = id.ok_or_else(|| {
+        anyhow!("usage: lex issue verify <id> | --project P [--at OP] [--store DIR]")
+    })?;
     let log = IssueLog::open(root)?;
     let issue = log.get(&id)?.ok_or_else(|| anyhow!("unknown issue `{id}`"))?;
-    let store = Store::open(root)?;
     // A free-form issue refined by an approved proposal (#956) is judged
     // against that proposal; the id — and so the verdict's key — is the
     // issue's own.
     let issue = with_effective_acceptance(&store, &issue)?;
-    let head = match at {
-        Some(h) => h,
+    let eval = evaluate_at(&store, &issue, &head)?;
+    emit_verdict(fmt, &store, &issue, &id, &head, eval)
+}
+
+fn resolve_head(store: &Store, at: Option<String>) -> Result<String> {
+    match at {
+        Some(h) => Ok(h),
         None => {
             let branch = store.current_branch();
             store
                 .get_branch(&branch)?
                 .and_then(|b| b.head_op)
-                .ok_or_else(|| anyhow!("branch `{branch}` has no head yet; pass --at OP"))?
+                .ok_or_else(|| anyhow!("branch `{branch}` has no head yet; pass --at OP"))
         }
-    };
+    }
+}
 
+/// Evaluate one issue's acceptance at `head` — the dependency gate, then the
+/// static half, then the examples — without recording or printing anything,
+/// so `verify <id>` and `verify --project` cannot disagree about a verdict.
+fn evaluate_at(store: &Store, issue: &Issue, head: &str) -> Result<IssueEvaluation> {
     // A blocked dependency gates everything else: `--dep` was recorded at
     // create time but nothing consulted it here, so an issue whose declared
-    // dependency had never itself verified could still come back `verified`
-    // — the derived board state (`issue_status`, #949 phase 3) already knows
-    // an unmet dep means `Blocked`; this is that same check, applied where a
-    // script actually branches on the verdict. Recorded as `Inconclusive`
-    // (never a pass the gate didn't check, and never a `Failed` either — the
-    // issue's own oracle was never even evaluated).
+    // dependency had never itself verified could still come back `verified`.
+    // Recorded as `Inconclusive` (never a pass the gate didn't check, and
+    // never a `Failed` either — the issue's own oracle was never evaluated).
     let mut unmet: Vec<String> = Vec::new();
     for dep in &issue.deps {
-        if !is_verified(&store, dep)? {
+        if !is_verified(store, dep)? {
             unmet.push(dep.clone());
         }
     }
     if !unmet.is_empty() {
-        let eval = IssueEvaluation::not_evaluable(format!(
+        return Ok(IssueEvaluation::not_evaluable(format!(
             "blocked on unverified dependenc{}: {}",
             if unmet.len() == 1 { "y" } else { "ies" },
             unmet.join(", ")
-        ));
-        return emit_verdict(fmt, &store, &issue, &id, &head, eval);
+        )));
     }
 
     // 1. Everything that needs no execution (the typed delta's API check).
-    let mut eval = evaluate_static(&store, &issue, &head)?;
+    let mut eval = evaluate_static(store, issue, head)?;
 
     // 2. The examples, only if the static half held and the shape carries any.
     if eval.is_passed() {
@@ -265,7 +296,7 @@ fn verify(fmt: &OutputFormat, root: &std::path::Path, args: &[String]) -> Result
             for c in &cases_src {
                 cases.push(parse_example_case(c)?);
             }
-            match prepare_example_stages(&store, &head, &cases) {
+            match prepare_example_stages(store, head, &cases) {
                 Ok(stages) => {
                     let errs = lex_runtime::evaluate_examples(&stages);
                     if !errs.is_empty() {
@@ -286,8 +317,114 @@ fn verify(fmt: &OutputFormat, root: &std::path::Path, args: &[String]) -> Result
             }
         }
     }
+    Ok(eval)
+}
 
-    emit_verdict(fmt, &store, &issue, &id, &head, eval)
+/// Dependency order over the issues of one project: an issue comes after
+/// every project-internal dependency. A cycle (or a dep outside the project)
+/// cannot deadlock it — whatever cannot be placed is appended in creation
+/// order, and `evaluate_at` reports the unmet dependency as `inconclusive`.
+fn dependency_order(mut issues: Vec<Issue>) -> Vec<Issue> {
+    issues.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.issue_id.cmp(&b.issue_id)));
+    let in_project: BTreeSet<String> = issues.iter().map(|i| i.issue_id.clone()).collect();
+    let mut placed: BTreeSet<String> = BTreeSet::new();
+    let mut out: Vec<Issue> = Vec::with_capacity(issues.len());
+    let mut rest = issues;
+    while !rest.is_empty() {
+        let (ready, waiting): (Vec<Issue>, Vec<Issue>) = rest.into_iter().partition(|i| {
+            i.deps.iter().all(|d| !in_project.contains(d) || placed.contains(d))
+        });
+        if ready.is_empty() {
+            out.extend(waiting);
+            break;
+        }
+        for i in &ready {
+            placed.insert(i.issue_id.clone());
+        }
+        out.extend(ready);
+        rest = waiting;
+    }
+    out
+}
+
+/// `lex issue verify --project P` — re-evaluate every issue of a project at
+/// one head, in dependency order, recording each verdict. This is the
+/// "no dependent regresses" half of the definition of done: closing one
+/// issue must not have quietly broken an earlier one (an agent turn that
+/// rewrites a file whole can drop another issue's verified function), and
+/// nothing else re-checks the earlier ones. Exit 1 if any issue fails.
+fn verify_project(
+    fmt: &OutputFormat,
+    root: &std::path::Path,
+    store: &Store,
+    project: &str,
+    head: &str,
+    verified_only: bool,
+) -> Result<()> {
+    let log = IssueLog::open(root)?;
+    let mut issues: Vec<Issue> = Vec::new();
+    let mut in_project = 0usize;
+    for id in log.list_ids()? {
+        if let Some(i) = log.get(&id)? {
+            if i.project.as_deref() == Some(project) {
+                in_project += 1;
+                // A regression pass only re-checks what had verified: an
+                // issue nobody has built yet is "not done", not "broken",
+                // and reporting it as failed would bury a real regression.
+                if !verified_only || is_verified(store, &i.issue_id)? {
+                    issues.push(i);
+                }
+            }
+        }
+    }
+    if in_project == 0 {
+        bail!("no issues in project `{project}`");
+    }
+    let mut rows = Vec::new();
+    let (mut verified, mut failed, mut inconclusive) = (0usize, 0usize, 0usize);
+    for issue in dependency_order(issues) {
+        let judged = with_effective_acceptance(store, &issue)?;
+        let eval = evaluate_at(store, &judged, head)?;
+        record_issue_verdict(store, &judged, head, &eval)?;
+        let (verdict, detail) = match &eval {
+            IssueEvaluation::Passed => {
+                verified += 1;
+                ("verified", String::new())
+            }
+            IssueEvaluation::NotEvaluable { reason } => {
+                inconclusive += 1;
+                ("inconclusive", reason.clone())
+            }
+            IssueEvaluation::Failed { detail } => {
+                failed += 1;
+                ("failed", detail.clone())
+            }
+        };
+        rows.push((issue.issue_id.clone(), issue.title.clone(), verdict, detail));
+    }
+    let data = serde_json::json!({
+        "project": project,
+        "head_op": head,
+        "verified": verified,
+        "failed": failed,
+        "inconclusive": inconclusive,
+        "issues": rows.iter().map(|(id, title, verdict, detail)| serde_json::json!({
+            "issue_id": id, "title": title, "verdict": verdict, "detail": detail,
+        })).collect::<Vec<_>>(),
+    });
+    let text_rows = rows.clone();
+    let total = rows.len();
+    acli::emit_or_text("issue-verify-project", data, fmt, move || {
+        for (id, title, verdict, detail) in &text_rows {
+            let tail = if detail.is_empty() { String::new() } else { format!("  — {detail}") };
+            println!("{verdict:<12}  {id}  {title}{tail}");
+        }
+        println!("{verified}/{total} verified, {failed} failed, {inconclusive} inconclusive");
+    });
+    if failed > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 /// Record `eval` as the issue's verdict at `head` and print it — the tail
@@ -358,13 +495,134 @@ fn parse_example_case(case: &str) -> Result<(String, lex_ast::Example)> {
     Ok((name, example))
 }
 
-fn list(root: &std::path::Path) -> Result<()> {
-    let log = IssueLog::open(root)?;
-    for id in log.list_ids()? {
-        if let Some(issue) = log.get(&id)? {
-            println!("{}  {:<16}  {}", issue.issue_id, issue.acceptance.shape(), issue.title);
+/// The flags `list` and `next` share: `--project P`, and a value-taking
+/// `--state S` / `--limit N` where the command uses them.
+fn parse_board_flags(args: &[String], allow_state: bool, allow_limit: bool) -> Result<(Option<String>, Option<String>, Option<usize>)> {
+    let (mut project, mut state, mut limit) = (None, None, None);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--project" => {
+                project = Some(it.next().cloned().ok_or_else(|| anyhow!("--project needs a name"))?)
+            }
+            "--state" if allow_state => {
+                let v = it.next().cloned().ok_or_else(|| anyhow!("--state needs a value"))?;
+                if !matches!(v.as_str(), "open" | "in_progress" | "verified" | "blocked") {
+                    bail!("unknown state `{v}` (open|in_progress|verified|blocked)");
+                }
+                state = Some(v);
+            }
+            "--limit" if allow_limit => {
+                let v = it.next().ok_or_else(|| anyhow!("--limit needs a number"))?;
+                limit = Some(v.parse().map_err(|_| anyhow!("--limit needs a number, got `{v}`"))?);
+            }
+            other => bail!("unexpected arg `{other}`"),
         }
     }
+    Ok((project, state, limit))
+}
+
+fn state_name(s: IssueState) -> &'static str {
+    match s {
+        IssueState::Open => "open",
+        IssueState::InProgress => "in_progress",
+        IssueState::Verified => "verified",
+        IssueState::Blocked => "blocked",
+    }
+}
+
+/// Every issue's derived state, in creation order — so the order a planner
+/// filed a project's issues in is the order `list` and `next` report them.
+fn board(root: &std::path::Path, project: &Option<String>) -> Result<Vec<IssueStatus>> {
+    let store = Store::open(root)?;
+    let mut rows = all_issue_status(&store)?;
+    rows.retain(|r| project.as_ref().is_none_or(|p| r.issue.project.as_deref() == Some(p.as_str())));
+    rows.sort_by(|a, b| {
+        a.issue.created_at.cmp(&b.issue.created_at).then(a.issue.issue_id.cmp(&b.issue.issue_id))
+    });
+    Ok(rows)
+}
+
+fn counts(rows: &[IssueStatus]) -> serde_json::Value {
+    let n = |s: IssueState| rows.iter().filter(|r| r.state == s).count();
+    serde_json::json!({
+        "open": n(IssueState::Open),
+        "in_progress": n(IssueState::InProgress),
+        "verified": n(IssueState::Verified),
+        "blocked": n(IssueState::Blocked),
+        "total": rows.len(),
+    })
+}
+
+fn row_json(r: &IssueStatus) -> serde_json::Value {
+    serde_json::json!({
+        "issue_id": r.issue.issue_id,
+        "title": r.issue.title,
+        "shape": r.issue.acceptance.shape(),
+        "state": state_name(r.state),
+        "project": r.issue.project,
+        "deps": r.issue.deps,
+        "blocked_on": r.blocked_on,
+    })
+}
+
+/// `lex issue list [--project P] [--state S]` — each issue with the state
+/// derived from the log (open, in progress, verified, blocked).
+fn list(fmt: &OutputFormat, root: &std::path::Path, args: &[String]) -> Result<()> {
+    let (project, state, _) = parse_board_flags(args, true, false)?;
+    let mut rows = board(root, &project)?;
+    let summary = counts(&rows);
+    if let Some(s) = &state {
+        rows.retain(|r| state_name(r.state) == s);
+    }
+    let data = serde_json::json!({
+        "project": project,
+        "counts": summary,
+        "issues": rows.iter().map(row_json).collect::<Vec<_>>(),
+    });
+    acli::emit_or_text("issue-list", data, fmt, move || {
+        for r in &rows {
+            println!(
+                "{}  {:<16}  {:<11}  {}",
+                r.issue.issue_id,
+                r.issue.acceptance.shape(),
+                state_name(r.state),
+                r.issue.title
+            );
+        }
+    });
+    Ok(())
+}
+
+/// `lex issue next [--project P] [--limit N]` — the issues that can start
+/// now: not verified, and every dependency verified. Text mode prints bare
+/// ids, one per line (what a harness reads); JSON also says whether the
+/// board is `done` (everything verified) so a driver can tell "finished"
+/// from "nothing ready but work remains" (stuck).
+fn next(fmt: &OutputFormat, root: &std::path::Path, args: &[String]) -> Result<()> {
+    let (project, _, limit) = parse_board_flags(args, false, true)?;
+    let rows = board(root, &project)?;
+    let summary = counts(&rows);
+    let done = !rows.is_empty() && rows.iter().all(|r| r.state == IssueState::Verified);
+    let mut ready: Vec<&IssueStatus> = rows
+        .iter()
+        .filter(|r| matches!(r.state, IssueState::Open | IssueState::InProgress))
+        .collect();
+    if let Some(n) = limit {
+        ready.truncate(n);
+    }
+    let data = serde_json::json!({
+        "project": project,
+        "done": done,
+        "counts": summary,
+        "ready": ready.iter().map(|r| row_json(r)).collect::<Vec<_>>(),
+    });
+    let ids: Vec<String> = ready.iter().map(|r| r.issue.issue_id.clone()).collect();
+    acli::emit_or_text("issue-next", data, fmt, move || {
+        for id in &ids {
+            println!("{id}");
+        }
+    });
     Ok(())
 }
 

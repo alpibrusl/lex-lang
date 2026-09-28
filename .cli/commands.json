@@ -1996,7 +1996,7 @@
       "arguments": [
         {
           "name": "subcommand",
-          "type": "enum[create|list|show|verify|propose|proposals|approve|reject]",
+          "type": "enum[create|list|next|show|verify|propose|proposals|approve|reject]",
           "description": "what to do",
           "required": true
         }
@@ -2018,8 +2018,24 @@
           "invocation": "lex issue create --title \"p99 under 200ms\" --shape metric_invariant --predicate \"p99 < 200\" --window 7d"
         },
         {
-          "description": "List issues",
+          "description": "List issues with their derived state",
           "invocation": "lex issue list"
+        },
+        {
+          "description": "Only one project's board",
+          "invocation": "lex issue list --project pkg"
+        },
+        {
+          "description": "What can start now (unblocked, unverified)",
+          "invocation": "lex issue next --project pkg"
+        },
+        {
+          "description": "Re-check every issue of a project in dependency order (exit 1 on a regression)",
+          "invocation": "lex issue verify --project pkg"
+        },
+        {
+          "description": "A regression pass: re-check only what had already verified",
+          "invocation": "lex issue verify --project pkg --verified-only"
         },
         {
           "description": "Show one as JSON",

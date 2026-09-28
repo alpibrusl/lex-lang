@@ -176,7 +176,7 @@ fn cmd_issue() -> CommandInfo {
     .idempotent(true)
     .add_argument(
         "subcommand",
-        "enum[create|list|show|verify|propose|proposals|approve|reject]",
+        "enum[create|list|next|show|verify|propose|proposals|approve|reject]",
         "what to do",
         true,
     )
@@ -196,7 +196,17 @@ fn cmd_issue() -> CommandInfo {
             "lex issue create --title \"p99 under 200ms\" --shape metric_invariant \
              --predicate \"p99 < 200\" --window 7d",
         ),
-        ("List issues", "lex issue list"),
+        ("List issues with their derived state", "lex issue list"),
+        ("Only one project's board", "lex issue list --project pkg"),
+        ("What can start now (unblocked, unverified)", "lex issue next --project pkg"),
+        (
+            "Re-check every issue of a project in dependency order (exit 1 on a regression)",
+            "lex issue verify --project pkg",
+        ),
+        (
+            "A regression pass: re-check only what had already verified",
+            "lex issue verify --project pkg --verified-only",
+        ),
         ("Show one as JSON", "lex issue show <id>"),
         (
             "Verify an issue at the branch head — done is a proof the gate records, not a status",
