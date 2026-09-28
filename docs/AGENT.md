@@ -648,6 +648,19 @@ functions instead.
 The type checker requires exhaustive match arms for variants. Add a wildcard
 arm (`_ => ...`) if you don't handle every case.
 
+### `todo()` panics if actually executed
+`todo()` is a checker-recognized placeholder call, not a stdlib function —
+it's not in any module, so it's called bare (`todo()`, no import). It
+type-checks as `Never`, so it unifies with whatever return type or argument
+type the call site expects, and it exists only in immediate-call position: a
+bare reference to `todo` that isn't applied is an ordinary unknown-identifier
+error, not a value. At runtime it unconditionally aborts the call with
+`VmError::Panic("todo() reached")` — useful for stubbing out a function
+signature (or one branch of one) before it has a real body, never for
+production code. A program's own `fn todo(...)` shadows it. See
+`docs/design/project-to-issue-graph.md` §3 for the design this exists to
+support.
+
 ---
 
 ## Useful commands

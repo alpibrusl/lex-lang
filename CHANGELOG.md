@@ -42,6 +42,19 @@ bumps may carry breaking changes when justified).
 - `lex agent-guidelines` § 3.9 ("look for an existing package before
   hand-rolling"), plus the § 8 anti-pattern row and § 9 checklist item, and
   the same step in the `lex init` `AGENTS.md`.
+- **`todo()` — a placeholder call for a function (or one match arm) that
+  doesn't have a real body yet** (`docs/design/project-to-issue-graph.md`
+  §3). Type-checks as `Never`, the same bottom type `return`'s expression
+  position already resolves to, so it unifies with whatever the call site
+  expects; unconditionally panics (`Op::Panic`, the same op a
+  non-exhaustive `match` already falls through to) if actually reached at
+  runtime. Not a stdlib function — no import, called bare — and not a real
+  global either: it's recognized only in immediate-call position, so an
+  uncalled bare reference is an ordinary unknown-identifier error, and a
+  program's own `fn todo(...)` shadows it. Lets a whole signature graph
+  (every function declared, none implemented) be real, typecheckable Lex
+  source, which is the mechanism the project-to-issue-graph design depends
+  on for its "compile the skeleton before any issue exists" step.
 
 ### Fixed
 

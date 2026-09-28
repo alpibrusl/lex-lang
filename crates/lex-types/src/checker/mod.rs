@@ -1444,6 +1444,28 @@ impl Checker {
         locals: &mut IndexMap<String, Ty>,
         effs: &mut EffectSet,
     ) -> Result<Ty, TypeError> {
+        // `todo()` (docs/design/project-to-issue-graph.md §3): a
+        // checker-recognized placeholder call, not a real global —
+        // it's never inserted into `globals`, so it exists only in
+        // this immediate-call position. A bare, uncalled reference to
+        // `todo` therefore falls through to the ordinary
+        // `UnknownIdentifier` error in `check_expr`'s `Var` arm rather
+        // than type-checking as a value that could panic at runtime if
+        // never called. `!self.globals.contains_key("todo")` lets a
+        // user's own `fn todo(...)` shadow this unconditionally, same
+        // precedence as any other name.
+        if let a::CExpr::Var { name } = callee {
+            if name == "todo" && !self.globals.contains_key(name) {
+                if !args.is_empty() {
+                    return Err(TypeError::ArityMismatch {
+                        at_node: node_id.into(),
+                        expected: 0,
+                        got: args.len(),
+                    });
+                }
+                return Ok(Ty::Never);
+            }
+        }
         // #963: a qualified constructor call, `<alias>.Ctor(args)`, where the
         // alias is a resolved dependency module and `Ctor` is one of its
         // exported constructors. Non-inlined resolution keeps the reference

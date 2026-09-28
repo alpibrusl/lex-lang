@@ -183,8 +183,22 @@ out from under the issues built on it.
 
 ## 7. Open questions / first concrete tasks
 
-- Land `todo() -> a` (§3, option 1) as a real builtin — the one
-  genuinely new piece of language surface this depends on.
+- ~~Land `todo() -> a` (§3, option 1) as a real builtin~~ — done. It
+  landed as `todo() -> Never` rather than a fresh polymorphic type
+  variable: `Ty::Never` already exists as the type of a diverging
+  expression (it's what `return`'s own expression position resolves
+  to, `checker/mod.rs`), and the unifier already treats it as a
+  bottom type (`(Ty::Never, _) | (_, Ty::Never) => Ok(())`,
+  `unifier.rs`) — so it unifies with whatever the call site expects
+  with no new generalization machinery needed. It's a
+  checker-recognized call form, not a registered global: `todo` is
+  never inserted into `Checker::globals`, so it exists only in
+  immediate-call position (`todo()`), a bare reference falls through
+  to the ordinary `UnknownIdentifier` error, and a program's own `fn
+  todo(...)` shadows it like any other name. Compiles to the same
+  `Op::Panic` already emitted for a non-exhaustive `match`. See
+  `docs/AGENT.md`'s "Known sharp edges" section for the user-facing
+  note.
 - Write the driver: given a proposed signature graph, emit the
   placeholder-bodied module, run `check_program`, and on success mint
   one `Issue` per function with `deps` derived from the call edges.

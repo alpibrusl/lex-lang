@@ -619,6 +619,18 @@ impl<'a> FnCompiler<'a> {
                     self.emit(Op::Call { fn_id, arity: args.len() as u16, node_id_idx });
                 }
             }
+            a::CExpr::Var { name } if name == "todo" => {
+                // `todo()` — checker-recognized placeholder (never a real
+                // function, so it's not in `function_names`); compiles to
+                // the same unconditional trap emitted for a non-exhaustive
+                // match (`compile_match`, below). The checker guarantees
+                // `args` is empty and this arm is unreachable if the
+                // program declares its own `fn todo(...)`, since that
+                // shadowing name would already be caught by the
+                // `function_names` arm above.
+                let idx = self.pool.str("todo() reached");
+                self.emit(Op::Panic(idx));
+            }
             a::CExpr::Var { name } if self.locals.contains_key(name) => {
                 // First-class function value bound to a local. Push the
                 // closure, then args, then CallClosure.
