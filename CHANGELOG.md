@@ -32,6 +32,22 @@ bumps may carry breaking changes when justified).
   Declared and head signatures are now compared with record fields in
   canonical order.
 
+- **`lex pkg search <query…>` — discover existing packages before
+  hand-rolling one.** A coding agent in an empty `lex init` project had no
+  supported way to learn that an HTTP router (`lex-web`), JWT library or ORM
+  already ships as a package, so it wrote them by hand. `lex pkg search`
+  queries GitHub's repository search scoped to the package org (name,
+  description *and* README, so an undescribed package is still found), drops
+  repos without a `lex.toml`, and prints each hit's name, version,
+  description, git URL, toolchain floor and the exact `lex.toml`
+  `[dependencies]` line to add. `--json` for machine output, `--limit`,
+  `--org`; `GITHUB_TOKEN` raises the rate limit. A multi-word query that ANDs
+  to nothing is retried as "any word"; an unreachable backend is an error with
+  a browse fallback, never a silent "no results".
+- `lex agent-guidelines` § 3.9 ("look for an existing package before
+  hand-rolling"), plus the § 8 anti-pattern row and § 9 checklist item, and
+  the same step in the `lex init` `AGENTS.md`.
+
 ## [0.11.74] - 2026-09-28
 
 ### Changed — behavior operators need to know

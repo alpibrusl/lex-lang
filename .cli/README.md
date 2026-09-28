@@ -177,7 +177,7 @@ Idempotent: false
 
 ### pkg
 
-package manager: init, add, install, list deps; publish/verify signed capability contracts
+package manager: init, add, install, list deps, search for existing packages; publish/verify signed capability contracts
 
 Idempotent: false
 

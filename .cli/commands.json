@@ -1942,11 +1942,11 @@
     },
     {
       "name": "pkg",
-      "description": "package manager: init, add, install, list deps; publish/verify signed capability contracts",
+      "description": "package manager: init, add, install, list deps, search for existing packages; publish/verify signed capability contracts",
       "arguments": [
         {
           "name": "subcommand",
-          "type": "enum[init|add|install|lock|update|list|publish|release|verify]",
+          "type": "enum[init|add|install|lock|update|list|search|publish|release|verify]",
           "description": "what to do",
           "required": true
         }
@@ -1955,6 +1955,10 @@
       "subcommands": [],
       "idempotent": false,
       "examples": [
+        {
+          "description": "Before hand-rolling routing/HTTP/JWT/SQL, look for an existing package (prints the lex.toml line to add)",
+          "invocation": "lex pkg search http router"
+        },
         {
           "description": "Install deps",
           "invocation": "lex pkg install"

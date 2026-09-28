@@ -41,7 +41,7 @@ description: "Invoke the `lex` CLI. Commands: parse, check, authority, run…"
 - `lex watch` — re-run check or run on file save (agent inner loop)
 - `lex agent-guidelines` — emit the AI-agent authoring contract (idiom rules) for this Lex toolchain (idempotent)
 - `lex init` — scaffold a new project (lex.toml, src/, tests/, CI)
-- `lex pkg` — package manager: init, add, install, list deps; publish/verify signed capability contracts
+- `lex pkg` — package manager: init, add, install, list deps, search for existing packages; publish/verify signed capability contracts
 - `lex issue` — typed issues (#949): a unit of work with a declared, verifiable acceptance — done is a proof the gate verifies at HEAD, not a status someone sets (idempotent)
 - `lex propagate` — push an upstream package's API change down its dependents: token-precise rename fan-out, or an agent-gated semantic migration
 - `lex fmt` — format .lex files; --check exits 1 if any need it
@@ -880,13 +880,18 @@ lex init my-proj
 
 ## `lex pkg`
 
-package manager: init, add, install, list deps; publish/verify signed capability contracts
+package manager: init, add, install, list deps, search for existing packages; publish/verify signed capability contracts
 
 ### Arguments
 
-- `subcommand` (enum[init|add|install|lock|update|list|publish|release|verify], required) — what to do
+- `subcommand` (enum[init|add|install|lock|update|list|search|publish|release|verify], required) — what to do
 
 ### Examples
+
+```bash
+# Before hand-rolling routing/HTTP/JWT/SQL, look for an existing package (prints the lex.toml line to add)
+lex pkg search http router
+```
 
 ```bash
 # Install deps

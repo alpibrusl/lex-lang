@@ -314,7 +314,8 @@ Key rules:
 - Tests live in `tests/` — files must start with `test_` and export
   `fn run_all() -> ...`.
 - Dependencies go in `[dependencies]` of `lex.toml`; run `lex pkg install`
-  after editing.
+  after editing. Need routing, HTTP serving, auth, an ORM, …? Run
+  `lex pkg search <word>` **before** writing it — it probably exists.
 - Before pushing: `lex ci`. CI runs the same command.
 
 ## 5. Idiom rules — read before writing code
@@ -339,8 +340,11 @@ you're tempted to skip them:
 3. **`examples {{}}` blocks on every pure fn.** They're part of the
    SigId and run at `lex check` time — free regression tests with no
    `tests/` boilerplate. Rule 2.1.
-4. **Use the stdlib.** `std.crypto` not hand-rolled crypto, `std.conc`
-   not threads, `std.sql` not string-concat SQL. Section 3.
+4. **Use the stdlib, then existing packages.** `std.crypto` not
+   hand-rolled crypto, `std.conc` not threads, `std.sql` not
+   string-concat SQL. Beyond the stdlib, **look before you hand-roll**:
+   `lex pkg search <word>` (e.g. `http`, `router`, `jwt`, `orm`) lists
+   existing packages and prints the `lex.toml` line to add. Section 3.
 
 ## 6. Need more?
 

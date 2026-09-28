@@ -40,6 +40,7 @@ mod export_git;
 mod replay_runner;
 mod pkg;
 mod pkg_lock;
+mod pkg_search;
 mod propagate;
 mod plan;
 mod publish_core;
