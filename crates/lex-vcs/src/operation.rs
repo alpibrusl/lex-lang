@@ -130,10 +130,19 @@ pub enum StageTransition {
     Rename { from: SigId, to: SigId, body_stage_id: StageId },
     /// Import-only change; doesn't touch any stage.
     ImportOnly,
-    /// Merge op result. `entries` lists only the sigs whose head
-    /// changed relative to the merge op's first parent (`dst_head`):
-    /// `Some(stage_id)` sets the head; `None` removes the sig.
-    /// Sigs unaffected by the merge are not listed.
+    /// Merge op result. `entries` pins every sig the merge **decided**
+    /// (every sig either side touched since the merge base) to the value
+    /// the merge resolved it to: `Some(stage_id)` sets the head; `None`
+    /// removes the sig. Sigs neither side touched are not listed.
+    ///
+    /// Merge ops written before #1062 list only the sigs whose head
+    /// changed relative to dst, so a sig kept as dst had it (`take_ours`)
+    /// is absent and the replay order of the two parallel histories
+    /// decided it. They still load and replay — to one answer, see
+    /// `OpLog::walk_forward` — but their resolution cannot be recovered.
+    /// Note that `parents` are sorted by op id, so neither position says
+    /// which parent was dst; that is why the entries are absolute values,
+    /// not a delta.
     ///
     /// **Canonical-form contract:** `BTreeMap` is load-bearing —
     /// iteration is sorted by `SigId`, so on-disk JSON for two

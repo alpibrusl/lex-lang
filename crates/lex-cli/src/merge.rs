@@ -391,16 +391,6 @@ fn cmd_commit(fmt: &OutputFormat, args: &[String]) -> Result<()> {
     let lca        = file.session.lca.clone();
     let auto_resolved = file.session.auto_resolved.clone();
 
-    // Translate auto-resolved + resolutions into the
-    // StageTransition::Merge entries map. Mirrors the HTTP
-    // /v1/merge/<id>/commit handler.
-    let mut entries: BTreeMap<lex_vcs::SigId, Option<lex_vcs::StageId>> = BTreeMap::new();
-    for outcome in &auto_resolved {
-        if let lex_vcs::MergeOutcome::Src { sig_id, stage_id } = outcome {
-            entries.insert(sig_id.clone(), stage_id.clone());
-        }
-    }
-
     let commit_out = match file.session.commit() {
         Ok(r) => r,
         Err(lex_vcs::CommitError::ConflictsRemaining(ids)) => {
@@ -411,13 +401,20 @@ fn cmd_commit(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         }
     };
 
+    // Translate auto-resolved + resolutions into the
+    // StageTransition::Merge entries map. Mirrors the HTTP
+    // /v1/merge/<id>/commit handler. Every sig the merge decided is listed,
+    // including the ones dst already has (`take_ours`), so the merged head
+    // does not depend on the order the replay applies the two sides in
+    // (#1062); see `Store::merge_pins`.
+    let mut entries = store.merge_pins(
+        dst_head.as_ref(), src_head.as_ref(), &auto_resolved, &commit_out.resolved,
+    )?;
+
     for (conflict_id, resolution) in commit_out.resolved {
         match resolution {
-            lex_vcs::Resolution::TakeOurs => {}
-            lex_vcs::Resolution::TakeTheirs => {
-                let stage_id = walk_src_for_sig(&store, &src_head, &conflict_id)?;
-                entries.insert(conflict_id, stage_id);
-            }
+            // Pinned by `merge_pins` above.
+            lex_vcs::Resolution::TakeOurs | lex_vcs::Resolution::TakeTheirs => {}
             lex_vcs::Resolution::Custom { op } => {
                 let (sig, stage) = op.kind.merge_target()
                     .ok_or_else(|| anyhow!(
@@ -484,38 +481,6 @@ fn cmd_commit(fmt: &OutputFormat, args: &[String]) -> Result<()> {
         println!("merged {dst_for_text}: head_op = {new_head_for_text}");
     });
     Ok(())
-}
-
-fn walk_src_for_sig(
-    store: &Store,
-    src_head: &Option<lex_vcs::OpId>,
-    sig: &lex_vcs::SigId,
-) -> Result<Option<lex_vcs::StageId>> {
-    let log = lex_vcs::OpLog::open(store.root())?;
-    let Some(head) = src_head.as_ref() else { return Ok(None); };
-    let mut current: Option<lex_vcs::StageId> = None;
-    for record in log.walk_forward(head, None)? {
-        match &record.produces {
-            lex_vcs::StageTransition::Create { sig_id, stage_id }
-                if sig_id == sig => { current = Some(stage_id.clone()); }
-            lex_vcs::StageTransition::Replace { sig_id, to, .. }
-                if sig_id == sig => { current = Some(to.clone()); }
-            lex_vcs::StageTransition::Remove { sig_id, .. }
-                if sig_id == sig => { current = None; }
-            lex_vcs::StageTransition::Rename { from, to, body_stage_id }
-                if from == sig || to == sig => {
-                if from == sig { current = None; }
-                if to == sig   { current = Some(body_stage_id.clone()); }
-            }
-            lex_vcs::StageTransition::Merge { entries } => {
-                if let Some(opt) = entries.get(sig) {
-                    current = opt.clone();
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(current)
 }
 
 fn mint_merge_id() -> String {
