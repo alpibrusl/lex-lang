@@ -52,6 +52,13 @@ fn parse_args(args: &[String]) -> Result<Args> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            // POSIX end-of-flags: everything after is query text, so a caller
+            // (an agent tool) can pass a model-written query without it being
+            // read as a flag.
+            "--" => {
+                words.extend(args[i + 1..].iter().map(|w| w.as_str()));
+                break;
+            }
             "--json" => json = true,
             "--limit" => {
                 i += 1;
@@ -398,6 +405,9 @@ mod tests {
         assert!(parse_args(&s(&["x", "--limit", "0"])).is_err());
         assert!(parse_args(&s(&["router", "--org", "a b"])).is_err());
         assert!(parse_args(&s(&["router", "--bogus"])).is_err());
+        // After `--` a flag-shaped word is just query text.
+        let a = parse_args(&s(&["--json", "--", "--org", "jwt"])).unwrap();
+        assert_eq!((a.json, a.org.as_str(), a.terms), (true, "alpibrusl", s(&["org", "jwt"])));
     }
 
     #[test]
