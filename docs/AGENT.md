@@ -214,7 +214,6 @@ an exhaustive function list.
 | `std.stream` | `next`, `collect` |
 | `std.decimal` | `decimal`, `zero`, `one`, `from_int`, `add`, `sub`, `mul`, `compare`, `is_zero`, `is_positive`, `is_negative`, `normalize`, `negate`, `abs`, `round_to`, `to_str`, `pow10` |
 | `std.moe` | `pin`, `unpin`, `prefetch_hint`, `usage_snapshot`, `stats` |
-| `std.panic` | `todo` |
 <!-- docsync:end stdlib-index -->
 
 #### Deprecated: `io.read` / `io.write`
@@ -248,7 +247,6 @@ positions count, since `std.str` mixes both.
 <!-- docsync:begin stdlib-spec -->
 | builtin | signature | indices | notes |
 |---|---|---|---|
-| `panic.todo` | `(Str) -> Never` |  | Aborts immediately with `msg`. Its return type unifies with anything, so it stands in for a body not yet written, in any signature, with no effect of its own. |
 | `str.is_empty` | `(Str) -> Bool` |  | `true` when the string has no bytes. |
 | `str.to_int` | `(Str) -> Option[Int]` |  | Parse a decimal integer (optional leading `-`); `None` on any other input. |
 | `str.to_float` | `(Str) -> Option[Float]` |  | Parse a float literal; `None` on any other input. |

@@ -99,22 +99,6 @@ use IndexConvention::{Byte, Codepoint, None as NoIndex};
 /// Every declared builtin, in the order the stdlib reference lists them
 /// (module order, then declaration order within a module).
 pub const BUILTINS: &[BuiltinDef] = &[
-    // ── std.panic ───────────────────────────────────────────────────
-    // A stub body that type-checks against ANY signature, without the
-    // signature itself changing: `Never` unifies with whatever the
-    // context expects (already true of the checker before this builtin —
-    // `fn f() -> Never { f() }` checks fine, `boom()` used where `Int` or
-    // `Str` is expected checks fine too), so `panic.todo("name")` fits a
-    // pure or an effectful signature alike, with no effect row of its
-    // own. Effect-free on purpose: an unfinished function should be
-    // exactly as callable — and no more capable — as its finished body
-    // will be, and a step-limit-exceeded panic (the previous way to mark
-    // "not written yet", by having a stub call itself) already aborted
-    // with no effect granted, so this changes no capability, only how
-    // fast and how clearly it fails: immediately, with a name, instead
-    // of after the VM's step budget runs out.
-    pure("panic", "todo", "(Str) -> Never", NoIndex,
-        "Aborts immediately with `msg`. Its return type unifies with anything, so it stands in for a body not yet written, in any signature, with no effect of its own.", None),
     // ── std.str ─────────────────────────────────────────────────────
     pure("str", "is_empty", "(Str) -> Bool", NoIndex,
         "`true` when the string has no bytes.", None),
