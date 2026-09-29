@@ -924,10 +924,10 @@ fn handle_connection_fn_actor(
                 }
             }),
         };
-        let cell = Value::Actor(Arc::new(Mutex::new(lex_bytecode::value::ActorCell {
-            state: Value::Unit,
-            handler: lex_bytecode::value::ActorHandler::Native(Arc::new(bridge)),
-        })));
+        let cell = Value::Actor(Arc::new(Mutex::new(lex_bytecode::value::ActorCell::new(
+            Value::Unit,
+            lex_bytecode::value::ActorHandler::Native(Arc::new(bridge)),
+        ))));
         if let Err(e) = lex_bytecode::conc_registry::register(name, cell) {
             // Name collision: abort the connection. Surfacing the
             // duplicate immediately is more useful than silently
@@ -1170,10 +1170,10 @@ pub fn dial_ws_actor(
                 }
             }),
         };
-        let cell = Value::Actor(Arc::new(Mutex::new(lex_bytecode::value::ActorCell {
-            state: Value::Unit,
-            handler: lex_bytecode::value::ActorHandler::Native(Arc::new(bridge)),
-        })));
+        let cell = Value::Actor(Arc::new(Mutex::new(lex_bytecode::value::ActorCell::new(
+            Value::Unit,
+            lex_bytecode::value::ActorHandler::Native(Arc::new(bridge)),
+        ))));
         if let Err(e) = lex_bytecode::conc_registry::register(&name, cell) {
             return Ok(build_dial_result(Err(format!(
                 "net.dial_ws_actor: conc.register({name:?}) failed: {e:?}"

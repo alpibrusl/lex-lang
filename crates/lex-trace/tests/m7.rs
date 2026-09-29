@@ -83,7 +83,7 @@ fn value_to_json(v: &Value) -> serde_json::Value {
             J::Object(m)
         }
         Value::Map(_) | Value::Set(_) | Value::Deque(_) | Value::Actor(_)
-        | Value::Ticker(_) | Value::ArrowTable(_)
+        | Value::Ticker(_) | Value::AskHandle(_) | Value::ArrowTable(_)
         | Value::StackRecord { .. } | Value::StackTuple { .. }
         | Value::ArenaRecord { .. } | Value::ArenaTuple { .. } => {
             // Tests in this file don't exercise these container values;

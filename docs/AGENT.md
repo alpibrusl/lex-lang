@@ -141,7 +141,7 @@ then `lex doc-sync`):
 | `kv` | std.kv key-value store |
 | `stream` | std.stream |
 | `fs_walk` | std.fs directory traversal |
-| `concurrent` | conc.spawn / conc.ask / conc.tell (#381) |
+| `concurrent` | conc.spawn / conc.ask / conc.tell / conc.ask_async (#381, #1085) |
 | `crypto` | std.crypto hashing / signing (#562, #582) |
 | `vcs` | std.vcs content-addressed blob store (lex-loom#198) |
 | `approval` | std.approval human-in-the-loop boundary; scope checked against `--allow-approval` (#737) |
@@ -178,7 +178,7 @@ an exhaustive function list.
 | `std.net` | `get`, `post`, `udp_open`, `udp_close`, `udp_send`, `udp_recv`, `udp_broadcast`, `udp_join_multicast`, `serve`, `serve_tls`, `serve_ws`, `serve_ws_fn`, `serve_ws_fn_auth`, `serve_ws_fn_actor_with`, `serve_ws_fn_actor`, `dial_ws`, `dial_ws_actor`, `serve_fn`, `serve_routed`, `default_opts`, `serve_with`, `serve_fn_with`, `serve_routed_with`, `serve_quic`, `serve_quic_fn`, `serve_quic_routed` |
 | `std.tls` | `from_pem_files`, `self_signed` |
 | `std.chat` | `broadcast`, `send` |
-| `std.conc` | `spawn`, `ask`, `tell`, `register`, `lookup`, `unregister`, `registered` |
+| `std.conc` | `spawn`, `ask`, `tell`, `ask_async`, `await`, `register`, `lookup`, `unregister`, `registered` |
 | `std.arrow` | `from_int_columns`, `from_float_columns`, `from_str_columns`, `nrows`, `ncols`, `col_names`, `col_type`, `col_sum_int`, `col_sum_float`, `col_mean`, `col_min_int`, `col_max_int`, `col_count`, `head`, `tail`, `slice`, `select_cols`, `drop_col`, `rename_col`, `read_csv`, `read_parquet`, `read_parquet_cols`, `write_parquet`, `write_csv` |
 | `std.df` | `filter_eq_int`, `filter_gt_int`, `filter_lt_int`, `filter_eq_str`, `filter_in_str`, `filter_eq_float`, `filter_lt_float`, `filter_gt_float`, `filter_isnull`, `filter_notnull`, `drop_nulls`, `sort_by`, `group_by_agg`, `inner_join`, `left_join`, `cross_join` |
 | `std.json` | `stringify`, `parse`, `parse_strict`, `decode`, `encode`, `encode_pretty` |
@@ -354,7 +354,24 @@ to bound runaway loops; use process-level scheduling for longer waits.
 All `std.conc` functions carry the `[concurrent]` effect. Actors hold
 per-process state across messages. `spawn(init, handler)`
 returns `Actor[S]`; `ask` / `tell` run `handler(state, msg)` on the
-caller's VM thread, serialised by the actor's internal mutex.
+caller's VM thread. An actor processes one message at a time, in the
+order messages were sent.
+
+`ask` blocks the caller, so asking several actors in turn is sequential.
+To fan out, use `ask_async(actor, msg) :: AskHandle[R]` then
+`await(handle) :: R` — the same spawn → handle → wait shape as
+elsewhere in the stdlib. Each `ask_async` message runs on its own OS
+thread with its own effect handler, so handlers on *different* actors
+(including effectful ones: `io`, `net`, `llm`, …) run in parallel; on
+the *same* actor they still run one at a time, FIFO with its `ask`/`tell`
+traffic. A handler failure surfaces at `await`. Effects performed inside
+an `ask_async` handler are not recorded by `--trace`; use plain `ask`
+where a replayable trace matters.
+
+A handler must not `ask` or `tell` its own actor, or `await` an
+`ask_async` to it: that message waits behind the turn that sent it, so
+the call deadlocks. Return the follow-up work in the reply and send it
+from the caller instead.
 
 `register(actor, name)` makes the actor reachable by name from anywhere
 in the process — for routing a request handler to the actor that owns
