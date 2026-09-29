@@ -57,7 +57,7 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
         }
         // Declared in `crate::stdlib_spec` (#778): signatures, docs and
         // the runtime table share one definition per builtin.
-        "str" | "list" => crate::stdlib_spec::module_record(name),
+        "str" | "list" | "panic" => crate::stdlib_spec::module_record(name),
         "int" => {
             let mut fields = IndexMap::new();
             fields.insert("to_str".into(), Ty::function(vec![Ty::int()], EffectSet::empty(), Ty::str()));
@@ -3482,6 +3482,7 @@ pub fn module_for_import(reference: &str) -> Option<&'static str> {
         "redis" => "redis",
         "decimal" => "decimal",
         "vcs" => "vcs",
+        "panic" => "panic",
         _ => return None,
     })
 }
@@ -3496,7 +3497,7 @@ pub const MODULE_NAMES: &[&str] = &[
     "tls", "chat", "conc", "arrow", "df", "json", "result", "option", "tuple", "map", "set",
     "iter", "flow", "crypto", "deque", "log", "datetime", "duration", "approval", "process", "fs",
     "kv", "vcs", "sql", "redis", "parser", "cli", "regex", "http", "yaml", "dotenv", "csv", "test",
-    "toml", "agent", "stream", "decimal", "moe",
+    "toml", "agent", "stream", "decimal", "moe", "panic",
 ];
 
 #[cfg(test)]
