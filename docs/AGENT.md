@@ -368,6 +368,11 @@ traffic. A handler failure surfaces at `await`. Effects performed inside
 an `ask_async` handler are not recorded by `--trace`; use plain `ask`
 where a replayable trace matters.
 
+A handler must not `ask` or `tell` its own actor, or `await` an
+`ask_async` to it: that message waits behind the turn that sent it, so
+the call deadlocks. Return the follow-up work in the reply and send it
+from the caller instead.
+
 `register(actor, name)` makes the actor reachable by name from anywhere
 in the process — for routing a request handler to the actor that owns
 the relevant agent state (vehicle / depot / etc.). Returns `Err(AlreadyRegistered(name))`

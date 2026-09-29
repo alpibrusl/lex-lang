@@ -832,13 +832,22 @@ impl<'a> Vm<'a> {
                 let spawned = std::thread::Builder::new()
                     .name("lex-conc-ask".into())
                     .spawn(move || {
+                        // Set once `run_actor_turn` owns the ticket; from
+                        // then on its turn guard advances it on every exit.
+                        let mut entered = false;
                         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             let mut vm = Vm::with_handler(&program, worker_handler);
                             vm.shared_program = Some(Arc::clone(&program));
                             vm.set_step_limit(step_limit);
+                            entered = true;
                             vm.run_actor_turn(&worker_cell, ticket, closure, msg, "ask_async")
                         }))
                         .unwrap_or_else(|_| Err("conc.ask_async: handler panicked".into()));
+                        if !entered {
+                            // Worker setup panicked before the turn began:
+                            // skip the ticket so later messages aren't wedged.
+                            skip_actor_turn(&worker_cell, ticket);
+                        }
                         worker_slot.complete(r);
                     });
                 if let Err(e) = spawned {
@@ -1370,7 +1379,8 @@ impl Drop for ActorTurn<'_> {
 }
 
 /// Give up `ticket` without running it: wait for its turn, then advance.
-/// Used when an `ask_async` worker thread fails to start.
+/// Used when an `ask_async` worker thread fails to start, or panics
+/// while setting up its VM before the turn begins.
 fn skip_actor_turn(cell: &Arc<Mutex<ActorCell>>, ticket: u64) {
     let mut guard = cell.lock().unwrap_or_else(|p| p.into_inner());
     while guard.serving != ticket {
