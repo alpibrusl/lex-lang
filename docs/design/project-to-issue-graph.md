@@ -199,18 +199,47 @@ out from under the issues built on it.
   `Op::Panic` already emitted for a non-exhaustive `match`. See
   `docs/AGENT.md`'s "Known sharp edges" section for the user-facing
   note.
-- Write the driver: given a proposed signature graph, emit the
-  placeholder-bodied module, run `check_program`, and on success mint
-  one `Issue` per function with `deps` derived from the call edges.
-  Everything it calls already exists; this is glue, not a new
-  subsystem.
+- ~~Write the driver~~ — substantially done, at the agent-tool layer
+  rather than inside `lex-vcs` itself: `lex-code`'s `src/package_flow`
+  (`--package "<brief>" --name=P` to plan, `--package-check=P` to gate,
+  `--package-apply=P` to scaffold and file, `--project=P` to drive to
+  done, `--auto` to chain all four with no human step) implements this
+  flow's shape, if not yet its exact mechanism. Where it matches: it
+  drives to completion through the unmodified `lex issue
+  list/next/verify --project [--verified-only]` primitives this doc's
+  §2 table already names. Where it differs: the "signature graph" is
+  its own agent-authored JSON plan (types/packages/policy/units), not
+  yet literally one `Issue` with `Acceptance::TypedDelta` per function
+  at skeleton time — those get minted from the plan only once it
+  passes the gate. The skeleton-check gate is two layers: a real `lex
+  check` run against a generated stub module (today each stub body is
+  a self-recursive call, since this landed before `todo()` did — the
+  obvious next step is switching it to `todo()`, which should turn a
+  step-limit timeout on an unbuilt stub into an immediate, clearer
+  panic), plus a second, pure-Lex layer of cross-unit rules this doc
+  didn't originally scope (dangling types, one error type project-wide,
+  `Result`/`Option` examples covering both outcomes). It also adds a
+  repair loop (a rejected plan's errors go back to the planner, budgeted
+  retries) and deterministic hardening (invariants declared in the plan
+  become real scaffold functions, checked by a mechanically generated
+  test harness over a fixed corpus — zero LLM involvement in
+  test-writing) — both beyond this doc's original scope, not required
+  by it.
 - Decide whether the *first* skeleton-compile step for a project should
   itself require review (a human or agent looking at the proposed
   signature graph before any typechecking happens) — this doc's own
   §5 caveat is that nothing mechanical validates the graph captures the
-  right goal, only that it's internally consistent.
-- Try it on one real, small project end to end before deciding whether
-  it needs anything `lex-loom`'s own machinery already has and this
-  doesn't (parallelism scheduling beyond "topological order," a queue
-  for many concurrent implementers, audit-trail integration beyond what
-  `lex issue verify`'s attestations already give).
+  right goal, only that it's internally consistent. `lex-code`'s `--auto`
+  chain currently answers this "no" (0 humans in the loop) by design.
+- ~~Try it on one real, small project end to end~~ — done, several
+  times over: `lex-code`'s driver has been run `--auto` end to end on
+  real small packages against more than one model, including clean
+  successes it independently verified were correct. What it's shown so
+  far: the mechanism works; a model that never commits to writing
+  output within its step budget still fails cleanly (a legible rejection
+  reason, not a corrupted or partial result) rather than silently.
+  What's still open, matching this doc's own framing: parallelism
+  scheduling beyond topological order, a queue for many concurrent
+  implementers, and audit-trail integration beyond `lex issue verify`'s
+  attestations remain `lex-loom`-shaped needs this narrower driver
+  doesn't try to cover.
