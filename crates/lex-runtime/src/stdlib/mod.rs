@@ -19,7 +19,6 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 pub(crate) mod list;
-pub(crate) mod panic;
 pub(crate) mod str;
 
 /// Signature every declared pure builtin implements.
@@ -31,7 +30,7 @@ pub(crate) type Entry = (&'static str, BuiltinFn);
 /// Every implemented builtin as `((module, name), fn)`.
 pub(crate) fn entries() -> Vec<((&'static str, &'static str), BuiltinFn)> {
     let mut out = Vec::new();
-    for (module, table) in [("str", str::TABLE), ("list", list::TABLE), ("panic", panic::TABLE)] {
+    for (module, table) in [("str", str::TABLE), ("list", list::TABLE)] {
         for (name, f) in table {
             out.push(((module, *name), *f));
         }
