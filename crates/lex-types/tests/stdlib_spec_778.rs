@@ -29,8 +29,9 @@ fn no_duplicate_definitions() {
 }
 
 #[test]
-fn declared_modules_are_str_and_list() {
-    assert_eq!(declared_modules(), vec!["str", "list"]);
+fn declared_modules_are_panic_str_and_list() {
+    // In BUILTINS declaration order — `panic` was added ahead of `str`.
+    assert_eq!(declared_modules(), vec!["panic", "str", "list"]);
 }
 
 #[test]
