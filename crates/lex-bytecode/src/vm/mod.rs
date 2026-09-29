@@ -388,6 +388,13 @@ pub struct Vm<'a> {
     /// "interpreter-only" — that branch in the dispatch arm folds
     /// to a single null-pointer check the optimizer can hoist.
     jit_hook: Option<Box<dyn crate::jit_hook::JitHook + 'a>>,
+    /// Owned copy of `program` for work that outlives this VM's
+    /// borrow — today only `conc.ask_async` worker threads (#1085).
+    /// Filled lazily on first use (one `Program` clone per VM), or
+    /// up front for VMs that already run from an `Arc<Program>`
+    /// (the ask_async workers themselves, so nested fan-out doesn't
+    /// clone again).
+    shared_program: Option<Arc<Program>>,
 }
 
 struct Frame {
@@ -601,6 +608,7 @@ impl<'a> Vm<'a> {
             arena_record_allocs: 0,
             arena_record_heap_fallbacks: 0,
             jit_hook: None,
+            shared_program: None,
         }
     }
 
@@ -660,6 +668,63 @@ impl<'a> Vm<'a> {
         }
     }
 
+    /// This VM's program as an `Arc`, cloning it on first use (#1085).
+    fn shared_program(&mut self) -> Arc<Program> {
+        let program = self.program;
+        Arc::clone(self.shared_program.get_or_insert_with(|| Arc::new(program.clone())))
+    }
+
+    /// Run one actor message holding `ticket`: wait until the actor is
+    /// serving that ticket, call `handler(state, msg)` on this VM, store
+    /// the new state, and return the reply. The turn always advances —
+    /// on success, on a handler error (state left unchanged), and on
+    /// unwind — so one failed message never wedges the actor.
+    fn run_actor_turn(
+        &mut self,
+        cell: &Arc<Mutex<ActorCell>>,
+        ticket: u64,
+        closure: Value,
+        msg: Value,
+        op: &str,
+    ) -> Result<Value, String> {
+        // The cell's mutex is never held across user code, so poisoning
+        // can only come from a panic inside this bookkeeping; recover the
+        // guard rather than wedge every later message on this actor.
+        let state = {
+            let mut guard = cell.lock().unwrap_or_else(|p| p.into_inner());
+            while guard.serving != ticket {
+                let cv = Arc::clone(&guard.turn);
+                guard = cv.wait(guard).unwrap_or_else(|p| p.into_inner());
+            }
+            guard.state.clone()
+        };
+        let mut turn = ActorTurn { cell, new_state: None };
+        // The mutex is released while the handler runs: only the ticket
+        // holder reads or writes `state`, and other senders can still
+        // take tickets without blocking behind this message.
+        let result = self.invoke_closure_value(closure, vec![state, msg])
+            .map_err(|e| format!("conc.{op}: handler error: {e:?}"))?;
+        // #698: when `ask`/`tell` runs inside a `net.serve` worker, an
+        // arena request-scope is active, so the handler's `(new_state,
+        // reply)` tuple is allocated as a `Value::ArenaTuple` rather than
+        // a heap `Value::Tuple` — and the bare match below would reject it.
+        // Materialize arena handles into heap-owned form NOW, while the
+        // producing scope is still active: the reply crosses back to the
+        // caller and `new_state` persists in the actor cell beyond this
+        // request's arena scope, so both must be heap-owned. Idempotent
+        // (a no-op walk) when there are no arena handles, e.g. from `main`.
+        let result = self.materialize_arena_handles(result);
+        match result {
+            Value::Tuple(mut parts) if parts.len() == 2 => {
+                let reply = parts.pop().unwrap();
+                turn.new_state = parts.pop();
+                Ok(reply)
+            }
+            other => Err(format!(
+                "conc.{op}: handler must return a 2-tuple (new_state, reply), got {other:?}")),
+        }
+    }
+
     // ---- Variant helpers used by conc.* registry ops (#444) ----
     // Local helpers (avoid pulling in serde / public API). Lex's
     // `Result`/`Option` are stdlib unions; their runtime shape is a
@@ -669,17 +734,31 @@ impl<'a> Vm<'a> {
     /// VM-level handler for `conc.*` effect ops (#381).
     ///
     /// * `conc.spawn(init, handler)` — creates an `Actor` wrapping the
-    ///   initial state and the handler closure. No background thread is
-    ///   started; the actor runs synchronously on the calling thread
-    ///   under a `Mutex` so concurrent callers serialise.
+    ///   initial state and the handler closure. No thread is started
+    ///   at spawn time.
     ///
-    /// * `conc.ask(actor, msg)` — locks the actor, calls
-    ///   `handler(state, msg)` on *this* VM (reentrant), expects a
+    /// * `conc.ask(actor, msg)` — waits for the actor's turn (see
+    ///   [`ActorCell`]: messages run one at a time, FIFO in send
+    ///   order), calls `handler(state, msg)` on *this* VM, expects a
     ///   2-tuple `(new_state, reply)`, updates the actor's state, and
-    ///   returns `reply`.
+    ///   returns `reply`. Running on the caller's VM keeps the caller's
+    ///   effect handler and tracer in the loop.
     ///
     /// * `conc.tell(actor, msg)` — same as `ask` but discards the
     ///   reply and returns `Unit`.
+    ///
+    /// * `conc.ask_async(actor, msg)` (#1085) — takes the actor's next
+    ///   turn on this thread (so FIFO order with any later `ask`/`tell`
+    ///   holds), then runs the handler on a fresh OS thread with its
+    ///   own VM and a per-thread effect handler from
+    ///   [`EffectHandler::spawn_for_worker`], and returns an
+    ///   `AskHandle` immediately. Asks to *different* actors therefore
+    ///   run in parallel, effects included. When the handler can't
+    ///   supply a per-thread handler, the message runs inline instead
+    ///   (same result, no parallelism) rather than failing its effects.
+    ///
+    /// * `conc.await(handle)` — blocks until the reply is ready and
+    ///   returns it; a handler error surfaces here.
     fn run_conc_op(&mut self, op: &str, args: Vec<Value>) -> Result<Value, String> {
         match op {
             "spawn" => {
@@ -690,12 +769,12 @@ impl<'a> Vm<'a> {
                     return Err(format!(
                         "conc.spawn: handler must be a Closure, got {handler:?}"));
                 }
-                Ok(Value::Actor(Arc::new(Mutex::new(ActorCell {
-                    state: init,
-                    handler: crate::value::ActorHandler::Lex(handler),
-                }))))
+                Ok(Value::Actor(Arc::new(Mutex::new(ActorCell::new(
+                    init,
+                    crate::value::ActorHandler::Lex(handler),
+                )))))
             }
-            "ask" | "tell" => {
+            "ask" | "tell" | "ask_async" => {
                 let mut it = args.into_iter();
                 let actor_val = it.next().unwrap_or(Value::Unit);
                 let msg = it.next().unwrap_or(Value::Unit);
@@ -704,50 +783,80 @@ impl<'a> Vm<'a> {
                     other => return Err(format!(
                         "conc.{op}: first arg must be an Actor, got {other:?}")),
                 };
-                // Lock the actor: guarantees at-most-one-concurrent message.
-                let mut guard = cell.lock().map_err(|e| format!("conc.{op}: actor mutex poisoned: {e}"))?;
-                let handler = guard.handler.clone();
-                let state = guard.state.clone();
-                match handler {
-                    crate::value::ActorHandler::Lex(closure_val) => {
-                        // Call handler(state, msg) on this VM — full effect access.
-                        let result = self.invoke_closure_value(closure_val, vec![state, msg])
-                            .map_err(|e| format!("conc.{op}: handler error: {e:?}"))?;
-                        // #698: when `ask`/`tell` runs inside a `net.serve` worker, an
-                        // arena request-scope is active, so the handler's `(new_state,
-                        // reply)` tuple is allocated as a `Value::ArenaTuple` rather than
-                        // a heap `Value::Tuple` — and the bare match below would reject it.
-                        // Materialize arena handles into heap-owned form NOW, while the
-                        // producing scope is still active: the reply crosses back to the
-                        // caller and `new_state` persists in the actor cell beyond this
-                        // request's arena scope, so both must be heap-owned. Idempotent
-                        // (a no-op walk) when there are no arena handles, e.g. from `main`.
-                        let result = self.materialize_arena_handles(result);
-                        // Expect (new_state, reply) tuple.
-                        match result {
-                            Value::Tuple(mut parts) if parts.len() == 2 => {
-                                let reply = parts.pop().unwrap();
-                                let new_state = parts.pop().unwrap();
-                                guard.state = new_state;
-                                drop(guard);
-                                if op == "ask" { Ok(reply) } else { Ok(Value::Unit) }
-                            }
-                            other => Err(format!(
-                                "conc.{op}: handler must return a 2-tuple (new_state, reply), got {other:?}")),
+                let (handler, ticket) = {
+                    let mut guard = cell.lock()
+                        .map_err(|e| format!("conc.{op}: actor mutex poisoned: {e}"))?;
+                    match guard.handler.clone() {
+                        crate::value::ActorHandler::Native(native) => {
+                            // Native bridge: fire-and-forget; `state` is unused
+                            // (the bridge's "state" is the external resource, e.g.
+                            // a WebSocket connection) and the bridge is itself
+                            // thread-safe, so it takes no turn. `ask` returns
+                            // whatever the bridge produces; `tell` discards it.
+                            drop(guard);
+                            let result = (native.send)(msg)
+                                .map_err(|e| format!("conc.{op}: native handler error: {e}"));
+                            return match op {
+                                "ask" => result,
+                                "tell" => result.map(|_| Value::Unit),
+                                _ => {
+                                    let slot = Arc::new(crate::value::AskSlot::default());
+                                    slot.complete(result);
+                                    Ok(Value::AskHandle(slot))
+                                }
+                            };
+                        }
+                        h @ crate::value::ActorHandler::Lex(_) => {
+                            let ticket = guard.next_ticket;
+                            guard.next_ticket += 1;
+                            (h, ticket)
                         }
                     }
-                    crate::value::ActorHandler::Native(native) => {
-                        // Native bridge: fire-and-forget; `state` is unused
-                        // (the bridge's "state" is the external resource, e.g.
-                        // a WebSocket connection). The closure receives `msg`
-                        // directly. `ask` returns whatever the bridge produces;
-                        // `tell` discards it. State stays untouched.
-                        drop(guard);
-                        let result = (native.send)(msg)
-                            .map_err(|e| format!("conc.{op}: native handler error: {e}"))?;
-                        if op == "ask" { Ok(result) } else { Ok(Value::Unit) }
-                    }
+                };
+                let crate::value::ActorHandler::Lex(closure) = handler else { unreachable!() };
+                if op != "ask_async" {
+                    let reply = self.run_actor_turn(&cell, ticket, closure, msg, op)?;
+                    return Ok(if op == "ask" { reply } else { Value::Unit });
                 }
+                let slot = Arc::new(crate::value::AskSlot::default());
+                let Some(worker_handler) = self.handler.spawn_for_worker() else {
+                    // No per-thread handler: run the message inline so its
+                    // effects still dispatch through this VM's handler.
+                    slot.complete(self.run_actor_turn(&cell, ticket, closure, msg, op));
+                    return Ok(Value::AskHandle(slot));
+                };
+                let program = self.shared_program();
+                let step_limit = self.step_limit;
+                let worker_slot = Arc::clone(&slot);
+                let worker_cell = Arc::clone(&cell);
+                let spawned = std::thread::Builder::new()
+                    .name("lex-conc-ask".into())
+                    .spawn(move || {
+                        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let mut vm = Vm::with_handler(&program, worker_handler);
+                            vm.shared_program = Some(Arc::clone(&program));
+                            vm.set_step_limit(step_limit);
+                            vm.run_actor_turn(&worker_cell, ticket, closure, msg, "ask_async")
+                        }))
+                        .unwrap_or_else(|_| Err("conc.ask_async: handler panicked".into()));
+                        worker_slot.complete(r);
+                    });
+                if let Err(e) = spawned {
+                    // The closure (and its turn guard) never ran: give the
+                    // ticket back by skipping it, or later messages would wait
+                    // on it forever.
+                    skip_actor_turn(&cell, ticket);
+                    return Err(format!("conc.ask_async: could not start worker thread: {e}"));
+                }
+                Ok(Value::AskHandle(slot))
+            }
+            "await" => {
+                let slot = match args.into_iter().next() {
+                    Some(Value::AskHandle(slot)) => slot,
+                    other => return Err(format!(
+                        "conc.await: arg must be an AskHandle, got {other:?}")),
+                };
+                slot.wait().map_err(|e| format!("conc.await: {e}"))
             }
             "register" => {
                 // conc.register(actor, name) -> Result[Unit, ConcError]
@@ -902,7 +1011,7 @@ impl<'a> Vm<'a> {
             // and Arc-bumps for the handle types.
             V::Int(_) | V::Float(_) | V::Bool(_) | V::Str(_) | V::Bytes(_)
             | V::Unit | V::Closure { .. } | V::F64Array { .. }
-            | V::Map(_) | V::Set(_) | V::Actor(_) | V::Ticker(_)
+            | V::Map(_) | V::Set(_) | V::Actor(_) | V::Ticker(_) | V::AskHandle(_)
             | V::ArrowTable(_) => value,
 
             // Containers: recurse on each element. Map/Set keys are
@@ -1059,7 +1168,7 @@ impl<'a> Vm<'a> {
             Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Str(_)
             | Value::Bytes(_) | Value::Unit | Value::Closure { .. }
             | Value::F64Array { .. } | Value::Map(_) | Value::Set(_)
-            | Value::Actor(_) | Value::Ticker(_) | Value::ArrowTable(_)
+            | Value::Actor(_) | Value::Ticker(_) | Value::AskHandle(_) | Value::ArrowTable(_)
                 => value.to_json(),
 
             Value::List(items) => J::Array(items.iter().map(|v| self.value_to_json(v)).collect()),
@@ -1239,4 +1348,35 @@ fn const_to_value(c: &Const) -> Value {
         Const::Unit => Value::Unit,
         Const::FieldName(s) | Const::VariantName(s) | Const::NodeId(s) => Value::Str(s.as_str().into()),
     }
+}
+
+/// Scope guard for one actor turn (#1085): on drop, stores the new
+/// state (if the handler produced one) and advances the actor to its
+/// next ticket, waking any sender waiting for its turn.
+struct ActorTurn<'c> {
+    cell: &'c Arc<Mutex<ActorCell>>,
+    new_state: Option<Value>,
+}
+
+impl Drop for ActorTurn<'_> {
+    fn drop(&mut self) {
+        let mut guard = self.cell.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(state) = self.new_state.take() {
+            guard.state = state;
+        }
+        guard.serving += 1;
+        guard.turn.notify_all();
+    }
+}
+
+/// Give up `ticket` without running it: wait for its turn, then advance.
+/// Used when an `ask_async` worker thread fails to start.
+fn skip_actor_turn(cell: &Arc<Mutex<ActorCell>>, ticket: u64) {
+    let mut guard = cell.lock().unwrap_or_else(|p| p.into_inner());
+    while guard.serving != ticket {
+        let cv = Arc::clone(&guard.turn);
+        guard = cv.wait(guard).unwrap_or_else(|p| p.into_inner());
+    }
+    guard.serving += 1;
+    guard.turn.notify_all();
 }

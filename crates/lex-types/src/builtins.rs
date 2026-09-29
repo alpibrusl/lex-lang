@@ -939,6 +939,7 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
             // spawn :: S, (S, M) -> [E] (S, R) -> [concurrent] Actor[S]
             // ask   :: Actor[S], M -> [concurrent] R
             // tell  :: Actor[S], M -> [concurrent] Unit
+            // ask_async / await: see #1085 below.
             //
             // The type variables used here are fresh placeholders;
             // the checker instantiates them at each call site.
@@ -969,6 +970,28 @@ pub fn module_scope(name: &str, _env: &TypeEnv) -> Option<Ty> {
                 vec![actor_t(Ty::Var(0)), Ty::Var(1)],
                 EffectSet::singleton("concurrent"),
                 Ty::Unit,
+            ));
+            // #1085 — non-blocking fan-out, mirroring the
+            // spawn → handle → wait shape used elsewhere in the stdlib.
+            //
+            // ask_async :: Actor[S], M -> [concurrent] AskHandle[R]
+            //   Queues `msg` (FIFO with the actor's other messages) and
+            //   runs the handler on its own OS thread, so asks to
+            //   different actors proceed in parallel.
+            //
+            // await :: AskHandle[R] -> [concurrent] R
+            //   Blocks until the reply is ready; a handler failure
+            //   surfaces here as a runtime effect error.
+            let ask_handle_t = |r: Ty| Ty::Con("AskHandle".into(), vec![r]);
+            fields.insert("ask_async".into(), Ty::function(
+                vec![actor_t(Ty::Var(0)), Ty::Var(1)],
+                EffectSet::singleton("concurrent"),
+                ask_handle_t(Ty::Var(2)),
+            ));
+            fields.insert("await".into(), Ty::function(
+                vec![ask_handle_t(Ty::Var(2))],
+                EffectSet::singleton("concurrent"),
+                Ty::Var(2),
             ));
             // #444 — named-actor discovery within a process.
             //

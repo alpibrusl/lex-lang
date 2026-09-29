@@ -103,7 +103,7 @@ pub const KNOWN_EFFECTS: &[(&str, &str)] = &[
     ("kv", "std.kv key-value store"),
     ("stream", "std.stream"),
     ("fs_walk", "std.fs directory traversal"),
-    ("concurrent", "conc.spawn / conc.ask / conc.tell (#381)"),
+    ("concurrent", "conc.spawn / conc.ask / conc.tell / conc.ask_async (#381, #1085)"),
     ("crypto", "std.crypto hashing / signing (#562, #582)"),
     ("vcs", "std.vcs content-addressed blob store (lex-loom#198)"),
     (

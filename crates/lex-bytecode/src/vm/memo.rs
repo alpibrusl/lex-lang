@@ -220,6 +220,10 @@ pub(super) fn hash_value_into<H: std::hash::Hasher>(v: &Value, h: &mut H) {
             h.write_u8(0x11);
             h.write_usize(Arc::as_ptr(t) as *const () as usize);
         }
+        Value::AskHandle(t) => {
+            h.write_u8(0x13);
+            h.write_usize(Arc::as_ptr(t) as *const () as usize);
+        }
         // Coarse summary (schema + dimensions), matching the prior
         // `to_json` encoding which deliberately omitted the cell data
         // (tables can be GB-scale). Equal tables share schema + dims

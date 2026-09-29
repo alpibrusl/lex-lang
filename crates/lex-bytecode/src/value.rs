@@ -6,7 +6,7 @@ use indexmap::IndexMap;
 use smol_str::SmolStr;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 /// Internal state of a `conc.Actor`. Protected by a `Mutex` so that
 /// the `Lex` handler variant serialises on message delivery (one
@@ -22,10 +22,62 @@ use std::sync::{Arc, Mutex};
 /// the closure on overlapping threads. Native bridges therefore
 /// need to be internally thread-safe; the `serve_ws_fn_actor`
 /// `mpsc::Sender` bridge is, because `Sender::send` is.
+///
+/// Delivery order (#1085): every `ask` / `tell` / `ask_async` takes a
+/// ticket from `next_ticket` *on the sending thread*, then waits until
+/// `serving` reaches it before touching `state`. That keeps an actor's
+/// messages FIFO in send order even when `conc.ask_async` runs the
+/// handler on a worker thread, and it lets the mutex be released while
+/// the handler runs — so a sender taking a ticket never blocks behind
+/// a long-running message on another thread.
 #[derive(Debug, Clone)]
 pub struct ActorCell {
     pub state: Value,
     pub handler: ActorHandler,
+    /// Next ticket to hand out.
+    pub next_ticket: u64,
+    /// Ticket whose message is currently allowed to run.
+    pub serving: u64,
+    /// Signalled whenever `serving` advances.
+    pub turn: Arc<Condvar>,
+}
+
+impl ActorCell {
+    pub fn new(state: Value, handler: ActorHandler) -> Self {
+        ActorCell { state, handler, next_ticket: 0, serving: 0, turn: Arc::new(Condvar::new()) }
+    }
+}
+
+/// Completion slot behind a `conc.AskHandle[R]` (#1085). The worker
+/// thread started by `conc.ask_async` stores the handler's reply (or
+/// its error) here exactly once and signals `done`; `conc.await`
+/// blocks on `done` until the slot is filled. Reading does not take
+/// the value out, so awaiting the same handle twice returns the same
+/// reply.
+#[derive(Debug, Default)]
+pub struct AskSlot {
+    pub result: Mutex<Option<Result<Value, String>>>,
+    pub done: Condvar,
+}
+
+impl AskSlot {
+    pub fn complete(&self, r: Result<Value, String>) {
+        let mut g = self.result.lock().unwrap_or_else(|p| p.into_inner());
+        if g.is_none() {
+            *g = Some(r);
+        }
+        self.done.notify_all();
+    }
+
+    pub fn wait(&self) -> Result<Value, String> {
+        let mut g = self.result.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if let Some(r) = g.as_ref() {
+                return r.clone();
+            }
+            g = self.done.wait(g).unwrap_or_else(|p| p.into_inner());
+        }
+    }
 }
 
 /// Two ways an actor's handler can be implemented.
@@ -224,6 +276,9 @@ pub enum Value {
     /// and exits. Two ticker handles compare equal iff they point to the
     /// same cancel flag.
     Ticker(Arc<AtomicBool>),
+    /// A pending reply from `conc.ask_async` (#1085), consumed by
+    /// `conc.await`. Identity equality, like `Actor` / `Ticker`.
+    AskHandle(Arc<AskSlot>),
     /// Apache Arrow `RecordBatch` — an unboxed columnar table. The
     /// "fast lane" representation for `lex-frame` and any future
     /// dataframe code: a `Value::ArrowTable` with one int64 column
@@ -301,6 +356,7 @@ impl PartialEq for Value {
             // Ticker identity: same if both handles point to the same
             // cancel flag (one ticker spawn → one flag).
             (Ticker(a), Ticker(b)) => Arc::ptr_eq(a, b),
+            (AskHandle(a), AskHandle(b)) => Arc::ptr_eq(a, b),
             // Arrow table equality: structural over schema + columns.
             // RecordBatch implements PartialEq directly.
             (ArrowTable(a), ArrowTable(b)) => a == b,
@@ -594,6 +650,7 @@ impl Value {
             Value::Deque(items) => J::Array(items.iter().map(Value::to_json).collect()),
             Value::Actor(_) => J::String("<actor>".into()),
             Value::Ticker(_) => J::String("<ticker>".into()),
+            Value::AskHandle(_) => J::String("<ask_handle>".into()),
             Value::ArrowTable(t) => {
                 // Compact summary: schema + nrows. Full data is intentionally
                 // not emitted — Arrow tables can be GB-scale and a JSON dump
