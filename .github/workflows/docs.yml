@@ -89,6 +89,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       # The lex-cli dep graph (lex-runtime → arrow-rs/Polars) inflates
       # target/; reclaim runner space the same way ci.yml does so the
       # debug build doesn't exhaust the disk.
